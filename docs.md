@@ -18,11 +18,13 @@ a real zone token.
 ## Local Data Flow
 
 1. Device worker receives live capture or dump record.
-2. Attendance processor generates deterministic `event_uid`.
-3. Record is inserted into local SQLite.
-4. Audit ledger appends a chained hash row.
-5. Sync queue receives a canonical JSON payload.
-6. Sync worker uploads batches and keeps local rows after ACK.
+2. If SDK live events are not emitted, the worker reconciles `get_attendance()` during
+   the 5-second clock loop and stores newly discovered records as `LIVE_POLL`.
+3. Attendance processor generates deterministic `event_uid`.
+4. Record is inserted into local SQLite.
+5. Audit ledger appends a chained hash row.
+6. Sync queue receives a canonical JSON payload.
+7. Sync worker uploads batches and keeps local rows after ACK.
 
 ## Trusted Time Flow
 

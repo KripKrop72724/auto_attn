@@ -32,6 +32,8 @@ class ZoneSettings(BaseSettings):
     scan_max_hosts_per_subnet: int = 254
     scan_include_public_subnets: bool = False
     clock_check_interval_seconds: int = 5
+    live_poll_reconcile_enabled: bool = True
+    live_poll_reconcile_interval_seconds: int = 5
     drift_threshold_seconds: int = 120
     jump_threshold_seconds: int = 15
     critical_drift_seconds: int = 300

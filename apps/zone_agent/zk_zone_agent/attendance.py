@@ -51,6 +51,27 @@ class AttendanceProcessor:
             row.raw_json = json.dumps(user.raw or {}, default=str, sort_keys=True)
         session.flush()
 
+    def event_uid(self, *, device: Device, attendance: ZKAttendance, context: AttendanceContext) -> str:
+        return attendance_event_uid(
+            zone_id=context.zone_id,
+            device_serial=device.serial or device.device_id,
+            user_id=str(attendance.user_id),
+            device_event_time=attendance.timestamp,
+            punch=attendance.punch,
+            source_uid=attendance.uid,
+        )
+
+    def find_event_id(
+        self,
+        session: Session,
+        device: Device,
+        attendance: ZKAttendance,
+        context: AttendanceContext,
+    ) -> int | None:
+        event_uid = self.event_uid(device=device, attendance=attendance, context=context)
+        existing = session.scalar(select(AttendanceEvent.id).where(AttendanceEvent.event_uid == event_uid))
+        return existing
+
     def process(
         self,
         session: Session,
@@ -61,20 +82,13 @@ class AttendanceProcessor:
         source_type: SourceType,
         zone_trusted_time: datetime,
     ) -> AttendanceEvent:
-        event_uid = attendance_event_uid(
-            zone_id=context.zone_id,
-            device_serial=device.serial or device.device_id,
-            user_id=str(attendance.user_id),
-            device_event_time=attendance.timestamp,
-            punch=attendance.punch,
-            source_uid=attendance.uid,
-        )
+        event_uid = self.event_uid(device=device, attendance=attendance, context=context)
         existing = session.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid))
         if existing is not None:
             return existing
 
         employee_name = self._employee_name(session, device.device_id, str(attendance.user_id))
-        if source_type == SourceType.LIVE:
+        if source_type in {SourceType.LIVE, SourceType.LIVE_POLL}:
             classification = self.engine.classify_live_attendance(
                 device_event_time=attendance.timestamp,
                 zone_trusted_time=zone_trusted_time,

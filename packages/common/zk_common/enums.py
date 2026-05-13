@@ -20,6 +20,7 @@ class TrustStatus(StrEnum):
 
 class SourceType(StrEnum):
     LIVE = "LIVE"
+    LIVE_POLL = "LIVE_POLL"
     DUMP_RECONNECT = "DUMP_RECONNECT"
     DUMP_STARTUP = "DUMP_STARTUP"
     MANUAL_REPROCESS = "MANUAL_REPROCESS"

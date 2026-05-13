@@ -31,6 +31,8 @@ The Zone Agent automatically scans detected private LAN subnets for TCP `4370` a
 
 Saved devices start local monitoring immediately after Comm Key validation, even when the zone is not registered with head office yet. In that state the agent uses a local unregistered identity, captures live attendance, runs clock/fraud checks, records outages, and queues sync payloads. Once setup succeeds and a zone token is issued, pending local records are associated with the registered zone and uploaded.
 
+For devices or firmware that do not reliably emit SDK live events, the worker also performs a monitored `get_attendance()` reconciliation during the 5-second clock-check loop. Newly appearing records are stored as `LIVE_POLL`, classified with the same live trust rules, and shown on the Live Attendance page through a 3-second local polling feed.
+
 Comm Key brute force is available for owned devices but disabled by default:
 
 ```bash

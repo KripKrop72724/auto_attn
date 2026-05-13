@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from fastapi import Body, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Form, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -366,6 +366,18 @@ def attendance_page(request: Request):
     return templates.TemplateResponse(request=request, name="attendance.html", context={"rows": rows})
 
 
+@app.get("/api/attendance/recent")
+def api_recent_attendance(limit: int = Query(default=200, ge=1, le=500)):
+    with session_scope() as session:
+        rows = session.scalars(
+            select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(limit)
+        ).all()
+        return {
+            "server_time": utc_now().isoformat(),
+            "rows": [_serialize_attendance(row) for row in rows],
+        }
+
+
 @app.get("/clock-guard", response_class=HTMLResponse)
 def clock_guard_page(request: Request):
     with session_scope() as session:
@@ -600,6 +612,20 @@ def _serialize_candidate(candidate: DeviceDiscoveryResult) -> dict:
         "platform": candidate.platform,
         "device_name": candidate.device_name,
         "configured_device_id": candidate.configured_device_id,
+    }
+
+
+def _serialize_attendance(row: AttendanceEvent) -> dict:
+    return {
+        "event_uid": row.event_uid,
+        "device_event_time": row.device_event_time.isoformat() if row.device_event_time else None,
+        "zone_trusted_time": row.zone_trusted_time.isoformat() if row.zone_trusted_time else None,
+        "user": row.employee_name or row.user_id,
+        "device_id": row.device_id,
+        "source_type": row.source_type,
+        "trust_status": row.trust_status,
+        "fraud_score": row.fraud_score,
+        "fraud_reason": row.fraud_reason or "",
     }
 
 

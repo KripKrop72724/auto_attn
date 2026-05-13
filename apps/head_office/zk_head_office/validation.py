@@ -5,7 +5,7 @@ from datetime import timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from zk_common.enums import TrustStatus
+from zk_common.enums import SourceType, TrustStatus
 from zk_common.schemas import AttendanceSyncEvent
 from zk_common.time_utils import ensure_utc, utc_now
 from zk_head_office.db import ClockCheck, FraudIncident, OutagePeriod
@@ -29,7 +29,7 @@ def final_trust_status(
         .order_by(ClockCheck.trusted_time.desc())
         .limit(1)
     )
-    if nearby_clock is None and event.source_type.value == "LIVE":
+    if nearby_clock is None and event.source_type in {SourceType.LIVE, SourceType.LIVE_POLL}:
         return TrustStatus.SUSPECT_MISSING_CLOCK_CHECK, "No nearby clock check supports this live event.", 70
     if nearby_clock and nearby_clock.status == "SUSPICIOUS":
         return TrustStatus.SUSPECT_DEVICE_CLOCK_JUMP, nearby_clock.reason, max(event.fraud_score, 80)

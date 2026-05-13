@@ -24,9 +24,10 @@ from zk_zone_agent.config import ActiveZoneConfig, config_manager
 from zk_zone_agent.db import ClockCheck, Device, FraudIncident, OutagePeriod
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.fraud import fraud_engine
+from zk_zone_agent.settings import settings
 from zk_zone_agent.sync import sync_queue_writer
 from zk_zone_agent.trusted_time import TrustedTimeService
-from zk_zone_agent.zk_client import PyZKClient, ZKClient
+from zk_zone_agent.zk_client import PyZKClient, ZKAttendance, ZKClient
 
 
 class DeviceWorker(threading.Thread):
@@ -40,6 +41,7 @@ class DeviceWorker(threading.Thread):
         session_factory: Callable[[], Session],
         client_factory: Callable[[Device], ZKClient] | None = None,
         clock_interval_seconds: int = 5,
+        live_poll_reconcile_interval_seconds: int | None = None,
     ) -> None:
         super().__init__(name=f"device-worker-{device_id}", daemon=True)
         self.device_id = device_id
@@ -49,6 +51,12 @@ class DeviceWorker(threading.Thread):
         self.session_factory = session_factory
         self.client_factory = client_factory or self._default_client_factory
         self.clock_interval_seconds = clock_interval_seconds
+        self.live_poll_reconcile_interval_seconds = (
+            settings.live_poll_reconcile_interval_seconds
+            if live_poll_reconcile_interval_seconds is None
+            else live_poll_reconcile_interval_seconds
+        )
+        self.last_live_poll_reconcile_monotonic: float | None = None
         self.previous_device_time: datetime | None = None
         self.previous_trusted_time: datetime | None = None
         self.last_clock_status: ClockStatus = ClockStatus.ERROR
@@ -114,28 +122,66 @@ class DeviceWorker(threading.Thread):
                 break
             if attendance is None:
                 self._clock_check(client)
+                self._live_poll_reconcile_if_due(client)
                 continue
-            trusted_now = self.trusted_time.now().value
+            self._process_observed_attendance(attendance, SourceType.LIVE)
+
+    def _process_observed_attendance(
+        self,
+        attendance: ZKAttendance,
+        source_type: SourceType,
+        *,
+        zone_trusted_time: datetime | None = None,
+    ) -> bool:
+        trusted_now = zone_trusted_time or self.trusted_time.now().value
+        with self.session_factory() as session:
+            device = self._session_device(session)
+            zone_config = self._zone_config(session)
+            context = AttendanceContext(
+                zone_id=zone_config.zone_id,
+                timezone=zone_config.timezone,
+                internet_online=self.trusted_time.last_head_office_time_utc is not None,
+                current_clock_status=device.last_clock_status,
+                pc_clock_suspicious=self.trusted_time.last_pc_tamper_at is not None,
+                reconnect_clock_ok=self.reconnect_clock_ok,
+            )
+            before_id = attendance_processor.find_event_id(session, device, attendance, context)
+            row = attendance_processor.process(
+                session,
+                device=device,
+                attendance=attendance,
+                context=context,
+                source_type=source_type,
+                zone_trusted_time=trusted_now,
+            )
+            inserted = row.id != before_id
+            if inserted:
+                device.last_error = (
+                    f"Captured attendance for user {row.employee_name or row.user_id} "
+                    f"via {source_type.value}."
+                )
+            session.commit()
+            return inserted
+
+    def _live_poll_reconcile_if_due(self, client: ZKClient) -> int:
+        if not settings.live_poll_reconcile_enabled:
+            return 0
+        now = time.monotonic()
+        if (
+            self.last_live_poll_reconcile_monotonic is not None
+            and now - self.last_live_poll_reconcile_monotonic
+            < self.live_poll_reconcile_interval_seconds
+        ):
+            return 0
+        self.last_live_poll_reconcile_monotonic = now
+        try:
+            return self._reconcile_dump(client, SourceType.LIVE_POLL)
+        except Exception as exc:
             with self.session_factory() as session:
                 device = self._session_device(session)
-                zone_config = self._zone_config(session)
-                context = AttendanceContext(
-                    zone_id=zone_config.zone_id,
-                    timezone=zone_config.timezone,
-                    internet_online=self.trusted_time.last_head_office_time_utc is not None,
-                    current_clock_status=device.last_clock_status,
-                    pc_clock_suspicious=self.trusted_time.last_pc_tamper_at is not None,
-                    reconnect_clock_ok=self.reconnect_clock_ok,
-                )
-                attendance_processor.process(
-                    session,
-                    device=device,
-                    attendance=attendance,
-                    context=context,
-                    source_type=SourceType.LIVE,
-                    zone_trusted_time=trusted_now,
-                )
+                device.last_error = f"Live attendance polling failed: {exc}"
                 session.commit()
+            return 0
 
     def _clock_check(self, client: ZKClient) -> None:
         trusted_now = self.trusted_time.now().value
@@ -343,9 +389,10 @@ class DeviceWorker(threading.Thread):
                 )
             session.commit()
 
-    def _reconcile_dump(self, client: ZKClient, source_type: SourceType) -> None:
+    def _reconcile_dump(self, client: ZKClient, source_type: SourceType) -> int:
         trusted_now = self.trusted_time.now().value
         attendances = client.get_attendance()
+        inserted_count = 0
         with self.session_factory() as session:
             device = self._session_device(session)
             zone_config = self._zone_config(session)
@@ -357,7 +404,8 @@ class DeviceWorker(threading.Thread):
                 reconnect_clock_ok=self.reconnect_clock_ok,
             )
             for item in attendances:
-                attendance_processor.process(
+                before_id = attendance_processor.find_event_id(session, device, item, context)
+                row = attendance_processor.process(
                     session,
                     device=device,
                     attendance=item,
@@ -365,4 +413,9 @@ class DeviceWorker(threading.Thread):
                     source_type=source_type,
                     zone_trusted_time=trusted_now,
                 )
+                if row.id != before_id:
+                    inserted_count += 1
+            if inserted_count and source_type == SourceType.LIVE_POLL:
+                device.last_error = f"Captured {inserted_count} attendance record(s) via live polling."
             session.commit()
+        return inserted_count

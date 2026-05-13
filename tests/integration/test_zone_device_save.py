@@ -3,6 +3,7 @@ import importlib
 
 from fastapi.testclient import TestClient
 
+from zk_common.enums import SourceType, TrustStatus
 from zk_zone_agent.device_validation import DeviceValidation
 from zk_zone_agent.zk_client import ZKDeviceInfo
 
@@ -80,3 +81,36 @@ def test_device_save_persists_only_after_validation(monkeypatch, tmp_path):
         assert device.serial == "ADZV211860253"
         assert device.last_clock_status == "PENDING"
         assert "Worker is starting" in device.last_error
+
+
+def test_recent_attendance_api_returns_live_rows(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    db_module.init_db()
+    now = datetime(2026, 5, 13, 11, 0, tzinfo=timezone.utc)
+    with db_module.session_scope() as session:
+        session.add(
+            db_module.AttendanceEvent(
+                event_uid="event-1",
+                zone_id="RWP-ZONE-01",
+                device_id="MAIN-GATE",
+                device_serial="ADZV211860253",
+                user_id="5",
+                employee_name="Ali",
+                device_event_time=now,
+                zone_received_wall_time=now,
+                zone_trusted_time=now,
+                status=TrustStatus.TRUSTED_LIVE.value,
+                trust_status=TrustStatus.TRUSTED_LIVE.value,
+                raw_event="{}",
+                source_type=SourceType.LIVE_POLL.value,
+                sync_status="PENDING",
+            )
+        )
+
+    with TestClient(web_module.app) as client:
+        response = client.get("/api/attendance/recent")
+
+    assert response.status_code == 200
+    rows = response.json()["rows"]
+    assert rows[0]["user"] == "Ali"
+    assert rows[0]["source_type"] == "LIVE_POLL"
