@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><h1>Service Logs</h1><p>Service lifecycle events.</p></section>
+<div class="table-wrap"><table>
+<thead><tr><th>Time</th><th>Event</th><th>Description</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td>{{ row.created_at }}</td><td>{{ row.event_type }}</td><td>{{ row.description or '' }}</td></tr>
+{% else %}<tr><td colspan="3">No service events.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}

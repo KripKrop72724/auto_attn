@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head">
+  <h1>First-Time Zone Setup</h1>
+  <p>Register this branch PC with the head office server.</p>
+</section>
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+<form class="panel form" method="post" action="/setup">
+  <label>Zone ID <input name="zone_id" value="{{ config.zone_id if config else 'RWP-ZONE-01' }}" required></label>
+  <label>Zone Name <input name="zone_name" value="{{ config.zone_name if config else 'Rawalpindi Main Office' }}" required></label>
+  <label>Head Office URL <input name="head_office_url" value="{{ config.head_office_url if config else 'http://127.0.0.1:8080' }}" required></label>
+  <label>Enrollment Key <input name="enrollment_key" value="ABC-123" required></label>
+  <label>Timezone <input name="timezone" value="{{ config.timezone if config else 'Asia/Karachi' }}" required></label>
+  <button class="primary" type="submit">Register Zone</button>
+</form>
+{% endblock %}

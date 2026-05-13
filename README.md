@@ -1,0 +1,48 @@
+# ZKTeco Attendance Fraud-Monitoring POC
+
+[![CI](https://github.com/KripKrop72724/auto_attn/actions/workflows/ci.yml/badge.svg)](https://github.com/KripKrop72724/auto_attn/actions/workflows/ci.yml)
+[![Shipping CD](https://github.com/KripKrop72724/auto_attn/actions/workflows/cd.yml/badge.svg)](https://github.com/KripKrop72724/auto_attn/actions/workflows/cd.yml)
+
+This repository contains a greenfield Python POC with two runnable products:
+
+- **Zone Agent**: local Windows/branch service that talks to ZKTeco devices over LAN, stores data in SQLite first, monitors device and PC clock tampering, records outages, and syncs queued records to head office.
+- **Head Office**: central FastAPI server and dashboard that receives zone data, revalidates trust status, and reports attendance, outages, clock checks, and incidents.
+
+## Quick Start
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[dev]"
+zk-head-office --host 127.0.0.1 --port 8080
+zk-zone-agent --host 127.0.0.1 --port 7860
+```
+
+Then open:
+
+- Zone Agent: <http://127.0.0.1:7860>
+- Head Office: <http://127.0.0.1:8080>
+
+Default POC enrollment key: `ABC-123`.
+
+## Shipping
+
+The repository ships through GitHub Actions:
+
+- `CI` runs lint, tests, and Python package build across Ubuntu/Windows and Python 3.11/3.12.
+- `Shipping CD` builds Python distributions on Ubuntu and the Windows Zone Agent installer on `windows-latest`.
+- Tag pushes matching `v*` publish a GitHub Release with the Python package and Windows installer artifacts.
+
+To cut a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## Important Notes
+
+- The zone agent stores mutable local state under `local-data/zone-agent` by default on non-Windows systems and under `C:\ProgramData\ZKZoneAgent` on Windows.
+- `pyzk` is used through an adapter (`ZKClient`) so tests can run with fake devices and hardware access remains isolated.
+- `pyzk` is GPL-2.0; review licensing before commercial redistribution.
+- SQLite is intentional for the POC. Head office should move to PostgreSQL for production.

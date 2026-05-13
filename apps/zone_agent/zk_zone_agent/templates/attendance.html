@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><h1>Live Attendance</h1><p>All records are saved locally first, including suspicious records.</p></section>
+<div class="table-wrap"><table>
+<thead><tr><th>Device Time</th><th>Trusted Time</th><th>User</th><th>Device</th><th>Source</th><th>Trust</th><th>Score</th><th>Reason</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td>{{ row.device_event_time }}</td><td>{{ row.zone_trusted_time }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.source_type }}</td><td>{{ row.trust_status }}</td><td>{{ row.fraud_score }}</td><td>{{ row.fraud_reason or '' }}</td></tr>
+{% else %}<tr><td colspan="8">No attendance captured yet.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}

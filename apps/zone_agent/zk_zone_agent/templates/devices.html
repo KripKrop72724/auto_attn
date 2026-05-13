@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head">
+  <h1>Selected Devices</h1>
+  <p>Each device is owned by a single worker connection.</p>
+</section>
+<form class="panel form inline-form" method="post" action="/devices">
+  <input name="device_id" placeholder="RWP-MAIN-GATE-01" required>
+  <input name="label" placeholder="Main Gate MB20" required>
+  <input name="ip" placeholder="192.168.110.137" required>
+  <input name="port" type="number" value="4370" required>
+  <input name="comm_key" placeholder="1979" required>
+  <button class="primary" type="submit">Save Device</button>
+</form>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Label</th><th>Address</th><th>Serial</th><th>Platform</th><th>Enabled</th><th>Last Error</th><th></th></tr></thead>
+    <tbody>
+    {% for device in devices %}
+      <tr>
+        <td>{{ device.label }}<br><small>{{ device.device_id }}</small></td>
+        <td>{{ device.ip }}:{{ device.port }}</td>
+        <td>{{ device.serial or '-' }}</td>
+        <td>{{ device.platform or '-' }}</td>
+        <td>{{ 'Yes' if device.enabled else 'No' }}</td>
+        <td>{{ device.last_error or '-' }}</td>
+        <td><form method="post" action="/devices/{{ device.device_id }}/toggle"><button type="submit">{{ 'Disable' if device.enabled else 'Enable' }}</button></form></td>
+      </tr>
+    {% else %}<tr><td colspan="7">No devices configured.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

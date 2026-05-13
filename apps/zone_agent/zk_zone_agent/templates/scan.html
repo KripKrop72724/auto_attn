@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head">
+  <h1>Scan Local Network</h1>
+  <p>Find hosts with TCP port 4370 open, then save the device with its Comm Key.</p>
+</section>
+<form class="panel form inline-form" method="post" action="/devices/scan">
+  <select name="subnet">
+    <option value="">All detected subnets</option>
+    {% for subnet in subnets %}<option value="{{ subnet }}">{{ subnet }}</option>{% endfor %}
+  </select>
+  <button class="primary" type="submit">Scan</button>
+</form>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>IP</th><th>Port</th><th>Add</th></tr></thead>
+    <tbody>
+    {% for item in results %}
+      <tr>
+        <td>{{ item.ip }}</td><td>{{ item.port }}</td>
+        <td>
+          <form class="inline-form" method="post" action="/devices">
+            <input name="device_id" value="DEVICE-{{ item.ip.replace('.', '-') }}">
+            <input name="label" value="ZKT Device {{ item.ip }}">
+            <input name="ip" value="{{ item.ip }}">
+            <input name="port" value="{{ item.port }}">
+            <input name="comm_key" placeholder="Comm Key">
+            <button type="submit">Save</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}<tr><td colspan="3">No scan results yet.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

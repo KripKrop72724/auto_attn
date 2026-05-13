@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><h1>Outage Timeline</h1><p>Internet, device LAN, PC reboot, and agent downtime reports.</p></section>
+<div class="table-wrap"><table>
+<thead><tr><th>Zone</th><th>Type</th><th>Device</th><th>Start</th><th>End</th><th>Duration</th><th>Classification</th></tr></thead>
+<tbody>{% for row in rows %}
+<tr><td>{{ row.zone_id }}</td><td>{{ row.outage_type }}</td><td>{{ row.device_id or '-' }}</td><td>{{ row.start_time }}</td><td>{{ row.end_time or '-' }}</td><td>{{ row.duration_seconds or '-' }}</td><td>{{ row.classification or '-' }}</td></tr>
+{% else %}<tr><td colspan="7">No outages synced.</td></tr>{% endfor %}</tbody>
+</table></div>
+{% endblock %}

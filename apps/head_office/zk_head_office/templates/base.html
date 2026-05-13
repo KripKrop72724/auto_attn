@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title or "ZK Head Office" }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">Head Office</div>
+      <nav>
+        <a href="/">Overview</a>
+        <a href="/zones">Zones</a>
+        <a href="/devices">Devices</a>
+        <a href="/attendance">Attendance</a>
+        <a href="/incidents">Fraud Incidents</a>
+        <a href="/clock">Clock Timeline</a>
+        <a href="/outages">Outage Timeline</a>
+        <a href="/reports/attendance.csv">CSV Export</a>
+      </nav>
+    </aside>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

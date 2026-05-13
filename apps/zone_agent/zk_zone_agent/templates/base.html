@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title or "ZK Zone Agent" }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+    <script defer src="{{ url_for('static', path='/app.js') }}"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">ZK Zone Agent</div>
+      <nav>
+        <a href="/dashboard">Status</a>
+        <a href="/setup">Setup</a>
+        <a href="/devices">Devices</a>
+        <a href="/devices/scan">Scan</a>
+        <a href="/attendance">Attendance</a>
+        <a href="/clock-guard">Clock Guard</a>
+        <a href="/outages">Outages</a>
+        <a href="/sync-queue">Sync Queue</a>
+        <a href="/logs">Logs</a>
+      </nav>
+    </aside>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><h1>Zones</h1><p>Registered branches and heartbeat status.</p></section>
+<div class="table-wrap"><table>
+<thead><tr><th>Zone</th><th>Active</th><th>Last Heartbeat</th><th>Pending Queue</th><th>Created</th></tr></thead>
+<tbody>{% for row in rows %}
+<tr><td>{{ row.zone_name }}<br><small>{{ row.zone_id }}</small></td><td>{{ 'Yes' if row.active else 'No' }}</td><td>{{ row.last_heartbeat_at or '-' }}</td><td>{{ row.pending_queue_count }}</td><td>{{ row.created_at }}</td></tr>
+{% else %}<tr><td colspan="5">No zones registered.</td></tr>{% endfor %}</tbody>
+</table></div>
+{% endblock %}
