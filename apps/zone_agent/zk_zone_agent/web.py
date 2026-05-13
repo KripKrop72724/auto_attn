@@ -31,13 +31,13 @@ from zk_zone_agent.db import (
     session_scope,
 )
 from zk_zone_agent.device_registry import device_registry
+from zk_zone_agent.device_validation import validate_device_connection
 from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.network_scanner import network_scanner
 from zk_zone_agent.settings import settings
 from zk_zone_agent.supervisor import zone_supervisor
 from zk_zone_agent.sync import HeadOfficeClient, sync_queue_writer
 from zk_zone_agent.trusted_time import trusted_time_service
-from zk_zone_agent.zk_client import PyZKClient
 
 
 BASE_DIR = Path(__file__).parent
@@ -170,14 +170,25 @@ def dashboard(request: Request):
 
 
 @app.get("/devices", response_class=HTMLResponse)
-def devices_page(request: Request):
+def devices_page(request: Request, error: str | None = None, success: str | None = None):
     with session_scope() as session:
+        config = config_manager.get(session)
         devices = device_registry.list_devices(session)
-    return templates.TemplateResponse(request=request, name="devices.html", context={"devices": devices})
+    return templates.TemplateResponse(
+        request=request,
+        name="devices.html",
+        context={
+            "devices": devices,
+            "config": config,
+            "error": error,
+            "success": success,
+            "workers_disabled": settings.disable_workers,
+        },
+    )
 
 
 @app.get("/devices/scan", response_class=HTMLResponse)
-def scan_page(request: Request):
+def scan_page(request: Request, error: str | None = None, success: str | None = None):
     subnets = [str(item) for item in network_scanner.discover_subnets()]
     with session_scope() as session:
         candidates = session.scalars(
@@ -205,6 +216,8 @@ def scan_page(request: Request):
             "discovery_state": discovery_service.status(),
             "last_scan": last_scan,
             "bruteforce_enabled": settings.bruteforce_enabled,
+            "error": error,
+            "success": success,
             "jobs": job_payloads,
             "active_bruteforce_jobs": any(
                 job["status"] in {"PENDING", "RUNNING", "PAUSED"} for job in job_payloads
@@ -231,19 +244,23 @@ def save_device(
     label: str = Form(...),
     ip: str = Form(...),
     port: int = Form(4370),
-    comm_key: str = Form("0"),
+    comm_key: str = Form(...),
+    return_to: str = Form("/devices"),
 ):
-    serial = platform = device_name = None
+    redirect_base = _safe_return_path(return_to)
     try:
-        client = PyZKClient(ip=ip, port=port, comm_key=int(comm_key or 0), timeout=5)
-        client.connect()
-        info = client.get_info()
-        serial, platform, device_name = info.serial, info.platform, info.device_name
-        client.disconnect()
-    except Exception:
-        pass
+        validation = validate_device_connection(ip=ip, port=port, comm_key=comm_key, timeout=5)
+    except Exception as exc:
+        return RedirectResponse(
+            f"{redirect_base}?error={quote_plus(f'Device was not saved: {exc}')}",
+            status_code=303,
+        )
+
+    serial = validation.info.serial
+    platform = validation.info.platform
+    device_name = validation.info.device_name
     with session_scope() as session:
-        device_registry.save_device(
+        device = device_registry.save_device(
             session,
             device_id=device_id,
             label=label,
@@ -255,6 +272,10 @@ def save_device(
             device_name=device_name,
             enabled=True,
         )
+        device.online = False
+        device.last_error = "Validated. Worker is starting and will connect for live capture."
+        device.last_clock_status = "PENDING"
+        device.last_drift_seconds = None
         candidate = session.scalar(
             select(DeviceDiscoveryResult).where(
                 DeviceDiscoveryResult.ip == ip,
@@ -268,8 +289,15 @@ def save_device(
             candidate.platform = platform or candidate.platform
             candidate.device_name = device_name or candidate.device_name
             candidate.updated_at = utc_now()
+        config = config_manager.get(session)
     zone_supervisor.refresh_device_workers()
-    return RedirectResponse("/devices", status_code=303)
+    if settings.disable_workers:
+        message = "Device validated and saved. Workers are disabled in local settings."
+    elif config is None or not config.setup_completed:
+        message = "Device validated and saved. Complete setup to start live monitoring."
+    else:
+        message = "Device validated and saved. Worker is connecting now for live capture and clock sync."
+    return RedirectResponse(f"/devices?success={quote_plus(message)}", status_code=303)
 
 
 @app.post("/devices/discovery/{candidate_id}/bruteforce")
@@ -531,6 +559,12 @@ def _parse_common_keys(value: str) -> list[int] | None:
             continue
         keys.append(int(item))
     return keys or None
+
+
+def _safe_return_path(value: str) -> str:
+    if value in {"/devices", "/devices/scan"}:
+        return value
+    return "/devices"
 
 
 def _serialize_candidate(candidate: DeviceDiscoveryResult) -> dict:

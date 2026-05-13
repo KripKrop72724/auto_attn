@@ -93,7 +93,8 @@ class ZoneSupervisor:
                 return
             devices = device_registry.enabled_devices(session)
             for device in devices:
-                if device.device_id in self.device_workers:
+                existing = self.device_workers.get(device.device_id)
+                if existing and existing.is_alive():
                     continue
                 worker = DeviceWorker(
                     device_id=device.device_id,

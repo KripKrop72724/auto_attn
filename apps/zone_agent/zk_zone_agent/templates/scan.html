@@ -2,8 +2,10 @@
 {% block content %}
 <section class="page-head">
   <h1>Device Discovery</h1>
-  <p>Auto-detected TCP 4370 candidates and Comm Key validation jobs.</p>
+  <p>Auto-detected TCP 4370 candidates. Devices are validated with a Comm Key before they can be saved.</p>
 </section>
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert success">{{ success }}</div>{% endif %}
 
 <section class="panel">
   <div class="inline-form split-row">
@@ -59,12 +61,13 @@
             <small>{{ item.configured_device_id }}</small>
           {% else %}
             <form class="stack-form" method="post" action="/devices">
+              <input type="hidden" name="return_to" value="/devices/scan">
               <input name="device_id" value="DEVICE-{{ item.ip.replace('.', '-') }}" required>
               <input name="label" value="ZKT Device {{ item.ip }}" required>
               <input name="ip" value="{{ item.ip }}" required>
               <input name="port" type="number" value="{{ item.port }}" required>
               <input name="comm_key" value="{{ found_key or '' }}" placeholder="Comm Key" required>
-              <button type="submit">{{ 'Save Found Key' if found_key else 'Save' }}</button>
+              <button type="submit">{{ 'Validate & Save Found Key' if found_key else 'Validate & Save' }}</button>
             </form>
           {% endif %}
         </td>

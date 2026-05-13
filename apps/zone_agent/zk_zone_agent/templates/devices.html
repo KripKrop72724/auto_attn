@@ -2,32 +2,50 @@
 {% block content %}
 <section class="page-head">
   <h1>Selected Devices</h1>
-  <p>Each device is owned by a single worker connection.</p>
+  <p>Each saved device is validated with its Comm Key before a worker starts live capture.</p>
 </section>
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert success">{{ success }}</div>{% endif %}
+{% if not config or not config.setup_completed %}
+  <div class="alert warn">Zone setup is not complete. Devices can be validated, but live workers start after setup.</div>
+{% elif workers_disabled %}
+  <div class="alert warn">Workers are disabled by local settings, so devices will not connect automatically.</div>
+{% endif %}
 <form class="panel form inline-form" method="post" action="/devices">
+  <input type="hidden" name="return_to" value="/devices">
   <input name="device_id" placeholder="RWP-MAIN-GATE-01" required>
   <input name="label" placeholder="Main Gate MB20" required>
   <input name="ip" placeholder="192.168.110.137" required>
   <input name="port" type="number" value="4370" required>
   <input name="comm_key" placeholder="1979" required>
-  <button class="primary" type="submit">Save Device</button>
+  <button class="primary" type="submit">Validate & Save</button>
 </form>
 <div class="table-wrap">
   <table>
-    <thead><tr><th>Label</th><th>Address</th><th>Serial</th><th>Platform</th><th>Enabled</th><th>Last Error</th><th></th></tr></thead>
+    <thead><tr><th>Label</th><th>Address</th><th>Connection</th><th>Clock</th><th>Serial</th><th>Platform</th><th>Enabled</th><th>Worker Feedback</th><th></th></tr></thead>
     <tbody>
     {% for device in devices %}
       <tr>
         <td>{{ device.label }}<br><small>{{ device.device_id }}</small></td>
         <td>{{ device.ip }}:{{ device.port }}</td>
+        <td><span class="pill {{ 'ok' if device.online else 'bad' }}">{{ 'Live' if device.online else 'Retrying' }}</span></td>
+        <td>
+          {{ device.last_clock_status or 'PENDING' }}<br>
+          <small>Drift: {{ device.last_drift_seconds if device.last_drift_seconds is not none else '-' }}</small>
+        </td>
         <td>{{ device.serial or '-' }}</td>
         <td>{{ device.platform or '-' }}</td>
         <td>{{ 'Yes' if device.enabled else 'No' }}</td>
         <td>{{ device.last_error or '-' }}</td>
         <td><form method="post" action="/devices/{{ device.device_id }}/toggle"><button type="submit">{{ 'Disable' if device.enabled else 'Enable' }}</button></form></td>
       </tr>
-    {% else %}<tr><td colspan="7">No devices configured.</td></tr>{% endfor %}
+    {% else %}<tr><td colspan="9">No devices configured.</td></tr>{% endfor %}
     </tbody>
   </table>
 </div>
+{% if devices %}
+<script>
+  setTimeout(() => window.location.reload(), 5000);
+</script>
+{% endif %}
 {% endblock %}

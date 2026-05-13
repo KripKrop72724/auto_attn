@@ -64,12 +64,13 @@ class DeviceWorker(threading.Thread):
                 return
             client = self.client_factory(device)
             try:
+                self._mark_connecting(backoff)
                 client.connect()
                 backoff = 5
                 self._on_connected(client)
                 self._live_loop(client)
             except Exception as exc:
-                self._mark_offline(str(exc))
+                self._mark_offline(f"{exc}. Retrying in {backoff} seconds.")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, 60)
             finally:
@@ -95,7 +96,7 @@ class DeviceWorker(threading.Thread):
             device.platform = info.platform or device.platform
             device.device_name = info.device_name or device.device_name
             device.online = True
-            device.last_error = None
+            device.last_error = "Connected. Loading users and running initial clock check."
             users = client.get_users()
             attendance_processor.upsert_users(session, device, users)
             session.commit()
@@ -162,6 +163,10 @@ class DeviceWorker(threading.Thread):
             device.last_drift_seconds = result.drift_seconds
             if error:
                 device.last_error = error
+            elif result.status == ClockStatus.OK:
+                device.last_error = None
+            else:
+                device.last_error = result.reason
             row = ClockCheck(
                 zone_id=self.zone_config.zone_id,
                 device_id=device.device_id,
@@ -229,6 +234,18 @@ class DeviceWorker(threading.Thread):
                     payload=incident_payload,
                     record_id=incident.id,
                 )
+            session.commit()
+
+    def _mark_connecting(self, next_retry_seconds: int) -> None:
+        with self.session_factory() as session:
+            device = self._session_device(session)
+            device.online = False
+            device.last_error = (
+                "Connecting to device for live capture and clock sync. "
+                f"Next retry window: {next_retry_seconds} seconds."
+            )
+            if not device.last_clock_status:
+                device.last_clock_status = "PENDING"
             session.commit()
 
     def _mark_offline(self, reason: str) -> None:

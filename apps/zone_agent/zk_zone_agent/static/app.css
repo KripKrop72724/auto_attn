@@ -108,6 +108,8 @@ small { color: var(--muted); }
 .pill.bad { background: #fef3f2; color: #b42318; }
 .alert { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
 .alert.danger { background: #fef3f2; color: var(--danger); border: 1px solid #fecdca; }
+.alert.success { background: #ecfdf3; color: #027a48; border: 1px solid #abefc6; }
+.alert.warn { background: #fffaeb; color: var(--warn); border: 1px solid #fedf89; }
 @media (max-width: 900px) {
   body { grid-template-columns: 1fr; }
   .sidebar { position: static; }
