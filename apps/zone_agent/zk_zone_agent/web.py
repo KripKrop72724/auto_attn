@@ -4,20 +4,25 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from fastapi import FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from zk_common.enums import ClockStatus
 from zk_common.schemas import ZoneRegisterRequest
 from zk_common.time_utils import utc_now
+from zk_zone_agent.bruteforce import BruteForceStart, comm_key_bruteforce_manager
 from zk_zone_agent.config import config_manager
 from zk_zone_agent.db import (
     AttendanceEvent,
     ClockCheck,
+    CommKeyBruteforceJob,
     Device,
+    DeviceDiscoveryResult,
+    DiscoveryScanRun,
     FraudIncident,
     OutagePeriod,
     ServiceEvent,
@@ -26,6 +31,7 @@ from zk_zone_agent.db import (
     session_scope,
 )
 from zk_zone_agent.device_registry import device_registry
+from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.network_scanner import network_scanner
 from zk_zone_agent.settings import settings
 from zk_zone_agent.supervisor import zone_supervisor
@@ -36,6 +42,20 @@ from zk_zone_agent.zk_client import PyZKClient
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+class BruteForceStartBody(BaseModel):
+    mode: str = Field("SAFE_FAST", pattern="^(SAFE_FAST|AGGRESSIVE|CUSTOM)$")
+    range_start: int = Field(0, ge=0)
+    range_end: int = Field(999999, ge=0)
+    worker_count: int | None = Field(None, ge=1)
+    timeout_seconds: float | None = Field(None, gt=0)
+    common_keys: list[int] | None = None
+    allow_configured: bool = False
+
+
+class DiscoveryRescanBody(BaseModel):
+    subnets: list[str] | None = None
 
 
 class LocalWebSocketHub:
@@ -159,22 +179,50 @@ def devices_page(request: Request):
 @app.get("/devices/scan", response_class=HTMLResponse)
 def scan_page(request: Request):
     subnets = [str(item) for item in network_scanner.discover_subnets()]
-    return templates.TemplateResponse(request=request, name="scan.html", context={"subnets": subnets, "results": []})
+    with session_scope() as session:
+        candidates = session.scalars(
+            select(DeviceDiscoveryResult).order_by(
+                DeviceDiscoveryResult.status.asc(),
+                DeviceDiscoveryResult.last_seen.desc().nullslast(),
+                DeviceDiscoveryResult.ip.asc(),
+            )
+        ).all()
+        jobs = session.scalars(
+            select(CommKeyBruteforceJob).order_by(CommKeyBruteforceJob.started_at.desc()).limit(25)
+        ).all()
+        last_scan = session.scalar(select(DiscoveryScanRun).order_by(DiscoveryScanRun.id.desc()).limit(1))
+        job_payloads = [
+            comm_key_bruteforce_manager.serialize_job(job, include_secret=True)
+            for job in jobs
+        ]
+    return templates.TemplateResponse(
+        request=request,
+        name="scan.html",
+        context={
+            "subnets": subnets,
+            "results": [],
+            "candidates": candidates,
+            "discovery_state": discovery_service.status(),
+            "last_scan": last_scan,
+            "bruteforce_enabled": settings.bruteforce_enabled,
+            "jobs": job_payloads,
+            "active_bruteforce_jobs": any(
+                job["status"] in {"PENDING", "RUNNING", "PAUSED"} for job in job_payloads
+            ),
+            "found_keys_by_candidate": {
+                job["device_candidate_id"]: job.get("found_key")
+                for job in job_payloads
+                if job["status"] == "SUCCEEDED" and job.get("found_key")
+            },
+        },
+    )
 
 
 @app.post("/devices/scan", response_class=HTMLResponse)
 def run_scan(request: Request, subnet: str = Form("")):
     subnets = [subnet] if subnet.strip() else None
-    results = network_scanner.scan(
-        subnets=subnets,
-        timeout=settings.scan_timeout_seconds,
-        max_workers=settings.scan_concurrency,
-    )
-    return templates.TemplateResponse(
-        request=request,
-        name="scan.html",
-        context={"subnets": [str(item) for item in network_scanner.discover_subnets()], "results": results},
-    )
+    discovery_service.run_scan(source="MANUAL", subnets=subnets)
+    return RedirectResponse("/devices/scan", status_code=303)
 
 
 @app.post("/devices")
@@ -207,8 +255,58 @@ def save_device(
             device_name=device_name,
             enabled=True,
         )
+        candidate = session.scalar(
+            select(DeviceDiscoveryResult).where(
+                DeviceDiscoveryResult.ip == ip,
+                DeviceDiscoveryResult.port == port,
+            )
+        )
+        if candidate:
+            candidate.status = "CONFIGURED"
+            candidate.configured_device_id = device_id
+            candidate.serial = serial or candidate.serial
+            candidate.platform = platform or candidate.platform
+            candidate.device_name = device_name or candidate.device_name
+            candidate.updated_at = utc_now()
     zone_supervisor.refresh_device_workers()
     return RedirectResponse("/devices", status_code=303)
+
+
+@app.post("/devices/discovery/{candidate_id}/bruteforce")
+def start_bruteforce_from_form(
+    candidate_id: int,
+    mode: str = Form("SAFE_FAST"),
+    range_start: int = Form(0),
+    range_end: int = Form(999999),
+    worker_count: int | None = Form(None),
+    timeout_seconds: float | None = Form(None),
+    common_keys: str = Form(""),
+    confirm_bruteforce: str | None = Form(None),
+):
+    if confirm_bruteforce != "yes":
+        raise HTTPException(status_code=400, detail="Operator confirmation is required.")
+    with session_scope() as session:
+        candidate = session.get(DeviceDiscoveryResult, candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="Discovery candidate not found.")
+        request = BruteForceStart(
+            candidate_id=candidate.id,
+            ip=candidate.ip,
+            port=candidate.port,
+            mode=mode,
+            range_start=range_start,
+            range_end=range_end,
+            worker_count=worker_count,
+            timeout_seconds=timeout_seconds,
+            common_keys=_parse_common_keys(common_keys),
+        )
+    try:
+        comm_key_bruteforce_manager.start_job(request)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/devices/scan", status_code=303)
 
 
 @app.post("/devices/{device_id}/toggle")
@@ -284,6 +382,125 @@ def api_status():
         }
 
 
+@app.get("/api/discovery/status")
+def api_discovery_status():
+    with session_scope() as session:
+        candidates = session.scalars(
+            select(DeviceDiscoveryResult).order_by(
+                DeviceDiscoveryResult.status.asc(),
+                DeviceDiscoveryResult.last_seen.desc().nullslast(),
+                DeviceDiscoveryResult.ip.asc(),
+            )
+        ).all()
+        last_scan = session.scalar(select(DiscoveryScanRun).order_by(DiscoveryScanRun.id.desc()).limit(1))
+        jobs = session.scalars(
+            select(CommKeyBruteforceJob).order_by(CommKeyBruteforceJob.started_at.desc()).limit(25)
+        ).all()
+        state = discovery_service.status()
+        return {
+            "running": state.running,
+            "current_scan_id": state.current_scan_id,
+            "last_started_at": state.last_started_at.isoformat() if state.last_started_at else None,
+            "last_finished_at": state.last_finished_at.isoformat() if state.last_finished_at else None,
+            "last_scan": None if last_scan is None else _serialize_scan_run(last_scan),
+            "candidates": [_serialize_candidate(candidate) for candidate in candidates],
+            "bruteforce_jobs": [comm_key_bruteforce_manager.serialize_job(job) for job in jobs],
+        }
+
+
+@app.post("/api/discovery/rescan")
+def api_discovery_rescan(body: DiscoveryRescanBody | None = Body(default=None)):
+    state = discovery_service.trigger_scan(source="MANUAL", subnets=None if body is None else body.subnets)
+    return {
+        "ok": True,
+        "running": state.running,
+        "current_scan_id": state.current_scan_id,
+    }
+
+
+@app.post("/api/discovery/candidates/{candidate_id}/ignore")
+def api_ignore_candidate(candidate_id: int):
+    with session_scope() as session:
+        candidate = session.get(DeviceDiscoveryResult, candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404)
+        candidate.status = "IGNORED"
+        candidate.updated_at = utc_now()
+    return {"ok": True}
+
+
+@app.post("/api/discovery/candidates/{candidate_id}/bruteforce/start")
+def api_start_candidate_bruteforce(candidate_id: int, body: BruteForceStartBody):
+    with session_scope() as session:
+        candidate = session.get(DeviceDiscoveryResult, candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="Discovery candidate not found.")
+        request = BruteForceStart(
+            candidate_id=candidate.id,
+            ip=candidate.ip,
+            port=candidate.port,
+            mode=body.mode,
+            range_start=body.range_start,
+            range_end=body.range_end,
+            worker_count=body.worker_count,
+            timeout_seconds=body.timeout_seconds,
+            common_keys=body.common_keys,
+            allow_configured=body.allow_configured,
+        )
+    try:
+        job = comm_key_bruteforce_manager.start_job(request)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "job": comm_key_bruteforce_manager.serialize_job(job)}
+
+
+@app.get("/api/bruteforce/jobs")
+def api_list_bruteforce_jobs():
+    with session_scope() as session:
+        jobs = session.scalars(
+            select(CommKeyBruteforceJob).order_by(CommKeyBruteforceJob.started_at.desc()).limit(100)
+        ).all()
+        return {"jobs": [comm_key_bruteforce_manager.serialize_job(job) for job in jobs]}
+
+
+@app.get("/api/bruteforce/jobs/{job_id}")
+def api_get_bruteforce_job(job_id: int):
+    with session_scope() as session:
+        job = session.get(CommKeyBruteforceJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404)
+        return comm_key_bruteforce_manager.serialize_job(job)
+
+
+@app.post("/api/bruteforce/jobs/{job_id}/pause")
+def api_pause_bruteforce_job(job_id: int):
+    try:
+        comm_key_bruteforce_manager.pause(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404) from None
+    return {"ok": True}
+
+
+@app.post("/api/bruteforce/jobs/{job_id}/resume")
+def api_resume_bruteforce_job(job_id: int):
+    try:
+        comm_key_bruteforce_manager.resume(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404) from None
+    return {"ok": True}
+
+
+@app.post("/api/bruteforce/jobs/{job_id}/cancel")
+def api_cancel_bruteforce_job(job_id: int):
+    try:
+        comm_key_bruteforce_manager.cancel(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404) from None
+    return {"ok": True}
+
+
 @app.websocket("/ws/local-events")
 async def local_events(websocket: WebSocket):
     await ws_hub.connect(websocket)
@@ -303,4 +520,49 @@ def _counts(session):
         "outages": session.scalar(select(func.count(OutagePeriod.id))) or 0,
         "incidents": session.scalar(select(func.count(FraudIncident.id))) or 0,
         "sync_queue": session.scalar(select(func.count(SyncQueue.id))) or 0,
+    }
+
+
+def _parse_common_keys(value: str) -> list[int] | None:
+    keys: list[int] = []
+    for item in value.replace("\n", ",").replace(" ", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        keys.append(int(item))
+    return keys or None
+
+
+def _serialize_candidate(candidate: DeviceDiscoveryResult) -> dict:
+    return {
+        "id": candidate.id,
+        "ip": candidate.ip,
+        "port": candidate.port,
+        "subnet": candidate.subnet,
+        "interface_name": candidate.interface_name,
+        "status": candidate.status,
+        "source": candidate.source,
+        "first_seen": candidate.first_seen.isoformat(),
+        "last_seen": candidate.last_seen.isoformat() if candidate.last_seen else None,
+        "last_checked_at": candidate.last_checked_at.isoformat() if candidate.last_checked_at else None,
+        "consecutive_failures": candidate.consecutive_failures,
+        "last_error": candidate.last_error,
+        "serial": candidate.serial,
+        "platform": candidate.platform,
+        "device_name": candidate.device_name,
+        "configured_device_id": candidate.configured_device_id,
+    }
+
+
+def _serialize_scan_run(scan_run: DiscoveryScanRun) -> dict:
+    return {
+        "id": scan_run.id,
+        "source": scan_run.source,
+        "status": scan_run.status,
+        "started_at": scan_run.started_at.isoformat(),
+        "ended_at": scan_run.ended_at.isoformat() if scan_run.ended_at else None,
+        "target_count": scan_run.target_count,
+        "found_count": scan_run.found_count,
+        "error_count": scan_run.error_count,
+        "message": scan_run.message,
     }

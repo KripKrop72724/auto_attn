@@ -21,14 +21,28 @@ class ZoneSettings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 7860
     disable_workers: bool = False
+    auto_discovery_enabled: bool = True
+    auto_discovery_interval_seconds: int = 300
+    auto_discovery_startup_delay_seconds: int = 5
+    manual_rescan_min_interval_seconds: int = 10
+    scan_port: int = 4370
     scan_timeout_seconds: float = 0.45
     scan_concurrency: int = 128
+    scan_max_hosts_per_subnet: int = 254
+    scan_include_public_subnets: bool = False
     clock_check_interval_seconds: int = 5
     drift_threshold_seconds: int = 120
     jump_threshold_seconds: int = 15
     critical_drift_seconds: int = 300
     time_sync_interval_seconds: int = 30
     heartbeat_interval_seconds: int = 15
+    bruteforce_enabled: bool = False
+    bruteforce_default_timeout_seconds: float = 0.75
+    bruteforce_global_max_workers: int = 0
+    bruteforce_safe_fast_workers: int = 1
+    bruteforce_aggressive_workers: int = 2
+    bruteforce_hard_per_device_workers: int = 8
+    bruteforce_chunk_size: int = 25
 
     @property
     def sqlite_path(self) -> Path:

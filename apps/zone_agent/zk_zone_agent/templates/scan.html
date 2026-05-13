@@ -1,36 +1,153 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="page-head">
-  <h1>Scan Local Network</h1>
-  <p>Find hosts with TCP port 4370 open, then save the device with its Comm Key.</p>
+  <h1>Device Discovery</h1>
+  <p>Auto-detected TCP 4370 candidates and Comm Key validation jobs.</p>
 </section>
-<form class="panel form inline-form" method="post" action="/devices/scan">
-  <select name="subnet">
-    <option value="">All detected subnets</option>
-    {% for subnet in subnets %}<option value="{{ subnet }}">{{ subnet }}</option>{% endfor %}
-  </select>
-  <button class="primary" type="submit">Scan</button>
-</form>
+
+<section class="panel">
+  <div class="inline-form split-row">
+    <div>
+      <strong>{{ 'Scanning now' if discovery_state.running else 'Discovery idle' }}</strong><br>
+      <small>
+        {% if last_scan %}
+          Last {{ last_scan.source }} scan: {{ last_scan.status }} · {{ last_scan.found_count }} found
+        {% else %}
+          No discovery scan has completed yet.
+        {% endif %}
+      </small>
+    </div>
+    <form class="inline-form" method="post" action="/devices/scan">
+      <select name="subnet">
+        <option value="">All detected subnets</option>
+        {% for subnet in subnets %}<option value="{{ subnet }}">{{ subnet }}</option>{% endfor %}
+      </select>
+      <button class="primary" type="submit">Rescan</button>
+    </form>
+  </div>
+</section>
+
 <div class="table-wrap">
   <table>
-    <thead><tr><th>IP</th><th>Port</th><th>Add</th></tr></thead>
-    <tbody>
-    {% for item in results %}
+    <thead>
       <tr>
-        <td>{{ item.ip }}</td><td>{{ item.port }}</td>
+        <th>Candidate</th>
+        <th>Status</th>
+        <th>Device Info</th>
+        <th>Save</th>
+        <th>Comm Key Brute Force</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for item in candidates %}
+      {% set found_key = found_keys_by_candidate.get(item.id) %}
+      <tr>
         <td>
-          <form class="inline-form" method="post" action="/devices">
-            <input name="device_id" value="DEVICE-{{ item.ip.replace('.', '-') }}">
-            <input name="label" value="ZKT Device {{ item.ip }}">
-            <input name="ip" value="{{ item.ip }}">
-            <input name="port" value="{{ item.port }}">
-            <input name="comm_key" placeholder="Comm Key">
-            <button type="submit">Save</button>
-          </form>
+          <strong>{{ item.ip }}:{{ item.port }}</strong><br>
+          <small>{{ item.subnet or '-' }} · {{ item.interface_name or '-' }}</small>
+        </td>
+        <td>
+          <span class="pill {{ 'ok' if item.status in ['VALIDATED_ZK', 'CONFIGURED'] else 'bad' if item.status == 'UNREACHABLE' else '' }}">{{ item.status }}</span><br>
+          <small>Seen {{ item.last_seen or '-' }}</small>
+        </td>
+        <td>
+          {{ item.device_name or '-' }}<br>
+          <small>{{ item.serial or '-' }} · {{ item.platform or '-' }}</small>
+        </td>
+        <td>
+          {% if item.status == 'CONFIGURED' %}
+            <small>{{ item.configured_device_id }}</small>
+          {% else %}
+            <form class="stack-form" method="post" action="/devices">
+              <input name="device_id" value="DEVICE-{{ item.ip.replace('.', '-') }}" required>
+              <input name="label" value="ZKT Device {{ item.ip }}" required>
+              <input name="ip" value="{{ item.ip }}" required>
+              <input name="port" type="number" value="{{ item.port }}" required>
+              <input name="comm_key" value="{{ found_key or '' }}" placeholder="Comm Key" required>
+              <button type="submit">{{ 'Save Found Key' if found_key else 'Save' }}</button>
+            </form>
+          {% endif %}
+        </td>
+        <td>
+          {% if bruteforce_enabled and item.status != 'CONFIGURED' %}
+            <form class="stack-form compact" method="post" action="/devices/discovery/{{ item.id }}/bruteforce">
+              <div class="inline-form">
+                <select name="mode">
+                  <option value="SAFE_FAST">Safe Fast</option>
+                  <option value="AGGRESSIVE">Aggressive</option>
+                  <option value="CUSTOM">Custom</option>
+                </select>
+                <input name="worker_count" type="number" min="1" max="8" placeholder="Workers">
+              </div>
+              <div class="inline-form">
+                <input name="range_start" type="number" min="0" value="0">
+                <input name="range_end" type="number" min="0" value="999999">
+              </div>
+              <input name="common_keys" value="0,12345,123456,9999,1979" placeholder="Common keys">
+              <input name="timeout_seconds" type="number" min="0.1" step="0.05" value="0.75">
+              <label class="check-row">
+                <input name="confirm_bruteforce" type="checkbox" value="yes" required>
+                <span>Authorized device</span>
+              </label>
+              <button type="submit">Start</button>
+            </form>
+          {% elif not bruteforce_enabled %}
+            <small>Disabled by setting <code>ZK_ZONE_BRUTEFORCE_ENABLED</code>.</small>
+          {% else %}
+            <small>-</small>
+          {% endif %}
         </td>
       </tr>
-    {% else %}<tr><td colspan="3">No scan results yet.</td></tr>{% endfor %}
+    {% else %}
+      <tr><td colspan="5">No candidates yet.</td></tr>
+    {% endfor %}
     </tbody>
   </table>
 </div>
+
+<h2>Brute Force Jobs</h2>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Target</th>
+        <th>Status</th>
+        <th>Progress</th>
+        <th>Rate</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for job in jobs %}
+      <tr>
+        <td>{{ job.ip }}:{{ job.port }}<br><small>{{ job.mode }}</small></td>
+        <td>
+          <span class="pill {{ 'ok' if job.status == 'SUCCEEDED' else 'bad' if job.status in ['FAILED', 'CANCELED'] else '' }}">{{ job.status }}</span><br>
+          <small>{{ job.last_error or '-' }}</small>
+        </td>
+        <td>
+          <progress max="100" value="{{ job.progress_percent }}"></progress><br>
+          <small>{{ job.attempt_count }} attempts · {{ job.progress_percent }}%</small>
+        </td>
+        <td>{{ job.attempts_per_second }}/s<br><small>ETA {{ job.eta_seconds or '-' }}s</small></td>
+        <td>
+          <div class="inline-form">
+            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/pause">Pause</button>
+            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/resume">Resume</button>
+            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/cancel">Cancel</button>
+          </div>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5">No brute force jobs.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if discovery_state.running or active_bruteforce_jobs %}
+<script>
+  setTimeout(() => window.location.reload(), 5000);
+</script>
+{% endif %}
 {% endblock %}

@@ -8,8 +8,10 @@ from zk_common.enums import IncidentSeverity, PayloadType, SyncStatus
 from zk_common.schemas import DeviceHeartbeat, HeartbeatRequest, IncidentSyncItem
 from zk_zone_agent import APP_VERSION
 from zk_zone_agent.audit import audit_ledger
+from zk_zone_agent.bruteforce import comm_key_bruteforce_manager
 from zk_zone_agent.config import config_manager
 from zk_zone_agent.db import Device, FraudIncident, ServiceEvent, SessionLocal, init_db, session_scope
+from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.device_worker import DeviceWorker
 from zk_zone_agent.settings import settings
@@ -25,6 +27,8 @@ class ZoneSupervisor:
         self.time_thread = threading.Thread(target=self._time_loop, name="trusted-time-loop", daemon=True)
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="heartbeat-loop", daemon=True)
         self.device_workers: dict[str, DeviceWorker] = {}
+        discovery_service.stop_event = self.stop_event
+        comm_key_bruteforce_manager.stop_event = self.stop_event
 
     def start(self) -> None:
         if self.started:
@@ -37,6 +41,10 @@ class ZoneSupervisor:
         self.sync_worker.start()
         self.time_thread.start()
         self.heartbeat_thread.start()
+        if settings.auto_discovery_enabled:
+            discovery_service.start()
+        if settings.bruteforce_enabled:
+            comm_key_bruteforce_manager.start_pending_jobs()
         self._start_device_workers()
         self.started = True
 

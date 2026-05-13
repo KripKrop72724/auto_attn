@@ -68,6 +68,43 @@ class Device(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class DeviceDiscoveryResult(Base):
+    __tablename__ = "device_discovery_results"
+    __table_args__ = (UniqueConstraint("ip", "port", name="uq_device_discovery_ip_port"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ip: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    port: Mapped[int] = mapped_column(Integer, default=4370, index=True, nullable=False)
+    subnet: Mapped[str | None] = mapped_column(String(80), index=True)
+    interface_name: Mapped[str | None] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(60), index=True, default="NEEDS_COMM_KEY")
+    source: Mapped[str] = mapped_column(String(60), index=True, default="AUTO")
+    first_seen: Mapped[datetime] = utc_column()
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    serial: Mapped[str | None] = mapped_column(String(120), index=True)
+    platform: Mapped[str | None] = mapped_column(String(120))
+    device_name: Mapped[str | None] = mapped_column(String(255))
+    configured_device_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class DiscoveryScanRun(Base):
+    __tablename__ = "discovery_scan_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(60), index=True, default="AUTO")
+    status: Mapped[str] = mapped_column(String(40), index=True, default="RUNNING")
+    started_at: Mapped[datetime] = utc_column()
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    target_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    found_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    message: Mapped[str | None] = mapped_column(Text)
+
+
 class DeviceUser(Base):
     __tablename__ = "device_users"
     __table_args__ = (UniqueConstraint("device_id", "user_id", name="uq_device_user"),)
@@ -211,6 +248,47 @@ class ServiceEvent(Base):
     description: Mapped[str | None] = mapped_column(Text)
     clean_shutdown_marker: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = utc_column()
+
+
+class CommKeyBruteforceJob(Base):
+    __tablename__ = "comm_key_bruteforce_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_candidate_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("device_discovery_results.id"))
+    ip: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    port: Mapped[int] = mapped_column(Integer, default=4370, nullable=False)
+    mode: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), index=True, default="PENDING")
+    range_start: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    range_end: Mapped[int] = mapped_column(Integer, default=999999, nullable=False)
+    current_key: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    found_key_encrypted: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    worker_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    timeout_seconds: Mapped[float] = mapped_column(Float, default=0.75, nullable=False)
+    common_keys_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    started_at: Mapped[datetime] = utc_column()
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = utc_column()
+
+    def common_keys(self) -> list[int]:
+        return [int(item) for item in json.loads(self.common_keys_json or "[]")]
+
+
+class CommKeyBruteforceAttempt(Base):
+    __tablename__ = "comm_key_bruteforce_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("comm_key_bruteforce_jobs.id"), index=True)
+    bucket_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    bucket_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), index=True, default="FAILED")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
 
 
 def create_sqlite_engine(database_url: str | None = None) -> Engine:

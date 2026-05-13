@@ -54,7 +54,7 @@ class PyZKClient:
         ip: str,
         port: int = 4370,
         comm_key: int = 0,
-        timeout: int = 5,
+        timeout: float = 5,
         force_udp: bool = False,
     ) -> None:
         self.ip = ip

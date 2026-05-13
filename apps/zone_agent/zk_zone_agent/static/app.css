@@ -63,6 +63,12 @@ button.primary, .primary {
   font-weight: 700;
 }
 .inline-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.stack-form { display: grid; gap: 8px; min-width: 220px; }
+.stack-form.compact { min-width: 260px; }
+.split-row { justify-content: space-between; }
+.check-row { display: flex; align-items: center; gap: 8px; color: #344054; font-weight: 650; }
+.check-row input { min-height: 0; }
+progress { width: 180px; height: 14px; }
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));

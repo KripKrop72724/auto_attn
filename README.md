@@ -25,6 +25,18 @@ Then open:
 
 Default POC enrollment key: `ABC-123`.
 
+## Zone Device Discovery
+
+The Zone Agent automatically scans detected private LAN subnets for TCP `4370` and persists candidates on the Scan page.
+
+Comm Key brute force is available for owned devices but disabled by default:
+
+```bash
+ZK_ZONE_BRUTEFORCE_ENABLED=true zk-zone-agent --host 127.0.0.1 --port 7860
+```
+
+The brute-force flow is opt-in per candidate, requires local operator confirmation, refuses public IPs, and refuses already configured live devices unless explicitly allowed through the API.
+
 ## Shipping
 
 The repository ships through GitHub Actions:
