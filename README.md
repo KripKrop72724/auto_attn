@@ -29,6 +29,8 @@ Default POC enrollment key: `ABC-123`.
 
 The Zone Agent automatically scans detected private LAN subnets for TCP `4370` and persists candidates on the Scan page.
 
+Saved devices start local monitoring immediately after Comm Key validation, even when the zone is not registered with head office yet. In that state the agent uses a local unregistered identity, captures live attendance, runs clock/fraud checks, records outages, and queues sync payloads. Once setup succeeds and a zone token is issued, pending local records are associated with the registered zone and uploaded.
+
 Comm Key brute force is available for owned devices but disabled by default:
 
 ```bash

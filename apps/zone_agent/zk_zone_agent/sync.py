@@ -110,7 +110,7 @@ class SyncWorker(threading.Thread):
     def sync_once(self) -> bool:
         with session_scope() as session:
             config = config_manager.get(session)
-            if not config or not config.setup_completed:
+            if not config or not config.setup_completed or not config.zone_token or not config.head_office_url:
                 return False
             client = HeadOfficeClient(config.head_office_url, config.zone_token)
             server_utc = client.get_time()
@@ -162,7 +162,7 @@ class SyncWorker(threading.Thread):
             return
 
         for chunk in chunks:
-            payload_items = [json.loads(row.payload_json) for row in chunk]
+            payload_items = [self._payload_for_sync(row, config) for row in chunk]
             request = request_model(zone_id=config.zone_id, batch_id=str(uuid.uuid4()), **{key: payload_items})
             try:
                 response = client.post_json(path, request.model_dump(mode="json"))
@@ -192,6 +192,12 @@ class SyncWorker(threading.Thread):
                 else:
                     row.status = SyncStatus.FAILED.value
                     row.last_error = "; ".join(response.errors)
+
+    def _payload_for_sync(self, row: SyncQueue, config: ActiveZoneConfig) -> dict[str, Any]:
+        payload = json.loads(row.payload_json)
+        if isinstance(payload, dict) and "zone_id" in payload:
+            payload["zone_id"] = config.zone_id
+        return payload
 
 
 def _chunk(items: list[SyncQueue], size: int) -> list[list[SyncQueue]]:

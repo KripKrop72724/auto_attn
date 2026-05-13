@@ -93,9 +93,6 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    with session_scope() as session:
-        if not config_manager.setup_completed(session):
-            return RedirectResponse("/setup", status_code=303)
     return RedirectResponse("/dashboard", status_code=303)
 
 
@@ -118,33 +115,46 @@ def save_setup(
     enrollment_key: str = Form(...),
     timezone: str = Form("Asia/Karachi"),
 ):
+    registration_error: str | None = None
     try:
         client = HeadOfficeClient(head_office_url)
         response = client.register_zone(
             ZoneRegisterRequest(zone_id=zone_id, zone_name=zone_name, enrollment_key=enrollment_key)
         )
     except Exception as exc:
-        return RedirectResponse(
-            f"/setup?error={quote_plus(f'Head office registration failed: {exc}')}",
-            status_code=303,
-        )
+        registration_error = f"Head office registration failed: {exc}"
+        response = None
 
     with session_scope() as session:
-        config_manager.save_setup(
-            session,
-            zone_id=zone_id,
-            zone_name=zone_name,
-            timezone=timezone,
-            head_office_url=head_office_url,
-            zone_token=response.zone_token,
-        )
-        trusted_time_service.update_from_head_office(response.server_utc, session)
+        if response is None:
+            config_manager.save_pending_registration(
+                session,
+                zone_id=zone_id,
+                zone_name=zone_name,
+                timezone=timezone,
+                head_office_url=head_office_url,
+            )
+        else:
+            config_manager.save_setup(
+                session,
+                zone_id=zone_id,
+                zone_name=zone_name,
+                timezone=timezone,
+                head_office_url=head_office_url,
+                zone_token=response.zone_token,
+            )
+            trusted_time_service.update_from_head_office(response.server_utc, session)
     zone_supervisor.refresh_device_workers()
+    if registration_error:
+        return RedirectResponse(
+            f"/dashboard?warning={quote_plus(registration_error + '; local capture remains active.')}",
+            status_code=303,
+        )
     return RedirectResponse("/dashboard", status_code=303)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
+def dashboard(request: Request, warning: str | None = None):
     with session_scope() as session:
         config = config_manager.get(session)
         counts = _counts(session)
@@ -165,6 +175,7 @@ def dashboard(request: Request):
             "incidents": incidents,
             "pending": pending,
             "trusted_time": trusted_time_service.now(),
+            "warning": warning,
         },
     )
 
@@ -289,14 +300,14 @@ def save_device(
             candidate.platform = platform or candidate.platform
             candidate.device_name = device_name or candidate.device_name
             candidate.updated_at = utc_now()
-        config = config_manager.get(session)
     zone_supervisor.refresh_device_workers()
     if settings.disable_workers:
         message = "Device validated and saved. Workers are disabled in local settings."
-    elif config is None or not config.setup_completed:
-        message = "Device validated and saved. Complete setup to start live monitoring."
     else:
-        message = "Device validated and saved. Worker is connecting now for live capture and clock sync."
+        message = (
+            "Device validated and saved. Worker is connecting now for live capture, "
+            "clock sync, fraud checks, and local queueing."
+        )
     return RedirectResponse(f"/devices?success={quote_plus(message)}", status_code=303)
 
 
@@ -390,8 +401,12 @@ def api_status():
     with session_scope() as session:
         config = config_manager.get(session)
         devices = session.scalars(select(Device).order_by(Device.label.asc())).all()
+        setup_completed = bool(config and config.setup_completed)
         return {
-            "setup_completed": bool(config and config.setup_completed),
+            "setup_completed": setup_completed,
+            "registration_status": "REGISTERED" if setup_completed else "LOCAL_CAPTURE_ONLY",
+            "capture_active": not settings.disable_workers,
+            "sync_ready": bool(config and config.setup_completed and config.zone_token and config.head_office_url),
             "zone": None if not config else {"zone_id": config.zone_id, "zone_name": config.zone_name},
             "trusted_time": trusted_time_service.now().value.isoformat(),
             "trusted_time_source": trusted_time_service.now().source,

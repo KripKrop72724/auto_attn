@@ -2,9 +2,12 @@
 {% block content %}
 <section class="page-head">
   <h1>First-Time Zone Setup</h1>
-  <p>Register this branch PC with the head office server.</p>
+  <p>Register this branch PC with the head office server. Local capture and fraud monitoring run even before registration completes.</p>
 </section>
 {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if config and not config.setup_completed %}
+  <div class="alert warn">Local setup is saved but registration is still pending. Sync will start after the head office issues a zone token.</div>
+{% endif %}
 <form class="panel form" method="post" action="/setup">
   <label>Zone ID <input name="zone_id" value="{{ config.zone_id if config else 'RWP-ZONE-01' }}" required></label>
   <label>Zone Name <input name="zone_name" value="{{ config.zone_name if config else 'Rawalpindi Main Office' }}" required></label>

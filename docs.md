@@ -10,7 +10,10 @@
 - Device Name: `MB20/0`
 - Platform: `ZLM60_TFT`
 
-Use the zone local UI at `/devices` to add this device after completing setup.
+Use the zone local UI at `/devices` to add this device. Registration is not required for
+local capture: the worker starts with a local unregistered identity, records attendance,
+clock checks, outages, and fraud incidents, then syncs the queued rows after setup issues
+a real zone token.
 
 ## Local Data Flow
 

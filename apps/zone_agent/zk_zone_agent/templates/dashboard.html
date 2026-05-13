@@ -4,6 +4,10 @@
   <h1>{{ config.zone_name if config else "Unconfigured Zone" }}</h1>
   <p>{{ config.zone_id if config else "Setup required" }} · Trusted time: {{ trusted_time.value }} · {{ trusted_time.source }}</p>
 </section>
+{% if warning %}<div class="alert warn">{{ warning }}</div>{% endif %}
+{% if not config or not config.setup_completed %}
+  <div class="alert warn">Zone is not registered yet. The local agent still captures attendance, checks device clocks, records outages, flags fraud, and queues sync payloads.</div>
+{% endif %}
 <section class="metric-grid">
   {% for label, value in counts.items() %}
   <div class="metric"><span>{{ label.replace('_', ' ').title() }}</span><strong>{{ value }}</strong></div>

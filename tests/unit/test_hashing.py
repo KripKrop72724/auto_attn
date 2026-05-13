@@ -15,5 +15,18 @@ def test_attendance_event_uid_is_deterministic():
     assert attendance_event_uid(**kwargs) == attendance_event_uid(**kwargs)
 
 
+def test_attendance_event_uid_survives_zone_registration():
+    kwargs = {
+        "device_serial": "ADZV211860253",
+        "user_id": "5",
+        "device_event_time": datetime(2026, 5, 13, 9, 0, 0),
+        "punch": 0,
+        "source_uid": 5,
+    }
+    assert attendance_event_uid(zone_id="LOCAL-UNREGISTERED", **kwargs) == attendance_event_uid(
+        zone_id="RWP-ZONE-01", **kwargs
+    )
+
+
 def test_canonical_json_sorts_keys_and_compacts():
     assert canonical_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'

@@ -20,6 +20,7 @@ class ZoneSettings(BaseSettings):
     database_url: str | None = None
     host: str = "127.0.0.1"
     port: int = 7860
+    default_timezone: str = "Asia/Karachi"
     disable_workers: bool = False
     auto_discovery_enabled: bool = True
     auto_discovery_interval_seconds: int = 300

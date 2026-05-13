@@ -57,8 +57,8 @@ class ZoneSupervisor:
         with session_scope() as session:
             last_event = session.scalar(select(ServiceEvent).order_by(ServiceEvent.id.desc()).limit(1))
             session.add(ServiceEvent(event_type="SERVICE_STARTED", description="Zone agent service started."))
-            config = config_manager.get(session)
-            if config and last_event and last_event.event_type != "SERVICE_STOPPED_CLEANLY":
+            config = config_manager.runtime_config(session)
+            if last_event and last_event.event_type != "SERVICE_STOPPED_CLEANLY":
                 incident = FraudIncident(
                     zone_id=config.zone_id,
                     device_id=None,
@@ -88,9 +88,7 @@ class ZoneSupervisor:
 
     def _start_device_workers(self) -> None:
         with session_scope() as session:
-            config = config_manager.get(session)
-            if not config:
-                return
+            config = config_manager.runtime_config(session)
             devices = device_registry.enabled_devices(session)
             for device in devices:
                 existing = self.device_workers.get(device.device_id)
@@ -114,28 +112,29 @@ class ZoneSupervisor:
     def _time_loop(self) -> None:
         while not self.stop_event.is_set():
             with session_scope() as session:
-                config = config_manager.get(session)
-                if config:
-                    tamper = trusted_time_service.check_pc_clock_tamper()
-                    if tamper:
-                        incident = trusted_time_service.record_pc_tamper(session, config.zone_id, tamper)
-                        payload = IncidentSyncItem(
-                            id=incident.id,
-                            zone_id=incident.zone_id,
-                            device_id=None,
-                            incident_type="ZONE_PC_CLOCK_TAMPER",
-                            severity=IncidentSeverity.CRITICAL,
-                            description=incident.description,
-                            created_at=incident.created_at,
-                        )
-                        sync_queue_writer.enqueue(
-                            session,
-                            payload_type=PayloadType.INCIDENT,
-                            payload=payload,
-                            record_id=incident.id,
-                        )
+                config = config_manager.runtime_config(session)
+                tamper = trusted_time_service.check_pc_clock_tamper()
+                if tamper:
+                    incident = trusted_time_service.record_pc_tamper(session, config.zone_id, tamper)
+                    payload = IncidentSyncItem(
+                        id=incident.id,
+                        zone_id=incident.zone_id,
+                        device_id=None,
+                        incident_type="ZONE_PC_CLOCK_TAMPER",
+                        severity=IncidentSeverity.CRITICAL,
+                        description=incident.description,
+                        created_at=incident.created_at,
+                    )
+                    sync_queue_writer.enqueue(
+                        session,
+                        payload_type=PayloadType.INCIDENT,
+                        payload=payload,
+                        record_id=incident.id,
+                    )
+                if config.head_office_url:
                     try:
-                        server_utc = HeadOfficeClient(config.head_office_url, config.zone_token).get_time()
+                        client = HeadOfficeClient(config.head_office_url, config.zone_token or None)
+                        server_utc = client.get_time()
                         trusted_time_service.update_from_head_office(server_utc, session)
                     except Exception:
                         pass
@@ -145,7 +144,7 @@ class ZoneSupervisor:
         while not self.stop_event.is_set():
             with session_scope() as session:
                 config = config_manager.get(session)
-                if config:
+                if config and config.setup_completed and config.zone_token and config.head_office_url:
                     devices = [
                         DeviceHeartbeat(
                             device_id=device.device_id,

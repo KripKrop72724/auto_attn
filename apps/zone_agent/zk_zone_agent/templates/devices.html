@@ -7,7 +7,7 @@
 {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
 {% if success %}<div class="alert success">{{ success }}</div>{% endif %}
 {% if not config or not config.setup_completed %}
-  <div class="alert warn">Zone setup is not complete. Devices can be validated, but live workers start after setup.</div>
+  <div class="alert warn">Zone is not registered yet. Live capture, clock guard, outage logging, fraud checks, and local queueing still run; sync waits for setup.</div>
 {% elif workers_disabled %}
   <div class="alert warn">Workers are disabled by local settings, so devices will not connect automatically.</div>
 {% endif %}

@@ -69,7 +69,6 @@ def attendance_event_uid(
 ) -> str:
     return payload_hash(
         {
-            "zone_id": zone_id,
             "device_serial": device_serial,
             "user_id": str(user_id),
             "device_event_time": device_event_time,

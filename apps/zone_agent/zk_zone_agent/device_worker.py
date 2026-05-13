@@ -20,7 +20,7 @@ from zk_common.schemas import ClockCheckSyncItem, IncidentSyncItem, OutageSyncIt
 from zk_common.time_utils import utc_now
 from zk_zone_agent.attendance import AttendanceContext, attendance_processor
 from zk_zone_agent.audit import audit_ledger
-from zk_zone_agent.config import ActiveZoneConfig
+from zk_zone_agent.config import ActiveZoneConfig, config_manager
 from zk_zone_agent.db import ClockCheck, Device, FraudIncident, OutagePeriod
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.fraud import fraud_engine
@@ -88,6 +88,9 @@ class DeviceWorker(threading.Thread):
             raise RuntimeError(f"Device {self.device_id} disappeared.")
         return device
 
+    def _zone_config(self, session: Session) -> ActiveZoneConfig:
+        return config_manager.runtime_config(session)
+
     def _on_connected(self, client: ZKClient) -> None:
         with self.session_factory() as session:
             device = self._session_device(session)
@@ -115,9 +118,10 @@ class DeviceWorker(threading.Thread):
             trusted_now = self.trusted_time.now().value
             with self.session_factory() as session:
                 device = self._session_device(session)
+                zone_config = self._zone_config(session)
                 context = AttendanceContext(
-                    zone_id=self.zone_config.zone_id,
-                    timezone=self.zone_config.timezone,
+                    zone_id=zone_config.zone_id,
+                    timezone=zone_config.timezone,
                     internet_online=self.trusted_time.last_head_office_time_utc is not None,
                     current_clock_status=device.last_clock_status,
                     pc_clock_suspicious=self.trusted_time.last_pc_tamper_at is not None,
@@ -144,21 +148,21 @@ class DeviceWorker(threading.Thread):
         except Exception as exc:
             error = str(exc)
 
-        result = fraud_engine.classify_clock_check(
-            device_time=device_time,
-            trusted_time=trusted_now,
-            timezone_name=self.zone_config.timezone,
-            previous_device_time=self.previous_device_time,
-            previous_trusted_time=self.previous_trusted_time,
-        )
-        if device_time is not None:
-            self.previous_device_time = device_time
-            self.previous_trusted_time = trusted_now
-        self.last_clock_status = result.status
-        self.reconnect_clock_ok = result.status == ClockStatus.OK
-
         with self.session_factory() as session:
             device = self._session_device(session)
+            zone_config = self._zone_config(session)
+            result = fraud_engine.classify_clock_check(
+                device_time=device_time,
+                trusted_time=trusted_now,
+                timezone_name=zone_config.timezone,
+                previous_device_time=self.previous_device_time,
+                previous_trusted_time=self.previous_trusted_time,
+            )
+            if device_time is not None:
+                self.previous_device_time = device_time
+                self.previous_trusted_time = trusted_now
+            self.last_clock_status = result.status
+            self.reconnect_clock_ok = result.status == ClockStatus.OK
             device.last_clock_status = result.status.value
             device.last_drift_seconds = result.drift_seconds
             if error:
@@ -168,7 +172,7 @@ class DeviceWorker(threading.Thread):
             else:
                 device.last_error = result.reason
             row = ClockCheck(
-                zone_id=self.zone_config.zone_id,
+                zone_id=zone_config.zone_id,
                 device_id=device.device_id,
                 device_serial=device.serial,
                 device_time=device_time,
@@ -209,7 +213,7 @@ class DeviceWorker(threading.Thread):
             )
             if result.incident_type is not None and result.severity is not None:
                 incident = FraudIncident(
-                    zone_id=self.zone_config.zone_id,
+                    zone_id=zone_config.zone_id,
                     device_id=device.device_id,
                     incident_type=result.incident_type.value,
                     severity=result.severity.value,
@@ -261,8 +265,9 @@ class DeviceWorker(threading.Thread):
                 )
             )
             if open_outage is None:
+                zone_config = self._zone_config(session)
                 outage = OutagePeriod(
-                    zone_id=self.zone_config.zone_id,
+                    zone_id=zone_config.zone_id,
                     device_id=device.device_id,
                     outage_type=OutageType.DEVICE_LAN_OUTAGE.value,
                     start_time=self.trusted_time.now().value,
@@ -273,7 +278,7 @@ class DeviceWorker(threading.Thread):
                 session.add(outage)
                 session.flush()
                 incident = FraudIncident(
-                    zone_id=self.zone_config.zone_id,
+                    zone_id=zone_config.zone_id,
                     device_id=device.device_id,
                     incident_type="DEVICE_LAN_BLIND_PERIOD",
                     severity=IncidentSeverity.MEDIUM.value,
@@ -343,9 +348,10 @@ class DeviceWorker(threading.Thread):
         attendances = client.get_attendance()
         with self.session_factory() as session:
             device = self._session_device(session)
+            zone_config = self._zone_config(session)
             context = AttendanceContext(
-                zone_id=self.zone_config.zone_id,
-                timezone=self.zone_config.timezone,
+                zone_id=zone_config.zone_id,
+                timezone=zone_config.timezone,
                 internet_online=self.trusted_time.last_head_office_time_utc is not None,
                 current_clock_status=device.last_clock_status,
                 reconnect_clock_ok=self.reconnect_clock_ok,
