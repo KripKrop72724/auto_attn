@@ -29,7 +29,7 @@ jobs:
           python -m build
 
       - name: Upload Python package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: auto-attn-python-dist
           path: dist/*
@@ -65,14 +65,14 @@ jobs:
           & $iscc "installer/windows/ZKZoneAgent.iss"
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zk-zone-agent-windows-installer
           path: installer/windows/Output/*.exe
           if-no-files-found: error
 
       - name: Upload PyInstaller payload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zk-zone-agent-pyinstaller-payload
           path: dist/zk-zone-agent/**
