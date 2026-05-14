@@ -13,4 +13,6 @@ def test_windows_installer_uses_nssm_service_wrapper():
     assert "AppRotateBytes" in inno
     assert "remove ZKZoneAgentService confirm" in inno
     assert "nssm.cc/release" in build
+    assert "choco install nssm" in build
+    assert "Find-NssmExe" in build
     assert "Copy-Item -Force $NssmExe" in build

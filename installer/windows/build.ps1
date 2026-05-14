@@ -22,14 +22,46 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$RepoRoot\build", "$R
   "apps\zone_agent\zk_zone_agent\__main__.py"
 
 $NssmRoot = Join-Path $RepoRoot "build\nssm"
-$NssmZip = Join-Path $NssmRoot "nssm-$NssmVersion.zip"
-$NssmUrl = "https://nssm.cc/release/nssm-$NssmVersion.zip"
-$NssmExe = Join-Path $NssmRoot "nssm-$NssmVersion\win64\nssm.exe"
 New-Item -ItemType Directory -Force $NssmRoot | Out-Null
-if (!(Test-Path $NssmZip)) {
-  Invoke-WebRequest -Uri $NssmUrl -OutFile $NssmZip
+
+function Find-NssmExe {
+  $command = Get-Command "nssm.exe" -ErrorAction SilentlyContinue
+  if ($command -and (Test-Path $command.Source)) {
+    return $command.Source
+  }
+  $roots = @(
+    $env:ChocolateyInstall,
+    "$env:ProgramData\chocolatey"
+  ) | Where-Object { $_ -and (Test-Path $_) }
+  foreach ($root in $roots) {
+    $matches = Get-ChildItem -Path $root -Recurse -Filter "nssm.exe" -ErrorAction SilentlyContinue |
+      Sort-Object @{ Expression = { if ($_.FullName -match "win64") { 0 } else { 1 } } }, FullName
+    if ($matches) {
+      return $matches[0].FullName
+    }
+  }
+  return $null
 }
-Expand-Archive -Force $NssmZip $NssmRoot
+
+$NssmExe = Find-NssmExe
+if (!$NssmExe -and (Get-Command "choco.exe" -ErrorAction SilentlyContinue)) {
+  & choco install nssm --no-progress -y
+  $NssmExe = Find-NssmExe
+}
+if (!$NssmExe) {
+  $NssmZip = Join-Path $NssmRoot "nssm-$NssmVersion.zip"
+  $NssmUrl = "https://nssm.cc/release/nssm-$NssmVersion.zip"
+  for ($attempt = 1; $attempt -le 3 -and !(Test-Path $NssmZip); $attempt++) {
+    try {
+      Invoke-WebRequest -Uri $NssmUrl -OutFile $NssmZip
+    } catch {
+      if ($attempt -eq 3) { throw }
+      Start-Sleep -Seconds (5 * $attempt)
+    }
+  }
+  Expand-Archive -Force $NssmZip $NssmRoot
+  $NssmExe = Join-Path $NssmRoot "nssm-$NssmVersion\win64\nssm.exe"
+}
 if (!(Test-Path $NssmExe)) {
   throw "Could not find NSSM executable at $NssmExe"
 }
