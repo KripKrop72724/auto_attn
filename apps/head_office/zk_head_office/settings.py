@@ -13,6 +13,7 @@ class HeadOfficeSettings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8080
     enrollment_key: str = "ABC-123"
+    allow_legacy_registration: bool = False
 
     @property
     def sqlite_path(self) -> Path:

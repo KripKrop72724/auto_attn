@@ -34,11 +34,22 @@ nav a {
   border-radius: 6px;
 }
 nav a:hover { background: #1f2937; color: white; }
+.nav-form button {
+  width: 100%;
+  min-height: 0;
+  color: #d1d5db;
+  background: transparent;
+  border: 0;
+  padding: 9px 10px;
+  text-align: left;
+}
+.nav-form button:hover { background: #1f2937; color: white; }
 .content { padding: 28px; min-width: 0; }
 .page-head { margin-bottom: 20px; }
 h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0; }
 h2 { font-size: 18px; margin: 20px 0 10px; }
 p { color: var(--muted); margin: 0; }
+.muted { color: var(--muted); }
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);

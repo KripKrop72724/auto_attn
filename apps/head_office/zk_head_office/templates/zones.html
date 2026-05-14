@@ -1,10 +1,39 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="page-head"><h1>Zones</h1><p>Registered branches and heartbeat status.</p></section>
+{% if generated_token %}
+  <div class="alert success">
+    New token for {{ token_zone_id }}. Copy it into the zone setup now; it will not be shown again.
+    <code>{{ generated_token }}</code>
+  </div>
+{% endif %}
+<form class="panel form inline-form" method="post" action="/zones/token">
+  <input name="zone_id" placeholder="RWP-ZONE-01" required>
+  <input name="zone_name" placeholder="Rawalpindi Main Office" required>
+  <button class="primary" type="submit">Generate Zone Token</button>
+</form>
 <div class="table-wrap"><table>
-<thead><tr><th>Zone</th><th>Active</th><th>Last Heartbeat</th><th>Pending Queue</th><th>Created</th></tr></thead>
+<thead><tr><th>Zone</th><th>Token</th><th>Active</th><th>Last Heartbeat</th><th>Pending Queue</th><th>Created</th><th></th></tr></thead>
 <tbody>{% for row in rows %}
-<tr><td>{{ row.zone_name }}<br><small>{{ row.zone_id }}</small></td><td>{{ 'Yes' if row.active else 'No' }}</td><td>{{ row.last_heartbeat_at or '-' }}</td><td>{{ row.pending_queue_count }}</td><td>{{ row.created_at }}</td></tr>
-{% else %}<tr><td colspan="5">No zones registered.</td></tr>{% endfor %}</tbody>
+<tr>
+  <td>{{ row.zone_name }}<br><small>{{ row.zone_id }}</small></td>
+  <td>
+    <small>
+      Issued: {{ row.token_issued_at or '-' }}<br>
+      Last used: {{ row.token_last_used_at or '-' }}<br>
+      Last 4: {{ row.token_last4 or '-' }}
+    </small>
+  </td>
+  <td>{{ 'Yes' if row.active and not row.token_revoked_at else 'No' }}</td>
+  <td>{{ row.last_heartbeat_at or '-' }}</td>
+  <td>{{ row.pending_queue_count }}</td>
+  <td>{{ row.created_at }}</td>
+  <td>
+    <form method="post" action="/zones/{{ row.zone_id }}/revoke">
+      <button type="submit">Revoke</button>
+    </form>
+  </td>
+</tr>
+{% else %}<tr><td colspan="7">No zones registered.</td></tr>{% endfor %}</tbody>
 </table></div>
 {% endblock %}

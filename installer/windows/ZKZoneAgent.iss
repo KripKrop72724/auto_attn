@@ -26,13 +26,24 @@ Source: "..\..\dist\zk-zone-agent\*"; DestDir: "{app}"; Flags: ignoreversion rec
 
 [Dirs]
 Name: "{commonappdata}\ZKZoneAgent"; Permissions: admins-full system-full
+Name: "{commonappdata}\ZKZoneAgent\logs"; Permissions: admins-full system-full
 
 [Run]
-Filename: "{app}\zk-zone-agent-service.exe"; Parameters: "install --startup auto"; StatusMsg: "Installing Windows service..."; Flags: runhidden waituntilterminated
-Filename: "sc.exe"; Parameters: "failure ZKZoneAgentService reset=86400 actions=restart/5000/restart/10000/restart/60000"; StatusMsg: "Configuring service recovery..."; Flags: runhidden waituntilterminated
-Filename: "{app}\zk-zone-agent-service.exe"; Parameters: "start"; StatusMsg: "Starting service..."; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "install ZKZoneAgentService ""{app}\zk-zone-agent.exe"" ""--host"" ""127.0.0.1"" ""--port"" ""7860"""; StatusMsg: "Installing Windows service with NSSM..."; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService DisplayName ""ZK Zone Agent Service"""; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService Description ""Local ZKTeco attendance fraud-monitoring zone agent."""; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppDirectory ""{app}"""; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService Start SERVICE_AUTO_START"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppExit Default Restart"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRestartDelay 5000"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppStdout ""{commonappdata}\ZKZoneAgent\logs\service.out.log"""; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppStderr ""{commonappdata}\ZKZoneAgent\logs\service.err.log"""; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateFiles 1"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateOnline 1"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateBytes 1048576"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "start ZKZoneAgentService"; StatusMsg: "Starting service..."; Flags: runhidden waituntilterminated
 Filename: "{cmd}"; Parameters: "/c start http://127.0.0.1:7860/setup"; Flags: postinstall shellexec skipifsilent
 
 [UninstallRun]
-Filename: "{app}\zk-zone-agent-service.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated
-Filename: "{app}\zk-zone-agent-service.exe"; Parameters: "remove"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "stop ZKZoneAgentService"; Flags: runhidden waituntilterminated
+Filename: "{app}\nssm.exe"; Parameters: "remove ZKZoneAgentService confirm"; Flags: runhidden waituntilterminated

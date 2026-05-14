@@ -13,6 +13,7 @@ def _reload_zone_modules(monkeypatch, tmp_path):
     monkeypatch.setenv("ZK_ZONE_DISABLE_WORKERS", "false")
     monkeypatch.setenv("ZK_ZONE_AUTO_DISCOVERY_ENABLED", "false")
     monkeypatch.setenv("ZK_ZONE_BRUTEFORCE_ENABLED", "false")
+    monkeypatch.setenv("ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS", "true")
 
     import zk_zone_agent.settings as settings_module
     import zk_zone_agent.db as db_module

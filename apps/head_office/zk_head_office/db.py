@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -28,6 +28,10 @@ class Zone(Base):
     zone_id: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
     zone_name: Mapped[str] = mapped_column(String(255), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_last4: Mapped[str | None] = mapped_column(String(8))
+    token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    token_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    token_last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_server_time_estimate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -167,6 +171,28 @@ class SyncBatch(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
+class SyncNonce(Base):
+    __tablename__ = "sync_nonces"
+    __table_args__ = (UniqueConstraint("zone_id", "nonce", name="uq_sync_nonce_zone_nonce"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    zone_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(120), nullable=False)
+    request_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class SecurityEvent(Base):
+    __tablename__ = "security_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    zone_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    ip_address: Mapped[str | None] = mapped_column(String(80))
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
+
+
 class AuditLedgerReceived(Base):
     __tablename__ = "audit_ledger_received"
 
@@ -225,7 +251,28 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False
 
 
 def init_db(bind: Engine | None = None) -> None:
-    Base.metadata.create_all(bind or engine)
+    target = bind or engine
+    Base.metadata.create_all(target)
+    _ensure_sqlite_schema(target)
+
+
+def _ensure_sqlite_schema(bind: Engine) -> None:
+    if bind.dialect.name != "sqlite":
+        return
+    with bind.begin() as connection:
+        zone_columns = {
+            row["name"]
+            for row in connection.execute(text("PRAGMA table_info(zones)")).mappings()
+        }
+        additions = {
+            "token_last4": "VARCHAR(8)",
+            "token_issued_at": "DATETIME",
+            "token_revoked_at": "DATETIME",
+            "token_last_used_at": "DATETIME",
+        }
+        for column, column_type in additions.items():
+            if column not in zone_columns:
+                connection.execute(text(f"ALTER TABLE zones ADD COLUMN {column} {column_type}"))
 
 
 @contextmanager

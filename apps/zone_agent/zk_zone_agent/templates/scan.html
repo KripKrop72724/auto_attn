@@ -19,13 +19,18 @@
         {% endif %}
       </small>
     </div>
-    <form class="inline-form" method="post" action="/devices/scan">
-      <select name="subnet">
-        <option value="">All detected subnets</option>
-        {% for subnet in subnets %}<option value="{{ subnet }}">{{ subnet }}</option>{% endfor %}
-      </select>
-      <button class="primary" type="submit">Rescan</button>
-    </form>
+    {% if admin_authenticated %}
+      <form class="inline-form" method="post" action="/devices/scan">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <select name="subnet">
+          <option value="">All detected subnets</option>
+          {% for subnet in subnets %}<option value="{{ subnet }}">{{ subnet }}</option>{% endfor %}
+        </select>
+        <button class="primary" type="submit">Rescan</button>
+      </form>
+    {% else %}
+      <small>Admin unlock is required to rescan or configure devices.</small>
+    {% endif %}
   </div>
 </section>
 
@@ -59,8 +64,11 @@
         <td>
           {% if item.status == 'CONFIGURED' %}
             <small>{{ item.configured_device_id }}</small>
+          {% elif not admin_authenticated %}
+            <small>Locked</small>
           {% else %}
             <form class="stack-form" method="post" action="/devices">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <input type="hidden" name="return_to" value="/devices/scan">
               <input name="device_id" value="DEVICE-{{ item.ip.replace('.', '-') }}" required>
               <input name="label" value="ZKT Device {{ item.ip }}" required>
@@ -72,8 +80,11 @@
           {% endif %}
         </td>
         <td>
-          {% if bruteforce_enabled and item.status != 'CONFIGURED' %}
+          {% if not admin_authenticated %}
+            <small>Locked</small>
+          {% elif bruteforce_enabled and item.status != 'CONFIGURED' %}
             <form class="stack-form compact" method="post" action="/devices/discovery/{{ item.id }}/bruteforce">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <div class="inline-form">
                 <select name="mode">
                   <option value="SAFE_FAST">Safe Fast</option>
@@ -134,11 +145,15 @@
         </td>
         <td>{{ job.attempts_per_second }}/s<br><small>ETA {{ job.eta_seconds or '-' }}s</small></td>
         <td>
-          <div class="inline-form">
-            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/pause">Pause</button>
-            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/resume">Resume</button>
-            <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/cancel">Cancel</button>
-          </div>
+          {% if admin_authenticated %}
+            <div class="inline-form">
+              <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/pause">Pause</button>
+              <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/resume">Resume</button>
+              <button type="button" data-api-post="/api/bruteforce/jobs/{{ job.id }}/cancel">Cancel</button>
+            </div>
+          {% else %}
+            <small>Locked</small>
+          {% endif %}
         </td>
       </tr>
     {% else %}

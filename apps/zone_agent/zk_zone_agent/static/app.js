@@ -69,12 +69,39 @@ document.addEventListener("click", async (event) => {
   event.preventDefault();
   button.disabled = true;
   try {
-    const res = await fetch(button.dataset.apiPost, { method: "POST" });
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
+    const headers = csrf ? { "X-CSRF-Token": csrf } : {};
+    const res = await fetch(button.dataset.apiPost, { method: "POST", headers });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       alert(body.detail || "Action failed");
     }
     window.location.reload();
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-health-check]");
+  if (!button) return;
+  event.preventDefault();
+  const input = document.querySelector("[data-head-office-url]");
+  const result = document.querySelector("[data-health-result]");
+  if (!input || !result) return;
+  button.disabled = true;
+  result.textContent = "Checking...";
+  try {
+    const url = `/api/head-office/health?base_url=${encodeURIComponent(input.value)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      result.textContent = `Live: ${data.health.server_utc}`;
+    } else {
+      result.textContent = data.error || data.detail || "Unavailable";
+    }
+  } catch {
+    result.textContent = "Unavailable";
   } finally {
     button.disabled = false;
   }

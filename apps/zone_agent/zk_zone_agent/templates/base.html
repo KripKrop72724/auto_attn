@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title or "ZK Zone Agent" }}</title>
+    {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
     <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
     <script defer src="{{ url_for('static', path='/app.js') }}"></script>
   </head>
@@ -20,6 +21,14 @@
         <a href="/outages">Outages</a>
         <a href="/sync-queue">Sync Queue</a>
         <a href="/logs">Logs</a>
+        {% if admin_authenticated %}
+          <form class="nav-form" method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Lock Admin</button>
+          </form>
+        {% else %}
+          <a href="/login">Admin Unlock</a>
+        {% endif %}
       </nav>
     </aside>
     <main class="content">

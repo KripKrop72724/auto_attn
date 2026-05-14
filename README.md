@@ -23,7 +23,7 @@ Then open:
 - Zone Agent: <http://127.0.0.1:7860>
 - Head Office: <http://127.0.0.1:8080>
 
-Default POC enrollment key: `ABC-123`.
+Create a zone token from **Head Office → Zones**, then enter it once in the Zone Agent setup screen. Production sync is pinned to `https://attnsync.slichealth.com`; localhost URLs are only allowed when `ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS=true`.
 
 ## Zone Device Discovery
 

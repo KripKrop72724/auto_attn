@@ -7,11 +7,11 @@ import json
 import secrets
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from zk_common.enums import PayloadType
@@ -26,15 +26,24 @@ from zk_common.schemas import (
     ZoneRegisterRequest,
     ZoneRegisterResponse,
 )
-from zk_common.security import token_hash, verify_token
-from zk_common.time_utils import utc_now
+from zk_common.security import (
+    body_sha256,
+    timestamp_within_skew,
+    token_hash,
+    verify_request_signature,
+    verify_token,
+)
+from zk_common.time_utils import parse_datetime, utc_now
+from zk_head_office import APP_VERSION
 from zk_head_office.db import (
     AttendanceEvent,
     ClockCheck,
     Device,
     FraudIncident,
     OutagePeriod,
+    SecurityEvent,
     SyncBatch,
+    SyncNonce,
     Zone,
     ZoneHeartbeat,
     init_db,
@@ -56,17 +65,104 @@ app = FastAPI(title="ZK Head Office", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
-def auth_zone(authorization: str | None = Header(default=None)) -> Zone:
+async def auth_zone(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_zk_zone_id: str | None = Header(default=None, alias="X-ZK-Zone-Id"),
+    x_zk_timestamp: str | None = Header(default=None, alias="X-ZK-Timestamp"),
+    x_zk_nonce: str | None = Header(default=None, alias="X-ZK-Nonce"),
+    x_zk_body_sha256: str | None = Header(default=None, alias="X-ZK-Body-SHA256"),
+    x_zk_signature: str | None = Header(default=None, alias="X-ZK-Signature"),
+) -> Zone:
     if not authorization or not authorization.startswith("Bearer "):
+        _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Missing bearer token.")
         raise HTTPException(status_code=401, detail="Missing bearer token.")
+    if not all([x_zk_zone_id, x_zk_timestamp, x_zk_nonce, x_zk_body_sha256, x_zk_signature]):
+        _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Missing signed sync headers.")
+        raise HTTPException(status_code=401, detail="Missing signed sync headers.")
     token = authorization.removeprefix("Bearer ").strip()
+    body = await request.body()
+    actual_body_hash = body_sha256(body)
+    if not secrets.compare_digest(actual_body_hash, x_zk_body_sha256):
+        _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Body hash mismatch.")
+        raise HTTPException(status_code=401, detail="Body hash mismatch.")
+    try:
+        request_timestamp = parse_datetime(x_zk_timestamp)
+        if not timestamp_within_skew(x_zk_timestamp):
+            raise ValueError("Timestamp outside allowed skew.")
+    except Exception:
+        _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Invalid request timestamp.")
+        raise HTTPException(status_code=401, detail="Invalid request timestamp.") from None
+
     with session_scope() as session:
-        zones = session.scalars(select(Zone).where(Zone.active == True)).all()  # noqa: E712
+        zones = session.scalars(
+            select(Zone).where(Zone.active == True, Zone.token_revoked_at == None)  # noqa: E711,E712
+        ).all()
+        matched: Zone | None = None
         for zone in zones:
             if verify_token(token, zone.token_hash):
-                session.expunge(zone)
-                return zone
-    raise HTTPException(status_code=401, detail="Invalid zone token.")
+                matched = zone
+                break
+        if matched is None:
+            _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Invalid zone token.")
+            raise HTTPException(status_code=401, detail="Invalid zone token.")
+        if x_zk_zone_id != matched.zone_id:
+            _record_security_event(
+                request,
+                "SYNC_AUTH_FAILED",
+                x_zk_zone_id,
+                "Signed zone id does not match token owner.",
+            )
+            raise HTTPException(status_code=403, detail="Token does not match zone id.")
+        if not verify_request_signature(
+            token=token,
+            method=request.method,
+            path=request.url.path,
+            timestamp=x_zk_timestamp,
+            nonce=x_zk_nonce,
+            body_hash=x_zk_body_sha256,
+            signature=x_zk_signature,
+        ):
+            _record_security_event(request, "SYNC_AUTH_FAILED", x_zk_zone_id, "Invalid sync signature.")
+            raise HTTPException(status_code=401, detail="Invalid sync signature.")
+        if session.scalar(
+            select(SyncNonce).where(SyncNonce.zone_id == matched.zone_id, SyncNonce.nonce == x_zk_nonce)
+        ):
+            _record_security_event(request, "SYNC_AUTH_REPLAY", matched.zone_id, "Replay nonce rejected.")
+            raise HTTPException(status_code=409, detail="Replay nonce rejected.")
+        session.add(
+            SyncNonce(
+                zone_id=matched.zone_id,
+                nonce=x_zk_nonce,
+                request_timestamp=request_timestamp,
+            )
+        )
+        matched.token_last_used_at = utc_now()
+        matched.updated_at = utc_now()
+        session.flush()
+        session.expunge(matched)
+        return matched
+
+
+def _record_security_event(
+    request: Request | None,
+    event_type: str,
+    zone_id: str | None,
+    description: str,
+) -> None:
+    try:
+        ip_address = request.client.host if request and request.client else None
+        with session_scope() as session:
+            session.add(
+                SecurityEvent(
+                    event_type=event_type,
+                    zone_id=zone_id,
+                    ip_address=ip_address,
+                    description=description,
+                )
+            )
+    except Exception:
+        pass
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -84,10 +180,48 @@ def dashboard(request: Request):
 
 
 @app.get("/zones", response_class=HTMLResponse)
-def zones_page(request: Request):
+def zones_page(request: Request, generated_token: str | None = None, token_zone_id: str | None = None):
     with session_scope() as session:
         rows = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
-    return templates.TemplateResponse(request=request, name="zones.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="zones.html",
+        context={"rows": rows, "generated_token": generated_token, "token_zone_id": token_zone_id},
+    )
+
+
+@app.post("/zones/token", response_class=HTMLResponse)
+def issue_zone_token_page(
+    request: Request,
+    zone_id: str = Form(...),
+    zone_name: str = Form(...),
+):
+    zone_token = _issue_zone_token(zone_id=zone_id.strip(), zone_name=zone_name.strip())
+    with session_scope() as session:
+        rows = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
+    return templates.TemplateResponse(
+        request=request,
+        name="zones.html",
+        context={"rows": rows, "generated_token": zone_token, "token_zone_id": zone_id.strip()},
+    )
+
+
+@app.post("/zones/{zone_id}/revoke")
+def revoke_zone_token(zone_id: str):
+    with session_scope() as session:
+        zone = session.scalar(select(Zone).where(Zone.zone_id == zone_id))
+        if zone is None:
+            raise HTTPException(status_code=404)
+        zone.active = False
+        zone.token_revoked_at = utc_now()
+        zone.updated_at = utc_now()
+    return zones_page_redirect()
+
+
+def zones_page_redirect():
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse("/zones", status_code=303)
 
 
 @app.get("/devices", response_class=HTMLResponse)
@@ -172,31 +306,35 @@ def attendance_csv():
     )
 
 
+@app.get("/api/health")
+def api_health():
+    database_ok = True
+    try:
+        with session_scope() as session:
+            session.execute(text("SELECT 1"))
+    except Exception:
+        database_ok = False
+    return {
+        "ok": database_ok,
+        "app": "zk-head-office",
+        "version": APP_VERSION,
+        "server_utc": utc_now(),
+        "database_ok": database_ok,
+    }
+
+
 @app.get("/api/time")
-def api_time() -> TimeResponse:
+def api_time(_zone: Zone = Depends(auth_zone)) -> TimeResponse:
     return TimeResponse(server_utc=utc_now())
 
 
 @app.post("/api/zones/register")
 def register_zone(request: ZoneRegisterRequest) -> ZoneRegisterResponse:
+    if not settings.allow_legacy_registration:
+        raise HTTPException(status_code=410, detail="Enrollment-key registration is disabled.")
     if request.enrollment_key != settings.enrollment_key:
         raise HTTPException(status_code=403, detail="Invalid enrollment key.")
-    zone_token = secrets.token_urlsafe(32)
-    with session_scope() as session:
-        zone = session.scalar(select(Zone).where(Zone.zone_id == request.zone_id))
-        if zone is None:
-            zone = Zone(
-                zone_id=request.zone_id,
-                zone_name=request.zone_name,
-                token_hash=token_hash(zone_token),
-                last_heartbeat_at=utc_now(),
-            )
-            session.add(zone)
-        else:
-            zone.zone_name = request.zone_name
-            zone.token_hash = token_hash(zone_token)
-            zone.active = True
-            zone.updated_at = utc_now()
+    zone_token = _issue_zone_token(zone_id=request.zone_id, zone_name=request.zone_name)
     return ZoneRegisterResponse(ok=True, zone_token=zone_token, server_utc=utc_now())
 
 
@@ -405,6 +543,41 @@ def _record_batch(
             errors_json=json.dumps(errors),
         )
     )
+
+
+def _issue_zone_token(*, zone_id: str, zone_name: str) -> str:
+    if not zone_id:
+        raise HTTPException(status_code=400, detail="Zone ID is required.")
+    if not zone_name:
+        raise HTTPException(status_code=400, detail="Zone name is required.")
+    zone_token = secrets.token_urlsafe(32)
+    now = utc_now()
+    with session_scope() as session:
+        zone = session.scalar(select(Zone).where(Zone.zone_id == zone_id))
+        if zone is None:
+            session.add(
+                Zone(
+                    zone_id=zone_id,
+                    zone_name=zone_name,
+                    token_hash=token_hash(zone_token),
+                    token_last4=zone_token[-4:],
+                    token_issued_at=now,
+                    token_revoked_at=None,
+                    token_last_used_at=None,
+                    last_heartbeat_at=None,
+                    active=True,
+                )
+            )
+        else:
+            zone.zone_name = zone_name
+            zone.token_hash = token_hash(zone_token)
+            zone.token_last4 = zone_token[-4:]
+            zone.token_issued_at = now
+            zone.token_revoked_at = None
+            zone.token_last_used_at = None
+            zone.active = True
+            zone.updated_at = now
+    return zone_token
 
 
 def _counts(session: Session):

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from zk_common.time_utils import utc_now
 from zk_zone_agent.crypto import protect_secret, unprotect_secret
 from zk_zone_agent.db import AttendanceEvent, ClockCheck, FraudIncident, OutagePeriod, ZoneConfig
+from zk_zone_agent.head_office_policy import normalize_head_office_url
 from zk_zone_agent.settings import settings
 
 
@@ -72,7 +73,7 @@ class ConfigManager:
                 zone_id=zone_id,
                 zone_name=zone_name,
                 timezone=timezone,
-                head_office_url=head_office_url.rstrip("/"),
+            head_office_url=normalize_head_office_url(head_office_url),
                 zone_token_encrypted=protect_secret(""),
                 setup_completed=False,
             )
@@ -81,7 +82,7 @@ class ConfigManager:
             row.zone_id = zone_id
             row.zone_name = zone_name
             row.timezone = timezone
-            row.head_office_url = head_office_url.rstrip("/")
+            row.head_office_url = normalize_head_office_url(head_office_url)
             row.setup_completed = False
             row.updated_at = utc_now()
         self.reassign_zone_records(session, old_zone_id=old_zone_id, new_zone_id=zone_id)
@@ -101,13 +102,16 @@ class ConfigManager:
         row = session.scalar(select(ZoneConfig).order_by(ZoneConfig.id.asc()))
         old_zone_id = UNREGISTERED_ZONE_ID if row is None else row.zone_id
         old_setup_completed = bool(row and row.setup_completed)
+        if old_setup_completed:
+            raise ValueError("Zone setup is already completed. Reset setup before entering a new token.")
+        normalized_url = normalize_head_office_url(head_office_url)
         if row is None:
             row = ZoneConfig(
                 id=1,
                 zone_id=zone_id,
                 zone_name=zone_name,
                 timezone=timezone,
-                head_office_url=head_office_url.rstrip("/"),
+                head_office_url=normalized_url,
                 zone_token_encrypted=protect_secret(zone_token),
                 setup_completed=True,
             )
@@ -116,7 +120,7 @@ class ConfigManager:
             row.zone_id = zone_id
             row.zone_name = zone_name
             row.timezone = timezone
-            row.head_office_url = head_office_url.rstrip("/")
+            row.head_office_url = normalized_url
             row.zone_token_encrypted = protect_secret(zone_token)
             row.setup_completed = True
             row.updated_at = utc_now()
@@ -124,6 +128,14 @@ class ConfigManager:
             self.reassign_zone_records(session, old_zone_id=old_zone_id, new_zone_id=zone_id)
         session.flush()
         return row
+
+    def clear_setup(self, session: Session) -> None:
+        row = session.scalar(select(ZoneConfig).order_by(ZoneConfig.id.asc()))
+        if row is None:
+            return
+        row.zone_token_encrypted = protect_secret("")
+        row.setup_completed = False
+        row.updated_at = utc_now()
 
     def reassign_zone_records(self, session: Session, *, old_zone_id: str, new_zone_id: str) -> None:
         if old_zone_id == new_zone_id:

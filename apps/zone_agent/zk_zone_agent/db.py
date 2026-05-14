@@ -47,6 +47,18 @@ class ZoneConfig(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class LocalAdmin(Base):
+    __tablename__ = "local_admin"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    session_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
 class Device(Base):
     __tablename__ = "devices"
 

@@ -28,6 +28,15 @@ nav a:hover { background: #1d2939; color: white; }
 h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0; }
 h2 { font-size: 18px; margin: 20px 0 10px; }
 p, small { color: var(--muted); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 18px; }
+.form { display: grid; gap: 12px; }
+.inline-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input, button { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; }
+button { background: white; cursor: pointer; }
+button.primary, .primary { background: var(--accent); color: white; border-color: var(--accent); font-weight: 700; }
+.alert { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
+.alert.success { background: #ecfdf3; color: #027a48; border: 1px solid #abefc6; }
+code { background: #f2f4f7; border: 1px solid var(--line); border-radius: 6px; display: block; margin-top: 8px; padding: 10px; word-break: break-all; }
 .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .metric { background: white; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
 .metric span { color: var(--muted); display: block; font-size: 13px; }

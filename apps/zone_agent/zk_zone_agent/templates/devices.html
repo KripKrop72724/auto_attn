@@ -11,15 +11,20 @@
 {% elif workers_disabled %}
   <div class="alert warn">Workers are disabled by local settings, so devices will not connect automatically.</div>
 {% endif %}
-<form class="panel form inline-form" method="post" action="/devices">
-  <input type="hidden" name="return_to" value="/devices">
-  <input name="device_id" placeholder="RWP-MAIN-GATE-01" required>
-  <input name="label" placeholder="Main Gate MB20" required>
-  <input name="ip" placeholder="192.168.110.137" required>
-  <input name="port" type="number" value="4370" required>
-  <input name="comm_key" placeholder="1979" required>
-  <button class="primary" type="submit">Validate & Save</button>
-</form>
+{% if admin_authenticated %}
+  <form class="panel form inline-form" method="post" action="/devices">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="return_to" value="/devices">
+    <input name="device_id" placeholder="RWP-MAIN-GATE-01" required>
+    <input name="label" placeholder="Main Gate MB20" required>
+    <input name="ip" placeholder="192.168.110.137" required>
+    <input name="port" type="number" value="4370" required>
+    <input name="comm_key" placeholder="1979" required>
+    <button class="primary" type="submit">Validate & Save</button>
+  </form>
+{% else %}
+  <div class="alert warn">Admin unlock is required to add or change devices.</div>
+{% endif %}
 <div class="table-wrap">
   <table>
     <thead><tr><th>Label</th><th>Address</th><th>Connection</th><th>Clock</th><th>Serial</th><th>Platform</th><th>Enabled</th><th>Worker Feedback</th><th></th></tr></thead>
@@ -37,7 +42,16 @@
         <td>{{ device.platform or '-' }}</td>
         <td>{{ 'Yes' if device.enabled else 'No' }}</td>
         <td>{{ device.last_error or '-' }}</td>
-        <td><form method="post" action="/devices/{{ device.device_id }}/toggle"><button type="submit">{{ 'Disable' if device.enabled else 'Enable' }}</button></form></td>
+        <td>
+          {% if admin_authenticated %}
+            <form method="post" action="/devices/{{ device.device_id }}/toggle">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit">{{ 'Disable' if device.enabled else 'Enable' }}</button>
+            </form>
+          {% else %}
+            <small>Locked</small>
+          {% endif %}
+        </td>
       </tr>
     {% else %}<tr><td colspan="9">No devices configured.</td></tr>{% endfor %}
     </tbody>

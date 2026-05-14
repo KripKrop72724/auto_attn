@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head">
+  <h1>Admin Unlock</h1>
+  <p>Unlock setup and device controls on this zone PC.</p>
+</section>
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if not admin_configured %}
+  <div class="alert warn">Create the first local admin password from Setup.</div>
+{% else %}
+  <form class="panel form" method="post" action="/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Admin Password <input name="password" type="password" autocomplete="current-password" required autofocus></label>
+    <button class="primary" type="submit">Unlock</button>
+  </form>
+{% endif %}
+{% endblock %}

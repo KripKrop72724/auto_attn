@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import uuid
 from collections import defaultdict
@@ -22,6 +23,7 @@ from zk_common.schemas import (
     ZoneRegisterRequest,
     ZoneRegisterResponse,
 )
+from zk_common.security import body_sha256, sign_request, signed_timestamp
 from zk_common.time_utils import parse_datetime, utc_now
 from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
@@ -30,14 +32,17 @@ from zk_zone_agent.trusted_time import trusted_time_service
 
 
 class HeadOfficeClient:
-    def __init__(self, base_url: str, token: str | None = None, timeout: float = 8.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        zone_id: str | None = None,
+        timeout: float = 8.0,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self.zone_id = zone_id
         self.timeout = timeout
-
-    @property
-    def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
     def register_zone(self, request: ZoneRegisterRequest) -> ZoneRegisterResponse:
         with httpx.Client(timeout=self.timeout) as client:
@@ -45,18 +50,57 @@ class HeadOfficeClient:
             response.raise_for_status()
             return ZoneRegisterResponse.model_validate(response.json())
 
-    def get_time(self) -> datetime:
+    def health(self) -> dict[str, Any]:
         with httpx.Client(timeout=self.timeout) as client:
-            response = client.get(f"{self.base_url}/api/time", headers=self.headers)
+            response = client.get(f"{self.base_url}/api/health")
             response.raise_for_status()
-            data = response.json()
-            return parse_datetime(data["server_utc"])
+            return response.json()
+
+    def get_time(self) -> datetime:
+        data = self._request_json("GET", "/api/time")
+        return parse_datetime(data["server_utc"])
 
     def post_json(self, path: str, payload: dict[str, Any]) -> SyncResponse:
+        data = self._request_json("POST", path, payload)
+        return SyncResponse.model_validate(data)
+
+    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = b"" if payload is None else canonical_json(payload).encode("utf-8")
+        headers = self._signed_headers(method, path, body)
+        if body:
+            headers["Content-Type"] = "application/json"
         with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}{path}", json=payload, headers=self.headers)
+            response = client.request(
+                method,
+                f"{self.base_url}{path}",
+                content=body if body else None,
+                headers=headers,
+            )
             response.raise_for_status()
-            return SyncResponse.model_validate(response.json())
+            return response.json()
+
+    def _signed_headers(self, method: str, path: str, body: bytes) -> dict[str, str]:
+        if not self.token or not self.zone_id:
+            return {}
+        timestamp = signed_timestamp()
+        nonce = secrets.token_urlsafe(18)
+        body_hash = body_sha256(body)
+        signature = sign_request(
+            token=self.token,
+            method=method,
+            path=path,
+            timestamp=timestamp,
+            nonce=nonce,
+            body_hash=body_hash,
+        )
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "X-ZK-Zone-Id": self.zone_id,
+            "X-ZK-Timestamp": timestamp,
+            "X-ZK-Nonce": nonce,
+            "X-ZK-Body-SHA256": body_hash,
+            "X-ZK-Signature": signature,
+        }
 
 
 class SyncQueueWriter:
@@ -112,7 +156,7 @@ class SyncWorker(threading.Thread):
             config = config_manager.get(session)
             if not config or not config.setup_completed or not config.zone_token or not config.head_office_url:
                 return False
-            client = HeadOfficeClient(config.head_office_url, config.zone_token)
+            client = HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id)
             server_utc = client.get_time()
             trusted_time_service.update_from_head_office(server_utc, session)
             pending = session.scalars(

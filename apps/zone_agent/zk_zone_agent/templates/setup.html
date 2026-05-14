@@ -2,18 +2,46 @@
 {% block content %}
 <section class="page-head">
   <h1>First-Time Zone Setup</h1>
-  <p>Register this branch PC with the head office server. Local capture and fraud monitoring run even before registration completes.</p>
+  <p>Bind this branch PC to the head office token issued for this zone.</p>
 </section>
 {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
 {% if config and not config.setup_completed %}
-  <div class="alert warn">Local setup is saved but registration is still pending. Sync will start after the head office issues a zone token.</div>
+  <div class="alert warn">Local setup is incomplete. Sync will start after a valid head office token is stored.</div>
+{% elif config and config.setup_completed %}
+  <div class="alert success">Zone token is stored securely. To replace it, reset setup first and use a fresh head office token.</div>
 {% endif %}
-<form class="panel form" method="post" action="/setup">
-  <label>Zone ID <input name="zone_id" value="{{ config.zone_id if config else 'RWP-ZONE-01' }}" required></label>
-  <label>Zone Name <input name="zone_name" value="{{ config.zone_name if config else 'Rawalpindi Main Office' }}" required></label>
-  <label>Head Office URL <input name="head_office_url" value="{{ config.head_office_url if config else 'http://127.0.0.1:8080' }}" required></label>
-  <label>Enrollment Key <input name="enrollment_key" value="ABC-123" required></label>
-  <label>Timezone <input name="timezone" value="{{ config.timezone if config else 'Asia/Karachi' }}" required></label>
-  <button class="primary" type="submit">Register Zone</button>
-</form>
+{% if admin_configured and not admin_authenticated %}
+  <div class="alert warn">Admin unlock is required to change setup.</div>
+{% endif %}
+{% if config and config.setup_completed and not admin_configured %}
+  <form class="panel form" method="post" action="/admin/create?next=/setup">
+    <label>Local Admin Password <input name="admin_password" type="password" autocomplete="new-password" required></label>
+    <label>Confirm Admin Password <input name="admin_password_confirm" type="password" autocomplete="new-password" required></label>
+    <button class="primary" type="submit">Create Admin Unlock</button>
+  </form>
+{% endif %}
+{% if not config or not config.setup_completed %}
+  <form class="panel form" method="post" action="/setup">
+    {% if admin_configured %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+    <label>Zone ID <input name="zone_id" value="{{ config.zone_id if config else 'RWP-ZONE-01' }}" required></label>
+    <label>Zone Name <input name="zone_name" value="{{ config.zone_name if config else 'Rawalpindi Main Office' }}" required></label>
+    <label>Head Office URL <input data-head-office-url name="head_office_url" value="{{ config.head_office_url if config else default_head_office_url }}" required></label>
+    <div class="inline-form">
+      <button type="button" data-health-check>Check Head Office</button>
+      <span data-health-result class="muted"></span>
+    </div>
+    <label>Zone Token <input name="zone_token" type="password" autocomplete="off" required></label>
+    {% if not admin_configured %}
+      <label>Local Admin Password <input name="admin_password" type="password" autocomplete="new-password" required></label>
+      <label>Confirm Admin Password <input name="admin_password_confirm" type="password" autocomplete="new-password" required></label>
+    {% endif %}
+    <label>Timezone <input name="timezone" value="{{ config.timezone if config else 'Asia/Karachi' }}" required></label>
+    <button class="primary" type="submit" {% if admin_configured and not admin_authenticated %}disabled{% endif %}>Store Token Once</button>
+  </form>
+{% elif admin_authenticated %}
+  <form class="panel form" method="post" action="/setup/reset">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Reset Local Setup</button>
+  </form>
+{% endif %}
 {% endblock %}

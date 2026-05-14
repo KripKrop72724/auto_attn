@@ -133,7 +133,7 @@ class ZoneSupervisor:
                     )
                 if config.head_office_url:
                     try:
-                        client = HeadOfficeClient(config.head_office_url, config.zone_token or None)
+                        client = HeadOfficeClient(config.head_office_url, config.zone_token or None, config.zone_id)
                         server_utc = client.get_time()
                         trusted_time_service.update_from_head_office(server_utc, session)
                     except Exception:
@@ -164,7 +164,7 @@ class ZoneSupervisor:
                         pending_queue_count=sync_queue_writer.pending_count(session),
                     )
                     try:
-                        HeadOfficeClient(config.head_office_url, config.zone_token).post_json(
+                        HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id).post_json(
                             "/api/zones/heartbeat", heartbeat.model_dump(mode="json")
                         )
                     except Exception:
