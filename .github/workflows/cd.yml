@@ -89,8 +89,20 @@ jobs:
         with:
           path: release-artifacts
 
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp release-artifacts/auto-attn-python-dist/* release-assets/
+          cp release-artifacts/zk-zone-agent-windows-installer/*.exe release-assets/
+          (
+            cd release-artifacts
+            zip -r ../release-assets/zk-zone-agent-pyinstaller-payload.zip zk-zone-agent-pyinstaller-payload
+          )
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-artifacts/**/*
+          files: release-assets/*
           generate_release_notes: true
