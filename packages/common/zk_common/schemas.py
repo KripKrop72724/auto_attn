@@ -42,7 +42,7 @@ class DeviceHeartbeat(BaseModel):
 class HeartbeatRequest(BaseModel):
     zone_id: str
     zone_name: str
-    agent_version: str = "0.1.0"
+    agent_version: str = "0.1.1"
     server_time_estimate: datetime | None = None
     devices: list[DeviceHeartbeat] = Field(default_factory=list)
     pending_queue_count: int = 0

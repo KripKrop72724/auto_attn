@@ -16,7 +16,7 @@ def ensure_utc(value: datetime) -> datetime:
 
 def parse_datetime(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
-    return datetime.fromisoformat(normalized)
+    return ensure_utc(datetime.fromisoformat(normalized))
 
 
 def device_local_to_utc(value: datetime, timezone_name: str) -> datetime:

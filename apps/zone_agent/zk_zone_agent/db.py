@@ -20,9 +20,27 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
-from zk_common.time_utils import utc_now
+from zk_common.time_utils import ensure_utc, utc_now
 from zk_zone_agent.settings import settings
+
+
+class UTCDateTime(TypeDecorator):
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        return ensure_utc(value)
+
+    def process_result_value(self, value: datetime | str | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return ensure_utc(value)
 
 
 class Base(DeclarativeBase):
@@ -30,7 +48,7 @@ class Base(DeclarativeBase):
 
 
 def utc_column() -> Mapped[datetime]:
-    return mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    return mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
 
 class ZoneConfig(Base):
@@ -54,7 +72,7 @@ class LocalAdmin(Base):
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     session_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime())
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
 
@@ -92,8 +110,8 @@ class DeviceDiscoveryResult(Base):
     status: Mapped[str] = mapped_column(String(60), index=True, default="NEEDS_COMM_KEY")
     source: Mapped[str] = mapped_column(String(60), index=True, default="AUTO")
     first_seen: Mapped[datetime] = utc_column()
-    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text)
     serial: Mapped[str | None] = mapped_column(String(120), index=True)
@@ -110,7 +128,7 @@ class DiscoveryScanRun(Base):
     source: Mapped[str] = mapped_column(String(60), index=True, default="AUTO")
     status: Mapped[str] = mapped_column(String(40), index=True, default="RUNNING")
     started_at: Mapped[datetime] = utc_column()
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     target_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     found_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -141,10 +159,10 @@ class AttendanceEvent(Base):
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     employee_name: Mapped[str | None] = mapped_column(String(255))
-    device_event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    zone_received_wall_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    zone_trusted_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    head_office_received_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    device_event_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    zone_received_wall_time: Mapped[datetime] = mapped_column(UTCDateTime())
+    zone_trusted_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    head_office_received_time: Mapped[datetime | None] = mapped_column(UTCDateTime())
     status: Mapped[str] = mapped_column(String(80), nullable=False)
     trust_status: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
     punch: Mapped[str | None] = mapped_column(String(60))
@@ -168,12 +186,12 @@ class ClockCheck(Base):
     zone_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     device_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
-    device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    trusted_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    windows_wall_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    device_time: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    trusted_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    windows_wall_time: Mapped[datetime] = mapped_column(UTCDateTime())
     monotonic_ns: Mapped[int] = mapped_column(Integer, nullable=False)
     drift_seconds: Mapped[float | None] = mapped_column(Float)
-    expected_device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expected_device_time: Mapped[datetime | None] = mapped_column(UTCDateTime())
     jump_seconds: Mapped[float | None] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
@@ -188,8 +206,8 @@ class OutagePeriod(Base):
     zone_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     device_id: Mapped[str | None] = mapped_column(String(120), index=True)
     outage_type: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
-    start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    start_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    end_time: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
     start_reason: Mapped[str | None] = mapped_column(Text)
     end_reason: Mapped[str | None] = mapped_column(Text)
@@ -222,19 +240,19 @@ class SyncQueue(Base):
     event_uid: Mapped[str | None] = mapped_column(String(128), index=True)
     record_id: Mapped[str | None] = mapped_column(String(100), index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     last_error: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), index=True, default="PENDING")
     created_at: Mapped[datetime] = utc_column()
-    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acked_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
 
 class HeadOfficeTimeSync(Base):
     __tablename__ = "head_office_time_sync"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    server_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    local_wall_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    server_utc: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    local_wall_utc: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     monotonic_ns: Mapped[int] = mapped_column(Integer, nullable=False)
     offset_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = utc_column()
@@ -279,9 +297,9 @@ class CommKeyBruteforceJob(Base):
     worker_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     timeout_seconds: Mapped[float] = mapped_column(Float, default=0.75, nullable=False)
     common_keys_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
-    success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    success_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     started_at: Mapped[datetime] = utc_column()
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     last_error: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = utc_column()
 

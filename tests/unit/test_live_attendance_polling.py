@@ -5,10 +5,10 @@ import threading
 
 from sqlalchemy.orm import sessionmaker
 
-from zk_common.enums import SourceType, TrustStatus
+from zk_common.enums import OutageType, SourceType, SyncStatus, TrustStatus
 from zk_zone_agent.config import ActiveZoneConfig
 from zk_zone_agent.crypto import protect_secret
-from zk_zone_agent.db import Base, Device, DeviceUser, AttendanceEvent, create_sqlite_engine
+from zk_zone_agent.db import Base, Device, DeviceUser, AttendanceEvent, OutagePeriod, SyncQueue, create_sqlite_engine
 from zk_zone_agent.device_worker import DeviceWorker
 from zk_zone_agent.trusted_time import TrustedTimeService
 from zk_zone_agent.zk_client import ZKAttendance
@@ -81,3 +81,62 @@ def test_live_poll_reconcile_captures_new_attendance_once(tmp_path):
         assert row.source_type == SourceType.LIVE_POLL.value
         assert row.trust_status == TrustStatus.TRUSTED_LIVE.value
         assert session.query(AttendanceEvent).count() == 1
+
+
+def test_reconnect_closes_sqlite_outage_with_utc_aware_duration(tmp_path):
+    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'zone.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
+    outage_start = datetime(2026, 5, 13, 10, 0, tzinfo=timezone.utc)
+    reconnect_time = datetime(2026, 5, 13, 10, 0, 30, tzinfo=timezone.utc)
+    trusted_time = TrustedTimeService(wall_clock=lambda: reconnect_time, monotonic_ns=lambda: 0)
+
+    with session_factory() as session:
+        session.add(
+            Device(
+                device_id="MAIN-GATE",
+                label="Main Gate",
+                ip="192.168.110.137",
+                port=4370,
+                comm_key_encrypted=protect_secret("1979"),
+                enabled=True,
+            )
+        )
+        session.add(
+            OutagePeriod(
+                zone_id="RWP-ZONE-01",
+                device_id="MAIN-GATE",
+                outage_type=OutageType.DEVICE_LAN_OUTAGE.value,
+                start_time=outage_start,
+                start_reason="previous disconnect",
+                classification="LAN_DEVICE_OFFLINE",
+                sync_status=SyncStatus.PENDING.value,
+            )
+        )
+        session.commit()
+
+    worker = DeviceWorker(
+        device_id="MAIN-GATE",
+        zone_config=ActiveZoneConfig(
+            zone_id="RWP-ZONE-01",
+            zone_name="Rawalpindi Main Office",
+            timezone="Asia/Karachi",
+            head_office_url="https://head-office-production.up.railway.app",
+            zone_token="token",
+            setup_completed=True,
+        ),
+        stop_event=threading.Event(),
+        trusted_time=trusted_time,
+        session_factory=session_factory,
+    )
+
+    worker._close_outage("Device reconnected.")
+
+    with session_factory() as session:
+        outage = session.query(OutagePeriod).one()
+        assert outage.start_time.tzinfo is not None
+        assert outage.end_time is not None
+        assert outage.end_time.tzinfo is not None
+        assert outage.duration_seconds == 30
+        queued = session.query(SyncQueue).one()
+        assert queued.payload_type == "OUTAGE"
