@@ -127,7 +127,7 @@ async def lifespan(_app: FastAPI):
         zone_supervisor.stop()
 
 ws_hub = LocalWebSocketHub()
-app = FastAPI(title="ZK Zone Agent", version="0.1.1", lifespan=lifespan)
+app = FastAPI(title="ZK Zone Agent", version="0.1.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
