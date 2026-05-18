@@ -15,6 +15,7 @@ from zk_zone_agent.db import Device, FraudIncident, ServiceEvent, SessionLocal, 
 from zk_zone_agent.db import run_session_with_retries
 from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.device_registry import device_registry
+from zk_zone_agent.device_users import DeviceUserUpdate
 from zk_zone_agent.device_worker import DeviceWorker
 from zk_zone_agent.settings import settings
 from zk_zone_agent.sync import HeadOfficeClient, SyncWorker, sync_queue_writer
@@ -116,6 +117,18 @@ class ZoneSupervisor:
     def refresh_device_workers(self) -> None:
         if not settings.disable_workers:
             self._start_device_workers()
+
+    def refresh_device_users(self, device_id: str):
+        return self._active_device_worker(device_id).refresh_users()
+
+    def update_device_user(self, device_id: str, update: DeviceUserUpdate):
+        return self._active_device_worker(device_id).update_user(update)
+
+    def _active_device_worker(self, device_id: str) -> DeviceWorker:
+        worker = self.device_workers.get(device_id)
+        if worker is None or not worker.is_alive():
+            raise RuntimeError("Device worker is not running; user changes require an online device.")
+        return worker
 
     def _time_loop(self) -> None:
         while not self.stop_event.is_set():

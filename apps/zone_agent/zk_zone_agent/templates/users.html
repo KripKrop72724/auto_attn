@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head split-row">
+  <div>
+    <h1>Device Users</h1>
+    <p>View and update existing users on online ZKT devices.</p>
+  </div>
+  {% if admin_authenticated and selected_device_id %}
+    <form method="post" action="/users/{{ selected_device_id }}/refresh">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="primary" type="submit">Refresh From Device</button>
+    </form>
+  {% endif %}
+</section>
+
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert success">{{ success }}</div>{% endif %}
+{% if not admin_authenticated %}
+  <div class="alert warn">Admin unlock is required to edit users. The list remains available in read-only mode.</div>
+{% endif %}
+
+<form class="filter-bar users-filter" method="get" action="/users">
+  <div class="filter-head">
+    <div>
+      <strong>User Directory</strong>
+      <span>{{ rows|length }} cached user{{ '' if rows|length == 1 else 's' }}</span>
+    </div>
+    <a class="button-link subtle" href="/users">Clear</a>
+  </div>
+  <div class="filter-grid">
+    <label class="field-label">Device
+      <select name="device_id">
+        <option value="">All devices</option>
+        {% for device in devices %}
+          <option value="{{ device.device_id }}" {% if selected_device_id == device.device_id %}selected{% endif %}>
+            {{ device.label }} ({{ device.device_id }})
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field-label search-field">Search
+      <input name="q" value="{{ q }}" placeholder="Name, user ID, UID, privilege">
+    </label>
+    <div class="filter-actions"><button class="primary" type="submit">Apply</button></div>
+  </div>
+</form>
+
+<section class="users-layout">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>User</th>
+          <th>Device</th>
+          <th>UID</th>
+          <th>Privilege</th>
+          <th>Card</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for user, device in rows %}
+        {% set active_row = selected_device and selected_user and selected_device.device_id == device.device_id and selected_user.uid == user.uid %}
+        <tr class="{{ 'selected-row' if active_row else '' }}">
+          <td>
+            <strong>{{ user.employee_name or 'Unnamed User' }}</strong><br>
+            <small>User ID {{ user.user_id }}</small>
+          </td>
+          <td>{{ device.label }}<br><small>{{ device.device_id }}</small></td>
+          <td>{{ user.uid or '-' }}</td>
+          <td>
+            {% if user.privilege|string in ['0', '14'] %}
+              {{ privilege_choices.get(user.privilege|int) }}
+            {% else %}
+              {{ user.privilege or '-' }}
+            {% endif %}
+          </td>
+          <td>{{ user.card if user.card is not none and user.card != 0 else '-' }}</td>
+          <td><span class="pill {{ 'ok' if device.online else 'bad' }}">{{ 'Online' if device.online else 'Offline' }}</span></td>
+          <td>
+            {% if user.uid %}
+              <a class="button-link compact" href="/users?device_id={{ device.device_id }}&uid={{ user.uid }}{% if q %}&q={{ q|urlencode }}{% endif %}">Edit</a>
+            {% else %}
+              <small>Refresh required</small>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7">No cached users yet. Refresh an online device to load its users.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <aside class="editor-panel">
+    {% if selected_user and selected_device %}
+      {% set can_edit = admin_authenticated and selected_user.uid and selected_device.online %}
+      <div class="editor-head">
+        <div>
+          <span class="eyebrow">Selected User</span>
+          <h2>{{ selected_user.employee_name or selected_user.user_id }}</h2>
+          <p>{{ selected_device.label }} · UID {{ selected_user.uid or '-' }}</p>
+        </div>
+        <span class="pill {{ 'ok' if selected_device.online else 'bad' }}">{{ 'Online' if selected_device.online else 'Offline' }}</span>
+      </div>
+      {% if not selected_device.online %}
+        <div class="alert warn compact">This device is offline. User edits can be retried after it reconnects.</div>
+      {% elif not selected_user.uid %}
+        <div class="alert warn compact">Refresh this device before editing; this cached row has no device UID.</div>
+      {% endif %}
+      <form class="form editor-form" method="post" action="/users/{{ selected_device.device_id }}/{{ selected_user.uid }}/update">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>User ID
+          <input name="user_id" value="{{ selected_user.user_id }}" required {% if not can_edit %}disabled{% endif %}>
+        </label>
+        <label>Name
+          <input name="employee_name" value="{{ selected_user.employee_name or '' }}" required {% if not can_edit %}disabled{% endif %}>
+        </label>
+        <label>Privilege
+          <select name="privilege" {% if not can_edit %}disabled{% endif %}>
+            {% for value, label in privilege_choices.items() %}
+              <option value="{{ value }}" {% if selected_user.privilege|string == value|string %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Card Number
+          <input name="card" type="number" min="0" value="{{ selected_user.card if selected_user.card is not none and selected_user.card != 0 else '' }}" {% if not can_edit %}disabled{% endif %}>
+        </label>
+        <div class="alert warn compact">Changing User ID affects the device user only. Existing attendance records keep their original User ID and name.</div>
+        <button class="primary" type="submit" {% if not can_edit %}disabled{% endif %}>Save Changes</button>
+      </form>
+    {% else %}
+      <div class="empty-state">
+        <h2>No User Selected</h2>
+        <p>Select a cached user from the table, or refresh an online device to load users.</p>
+      </div>
+    {% endif %}
+  </aside>
+</section>
+{% endblock %}

@@ -35,20 +35,53 @@ class AttendanceProcessor:
         self.engine = engine
 
     def upsert_users(self, session: Session, device: Device, users: Iterable[ZKUser]) -> None:
+        self._write_users(session, device, users, replace=False)
+
+    def replace_users(self, session: Session, device: Device, users: Iterable[ZKUser]) -> None:
+        self._write_users(session, device, users, replace=True)
+
+    def _write_users(
+        self,
+        session: Session,
+        device: Device,
+        users: Iterable[ZKUser],
+        *,
+        replace: bool,
+    ) -> None:
+        existing_rows = list(
+            session.scalars(select(DeviceUser).where(DeviceUser.device_id == device.device_id))
+        )
+        by_uid = {str(row.uid): row for row in existing_rows if row.uid}
+        by_user_id = {str(row.user_id): row for row in existing_rows}
+        seen_ids: set[int] = set()
         for user in users:
-            row = session.scalar(
-                select(DeviceUser).where(
-                    DeviceUser.device_id == device.device_id,
-                    DeviceUser.user_id == str(user.user_id),
-                )
-            )
+            row = by_uid.get(str(user.uid)) if user.uid else None
+            if row is None:
+                row = by_user_id.get(str(user.user_id))
             if row is None:
                 row = DeviceUser(device_id=device.device_id, user_id=str(user.user_id))
                 session.add(row)
+                session.flush()
+            conflict = by_user_id.get(str(user.user_id))
+            if conflict is not None and conflict is not row:
+                session.delete(conflict)
+                session.flush()
             row.uid = str(user.uid)
+            row.user_id = str(user.user_id)
             row.employee_name = user.name
             row.privilege = user.privilege
+            row.card = user.card
             row.raw_json = json.dumps(user.raw or {}, default=str, sort_keys=True)
+            row.updated_at = utc_now()
+            session.flush()
+            seen_ids.add(row.id)
+            if row.uid:
+                by_uid[str(row.uid)] = row
+            by_user_id[str(row.user_id)] = row
+        if replace:
+            for row in existing_rows:
+                if row.id not in seen_ids and row in session:
+                    session.delete(row)
         session.flush()
 
     def event_uid(self, *, device: Device, attendance: ZKAttendance, context: AttendanceContext) -> str:

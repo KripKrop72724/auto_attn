@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from queue import Empty, Queue
 import threading
 import time
 from datetime import datetime
@@ -23,11 +25,21 @@ from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
 from zk_zone_agent.db import ClockCheck, Device, FraudIncident, OutagePeriod
 from zk_zone_agent.device_registry import device_registry
+from zk_zone_agent.device_users import DeviceUserUpdate
 from zk_zone_agent.fraud import fraud_engine
 from zk_zone_agent.settings import settings
 from zk_zone_agent.sync import sync_queue_writer
 from zk_zone_agent.trusted_time import TrustedTimeService
-from zk_zone_agent.zk_client import PyZKClient, ZKAttendance, ZKClient
+from zk_zone_agent.zk_client import PyZKClient, ZKAttendance, ZKClient, ZKUser
+
+
+@dataclass
+class _DeviceCommand:
+    kind: str
+    payload: object | None
+    done: threading.Event
+    result: object | None = None
+    error: BaseException | None = None
 
 
 class DeviceWorker(threading.Thread):
@@ -61,6 +73,8 @@ class DeviceWorker(threading.Thread):
         self.previous_trusted_time: datetime | None = None
         self.last_clock_status: ClockStatus = ClockStatus.ERROR
         self.reconnect_clock_ok = True
+        self.command_queue: Queue[_DeviceCommand] = Queue()
+        self.command_available = threading.Event()
 
     def run(self) -> None:
         backoff = 5
@@ -76,12 +90,17 @@ class DeviceWorker(threading.Thread):
                 client.connect()
                 backoff = 5
                 self._on_connected(client)
+                self.command_available.set()
                 self._live_loop(client)
             except Exception as exc:
                 self._mark_offline(f"{exc}. Retrying in {backoff} seconds.")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, 60)
             finally:
+                self.command_available.clear()
+                self._fail_pending_commands(
+                    "Device disconnected before the user command could run."
+                )
                 try:
                     client.disconnect()
                 except Exception:
@@ -109,7 +128,7 @@ class DeviceWorker(threading.Thread):
             device.online = True
             device.last_error = "Connected. Loading users and running initial clock check."
             users = client.get_users()
-            attendance_processor.upsert_users(session, device, users)
+            attendance_processor.replace_users(session, device, users)
             session.commit()
 
         self._close_outage("Device reconnected.")
@@ -117,14 +136,125 @@ class DeviceWorker(threading.Thread):
         self._reconcile_dump(client, SourceType.DUMP_STARTUP)
 
     def _live_loop(self, client: ZKClient) -> None:
+        self._drain_commands(client)
         for attendance in client.live_capture(new_timeout=self.clock_interval_seconds):
             if self.stop_event.is_set():
                 break
+            self._drain_commands(client)
             if attendance is None:
                 self._clock_check(client)
                 self._live_poll_reconcile_if_due(client)
+                self._drain_commands(client)
                 continue
             self._process_observed_attendance(attendance, SourceType.LIVE)
+            self._drain_commands(client)
+
+    def refresh_users(self, timeout_seconds: float = 20) -> list[ZKUser]:
+        result = self._submit_command("refresh_users", None, timeout_seconds)
+        return list(result) if isinstance(result, list) else []
+
+    def update_user(
+        self,
+        update: DeviceUserUpdate,
+        timeout_seconds: float = 20,
+    ) -> ZKUser:
+        result = self._submit_command("update_user", update, timeout_seconds)
+        if not isinstance(result, ZKUser):
+            raise RuntimeError("Device update returned an unexpected response.")
+        return result
+
+    def _submit_command(
+        self,
+        kind: str,
+        payload: object | None,
+        timeout_seconds: float,
+    ) -> object | None:
+        if not self.is_alive() or not self.command_available.is_set():
+            raise RuntimeError(
+                "Device is not online; user changes can be retried after it reconnects."
+            )
+        command = _DeviceCommand(kind=kind, payload=payload, done=threading.Event())
+        self.command_queue.put(command)
+        if not command.done.wait(timeout_seconds):
+            raise TimeoutError("Device did not finish the user command before the timeout.")
+        if command.error is not None:
+            raise command.error
+        return command.result
+
+    def _drain_commands(self, client: ZKClient) -> None:
+        should_restart_live_capture = False
+        while True:
+            try:
+                command = self.command_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if command.kind == "refresh_users":
+                    command.result = self._refresh_device_users(client)
+                    should_restart_live_capture = True
+                elif command.kind == "update_user":
+                    if not isinstance(command.payload, DeviceUserUpdate):
+                        raise RuntimeError("Invalid user update command.")
+                    command.result = self._update_device_user(client, command.payload)
+                    should_restart_live_capture = True
+                else:
+                    raise RuntimeError(f"Unknown device command {command.kind}.")
+            except BaseException as exc:
+                command.error = exc
+            finally:
+                command.done.set()
+                self.command_queue.task_done()
+        if should_restart_live_capture:
+            client.stop_live_capture()
+
+    def _fail_pending_commands(self, message: str) -> None:
+        while True:
+            try:
+                command = self.command_queue.get_nowait()
+            except Empty:
+                break
+            command.error = RuntimeError(message)
+            command.done.set()
+            self.command_queue.task_done()
+
+    def _refresh_device_users(self, client: ZKClient) -> list[ZKUser]:
+        users = client.get_users()
+        with self.session_factory() as session:
+            device = self._session_device(session)
+            attendance_processor.replace_users(session, device, users)
+            device.last_error = f"Loaded {len(users)} user(s) from device."
+            session.commit()
+        return users
+
+    def _update_device_user(self, client: ZKClient, update: DeviceUserUpdate) -> ZKUser:
+        users = client.get_users()
+        existing = next((user for user in users if str(user.uid) == update.uid), None)
+        if existing is None:
+            raise ValueError("User was not found on the device. Refresh users and try again.")
+        duplicate = next(
+            (
+                user
+                for user in users
+                if str(user.user_id) == update.user_id and str(user.uid) != update.uid
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(f"User ID {update.user_id} already exists on this device.")
+        updated = client.update_user(
+            uid=update.uid,
+            user_id=update.user_id,
+            name=update.name,
+            privilege=update.privilege,
+            card=update.card,
+        )
+        refreshed_users = client.get_users()
+        with self.session_factory() as session:
+            device = self._session_device(session)
+            attendance_processor.replace_users(session, device, refreshed_users)
+            device.last_error = f"Updated user {updated.name or updated.user_id} on device."
+            session.commit()
+        return updated
 
     def _process_observed_attendance(
         self,

@@ -11,6 +11,9 @@ class ZKUser:
     user_id: str
     name: str | None = None
     privilege: str | None = None
+    password: str | None = None
+    group_id: str | None = None
+    card: int | None = None
     raw: dict | None = None
 
 
@@ -39,6 +42,18 @@ class ZKClient(Protocol):
     def get_info(self) -> ZKDeviceInfo: ...
 
     def get_users(self) -> list[ZKUser]: ...
+
+    def update_user(
+        self,
+        *,
+        uid: str | int,
+        user_id: str,
+        name: str,
+        privilege: int,
+        card: int,
+    ) -> ZKUser: ...
+
+    def stop_live_capture(self) -> None: ...
 
     def get_time(self) -> datetime: ...
 
@@ -101,23 +116,37 @@ class PyZKClient:
 
     def get_users(self) -> list[ZKUser]:
         conn = self._require_conn()
-        users = []
-        for user in conn.get_users():
-            users.append(
-                ZKUser(
-                    uid=str(getattr(user, "uid", "")),
-                    user_id=str(getattr(user, "user_id", "")),
-                    name=getattr(user, "name", None),
-                    privilege=str(getattr(user, "privilege", "")),
-                    raw={
-                        "uid": getattr(user, "uid", None),
-                        "user_id": getattr(user, "user_id", None),
-                        "name": getattr(user, "name", None),
-                        "privilege": getattr(user, "privilege", None),
-                    },
-                )
-            )
-        return users
+        return [_user_from_pyzk(user) for user in conn.get_users()]
+
+    def update_user(
+        self,
+        *,
+        uid: str | int,
+        user_id: str,
+        name: str,
+        privilege: int,
+        card: int,
+    ) -> ZKUser:
+        conn = self._require_conn()
+        uid_text = str(uid)
+        existing = next((user for user in self.get_users() if str(user.uid) == uid_text), None)
+        if existing is None:
+            raise ValueError(f"User UID {uid_text} was not found on the device.")
+        password = existing.password or ""
+        group_id = existing.group_id or ""
+        conn.set_user(
+            uid=int(uid_text),
+            name=name,
+            privilege=int(privilege),
+            password=password,
+            group_id=group_id,
+            user_id=user_id,
+            card=int(card),
+        )
+        refreshed = next((user for user in self.get_users() if str(user.uid) == uid_text), None)
+        if refreshed is None:
+            raise RuntimeError("Device accepted the update but the user could not be reloaded.")
+        return refreshed
 
     def get_time(self) -> datetime:
         return self._require_conn().get_time()
@@ -131,12 +160,42 @@ class PyZKClient:
         for item in conn.live_capture(new_timeout=new_timeout):
             yield None if item is None else _attendance_from_pyzk(item)
 
+    def stop_live_capture(self) -> None:
+        conn = self._require_conn()
+        conn.end_live_capture = True
+
 
 def _safe_call(func):
     try:
         return func()
     except Exception:
         return None
+
+
+def _user_from_pyzk(user) -> ZKUser:
+    card = getattr(user, "card", None)
+    try:
+        card = None if card is None else int(card)
+    except (TypeError, ValueError):
+        card = None
+    return ZKUser(
+        uid=str(getattr(user, "uid", "")),
+        user_id=str(getattr(user, "user_id", "")),
+        name=getattr(user, "name", None),
+        privilege=str(getattr(user, "privilege", "")),
+        password=getattr(user, "password", None),
+        group_id=getattr(user, "group_id", None),
+        card=card,
+        raw={
+            "uid": getattr(user, "uid", None),
+            "user_id": getattr(user, "user_id", None),
+            "name": getattr(user, "name", None),
+            "privilege": getattr(user, "privilege", None),
+            "password": getattr(user, "password", None),
+            "group_id": getattr(user, "group_id", None),
+            "card": card,
+        },
+    )
 
 
 def _attendance_from_pyzk(item) -> ZKAttendance:
@@ -172,6 +231,7 @@ class FakeZKClient:
         self.attendances = attendances or []
         self.current_time = current_time or datetime.utcnow()
         self.connected = False
+        self.live_capture_stopped = False
 
     def connect(self) -> None:
         self.connected = True
@@ -185,6 +245,39 @@ class FakeZKClient:
     def get_users(self) -> list[ZKUser]:
         return self.users
 
+    def update_user(
+        self,
+        *,
+        uid: str | int,
+        user_id: str,
+        name: str,
+        privilege: int,
+        card: int,
+    ) -> ZKUser:
+        uid_text = str(uid)
+        for index, user in enumerate(self.users):
+            if str(user.uid) == uid_text:
+                updated = ZKUser(
+                    uid=user.uid,
+                    user_id=str(user_id),
+                    name=name,
+                    privilege=str(privilege),
+                    password=user.password,
+                    group_id=user.group_id,
+                    card=int(card),
+                    raw={
+                        **(user.raw or {}),
+                        "uid": user.uid,
+                        "user_id": str(user_id),
+                        "name": name,
+                        "privilege": int(privilege),
+                        "card": int(card),
+                    },
+                )
+                self.users[index] = updated
+                return updated
+        raise ValueError(f"User UID {uid_text} was not found on the device.")
+
     def get_time(self) -> datetime:
         return self.current_time
 
@@ -192,7 +285,13 @@ class FakeZKClient:
         return self.attendances
 
     def live_capture(self, new_timeout: int = 5) -> Iterator[ZKAttendance | None]:
+        self.live_capture_stopped = False
         for attendance in self.attendances:
+            if self.live_capture_stopped:
+                return
             yield attendance
-        while True:
+        while not self.live_capture_stopped:
             yield None
+
+    def stop_live_capture(self) -> None:
+        self.live_capture_stopped = True

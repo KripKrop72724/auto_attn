@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
@@ -188,6 +189,7 @@ class DeviceUser(Base):
     user_id: Mapped[str] = mapped_column(String(100), nullable=False)
     employee_name: Mapped[str | None] = mapped_column(String(255))
     privilege: Mapped[str | None] = mapped_column(String(100))
+    card: Mapped[int | None] = mapped_column(Integer)
     raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     updated_at: Mapped[datetime] = utc_column()
 
@@ -395,7 +397,21 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False
 
 
 def init_db(bind: Engine | None = None) -> None:
-    Base.metadata.create_all(bind or engine)
+    target = bind or engine
+    Base.metadata.create_all(target)
+    _ensure_sqlite_schema(target)
+
+
+def _ensure_sqlite_schema(bind: Engine) -> None:
+    if bind.dialect.name != "sqlite":
+        return
+    with bind.begin() as connection:
+        device_user_columns = {
+            row["name"]
+            for row in connection.execute(text("PRAGMA table_info(device_users)")).mappings()
+        }
+        if "card" not in device_user_columns:
+            connection.execute(text("ALTER TABLE device_users ADD COLUMN card INTEGER"))
 
 
 @contextmanager

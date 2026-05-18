@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from zk_common.enums import SourceType, TrustStatus
 from zk_zone_agent.device_validation import DeviceValidation
-from zk_zone_agent.zk_client import ZKDeviceInfo
+from zk_zone_agent.zk_client import ZKDeviceInfo, ZKUser
 
 
 def _load_zone_web(monkeypatch, tmp_path):
@@ -218,6 +218,248 @@ def test_mutating_device_route_requires_admin_csrf(monkeypatch, tmp_path):
     assert response.status_code == 403
     with db_module.session_scope() as session:
         assert session.query(db_module.Device).count() == 0
+
+
+def _seed_device_user(db_module, *, online=True):
+    db_module.init_db()
+    now = datetime(2026, 5, 13, 11, 0, tzinfo=timezone.utc)
+    with db_module.session_scope() as session:
+        session.add(
+            db_module.Device(
+                device_id="MAIN-GATE",
+                label="Main Gate",
+                ip="192.168.110.137",
+                port=4370,
+                comm_key_encrypted="encrypted",
+                online=online,
+            )
+        )
+        session.add(
+            db_module.DeviceUser(
+                device_id="MAIN-GATE",
+                uid="7",
+                user_id="1007",
+                employee_name="Ali",
+                privilege="0",
+                card=12345,
+                raw_json="{}",
+            )
+        )
+        session.add(
+            db_module.AttendanceEvent(
+                event_uid="event-user-1007",
+                zone_id="RWP-ZONE-01",
+                device_id="MAIN-GATE",
+                user_id="1007",
+                employee_name="Ali",
+                device_event_time=now,
+                zone_received_wall_time=now,
+                zone_trusted_time=now,
+                status=TrustStatus.TRUSTED_LIVE.value,
+                trust_status=TrustStatus.TRUSTED_LIVE.value,
+                raw_event="{}",
+                source_type=SourceType.LIVE.value,
+                sync_status="PENDING",
+            )
+        )
+
+
+def test_users_page_locked_admin_sees_read_only_cached_users(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    with TestClient(web_module.app) as client:
+        response = client.get("/users")
+
+    assert response.status_code == 200
+    assert "Ali" in response.text
+    assert "users-layout" in response.text
+    assert "editor-panel" in response.text
+    assert "Admin unlock is required to edit users" in response.text
+    assert "Save Changes" in response.text
+    assert "disabled" in response.text
+
+
+def test_user_update_requires_admin_csrf(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    with TestClient(web_module.app) as client:
+        response = client.post(
+            "/users/MAIN-GATE/7/update",
+            data={
+                "user_id": "2007",
+                "employee_name": "Ali Khan",
+                "privilege": "14",
+                "card": "987",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 403
+    with db_module.session_scope() as session:
+        user = session.query(db_module.DeviceUser).one()
+        assert user.user_id == "1007"
+
+
+def test_user_update_calls_device_worker_and_preserves_attendance_history(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+    calls = []
+
+    def fake_update_device_user(device_id, update):
+        calls.append((device_id, update))
+        with db_module.session_scope() as session:
+            row = session.scalar(
+                select(db_module.DeviceUser).where(
+                    db_module.DeviceUser.device_id == device_id,
+                    db_module.DeviceUser.uid == update.uid,
+                )
+            )
+            row.user_id = update.user_id
+            row.employee_name = update.name
+            row.privilege = str(update.privilege)
+            row.card = update.card
+        return ZKUser(
+            uid=update.uid,
+            user_id=update.user_id,
+            name=update.name,
+            privilege=str(update.privilege),
+            card=update.card,
+        )
+
+    monkeypatch.setattr(web_module.zone_supervisor, "update_device_user", fake_update_device_user)
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.post(
+            "/users/MAIN-GATE/7/update",
+            data={
+                "csrf_token": csrf_token,
+                "user_id": "2007",
+                "employee_name": "Ali Khan",
+                "privilege": "14",
+                "card": "987",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert calls[0][0] == "MAIN-GATE"
+    assert calls[0][1].user_id == "2007"
+    with db_module.session_scope() as session:
+        user = session.query(db_module.DeviceUser).one()
+        assert user.user_id == "2007"
+        assert user.employee_name == "Ali Khan"
+        assert user.privilege == "14"
+        assert user.card == 987
+        attendance = session.query(db_module.AttendanceEvent).one()
+        assert attendance.user_id == "1007"
+        assert attendance.employee_name == "Ali"
+        assert (
+            session.query(db_module.AuditLedger)
+            .filter(db_module.AuditLedger.record_type == "device_user_update")
+            .count()
+            == 1
+        )
+
+
+def test_user_update_duplicate_error_does_not_mutate_cache(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    def duplicate_error(_device_id, _update):
+        raise ValueError("User ID 2007 already exists on this device.")
+
+    monkeypatch.setattr(web_module.zone_supervisor, "update_device_user", duplicate_error)
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.post(
+            "/users/MAIN-GATE/7/update",
+            data={
+                "csrf_token": csrf_token,
+                "user_id": "2007",
+                "employee_name": "Ali Khan",
+                "privilege": "14",
+                "card": "987",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert "already+exists" in response.headers["location"]
+    with db_module.session_scope() as session:
+        user = session.query(db_module.DeviceUser).one()
+        assert user.user_id == "1007"
+        assert user.employee_name == "Ali"
+
+
+def test_user_update_offline_device_fails_without_local_only_change(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module, online=False)
+
+    def offline_error(_device_id, _update):
+        raise RuntimeError("Device is not online; user changes can be retried after it reconnects.")
+
+    monkeypatch.setattr(web_module.zone_supervisor, "update_device_user", offline_error)
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.post(
+            "/users/MAIN-GATE/7/update",
+            data={
+                "csrf_token": csrf_token,
+                "user_id": "2007",
+                "employee_name": "Ali Khan",
+                "privilege": "14",
+                "card": "987",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert "not+online" in response.headers["location"]
+    with db_module.session_scope() as session:
+        user = session.query(db_module.DeviceUser).one()
+        assert user.user_id == "1007"
+        assert user.employee_name == "Ali"
+
+
+def test_user_refresh_route_uses_worker_and_updates_cache(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    def fake_refresh(device_id):
+        with db_module.session_scope() as session:
+            row = session.scalar(
+                select(db_module.DeviceUser).where(db_module.DeviceUser.device_id == device_id)
+            )
+            row.employee_name = "Ali Refreshed"
+            row.card = 777
+        return [ZKUser(uid="7", user_id="1007", name="Ali Refreshed", privilege="0", card=777)]
+
+    monkeypatch.setattr(web_module.zone_supervisor, "refresh_device_users", fake_refresh)
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.post(
+            "/users/MAIN-GATE/refresh",
+            data={"csrf_token": csrf_token},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    with db_module.session_scope() as session:
+        user = session.query(db_module.DeviceUser).one()
+        assert user.employee_name == "Ali Refreshed"
+        assert user.card == 777
 
 
 def test_setup_stores_token_once_and_encrypts_secret(monkeypatch, tmp_path):
@@ -641,6 +883,8 @@ def test_zone_timeline_filters_realtime_api_and_clean_timestamp_markup(monkeypat
             f"/attendance?{query}&source_type=LIVE_POLL&trust_status=TRUSTED_LIVE"
         )
         assert attendance.status_code == 200
+        assert "filter-head" in attendance.text
+        assert "filter-grid" in attendance.text
         assert "Ali" in attendance.text
         assert "Sara" not in attendance.text
         assert 'data-timestamp="2026-05-18T06:30:05Z"' in attendance.text

@@ -16,15 +16,17 @@
         <button type="button" data-time-format-option="12">12h</button>
       </div>
       <nav>
-        <a href="/dashboard">Status</a>
-        <a href="/setup">Setup</a>
-        <a href="/devices">Devices</a>
-        <a href="/devices/scan">Scan</a>
-        <a href="/attendance">Attendance</a>
-        <a href="/clock-guard">Clock Guard</a>
-        <a href="/outages">Outages</a>
-        <a href="/sync-queue">Sync Queue</a>
-        <a href="/logs">Logs</a>
+        {% set current_path = request.url.path %}
+        <a class="{{ 'active' if current_path == '/dashboard' else '' }}" href="/dashboard">Status</a>
+        <a class="{{ 'active' if current_path == '/setup' else '' }}" href="/setup">Setup</a>
+        <a class="{{ 'active' if current_path == '/devices' else '' }}" href="/devices">Devices</a>
+        <a class="{{ 'active' if current_path == '/users' else '' }}" href="/users">Users</a>
+        <a class="{{ 'active' if current_path == '/devices/scan' else '' }}" href="/devices/scan">Scan</a>
+        <a class="{{ 'active' if current_path == '/attendance' else '' }}" href="/attendance">Attendance</a>
+        <a class="{{ 'active' if current_path == '/clock-guard' else '' }}" href="/clock-guard">Clock Guard</a>
+        <a class="{{ 'active' if current_path == '/outages' else '' }}" href="/outages">Outages</a>
+        <a class="{{ 'active' if current_path == '/sync-queue' else '' }}" href="/sync-queue">Sync Queue</a>
+        <a class="{{ 'active' if current_path == '/logs' else '' }}" href="/logs">Logs</a>
         {% if admin_authenticated %}
           <form class="nav-form" method="post" action="/logout">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 from fastapi import Body, FastAPI, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
+from zk_zone_agent import APP_VERSION
 from zk_common.enums import ClockStatus
 from zk_common.time_utils import utc_now
 from zk_common.ui_time import (
@@ -28,6 +29,7 @@ from zk_zone_agent.db import (
     CommKeyBruteforceJob,
     Device,
     DeviceDiscoveryResult,
+    DeviceUser,
     DiscoveryScanRun,
     FraudIncident,
     OutagePeriod,
@@ -36,7 +38,9 @@ from zk_zone_agent.db import (
     init_db,
     session_scope,
 )
+from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.device_registry import device_registry
+from zk_zone_agent.device_users import PRIVILEGE_CHOICES, normalize_device_user_update
 from zk_zone_agent.device_validation import validate_device_connection
 from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.head_office_policy import normalize_head_office_url
@@ -135,7 +139,7 @@ async def lifespan(_app: FastAPI):
         zone_supervisor.stop()
 
 ws_hub = LocalWebSocketHub()
-app = FastAPI(title="ZK Zone Agent", version="0.1.3", lifespan=lifespan)
+app = FastAPI(title="ZK Zone Agent", version=APP_VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -252,6 +256,29 @@ def _device_options(session) -> list[dict[str, str]]:
 
 def _with_error(path: str, message: str) -> RedirectResponse:
     return RedirectResponse(f"{path}?error={quote_plus(message)}", status_code=303)
+
+
+def _users_redirect(
+    *,
+    device_id: str | None = None,
+    uid: str | None = None,
+    q: str | None = None,
+    success: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    params = {}
+    if device_id:
+        params["device_id"] = device_id
+    if uid:
+        params["uid"] = uid
+    if q:
+        params["q"] = q
+    if success:
+        params["success"] = success
+    if error:
+        params["error"] = error
+    suffix = f"?{urlencode(params)}" if params else ""
+    return RedirectResponse(f"/users{suffix}", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -616,6 +643,206 @@ def devices_page(request: Request, error: str | None = None, success: str | None
             "workers_disabled": settings.disable_workers,
             **security_context,
         },
+    )
+
+
+@app.get("/users", response_class=HTMLResponse)
+def users_page(
+    request: Request,
+    device_id: str = Query(""),
+    uid: str = Query(""),
+    q: str = Query(""),
+    error: str | None = None,
+    success: str | None = None,
+):
+    q = q.strip()
+    with session_scope() as session:
+        devices = device_registry.list_devices(session)
+        selected_device_id = device_id.strip()
+        if selected_device_id and not any(
+            device.device_id == selected_device_id for device in devices
+        ):
+            selected_device_id = ""
+        stmt = select(DeviceUser, Device).join(Device, DeviceUser.device_id == Device.device_id)
+        if selected_device_id:
+            stmt = stmt.where(DeviceUser.device_id == selected_device_id)
+        if q:
+            like = f"%{q}%"
+            stmt = stmt.where(
+                or_(
+                    DeviceUser.uid.ilike(like),
+                    DeviceUser.user_id.ilike(like),
+                    DeviceUser.employee_name.ilike(like),
+                    DeviceUser.privilege.ilike(like),
+                )
+            )
+        rows = session.execute(
+            stmt.order_by(Device.label.asc(), DeviceUser.user_id.asc()).limit(500)
+        ).all()
+        selected_pair = None
+        if uid:
+            selected_pair = next(
+                (
+                    (user, device)
+                    for user, device in rows
+                    if user.device_id == selected_device_id and str(user.uid or "") == uid
+                ),
+                None,
+            )
+        if selected_pair is None and rows:
+            selected_pair = rows[0]
+        selected_user = selected_pair[0] if selected_pair is not None else None
+        selected_device = selected_pair[1] if selected_pair is not None else None
+        security_context = _admin_context(request, session)
+    return templates.TemplateResponse(
+        request=request,
+        name="users.html",
+        context={
+            "devices": devices,
+            "rows": rows,
+            "selected_device_id": selected_device_id,
+            "selected_uid": "" if selected_user is None else str(selected_user.uid or ""),
+            "selected_user": selected_user,
+            "selected_device": selected_device,
+            "q": q,
+            "error": error,
+            "success": success,
+            "privilege_choices": PRIVILEGE_CHOICES,
+            **security_context,
+        },
+    )
+
+
+@app.post("/users/{device_id}/refresh")
+def refresh_device_users(
+    request: Request,
+    device_id: str,
+    csrf_token: str = Form(""),
+):
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        device = session.scalar(select(Device).where(Device.device_id == device_id))
+        if device is None:
+            raise HTTPException(status_code=404)
+        record_security_event(
+            session,
+            "DEVICE_USERS_REFRESH_ATTEMPT",
+            f"Refreshing users for {device_id}.",
+        )
+    try:
+        users = zone_supervisor.refresh_device_users(device_id)
+    except Exception as exc:
+        with session_scope() as session:
+            record_security_event(
+                session,
+                "DEVICE_USERS_REFRESH_FAILED",
+                f"Refreshing users for {device_id} failed: {exc}",
+            )
+        return _users_redirect(device_id=device_id, error=str(exc))
+    with session_scope() as session:
+        record_security_event(
+            session,
+            "DEVICE_USERS_REFRESH_SUCCEEDED",
+            f"Loaded {len(users)} user(s) from {device_id}.",
+        )
+        audit_ledger.append(
+            session,
+            "device_users_refresh",
+            device_id,
+            {
+                "device_id": device_id,
+                "user_count": len(users),
+                "refreshed_at": utc_now(),
+            },
+        )
+    return _users_redirect(device_id=device_id, success=f"Loaded {len(users)} user(s) from device.")
+
+
+@app.post("/users/{device_id}/{uid}/update")
+def update_device_user(
+    request: Request,
+    device_id: str,
+    uid: str,
+    csrf_token: str = Form(""),
+    user_id: str = Form(...),
+    employee_name: str = Form(...),
+    privilege: str = Form(...),
+    card: str = Form(""),
+):
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        device = session.scalar(select(Device).where(Device.device_id == device_id))
+        if device is None:
+            raise HTTPException(status_code=404)
+        current = session.scalar(
+            select(DeviceUser).where(DeviceUser.device_id == device_id, DeviceUser.uid == uid)
+        )
+        if current is None:
+            return _users_redirect(
+                device_id=device_id,
+                error="Refresh this device before editing that user.",
+            )
+        old_snapshot = {
+            "uid": current.uid,
+            "user_id": current.user_id,
+            "name": current.employee_name,
+            "privilege": current.privilege,
+            "card": current.card,
+        }
+        record_security_event(
+            session,
+            "DEVICE_USER_UPDATE_ATTEMPT",
+            f"Updating user UID {uid} on {device_id}.",
+        )
+    try:
+        update = normalize_device_user_update(
+            uid=uid,
+            user_id=user_id,
+            name=employee_name,
+            privilege=privilege,
+            card=card,
+        )
+        updated = zone_supervisor.update_device_user(device_id, update)
+    except Exception as exc:
+        with session_scope() as session:
+            record_security_event(
+                session,
+                "DEVICE_USER_UPDATE_FAILED",
+                f"Updating user UID {uid} on {device_id} failed: {exc}",
+            )
+        return _users_redirect(device_id=device_id, uid=uid, error=str(exc))
+
+    with session_scope() as session:
+        record_security_event(
+            session,
+            "DEVICE_USER_UPDATE_SUCCEEDED",
+            (
+                f"Updated user UID {uid} on {device_id}: "
+                f"{old_snapshot['user_id']} -> {updated.user_id}."
+            ),
+        )
+        audit_ledger.append(
+            session,
+            "device_user_update",
+            f"{device_id}:{uid}",
+            {
+                "device_id": device_id,
+                "uid": uid,
+                "old": old_snapshot,
+                "new": {
+                    "user_id": updated.user_id,
+                    "name": updated.name,
+                    "privilege": updated.privilege,
+                    "card": updated.card,
+                },
+                "updated_at": utc_now(),
+                "history_policy": "attendance_history_preserved",
+            },
+        )
+    return _users_redirect(
+        device_id=device_id,
+        uid=uid,
+        success=f"Updated user {updated.name or updated.user_id} on device.",
     )
 
 

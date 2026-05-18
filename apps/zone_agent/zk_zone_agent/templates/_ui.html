@@ -12,7 +12,7 @@
 
 {% macro select_filter(name, label, options, selected) -%}
   {% if options %}
-    <label>{{ label }}
+    <label class="field-label">{{ label }}
       <select name="{{ name }}">
         <option value="">All</option>
         {% for option in options %}
@@ -25,7 +25,14 @@
 
 {% macro timeline_filters(action, filters, choices) -%}
   <form class="filter-bar" method="get" action="{{ action }}">
-    <div class="filter-presets">
+    <div class="filter-head">
+      <div>
+        <strong>Filters</strong>
+        <span>{{ filters.date_preset.replace('_', ' ').title() }} · {{ filters.display_timezone }}</span>
+      </div>
+      <a class="button-link subtle" href="{{ action }}">Clear</a>
+    </div>
+    <div class="filter-presets" role="group" aria-label="Date range">
       {% for value, label in filters.presets %}
         <label class="preset-option {% if filters.date_preset == value %}active{% endif %}">
           <input type="radio" name="date_preset" value="{{ value }}" {% if filters.date_preset == value %}checked{% endif %}>
@@ -33,9 +40,9 @@
         </label>
       {% endfor %}
     </div>
-    <div class="filter-fields">
-      <label>From <input type="date" name="from_date" value="{{ filters.from_date }}"></label>
-      <label>To <input type="date" name="to_date" value="{{ filters.to_date }}"></label>
+    <div class="filter-grid">
+      <label class="field-label">From <input type="date" name="from_date" value="{{ filters.from_date }}"></label>
+      <label class="field-label">To <input type="date" name="to_date" value="{{ filters.to_date }}"></label>
       {{ select_filter('device_id', 'Device', choices.devices, filters.selected.device_id) }}
       {{ select_filter('source_type', 'Source', choices.source_types, filters.selected.source_type) }}
       {{ select_filter('trust_status', 'Trust', choices.trust_statuses, filters.selected.trust_status) }}
@@ -43,8 +50,7 @@
       {{ select_filter('outage_type', 'Outage', choices.outage_types, filters.selected.outage_type) }}
       {{ select_filter('payload_type', 'Payload', choices.payload_types, filters.selected.payload_type) }}
       {{ select_filter('event_type', 'Event', choices.event_types, filters.selected.event_type) }}
-      <button class="primary" type="submit">Apply</button>
-      <a class="button-link" href="{{ action }}">Clear</a>
+      <div class="filter-actions"><button class="primary" type="submit">Apply</button></div>
     </div>
   </form>
 {%- endmacro %}
