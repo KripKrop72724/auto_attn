@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 from sqlalchemy import (
     Boolean,
@@ -19,11 +20,23 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
 from zk_common.time_utils import ensure_utc, utc_now
 from zk_zone_agent.settings import settings
+
+T = TypeVar("T")
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_LOCK_RETRY_ATTEMPTS = 4
+SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS = 0.25
+SQLITE_LOCK_MESSAGES = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+)
 
 
 class UTCDateTime(TypeDecorator):
@@ -352,23 +365,26 @@ class CommKeyBruteforceAttempt(Base):
 
 def create_sqlite_engine(database_url: str | None = None) -> Engine:
     database_url = database_url or settings.resolved_database_url
+    is_sqlite = database_url.startswith("sqlite")
     if database_url.startswith("sqlite:///"):
         db_path = Path(database_url.removeprefix("sqlite:///"))
         db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
         database_url,
-        connect_args={"check_same_thread": False} if database_url.startswith("sqlite") else {},
+        connect_args={"check_same_thread": False, "timeout": 30} if is_sqlite else {},
         future=True,
     )
 
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=FULL")
-        cursor.execute("PRAGMA busy_timeout=5000")
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    if is_sqlite:
+
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=FULL")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     return engine
 
@@ -392,3 +408,30 @@ def session_scope() -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+def is_sqlite_lock_error(exc: BaseException) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    source = getattr(exc, "orig", None) or exc
+    message = str(source).lower()
+    return any(fragment in message for fragment in SQLITE_LOCK_MESSAGES)
+
+
+def run_session_with_retries(
+    operation: Callable[[Session], T],
+    *,
+    attempts: int = SQLITE_LOCK_RETRY_ATTEMPTS,
+    base_delay_seconds: float = SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS,
+) -> T:
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    for attempt in range(attempts):
+        try:
+            with session_scope() as session:
+                return operation(session)
+        except OperationalError as exc:
+            if not is_sqlite_lock_error(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(base_delay_seconds * (2**attempt))
+    raise RuntimeError("SQLite retry loop exited unexpectedly.")

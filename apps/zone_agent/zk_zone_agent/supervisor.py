@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from zk_common.enums import IncidentSeverity, PayloadType, SyncStatus
 from zk_common.schemas import DeviceHeartbeat, HeartbeatRequest, IncidentSyncItem
@@ -11,6 +12,7 @@ from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.bruteforce import comm_key_bruteforce_manager
 from zk_zone_agent.config import config_manager
 from zk_zone_agent.db import Device, FraudIncident, ServiceEvent, SessionLocal, init_db, session_scope
+from zk_zone_agent.db import run_session_with_retries
 from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.device_worker import DeviceWorker
@@ -50,8 +52,14 @@ class ZoneSupervisor:
 
     def stop(self) -> None:
         self.stop_event.set()
-        with session_scope() as session:
-            session.add(ServiceEvent(event_type="SERVICE_STOPPED_CLEANLY", description="Service stopped cleanly."))
+        try:
+            run_session_with_retries(
+                lambda session: session.add(
+                    ServiceEvent(event_type="SERVICE_STOPPED_CLEANLY", description="Service stopped cleanly.")
+                )
+            )
+        except Exception:
+            pass
 
     def _record_service_start(self) -> None:
         with session_scope() as session:
@@ -111,65 +119,100 @@ class ZoneSupervisor:
 
     def _time_loop(self) -> None:
         while not self.stop_event.is_set():
-            with session_scope() as session:
-                config = config_manager.runtime_config(session)
-                tamper = trusted_time_service.check_pc_clock_tamper()
-                if tamper:
-                    incident = trusted_time_service.record_pc_tamper(session, config.zone_id, tamper)
-                    payload = IncidentSyncItem(
-                        id=incident.id,
-                        zone_id=incident.zone_id,
-                        device_id=None,
-                        incident_type="ZONE_PC_CLOCK_TAMPER",
-                        severity=IncidentSeverity.CRITICAL,
-                        description=incident.description,
-                        created_at=incident.created_at,
-                    )
-                    sync_queue_writer.enqueue(
-                        session,
-                        payload_type=PayloadType.INCIDENT,
-                        payload=payload,
-                        record_id=incident.id,
-                    )
-                if config.head_office_url:
-                    try:
-                        client = HeadOfficeClient(config.head_office_url, config.zone_token or None, config.zone_id)
-                        server_utc = client.get_time()
-                        trusted_time_service.update_from_head_office(server_utc, session)
-                    except Exception:
-                        pass
+            try:
+                self._time_loop_tick()
+            except Exception as exc:
+                self._record_background_error("TRUSTED_TIME_LOOP_ERROR", exc)
             self.stop_event.wait(settings.time_sync_interval_seconds)
+
+    def _time_loop_tick(self) -> None:
+        config = run_session_with_retries(lambda session: config_manager.runtime_config(session))
+        tamper = trusted_time_service.check_pc_clock_tamper()
+        if tamper:
+            run_session_with_retries(
+                lambda session: self._record_pc_tamper(session, config.zone_id, tamper)
+            )
+        if not config.head_office_url:
+            return
+        try:
+            client = HeadOfficeClient(config.head_office_url, config.zone_token or None, config.zone_id)
+            server_utc = client.get_time()
+        except Exception:
+            return
+        run_session_with_retries(
+            lambda session: trusted_time_service.update_from_head_office(server_utc, session)
+        )
+
+    def _record_pc_tamper(self, session: Session, zone_id: str, tamper) -> None:
+        incident = trusted_time_service.record_pc_tamper(session, zone_id, tamper)
+        payload = IncidentSyncItem(
+            id=incident.id,
+            zone_id=incident.zone_id,
+            device_id=None,
+            incident_type="ZONE_PC_CLOCK_TAMPER",
+            severity=IncidentSeverity.CRITICAL,
+            description=incident.description,
+            created_at=incident.created_at,
+        )
+        sync_queue_writer.enqueue(
+            session,
+            payload_type=PayloadType.INCIDENT,
+            payload=payload,
+            record_id=incident.id,
+        )
 
     def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
-            with session_scope() as session:
-                config = config_manager.get(session)
-                if config and config.setup_completed and config.zone_token and config.head_office_url:
-                    devices = [
-                        DeviceHeartbeat(
-                            device_id=device.device_id,
-                            serial=device.serial,
-                            online=device.online,
-                            last_clock_status=device.last_clock_status,
-                            last_drift_seconds=device.last_drift_seconds,
-                        )
-                        for device in session.scalars(select(Device).order_by(Device.label.asc()))
-                    ]
-                    heartbeat = HeartbeatRequest(
-                        zone_id=config.zone_id,
-                        zone_name=config.zone_name,
-                        agent_version=APP_VERSION,
-                        server_time_estimate=trusted_time_service.now().value,
-                        devices=devices,
-                        pending_queue_count=sync_queue_writer.pending_count(session),
-                    )
-                    try:
-                        HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id).post_json(
-                            "/api/zones/heartbeat", heartbeat.model_dump(mode="json")
-                        )
-                    except Exception:
-                        pass
+            try:
+                self._heartbeat_loop_tick()
+            except Exception as exc:
+                self._record_background_error("HEARTBEAT_LOOP_ERROR", exc)
             self.stop_event.wait(settings.heartbeat_interval_seconds)
+
+    def _heartbeat_loop_tick(self) -> None:
+        heartbeat_context = run_session_with_retries(self._build_heartbeat)
+        if heartbeat_context is None:
+            return
+        config, heartbeat = heartbeat_context
+        try:
+            HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id).post_json(
+                "/api/zones/heartbeat", heartbeat.model_dump(mode="json")
+            )
+        except Exception:
+            pass
+
+    def _build_heartbeat(self, session: Session):
+        config = config_manager.get(session)
+        if not config or not config.setup_completed or not config.zone_token or not config.head_office_url:
+            return None
+        devices = [
+            DeviceHeartbeat(
+                device_id=device.device_id,
+                serial=device.serial,
+                online=device.online,
+                last_clock_status=device.last_clock_status,
+                last_drift_seconds=device.last_drift_seconds,
+            )
+            for device in session.scalars(select(Device).order_by(Device.label.asc()))
+        ]
+        heartbeat = HeartbeatRequest(
+            zone_id=config.zone_id,
+            zone_name=config.zone_name,
+            agent_version=APP_VERSION,
+            server_time_estimate=trusted_time_service.now().value,
+            devices=devices,
+            pending_queue_count=sync_queue_writer.pending_count(session),
+        )
+        return config, heartbeat
+
+    def _record_background_error(self, event_type: str, exc: Exception) -> None:
+        description = f"{exc.__class__.__name__}: {exc}"[:1000]
+        try:
+            run_session_with_retries(
+                lambda session: session.add(ServiceEvent(event_type=event_type, description=description))
+            )
+        except Exception:
+            pass
 
 
 zone_supervisor = ZoneSupervisor()
