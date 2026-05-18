@@ -3,6 +3,7 @@ import importlib
 import re
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from zk_common.enums import SourceType, TrustStatus
 from zk_zone_agent.device_validation import DeviceValidation
@@ -14,12 +15,18 @@ def _load_zone_web(monkeypatch, tmp_path):
     monkeypatch.setenv("ZK_ZONE_DISABLE_WORKERS", "true")
     import zk_zone_agent.settings as settings_module
     import zk_zone_agent.db as db_module
+    import zk_zone_agent.config as config_module
     import zk_zone_agent.device_registry as registry_module
+    import zk_zone_agent.local_security as local_security_module
     import zk_zone_agent.supervisor as supervisor_module
+    import zk_zone_agent.webauthn_security as webauthn_module
     import zk_zone_agent.web as web_module
 
     importlib.reload(settings_module)
     db_module = importlib.reload(db_module)
+    importlib.reload(config_module)
+    importlib.reload(local_security_module)
+    importlib.reload(webauthn_module)
     importlib.reload(registry_module)
     importlib.reload(supervisor_module)
     web_module = importlib.reload(web_module)
@@ -39,6 +46,92 @@ def _unlock(client: TestClient) -> str:
     match = re.search(r'<meta name="csrf-token" content="([^"]+)">', page.text)
     assert match
     return match.group(1)
+
+
+class FakeWebAuthnSecurity:
+    def __init__(self) -> None:
+        self.register_challenge = "register-challenge"
+        self.login_challenge = "login-challenge"
+        self.used_challenges: set[str] = set()
+
+    def credential_count(self, session) -> int:
+        return session.query(__import__("zk_zone_agent.db").db.AdminWebAuthnCredential).count()
+
+    def registration_options(self, _session, *, label=None):
+        return {
+            "challenge_id": self.register_challenge,
+            "label": label or "Windows Hello",
+            "publicKey": {
+                "challenge": "abc",
+                "rp": {"name": "ZK Zone Agent", "id": "localhost"},
+                "user": {"id": "abc", "name": "zone-agent-admin", "displayName": "Zone Agent Local Admin"},
+                "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+                "authenticatorSelection": {
+                    "authenticatorAttachment": "platform",
+                    "userVerification": "required",
+                },
+            },
+        }
+
+    def verify_registration(
+        self,
+        session,
+        *,
+        challenge_id,
+        credential,
+        expected_origin,
+        label=None,
+        recovery_password=None,
+    ):
+        db_module = __import__("zk_zone_agent.db").db
+        if challenge_id != self.register_challenge:
+            raise ValueError("Windows Hello challenge was not found.")
+        if challenge_id in self.used_challenges:
+            raise ValueError("Windows Hello challenge was already used.")
+        self.used_challenges.add(challenge_id)
+        admin = session.scalar(select(db_module.LocalAdmin).where(db_module.LocalAdmin.id == 1))
+        if admin is None:
+            from zk_zone_agent.local_security import create_admin
+
+            admin = create_admin(session, recovery_password)
+        row = db_module.AdminWebAuthnCredential(
+            admin_id=admin.id,
+            credential_id=credential.get("id", "fake-credential"),
+            public_key="fake-public-key",
+            sign_count=0,
+            label=label or "Windows Hello",
+            credential_device_type="single_device",
+            credential_backed_up=False,
+        )
+        session.add(row)
+        session.flush()
+        return admin, row
+
+    def authentication_options(self, session):
+        db_module = __import__("zk_zone_agent.db").db
+        if session.query(db_module.AdminWebAuthnCredential).count() == 0:
+            raise ValueError("Windows Hello unlock is not enrolled.")
+        return {
+            "challenge_id": self.login_challenge,
+            "publicKey": {
+                "challenge": "abc",
+                "rpId": "localhost",
+                "allowCredentials": [{"id": "fake-credential", "type": "public-key"}],
+                "userVerification": "required",
+            },
+        }
+
+    def verify_authentication(self, session, *, challenge_id, credential, expected_origin):
+        db_module = __import__("zk_zone_agent.db").db
+        if challenge_id != self.login_challenge:
+            raise ValueError("Windows Hello challenge was not found.")
+        if challenge_id in self.used_challenges:
+            raise ValueError("Windows Hello challenge was already used.")
+        self.used_challenges.add(challenge_id)
+        admin = session.scalar(select(db_module.LocalAdmin).where(db_module.LocalAdmin.id == 1))
+        if admin is None:
+            raise ValueError("Local admin is not configured.")
+        return admin
 
 
 def test_device_save_rejects_invalid_comm_key_without_persisting(monkeypatch, tmp_path):
@@ -246,7 +339,7 @@ def test_existing_setup_can_create_first_admin_after_upgrade(monkeypatch, tmp_pa
 
     with TestClient(web_module.app) as client:
         page = client.get("/setup")
-        assert "Create Admin Unlock" in page.text
+        assert "Create Recovery Password Unlock" in page.text
         response = client.post(
             "/admin/create?next=/setup",
             data={"admin_password": "local-pass", "admin_password_confirm": "local-pass"},
@@ -256,6 +349,174 @@ def test_existing_setup_can_create_first_admin_after_upgrade(monkeypatch, tmp_pa
     assert response.status_code == 303
     with db_module.session_scope() as session:
         assert web_module.admin_exists(session)
+
+
+def test_password_unlock_creation_rejects_blank_password(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+
+    with TestClient(web_module.app) as client:
+        response = client.post(
+            "/admin/create?next=/setup",
+            data={"admin_password": "", "admin_password_confirm": ""},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert "Recovery+password+is+required" in response.headers["location"]
+    with db_module.session_scope() as session:
+        assert not web_module.admin_exists(session)
+
+
+def test_webauthn_passwordless_admin_creation_and_setup(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS", "true")
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    fake_webauthn = FakeWebAuthnSecurity()
+    monkeypatch.setattr(web_module, "webauthn_admin_security", fake_webauthn)
+
+    class FakeHeadOfficeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_time(self):
+            return datetime(2026, 5, 13, 11, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(web_module, "HeadOfficeClient", FakeHeadOfficeClient)
+
+    with TestClient(web_module.app, base_url="http://localhost:7860") as client:
+        page = client.get("/setup")
+        assert "Enroll Windows Hello Admin Unlock" in page.text
+        options = client.post("/api/admin/webauthn/register/options", json={"label": "Front Desk PC"})
+        assert options.status_code == 200
+        verify = client.post(
+            "/api/admin/webauthn/register/verify",
+            json={
+                "challenge_id": options.json()["challenge_id"],
+                "credential": {"id": "fake-credential"},
+                "label": "Front Desk PC",
+                "next": "/setup",
+            },
+        )
+        assert verify.status_code == 200
+        assert "zk_zone_admin" in verify.headers["set-cookie"]
+
+        setup_page = client.get("/setup")
+        csrf = re.search(r'<meta name="csrf-token" content="([^"]+)">', setup_page.text).group(1)
+        setup = client.post(
+            "/setup",
+            data={
+                "csrf_token": csrf,
+                "zone_id": "RWP-ZONE-01",
+                "zone_name": "Rawalpindi Main Office",
+                "head_office_url": "http://localhost:8080",
+                "zone_token": "issued-token",
+                "timezone": "Asia/Karachi",
+                "admin_password": "",
+                "admin_password_confirm": "",
+            },
+            follow_redirects=False,
+        )
+
+    assert setup.status_code == 303
+    with db_module.session_scope() as session:
+        assert web_module.admin_exists(session)
+        assert not web_module.admin_has_recovery_password(session)
+        assert session.query(db_module.AdminWebAuthnCredential).count() == 1
+        assert web_module.config_manager.get(session).zone_token == "issued-token"
+
+
+def test_webauthn_login_unlocks_admin_session(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    fake_webauthn = FakeWebAuthnSecurity()
+    fake_webauthn.used_challenges.add(fake_webauthn.register_challenge)
+    monkeypatch.setattr(web_module, "webauthn_admin_security", fake_webauthn)
+    db_module.init_db()
+    with db_module.session_scope() as session:
+        admin = web_module.create_admin(session)
+        session.add(
+            db_module.AdminWebAuthnCredential(
+                admin_id=admin.id,
+                credential_id="fake-credential",
+                public_key="fake-public-key",
+                sign_count=0,
+                label="Windows Hello",
+            )
+        )
+
+    with TestClient(web_module.app, base_url="http://localhost:7860") as client:
+        options = client.post("/api/admin/webauthn/login/options")
+        assert options.status_code == 200
+        verify = client.post(
+            "/api/admin/webauthn/login/verify",
+            json={
+                "challenge_id": options.json()["challenge_id"],
+                "credential": {"id": "fake-credential"},
+                "next": "/devices",
+            },
+        )
+        assert verify.status_code == 200
+        assert verify.json()["redirect"] == "/devices"
+        page = client.get("/devices")
+
+    assert re.search(r'<meta name="csrf-token" content="([^"]+)">', page.text)
+
+
+def test_existing_password_admin_can_enroll_webauthn(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    fake_webauthn = FakeWebAuthnSecurity()
+    monkeypatch.setattr(web_module, "webauthn_admin_security", fake_webauthn)
+    _create_admin(db_module, web_module)
+
+    with TestClient(web_module.app, base_url="http://localhost:7860") as client:
+        csrf = _unlock(client)
+        options = client.post(
+            "/api/admin/webauthn/register/options",
+            json={"label": "Manager PC"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert options.status_code == 200
+        verify = client.post(
+            "/api/admin/webauthn/register/verify",
+            json={
+                "challenge_id": options.json()["challenge_id"],
+                "credential": {"id": "fake-credential"},
+                "label": "Manager PC",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+    assert verify.status_code == 200
+    with db_module.session_scope() as session:
+        assert session.query(db_module.AdminWebAuthnCredential).count() == 1
+        assert web_module.admin_has_recovery_password(session)
+
+
+def test_webauthn_replayed_challenge_is_rejected(monkeypatch, tmp_path):
+    _db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    fake_webauthn = FakeWebAuthnSecurity()
+    monkeypatch.setattr(web_module, "webauthn_admin_security", fake_webauthn)
+
+    with TestClient(web_module.app, base_url="http://localhost:7860") as client:
+        first = client.post(
+            "/api/admin/webauthn/register/verify",
+            json={
+                "challenge_id": fake_webauthn.register_challenge,
+                "credential": {"id": "fake-credential"},
+            },
+        )
+        setup_page = client.get("/setup")
+        csrf = re.search(r'<meta name="csrf-token" content="([^"]+)">', setup_page.text).group(1)
+        replay = client.post(
+            "/api/admin/webauthn/register/verify",
+            json={
+                "challenge_id": fake_webauthn.register_challenge,
+                "credential": {"id": "fake-credential-2"},
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 400
+    assert "already used" in replay.json()["detail"]
 
 
 def test_recent_attendance_api_returns_live_rows(monkeypatch, tmp_path):

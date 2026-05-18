@@ -42,7 +42,7 @@ Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateFiles 1
 Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateOnline 1"; Flags: runhidden waituntilterminated
 Filename: "{app}\nssm.exe"; Parameters: "set ZKZoneAgentService AppRotateBytes 1048576"; Flags: runhidden waituntilterminated
 Filename: "{app}\nssm.exe"; Parameters: "start ZKZoneAgentService"; StatusMsg: "Starting service..."; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/c start http://127.0.0.1:7860/setup"; Flags: postinstall shellexec skipifsilent
+Filename: "{cmd}"; Parameters: "/c start http://localhost:7860/setup"; Flags: postinstall shellexec skipifsilent
 
 [UninstallRun]
 Filename: "{app}\nssm.exe"; Parameters: "stop ZKZoneAgentService"; Flags: runhidden waituntilterminated

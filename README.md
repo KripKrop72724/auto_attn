@@ -20,10 +20,12 @@ zk-zone-agent --host 127.0.0.1 --port 7860
 
 Then open:
 
-- Zone Agent: <http://127.0.0.1:7860>
+- Zone Agent: <http://localhost:7860>
 - Head Office: <http://127.0.0.1:8080>
 
 Create a zone token from **Head Office → Zones**, then enter it once in the Zone Agent setup screen. Production sync is pinned to `https://head-office-production.up.railway.app`; localhost URLs are only allowed when `ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS=true`.
+
+On Windows, open the Zone Agent through `http://localhost:7860` before enrolling Windows Hello admin unlock. PIN and fingerprint unlocks are WebAuthn credentials scoped to `localhost`; the app does not need or store Windows, Outlook, or Microsoft account passwords.
 
 ## Zone Device Discovery
 

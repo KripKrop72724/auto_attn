@@ -17,6 +17,7 @@ from zk_zone_agent.db import LocalAdmin, ServiceEvent
 SESSION_COOKIE = "zk_zone_admin"
 SESSION_SECONDS = 8 * 60 * 60
 MIN_ADMIN_PASSWORD_LENGTH = 8
+DISABLED_PASSWORD_HASH = "disabled$recovery-password-not-configured"
 
 
 @dataclass(frozen=True)
@@ -57,26 +58,54 @@ def get_admin(session: Session) -> LocalAdmin | None:
     return session.scalar(select(LocalAdmin).where(LocalAdmin.id == 1))
 
 
-def create_admin(session: Session, password: str) -> LocalAdmin:
-    if len(password) < MIN_ADMIN_PASSWORD_LENGTH:
+def recovery_password_configured(admin: LocalAdmin | None) -> bool:
+    return bool(admin and admin.password_hash != DISABLED_PASSWORD_HASH)
+
+
+def admin_has_recovery_password(session: Session) -> bool:
+    return recovery_password_configured(get_admin(session))
+
+
+def create_admin(session: Session, password: str | None = None) -> LocalAdmin:
+    password = password or ""
+    if password and len(password) < MIN_ADMIN_PASSWORD_LENGTH:
         raise ValueError(f"Admin password must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters.")
     existing = get_admin(session)
     if existing is not None:
         raise ValueError("Local admin is already configured.")
     row = LocalAdmin(
         id=1,
-        password_hash=password_hash(password),
+        password_hash=password_hash(password) if password else DISABLED_PASSWORD_HASH,
         session_secret_encrypted=protect_secret(secrets.token_urlsafe(32)),
     )
     session.add(row)
     session.flush()
-    record_security_event(session, "LOCAL_ADMIN_CREATED", "Local admin unlock password was created.")
+    description = (
+        "Local admin recovery password was created."
+        if password
+        else "Local admin was created without a recovery password."
+    )
+    record_security_event(session, "LOCAL_ADMIN_CREATED", description)
     return row
+
+
+def set_recovery_password(session: Session, password: str) -> LocalAdmin:
+    if len(password) < MIN_ADMIN_PASSWORD_LENGTH:
+        raise ValueError(f"Recovery password must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters.")
+    admin = get_admin(session)
+    if admin is None:
+        raise ValueError("Local admin is not configured.")
+    admin.password_hash = password_hash(password)
+    admin.updated_at = utc_now()
+    record_security_event(session, "LOCAL_RECOVERY_PASSWORD_SET", "Local admin recovery password was updated.")
+    return admin
 
 
 def verify_admin_password(session: Session, password: str) -> LocalAdmin | None:
     admin = get_admin(session)
-    if admin is None or not verify_password(password, admin.password_hash):
+    if admin is None or not recovery_password_configured(admin):
+        return None
+    if not verify_password(password, admin.password_hash):
         return None
     admin.failed_login_count = 0
     admin.locked_until = None

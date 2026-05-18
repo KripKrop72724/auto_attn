@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from fastapi import Body, FastAPI, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -35,6 +35,7 @@ from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.head_office_policy import normalize_head_office_url
 from zk_zone_agent.local_security import (
     SESSION_COOKIE,
+    admin_has_recovery_password,
     admin_exists,
     create_admin,
     login_rate_limiter,
@@ -42,6 +43,7 @@ from zk_zone_agent.local_security import (
     manual_action_rate_limiter,
     parse_session,
     record_security_event,
+    set_recovery_password,
     setup_rate_limiter,
     valid_csrf,
     verify_admin_password,
@@ -51,6 +53,12 @@ from zk_zone_agent.settings import settings
 from zk_zone_agent.supervisor import zone_supervisor
 from zk_zone_agent.sync import HeadOfficeClient, sync_queue_writer
 from zk_zone_agent.trusted_time import trusted_time_service
+from zk_zone_agent.webauthn_security import (
+    expected_webauthn_origin,
+    webauthn_admin_security,
+    webauthn_origin_for_request,
+    webauthn_origin_is_canonical,
+)
 
 
 BASE_DIR = Path(__file__).parent
@@ -69,6 +77,25 @@ class BruteForceStartBody(BaseModel):
 
 class DiscoveryRescanBody(BaseModel):
     subnets: list[str] | None = None
+
+
+class WebAuthnRegistrationOptionsBody(BaseModel):
+    label: str | None = None
+
+
+class WebAuthnRegistrationVerifyBody(BaseModel):
+    challenge_id: str
+    credential: dict
+    label: str | None = None
+    recovery_password: str | None = None
+    recovery_password_confirm: str | None = None
+    next: str = "/dashboard"
+
+
+class WebAuthnAuthenticationVerifyBody(BaseModel):
+    challenge_id: str
+    credential: dict
+    next: str = "/dashboard"
 
 
 class LocalWebSocketHub:
@@ -119,10 +146,16 @@ def _client_ip(request: Request) -> str:
 
 def _admin_context(request: Request, session) -> dict:
     admin_session = parse_session(session, request.cookies.get(SESSION_COOKIE))
+    webauthn_credential_count = webauthn_admin_security.credential_count(session)
     return {
         "admin_configured": admin_exists(session),
         "admin_authenticated": admin_session is not None,
         "csrf_token": "" if admin_session is None else admin_session.csrf_token,
+        "recovery_password_configured": admin_has_recovery_password(session),
+        "webauthn_credential_count": webauthn_credential_count,
+        "webauthn_enrolled": webauthn_credential_count > 0,
+        "webauthn_origin_ok": webauthn_origin_is_canonical(request),
+        "webauthn_canonical_url": expected_webauthn_origin(request.url.port, request.url.scheme),
     }
 
 
@@ -140,6 +173,17 @@ def _require_admin_api(request: Request, session, csrf_token: str | None) -> Non
 
 
 def _set_admin_cookie(response: RedirectResponse, admin) -> None:
+    cookie_value, _session = make_session(admin)
+    response.set_cookie(
+        SESSION_COOKIE,
+        cookie_value,
+        httponly=True,
+        samesite="strict",
+        max_age=8 * 60 * 60,
+    )
+
+
+def _set_admin_cookie_on_json(response: JSONResponse, admin) -> None:
     cookie_value, _session = make_session(admin)
     response.set_cookie(
         SESSION_COOKIE,
@@ -191,14 +235,116 @@ def login(request: Request, password: str = Form(...), next: str = Form("/dashbo
         return response
 
 
+@app.post("/api/admin/webauthn/register/options")
+def api_webauthn_register_options(
+    request: Request,
+    body: WebAuthnRegistrationOptionsBody | None = Body(default=None),
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    if not setup_rate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many Windows Hello enrollment attempts.")
+    with session_scope() as session:
+        if admin_exists(session):
+            _require_admin_api(request, session, x_csrf_token)
+        try:
+            options = webauthn_admin_security.registration_options(session, label=None if body is None else body.label)
+        except Exception as exc:
+            record_security_event(session, "LOCAL_WEBAUTHN_REGISTER_OPTIONS_FAILED", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return options
+
+
+@app.post("/api/admin/webauthn/register/verify")
+def api_webauthn_register_verify(
+    request: Request,
+    body: WebAuthnRegistrationVerifyBody,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    if not setup_rate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many Windows Hello enrollment attempts.")
+    recovery_password = (body.recovery_password or "").strip()
+    recovery_password_confirm = (body.recovery_password_confirm or "").strip()
+    if recovery_password or recovery_password_confirm:
+        if recovery_password != recovery_password_confirm:
+            raise HTTPException(status_code=400, detail="Recovery password confirmation does not match.")
+    else:
+        recovery_password = None
+    with session_scope() as session:
+        existing_admin = admin_exists(session)
+        if existing_admin:
+            _require_admin_api(request, session, x_csrf_token)
+            recovery_password = None
+        try:
+            admin, credential = webauthn_admin_security.verify_registration(
+                session,
+                challenge_id=body.challenge_id,
+                credential=body.credential,
+                expected_origin=webauthn_origin_for_request(request),
+                label=body.label,
+                recovery_password=recovery_password,
+            )
+        except Exception as exc:
+            record_security_event(session, "LOCAL_WEBAUTHN_REGISTER_FAILED", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        record_security_event(
+            session,
+            "LOCAL_WEBAUTHN_REGISTERED",
+            f"Windows Hello admin credential enrolled: {credential.label}.",
+        )
+        if recovery_password:
+            record_security_event(
+                session,
+                "LOCAL_RECOVERY_PASSWORD_SET",
+                "Local admin recovery password was configured during Windows Hello enrollment.",
+            )
+        response = JSONResponse({"ok": True, "redirect": _safe_next(body.next)})
+        _set_admin_cookie_on_json(response, admin)
+        return response
+
+
+@app.post("/api/admin/webauthn/login/options")
+def api_webauthn_login_options(request: Request):
+    if not login_rate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again shortly.")
+    with session_scope() as session:
+        try:
+            return webauthn_admin_security.authentication_options(session)
+        except Exception as exc:
+            record_security_event(session, "LOCAL_WEBAUTHN_LOGIN_OPTIONS_FAILED", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/webauthn/login/verify")
+def api_webauthn_login_verify(request: Request, body: WebAuthnAuthenticationVerifyBody):
+    if not login_rate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again shortly.")
+    with session_scope() as session:
+        try:
+            admin = webauthn_admin_security.verify_authentication(
+                session,
+                challenge_id=body.challenge_id,
+                credential=body.credential,
+                expected_origin=webauthn_origin_for_request(request),
+            )
+        except Exception as exc:
+            record_security_event(session, "LOCAL_WEBAUTHN_LOGIN_FAILED", str(exc))
+            raise HTTPException(status_code=400, detail="Windows Hello unlock failed.") from exc
+        record_security_event(session, "LOCAL_WEBAUTHN_LOGIN_SUCCEEDED", "Windows Hello unlocked the UI.")
+        response = JSONResponse({"ok": True, "redirect": _safe_next(body.next)})
+        _set_admin_cookie_on_json(response, admin)
+        return response
+
+
 @app.post("/admin/create")
 def create_first_admin(
     request: Request,
-    admin_password: str = Form(...),
-    admin_password_confirm: str = Form(...),
+    admin_password: str = Form(""),
+    admin_password_confirm: str = Form(""),
 ):
     if not setup_rate_limiter.allow(_client_ip(request)):
         raise HTTPException(status_code=429, detail="Too many setup attempts.")
+    if not admin_password:
+        return _with_error("/setup", "Recovery password is required for password unlock setup.")
     if admin_password != admin_password_confirm:
         return _with_error("/setup", "Admin password confirmation does not match.")
     with session_scope() as session:
@@ -212,6 +358,24 @@ def create_first_admin(
         response = RedirectResponse(_safe_next(request.query_params.get("next")), status_code=303)
         _set_admin_cookie(response, admin)
         return response
+
+
+@app.post("/admin/recovery-password")
+def update_recovery_password(
+    request: Request,
+    recovery_password: str = Form(...),
+    recovery_password_confirm: str = Form(...),
+    csrf_token: str = Form(""),
+):
+    if recovery_password != recovery_password_confirm:
+        return _with_error("/setup", "Recovery password confirmation does not match.")
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        try:
+            set_recovery_password(session, recovery_password)
+        except ValueError as exc:
+            return _with_error("/setup", str(exc))
+    return RedirectResponse("/setup", status_code=303)
 
 
 @app.post("/logout")
@@ -265,6 +429,8 @@ def save_setup(
         if admin_exists(session):
             _require_admin_form(request, session, csrf_token)
         else:
+            if not admin_password:
+                return _with_error("/setup", "Enroll Windows Hello admin unlock before storing setup.")
             if admin_password != admin_password_confirm:
                 return _with_error("/setup", "Admin password confirmation does not match.")
             try:

@@ -17,6 +17,7 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$RepoRoot\build", "$R
   --clean `
   --collect-all zk_zone_agent `
   --collect-all zk_common `
+  --collect-all webauthn `
   --hidden-import win32timezone `
   --console `
   "apps\zone_agent\zk_zone_agent\__main__.py"

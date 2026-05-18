@@ -77,6 +77,35 @@ class LocalAdmin(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class AdminWebAuthnCredential(Base):
+    __tablename__ = "admin_webauthn_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    admin_id: Mapped[int] = mapped_column(Integer, ForeignKey("local_admin.id"), default=1, nullable=False)
+    credential_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    public_key: Mapped[str] = mapped_column(Text, nullable=False)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    aaguid: Mapped[str | None] = mapped_column(String(80))
+    credential_device_type: Mapped[str | None] = mapped_column(String(80))
+    credential_backed_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+    last_used_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class AdminWebAuthnChallenge(Base):
+    __tablename__ = "admin_webauthn_challenges"
+
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    admin_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("local_admin.id"))
+    purpose: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
+    challenge: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    created_at: Mapped[datetime] = utc_column()
+
+
 class Device(Base):
     __tablename__ = "devices"
 

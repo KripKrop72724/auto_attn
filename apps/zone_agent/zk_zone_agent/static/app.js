@@ -63,6 +63,131 @@ async function refreshAttendance() {
 setInterval(refreshAttendance, 3000);
 refreshAttendance();
 
+function base64urlToBuffer(value) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
+function bufferToBase64url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function csrfHeaders() {
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
+  return csrf ? { "X-CSRF-Token": csrf } : {};
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || "Action failed");
+  }
+  return data;
+}
+
+function decodeCreationOptions(publicKey) {
+  publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+  publicKey.user.id = base64urlToBuffer(publicKey.user.id);
+  publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((item) => ({
+    ...item,
+    id: base64urlToBuffer(item.id),
+  }));
+  return publicKey;
+}
+
+function decodeRequestOptions(publicKey) {
+  publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+  publicKey.allowCredentials = (publicKey.allowCredentials || []).map((item) => ({
+    ...item,
+    id: base64urlToBuffer(item.id),
+  }));
+  return publicKey;
+}
+
+function registrationCredentialToJson(credential) {
+  return {
+    id: credential.id,
+    rawId: bufferToBase64url(credential.rawId),
+    type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment,
+    response: {
+      clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+      attestationObject: bufferToBase64url(credential.response.attestationObject),
+      transports: credential.response.getTransports ? credential.response.getTransports() : [],
+    },
+  };
+}
+
+function authenticationCredentialToJson(credential) {
+  return {
+    id: credential.id,
+    rawId: bufferToBase64url(credential.rawId),
+    type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment,
+    response: {
+      clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+      authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+      signature: bufferToBase64url(credential.response.signature),
+      userHandle: credential.response.userHandle ? bufferToBase64url(credential.response.userHandle) : null,
+    },
+  };
+}
+
+async function enrollWindowsHello(form, button) {
+  if (!window.PublicKeyCredential) {
+    throw new Error("Windows Hello unlock is not available in this browser.");
+  }
+  const label = form.querySelector("[data-webauthn-label]")?.value || "Windows Hello";
+  const recoveryPassword = form.querySelector("[data-webauthn-recovery-password]")?.value || "";
+  const recoveryPasswordConfirm = form.querySelector("[data-webauthn-recovery-password-confirm]")?.value || "";
+  const options = await postJson("/api/admin/webauthn/register/options", { label });
+  const credential = await navigator.credentials.create({
+    publicKey: decodeCreationOptions(options.publicKey),
+  });
+  const result = await postJson("/api/admin/webauthn/register/verify", {
+    challenge_id: options.challenge_id,
+    credential: registrationCredentialToJson(credential),
+    label,
+    recovery_password: recoveryPassword,
+    recovery_password_confirm: recoveryPasswordConfirm,
+    next: button.dataset.next || "/setup",
+  });
+  window.location.href = result.redirect || "/setup";
+}
+
+async function unlockWithWindowsHello(form) {
+  if (!window.PublicKeyCredential) {
+    throw new Error("Windows Hello unlock is not available in this browser.");
+  }
+  const next = form.querySelector('input[name="next"]')?.value || "/dashboard";
+  const options = await postJson("/api/admin/webauthn/login/options", {});
+  const credential = await navigator.credentials.get({
+    publicKey: decodeRequestOptions(options.publicKey),
+  });
+  const result = await postJson("/api/admin/webauthn/login/verify", {
+    challenge_id: options.challenge_id,
+    credential: authenticationCredentialToJson(credential),
+    next,
+  });
+  window.location.href = result.redirect || "/dashboard";
+}
+
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-api-post]");
   if (!button) return;
@@ -78,6 +203,40 @@ document.addEventListener("click", async (event) => {
     }
     window.location.reload();
   } finally {
+    button.disabled = false;
+  }
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-webauthn-register]");
+  if (!button) return;
+  event.preventDefault();
+  const form = button.closest("[data-webauthn-register-form]");
+  const status = form?.querySelector("[data-webauthn-status]");
+  if (!form) return;
+  button.disabled = true;
+  if (status) status.textContent = "Waiting for Windows Hello...";
+  try {
+    await enrollWindowsHello(form, button);
+  } catch (error) {
+    if (status) status.textContent = error.message || "Windows Hello enrollment failed";
+    button.disabled = false;
+  }
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-webauthn-login]");
+  if (!button) return;
+  event.preventDefault();
+  const form = button.closest("[data-webauthn-login-form]");
+  const status = form?.querySelector("[data-webauthn-status]");
+  if (!form) return;
+  button.disabled = true;
+  if (status) status.textContent = "Waiting for Windows Hello...";
+  try {
+    await unlockWithWindowsHello(form);
+  } catch (error) {
+    if (status) status.textContent = error.message || "Windows Hello unlock failed";
     button.disabled = false;
   }
 });

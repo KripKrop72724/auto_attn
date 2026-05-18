@@ -15,6 +15,9 @@ The installer:
 - Bundles NSSM and installs `ZKZoneAgentService` with automatic startup
 - Configures NSSM restart-on-failure behavior and log rotation under `C:\ProgramData\ZKZoneAgent\logs`
 - Ships the production Head Office URL default: `https://head-office-production.up.railway.app`
-- Starts the service and opens `http://127.0.0.1:7860/setup`
+- Starts the service and opens `http://localhost:7860/setup`
+
+Windows Hello admin unlock is bound to the local WebAuthn relying party ID `localhost`.
+Use `http://localhost:7860` rather than `http://127.0.0.1:7860` when enrolling or unlocking with PIN or fingerprint.
 
 Local SQLite data is intentionally left behind on uninstall unless an operator removes it manually.

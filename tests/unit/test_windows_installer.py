@@ -11,8 +11,11 @@ def test_windows_installer_uses_nssm_service_wrapper():
     assert "zk-zone-agent-service.exe" not in inno
     assert "AppStdout" in inno
     assert "AppRotateBytes" in inno
+    assert "http://localhost:7860/setup" in inno
+    assert "http://127.0.0.1:7860/setup" not in inno
     assert "remove ZKZoneAgentService confirm" in inno
     assert "nssm.cc/release" in build
     assert "choco install nssm" in build
     assert "Find-NssmExe" in build
     assert "Copy-Item -Force $NssmExe" in build
+    assert "--collect-all webauthn" in build
