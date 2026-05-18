@@ -223,30 +223,34 @@ class EmployeeDeviceMapping(Base):
     device_user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
 
 
-def create_sqlite_engine(database_url: str | None = None) -> Engine:
+def create_database_engine(database_url: str | None = None) -> Engine:
     database_url = database_url or settings.resolved_database_url
+    is_sqlite = database_url.startswith("sqlite")
     if database_url.startswith("sqlite:///"):
         db_path = Path(database_url.removeprefix("sqlite:///"))
         db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
         database_url,
-        connect_args={"check_same_thread": False} if database_url.startswith("sqlite") else {},
+        connect_args={"check_same_thread": False} if is_sqlite else {},
         future=True,
     )
 
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=FULL")
-        cursor.execute("PRAGMA busy_timeout=5000")
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    if is_sqlite:
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=FULL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     return engine
 
 
-engine = create_sqlite_engine()
+create_sqlite_engine = create_database_engine
+
+engine = create_database_engine()
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
 
 

@@ -23,6 +23,16 @@ body {
 nav { display: grid; gap: 6px; }
 nav a { color: #d0d5dd; padding: 9px 10px; text-decoration: none; border-radius: 6px; }
 nav a:hover { background: #1d2939; color: white; }
+.nav-form { margin: 0; }
+.nav-form button {
+  width: 100%;
+  color: #d0d5dd;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  padding: 9px 10px;
+}
+.nav-form button:hover { background: #1d2939; color: white; }
 .content { padding: 28px; min-width: 0; }
 .page-head { margin-bottom: 20px; }
 h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0; }
@@ -35,6 +45,7 @@ input, button { min-height: 38px; border: 1px solid var(--line); border-radius: 
 button { background: white; cursor: pointer; }
 button.primary, .primary { background: var(--accent); color: white; border-color: var(--accent); font-weight: 700; }
 .alert { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
+.alert.danger { background: #fef3f2; color: #b42318; border: 1px solid #fecdca; }
 .alert.success { background: #ecfdf3; color: #027a48; border: 1px solid #abefc6; }
 code { background: #f2f4f7; border: 1px solid var(--line); border-radius: 6px; display: block; margin-top: 8px; padding: 10px; word-break: break-all; }
 .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }

@@ -21,7 +21,7 @@ class ZoneSettings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 7860
     default_timezone: str = "Asia/Karachi"
-    production_head_office_url: str = "https://attnsync.slichealth.com"
+    production_head_office_url: str = "https://head-office-production.up.railway.app"
     allow_dev_head_office_urls: bool = False
     disable_workers: bool = False
     auto_discovery_enabled: bool = True

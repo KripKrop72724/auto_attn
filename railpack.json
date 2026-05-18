@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "steps": {
+    "install": {
+      "inputs": [
+        { "step": "packages:mise" },
+        { "local": true, "include": ["."] }
+      ],
+      "commands": [
+        "python -m venv /app/.venv",
+        "/app/.venv/bin/python -m pip install ."
+      ],
+      "deployOutputs": [{ "include": ["."] }]
+    }
+  },
+  "deploy": {
+    "paths": ["/app/.venv/bin"]
+  }
+}

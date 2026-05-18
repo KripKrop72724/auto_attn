@@ -6,9 +6,10 @@ import io
 import json
 import secrets
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text
@@ -35,6 +36,18 @@ from zk_common.security import (
 )
 from zk_common.time_utils import parse_datetime, utc_now
 from zk_head_office import APP_VERSION
+from zk_head_office.admin_auth import (
+    SESSION_COOKIE,
+    SESSION_SECONDS,
+    admin_auth_enabled,
+    login_rate_limiter,
+    make_session,
+    manual_action_rate_limiter,
+    parse_session,
+    require_auth_config,
+    valid_csrf,
+    verify_admin_login,
+)
 from zk_head_office.db import (
     AttendanceEvent,
     ClockCheck,
@@ -57,6 +70,7 @@ BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    require_auth_config()
     init_db()
     yield
 
@@ -165,8 +179,105 @@ def _record_security_event(
         pass
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _safe_next(value: str | None) -> str:
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return "/"
+    return value
+
+
+def _request_path(request: Request) -> str:
+    path = request.url.path
+    if request.url.query:
+        path = f"{path}?{request.url.query}"
+    return path
+
+
+def _admin_context(request: Request) -> dict:
+    admin_session = parse_session(request.cookies.get(SESSION_COOKIE))
+    return {
+        "admin_auth_required": admin_auth_enabled(),
+        "admin_authenticated": not admin_auth_enabled() or admin_session is not None,
+        "csrf_token": "" if admin_session is None else admin_session.csrf_token,
+    }
+
+
+def _admin_redirect(request: Request) -> RedirectResponse | None:
+    if not admin_auth_enabled() or parse_session(request.cookies.get(SESSION_COOKIE)) is not None:
+        return None
+    return RedirectResponse(f"/login?next={quote_plus(_request_path(request))}", status_code=303)
+
+
+def _require_admin_form(request: Request, csrf_token: str | None) -> None:
+    if not admin_auth_enabled():
+        return
+    if not manual_action_rate_limiter.allow(_client_ip(request)):
+        _record_security_event(request, "HEAD_ADMIN_RATE_LIMIT", None, "Too many admin actions.")
+        raise HTTPException(status_code=429, detail="Too many admin actions.")
+    if not valid_csrf(request.cookies.get(SESSION_COOKIE), csrf_token):
+        _record_security_event(request, "HEAD_ADMIN_CSRF_REJECTED", None, "Admin CSRF validation failed.")
+        raise HTTPException(status_code=403, detail="Admin unlock and CSRF token are required.")
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, error: str | None = None, next: str | None = None):
+    if not admin_auth_enabled():
+        return RedirectResponse("/", status_code=303)
+    if parse_session(request.cookies.get(SESSION_COOKIE)) is not None:
+        return RedirectResponse(_safe_next(next), status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={"error": error, "next": _safe_next(next), **_admin_context(request)},
+    )
+
+
+@app.post("/login")
+def login(request: Request, password: str = Form(...), next: str = Form("/")):
+    if not admin_auth_enabled():
+        return RedirectResponse("/", status_code=303)
+    if not login_rate_limiter.allow(_client_ip(request)):
+        _record_security_event(request, "HEAD_ADMIN_LOGIN_RATE_LIMIT", None, "Too many login attempts.")
+        return RedirectResponse(
+            f"/login?error={quote_plus('Too many login attempts. Try again shortly.')}&next={quote_plus(_safe_next(next))}",
+            status_code=303,
+        )
+    if not verify_admin_login(password):
+        _record_security_event(request, "HEAD_ADMIN_LOGIN_FAILED", None, "Invalid admin password.")
+        return RedirectResponse(
+            f"/login?error={quote_plus('Invalid admin password.')}&next={quote_plus(_safe_next(next))}",
+            status_code=303,
+        )
+    cookie_value, _session = make_session()
+    _record_security_event(request, "HEAD_ADMIN_LOGIN_SUCCEEDED", None, "Head office admin unlocked the UI.")
+    response = RedirectResponse(_safe_next(next), status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        cookie_value,
+        httponly=True,
+        samesite="strict",
+        secure=settings.admin_cookie_secure,
+        max_age=SESSION_SECONDS,
+    )
+    return response
+
+
+@app.post("/logout")
+def logout(request: Request, csrf_token: str = Form("")):
+    _require_admin_form(request, csrf_token)
+    _record_security_event(request, "HEAD_ADMIN_LOGOUT", None, "Head office admin locked the UI.")
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         zones = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
         incidents = session.scalars(select(FraudIncident).order_by(FraudIncident.created_at.desc()).limit(12)).all()
@@ -175,18 +286,31 @@ def dashboard(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context={"zones": zones, "incidents": incidents, "attendance": attendance, "counts": counts},
+        context={
+            "zones": zones,
+            "incidents": incidents,
+            "attendance": attendance,
+            "counts": counts,
+            **_admin_context(request),
+        },
     )
 
 
 @app.get("/zones", response_class=HTMLResponse)
 def zones_page(request: Request, generated_token: str | None = None, token_zone_id: str | None = None):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"rows": rows, "generated_token": generated_token, "token_zone_id": token_zone_id},
+        context={
+            "rows": rows,
+            "generated_token": generated_token,
+            "token_zone_id": token_zone_id,
+            **_admin_context(request),
+        },
     )
 
 
@@ -195,19 +319,27 @@ def issue_zone_token_page(
     request: Request,
     zone_id: str = Form(...),
     zone_name: str = Form(...),
+    csrf_token: str = Form(""),
 ):
+    _require_admin_form(request, csrf_token)
     zone_token = _issue_zone_token(zone_id=zone_id.strip(), zone_name=zone_name.strip())
     with session_scope() as session:
         rows = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"rows": rows, "generated_token": zone_token, "token_zone_id": zone_id.strip()},
+        context={
+            "rows": rows,
+            "generated_token": zone_token,
+            "token_zone_id": zone_id.strip(),
+            **_admin_context(request),
+        },
     )
 
 
 @app.post("/zones/{zone_id}/revoke")
-def revoke_zone_token(zone_id: str):
+def revoke_zone_token(request: Request, zone_id: str, csrf_token: str = Form("")):
+    _require_admin_form(request, csrf_token)
     with session_scope() as session:
         zone = session.scalar(select(Zone).where(Zone.zone_id == zone_id))
         if zone is None:
@@ -219,48 +351,78 @@ def revoke_zone_token(zone_id: str):
 
 
 def zones_page_redirect():
-    from fastapi.responses import RedirectResponse
-
     return RedirectResponse("/zones", status_code=303)
 
 
 @app.get("/devices", response_class=HTMLResponse)
 def devices_page(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(Device).order_by(Device.zone_id.asc(), Device.device_id.asc())).all()
-    return templates.TemplateResponse(request=request, name="devices.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="devices.html",
+        context={"rows": rows, **_admin_context(request)},
+    )
 
 
 @app.get("/attendance", response_class=HTMLResponse)
 def attendance_page(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(500)).all()
-    return templates.TemplateResponse(request=request, name="attendance.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="attendance.html",
+        context={"rows": rows, **_admin_context(request)},
+    )
 
 
 @app.get("/incidents", response_class=HTMLResponse)
 def incidents_page(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(FraudIncident).order_by(FraudIncident.created_at.desc()).limit(500)).all()
-    return templates.TemplateResponse(request=request, name="incidents.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="incidents.html",
+        context={"rows": rows, **_admin_context(request)},
+    )
 
 
 @app.get("/clock", response_class=HTMLResponse)
 def clock_page(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(ClockCheck).order_by(ClockCheck.created_at.desc()).limit(500)).all()
-    return templates.TemplateResponse(request=request, name="clock.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="clock.html",
+        context={"rows": rows, **_admin_context(request)},
+    )
 
 
 @app.get("/outages", response_class=HTMLResponse)
 def outages_page(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(OutagePeriod).order_by(OutagePeriod.created_at.desc()).limit(500)).all()
-    return templates.TemplateResponse(request=request, name="outages.html", context={"rows": rows})
+    return templates.TemplateResponse(
+        request=request,
+        name="outages.html",
+        context={"rows": rows, **_admin_context(request)},
+    )
 
 
 @app.get("/reports/attendance.csv")
-def attendance_csv():
+def attendance_csv(request: Request):
+    if redirect := _admin_redirect(request):
+        return redirect
     with session_scope() as session:
         rows = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.asc())).all()
         output = io.StringIO()

@@ -23,7 +23,7 @@ Then open:
 - Zone Agent: <http://127.0.0.1:7860>
 - Head Office: <http://127.0.0.1:8080>
 
-Create a zone token from **Head Office → Zones**, then enter it once in the Zone Agent setup screen. Production sync is pinned to `https://attnsync.slichealth.com`; localhost URLs are only allowed when `ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS=true`.
+Create a zone token from **Head Office → Zones**, then enter it once in the Zone Agent setup screen. Production sync is pinned to `https://head-office-production.up.railway.app`; localhost URLs are only allowed when `ZK_ZONE_ALLOW_DEV_HEAD_OFFICE_URLS=true`.
 
 ## Zone Device Discovery
 
@@ -61,4 +61,4 @@ git push origin v0.1.0
 - The zone agent stores mutable local state under `local-data/zone-agent` by default on non-Windows systems and under `C:\ProgramData\ZKZoneAgent` on Windows.
 - `pyzk` is used through an adapter (`ZKClient`) so tests can run with fake devices and hardware access remains isolated.
 - `pyzk` is GPL-2.0; review licensing before commercial redistribution.
-- SQLite is intentional for the POC. Head office should move to PostgreSQL for production.
+- SQLite is intentional for branch/zone local state. Head Office production runs on Railway PostgreSQL.

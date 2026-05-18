@@ -32,3 +32,10 @@ a real zone token.
 2. Agent stores server UTC and `time.monotonic_ns()`.
 3. During internet outage, trusted time advances from monotonic elapsed time.
 4. Windows wall-clock movement is compared against monotonic elapsed time and creates `ZONE_PC_CLOCK_TAMPER` when it jumps over 15 seconds.
+
+## Production Head Office
+
+- Railway project: `zk-head-office-prod`
+- Railway service: `head-office`
+- Canonical branch sync URL: `https://head-office-production.up.railway.app`
+- Existing branch installs must either upgrade to a build with that default or set `ZK_ZONE_PRODUCTION_HEAD_OFFICE_URL=https://head-office-production.up.railway.app` before setup/reset.

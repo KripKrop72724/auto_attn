@@ -144,7 +144,7 @@ def test_setup_stores_token_once_and_encrypts_secret(monkeypatch, tmp_path):
             data={
                 "zone_id": "RWP-ZONE-01",
                 "zone_name": "Rawalpindi Main Office",
-                "head_office_url": "https://attnsync.slichealth.com",
+                "head_office_url": "https://head-office-production.up.railway.app",
                 "zone_token": "issued-token",
                 "timezone": "Asia/Karachi",
                 "admin_password": "local-pass",
@@ -161,7 +161,7 @@ def test_setup_stores_token_once_and_encrypts_secret(monkeypatch, tmp_path):
                 "csrf_token": csrf,
                 "zone_id": "RWP-ZONE-01",
                 "zone_name": "Rawalpindi Main Office",
-                "head_office_url": "https://attnsync.slichealth.com",
+                "head_office_url": "https://head-office-production.up.railway.app",
                 "zone_token": "replacement-token",
                 "timezone": "Asia/Karachi",
             },

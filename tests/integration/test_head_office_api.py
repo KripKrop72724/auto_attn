@@ -6,7 +6,7 @@ import secrets
 from fastapi.testclient import TestClient
 
 from zk_common.hashing import canonical_json
-from zk_common.security import body_sha256, sign_request, signed_timestamp
+from zk_common.security import body_sha256, password_hash, sign_request, signed_timestamp
 
 
 def _signed_headers(token: str, zone_id: str, method: str, path: str, body: bytes, *, nonce: str | None = None):
@@ -43,6 +43,13 @@ def _issue_token(client: TestClient, zone_id: str = "RWP-ZONE-01", zone_name: st
     match = re.search(r"<code>([^<]+)</code>", response.text)
     assert match
     return match.group(1)
+
+
+def _csrf_from_page(response) -> str:
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)">', response.text)
+    assert match
+    return match.group(1)
+
 
 def test_register_heartbeat_and_attendance_sync(monkeypatch, tmp_path):
     monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
@@ -156,3 +163,66 @@ def test_signed_sync_rejects_bad_signature_replay_wrong_zone_and_revoked_token(m
         assert revoke.status_code == 303
         revoked = _post_signed(client, "/api/zones/heartbeat", token, "RWP-ZONE-01", payload)
         assert revoked.status_code == 401
+
+
+def test_head_office_admin_auth_protects_dashboard_and_token_controls(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
+    monkeypatch.setenv("ZK_HEAD_REQUIRE_ADMIN_AUTH", "true")
+    monkeypatch.setenv("ZK_HEAD_ADMIN_PASSWORD_HASH", password_hash("head-office-pass"))
+    monkeypatch.setenv("ZK_HEAD_SESSION_SECRET", "test-head-office-session-secret")
+    import zk_head_office.settings as settings_module
+    import zk_head_office.db as db_module
+    import zk_head_office.admin_auth as auth_module
+    import zk_head_office.web as web_module
+
+    importlib.reload(settings_module)
+    importlib.reload(db_module)
+    importlib.reload(auth_module)
+    web_module = importlib.reload(web_module)
+    with TestClient(web_module.app) as client:
+        health = client.get("/api/health")
+        assert health.status_code == 200
+
+        zones_locked = client.get("/zones", follow_redirects=False)
+        assert zones_locked.status_code == 303
+        assert zones_locked.headers["location"].startswith("/login")
+
+        unauth_token = client.post(
+            "/zones/token",
+            data={"zone_id": "RWP-ZONE-01", "zone_name": "Rawalpindi"},
+        )
+        assert unauth_token.status_code == 403
+
+        login = client.post(
+            "/login",
+            data={"password": "head-office-pass", "next": "/zones"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+
+        zones_page = client.get("/zones")
+        assert zones_page.status_code == 200
+        assert 'href="/static/app.css"' in zones_page.text
+        assert "http://testserver/static/app.css" not in zones_page.text
+        csrf_token = _csrf_from_page(zones_page)
+
+        token_response = client.post(
+            "/zones/token",
+            data={
+                "csrf_token": csrf_token,
+                "zone_id": "RWP-ZONE-01",
+                "zone_name": "Rawalpindi",
+            },
+        )
+        assert token_response.status_code == 200
+        assert re.search(r"<code>([^<]+)</code>", token_response.text)
+
+        revoke_without_csrf = client.post("/zones/RWP-ZONE-01/revoke")
+        assert revoke_without_csrf.status_code == 403
+
+        revoke = client.post(
+            "/zones/RWP-ZONE-01/revoke",
+            data={"csrf_token": csrf_token},
+            follow_redirects=False,
+        )
+        assert revoke.status_code == 303

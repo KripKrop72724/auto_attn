@@ -8,6 +8,7 @@
   </div>
 {% endif %}
 <form class="panel form inline-form" method="post" action="/zones/token">
+  {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
   <input name="zone_id" placeholder="RWP-ZONE-01" required>
   <input name="zone_name" placeholder="Rawalpindi Main Office" required>
   <button class="primary" type="submit">Generate Zone Token</button>
@@ -30,6 +31,7 @@
   <td>{{ row.created_at }}</td>
   <td>
     <form method="post" action="/zones/{{ row.zone_id }}/revoke">
+      {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
       <button type="submit">Revoke</button>
     </form>
   </td>
