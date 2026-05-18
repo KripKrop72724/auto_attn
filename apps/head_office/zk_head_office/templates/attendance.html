@@ -1,10 +1,12 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Attendance</h1><p>Final records after head-office validation.</p></section>
+{{ ui.timeline_filters('/attendance', filters, filter_choices, csv_url) }}
 <div class="table-wrap"><table>
 <thead><tr><th>Device Time</th><th>HO Received</th><th>Zone</th><th>User</th><th>Device</th><th>Source</th><th>Zone Trust</th><th>Final Trust</th><th>Score</th><th>Reason</th></tr></thead>
 <tbody>{% for row in rows %}
-<tr><td>{{ row.device_event_time }}</td><td>{{ row.head_office_received_time }}</td><td>{{ row.zone_id }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.source_type }}</td><td>{{ row.zone_claimed_trust_status }}</td><td>{{ row.head_office_final_trust_status }}</td><td>{{ row.fraud_score }}</td><td>{{ row.fraud_reason or '' }}</td></tr>
+<tr><td>{{ ui.ts(row.device_event_time) }}</td><td>{{ ui.ts(row.head_office_received_time) }}</td><td>{{ row.zone_id }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.source_type }}</td><td>{{ row.zone_claimed_trust_status }}</td><td>{{ row.head_office_final_trust_status }}</td><td>{{ row.fraud_score }}</td><td>{{ row.fraud_reason or '' }}</td></tr>
 {% else %}<tr><td colspan="10">No attendance synced.</td></tr>{% endfor %}</tbody>
 </table></div>
 {% endblock %}

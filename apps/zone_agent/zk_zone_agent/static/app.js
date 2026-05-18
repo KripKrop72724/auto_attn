@@ -1,3 +1,80 @@
+const TIME_FORMAT_KEY = "zk-time-format";
+
+function selectedTimeFormat() {
+  const saved = window.localStorage.getItem(TIME_FORMAT_KEY);
+  return saved === "12" ? "12" : "24";
+}
+
+function datePartsFor(value, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${lookup.year}-${lookup.month}-${lookup.day}`;
+}
+
+function timeFor(value, timeZone, format) {
+  const options = {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: format === "12",
+  };
+  return new Intl.DateTimeFormat(format === "12" ? "en-US" : "en-GB", options).format(value);
+}
+
+function renderTimestampElement(element, format = selectedTimeFormat()) {
+  const value = element.dataset.timestamp;
+  if (!value) return;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return;
+  const timeZone = element.dataset.timezone || document.body.dataset.displayTimezone || "UTC";
+  const datePart = element.querySelector("[data-date-part]");
+  const timePart = element.querySelector("[data-time-part]");
+  if (datePart) datePart.textContent = datePartsFor(date, timeZone);
+  if (timePart) timePart.textContent = timeFor(date, timeZone, format);
+}
+
+function renderTimestampElements(root = document) {
+  const format = selectedTimeFormat();
+  root.querySelectorAll("[data-timestamp]").forEach((element) => renderTimestampElement(element, format));
+  document.querySelectorAll("[data-time-format-option]").forEach((button) => {
+    const active = button.dataset.timeFormatOption === format;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function createTimestampElement(value, timeZone) {
+  if (!value) return document.createTextNode("-");
+  const element = document.createElement("time");
+  element.dataset.timestamp = value;
+  element.dataset.timezone = timeZone || document.body.dataset.displayTimezone || "UTC";
+  const datePart = document.createElement("span");
+  datePart.dataset.datePart = "";
+  const timePart = document.createElement("span");
+  timePart.dataset.timePart = "";
+  element.append(datePart, timePart);
+  renderTimestampElement(element);
+  return element;
+}
+
+function initTimeFormatToggle() {
+  document.querySelectorAll("[data-time-format-option]").forEach((button) => {
+    button.addEventListener("click", () => {
+      window.localStorage.setItem(TIME_FORMAT_KEY, button.dataset.timeFormatOption || "24");
+      renderTimestampElements();
+    });
+  });
+  renderTimestampElements();
+}
+
+document.addEventListener("DOMContentLoaded", initTimeFormatToggle);
+
 async function refreshStatus() {
   const badge = document.querySelector("[data-status-json]");
   if (!badge) return;
@@ -17,7 +94,13 @@ function appendCell(row, value) {
   row.appendChild(cell);
 }
 
-function renderAttendanceRows(rows) {
+function appendTimestampCell(row, value, timeZone) {
+  const cell = document.createElement("td");
+  cell.appendChild(createTimestampElement(value, timeZone));
+  row.appendChild(cell);
+}
+
+function renderAttendanceRows(rows, timeZone) {
   const body = document.querySelector("[data-attendance-body]");
   if (!body) return;
   body.replaceChildren();
@@ -33,8 +116,8 @@ function renderAttendanceRows(rows) {
   }
   for (const item of rows) {
     const row = document.createElement("tr");
-    appendCell(row, item.device_event_time);
-    appendCell(row, item.zone_trusted_time);
+    appendTimestampCell(row, item.device_event_time, timeZone);
+    appendTimestampCell(row, item.zone_trusted_time, timeZone);
     appendCell(row, item.user);
     appendCell(row, item.device_id);
     appendCell(row, item.source_type);
@@ -50,11 +133,18 @@ async function refreshAttendance() {
   if (!body) return;
   const status = document.querySelector("[data-attendance-refresh]");
   try {
-    const res = await fetch("/api/attendance/recent?limit=200");
+    const params = new URLSearchParams(window.location.search);
+    params.set("limit", "200");
+    const res = await fetch(`/api/attendance/recent?${params.toString()}`);
     if (!res.ok) throw new Error("Attendance refresh failed");
     const data = await res.json();
-    renderAttendanceRows(data.rows || []);
-    if (status) status.textContent = `Last refreshed ${data.server_time}`;
+    renderAttendanceRows(data.rows || [], data.display_timezone);
+    if (status) {
+      status.replaceChildren(
+        document.createTextNode("Last refreshed "),
+        createTimestampElement(data.server_time, data.display_timezone),
+      );
+    }
   } catch {
     if (status) status.textContent = "Realtime refresh unavailable";
   }

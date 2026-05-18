@@ -1,11 +1,13 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Service Logs</h1><p>Service lifecycle events.</p></section>
+{{ ui.timeline_filters('/logs', filters, filter_choices) }}
 <div class="table-wrap"><table>
 <thead><tr><th>Time</th><th>Event</th><th>Description</th></tr></thead>
 <tbody>
 {% for row in rows %}
-<tr><td>{{ row.created_at }}</td><td>{{ row.event_type }}</td><td>{{ row.description or '' }}</td></tr>
+<tr><td>{{ ui.ts(row.created_at) }}</td><td>{{ row.event_type }}</td><td>{{ row.description or '' }}</td></tr>
 {% else %}<tr><td colspan="3">No service events.</td></tr>{% endfor %}
 </tbody></table></div>
 {% endblock %}

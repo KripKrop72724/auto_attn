@@ -1,10 +1,12 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Clock Tamper Timeline</h1><p>Clock checks received from zone agents.</p></section>
+{{ ui.timeline_filters('/clock', filters, filter_choices) }}
 <div class="table-wrap"><table>
 <thead><tr><th>Time</th><th>Zone</th><th>Device</th><th>Device Time</th><th>Trusted Time</th><th>Drift</th><th>Jump</th><th>Status</th><th>Reason</th></tr></thead>
 <tbody>{% for row in rows %}
-<tr><td>{{ row.created_at }}</td><td>{{ row.zone_id }}</td><td>{{ row.device_id }}</td><td>{{ row.device_time or '-' }}</td><td>{{ row.trusted_time }}</td><td>{{ row.drift_seconds if row.drift_seconds is not none else '-' }}</td><td>{{ row.jump_seconds if row.jump_seconds is not none else '-' }}</td><td>{{ row.status }}</td><td>{{ row.reason or '' }}</td></tr>
+<tr><td>{{ ui.ts(row.created_at) }}</td><td>{{ row.zone_id }}</td><td>{{ row.device_id }}</td><td>{{ ui.ts(row.device_time) }}</td><td>{{ ui.ts(row.trusted_time) }}</td><td>{{ row.drift_seconds if row.drift_seconds is not none else '-' }}</td><td>{{ row.jump_seconds if row.jump_seconds is not none else '-' }}</td><td>{{ row.status }}</td><td>{{ row.reason or '' }}</td></tr>
 {% else %}<tr><td colspan="9">No clock checks synced.</td></tr>{% endfor %}</tbody>
 </table></div>
 {% endblock %}

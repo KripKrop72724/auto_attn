@@ -8,9 +8,13 @@
     <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
     <script defer src="{{ url_for('static', path='/app.js') }}"></script>
   </head>
-  <body>
+  <body data-display-timezone="{{ display_timezone or 'UTC' }}">
     <aside class="sidebar">
       <div class="brand">ZK Zone Agent</div>
+      <div class="time-toggle" role="group" aria-label="Time format">
+        <button type="button" data-time-format-option="24">24h</button>
+        <button type="button" data-time-format-option="12">12h</button>
+      </div>
       <nav>
         <a href="/dashboard">Status</a>
         <a href="/setup">Setup</a>

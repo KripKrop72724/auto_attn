@@ -64,3 +64,4 @@ git push origin vX.Y.Z
 - `pyzk` is used through an adapter (`ZKClient`) so tests can run with fake devices and hardware access remains isolated.
 - `pyzk` is GPL-2.0; review licensing before commercial redistribution.
 - SQLite is intentional for branch/zone local state. Head Office production runs on Railway PostgreSQL.
+- Head Office timeline filters and timestamp display use `ZK_HEAD_DISPLAY_TIMEZONE`, defaulting to `Asia/Karachi`; Zone Agent UI uses the configured zone timezone.

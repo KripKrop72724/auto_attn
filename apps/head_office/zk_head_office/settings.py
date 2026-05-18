@@ -18,6 +18,7 @@ class HeadOfficeSettings(BaseSettings):
     admin_password_hash: str | None = None
     session_secret: str | None = None
     admin_cookie_secure: bool = False
+    display_timezone: str = "Asia/Karachi"
 
     @property
     def sqlite_path(self) -> Path:

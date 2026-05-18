@@ -35,6 +35,13 @@ from zk_common.security import (
     verify_token,
 )
 from zk_common.time_utils import parse_datetime, utc_now
+from zk_common.ui_time import (
+    apply_timeline_date_filter,
+    filter_context,
+    selected_query_values,
+    timeline_date_filter,
+    timestamp_view,
+)
 from zk_head_office import APP_VERSION
 from zk_head_office.admin_auth import (
     SESSION_COOKIE,
@@ -68,6 +75,8 @@ from zk_head_office.validation import final_trust_status
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+templates.env.globals["timestamp_view"] = timestamp_view
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     require_auth_config()
@@ -202,6 +211,7 @@ def _admin_context(request: Request) -> dict:
         "admin_auth_required": admin_auth_enabled(),
         "admin_authenticated": not admin_auth_enabled() or admin_session is not None,
         "csrf_token": "" if admin_session is None else admin_session.csrf_token,
+        "display_timezone": settings.display_timezone,
     }
 
 
@@ -209,6 +219,45 @@ def _admin_redirect(request: Request) -> RedirectResponse | None:
     if not admin_auth_enabled() or parse_session(request.cookies.get(SESSION_COOKIE)) is not None:
         return None
     return RedirectResponse(f"/login?next={quote_plus(_request_path(request))}", status_code=303)
+
+
+def _timeline_filter(request: Request):
+    return timeline_date_filter(request.query_params, timezone_name=settings.display_timezone)
+
+
+def _filters_context(date_filter, selected: dict[str, str], choices: dict[str, list[dict[str, str]]] | None = None):
+    return {
+        "filters": filter_context(date_filter, selected),
+        "filter_choices": choices or {},
+        "display_timezone": date_filter.display_timezone,
+    }
+
+
+def _current_query_path(request: Request, path: str) -> str:
+    return f"{path}?{request.url.query}" if request.url.query else path
+
+
+def _apply_selected(statement, selected: dict[str, str], columns: dict[str, object]):
+    for key, column in columns.items():
+        if value := selected.get(key):
+            statement = statement.where(column == value)
+    return statement
+
+
+def _option(value: str, label: str | None = None) -> dict[str, str]:
+    return {"value": value, "label": label or value}
+
+
+def _distinct_options(session: Session, column) -> list[dict[str, str]]:
+    values = session.scalars(
+        select(column).where(column.is_not(None)).distinct().order_by(column.asc())
+    ).all()
+    return [_option(str(value)) for value in values if str(value).strip()]
+
+
+def _zone_options(session: Session) -> list[dict[str, str]]:
+    rows = session.scalars(select(Zone).order_by(Zone.zone_name.asc(), Zone.zone_id.asc())).all()
+    return [_option(row.zone_id, f"{row.zone_name} ({row.zone_id})") for row in rows]
 
 
 def _require_admin_form(request: Request, csrf_token: str | None) -> None:
@@ -278,11 +327,29 @@ def logout(request: Request, csrf_token: str = Form("")):
 def dashboard(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(request.query_params, ["zone_id"])
     with session_scope() as session:
-        zones = session.scalars(select(Zone).order_by(Zone.zone_name.asc())).all()
-        incidents = session.scalars(select(FraudIncident).order_by(FraudIncident.created_at.desc()).limit(12)).all()
-        attendance = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(20)).all()
+        zones_stmt = select(Zone).order_by(Zone.zone_name.asc())
+        if selected.get("zone_id"):
+            zones_stmt = zones_stmt.where(Zone.zone_id == selected["zone_id"])
+        zones = session.scalars(zones_stmt).all()
+        incidents_stmt = apply_timeline_date_filter(
+            select(FraudIncident).order_by(FraudIncident.created_at.desc()),
+            FraudIncident.created_at,
+            date_filter,
+        )
+        incidents_stmt = _apply_selected(incidents_stmt, selected, {"zone_id": FraudIncident.zone_id})
+        incidents = session.scalars(incidents_stmt.limit(12)).all()
+        attendance_stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.desc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        attendance_stmt = _apply_selected(attendance_stmt, selected, {"zone_id": AttendanceEvent.zone_id})
+        attendance = session.scalars(attendance_stmt.limit(20)).all()
         counts = _counts(session)
+        choices = {"zones": _zone_options(session)}
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -291,6 +358,7 @@ def dashboard(request: Request):
             "incidents": incidents,
             "attendance": attendance,
             "counts": counts,
+            **_filters_context(date_filter, selected, choices),
             **_admin_context(request),
         },
     )
@@ -371,12 +439,43 @@ def devices_page(request: Request):
 def attendance_page(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(
+        request.query_params,
+        ["zone_id", "device_id", "source_type", "trust_status"],
+    )
     with session_scope() as session:
-        rows = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(500)).all()
+        stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.desc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "zone_id": AttendanceEvent.zone_id,
+                "device_id": AttendanceEvent.device_id,
+                "source_type": AttendanceEvent.source_type,
+                "trust_status": AttendanceEvent.head_office_final_trust_status,
+            },
+        )
+        rows = session.scalars(stmt.limit(500)).all()
+        choices = {
+            "zones": _zone_options(session),
+            "devices": _distinct_options(session, AttendanceEvent.device_id),
+            "source_types": _distinct_options(session, AttendanceEvent.source_type),
+            "trust_statuses": _distinct_options(session, AttendanceEvent.head_office_final_trust_status),
+        }
     return templates.TemplateResponse(
         request=request,
         name="attendance.html",
-        context={"rows": rows, **_admin_context(request)},
+        context={
+            "rows": rows,
+            "csv_url": _current_query_path(request, "/reports/attendance.csv"),
+            **_filters_context(date_filter, selected, choices),
+            **_admin_context(request),
+        },
     )
 
 
@@ -384,12 +483,38 @@ def attendance_page(request: Request):
 def incidents_page(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(
+        request.query_params,
+        ["zone_id", "device_id", "severity", "incident_type"],
+    )
     with session_scope() as session:
-        rows = session.scalars(select(FraudIncident).order_by(FraudIncident.created_at.desc()).limit(500)).all()
+        stmt = apply_timeline_date_filter(
+            select(FraudIncident).order_by(FraudIncident.created_at.desc()),
+            FraudIncident.created_at,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "zone_id": FraudIncident.zone_id,
+                "device_id": FraudIncident.device_id,
+                "severity": FraudIncident.severity,
+                "incident_type": FraudIncident.incident_type,
+            },
+        )
+        rows = session.scalars(stmt.limit(500)).all()
+        choices = {
+            "zones": _zone_options(session),
+            "devices": _distinct_options(session, FraudIncident.device_id),
+            "severities": _distinct_options(session, FraudIncident.severity),
+            "incident_types": _distinct_options(session, FraudIncident.incident_type),
+        }
     return templates.TemplateResponse(
         request=request,
         name="incidents.html",
-        context={"rows": rows, **_admin_context(request)},
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **_admin_context(request)},
     )
 
 
@@ -397,12 +522,29 @@ def incidents_page(request: Request):
 def clock_page(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(request.query_params, ["zone_id", "device_id", "status"])
     with session_scope() as session:
-        rows = session.scalars(select(ClockCheck).order_by(ClockCheck.created_at.desc()).limit(500)).all()
+        stmt = apply_timeline_date_filter(
+            select(ClockCheck).order_by(ClockCheck.trusted_time.desc()),
+            ClockCheck.trusted_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {"zone_id": ClockCheck.zone_id, "device_id": ClockCheck.device_id, "status": ClockCheck.status},
+        )
+        rows = session.scalars(stmt.limit(500)).all()
+        choices = {
+            "zones": _zone_options(session),
+            "devices": _distinct_options(session, ClockCheck.device_id),
+            "statuses": _distinct_options(session, ClockCheck.status),
+        }
     return templates.TemplateResponse(
         request=request,
         name="clock.html",
-        context={"rows": rows, **_admin_context(request)},
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **_admin_context(request)},
     )
 
 
@@ -410,12 +552,33 @@ def clock_page(request: Request):
 def outages_page(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(request.query_params, ["zone_id", "device_id", "outage_type"])
     with session_scope() as session:
-        rows = session.scalars(select(OutagePeriod).order_by(OutagePeriod.created_at.desc()).limit(500)).all()
+        stmt = apply_timeline_date_filter(
+            select(OutagePeriod).order_by(OutagePeriod.start_time.desc()),
+            OutagePeriod.start_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "zone_id": OutagePeriod.zone_id,
+                "device_id": OutagePeriod.device_id,
+                "outage_type": OutagePeriod.outage_type,
+            },
+        )
+        rows = session.scalars(stmt.limit(500)).all()
+        choices = {
+            "zones": _zone_options(session),
+            "devices": _distinct_options(session, OutagePeriod.device_id),
+            "outage_types": _distinct_options(session, OutagePeriod.outage_type),
+        }
     return templates.TemplateResponse(
         request=request,
         name="outages.html",
-        context={"rows": rows, **_admin_context(request)},
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **_admin_context(request)},
     )
 
 
@@ -423,8 +586,28 @@ def outages_page(request: Request):
 def attendance_csv(request: Request):
     if redirect := _admin_redirect(request):
         return redirect
+    date_filter = _timeline_filter(request)
+    selected = selected_query_values(
+        request.query_params,
+        ["zone_id", "device_id", "source_type", "trust_status"],
+    )
     with session_scope() as session:
-        rows = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.asc())).all()
+        stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.asc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "zone_id": AttendanceEvent.zone_id,
+                "device_id": AttendanceEvent.device_id,
+                "source_type": AttendanceEvent.source_type,
+                "trust_status": AttendanceEvent.head_office_final_trust_status,
+            },
+        )
+        rows = session.scalars(stmt).all()
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(

@@ -124,6 +124,112 @@ def test_register_heartbeat_and_attendance_sync(monkeypatch, tmp_path):
         assert sync.json()["acked_event_uids"] == ["event-1"]
 
 
+def test_head_office_timeline_filters_and_clean_timestamp_markup(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
+    import zk_head_office.settings as settings_module
+    import zk_head_office.db as db_module
+    import zk_head_office.web as web_module
+
+    importlib.reload(settings_module)
+    db_module = importlib.reload(db_module)
+    web_module = importlib.reload(web_module)
+    inside = datetime(2026, 5, 18, 6, 30, 5, tzinfo=timezone.utc)
+    outside = datetime(2026, 5, 18, 20, 0, tzinfo=timezone.utc)
+    with TestClient(web_module.app) as client:
+        with db_module.session_scope() as session:
+            session.add_all(
+                [
+                    db_module.Zone(zone_id="ZONE-A", zone_name="Zone A", token_hash="hash-a"),
+                    db_module.Zone(zone_id="ZONE-B", zone_name="Zone B", token_hash="hash-b"),
+                    db_module.AttendanceEvent(
+                        event_uid="event-1",
+                        zone_id="ZONE-A",
+                        device_id="DEV-1",
+                        user_id="5",
+                        employee_name="Ali",
+                        device_event_time=inside,
+                        zone_trusted_time=inside,
+                        head_office_received_time=inside,
+                        zone_claimed_trust_status="TRUSTED_LIVE",
+                        head_office_final_trust_status="TRUSTED",
+                        source_type="LIVE",
+                    ),
+                    db_module.AttendanceEvent(
+                        event_uid="event-2",
+                        zone_id="ZONE-B",
+                        device_id="DEV-2",
+                        user_id="6",
+                        employee_name="Sara",
+                        device_event_time=outside,
+                        zone_trusted_time=outside,
+                        head_office_received_time=outside,
+                        zone_claimed_trust_status="SUSPECT",
+                        head_office_final_trust_status="SUSPECT",
+                        source_type="DUMP_RECONNECT",
+                    ),
+                    db_module.ClockCheck(
+                        zone_id="ZONE-A",
+                        device_id="DEV-1",
+                        device_time=inside,
+                        trusted_time=inside,
+                        windows_wall_time=inside,
+                        monotonic_ns=1,
+                        status="OK",
+                        reason="Clock ok.",
+                    ),
+                    db_module.OutagePeriod(
+                        zone_id="ZONE-A",
+                        device_id="DEV-1",
+                        outage_type="DEVICE_LAN_OUTAGE",
+                        start_time=inside,
+                        classification="LAN_DEVICE_OFFLINE",
+                    ),
+                    db_module.FraudIncident(
+                        zone_id="ZONE-A",
+                        device_id="DEV-1",
+                        incident_type="CLOCK_DRIFT",
+                        severity="HIGH",
+                        description="Clock drift.",
+                        created_at=inside,
+                    ),
+                ]
+            )
+
+        query = (
+            "date_preset=custom&from_date=2026-05-18&to_date=2026-05-18"
+            "&zone_id=ZONE-A&device_id=DEV-1"
+        )
+        attendance = client.get(f"/attendance?{query}&source_type=LIVE&trust_status=TRUSTED")
+        assert attendance.status_code == 200
+        assert "Ali" in attendance.text
+        assert "Sara" not in attendance.text
+        assert 'data-timestamp="2026-05-18T06:30:05Z"' in attendance.text
+        assert "11:30:05" in attendance.text
+        assert ">2026-05-18T06:30:05" not in attendance.text
+        assert 'data-time-format-option="24"' in attendance.text
+        assert 'name="date_preset"' in attendance.text
+
+        csv_export = client.get(f"/reports/attendance.csv?{query}&source_type=LIVE&trust_status=TRUSTED")
+        assert csv_export.status_code == 200
+        assert "event-1" in csv_export.text
+        assert "event-2" not in csv_export.text
+
+        clock = client.get(f"/clock?{query}&status=OK")
+        assert clock.status_code == 200
+        assert "Clock ok." in clock.text
+        assert "11:30:05" in clock.text
+
+        outages = client.get(f"/outages?{query}&outage_type=DEVICE_LAN_OUTAGE")
+        assert outages.status_code == 200
+        assert "LAN_DEVICE_OFFLINE" in outages.text
+        assert "11:30:05" in outages.text
+
+        incidents = client.get(f"/incidents?{query}&severity=HIGH&incident_type=CLOCK_DRIFT")
+        assert incidents.status_code == 200
+        assert "Clock drift." in incidents.text
+        assert "11:30:05" in incidents.text
+
+
 def test_clock_check_sync_accepts_large_monotonic_ns(monkeypatch, tmp_path):
     monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
     import zk_head_office.settings as settings_module

@@ -1,9 +1,11 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head">
   <h1>Zones Overview</h1>
   <p>Central view of zone health, attendance, clock checks, outages, and incidents.</p>
 </section>
+{{ ui.timeline_filters('/', filters, filter_choices) }}
 <section class="metric-grid">
   {% for label, value in counts.items() %}
   <div class="metric"><span>{{ label.replace('_', ' ').title() }}</span><strong>{{ value }}</strong></div>
@@ -15,7 +17,7 @@
     <div class="table-wrap"><table>
       <thead><tr><th>Zone</th><th>Last Heartbeat</th><th>Pending</th></tr></thead>
       <tbody>{% for zone in zones %}
-        <tr><td>{{ zone.zone_name }}<br><small>{{ zone.zone_id }}</small></td><td>{{ zone.last_heartbeat_at or '-' }}</td><td>{{ zone.pending_queue_count }}</td></tr>
+        <tr><td>{{ zone.zone_name }}<br><small>{{ zone.zone_id }}</small></td><td>{{ ui.ts(zone.last_heartbeat_at) }}</td><td>{{ zone.pending_queue_count }}</td></tr>
       {% else %}<tr><td colspan="3">No zones registered.</td></tr>{% endfor %}</tbody>
     </table></div>
   </div>
@@ -34,7 +36,7 @@
   <div class="table-wrap"><table>
     <thead><tr><th>Time</th><th>Zone</th><th>User</th><th>Device</th><th>Zone Trust</th><th>Final Trust</th><th>Score</th></tr></thead>
     <tbody>{% for row in attendance %}
-      <tr><td>{{ row.device_event_time }}</td><td>{{ row.zone_id }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.zone_claimed_trust_status }}</td><td>{{ row.head_office_final_trust_status }}</td><td>{{ row.fraud_score }}</td></tr>
+      <tr><td>{{ ui.ts(row.device_event_time) }}</td><td>{{ row.zone_id }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.zone_claimed_trust_status }}</td><td>{{ row.head_office_final_trust_status }}</td><td>{{ row.fraud_score }}</td></tr>
     {% else %}<tr><td colspan="7">No attendance synced yet.</td></tr>{% endfor %}</tbody>
   </table></div>
 </section>

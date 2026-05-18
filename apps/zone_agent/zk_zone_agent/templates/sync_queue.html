@@ -1,11 +1,13 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Sync Queue</h1><p>Durable local payload queue to head office.</p></section>
+{{ ui.timeline_filters('/sync-queue', filters, filter_choices) }}
 <div class="table-wrap"><table>
 <thead><tr><th>ID</th><th>Type</th><th>Status</th><th>Attempts</th><th>Created</th><th>Last Error</th></tr></thead>
 <tbody>
 {% for row in rows %}
-<tr><td>{{ row.id }}</td><td>{{ row.payload_type }}</td><td>{{ row.status }}</td><td>{{ row.attempt_count }}</td><td>{{ row.created_at }}</td><td>{{ row.last_error or '' }}</td></tr>
+<tr><td>{{ row.id }}</td><td>{{ row.payload_type }}</td><td>{{ row.status }}</td><td>{{ row.attempt_count }}</td><td>{{ ui.ts(row.created_at) }}</td><td>{{ row.last_error or '' }}</td></tr>
 {% else %}<tr><td colspan="6">Queue is empty.</td></tr>{% endfor %}
 </tbody></table></div>
 {% endblock %}

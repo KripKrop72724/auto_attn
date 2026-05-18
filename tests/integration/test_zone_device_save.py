@@ -544,9 +544,139 @@ def test_recent_attendance_api_returns_live_rows(monkeypatch, tmp_path):
         )
 
     with TestClient(web_module.app) as client:
-        response = client.get("/api/attendance/recent")
+        response = client.get("/api/attendance/recent?date_preset=all")
 
     assert response.status_code == 200
     rows = response.json()["rows"]
     assert rows[0]["user"] == "Ali"
     assert rows[0]["source_type"] == "LIVE_POLL"
+
+
+def test_zone_timeline_filters_realtime_api_and_clean_timestamp_markup(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    db_module.init_db()
+    inside = datetime(2026, 5, 18, 6, 30, 5, tzinfo=timezone.utc)
+    outside = datetime(2026, 5, 18, 20, 0, tzinfo=timezone.utc)
+    with db_module.session_scope() as session:
+        session.add(
+            db_module.Device(
+                device_id="MAIN-GATE",
+                label="Main Gate",
+                ip="192.168.110.137",
+                port=4370,
+                comm_key_encrypted="encrypted",
+            )
+        )
+        session.add_all(
+            [
+                db_module.AttendanceEvent(
+                    event_uid="event-1",
+                    zone_id="RWP-ZONE-01",
+                    device_id="MAIN-GATE",
+                    user_id="5",
+                    employee_name="Ali",
+                    device_event_time=inside,
+                    zone_received_wall_time=inside,
+                    zone_trusted_time=inside,
+                    status=TrustStatus.TRUSTED_LIVE.value,
+                    trust_status=TrustStatus.TRUSTED_LIVE.value,
+                    raw_event="{}",
+                    source_type=SourceType.LIVE_POLL.value,
+                    sync_status="PENDING",
+                ),
+                db_module.AttendanceEvent(
+                    event_uid="event-2",
+                    zone_id="RWP-ZONE-01",
+                    device_id="SIDE-GATE",
+                    user_id="6",
+                    employee_name="Sara",
+                    device_event_time=outside,
+                    zone_received_wall_time=outside,
+                    zone_trusted_time=outside,
+                    status="SUSPECT",
+                    trust_status="SUSPECT",
+                    raw_event="{}",
+                    source_type="DUMP_RECONNECT",
+                    sync_status="PENDING",
+                ),
+                db_module.ClockCheck(
+                    zone_id="RWP-ZONE-01",
+                    device_id="MAIN-GATE",
+                    device_time=inside,
+                    trusted_time=inside,
+                    windows_wall_time=inside,
+                    monotonic_ns=1,
+                    status="OK",
+                    reason="Clock ok.",
+                    sync_status="PENDING",
+                ),
+                db_module.OutagePeriod(
+                    zone_id="RWP-ZONE-01",
+                    device_id="MAIN-GATE",
+                    outage_type="DEVICE_LAN_OUTAGE",
+                    start_time=inside,
+                    classification="LAN_DEVICE_OFFLINE",
+                    sync_status="PENDING",
+                ),
+                db_module.SyncQueue(
+                    payload_type="ATTENDANCE",
+                    payload_json="{}",
+                    status="PENDING",
+                    created_at=inside,
+                ),
+                db_module.ServiceEvent(
+                    event_type="ZONE_SETUP_COMPLETED",
+                    description="Setup completed.",
+                    created_at=inside,
+                ),
+            ]
+        )
+
+    with TestClient(web_module.app) as client:
+        query = (
+            "date_preset=custom&from_date=2026-05-18&to_date=2026-05-18"
+            "&device_id=MAIN-GATE"
+        )
+        attendance = client.get(
+            f"/attendance?{query}&source_type=LIVE_POLL&trust_status=TRUSTED_LIVE"
+        )
+        assert attendance.status_code == 200
+        assert "Ali" in attendance.text
+        assert "Sara" not in attendance.text
+        assert 'data-timestamp="2026-05-18T06:30:05Z"' in attendance.text
+        assert "11:30:05" in attendance.text
+        assert 'data-time-format-option="12"' in attendance.text
+
+        recent = client.get(
+            f"/api/attendance/recent?{query}&source_type=LIVE_POLL&trust_status=TRUSTED_LIVE"
+        )
+        assert recent.status_code == 200
+        body = recent.json()
+        assert body["display_timezone"] == "Asia/Karachi"
+        assert [row["user"] for row in body["rows"]] == ["Ali"]
+
+        clock = client.get(f"/clock-guard?{query}&status=OK")
+        assert clock.status_code == 200
+        assert "Clock ok." in clock.text
+        assert "11:30:05" in clock.text
+
+        outages = client.get(f"/outages?{query}&outage_type=DEVICE_LAN_OUTAGE")
+        assert outages.status_code == 200
+        assert "LAN_DEVICE_OFFLINE" in outages.text
+        assert "11:30:05" in outages.text
+
+        sync_queue = client.get(
+            "/sync-queue?date_preset=custom&from_date=2026-05-18&to_date=2026-05-18"
+            "&payload_type=ATTENDANCE&status=PENDING"
+        )
+        assert sync_queue.status_code == 200
+        assert "ATTENDANCE" in sync_queue.text
+        assert "11:30:05" in sync_queue.text
+
+        logs = client.get(
+            "/logs?date_preset=custom&from_date=2026-05-18&to_date=2026-05-18"
+            "&event_type=ZONE_SETUP_COMPLETED"
+        )
+        assert logs.status_code == 200
+        assert "Setup completed." in logs.text
+        assert "11:30:05" in logs.text

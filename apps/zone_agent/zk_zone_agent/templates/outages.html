@@ -1,11 +1,13 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Outages</h1><p>LAN blind periods and service downtime stay visible after sync.</p></section>
+{{ ui.timeline_filters('/outages', filters, filter_choices) }}
 <div class="table-wrap"><table>
 <thead><tr><th>Type</th><th>Device</th><th>Start</th><th>End</th><th>Duration</th><th>Classification</th><th>Reason</th></tr></thead>
 <tbody>
 {% for row in rows %}
-<tr><td>{{ row.outage_type }}</td><td>{{ row.device_id or '-' }}</td><td>{{ row.start_time }}</td><td>{{ row.end_time or '-' }}</td><td>{{ row.duration_seconds or '-' }}</td><td>{{ row.classification or '-' }}</td><td>{{ row.start_reason or row.end_reason or '' }}</td></tr>
+<tr><td>{{ row.outage_type }}</td><td>{{ row.device_id or '-' }}</td><td>{{ ui.ts(row.start_time) }}</td><td>{{ ui.ts(row.end_time) }}</td><td>{{ row.duration_seconds or '-' }}</td><td>{{ row.classification or '-' }}</td><td>{{ row.start_reason or row.end_reason or '' }}</td></tr>
 {% else %}<tr><td colspan="7">No outages recorded.</td></tr>{% endfor %}
 </tbody></table></div>
 {% endblock %}

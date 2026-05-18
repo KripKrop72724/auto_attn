@@ -1,9 +1,11 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head">
   <h1>{{ config.zone_name if config else "Unconfigured Zone" }}</h1>
-  <p>{{ config.zone_id if config else "Setup required" }} · Trusted time: {{ trusted_time.value }} · {{ trusted_time.source }}</p>
+  <p>{{ config.zone_id if config else "Setup required" }} · Trusted time: {{ ui.ts(trusted_time.value) }} · {{ trusted_time.source }}</p>
 </section>
+{{ ui.timeline_filters('/dashboard', filters, filter_choices) }}
 {% if warning %}<div class="alert warn">{{ warning }}</div>{% endif %}
 {% if not config or not config.setup_completed %}
   <div class="alert warn">Zone is not registered yet. The local agent still captures attendance, checks device clocks, records outages, flags fraud, and queues sync payloads.</div>
@@ -55,7 +57,7 @@
       <thead><tr><th>Time</th><th>User</th><th>Device</th><th>Trust</th><th>Score</th></tr></thead>
       <tbody>
       {% for row in latest_attendance %}
-        <tr><td>{{ row.device_event_time }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.trust_status }}</td><td>{{ row.fraud_score }}</td></tr>
+        <tr><td>{{ ui.ts(row.device_event_time) }}</td><td>{{ row.employee_name or row.user_id }}</td><td>{{ row.device_id }}</td><td>{{ row.trust_status }}</td><td>{{ row.fraud_score }}</td></tr>
       {% else %}<tr><td colspan="5">No attendance captured yet.</td></tr>{% endfor %}
       </tbody>
     </table>

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head">
   <h1>Device Discovery</h1>
@@ -55,7 +56,7 @@
         </td>
         <td>
           <span class="pill {{ 'ok' if item.status in ['VALIDATED_ZK', 'CONFIGURED'] else 'bad' if item.status == 'UNREACHABLE' else '' }}">{{ item.status }}</span><br>
-          <small>Seen {{ item.last_seen or '-' }}</small>
+          <small>Seen {{ ui.ts(item.last_seen) }}</small>
         </td>
         <td>
           {{ item.device_name or '-' }}<br>

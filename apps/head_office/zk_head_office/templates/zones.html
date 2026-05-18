@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_ui.html" as ui with context %}
 {% block content %}
 <section class="page-head"><h1>Zones</h1><p>Registered branches and heartbeat status.</p></section>
 {% if generated_token %}
@@ -20,15 +21,15 @@
   <td>{{ row.zone_name }}<br><small>{{ row.zone_id }}</small></td>
   <td>
     <small>
-      Issued: {{ row.token_issued_at or '-' }}<br>
-      Last used: {{ row.token_last_used_at or '-' }}<br>
+      Issued: {{ ui.ts(row.token_issued_at) }}<br>
+      Last used: {{ ui.ts(row.token_last_used_at) }}<br>
       Last 4: {{ row.token_last4 or '-' }}
     </small>
   </td>
   <td>{{ 'Yes' if row.active and not row.token_revoked_at else 'No' }}</td>
-  <td>{{ row.last_heartbeat_at or '-' }}</td>
+  <td>{{ ui.ts(row.last_heartbeat_at) }}</td>
   <td>{{ row.pending_queue_count }}</td>
-  <td>{{ row.created_at }}</td>
+  <td>{{ ui.ts(row.created_at) }}</td>
   <td>
     <form method="post" action="/zones/{{ row.zone_id }}/revoke">
       {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}

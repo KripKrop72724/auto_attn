@@ -13,6 +13,13 @@ from sqlalchemy import func, select
 
 from zk_common.enums import ClockStatus
 from zk_common.time_utils import utc_now
+from zk_common.ui_time import (
+    apply_timeline_date_filter,
+    filter_context,
+    selected_query_values,
+    timeline_date_filter,
+    timestamp_view,
+)
 from zk_zone_agent.bruteforce import BruteForceStart, comm_key_bruteforce_manager
 from zk_zone_agent.config import config_manager
 from zk_zone_agent.db import (
@@ -63,6 +70,7 @@ from zk_zone_agent.webauthn_security import (
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+templates.env.globals["timestamp_view"] = timestamp_view
 
 
 class BruteForceStartBody(BaseModel):
@@ -147,6 +155,7 @@ def _client_ip(request: Request) -> str:
 def _admin_context(request: Request, session) -> dict:
     admin_session = parse_session(session, request.cookies.get(SESSION_COOKIE))
     webauthn_credential_count = webauthn_admin_security.credential_count(session)
+    config = config_manager.get(session)
     return {
         "admin_configured": admin_exists(session),
         "admin_authenticated": admin_session is not None,
@@ -156,6 +165,7 @@ def _admin_context(request: Request, session) -> dict:
         "webauthn_enrolled": webauthn_credential_count > 0,
         "webauthn_origin_ok": webauthn_origin_is_canonical(request),
         "webauthn_canonical_url": expected_webauthn_origin(request.url.port, request.url.scheme),
+        "display_timezone": config.timezone if config else settings.default_timezone,
     }
 
 
@@ -198,6 +208,46 @@ def _safe_next(value: str | None) -> str:
     if not value or not value.startswith("/") or value.startswith("//"):
         return "/dashboard"
     return value
+
+
+def _display_timezone(session) -> str:
+    config = config_manager.get(session)
+    return config.timezone if config else settings.default_timezone
+
+
+def _timeline_filter(request: Request, session):
+    return timeline_date_filter(request.query_params, timezone_name=_display_timezone(session))
+
+
+def _filters_context(date_filter, selected: dict[str, str], choices: dict[str, list[dict[str, str]]] | None = None):
+    return {
+        "filters": filter_context(date_filter, selected),
+        "filter_choices": choices or {},
+        "display_timezone": date_filter.display_timezone,
+    }
+
+
+def _apply_selected(statement, selected: dict[str, str], columns: dict[str, object]):
+    for key, column in columns.items():
+        if value := selected.get(key):
+            statement = statement.where(column == value)
+    return statement
+
+
+def _option(value: str, label: str | None = None) -> dict[str, str]:
+    return {"value": value, "label": label or value}
+
+
+def _distinct_options(session, column) -> list[dict[str, str]]:
+    values = session.scalars(
+        select(column).where(column.is_not(None)).distinct().order_by(column.asc())
+    ).all()
+    return [_option(str(value)) for value in values if str(value).strip()]
+
+
+def _device_options(session) -> list[dict[str, str]]:
+    rows = session.scalars(select(Device).order_by(Device.label.asc(), Device.device_id.asc())).all()
+    return [_option(row.device_id, f"{row.label} ({row.device_id})") for row in rows]
 
 
 def _with_error(path: str, message: str) -> RedirectResponse:
@@ -506,16 +556,31 @@ def api_head_office_health(request: Request, base_url: str = Query("")):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, warning: str | None = None):
+    selected = selected_query_values(request.query_params, ["device_id"])
     with session_scope() as session:
+        date_filter = _timeline_filter(request, session)
         config = config_manager.get(session)
         counts = _counts(session)
         devices = session.scalars(select(Device).order_by(Device.label.asc())).all()
+        latest_stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.desc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        latest_stmt = _apply_selected(latest_stmt, selected, {"device_id": AttendanceEvent.device_id})
         latest_attendance = session.scalars(
-            select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(15)
+            latest_stmt.limit(15)
         ).all()
-        incidents = session.scalars(select(FraudIncident).order_by(FraudIncident.created_at.desc()).limit(10)).all()
+        incidents_stmt = apply_timeline_date_filter(
+            select(FraudIncident).order_by(FraudIncident.created_at.desc()),
+            FraudIncident.created_at,
+            date_filter,
+        )
+        incidents_stmt = _apply_selected(incidents_stmt, selected, {"device_id": FraudIncident.device_id})
+        incidents = session.scalars(incidents_stmt.limit(10)).all()
         pending = sync_queue_writer.pending_count(session)
         security_context = _admin_context(request, session)
+        choices = {"devices": _device_options(session)}
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -528,6 +593,7 @@ def dashboard(request: Request, warning: str | None = None):
             "pending": pending,
             "trusted_time": trusted_time_service.now(),
             "warning": warning,
+            **_filters_context(date_filter, selected, choices),
             **security_context,
         },
     )
@@ -727,56 +793,168 @@ def toggle_device(request: Request, device_id: str, csrf_token: str = Form("")):
 
 @app.get("/attendance", response_class=HTMLResponse)
 def attendance_page(request: Request):
+    selected = selected_query_values(request.query_params, ["device_id", "source_type", "trust_status"])
     with session_scope() as session:
-        rows = session.scalars(select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(200)).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.desc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "device_id": AttendanceEvent.device_id,
+                "source_type": AttendanceEvent.source_type,
+                "trust_status": AttendanceEvent.trust_status,
+            },
+        )
+        rows = session.scalars(stmt.limit(200)).all()
         security_context = _admin_context(request, session)
-    return templates.TemplateResponse(request=request, name="attendance.html", context={"rows": rows, **security_context})
+        choices = {
+            "devices": _device_options(session),
+            "source_types": _distinct_options(session, AttendanceEvent.source_type),
+            "trust_statuses": _distinct_options(session, AttendanceEvent.trust_status),
+        }
+    return templates.TemplateResponse(
+        request=request,
+        name="attendance.html",
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **security_context},
+    )
 
 
 @app.get("/api/attendance/recent")
-def api_recent_attendance(limit: int = Query(default=200, ge=1, le=500)):
+def api_recent_attendance(request: Request, limit: int = Query(default=200, ge=1, le=500)):
+    selected = selected_query_values(request.query_params, ["device_id", "source_type", "trust_status"])
     with session_scope() as session:
-        rows = session.scalars(
-            select(AttendanceEvent).order_by(AttendanceEvent.created_at.desc()).limit(limit)
-        ).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(AttendanceEvent).order_by(AttendanceEvent.device_event_time.desc()),
+            AttendanceEvent.device_event_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {
+                "device_id": AttendanceEvent.device_id,
+                "source_type": AttendanceEvent.source_type,
+                "trust_status": AttendanceEvent.trust_status,
+            },
+        )
+        rows = session.scalars(stmt.limit(limit)).all()
         return {
             "server_time": utc_now().isoformat(),
+            "display_timezone": date_filter.display_timezone,
             "rows": [_serialize_attendance(row) for row in rows],
         }
 
 
 @app.get("/clock-guard", response_class=HTMLResponse)
 def clock_guard_page(request: Request):
+    selected = selected_query_values(request.query_params, ["device_id", "status"])
     with session_scope() as session:
-        rows = session.scalars(select(ClockCheck).order_by(ClockCheck.created_at.desc()).limit(200)).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(ClockCheck).order_by(ClockCheck.trusted_time.desc()),
+            ClockCheck.trusted_time,
+            date_filter,
+        )
+        stmt = _apply_selected(stmt, selected, {"device_id": ClockCheck.device_id, "status": ClockCheck.status})
+        rows = session.scalars(stmt.limit(200)).all()
         security_context = _admin_context(request, session)
+        choices = {
+            "devices": _device_options(session),
+            "statuses": _distinct_options(session, ClockCheck.status),
+        }
     return templates.TemplateResponse(
-        request=request, name="clock.html", context={"rows": rows, "ClockStatus": ClockStatus, **security_context}
+        request=request,
+        name="clock.html",
+        context={
+            "rows": rows,
+            "ClockStatus": ClockStatus,
+            **_filters_context(date_filter, selected, choices),
+            **security_context,
+        },
     )
 
 
 @app.get("/outages", response_class=HTMLResponse)
 def outages_page(request: Request):
+    selected = selected_query_values(request.query_params, ["device_id", "outage_type"])
     with session_scope() as session:
-        rows = session.scalars(select(OutagePeriod).order_by(OutagePeriod.created_at.desc()).limit(200)).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(OutagePeriod).order_by(OutagePeriod.start_time.desc()),
+            OutagePeriod.start_time,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {"device_id": OutagePeriod.device_id, "outage_type": OutagePeriod.outage_type},
+        )
+        rows = session.scalars(stmt.limit(200)).all()
         security_context = _admin_context(request, session)
-    return templates.TemplateResponse(request=request, name="outages.html", context={"rows": rows, **security_context})
+        choices = {
+            "devices": _device_options(session),
+            "outage_types": _distinct_options(session, OutagePeriod.outage_type),
+        }
+    return templates.TemplateResponse(
+        request=request,
+        name="outages.html",
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **security_context},
+    )
 
 
 @app.get("/sync-queue", response_class=HTMLResponse)
 def sync_queue_page(request: Request):
+    selected = selected_query_values(request.query_params, ["payload_type", "status"])
     with session_scope() as session:
-        rows = session.scalars(select(SyncQueue).order_by(SyncQueue.created_at.desc()).limit(200)).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(SyncQueue).order_by(SyncQueue.created_at.desc()),
+            SyncQueue.created_at,
+            date_filter,
+        )
+        stmt = _apply_selected(
+            stmt,
+            selected,
+            {"payload_type": SyncQueue.payload_type, "status": SyncQueue.status},
+        )
+        rows = session.scalars(stmt.limit(200)).all()
         security_context = _admin_context(request, session)
-    return templates.TemplateResponse(request=request, name="sync_queue.html", context={"rows": rows, **security_context})
+        choices = {
+            "payload_types": _distinct_options(session, SyncQueue.payload_type),
+            "statuses": _distinct_options(session, SyncQueue.status),
+        }
+    return templates.TemplateResponse(
+        request=request,
+        name="sync_queue.html",
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **security_context},
+    )
 
 
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request):
+    selected = selected_query_values(request.query_params, ["event_type"])
     with session_scope() as session:
-        rows = session.scalars(select(ServiceEvent).order_by(ServiceEvent.created_at.desc()).limit(200)).all()
+        date_filter = _timeline_filter(request, session)
+        stmt = apply_timeline_date_filter(
+            select(ServiceEvent).order_by(ServiceEvent.created_at.desc()),
+            ServiceEvent.created_at,
+            date_filter,
+        )
+        stmt = _apply_selected(stmt, selected, {"event_type": ServiceEvent.event_type})
+        rows = session.scalars(stmt.limit(200)).all()
         security_context = _admin_context(request, session)
-    return templates.TemplateResponse(request=request, name="logs.html", context={"rows": rows, **security_context})
+        choices = {"event_types": _distinct_options(session, ServiceEvent.event_type)}
+    return templates.TemplateResponse(
+        request=request,
+        name="logs.html",
+        context={"rows": rows, **_filters_context(date_filter, selected, choices), **security_context},
+    )
 
 
 @app.get("/api/status")
