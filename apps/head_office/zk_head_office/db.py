@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -117,7 +117,7 @@ class ClockCheck(Base):
     device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     trusted_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     windows_wall_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    monotonic_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    monotonic_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
     drift_seconds: Mapped[float | None] = mapped_column(Float)
     expected_device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     jump_seconds: Mapped[float | None] = mapped_column(Float)

@@ -9,6 +9,7 @@ from typing import Callable, Iterator, TypeVar
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     DateTime,
     Float,
     ForeignKey,
@@ -231,7 +232,7 @@ class ClockCheck(Base):
     device_time: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     trusted_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     windows_wall_time: Mapped[datetime] = mapped_column(UTCDateTime())
-    monotonic_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    monotonic_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
     drift_seconds: Mapped[float | None] = mapped_column(Float)
     expected_device_time: Mapped[datetime | None] = mapped_column(UTCDateTime())
     jump_seconds: Mapped[float | None] = mapped_column(Float)
@@ -295,7 +296,7 @@ class HeadOfficeTimeSync(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     server_utc: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     local_wall_utc: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-    monotonic_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    monotonic_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
     offset_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = utc_column()
 

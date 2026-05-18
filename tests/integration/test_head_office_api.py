@@ -124,6 +124,49 @@ def test_register_heartbeat_and_attendance_sync(monkeypatch, tmp_path):
         assert sync.json()["acked_event_uids"] == ["event-1"]
 
 
+def test_clock_check_sync_accepts_large_monotonic_ns(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
+    import zk_head_office.settings as settings_module
+    import zk_head_office.db as db_module
+    import zk_head_office.web as web_module
+
+    importlib.reload(settings_module)
+    db_module = importlib.reload(db_module)
+    web_module = importlib.reload(web_module)
+    with TestClient(web_module.app) as client:
+        token = _issue_token(client)
+        event_time = datetime(2026, 5, 13, 11, 0, tzinfo=timezone.utc).isoformat()
+        payload = {
+            "zone_id": "RWP-ZONE-01",
+            "batch_id": "clock-batch-1",
+            "clock_checks": [
+                {
+                    "id": 1,
+                    "zone_id": "RWP-ZONE-01",
+                    "device_id": "RWP-MAIN-GATE-01",
+                    "device_serial": "ADZV211860253",
+                    "device_time": event_time,
+                    "trusted_time": event_time,
+                    "windows_wall_time": event_time,
+                    "monotonic_ns": 273092062000000,
+                    "drift_seconds": 0,
+                    "expected_device_time": None,
+                    "jump_seconds": None,
+                    "status": "OK",
+                    "reason": "Device clock is within configured thresholds.",
+                    "created_at": event_time,
+                }
+            ],
+        }
+        response = _post_signed(client, "/api/sync/clock-checks", token, "RWP-ZONE-01", payload)
+
+        assert response.status_code == 200
+        assert response.json()["acked_ids"] == ["1"]
+        with db_module.session_scope() as session:
+            row = session.query(db_module.ClockCheck).one()
+            assert row.monotonic_ns == 273092062000000
+
+
 def test_signed_sync_rejects_bad_signature_replay_wrong_zone_and_revoked_token(monkeypatch, tmp_path):
     monkeypatch.setenv("ZK_HEAD_DATABASE_URL", f"sqlite:///{tmp_path / 'head.db'}")
     import zk_head_office.settings as settings_module
