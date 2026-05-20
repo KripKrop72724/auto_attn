@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote_plus, urlencode
 
-from fastapi import Body, FastAPI, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -22,9 +23,17 @@ from zk_common.ui_time import (
     timestamp_view,
 )
 from zk_zone_agent.bruteforce import BruteForceStart, comm_key_bruteforce_manager
+from zk_zone_agent.bulk_user_update import (
+    ExportUserRow,
+    export_users_xlsx,
+    parse_bulk_update_xlsx,
+    split_machine_name_cnic,
+)
 from zk_zone_agent.config import config_manager
 from zk_zone_agent.db import (
     AttendanceEvent,
+    BulkUserUpdateItem,
+    BulkUserUpdateJob,
     ClockCheck,
     CommKeyBruteforceJob,
     Device,
@@ -184,6 +193,11 @@ def _require_admin_form(request: Request, session, csrf_token: str | None) -> No
 
 def _require_admin_api(request: Request, session, csrf_token: str | None) -> None:
     _require_admin_form(request, session, csrf_token)
+
+
+def _require_admin_read_api(request: Request, session, csrf_token: str | None) -> None:
+    if not valid_csrf(session, request.cookies.get(SESSION_COOKIE), csrf_token):
+        raise HTTPException(status_code=403, detail="Admin unlock and CSRF token are required.")
 
 
 def _set_admin_cookie(response: RedirectResponse, admin) -> None:
@@ -693,7 +707,15 @@ def users_page(
             selected_pair = rows[0]
         selected_user = selected_pair[0] if selected_pair is not None else None
         selected_device = selected_pair[1] if selected_pair is not None else None
+        bulk_jobs = []
         security_context = _admin_context(request, session)
+        if selected_device_id and security_context["admin_authenticated"]:
+            bulk_jobs = session.scalars(
+                select(BulkUserUpdateJob)
+                .where(BulkUserUpdateJob.device_id == selected_device_id)
+                .order_by(BulkUserUpdateJob.created_at.desc())
+                .limit(5)
+            ).all()
     return templates.TemplateResponse(
         request=request,
         name="users.html",
@@ -708,6 +730,7 @@ def users_page(
             "error": error,
             "success": success,
             "privilege_choices": PRIVILEGE_CHOICES,
+            "bulk_jobs": bulk_jobs,
             **security_context,
         },
     )
@@ -843,6 +866,146 @@ def update_device_user(
         device_id=device_id,
         uid=uid,
         success=f"Updated user {updated.name or updated.user_id} on device.",
+    )
+
+
+@app.get("/users/{device_id}/bulk.xlsx")
+def download_bulk_user_update_xlsx(request: Request, device_id: str):
+    with session_scope() as session:
+        _require_admin_form(request, session, request.query_params.get("csrf_token"))
+        device = session.scalar(select(Device).where(Device.device_id == device_id))
+        if device is None:
+            raise HTTPException(status_code=404)
+        record_security_event(
+            session,
+            "BULK_USER_UPDATE_DOWNLOAD_ATTEMPT",
+            f"Downloading bulk update workbook for {device_id}.",
+        )
+    try:
+        zone_supervisor.refresh_device_users(device_id)
+    except Exception as exc:
+        return _users_redirect(device_id=device_id, error=f"Could not refresh users before export: {exc}")
+    with session_scope() as session:
+        users = session.scalars(
+            select(DeviceUser)
+            .where(DeviceUser.device_id == device_id)
+            .order_by(DeviceUser.user_id.asc())
+        ).all()
+        rows: list[ExportUserRow] = []
+        for user in users:
+            name, cnic = split_machine_name_cnic(user.employee_name)
+            rows.append(ExportUserRow(user_id=user.user_id, name=name, cnic=cnic))
+        content = export_users_xlsx(rows)
+        record_security_event(
+            session,
+            "BULK_USER_UPDATE_DOWNLOAD_SUCCEEDED",
+            f"Downloaded bulk update workbook for {device_id} with {len(rows)} user(s).",
+        )
+        audit_ledger.append(
+            session,
+            "bulk_user_update_download",
+            device_id,
+            {"device_id": device_id, "user_count": len(rows), "downloaded_at": utc_now()},
+        )
+    filename = f"{device_id}-users.xlsx"
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/users/{device_id}/bulk-upload")
+def upload_bulk_user_update_xlsx(
+    request: Request,
+    device_id: str,
+    csrf_token: str = Form(""),
+    file: UploadFile = File(...),
+):
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        device = session.scalar(select(Device).where(Device.device_id == device_id))
+        if device is None:
+            raise HTTPException(status_code=404)
+        record_security_event(
+            session,
+            "BULK_USER_UPDATE_UPLOAD_ATTEMPT",
+            f"Uploading bulk update workbook for {device_id}.",
+        )
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        return _users_redirect(device_id=device_id, error="Upload a .xlsx workbook.")
+    content = file.file.read()
+    try:
+        parsed_rows = parse_bulk_update_xlsx(content)
+    except Exception as exc:
+        return _users_redirect(device_id=device_id, error=str(exc))
+    try:
+        zone_supervisor.refresh_device_users(device_id)
+    except Exception as exc:
+        return _users_redirect(device_id=device_id, error=f"Could not refresh users before upload: {exc}")
+
+    with session_scope() as session:
+        device_users = {
+            user.user_id: user
+            for user in session.scalars(select(DeviceUser).where(DeviceUser.device_id == device_id))
+        }
+        job = BulkUserUpdateJob(
+            device_id=device_id,
+            status="PENDING",
+            uploaded_filename=file.filename,
+        )
+        session.add(job)
+        session.flush()
+        for parsed in parsed_rows:
+            cached = device_users.get(parsed.user_id)
+            status = parsed.status
+            message = parsed.message
+            expected_name = parsed.expected_name
+            if cached is None and parsed.status != "SKIPPED":
+                status = "FAILED"
+                message = f"ID {parsed.user_id} is not present on the current device snapshot."
+                expected_name = None
+            item = BulkUserUpdateItem(
+                job_id=job.id,
+                device_id=device_id,
+                uid=None if cached is None else cached.uid,
+                user_id=parsed.user_id,
+                old_name=None if cached is None else cached.employee_name,
+                sheet_name=parsed.sheet_name,
+                expected_name=expected_name,
+                cnic=parsed.cnic,
+                privilege=None if cached is None else cached.privilege,
+                card=None if cached is None else cached.card,
+                status=status,
+                message=message,
+            )
+            session.add(item)
+        session.flush()
+        _refresh_bulk_job_counts_for_web(session, job)
+        record_security_event(
+            session,
+            "BULK_USER_UPDATE_UPLOAD_SUCCEEDED",
+            f"Created bulk update job {job.id} for {device_id}.",
+        )
+        audit_ledger.append(
+            session,
+            "bulk_user_update_job",
+            job.id,
+            {
+                "device_id": device_id,
+                "status": job.status,
+                "total_count": job.total_count,
+                "pending_count": job.pending_count,
+                "skipped_count": job.skipped_count,
+                "failed_count": job.failed_count,
+                "uploaded_at": utc_now(),
+            },
+        )
+        job_id = job.id
+    zone_supervisor.start_bulk_user_update_job(job_id)
+    return _users_redirect(
+        device_id=device_id,
+        success=f"Bulk update job {job_id} started. Progress is shown below.",
     )
 
 
@@ -1213,6 +1376,68 @@ def api_status():
         }
 
 
+@app.get("/api/users/bulk-jobs/{job_id}")
+def api_bulk_user_update_job(
+    request: Request,
+    job_id: int,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    with session_scope() as session:
+        _require_admin_read_api(request, session, x_csrf_token)
+        job = session.get(BulkUserUpdateJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404)
+        items = session.scalars(
+            select(BulkUserUpdateItem)
+            .where(BulkUserUpdateItem.job_id == job_id)
+            .order_by(BulkUserUpdateItem.id.asc())
+        ).all()
+        return _serialize_bulk_job(job, items)
+
+
+@app.post("/api/users/bulk-jobs/{job_id}/resume")
+def api_resume_bulk_user_update_job(
+    request: Request,
+    job_id: int,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    with session_scope() as session:
+        _require_admin_api(request, session, x_csrf_token)
+        job = session.get(BulkUserUpdateJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404)
+        if job.status in {"COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELED"}:
+            raise HTTPException(status_code=400, detail="This bulk update job cannot be resumed.")
+        job.status = "PENDING"
+        job.last_error = None
+        job.updated_at = utc_now()
+        for item in session.scalars(
+            select(BulkUserUpdateItem).where(
+                BulkUserUpdateItem.job_id == job_id,
+                BulkUserUpdateItem.status == "UPDATING",
+            )
+        ):
+            item.status = "PENDING"
+            item.message = "Retrying after resume."
+    zone_supervisor.start_bulk_user_update_job(job_id)
+    return {"ok": True}
+
+
+@app.post("/api/users/bulk-jobs/{job_id}/cancel")
+def api_cancel_bulk_user_update_job(
+    request: Request,
+    job_id: int,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    with session_scope() as session:
+        _require_admin_api(request, session, x_csrf_token)
+    try:
+        zone_supervisor.cancel_bulk_user_update_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404) from None
+    return {"ok": True}
+
+
 @app.get("/api/discovery/status")
 def api_discovery_status():
     with session_scope() as session:
@@ -1387,6 +1612,50 @@ def _counts(session):
         "outages": session.scalar(select(func.count(OutagePeriod.id))) or 0,
         "incidents": session.scalar(select(func.count(FraudIncident.id))) or 0,
         "sync_queue": session.scalar(select(func.count(SyncQueue.id))) or 0,
+    }
+
+
+def _refresh_bulk_job_counts_for_web(session, job: BulkUserUpdateJob) -> None:
+    items = list(session.scalars(select(BulkUserUpdateItem).where(BulkUserUpdateItem.job_id == job.id)))
+    job.total_count = len(items)
+    job.pending_count = sum(1 for item in items if item.status == "PENDING")
+    job.updating_count = sum(1 for item in items if item.status == "UPDATING")
+    job.verified_count = sum(1 for item in items if item.status == "VERIFIED")
+    job.skipped_count = sum(1 for item in items if item.status == "SKIPPED")
+    job.failed_count = sum(1 for item in items if item.status == "FAILED")
+    job.updated_at = utc_now()
+
+
+def _serialize_bulk_job(job: BulkUserUpdateJob, items: list[BulkUserUpdateItem]) -> dict:
+    return {
+        "id": job.id,
+        "device_id": job.device_id,
+        "status": job.status,
+        "total_count": job.total_count,
+        "pending_count": job.pending_count,
+        "updating_count": job.updating_count,
+        "verified_count": job.verified_count,
+        "skipped_count": job.skipped_count,
+        "failed_count": job.failed_count,
+        "last_error": job.last_error,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+        "items": [
+            {
+                "id": item.id,
+                "user_id": item.user_id,
+                "uid": item.uid,
+                "old_name": item.old_name,
+                "sheet_name": item.sheet_name,
+                "expected_name": item.expected_name,
+                "cnic": item.cnic,
+                "status": item.status,
+                "message": item.message,
+                "attempt_count": item.attempt_count,
+            }
+            for item in items
+        ],
     }
 
 

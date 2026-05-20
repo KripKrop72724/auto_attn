@@ -153,6 +153,90 @@ async function refreshAttendance() {
 setInterval(refreshAttendance, 3000);
 refreshAttendance();
 
+function renderBulkJob(jobRoot, job) {
+  const summary = jobRoot.querySelector("[data-bulk-job-summary]");
+  if (summary) {
+    summary.textContent = `Status ${job.status} · Pending ${job.pending_count} · Updating ${job.updating_count} · Verified ${job.verified_count} · Skipped ${job.skipped_count} · Failed ${job.failed_count}`;
+  }
+  let error = jobRoot.querySelector("[data-bulk-job-error]");
+  if (job.last_error) {
+    if (!error) {
+      error = document.createElement("div");
+      error.className = "alert warn compact";
+      error.dataset.bulkJobError = "";
+      summary?.after(error);
+    }
+    error.textContent = job.last_error;
+  } else if (error) {
+    error.remove();
+  }
+  const body = jobRoot.querySelector("[data-bulk-job-items]");
+  if (!body) return;
+  body.replaceChildren();
+  for (const item of job.items || []) {
+    const row = document.createElement("tr");
+    appendCell(row, item.user_id);
+    appendCell(row, item.status);
+    appendCell(row, item.cnic || "");
+    appendCell(row, item.expected_name || "");
+    appendCell(row, item.message || "");
+    body.appendChild(row);
+  }
+  if (!body.children.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.textContent = "No job rows.";
+    row.appendChild(cell);
+    body.appendChild(row);
+  }
+}
+
+async function refreshBulkJobs() {
+  const roots = document.querySelectorAll("[data-bulk-job-id]");
+  for (const root of roots) {
+    const jobId = root.dataset.bulkJobId;
+    if (!jobId) continue;
+    try {
+      const res = await fetch(`/api/users/bulk-jobs/${jobId}`, { headers: csrfHeaders() });
+      if (!res.ok) throw new Error("Bulk job status unavailable");
+      renderBulkJob(root, await res.json());
+    } catch {
+      const summary = root.querySelector("[data-bulk-job-summary]");
+      if (summary) summary.textContent = "Bulk job status unavailable";
+    }
+  }
+}
+
+function initBulkJobActions() {
+  document.querySelectorAll("[data-bulk-job-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const root = button.closest("[data-bulk-job-id]");
+      const jobId = root?.dataset.bulkJobId;
+      const action = button.dataset.bulkJobAction;
+      if (!jobId || !action) return;
+      button.disabled = true;
+      try {
+        await postJson(`/api/users/bulk-jobs/${jobId}/${action}`, {});
+        await refreshBulkJobs();
+      } catch (error) {
+        const summary = root.querySelector("[data-bulk-job-summary]");
+        if (summary) summary.textContent = error.message || "Bulk job action failed";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  initBulkJobActions();
+  refreshBulkJobs();
+  if (document.querySelector("[data-bulk-job-id]")) {
+    setInterval(refreshBulkJobs, 2000);
+  }
+});
+
 function base64urlToBuffer(value) {
   const padding = "=".repeat((4 - (value.length % 4)) % 4);
   const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");

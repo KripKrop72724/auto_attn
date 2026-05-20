@@ -23,7 +23,14 @@ from zk_common.time_utils import utc_now
 from zk_zone_agent.attendance import AttendanceContext, attendance_processor
 from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
-from zk_zone_agent.db import ClockCheck, Device, FraudIncident, OutagePeriod
+from zk_zone_agent.db import (
+    BulkUserUpdateItem,
+    BulkUserUpdateJob,
+    ClockCheck,
+    Device,
+    FraudIncident,
+    OutagePeriod,
+)
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.device_users import DeviceUserUpdate
 from zk_zone_agent.fraud import fraud_engine
@@ -163,6 +170,9 @@ class DeviceWorker(threading.Thread):
             raise RuntimeError("Device update returned an unexpected response.")
         return result
 
+    def run_bulk_user_update_job(self, job_id: int, timeout_seconds: float = 3600) -> None:
+        self._submit_command("bulk_user_update_job", job_id, timeout_seconds)
+
     def _submit_command(
         self,
         kind: str,
@@ -196,6 +206,12 @@ class DeviceWorker(threading.Thread):
                     if not isinstance(command.payload, DeviceUserUpdate):
                         raise RuntimeError("Invalid user update command.")
                     command.result = self._update_device_user(client, command.payload)
+                    should_restart_live_capture = True
+                elif command.kind == "bulk_user_update_job":
+                    if not isinstance(command.payload, int):
+                        raise RuntimeError("Invalid bulk user update command.")
+                    self._run_bulk_user_update_job(client, command.payload)
+                    command.result = True
                     should_restart_live_capture = True
                 else:
                     raise RuntimeError(f"Unknown device command {command.kind}.")
@@ -255,6 +271,244 @@ class DeviceWorker(threading.Thread):
             device.last_error = f"Updated user {updated.name or updated.user_id} on device."
             session.commit()
         return updated
+
+    def _run_bulk_user_update_job(self, client: ZKClient, job_id: int) -> None:
+        self._mark_bulk_job_started(job_id)
+        try:
+            self._refresh_device_users(client)
+            while not self.stop_event.is_set():
+                item = self._next_bulk_item(job_id)
+                if item is None:
+                    break
+                self._process_bulk_item(client, item.id)
+            if self.stop_event.is_set():
+                self._interrupt_bulk_job(job_id, "Zone agent stopped while the bulk update was running.")
+                return
+            self._finish_bulk_job(job_id)
+        except BaseException as exc:
+            self._interrupt_bulk_job(job_id, str(exc))
+            raise
+
+    def _mark_bulk_job_started(self, job_id: int) -> None:
+        with self.session_factory() as session:
+            job = session.get(BulkUserUpdateJob, job_id)
+            if job is None:
+                raise RuntimeError("Bulk update job was not found.")
+            if job.device_id != self.device_id:
+                raise RuntimeError("Bulk update job belongs to a different device.")
+            job.status = "RUNNING"
+            job.started_at = job.started_at or utc_now()
+            job.last_error = None
+            job.updated_at = utc_now()
+            for item in session.scalars(
+                select(BulkUserUpdateItem).where(
+                    BulkUserUpdateItem.job_id == job_id,
+                    BulkUserUpdateItem.status == "UPDATING",
+                )
+            ):
+                item.status = "PENDING"
+                item.message = "Retrying after an interrupted attempt."
+                item.updated_at = utc_now()
+            self._refresh_bulk_job_counts(session, job)
+            session.commit()
+
+    def _next_bulk_item(self, job_id: int) -> BulkUserUpdateItem | None:
+        with self.session_factory() as session:
+            job = session.get(BulkUserUpdateJob, job_id)
+            if job is None or job.status == "CANCELED":
+                return None
+            item = session.scalar(
+                select(BulkUserUpdateItem)
+                .where(
+                    BulkUserUpdateItem.job_id == job_id,
+                    BulkUserUpdateItem.status == "PENDING",
+                )
+                .order_by(BulkUserUpdateItem.id.asc())
+                .limit(1)
+            )
+            if item is None:
+                return None
+            session.expunge(item)
+            return item
+
+    def _process_bulk_item(self, client: ZKClient, item_id: int) -> None:
+        with self.session_factory() as session:
+            item = session.get(BulkUserUpdateItem, item_id)
+            if item is None or item.status != "PENDING":
+                return
+            item.status = "UPDATING"
+            item.started_at = utc_now()
+            item.attempt_count += 1
+            item.message = "Updating user on device."
+            item.updated_at = utc_now()
+            job = session.get(BulkUserUpdateJob, item.job_id)
+            if job:
+                self._refresh_bulk_job_counts(session, job)
+            session.commit()
+
+        try:
+            users = client.get_users()
+            with self.session_factory() as session:
+                item = session.get(BulkUserUpdateItem, item_id)
+                if item is None:
+                    return
+                existing = next((user for user in users if str(user.user_id) == item.user_id), None)
+                if existing is None:
+                    self._fail_bulk_item(session, item, "ID was not found on the device during update.")
+                    return
+                if item.expected_name and (existing.name or "") == item.expected_name:
+                    self._verify_bulk_item(session, item, "Already matched expected machine data.")
+                    return
+                privilege = _bulk_privilege(existing.privilege or item.privilege)
+                card = existing.card if existing.card is not None else (item.card or 0)
+                uid = existing.uid
+
+            if not item.expected_name:
+                raise RuntimeError("Bulk item is missing an expected name.")
+            updated = client.update_user(
+                uid=uid,
+                user_id=item.user_id,
+                name=item.expected_name,
+                privilege=privilege,
+                card=card,
+            )
+            refreshed_users = client.get_users()
+            verified = next((user for user in refreshed_users if str(user.user_id) == item.user_id), None)
+            with self.session_factory() as session:
+                item = session.get(BulkUserUpdateItem, item_id)
+                if item is None:
+                    return
+                if verified is None:
+                    self._fail_bulk_item(session, item, "Device reload did not contain this ID after update.")
+                    return
+                if str(verified.user_id) != item.user_id:
+                    self._fail_bulk_item(session, item, "Device ID changed during update; verification failed.")
+                    return
+                if (verified.name or "") != item.expected_name:
+                    self._fail_bulk_item(
+                        session,
+                        item,
+                        f"Verification failed: device has {verified.name or ''!r}.",
+                    )
+                    return
+                device = self._session_device(session)
+                attendance_processor.replace_users(session, device, refreshed_users)
+                self._verify_bulk_item(
+                    session,
+                    item,
+                    f"Verified {updated.name or updated.user_id} on device.",
+                )
+        except BaseException as exc:
+            with self.session_factory() as session:
+                item = session.get(BulkUserUpdateItem, item_id)
+                if item is not None:
+                    item.status = "PENDING"
+                    item.message = f"Interrupted during update: {exc}"
+                    item.updated_at = utc_now()
+                    job = session.get(BulkUserUpdateJob, item.job_id)
+                    if job:
+                        self._refresh_bulk_job_counts(session, job)
+            raise
+
+    def _verify_bulk_item(self, session: Session, item: BulkUserUpdateItem, message: str) -> None:
+        item.status = "VERIFIED"
+        item.message = message
+        item.ended_at = utc_now()
+        item.updated_at = utc_now()
+        job = session.get(BulkUserUpdateJob, item.job_id)
+        if job:
+            self._refresh_bulk_job_counts(session, job)
+        audit_ledger.append(
+            session,
+            "bulk_user_update_item",
+            item.id,
+            {
+                "job_id": item.job_id,
+                "device_id": item.device_id,
+                "user_id": item.user_id,
+                "expected_name": item.expected_name,
+                "cnic": item.cnic,
+                "status": item.status,
+                "message": message,
+                "updated_at": utc_now(),
+            },
+        )
+
+    def _fail_bulk_item(self, session: Session, item: BulkUserUpdateItem, message: str) -> None:
+        item.status = "FAILED"
+        item.message = message
+        item.ended_at = utc_now()
+        item.updated_at = utc_now()
+        job = session.get(BulkUserUpdateJob, item.job_id)
+        if job:
+            self._refresh_bulk_job_counts(session, job)
+        audit_ledger.append(
+            session,
+            "bulk_user_update_item",
+            item.id,
+            {
+                "job_id": item.job_id,
+                "device_id": item.device_id,
+                "user_id": item.user_id,
+                "status": item.status,
+                "message": message,
+                "updated_at": utc_now(),
+            },
+        )
+
+    def _finish_bulk_job(self, job_id: int) -> None:
+        with self.session_factory() as session:
+            job = session.get(BulkUserUpdateJob, job_id)
+            if job is None:
+                return
+            if job.status == "CANCELED":
+                return
+            self._refresh_bulk_job_counts(session, job)
+            job.status = "COMPLETED_WITH_ERRORS" if job.failed_count else "COMPLETED"
+            job.ended_at = utc_now()
+            job.updated_at = utc_now()
+            audit_ledger.append(
+                session,
+                "bulk_user_update_job",
+                job.id,
+                {
+                    "device_id": job.device_id,
+                    "status": job.status,
+                    "verified_count": job.verified_count,
+                    "skipped_count": job.skipped_count,
+                    "failed_count": job.failed_count,
+                    "ended_at": utc_now(),
+                },
+            )
+
+    def _interrupt_bulk_job(self, job_id: int, message: str) -> None:
+        with self.session_factory() as session:
+            job = session.get(BulkUserUpdateJob, job_id)
+            if job is None:
+                return
+            for item in session.scalars(
+                select(BulkUserUpdateItem).where(
+                    BulkUserUpdateItem.job_id == job_id,
+                    BulkUserUpdateItem.status == "UPDATING",
+                )
+            ):
+                item.status = "PENDING"
+                item.message = message
+                item.updated_at = utc_now()
+            job.status = "INTERRUPTED"
+            job.last_error = message
+            job.updated_at = utc_now()
+            self._refresh_bulk_job_counts(session, job)
+
+    def _refresh_bulk_job_counts(self, session: Session, job: BulkUserUpdateJob) -> None:
+        items = list(session.scalars(select(BulkUserUpdateItem).where(BulkUserUpdateItem.job_id == job.id)))
+        job.total_count = len(items)
+        job.pending_count = sum(1 for item in items if item.status == "PENDING")
+        job.updating_count = sum(1 for item in items if item.status == "UPDATING")
+        job.verified_count = sum(1 for item in items if item.status == "VERIFIED")
+        job.skipped_count = sum(1 for item in items if item.status == "SKIPPED")
+        job.failed_count = sum(1 for item in items if item.status == "FAILED")
+        job.updated_at = utc_now()
 
     def _process_observed_attendance(
         self,
@@ -549,3 +803,11 @@ class DeviceWorker(threading.Thread):
                 device.last_error = f"Captured {inserted_count} attendance record(s) via live polling."
             session.commit()
         return inserted_count
+
+
+def _bulk_privilege(value: str | int | None) -> int:
+    try:
+        privilege = int(value) if value not in (None, "") else 0
+    except (TypeError, ValueError):
+        return 0
+    return privilege if privilege in {0, 14} else 0

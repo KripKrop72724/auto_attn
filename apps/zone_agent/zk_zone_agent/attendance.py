@@ -13,6 +13,7 @@ from zk_common.hashing import attendance_event_uid
 from zk_common.schemas import AttendanceSyncEvent
 from zk_common.time_utils import device_local_to_utc, ensure_utc, utc_now
 from zk_zone_agent.audit import audit_ledger
+from zk_zone_agent.bulk_user_update import split_machine_name_cnic
 from zk_zone_agent.db import AttendanceEvent, Device, DeviceUser, OutagePeriod
 from zk_zone_agent.fraud import FraudEngine, fraud_engine
 from zk_zone_agent.sync import sync_queue_writer
@@ -69,6 +70,8 @@ class AttendanceProcessor:
             row.uid = str(user.uid)
             row.user_id = str(user.user_id)
             row.employee_name = user.name
+            _name, cnic = split_machine_name_cnic(user.name)
+            row.cnic = cnic or None
             row.privilege = user.privilege
             row.card = user.card
             row.raw_json = json.dumps(user.raw or {}, default=str, sort_keys=True)
@@ -120,7 +123,7 @@ class AttendanceProcessor:
         if existing is not None:
             return existing
 
-        employee_name = self._employee_name(session, device.device_id, str(attendance.user_id))
+        employee_name, cnic = self._employee_identity(session, device.device_id, str(attendance.user_id))
         if source_type in {SourceType.LIVE, SourceType.LIVE_POLL}:
             classification = self.engine.classify_live_attendance(
                 device_event_time=attendance.timestamp,
@@ -169,6 +172,7 @@ class AttendanceProcessor:
             device_serial=device.serial,
             user_id=str(attendance.user_id),
             employee_name=employee_name,
+            cnic=cnic,
             device_event_time=attendance.timestamp,
             zone_received_wall_time=payload.zone_received_wall_time,
             zone_trusted_time=zone_trusted_time,
@@ -194,11 +198,13 @@ class AttendanceProcessor:
         )
         return row
 
-    def _employee_name(self, session: Session, device_id: str, user_id: str) -> str | None:
+    def _employee_identity(
+        self, session: Session, device_id: str, user_id: str
+    ) -> tuple[str | None, str | None]:
         user = session.scalar(
             select(DeviceUser).where(DeviceUser.device_id == device_id, DeviceUser.user_id == user_id)
         )
-        return user.employee_name if user else None
+        return (user.employee_name, user.cnic) if user else (None, None)
 
     def _is_inside_lan_outage(self, session: Session, device_id: str, event_utc: datetime) -> bool:
         outage = session.scalar(

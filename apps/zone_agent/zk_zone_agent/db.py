@@ -188,9 +188,53 @@ class DeviceUser(Base):
     uid: Mapped[str | None] = mapped_column(String(100))
     user_id: Mapped[str] = mapped_column(String(100), nullable=False)
     employee_name: Mapped[str | None] = mapped_column(String(255))
+    cnic: Mapped[str | None] = mapped_column(String(13), index=True)
     privilege: Mapped[str | None] = mapped_column(String(100))
     card: Mapped[int | None] = mapped_column(Integer)
     raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class BulkUserUpdateJob(Base):
+    __tablename__ = "bulk_user_update_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(120), ForeignKey("devices.device_id"), index=True)
+    status: Mapped[str] = mapped_column(String(40), index=True, default="PENDING", nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pending_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updating_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verified_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    uploaded_filename: Mapped[str | None] = mapped_column(String(255))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class BulkUserUpdateItem(Base):
+    __tablename__ = "bulk_user_update_items"
+    __table_args__ = (UniqueConstraint("job_id", "user_id", name="uq_bulk_user_update_item"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("bulk_user_update_jobs.id"), index=True)
+    device_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    uid: Mapped[str | None] = mapped_column(String(100))
+    user_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    old_name: Mapped[str | None] = mapped_column(String(255))
+    sheet_name: Mapped[str | None] = mapped_column(String(255))
+    expected_name: Mapped[str | None] = mapped_column(String(255))
+    cnic: Mapped[str | None] = mapped_column(String(13), index=True)
+    privilege: Mapped[str | None] = mapped_column(String(100))
+    card: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(40), index=True, default="PENDING", nullable=False)
+    message: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     updated_at: Mapped[datetime] = utc_column()
 
 
@@ -204,6 +248,7 @@ class AttendanceEvent(Base):
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     employee_name: Mapped[str | None] = mapped_column(String(255))
+    cnic: Mapped[str | None] = mapped_column(String(13), index=True)
     device_event_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     zone_received_wall_time: Mapped[datetime] = mapped_column(UTCDateTime())
     zone_trusted_time: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
@@ -412,6 +457,14 @@ def _ensure_sqlite_schema(bind: Engine) -> None:
         }
         if "card" not in device_user_columns:
             connection.execute(text("ALTER TABLE device_users ADD COLUMN card INTEGER"))
+        if "cnic" not in device_user_columns:
+            connection.execute(text("ALTER TABLE device_users ADD COLUMN cnic VARCHAR(13)"))
+        attendance_columns = {
+            row["name"]
+            for row in connection.execute(text("PRAGMA table_info(attendance_events)")).mappings()
+        }
+        if "cnic" not in attendance_columns:
+            connection.execute(text("ALTER TABLE attendance_events ADD COLUMN cnic VARCHAR(13)"))
 
 
 @contextmanager

@@ -45,6 +45,56 @@
   </div>
 </form>
 
+{% if selected_device_id and admin_authenticated %}
+<section class="panel bulk-panel" data-bulk-jobs-root>
+  <div class="split-row">
+    <div>
+      <h2>Bulk Update</h2>
+      <p>Download the current machine users, fill CNIC, then upload the workbook for verified device updates.</p>
+    </div>
+    <a class="button-link" href="/users/{{ selected_device_id }}/bulk.xlsx?csrf_token={{ csrf_token|urlencode }}">Download Excel</a>
+  </div>
+  <form class="form inline-form bulk-upload-form" method="post" action="/users/{{ selected_device_id }}/bulk-upload" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Completed Excel
+      <input name="file" type="file" accept=".xlsx" required>
+    </label>
+    <button class="primary" type="submit">Upload And Start</button>
+  </form>
+
+  <div class="bulk-jobs">
+    {% for job in bulk_jobs %}
+      <article class="bulk-job" data-bulk-job-id="{{ job.id }}">
+        <div class="bulk-job-head">
+          <div>
+            <strong>Job {{ job.id }}</strong>
+            <small>{{ job.status }} · {{ job.created_at }}</small>
+          </div>
+          {% if job.status in ['PENDING', 'RUNNING', 'INTERRUPTED'] %}
+            <div class="bulk-job-actions">
+              <button type="button" data-bulk-job-action="resume">Resume</button>
+              <button type="button" data-bulk-job-action="cancel">Cancel</button>
+            </div>
+          {% endif %}
+        </div>
+        <div class="bulk-progress" data-bulk-job-summary>
+          Pending {{ job.pending_count }} · Updating {{ job.updating_count }} · Verified {{ job.verified_count }} · Skipped {{ job.skipped_count }} · Failed {{ job.failed_count }}
+        </div>
+        {% if job.last_error %}<div class="alert warn compact" data-bulk-job-error>{{ job.last_error }}</div>{% endif %}
+        <div class="table-wrap compact-table">
+          <table>
+            <thead><tr><th>ID</th><th>Status</th><th>CNIC</th><th>Final Name</th><th>Message</th></tr></thead>
+            <tbody data-bulk-job-items><tr><td colspan="5">Loading job details...</td></tr></tbody>
+          </table>
+        </div>
+      </article>
+    {% else %}
+      <p class="muted">No bulk jobs for this device yet.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <section class="users-layout">
   <div class="table-wrap">
     <table>

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from zk_common.enums import SourceType, TrustStatus
+from zk_zone_agent.bulk_user_update import ExportUserRow, export_users_xlsx
 from zk_zone_agent.device_validation import DeviceValidation
 from zk_zone_agent.zk_client import ZKDeviceInfo, ZKUser
 
@@ -460,6 +461,96 @@ def test_user_refresh_route_uses_worker_and_updates_cache(monkeypatch, tmp_path)
         user = session.query(db_module.DeviceUser).one()
         assert user.employee_name == "Ali Refreshed"
         assert user.card == 777
+
+
+def test_bulk_user_download_requires_admin_csrf(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    with TestClient(web_module.app) as client:
+        response = client.get("/users/MAIN-GATE/bulk.xlsx", follow_redirects=False)
+
+    assert response.status_code == 403
+
+
+def test_bulk_user_download_refreshes_and_exports_stripped_cnic(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    def fake_refresh(device_id):
+        with db_module.session_scope() as session:
+            row = session.scalar(
+                select(db_module.DeviceUser).where(db_module.DeviceUser.device_id == device_id)
+            )
+            row.employee_name = "Ali Khan-3520212345671"
+        return [ZKUser(uid="7", user_id="1007", name="Ali Khan-3520212345671", privilege="0")]
+
+    monkeypatch.setattr(web_module.zone_supervisor, "refresh_device_users", fake_refresh)
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.get(f"/users/MAIN-GATE/bulk.xlsx?csrf_token={csrf_token}")
+
+    assert response.status_code == 200
+    rows = web_module.parse_bulk_update_xlsx(response.content)
+    assert rows[0].user_id == "1007"
+    assert rows[0].sheet_name == "Ali Khan"
+    assert rows[0].cnic == "3520212345671"
+
+
+def test_bulk_user_upload_creates_job_and_items(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+    started_jobs = []
+
+    def fake_refresh(_device_id):
+        return [ZKUser(uid="7", user_id="1007", name="Ali", privilege="0", card=12345)]
+
+    def fake_start(job_id):
+        started_jobs.append(job_id)
+
+    monkeypatch.setattr(web_module.zone_supervisor, "refresh_device_users", fake_refresh)
+    monkeypatch.setattr(web_module.zone_supervisor, "start_bulk_user_update_job", fake_start)
+    content = export_users_xlsx(
+        [
+            ExportUserRow(user_id="1007", name="Ali Updated", cnic="35202-1234567-1"),
+            ExportUserRow(user_id="9999", name="Missing", cnic="3520212345672"),
+            ExportUserRow(user_id="1008", name="Blank", cnic=""),
+        ]
+    )
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        response = client.post(
+            "/users/MAIN-GATE/bulk-upload",
+            data={"csrf_token": csrf_token},
+            files={
+                "file": (
+                    "users.xlsx",
+                    content,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert started_jobs
+    with db_module.session_scope() as session:
+        job = session.query(db_module.BulkUserUpdateJob).one()
+        items = session.query(db_module.BulkUserUpdateItem).order_by(db_module.BulkUserUpdateItem.id).all()
+        assert job.pending_count == 1
+        assert job.failed_count == 1
+        assert job.skipped_count == 1
+        assert items[0].status == "PENDING"
+        assert items[0].user_id == "1007"
+        assert items[0].expected_name == "Ali Update-3520212345671"
+        assert items[1].status == "FAILED"
+        assert "not present" in items[1].message
+        assert items[2].status == "SKIPPED"
 
 
 def test_setup_stores_token_once_and_encrypts_secret(monkeypatch, tmp_path):

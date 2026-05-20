@@ -364,6 +364,50 @@ time[data-timestamp] [data-time-part] {
   align-items: center;
 }
 
+.bulk-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.bulk-upload-form {
+  max-width: none;
+}
+
+.bulk-jobs {
+  display: grid;
+  gap: 12px;
+}
+
+.bulk-job {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.bulk-job-head,
+.bulk-job-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.bulk-progress {
+  color: #344054;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.compact-table table {
+  font-size: 13px;
+}
+
+.compact-table th,
+.compact-table td {
+  padding: 8px 10px;
+}
+
 .stack-form {
   display: grid;
   gap: 8px;

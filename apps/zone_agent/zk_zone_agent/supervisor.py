@@ -11,7 +11,16 @@ from zk_zone_agent import APP_VERSION
 from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.bruteforce import comm_key_bruteforce_manager
 from zk_zone_agent.config import config_manager
-from zk_zone_agent.db import Device, FraudIncident, ServiceEvent, SessionLocal, init_db, session_scope
+from zk_zone_agent.db import (
+    BulkUserUpdateItem,
+    BulkUserUpdateJob,
+    Device,
+    FraudIncident,
+    ServiceEvent,
+    SessionLocal,
+    init_db,
+    session_scope,
+)
 from zk_zone_agent.db import run_session_with_retries
 from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.device_registry import device_registry
@@ -20,6 +29,7 @@ from zk_zone_agent.device_worker import DeviceWorker
 from zk_zone_agent.settings import settings
 from zk_zone_agent.sync import HeadOfficeClient, SyncWorker, sync_queue_writer
 from zk_zone_agent.trusted_time import trusted_time_service
+from zk_common.time_utils import utc_now
 
 
 class ZoneSupervisor:
@@ -30,6 +40,7 @@ class ZoneSupervisor:
         self.time_thread = threading.Thread(target=self._time_loop, name="trusted-time-loop", daemon=True)
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="heartbeat-loop", daemon=True)
         self.device_workers: dict[str, DeviceWorker] = {}
+        self.bulk_job_threads: dict[int, threading.Thread] = {}
         discovery_service.stop_event = self.stop_event
         comm_key_bruteforce_manager.stop_event = self.stop_event
 
@@ -37,6 +48,7 @@ class ZoneSupervisor:
         if self.started:
             return
         init_db()
+        self._recover_interrupted_bulk_jobs()
         self._record_service_start()
         if settings.disable_workers:
             self.started = True
@@ -124,11 +136,97 @@ class ZoneSupervisor:
     def update_device_user(self, device_id: str, update: DeviceUserUpdate):
         return self._active_device_worker(device_id).update_user(update)
 
+    def start_bulk_user_update_job(self, job_id: int) -> None:
+        existing = self.bulk_job_threads.get(job_id)
+        if existing and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._bulk_user_update_job_thread,
+            args=(job_id,),
+            name=f"bulk-user-update-{job_id}",
+            daemon=True,
+        )
+        self.bulk_job_threads[job_id] = thread
+        thread.start()
+
+    def cancel_bulk_user_update_job(self, job_id: int) -> None:
+        with session_scope() as session:
+            job = session.get(BulkUserUpdateJob, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status in {"COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELED"}:
+                return
+            job.status = "CANCELED"
+            job.last_error = "Canceled by local admin."
+            job.ended_at = job.ended_at or utc_now()
+            job.updated_at = utc_now()
+            for item in session.scalars(
+                select(BulkUserUpdateItem).where(
+                    BulkUserUpdateItem.job_id == job_id,
+                    BulkUserUpdateItem.status.in_(["PENDING", "UPDATING"]),
+                )
+            ):
+                item.status = "FAILED"
+                item.message = "Canceled by local admin."
+                item.ended_at = item.ended_at or utc_now()
+                item.updated_at = utc_now()
+            self._refresh_bulk_job_counts(session, job)
+
+    def _bulk_user_update_job_thread(self, job_id: int) -> None:
+        try:
+            with session_scope() as session:
+                job = session.get(BulkUserUpdateJob, job_id)
+                if job is None or job.status == "CANCELED":
+                    return
+                device_id = job.device_id
+            self._active_device_worker(device_id).run_bulk_user_update_job(job_id)
+        except Exception as exc:
+            try:
+                with session_scope() as session:
+                    job = session.get(BulkUserUpdateJob, job_id)
+                    if job is None or job.status == "CANCELED":
+                        return
+                    job.status = "INTERRUPTED"
+                    job.last_error = str(exc)
+                    job.updated_at = utc_now()
+            except Exception:
+                pass
+
+    def _recover_interrupted_bulk_jobs(self) -> None:
+        with session_scope() as session:
+            jobs = session.scalars(
+                select(BulkUserUpdateJob).where(BulkUserUpdateJob.status.in_(["RUNNING", "PENDING"]))
+            ).all()
+            for job in jobs:
+                job.status = "INTERRUPTED"
+                job.last_error = "Zone agent restarted before this bulk update finished."
+                job.updated_at = utc_now()
+                for item in session.scalars(
+                    select(BulkUserUpdateItem).where(
+                        BulkUserUpdateItem.job_id == job.id,
+                        BulkUserUpdateItem.status == "UPDATING",
+                    )
+                ):
+                    item.status = "PENDING"
+                    item.message = "Retry after zone agent restart."
+                    item.updated_at = utc_now()
+                self._refresh_bulk_job_counts(session, job)
+
     def _active_device_worker(self, device_id: str) -> DeviceWorker:
         worker = self.device_workers.get(device_id)
         if worker is None or not worker.is_alive():
             raise RuntimeError("Device worker is not running; user changes require an online device.")
         return worker
+
+    def _refresh_bulk_job_counts(self, session: Session, job: BulkUserUpdateJob) -> None:
+        items = list(session.scalars(select(BulkUserUpdateItem).where(BulkUserUpdateItem.job_id == job.id)))
+        job.total_count = len(items)
+        job.pending_count = sum(1 for item in items if item.status == "PENDING")
+        job.updating_count = sum(1 for item in items if item.status == "UPDATING")
+        job.verified_count = sum(1 for item in items if item.status == "VERIFIED")
+        job.skipped_count = sum(1 for item in items if item.status == "SKIPPED")
+        job.failed_count = sum(1 for item in items if item.status == "FAILED")
+        job.updated_at = utc_now()
 
     def _time_loop(self) -> None:
         while not self.stop_event.is_set():
