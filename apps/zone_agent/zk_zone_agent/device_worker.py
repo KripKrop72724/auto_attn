@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 import threading
 import time
 from datetime import datetime
-from typing import Callable
+from typing import Callable, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -39,6 +39,8 @@ from zk_zone_agent.sync import sync_queue_writer
 from zk_zone_agent.trusted_time import TrustedTimeService
 from zk_zone_agent.zk_client import PyZKClient, ZKAttendance, ZKClient, ZKUser
 
+T = TypeVar("T")
+
 
 @dataclass
 class _DeviceCommand:
@@ -47,6 +49,9 @@ class _DeviceCommand:
     done: threading.Event
     result: object | None = None
     error: BaseException | None = None
+    started: bool = False
+    canceled: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class DeviceWorker(threading.Thread):
@@ -82,6 +87,8 @@ class DeviceWorker(threading.Thread):
         self.reconnect_clock_ok = True
         self.command_queue: Queue[_DeviceCommand] = Queue()
         self.command_available = threading.Event()
+        self._active_client: ZKClient | None = None
+        self._active_client_lock = threading.Lock()
 
     def run(self) -> None:
         backoff = 5
@@ -96,6 +103,7 @@ class DeviceWorker(threading.Thread):
                 self._mark_connecting(backoff)
                 client.connect()
                 backoff = 5
+                self._set_active_client(client)
                 self._on_connected(client)
                 self.command_available.set()
                 self._live_loop(client)
@@ -105,6 +113,7 @@ class DeviceWorker(threading.Thread):
                 backoff = min(backoff * 2, 60)
             finally:
                 self.command_available.clear()
+                self._clear_active_client(client)
                 self._fail_pending_commands(
                     "Device disconnected before the user command could run."
                 )
@@ -114,7 +123,34 @@ class DeviceWorker(threading.Thread):
                     pass
 
     def _default_client_factory(self, device: Device) -> ZKClient:
-        return PyZKClient(ip=device.ip, port=device.port, comm_key=device_registry.comm_key(device), timeout=5)
+        return PyZKClient(
+            ip=device.ip,
+            port=device.port,
+            comm_key=device_registry.comm_key(device),
+            timeout=settings.zkt_client_timeout_seconds,
+        )
+
+    def _set_active_client(self, client: ZKClient) -> None:
+        with self._active_client_lock:
+            self._active_client = client
+
+    def _clear_active_client(self, client: ZKClient) -> None:
+        with self._active_client_lock:
+            if self._active_client is client:
+                self._active_client = None
+
+    def _wake_live_capture(self) -> None:
+        with self._active_client_lock:
+            client = self._active_client
+        if client is None:
+            return
+        self._stop_live_capture_quietly(client)
+
+    def _stop_live_capture_quietly(self, client: ZKClient) -> None:
+        try:
+            client.stop_live_capture()
+        except Exception:
+            pass
 
     def _session_device(self, session: Session) -> Device:
         device = session.scalar(select(Device).where(Device.device_id == self.device_id))
@@ -156,21 +192,24 @@ class DeviceWorker(threading.Thread):
             self._process_observed_attendance(attendance, SourceType.LIVE)
             self._drain_commands(client)
 
-    def refresh_users(self, timeout_seconds: float = 20) -> list[ZKUser]:
+    def refresh_users(self, timeout_seconds: float | None = None) -> list[ZKUser]:
+        timeout_seconds = timeout_seconds or settings.device_user_refresh_timeout_seconds
         result = self._submit_command("refresh_users", None, timeout_seconds)
         return list(result) if isinstance(result, list) else []
 
     def update_user(
         self,
         update: DeviceUserUpdate,
-        timeout_seconds: float = 20,
+        timeout_seconds: float | None = None,
     ) -> ZKUser:
+        timeout_seconds = timeout_seconds or settings.device_user_update_timeout_seconds
         result = self._submit_command("update_user", update, timeout_seconds)
         if not isinstance(result, ZKUser):
             raise RuntimeError("Device update returned an unexpected response.")
         return result
 
-    def run_bulk_user_update_job(self, job_id: int, timeout_seconds: float = 3600) -> None:
+    def run_bulk_user_update_job(self, job_id: int, timeout_seconds: float | None = None) -> None:
+        timeout_seconds = timeout_seconds or settings.bulk_user_update_timeout_seconds
         self._submit_command("bulk_user_update_job", job_id, timeout_seconds)
 
     def _submit_command(
@@ -185,8 +224,24 @@ class DeviceWorker(threading.Thread):
             )
         command = _DeviceCommand(kind=kind, payload=payload, done=threading.Event())
         self.command_queue.put(command)
+        self._wake_live_capture()
         if not command.done.wait(timeout_seconds):
-            raise TimeoutError("Device did not finish the user command before the timeout.")
+            with command.lock:
+                if not command.started:
+                    command.canceled = True
+                    command.error = TimeoutError(
+                        "Device command expired before it started; the queued operation was canceled."
+                    )
+                else:
+                    command.error = TimeoutError(
+                        "Device command started but did not finish before the timeout."
+                    )
+            self._wake_live_capture()
+            raise TimeoutError(
+                f"Device did not finish the {kind.replace('_', ' ')} command within "
+                f"{timeout_seconds:g} seconds. The app interrupted live capture so the "
+                "command could run; check the device network/power and refresh before retrying."
+            )
         if command.error is not None:
             raise command.error
         return command.result
@@ -199,6 +254,13 @@ class DeviceWorker(threading.Thread):
             except Empty:
                 break
             try:
+                with command.lock:
+                    if command.canceled:
+                        if command.error is None:
+                            command.error = TimeoutError("Timed-out command was canceled before execution.")
+                        continue
+                    command.started = True
+                self._stop_live_capture_quietly(client)
                 if command.kind == "refresh_users":
                     command.result = self._refresh_device_users(client)
                     should_restart_live_capture = True
@@ -221,7 +283,7 @@ class DeviceWorker(threading.Thread):
                 command.done.set()
                 self.command_queue.task_done()
         if should_restart_live_capture:
-            client.stop_live_capture()
+            self._stop_live_capture_quietly(client)
 
     def _fail_pending_commands(self, message: str) -> None:
         while True:
@@ -234,7 +296,7 @@ class DeviceWorker(threading.Thread):
             self.command_queue.task_done()
 
     def _refresh_device_users(self, client: ZKClient) -> list[ZKUser]:
-        users = client.get_users()
+        users = self._device_io(client, "read users from device", client.get_users)
         with self.session_factory() as session:
             device = self._session_device(session)
             attendance_processor.replace_users(session, device, users)
@@ -243,7 +305,7 @@ class DeviceWorker(threading.Thread):
         return users
 
     def _update_device_user(self, client: ZKClient, update: DeviceUserUpdate) -> ZKUser:
-        users = client.get_users()
+        users = self._device_io(client, "read users before update", client.get_users)
         existing = next((user for user in users if str(user.uid) == update.uid), None)
         if existing is None:
             raise ValueError("User was not found on the device. Refresh users and try again.")
@@ -257,20 +319,76 @@ class DeviceWorker(threading.Thread):
         )
         if duplicate is not None:
             raise ValueError(f"User ID {update.user_id} already exists on this device.")
-        updated = client.update_user(
-            uid=update.uid,
-            user_id=update.user_id,
-            name=update.name,
-            privilege=update.privilege,
-            card=update.card,
+        updated = self._device_io(
+            client,
+            f"write user {update.user_id}",
+            lambda: client.update_user(
+                uid=update.uid,
+                user_id=update.user_id,
+                name=update.name,
+                privilege=update.privilege,
+                card=update.card,
+            ),
         )
-        refreshed_users = client.get_users()
+        refreshed_users = self._device_io(client, "verify users after update", client.get_users)
         with self.session_factory() as session:
             device = self._session_device(session)
             attendance_processor.replace_users(session, device, refreshed_users)
             device.last_error = f"Updated user {updated.name or updated.user_id} on device."
             session.commit()
         return updated
+
+    def _device_io(self, client: ZKClient, action: str, operation: Callable[[], T]) -> T:
+        attempts = max(1, settings.device_user_io_retry_attempts)
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            self._stop_live_capture_quietly(client)
+            try:
+                return operation()
+            except BaseException as exc:
+                last_error = exc
+                if attempt >= attempts or not self._is_retryable_device_error(exc):
+                    raise
+                self._mark_device_command_retry(action, attempt, attempts, exc)
+                time.sleep(max(0, settings.device_user_io_retry_delay_seconds))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"{action} did not return a result.")
+
+    def _is_retryable_device_error(self, exc: BaseException) -> bool:
+        if isinstance(exc, (TimeoutError, OSError, ConnectionError)):
+            return True
+        message = str(exc).lower()
+        retryable_fragments = (
+            "timed out",
+            "timeout",
+            "can't read sizes",
+            "cannot read sizes",
+            "read sizes",
+            "connection",
+            "socket",
+            "temporarily",
+            "broken pipe",
+            "reset by peer",
+        )
+        return any(fragment in message for fragment in retryable_fragments)
+
+    def _mark_device_command_retry(
+        self,
+        action: str,
+        attempt: int,
+        attempts: int,
+        exc: BaseException,
+    ) -> None:
+        try:
+            with self.session_factory() as session:
+                device = self._session_device(session)
+                device.last_error = (
+                    f"{action} failed on attempt {attempt}/{attempts}: {exc}. Retrying."
+                )
+                session.commit()
+        except Exception:
+            pass
 
     def _run_bulk_user_update_job(self, client: ZKClient, job_id: int) -> None:
         self._mark_bulk_job_started(job_id)
@@ -347,7 +465,7 @@ class DeviceWorker(threading.Thread):
             session.commit()
 
         try:
-            users = client.get_users()
+            users = self._device_io(client, "read users before bulk row update", client.get_users)
             with self.session_factory() as session:
                 item = session.get(BulkUserUpdateItem, item_id)
                 if item is None:
@@ -365,14 +483,22 @@ class DeviceWorker(threading.Thread):
 
             if not item.expected_name:
                 raise RuntimeError("Bulk item is missing an expected name.")
-            updated = client.update_user(
-                uid=uid,
-                user_id=item.user_id,
-                name=item.expected_name,
-                privilege=privilege,
-                card=card,
+            updated = self._device_io(
+                client,
+                f"write bulk user {item.user_id}",
+                lambda: client.update_user(
+                    uid=uid,
+                    user_id=item.user_id,
+                    name=item.expected_name,
+                    privilege=privilege,
+                    card=card,
+                ),
             )
-            refreshed_users = client.get_users()
+            refreshed_users = self._device_io(
+                client,
+                "verify users after bulk row update",
+                client.get_users,
+            )
             verified = next((user for user in refreshed_users if str(user.user_id) == item.user_id), None)
             with self.session_factory() as session:
                 item = session.get(BulkUserUpdateItem, item_id)

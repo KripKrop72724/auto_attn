@@ -34,6 +34,12 @@ class ZoneSettings(BaseSettings):
     scan_max_hosts_per_subnet: int = 254
     scan_include_public_subnets: bool = False
     clock_check_interval_seconds: int = 5
+    zkt_client_timeout_seconds: float = 10
+    device_user_refresh_timeout_seconds: float = 120
+    device_user_update_timeout_seconds: float = 180
+    bulk_user_update_timeout_seconds: float = 7200
+    device_user_io_retry_attempts: int = 3
+    device_user_io_retry_delay_seconds: float = 0.75
     live_poll_reconcile_enabled: bool = True
     live_poll_reconcile_interval_seconds: int = 5
     drift_threshold_seconds: int = 120

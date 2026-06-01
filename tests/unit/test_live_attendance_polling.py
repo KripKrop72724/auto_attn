@@ -9,7 +9,7 @@ from zk_common.enums import OutageType, SourceType, SyncStatus, TrustStatus
 from zk_zone_agent.config import ActiveZoneConfig
 from zk_zone_agent.crypto import protect_secret
 from zk_zone_agent.db import Base, Device, DeviceUser, AttendanceEvent, OutagePeriod, SyncQueue, create_sqlite_engine
-from zk_zone_agent.device_worker import DeviceWorker
+from zk_zone_agent.device_worker import DeviceWorker, _DeviceCommand
 from zk_zone_agent.trusted_time import TrustedTimeService
 from zk_zone_agent.zk_client import ZKAttendance
 
@@ -20,6 +20,86 @@ class _PollOnlyClient:
 
     def get_attendance(self) -> list[ZKAttendance]:
         return self.attendances
+
+
+class _CommandClient:
+    def __init__(self) -> None:
+        self.stop_calls = 0
+        self.get_users_calls = 0
+
+    def stop_live_capture(self) -> None:
+        self.stop_calls += 1
+
+    def get_users(self):
+        self.get_users_calls += 1
+        raise AssertionError("canceled command should not touch the device")
+
+
+def _command_worker() -> DeviceWorker:
+    return DeviceWorker(
+        device_id="MAIN-GATE",
+        zone_config=ActiveZoneConfig(
+            zone_id="RWP-ZONE-01",
+            zone_name="Rawalpindi Main Office",
+            timezone="Asia/Karachi",
+            head_office_url="https://head-office-production.up.railway.app",
+            zone_token="token",
+            setup_completed=True,
+        ),
+        stop_event=threading.Event(),
+        trusted_time=TrustedTimeService(),
+        session_factory=lambda: (_ for _ in ()).throw(RuntimeError("no database in this test")),
+    )
+
+
+def test_device_command_timeout_wakes_live_capture_and_cancels_before_start():
+    worker = _command_worker()
+    client = _CommandClient()
+    worker.is_alive = lambda: True
+    worker.command_available.set()
+    worker._set_active_client(client)
+
+    try:
+        worker._submit_command("refresh_users", None, 0.001)
+    except TimeoutError as exc:
+        assert "refresh users" in str(exc)
+    else:
+        raise AssertionError("expected command timeout")
+
+    command = worker.command_queue.get_nowait()
+    assert command.canceled is True
+    assert client.stop_calls >= 1
+
+
+def test_device_worker_skips_canceled_command_without_mutating_device():
+    worker = _command_worker()
+    client = _CommandClient()
+    command = _DeviceCommand(kind="refresh_users", payload=None, done=threading.Event())
+    command.canceled = True
+    worker.command_queue.put(command)
+
+    worker._drain_commands(client)
+
+    assert command.done.is_set()
+    assert client.get_users_calls == 0
+
+
+def test_retryable_device_io_retries_zkt_read_size_failures(monkeypatch):
+    worker = _command_worker()
+    client = _CommandClient()
+    monkeypatch.setattr("zk_zone_agent.device_worker.settings.device_user_io_retry_attempts", 2)
+    monkeypatch.setattr("zk_zone_agent.device_worker.settings.device_user_io_retry_delay_seconds", 0)
+    calls = {"count": 0}
+
+    def flaky_operation():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("can't read sizes")
+        return ["ok"]
+
+    assert worker._device_io(client, "read users", flaky_operation) == ["ok"]
+    assert calls["count"] == 2
+    assert client.stop_calls == 2
 
 
 def test_live_poll_reconcile_captures_new_attendance_once(tmp_path):
