@@ -45,6 +45,7 @@ from zk_zone_agent.db import (
     ServiceEvent,
     SyncQueue,
     init_db,
+    run_session_with_retries,
     session_scope,
 )
 from zk_zone_agent.audit import audit_ledger
@@ -872,15 +873,14 @@ def update_device_user(
 @app.get("/users/{device_id}/bulk.xlsx")
 def download_bulk_user_update_xlsx(request: Request, device_id: str):
     with session_scope() as session:
-        _require_admin_form(request, session, request.query_params.get("csrf_token"))
+        _require_admin_read_api(request, session, request.query_params.get("csrf_token"))
         device = session.scalar(select(Device).where(Device.device_id == device_id))
         if device is None:
             raise HTTPException(status_code=404)
-        record_security_event(
-            session,
-            "BULK_USER_UPDATE_DOWNLOAD_ATTEMPT",
-            f"Downloading bulk update workbook for {device_id}.",
-        )
+    _record_security_event_best_effort(
+        "BULK_USER_UPDATE_DOWNLOAD_ATTEMPT",
+        f"Downloading bulk update workbook for {device_id}.",
+    )
     try:
         zone_supervisor.refresh_device_users(device_id)
     except Exception as exc:
@@ -896,22 +896,46 @@ def download_bulk_user_update_xlsx(request: Request, device_id: str):
             name, cnic = split_machine_name_cnic(user.employee_name)
             rows.append(ExportUserRow(user_id=user.user_id, name=name, cnic=cnic))
         content = export_users_xlsx(rows)
-        record_security_event(
-            session,
-            "BULK_USER_UPDATE_DOWNLOAD_SUCCEEDED",
-            f"Downloaded bulk update workbook for {device_id} with {len(rows)} user(s).",
-        )
-        audit_ledger.append(
-            session,
-            "bulk_user_update_download",
-            device_id,
-            {"device_id": device_id, "user_count": len(rows), "downloaded_at": utc_now()},
-        )
+    _record_bulk_download_success_best_effort(device_id=device_id, user_count=len(rows))
     filename = f"{device_id}-users.xlsx"
     return StreamingResponse(
         BytesIO(content),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _record_security_event_best_effort(event_type: str, description: str | None = None) -> None:
+    try:
+        run_session_with_retries(
+            lambda session: record_security_event(session, event_type, description),
+            attempts=6,
+        )
+    except Exception:
+        pass
+
+
+def _record_bulk_download_success_best_effort(*, device_id: str, user_count: int) -> None:
+    try:
+        run_session_with_retries(
+            lambda session: _record_bulk_download_success(session, device_id, user_count),
+            attempts=6,
+        )
+    except Exception:
+        pass
+
+
+def _record_bulk_download_success(session, device_id: str, user_count: int) -> None:
+    record_security_event(
+        session,
+        "BULK_USER_UPDATE_DOWNLOAD_SUCCEEDED",
+        f"Downloaded bulk update workbook for {device_id} with {user_count} user(s).",
+    )
+    audit_ledger.append(
+        session,
+        "bulk_user_update_download",
+        device_id,
+        {"device_id": device_id, "user_count": user_count, "downloaded_at": utc_now()},
     )
 
 

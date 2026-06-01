@@ -500,6 +500,28 @@ def test_bulk_user_download_refreshes_and_exports_stripped_cnic(monkeypatch, tmp
     assert rows[0].cnic == "3520212345671"
 
 
+def test_bulk_user_download_survives_security_event_lock(monkeypatch, tmp_path):
+    db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
+    _create_admin(db_module, web_module)
+    _seed_device_user(db_module)
+
+    def fake_refresh(_device_id):
+        return [ZKUser(uid="7", user_id="1007", name="Ali", privilege="0")]
+
+    def locked_event(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    with TestClient(web_module.app) as client:
+        csrf_token = _unlock(client)
+        monkeypatch.setattr(web_module.zone_supervisor, "refresh_device_users", fake_refresh)
+        monkeypatch.setattr(web_module, "record_security_event", locked_event)
+        response = client.get(f"/users/MAIN-GATE/bulk.xlsx?csrf_token={csrf_token}")
+
+    assert response.status_code == 200
+    rows = web_module.parse_bulk_update_xlsx(response.content)
+    assert rows[0].user_id == "1007"
+
+
 def test_bulk_user_upload_creates_job_and_items(monkeypatch, tmp_path):
     db_module, web_module = _load_zone_web(monkeypatch, tmp_path)
     _create_admin(db_module, web_module)
