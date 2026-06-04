@@ -28,5 +28,18 @@ def test_attendance_event_uid_survives_zone_registration():
     )
 
 
+def test_attendance_event_uid_survives_live_poll_source_uid_mismatch():
+    kwargs = {
+        "zone_id": "RWP-ZONE-01",
+        "device_serial": "ADZV211860253",
+        "user_id": "5",
+        "device_event_time": datetime(2026, 5, 13, 9, 0, 0),
+        "punch": 0,
+    }
+    assert attendance_event_uid(source_uid=None, **kwargs) == attendance_event_uid(
+        source_uid=12345, **kwargs
+    )
+
+
 def test_canonical_json_sorts_keys_and_compacts():
     assert canonical_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'

@@ -125,7 +125,7 @@ def test_attendance_event_uid_is_stable_across_live_and_dump_sources():
         user_id="1001",
         device_event_time=timestamp,
         punch=0,
-        source_uid=77,
+        source_uid=None,
     )
     dump_uid = attendance_event_uid(
         zone_id="ZONE-SLICTOWER-3FL",

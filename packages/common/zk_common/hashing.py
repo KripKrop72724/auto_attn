@@ -67,12 +67,15 @@ def attendance_event_uid(
     punch: str | int | None,
     source_uid: str | int | None = None,
 ) -> str:
+    # ZKT live capture and get_attendance() can disagree about source_uid for
+    # the same physical punch. Keep event IDs tied to the actual punch identity
+    # so live, poll, startup, and reconnect paths converge.
+    _ = source_uid
     return payload_hash(
         {
             "device_serial": device_serial,
             "user_id": str(user_id),
             "device_event_time": device_event_time,
             "punch": None if punch is None else str(punch),
-            "source_uid": None if source_uid is None else str(source_uid),
         }
     )

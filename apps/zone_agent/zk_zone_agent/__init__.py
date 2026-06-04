@@ -1,3 +1,3 @@
 """Local Windows zone-agent application."""
 
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
