@@ -14,7 +14,7 @@ from sqlalchemy import func, or_, select
 
 from zk_zone_agent import APP_VERSION
 from zk_common.enums import ClockStatus
-from zk_common.time_utils import utc_now
+from zk_common.time_utils import parse_datetime, utc_now
 from zk_common.ui_time import (
     apply_timeline_date_filter,
     filter_context,
@@ -41,6 +41,7 @@ from zk_zone_agent.db import (
     DeviceUser,
     DiscoveryScanRun,
     FraudIncident,
+    OracleAttendanceOutbox,
     OutagePeriod,
     ServiceEvent,
     SyncQueue,
@@ -70,6 +71,7 @@ from zk_zone_agent.local_security import (
     verify_admin_password,
 )
 from zk_zone_agent.network_scanner import network_scanner
+from zk_zone_agent.oracle_sync import oracle_sync_wakeup
 from zk_zone_agent.settings import settings
 from zk_zone_agent.supervisor import zone_supervisor
 from zk_zone_agent.sync import HeadOfficeClient, sync_queue_writer
@@ -485,6 +487,7 @@ def setup_page(request: Request, error: str | None = None):
     with session_scope() as session:
         config = config_manager.get(session)
         context = _admin_context(request, session)
+        oracle_summary = _oracle_summary(session)
     return templates.TemplateResponse(
         request=request,
         name="setup.html",
@@ -492,6 +495,8 @@ def setup_page(request: Request, error: str | None = None):
             "config": config,
             "error": error,
             "default_head_office_url": settings.production_head_office_url,
+            "default_ords_base_url": settings.default_ords_base_url,
+            "oracle_summary": oracle_summary,
             **context,
         },
     )
@@ -573,6 +578,47 @@ def reset_setup(request: Request, csrf_token: str = Form("")):
         _require_admin_form(request, session, csrf_token)
         config_manager.clear_setup(session)
         record_security_event(session, "ZONE_SETUP_RESET", "Local zone setup token was cleared.")
+    return RedirectResponse("/setup", status_code=303)
+
+
+@app.post("/setup/oracle")
+def save_oracle_setup(
+    request: Request,
+    ords_base_url: str = Form(...),
+    ords_api_username: str = Form(...),
+    ords_api_password: str = Form(...),
+    oracle_cutover_utc: str = Form(...),
+    csrf_token: str = Form(""),
+):
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        if not ords_base_url.strip().startswith(("https://", "http://")):
+            return _with_error("/setup", "Oracle ORDS base URL must start with http:// or https://.")
+        try:
+            cutover = parse_datetime(oracle_cutover_utc.strip())
+        except Exception:
+            return _with_error("/setup", "Oracle cutover must be ISO UTC like 2026-06-03T13:59:00Z.")
+        if not ords_api_username.strip() or not ords_api_password.strip():
+            return _with_error("/setup", "Oracle API username and password are required.")
+        config_manager.save_oracle_attendance(
+            session,
+            ords_base_url=ords_base_url,
+            ords_api_username=ords_api_username,
+            ords_api_password=ords_api_password,
+            oracle_cutover_utc=cutover,
+        )
+        record_security_event(session, "ORACLE_SETUP_SAVED", "Oracle attendance sync configuration was saved.")
+        oracle_sync_wakeup.set()
+    return RedirectResponse("/setup", status_code=303)
+
+
+@app.post("/setup/oracle/clear")
+def clear_oracle_setup(request: Request, csrf_token: str = Form("")):
+    with session_scope() as session:
+        _require_admin_form(request, session, csrf_token)
+        config_manager.clear_oracle_attendance(session)
+        record_security_event(session, "ORACLE_SETUP_CLEARED", "Oracle attendance sync configuration was cleared.")
+        oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
 
 
@@ -1637,6 +1683,19 @@ def _counts(session):
         "incidents": session.scalar(select(func.count(FraudIncident.id))) or 0,
         "sync_queue": session.scalar(select(func.count(SyncQueue.id))) or 0,
     }
+
+
+def _oracle_summary(session) -> dict:
+    counts = {
+        str(status): count
+        for status, count in session.execute(
+            select(OracleAttendanceOutbox.status, func.count(OracleAttendanceOutbox.id)).group_by(
+                OracleAttendanceOutbox.status
+            )
+        ).all()
+    }
+    total = session.scalar(select(func.count(OracleAttendanceOutbox.id))) or 0
+    return {"counts": counts, "total": total}
 
 
 def _refresh_bulk_job_counts_for_web(session, job: BulkUserUpdateJob) -> None:

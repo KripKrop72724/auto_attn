@@ -170,9 +170,13 @@ class SyncWorker(threading.Thread):
             grouped: dict[str, list[SyncQueue]] = defaultdict(list)
             for row in pending:
                 grouped[row.payload_type].append(row)
+            did_sync_work = False
             for payload_type, rows in grouped.items():
+                if payload_type == PayloadType.ATTENDANCE.value and config.oracle_attendance_configured:
+                    continue
                 self._sync_group(session, client, config, payload_type, rows)
-            return True
+                did_sync_work = True
+            return did_sync_work
 
     def _sync_group(
         self,

@@ -654,6 +654,8 @@ class DeviceWorker(threading.Thread):
                 current_clock_status=device.last_clock_status,
                 pc_clock_suspicious=self.trusted_time.last_pc_tamper_at is not None,
                 reconnect_clock_ok=self.reconnect_clock_ok,
+                oracle_attendance_configured=zone_config.oracle_attendance_configured,
+                oracle_cutover_utc=zone_config.oracle_cutover_utc,
             )
             before_id = attendance_processor.find_event_id(session, device, attendance, context)
             row = attendance_processor.process(
@@ -912,6 +914,8 @@ class DeviceWorker(threading.Thread):
                 internet_online=self.trusted_time.last_head_office_time_utc is not None,
                 current_clock_status=device.last_clock_status,
                 reconnect_clock_ok=self.reconnect_clock_ok,
+                oracle_attendance_configured=zone_config.oracle_attendance_configured,
+                oracle_cutover_utc=zone_config.oracle_cutover_utc,
             )
             for item in attendances:
                 before_id = attendance_processor.find_event_id(session, device, item, context)

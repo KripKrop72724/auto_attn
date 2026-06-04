@@ -167,6 +167,34 @@ small {
   align-items: center;
 }
 
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 10px;
+}
+
+.stat-grid > div {
+  min-height: 68px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.stat-grid strong {
+  display: block;
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.stat-grid span {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .form {
   display: grid;
   gap: 12px;

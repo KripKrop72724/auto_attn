@@ -75,6 +75,10 @@ class ZoneConfig(Base):
     timezone: Mapped[str] = mapped_column(String(100), default="Asia/Karachi", nullable=False)
     head_office_url: Mapped[str] = mapped_column(String(500), nullable=False)
     zone_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    ords_base_url: Mapped[str | None] = mapped_column(String(500))
+    ords_api_username_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    ords_api_password_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    oracle_cutover_utc: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
@@ -259,6 +263,7 @@ class AttendanceEvent(Base):
     raw_event: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     device_drift_seconds: Mapped[float | None] = mapped_column(Float)
     device_jump_context_id: Mapped[int | None] = mapped_column(Integer)
+    raw_punch: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     fraud_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     fraud_reason: Mapped[str | None] = mapped_column(Text)
     source_type: Mapped[str] = mapped_column(String(60), index=True, nullable=False)
@@ -267,6 +272,30 @@ class AttendanceEvent(Base):
 
     def raw_event_dict(self) -> dict:
         return json.loads(self.raw_event or "{}")
+
+
+class OracleAttendanceOutbox(Base):
+    __tablename__ = "oracle_attendance_outbox"
+    __table_args__ = (
+        UniqueConstraint("attendance_event_id", name="uq_oracle_outbox_attendance_event"),
+        UniqueConstraint("event_uid", name="uq_oracle_outbox_event_uid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_event_id: Mapped[int] = mapped_column(Integer, ForeignKey("attendance_events.id"), index=True)
+    event_uid: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), index=True, default="PENDING", nullable=False)
+    delivery_mode: Mapped[str | None] = mapped_column(String(20), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    last_http_status: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_payload_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    batch_uid: Mapped[str | None] = mapped_column(String(150), index=True)
+    acked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
 
 
 class ClockCheck(Base):
@@ -465,6 +494,33 @@ def _ensure_sqlite_schema(bind: Engine) -> None:
         }
         if "cnic" not in attendance_columns:
             connection.execute(text("ALTER TABLE attendance_events ADD COLUMN cnic VARCHAR(13)"))
+        if "raw_punch" not in attendance_columns:
+            connection.execute(
+                text("ALTER TABLE attendance_events ADD COLUMN raw_punch BOOLEAN DEFAULT 0 NOT NULL")
+            )
+        zone_config_columns = {
+            row["name"]
+            for row in connection.execute(text("PRAGMA table_info(zone_config)")).mappings()
+        }
+        if "ords_base_url" not in zone_config_columns:
+            connection.execute(text("ALTER TABLE zone_config ADD COLUMN ords_base_url VARCHAR(500)"))
+        if "ords_api_username_encrypted" not in zone_config_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE zone_config "
+                    "ADD COLUMN ords_api_username_encrypted TEXT DEFAULT '' NOT NULL"
+                )
+            )
+        if "ords_api_password_encrypted" not in zone_config_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE zone_config "
+                    "ADD COLUMN ords_api_password_encrypted TEXT DEFAULT '' NOT NULL"
+                )
+            )
+        if "oracle_cutover_utc" not in zone_config_columns:
+            connection.execute(text("ALTER TABLE zone_config ADD COLUMN oracle_cutover_utc DATETIME"))
+        OracleAttendanceOutbox.__table__.create(connection, checkfirst=True)
 
 
 @contextmanager

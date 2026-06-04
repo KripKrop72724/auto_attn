@@ -13,9 +13,10 @@ from zk_common.hashing import attendance_event_uid
 from zk_common.schemas import AttendanceSyncEvent
 from zk_common.time_utils import device_local_to_utc, ensure_utc, utc_now
 from zk_zone_agent.audit import audit_ledger
-from zk_zone_agent.bulk_user_update import split_machine_name_cnic
+from zk_zone_agent.bulk_user_update import split_machine_identity, split_machine_name_cnic
 from zk_zone_agent.db import AttendanceEvent, Device, DeviceUser, OutagePeriod
 from zk_zone_agent.fraud import FraudEngine, fraud_engine
+from zk_zone_agent.oracle_sync import DELIVERY_BULK, DELIVERY_LIVE, oracle_outbox_writer, oracle_sync_wakeup
 from zk_zone_agent.sync import sync_queue_writer
 from zk_zone_agent.zk_client import ZKAttendance, ZKUser
 
@@ -29,6 +30,8 @@ class AttendanceContext:
     pc_clock_suspicious: bool = False
     reconnect_clock_ok: bool = True
     service_was_down: bool = False
+    oracle_attendance_configured: bool = False
+    oracle_cutover_utc: datetime | None = None
 
 
 class AttendanceProcessor:
@@ -123,7 +126,9 @@ class AttendanceProcessor:
         if existing is not None:
             return existing
 
-        employee_name, cnic = self._employee_identity(session, device.device_id, str(attendance.user_id))
+        employee_name, cnic, raw_punch = self._employee_identity(
+            session, device.device_id, str(attendance.user_id)
+        )
         if source_type in {SourceType.LIVE, SourceType.LIVE_POLL}:
             classification = self.engine.classify_live_attendance(
                 device_event_time=attendance.timestamp,
@@ -148,13 +153,14 @@ class AttendanceProcessor:
                 service_was_down=context.service_was_down,
             )
 
+        device_event_utc = device_local_to_utc(attendance.timestamp, context.timezone)
         payload = AttendanceSyncEvent(
             event_uid=event_uid,
             device_id=device.device_id,
             device_serial=device.serial,
             user_id=str(attendance.user_id),
             employee_name=employee_name,
-            device_event_time=attendance.timestamp,
+            device_event_time=device_event_utc,
             zone_received_wall_time=ensure_utc(utc_now()),
             zone_trusted_time=zone_trusted_time,
             source_type=source_type,
@@ -173,7 +179,7 @@ class AttendanceProcessor:
             user_id=str(attendance.user_id),
             employee_name=employee_name,
             cnic=cnic,
-            device_event_time=attendance.timestamp,
+            device_event_time=device_event_utc,
             zone_received_wall_time=payload.zone_received_wall_time,
             zone_trusted_time=zone_trusted_time,
             status=classification.trust_status.value,
@@ -181,6 +187,7 @@ class AttendanceProcessor:
             punch=None if attendance.punch is None else str(attendance.punch),
             raw_event=json.dumps(attendance.raw or {}, default=str, sort_keys=True),
             device_drift_seconds=classification.drift_seconds,
+            raw_punch=raw_punch,
             fraud_score=classification.fraud_score,
             fraud_reason=classification.fraud_reason,
             source_type=source_type.value,
@@ -189,22 +196,47 @@ class AttendanceProcessor:
         session.add(row)
         session.flush()
         audit_ledger.append(session, "attendance_event", row.event_uid, payload)
-        sync_queue_writer.enqueue(
-            session,
-            payload_type=PayloadType.ATTENDANCE,
-            payload=payload,
-            event_uid=row.event_uid,
-            record_id=row.id,
-        )
+        self._enqueue_oracle_if_due(session, row, context, source_type)
+        if not context.oracle_attendance_configured:
+            sync_queue_writer.enqueue(
+                session,
+                payload_type=PayloadType.ATTENDANCE,
+                payload=payload,
+                event_uid=row.event_uid,
+                record_id=row.id,
+            )
         return row
+
+    def _enqueue_oracle_if_due(
+        self,
+        session: Session,
+        row: AttendanceEvent,
+        context: AttendanceContext,
+        source_type: SourceType,
+    ) -> None:
+        if not context.oracle_attendance_configured:
+            return
+        cutover = ensure_utc(context.oracle_cutover_utc) if context.oracle_cutover_utc else None
+        if cutover is not None and row.device_event_time < cutover:
+            return
+        preferred_delivery = DELIVERY_LIVE if source_type == SourceType.LIVE else DELIVERY_BULK
+        oracle_outbox_writer.enqueue_for_event(
+            session,
+            row,
+            preferred_delivery=preferred_delivery,
+        )
+        oracle_sync_wakeup.set()
 
     def _employee_identity(
         self, session: Session, device_id: str, user_id: str
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, bool]:
         user = session.scalar(
             select(DeviceUser).where(DeviceUser.device_id == device_id, DeviceUser.user_id == user_id)
         )
-        return (user.employee_name, user.cnic) if user else (None, None)
+        if user is None:
+            return None, None, False
+        identity = split_machine_identity(user.employee_name)
+        return identity.employee_name or user.employee_name, user.cnic or identity.cnic or None, identity.raw_punch
 
     def _is_inside_lan_outage(self, session: Session, device_id: str, event_utc: datetime) -> bool:
         outage = session.scalar(

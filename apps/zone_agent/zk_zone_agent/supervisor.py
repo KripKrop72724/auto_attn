@@ -26,6 +26,7 @@ from zk_zone_agent.discovery import discovery_service
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.device_users import DeviceUserUpdate
 from zk_zone_agent.device_worker import DeviceWorker
+from zk_zone_agent.oracle_sync import OracleSyncWorker
 from zk_zone_agent.settings import settings
 from zk_zone_agent.sync import HeadOfficeClient, SyncWorker, sync_queue_writer
 from zk_zone_agent.trusted_time import trusted_time_service
@@ -37,6 +38,7 @@ class ZoneSupervisor:
         self.stop_event = threading.Event()
         self.started = False
         self.sync_worker = SyncWorker(self.stop_event)
+        self.oracle_sync_worker = OracleSyncWorker(self.stop_event)
         self.time_thread = threading.Thread(target=self._time_loop, name="trusted-time-loop", daemon=True)
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="heartbeat-loop", daemon=True)
         self.device_workers: dict[str, DeviceWorker] = {}
@@ -54,6 +56,7 @@ class ZoneSupervisor:
             self.started = True
             return
         self.sync_worker.start()
+        self.oracle_sync_worker.start()
         self.time_thread.start()
         self.heartbeat_thread.start()
         if settings.auto_discovery_enabled:

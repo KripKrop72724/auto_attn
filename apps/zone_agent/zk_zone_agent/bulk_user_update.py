@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from zk_zone_agent.device_users import MAX_NAME_BYTES
 
 
-CNIC_SUFFIX_RE = re.compile(r"^(?P<name>.*)-(?P<cnic>\d{13})$")
+CNIC_SUFFIX_RE = re.compile(r"^(?P<name>.*?)(?P<shift>-S)?-(?P<cnic>\d{13})$")
 EXPECTED_HEADERS = ("ID", "name", "CNIC")
 
 
@@ -32,12 +32,28 @@ class ParsedBulkUserRow:
     expected_name: str | None
 
 
-def split_machine_name_cnic(name: str | None) -> tuple[str, str]:
+@dataclass(frozen=True)
+class MachineIdentity:
+    employee_name: str
+    cnic: str
+    raw_punch: bool
+
+
+def split_machine_identity(name: str | None) -> MachineIdentity:
     normalized = normalize_name(name or "")
     match = CNIC_SUFFIX_RE.match(normalized)
     if not match:
-        return normalized, ""
-    return normalize_name(match.group("name")), match.group("cnic")
+        return MachineIdentity(normalized, "", False)
+    return MachineIdentity(
+        employee_name=normalize_name(match.group("name")),
+        cnic=match.group("cnic"),
+        raw_punch=bool(match.group("shift")),
+    )
+
+
+def split_machine_name_cnic(name: str | None) -> tuple[str, str]:
+    identity = split_machine_identity(name)
+    return identity.employee_name, identity.cnic
 
 
 def normalize_name(value: str) -> str:

@@ -22,6 +22,7 @@ class ZoneSettings(BaseSettings):
     port: int = 7860
     default_timezone: str = "Asia/Karachi"
     production_head_office_url: str = "https://head-office-production.up.railway.app"
+    default_ords_base_url: str = "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
     allow_dev_head_office_urls: bool = False
     disable_workers: bool = False
     auto_discovery_enabled: bool = True

@@ -71,4 +71,34 @@
     <button type="submit">Reset Local Setup</button>
   </form>
 {% endif %}
+{% if admin_authenticated %}
+  <form class="panel form" method="post" action="/setup/oracle">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h2>Oracle Attendance Sync</h2>
+    {% if config and config.ords_base_url and config.ords_api_username %}
+      <div class="alert success">Oracle attendance sync is configured for {{ config.ords_base_url }}.</div>
+    {% else %}
+      <div class="alert warn">Oracle attendance sync is not configured.</div>
+    {% endif %}
+    <label>ORDS Base URL <input name="ords_base_url" value="{{ config.ords_base_url if config and config.ords_base_url else default_ords_base_url }}" required></label>
+    <label>API Username <input name="ords_api_username" value="{{ config.ords_api_username if config and config.ords_api_username else 'slic_zone_agent' }}" autocomplete="off" required></label>
+    <label>API Password <input name="ords_api_password" type="password" autocomplete="off" required></label>
+    <label>Oracle Cutover UTC <input name="oracle_cutover_utc" value="{{ config.oracle_cutover_utc.isoformat().replace('+00:00', 'Z') if config and config.oracle_cutover_utc else '' }}" placeholder="2026-06-03T13:59:00Z" required></label>
+    <div class="stat-grid">
+      <div><strong>{{ oracle_summary.total }}</strong><span>Total outbox</span></div>
+      <div><strong>{{ oracle_summary.counts.get('PENDING', 0) }}</strong><span>Pending</span></div>
+      <div><strong>{{ oracle_summary.counts.get('ACKED', 0) }}</strong><span>Acked</span></div>
+      <div><strong>{{ oracle_summary.counts.get('FAILED_RETRYABLE', 0) }}</strong><span>Retrying</span></div>
+      <div><strong>{{ oracle_summary.counts.get('FAILED_PERMANENT', 0) }}</strong><span>Failed</span></div>
+      <div><strong>{{ oracle_summary.counts.get('BLOCKED_IDENTITY', 0) }}</strong><span>Blocked identity</span></div>
+    </div>
+    <button class="primary" type="submit">Store Oracle Credentials</button>
+  </form>
+  {% if config and config.ords_base_url %}
+    <form class="panel form" method="post" action="/setup/oracle/clear">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">Clear Oracle Attendance Sync</button>
+    </form>
+  {% endif %}
+{% endif %}
 {% endblock %}

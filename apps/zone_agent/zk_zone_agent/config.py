@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,14 @@ class ActiveZoneConfig:
     head_office_url: str
     zone_token: str
     setup_completed: bool
+    ords_base_url: str = ""
+    ords_api_username: str = ""
+    ords_api_password: str = ""
+    oracle_cutover_utc: datetime | None = None
+
+    @property
+    def oracle_attendance_configured(self) -> bool:
+        return bool(self.ords_base_url and self.ords_api_username and self.ords_api_password)
 
 
 class ConfigManager:
@@ -37,6 +46,10 @@ class ConfigManager:
             head_office_url=row.head_office_url.rstrip("/"),
             zone_token=unprotect_secret(row.zone_token_encrypted),
             setup_completed=row.setup_completed,
+            ords_base_url=(row.ords_base_url or "").rstrip("/"),
+            ords_api_username=unprotect_secret(row.ords_api_username_encrypted),
+            ords_api_password=unprotect_secret(row.ords_api_password_encrypted),
+            oracle_cutover_utc=row.oracle_cutover_utc,
         )
 
     def setup_completed(self, session: Session) -> bool:
@@ -54,6 +67,10 @@ class ConfigManager:
             head_office_url="",
             zone_token="",
             setup_completed=False,
+            ords_base_url="",
+            ords_api_username="",
+            ords_api_password="",
+            oracle_cutover_utc=None,
         )
 
     def save_pending_registration(
@@ -128,6 +145,45 @@ class ConfigManager:
             self.reassign_zone_records(session, old_zone_id=old_zone_id, new_zone_id=zone_id)
         session.flush()
         return row
+
+    def save_oracle_attendance(
+        self,
+        session: Session,
+        *,
+        ords_base_url: str,
+        ords_api_username: str,
+        ords_api_password: str,
+        oracle_cutover_utc,
+    ) -> ZoneConfig:
+        row = session.scalar(select(ZoneConfig).order_by(ZoneConfig.id.asc()))
+        if row is None:
+            row = ZoneConfig(
+                id=1,
+                zone_id=UNREGISTERED_ZONE_ID,
+                zone_name=UNREGISTERED_ZONE_NAME,
+                timezone=settings.default_timezone,
+                head_office_url="",
+                zone_token_encrypted=protect_secret(""),
+                setup_completed=False,
+            )
+            session.add(row)
+        row.ords_base_url = ords_base_url.strip().rstrip("/")
+        row.ords_api_username_encrypted = protect_secret(ords_api_username.strip())
+        row.ords_api_password_encrypted = protect_secret(ords_api_password.strip())
+        row.oracle_cutover_utc = oracle_cutover_utc
+        row.updated_at = utc_now()
+        session.flush()
+        return row
+
+    def clear_oracle_attendance(self, session: Session) -> None:
+        row = session.scalar(select(ZoneConfig).order_by(ZoneConfig.id.asc()))
+        if row is None:
+            return
+        row.ords_base_url = None
+        row.ords_api_username_encrypted = protect_secret("")
+        row.ords_api_password_encrypted = protect_secret("")
+        row.oracle_cutover_utc = None
+        row.updated_at = utc_now()
 
     def clear_setup(self, session: Session) -> None:
         row = session.scalar(select(ZoneConfig).order_by(ZoneConfig.id.asc()))
