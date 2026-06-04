@@ -2,7 +2,7 @@
 ; Build after running installer/windows/build.ps1 on Windows.
 
 #define MyAppName "ZK Zone Agent"
-#define MyAppVersion "0.1.7"
+#define MyAppVersion "0.1.8"
 #define MyAppPublisher "POC"
 #define MyAppExeName "zk-zone-agent.exe"
 

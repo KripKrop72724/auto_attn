@@ -590,7 +590,7 @@ def save_oracle_setup(
     oracle_cutover_utc: str = Form(...),
     csrf_token: str = Form(""),
 ):
-    with session_scope() as session:
+    def _save(session):
         _require_admin_form(request, session, csrf_token)
         if not ords_base_url.strip().startswith(("https://", "http://")):
             return _with_error("/setup", "Oracle ORDS base URL must start with http:// or https://.")
@@ -608,17 +608,26 @@ def save_oracle_setup(
             oracle_cutover_utc=cutover,
         )
         record_security_event(session, "ORACLE_SETUP_SAVED", "Oracle attendance sync configuration was saved.")
-        oracle_sync_wakeup.set()
+        return None
+
+    error_response = run_session_with_retries(_save)
+    if error_response is not None:
+        return error_response
+
+    oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
 
 
 @app.post("/setup/oracle/clear")
 def clear_oracle_setup(request: Request, csrf_token: str = Form("")):
-    with session_scope() as session:
+    def _clear(session):
         _require_admin_form(request, session, csrf_token)
         config_manager.clear_oracle_attendance(session)
         record_security_event(session, "ORACLE_SETUP_CLEARED", "Oracle attendance sync configuration was cleared.")
-        oracle_sync_wakeup.set()
+        return None
+
+    run_session_with_retries(_clear)
+    oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
 
 
