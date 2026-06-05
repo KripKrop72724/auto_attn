@@ -281,8 +281,9 @@ class SyncWorker(threading.Thread):
 
         run_session_with_retries(operation, attempts=6, base_delay_seconds=0.1)
 
-    def _payload_for_sync(self, row: dict[str, Any], config: ActiveZoneConfig) -> dict[str, Any]:
-        payload = json.loads(str(row["payload_json"]))
+    def _payload_for_sync(self, row: dict[str, Any] | SyncQueue, config: ActiveZoneConfig) -> dict[str, Any]:
+        payload_json = row["payload_json"] if isinstance(row, dict) else row.payload_json
+        payload = json.loads(str(payload_json))
         if isinstance(payload, dict) and "zone_id" in payload:
             payload["zone_id"] = config.zone_id
         return payload

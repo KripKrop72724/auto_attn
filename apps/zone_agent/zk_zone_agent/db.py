@@ -31,8 +31,8 @@ from zk_zone_agent.settings import settings
 
 T = TypeVar("T")
 SQLITE_BUSY_TIMEOUT_MS = 30_000
-SQLITE_LOCK_RETRY_ATTEMPTS = 4
-SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS = 0.25
+SQLITE_LOCK_RETRY_ATTEMPTS = 8
+SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS = 0.2
 SQLITE_LOCK_MESSAGES = (
     "database is locked",
     "database table is locked",

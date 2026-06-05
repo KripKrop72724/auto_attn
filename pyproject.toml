@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zkteco-attendance-poc"
-version = "0.1.9"
+version = "0.1.10"
 description = "Windows zone-agent and head-office POC for fraud-resistant ZKTeco attendance capture."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

@@ -600,7 +600,7 @@ def save_oracle_setup(
     if not ords_api_username.strip() or not ords_api_password.strip():
         return _with_error("/setup", "Oracle API username and password are required.")
 
-    def operation(session):
+    def _save(session):
         _require_admin_form(request, session, csrf_token)
         config_manager.save_oracle_attendance(
             session,
@@ -610,16 +610,20 @@ def save_oracle_setup(
             oracle_cutover_utc=cutover,
         )
         record_security_event(session, "ORACLE_SETUP_SAVED", "Oracle attendance sync configuration was saved.")
+        return None
 
     try:
-        run_session_with_retries(operation, attempts=10, base_delay_seconds=0.2)
+        error_response = run_session_with_retries(_save)
     except Exception as exc:
         if is_sqlite_lock_error(exc):
-            return _with_error(
+            error_response = _with_error(
                 "/setup",
                 "Local database was busy while saving Oracle settings. Please retry in a few seconds.",
             )
-        raise
+        else:
+            raise
+    if error_response is not None:
+        return error_response
 
     oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
@@ -627,12 +631,12 @@ def save_oracle_setup(
 
 @app.post("/setup/oracle/clear")
 def clear_oracle_setup(request: Request, csrf_token: str = Form("")):
-    def operation(session):
+    def _clear(session):
         _require_admin_form(request, session, csrf_token)
         config_manager.clear_oracle_attendance(session)
         record_security_event(session, "ORACLE_SETUP_CLEARED", "Oracle attendance sync configuration was cleared.")
 
-    run_session_with_retries(operation, attempts=10, base_delay_seconds=0.2)
+    run_session_with_retries(_clear)
     oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
 
