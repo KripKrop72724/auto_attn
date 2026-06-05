@@ -46,6 +46,7 @@ from zk_zone_agent.db import (
     ServiceEvent,
     SyncQueue,
     init_db,
+    is_sqlite_lock_error,
     run_session_with_retries,
     session_scope,
 )
@@ -590,16 +591,17 @@ def save_oracle_setup(
     oracle_cutover_utc: str = Form(...),
     csrf_token: str = Form(""),
 ):
-    def _save(session):
+    if not ords_base_url.strip().startswith(("https://", "http://")):
+        return _with_error("/setup", "Oracle ORDS base URL must start with http:// or https://.")
+    try:
+        cutover = parse_datetime(oracle_cutover_utc.strip())
+    except Exception:
+        return _with_error("/setup", "Oracle cutover must be ISO UTC like 2026-06-03T13:59:00Z.")
+    if not ords_api_username.strip() or not ords_api_password.strip():
+        return _with_error("/setup", "Oracle API username and password are required.")
+
+    def operation(session):
         _require_admin_form(request, session, csrf_token)
-        if not ords_base_url.strip().startswith(("https://", "http://")):
-            return _with_error("/setup", "Oracle ORDS base URL must start with http:// or https://.")
-        try:
-            cutover = parse_datetime(oracle_cutover_utc.strip())
-        except Exception:
-            return _with_error("/setup", "Oracle cutover must be ISO UTC like 2026-06-03T13:59:00Z.")
-        if not ords_api_username.strip() or not ords_api_password.strip():
-            return _with_error("/setup", "Oracle API username and password are required.")
         config_manager.save_oracle_attendance(
             session,
             ords_base_url=ords_base_url,
@@ -608,11 +610,16 @@ def save_oracle_setup(
             oracle_cutover_utc=cutover,
         )
         record_security_event(session, "ORACLE_SETUP_SAVED", "Oracle attendance sync configuration was saved.")
-        return None
 
-    error_response = run_session_with_retries(_save)
-    if error_response is not None:
-        return error_response
+    try:
+        run_session_with_retries(operation, attempts=10, base_delay_seconds=0.2)
+    except Exception as exc:
+        if is_sqlite_lock_error(exc):
+            return _with_error(
+                "/setup",
+                "Local database was busy while saving Oracle settings. Please retry in a few seconds.",
+            )
+        raise
 
     oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
@@ -620,13 +627,12 @@ def save_oracle_setup(
 
 @app.post("/setup/oracle/clear")
 def clear_oracle_setup(request: Request, csrf_token: str = Form("")):
-    def _clear(session):
+    def operation(session):
         _require_admin_form(request, session, csrf_token)
         config_manager.clear_oracle_attendance(session)
         record_security_event(session, "ORACLE_SETUP_CLEARED", "Oracle attendance sync configuration was cleared.")
-        return None
 
-    run_session_with_retries(_clear)
+    run_session_with_retries(operation, attempts=10, base_delay_seconds=0.2)
     oracle_sync_wakeup.set()
     return RedirectResponse("/setup", status_code=303)
 

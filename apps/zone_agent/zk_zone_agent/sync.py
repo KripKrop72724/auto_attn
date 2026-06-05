@@ -27,7 +27,7 @@ from zk_common.security import body_sha256, sign_request, signed_timestamp
 from zk_common.time_utils import parse_datetime, utc_now
 from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
-from zk_zone_agent.db import SyncQueue, session_scope
+from zk_zone_agent.db import SyncQueue, run_session_with_retries, session_scope
 from zk_zone_agent.trusted_time import trusted_time_service
 
 
@@ -154,37 +154,53 @@ class SyncWorker(threading.Thread):
     def sync_once(self) -> bool:
         with session_scope() as session:
             config = config_manager.get(session)
-            if not config or not config.setup_completed or not config.zone_token or not config.head_office_url:
-                return False
-            client = HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id)
-            server_utc = client.get_time()
+        if not config or not config.setup_completed or not config.zone_token or not config.head_office_url:
+            return False
+
+        client = HeadOfficeClient(config.head_office_url, config.zone_token, config.zone_id)
+        server_utc = client.get_time()
+
+        def update_trusted_time(session: Session) -> None:
             trusted_time_service.update_from_head_office(server_utc, session)
+
+        run_session_with_retries(update_trusted_time, attempts=6, base_delay_seconds=0.1)
+
+        with session_scope() as session:
             pending = session.scalars(
                 select(SyncQueue)
                 .where(SyncQueue.status.in_([SyncStatus.PENDING.value, SyncStatus.FAILED.value]))
                 .order_by(SyncQueue.id.asc())
                 .limit(500)
             ).all()
-            if not pending:
-                return False
-            grouped: dict[str, list[SyncQueue]] = defaultdict(list)
-            for row in pending:
-                grouped[row.payload_type].append(row)
-            did_sync_work = False
-            for payload_type, rows in grouped.items():
-                if payload_type == PayloadType.ATTENDANCE.value and config.oracle_attendance_configured:
-                    continue
-                self._sync_group(session, client, config, payload_type, rows)
-                did_sync_work = True
-            return did_sync_work
+            pending_items = [
+                {
+                    "id": row.id,
+                    "payload_type": row.payload_type,
+                    "payload_json": row.payload_json,
+                    "event_uid": row.event_uid,
+                    "record_id": row.record_id,
+                }
+                for row in pending
+            ]
+        if not pending_items:
+            return False
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in pending_items:
+            grouped[str(row["payload_type"])].append(row)
+        did_sync_work = False
+        for payload_type, rows in grouped.items():
+            if payload_type == PayloadType.ATTENDANCE.value and config.oracle_attendance_configured:
+                continue
+            self._sync_group(client, config, payload_type, rows)
+            did_sync_work = True
+        return did_sync_work
 
     def _sync_group(
         self,
-        session: Session,
         client: HeadOfficeClient,
         config: ActiveZoneConfig,
         payload_type: str,
-        rows: list[SyncQueue],
+        rows: list[dict[str, Any]],
     ) -> None:
         if payload_type == PayloadType.ATTENDANCE.value:
             chunks = _chunk(rows, 100)
@@ -215,23 +231,45 @@ class SyncWorker(threading.Thread):
             try:
                 response = client.post_json(path, request.model_dump(mode="json"))
             except Exception as exc:
-                now = utc_now()
-                for row in chunk:
-                    row.status = SyncStatus.FAILED.value
-                    row.attempt_count += 1
-                    row.last_attempt_at = now
-                    row.last_error = str(exc)
+                self._mark_chunk_failed(chunk, str(exc))
                 continue
+            self._mark_chunk_response(chunk, response)
+
+    def _mark_chunk_failed(self, rows: list[dict[str, Any]], error: str) -> None:
+        row_ids = [int(row["id"]) for row in rows]
+
+        def operation(session: Session) -> None:
             now = utc_now()
-            acked_uids = set(response.acked_event_uids)
-            acked_ids = set(response.acked_ids)
-            for row in chunk:
+            for row_id in row_ids:
+                row = session.get(SyncQueue, row_id)
+                if row is None or row.status == SyncStatus.ACKED.value:
+                    continue
+                row.status = SyncStatus.FAILED.value
                 row.attempt_count += 1
                 row.last_attempt_at = now
-                if row.event_uid and row.event_uid in acked_uids:
+                row.last_error = error[:2000]
+
+        run_session_with_retries(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _mark_chunk_response(self, rows: list[dict[str, Any]], response: SyncResponse) -> None:
+        row_ids = [int(row["id"]) for row in rows]
+        row_meta = {int(row["id"]): row for row in rows}
+        acked_uids = set(response.acked_event_uids)
+        acked_ids = set(response.acked_ids)
+
+        def operation(session: Session) -> None:
+            now = utc_now()
+            for row_id in row_ids:
+                row = session.get(SyncQueue, row_id)
+                if row is None or row.status == SyncStatus.ACKED.value:
+                    continue
+                meta = row_meta[row_id]
+                row.attempt_count += 1
+                row.last_attempt_at = now
+                if meta["event_uid"] and meta["event_uid"] in acked_uids:
                     row.status = SyncStatus.ACKED.value
                     row.acked_at = now
-                elif row.record_id and row.record_id in acked_ids:
+                elif meta["record_id"] and meta["record_id"] in acked_ids:
                     row.status = SyncStatus.ACKED.value
                     row.acked_at = now
                 elif response.ok:
@@ -241,12 +279,14 @@ class SyncWorker(threading.Thread):
                     row.status = SyncStatus.FAILED.value
                     row.last_error = "; ".join(response.errors)
 
-    def _payload_for_sync(self, row: SyncQueue, config: ActiveZoneConfig) -> dict[str, Any]:
-        payload = json.loads(row.payload_json)
+        run_session_with_retries(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _payload_for_sync(self, row: dict[str, Any], config: ActiveZoneConfig) -> dict[str, Any]:
+        payload = json.loads(str(row["payload_json"]))
         if isinstance(payload, dict) and "zone_id" in payload:
             payload["zone_id"] = config.zone_id
         return payload
 
 
-def _chunk(items: list[SyncQueue], size: int) -> list[list[SyncQueue]]:
+def _chunk(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
     return [items[index : index + size] for index in range(0, len(items), size)]

@@ -16,6 +16,7 @@ from zk_zone_agent.db import (
     Device,
     DeviceUser,
     OracleAttendanceOutbox,
+    ServiceEvent,
     SyncQueue,
     create_sqlite_engine,
 )
@@ -261,17 +262,58 @@ def test_live_delivery_failure_keeps_event_retryable(tmp_path):
         def post_live(self, _payload):
             raise RuntimeError("network down")
 
+    worker = OracleSyncWorker(threading.Event(), session_factory=session_factory)
+    worker._record_service_event = lambda *_args: None
+
+    assert worker._sync_live_once(DownClient()) is True
+
     with session_factory() as session:
-        worker = OracleSyncWorker(threading.Event())
-        worker._record_service_event = lambda *_args: None
-
-        assert worker._sync_live_once(session, DownClient()) is True
-
         row = session.query(OracleAttendanceOutbox).one()
         assert row.status == ORACLE_STATUS_FAILED_RETRYABLE
         assert row.attempt_count == 1
         assert row.last_error == "network down"
         assert row.next_attempt_at is not None
+
+
+def test_live_delivery_commits_claim_before_http_call(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        event = _device_event()
+        session.add(event)
+        session.flush()
+        session.add(
+            OracleAttendanceOutbox(
+                attendance_event_id=event.id,
+                event_uid=event.event_uid,
+                status=ORACLE_STATUS_PENDING,
+                delivery_mode=DELIVERY_LIVE,
+            )
+        )
+        session.commit()
+
+    class InspectingClient:
+        def post_live(self, _payload):
+            with session_factory() as session:
+                row = session.query(OracleAttendanceOutbox).one()
+                assert row.status == "IN_FLIGHT"
+                session.add(
+                    ServiceEvent(
+                        event_type="CONCURRENT_WRITE",
+                        description="HTTP delivery did not hold the SQLite transaction.",
+                    )
+                )
+                session.commit()
+            return 201, {"success": True}, ""
+
+    worker = OracleSyncWorker(threading.Event(), session_factory=session_factory)
+    worker._record_service_event = lambda *_args: None
+
+    assert worker._sync_live_once(InspectingClient()) is True
+
+    with session_factory() as session:
+        row = session.query(OracleAttendanceOutbox).one()
+        assert row.status == ORACLE_STATUS_ACKED
+        assert session.query(ServiceEvent).count() == 1
 
 
 def test_bulk_duplicate_existing_is_acknowledged(tmp_path):
@@ -308,12 +350,12 @@ def test_bulk_duplicate_existing_is_acknowledged(tmp_path):
                 "",
             )
 
+    worker = OracleSyncWorker(threading.Event(), session_factory=session_factory)
+    worker._record_service_event = lambda *_args: None
+
+    assert worker._sync_bulk_once(DuplicateClient()) is True
+
     with session_factory() as session:
-        worker = OracleSyncWorker(threading.Event())
-        worker._record_service_event = lambda *_args: None
-
-        assert worker._sync_bulk_once(session, DuplicateClient()) is True
-
         row = session.query(OracleAttendanceOutbox).one()
         assert row.status == ORACLE_STATUS_ACKED
         assert row.attempt_count == 1

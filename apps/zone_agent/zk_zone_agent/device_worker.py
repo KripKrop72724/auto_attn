@@ -19,7 +19,7 @@ from zk_common.enums import (
     SyncStatus,
 )
 from zk_common.schemas import ClockCheckSyncItem, IncidentSyncItem, OutageSyncItem
-from zk_common.time_utils import utc_now
+from zk_common.time_utils import device_local_to_utc, utc_now
 from zk_zone_agent.attendance import AttendanceContext, attendance_processor
 from zk_zone_agent.audit import audit_ledger
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
@@ -30,6 +30,7 @@ from zk_zone_agent.db import (
     Device,
     FraudIncident,
     OutagePeriod,
+    is_sqlite_lock_error,
 )
 from zk_zone_agent.device_registry import device_registry
 from zk_zone_agent.device_users import DeviceUserUpdate
@@ -81,6 +82,7 @@ class DeviceWorker(threading.Thread):
             else live_poll_reconcile_interval_seconds
         )
         self.last_live_poll_reconcile_monotonic: float | None = None
+        self.pending_startup_reconcile = False
         self.previous_device_time: datetime | None = None
         self.previous_trusted_time: datetime | None = None
         self.last_clock_status: ClockStatus = ClockStatus.ERROR
@@ -158,25 +160,49 @@ class DeviceWorker(threading.Thread):
             raise RuntimeError(f"Device {self.device_id} disappeared.")
         return device
 
+    def _run_db(
+        self,
+        operation: Callable[[Session], T],
+        *,
+        attempts: int = 6,
+        base_delay_seconds: float = 0.1,
+    ) -> T:
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        for attempt in range(attempts):
+            try:
+                with self.session_factory() as session:
+                    result = operation(session)
+                    session.commit()
+                    return result
+            except Exception as exc:
+                if not is_sqlite_lock_error(exc) or attempt == attempts - 1:
+                    raise
+                time.sleep(base_delay_seconds * (2**attempt))
+        raise RuntimeError("SQLite retry loop exited unexpectedly.")
+
     def _zone_config(self, session: Session) -> ActiveZoneConfig:
         return config_manager.runtime_config(session)
 
     def _on_connected(self, client: ZKClient) -> None:
-        with self.session_factory() as session:
+        info = client.get_info()
+        users = client.get_users()
+
+        def operation(session: Session) -> None:
             device = self._session_device(session)
-            info = client.get_info()
             device.serial = info.serial or device.serial
             device.platform = info.platform or device.platform
             device.device_name = info.device_name or device.device_name
             device.online = True
             device.last_error = "Connected. Loading users and running initial clock check."
-            users = client.get_users()
             attendance_processor.replace_users(session, device, users)
-            session.commit()
+
+        self._run_db(operation, attempts=8, base_delay_seconds=0.1)
 
         self._close_outage("Device reconnected.")
         self._clock_check(client)
-        self._reconcile_dump(client, SourceType.DUMP_STARTUP)
+        self.pending_startup_reconcile = True
+        self.last_live_poll_reconcile_monotonic = time.monotonic()
 
     def _live_loop(self, client: ZKClient) -> None:
         self._drain_commands(client)
@@ -185,12 +211,35 @@ class DeviceWorker(threading.Thread):
                 break
             self._drain_commands(client)
             if attendance is None:
-                self._clock_check(client)
-                self._live_poll_reconcile_if_due(client)
+                self._run_live_step("clock check", lambda: self._clock_check(client))
+                self._run_live_step(
+                    "attendance reconciliation",
+                    lambda: self._live_poll_reconcile_if_due(client),
+                )
                 self._drain_commands(client)
                 continue
-            self._process_observed_attendance(attendance, SourceType.LIVE)
+            self._run_live_step(
+                "live attendance capture",
+                lambda: self._process_observed_attendance(attendance, SourceType.LIVE),
+            )
             self._drain_commands(client)
+
+    def _run_live_step(self, action: str, operation: Callable[[], T]) -> T | None:
+        try:
+            return operation()
+        except Exception as exc:
+            self._record_device_worker_warning(f"{action} failed without stopping live capture: {exc}")
+            return None
+
+    def _record_device_worker_warning(self, message: str) -> None:
+        def operation(session: Session) -> None:
+            device = self._session_device(session)
+            device.last_error = message[:1000]
+
+        try:
+            self._run_db(operation, attempts=4, base_delay_seconds=0.1)
+        except Exception:
+            pass
 
     def refresh_users(self, timeout_seconds: float | None = None) -> list[ZKUser]:
         timeout_seconds = timeout_seconds or settings.device_user_refresh_timeout_seconds
@@ -297,11 +346,13 @@ class DeviceWorker(threading.Thread):
 
     def _refresh_device_users(self, client: ZKClient) -> list[ZKUser]:
         users = self._device_io(client, "read users from device", client.get_users)
-        with self.session_factory() as session:
+
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             attendance_processor.replace_users(session, device, users)
             device.last_error = f"Loaded {len(users)} user(s) from device."
-            session.commit()
+
+        self._run_db(operation, attempts=8, base_delay_seconds=0.1)
         return users
 
     def _update_device_user(self, client: ZKClient, update: DeviceUserUpdate) -> ZKUser:
@@ -331,11 +382,12 @@ class DeviceWorker(threading.Thread):
             ),
         )
         refreshed_users = self._device_io(client, "verify users after update", client.get_users)
-        with self.session_factory() as session:
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             attendance_processor.replace_users(session, device, refreshed_users)
             device.last_error = f"Updated user {updated.name or updated.user_id} on device."
-            session.commit()
+
+        self._run_db(operation, attempts=8, base_delay_seconds=0.1)
         return updated
 
     def _device_io(self, client: ZKClient, action: str, operation: Callable[[], T]) -> T:
@@ -644,7 +696,8 @@ class DeviceWorker(threading.Thread):
         zone_trusted_time: datetime | None = None,
     ) -> bool:
         trusted_now = zone_trusted_time or self.trusted_time.now().value
-        with self.session_factory() as session:
+
+        def operation(session: Session) -> bool:
             device = self._session_device(session)
             zone_config = self._zone_config(session)
             context = AttendanceContext(
@@ -672,8 +725,9 @@ class DeviceWorker(threading.Thread):
                     f"Captured attendance for user {row.employee_name or row.user_id} "
                     f"via {source_type.value}."
                 )
-            session.commit()
             return inserted
+
+        return self._run_db(operation, attempts=8, base_delay_seconds=0.1)
 
     def _live_poll_reconcile_if_due(self, client: ZKClient) -> int:
         if not settings.live_poll_reconcile_enabled:
@@ -687,12 +741,20 @@ class DeviceWorker(threading.Thread):
             return 0
         self.last_live_poll_reconcile_monotonic = now
         try:
-            return self._reconcile_dump(client, SourceType.LIVE_POLL)
+            source_type = SourceType.DUMP_STARTUP if self.pending_startup_reconcile else SourceType.LIVE_POLL
+            inserted_count = self._reconcile_dump(client, source_type)
+            self.pending_startup_reconcile = False
+            return inserted_count
         except Exception as exc:
-            with self.session_factory() as session:
+            message = str(exc)
+            def operation(session: Session) -> None:
                 device = self._session_device(session)
-                device.last_error = f"Live attendance polling failed: {exc}"
-                session.commit()
+                device.last_error = f"Live attendance polling failed: {message}"
+
+            try:
+                self._run_db(operation, attempts=4, base_delay_seconds=0.1)
+            except Exception:
+                pass
             return 0
 
     def _clock_check(self, client: ZKClient) -> None:
@@ -706,7 +768,7 @@ class DeviceWorker(threading.Thread):
         except Exception as exc:
             error = str(exc)
 
-        with self.session_factory() as session:
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             zone_config = self._zone_config(session)
             result = fraud_engine.classify_clock_check(
@@ -796,10 +858,11 @@ class DeviceWorker(threading.Thread):
                     payload=incident_payload,
                     record_id=incident.id,
                 )
-            session.commit()
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
 
     def _mark_connecting(self, next_retry_seconds: int) -> None:
-        with self.session_factory() as session:
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             device.online = False
             device.last_error = (
@@ -808,10 +871,11 @@ class DeviceWorker(threading.Thread):
             )
             if not device.last_clock_status:
                 device.last_clock_status = "PENDING"
-            session.commit()
+
+        self._run_db(operation, attempts=4, base_delay_seconds=0.1)
 
     def _mark_offline(self, reason: str) -> None:
-        with self.session_factory() as session:
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             device.online = False
             device.last_error = reason
@@ -863,10 +927,11 @@ class DeviceWorker(threading.Thread):
                     payload=incident_payload,
                     record_id=incident.id,
                 )
-            session.commit()
+
+        self._run_db(operation, attempts=4, base_delay_seconds=0.1)
 
     def _close_outage(self, reason: str) -> None:
-        with self.session_factory() as session:
+        def operation(session: Session) -> None:
             device = self._session_device(session)
             outage = session.scalar(
                 select(OutagePeriod).where(
@@ -899,13 +964,25 @@ class DeviceWorker(threading.Thread):
                     payload=outage_payload,
                     record_id=outage.id,
                 )
-            session.commit()
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
 
     def _reconcile_dump(self, client: ZKClient, source_type: SourceType) -> int:
         trusted_now = self.trusted_time.now().value
         attendances = client.get_attendance()
         inserted_count = 0
-        with self.session_factory() as session:
+        batch_size = max(1, settings.reconcile_commit_batch_size)
+        for batch in _chunk_attendances(attendances, batch_size):
+            inserted_count += self._reconcile_attendance_batch(batch, source_type, trusted_now)
+        return inserted_count
+
+    def _reconcile_attendance_batch(
+        self,
+        attendances: list[ZKAttendance],
+        source_type: SourceType,
+        trusted_now: datetime,
+    ) -> int:
+        def operation(session: Session) -> int:
             device = self._session_device(session)
             zone_config = self._zone_config(session)
             context = AttendanceContext(
@@ -917,7 +994,13 @@ class DeviceWorker(threading.Thread):
                 oracle_attendance_configured=zone_config.oracle_attendance_configured,
                 oracle_cutover_utc=zone_config.oracle_cutover_utc,
             )
+            cutover = context.oracle_cutover_utc if context.oracle_attendance_configured else None
+            batch_inserted_count = 0
             for item in attendances:
+                if cutover is not None:
+                    event_utc = device_local_to_utc(item.timestamp, context.timezone)
+                    if event_utc < cutover:
+                        continue
                 before_id = attendance_processor.find_event_id(session, device, item, context)
                 row = attendance_processor.process(
                     session,
@@ -928,11 +1011,15 @@ class DeviceWorker(threading.Thread):
                     zone_trusted_time=trusted_now,
                 )
                 if row.id != before_id:
-                    inserted_count += 1
-            if inserted_count and source_type == SourceType.LIVE_POLL:
-                device.last_error = f"Captured {inserted_count} attendance record(s) via live polling."
-            session.commit()
-        return inserted_count
+                    batch_inserted_count += 1
+            if batch_inserted_count and source_type in {SourceType.LIVE_POLL, SourceType.DUMP_STARTUP}:
+                device.last_error = (
+                    f"Captured {batch_inserted_count} attendance record(s) via "
+                    f"{source_type.value.lower().replace('_', ' ')}."
+                )
+            return batch_inserted_count
+
+        return self._run_db(operation, attempts=8, base_delay_seconds=0.1)
 
 
 def _bulk_privilege(value: str | int | None) -> int:
@@ -941,3 +1028,7 @@ def _bulk_privilege(value: str | int | None) -> int:
     except (TypeError, ValueError):
         return 0
     return privilege if privilege in {0, 14} else 0
+
+
+def _chunk_attendances(items: list[ZKAttendance], size: int) -> list[list[ZKAttendance]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]

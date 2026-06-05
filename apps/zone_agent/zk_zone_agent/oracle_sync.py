@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+import time
+from typing import Any, Callable, Iterator
 
 import httpx
 from sqlalchemy import select
@@ -14,7 +17,13 @@ from zk_common.enums import SourceType, TrustStatus
 from zk_common.hashing import payload_hash
 from zk_common.time_utils import ensure_utc, iso_utc, utc_now
 from zk_zone_agent.config import ActiveZoneConfig, config_manager
-from zk_zone_agent.db import AttendanceEvent, OracleAttendanceOutbox, ServiceEvent, session_scope
+from zk_zone_agent.db import (
+    AttendanceEvent,
+    OracleAttendanceOutbox,
+    ServiceEvent,
+    is_sqlite_lock_error,
+    session_scope,
+)
 
 
 ORACLE_LIVE_PATH = "/raw-captures"
@@ -159,11 +168,71 @@ class OracleAttendanceClient:
         return response.status_code, data, response.text[:1000]
 
 
+@dataclass(frozen=True)
+class _ClaimedOracleEvent:
+    row_id: int
+    event_uid: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _LiveClaim:
+    did_work: bool
+    item: _ClaimedOracleEvent | None = None
+
+
+@dataclass(frozen=True)
+class _BulkClaim:
+    did_work: bool
+    batch_uid: str | None = None
+    items: list[_ClaimedOracleEvent] | None = None
+
+
 class OracleSyncWorker(threading.Thread):
-    def __init__(self, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        session_factory: Callable[[], Session] | None = None,
+    ) -> None:
         super().__init__(name="oracle-attendance-sync-worker", daemon=True)
         self.stop_event = stop_event
         self.backoff_seconds = 2
+        self.session_factory = session_factory
+
+    @contextmanager
+    def _session_scope(self) -> Iterator[Session]:
+        if self.session_factory is None:
+            with session_scope() as session:
+                yield session
+            return
+        session = self.session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _run_db(
+        self,
+        operation: Callable[[Session], Any],
+        *,
+        attempts: int = 6,
+        base_delay_seconds: float = 0.1,
+    ) -> Any:
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        for attempt in range(attempts):
+            try:
+                with self._session_scope() as session:
+                    return operation(session)
+            except Exception as exc:
+                if not is_sqlite_lock_error(exc) or attempt == attempts - 1:
+                    raise
+                time.sleep(base_delay_seconds * (2**attempt))
+        raise RuntimeError("SQLite retry loop exited unexpectedly.")
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -177,175 +246,252 @@ class OracleSyncWorker(threading.Thread):
             oracle_sync_wakeup.clear()
 
     def sync_once(self) -> bool:
-        with session_scope() as session:
-            config = config_manager.get(session)
-            if not config or not config.oracle_attendance_configured:
-                return False
-            self._reset_stale_in_flight(session)
-            self._sweep_missing_outbox_rows(session, config)
-            client = OracleAttendanceClient(
-                base_url=config.ords_base_url,
-                api_username=config.ords_api_username,
-                api_password=config.ords_api_password,
-            )
-            did_live = self._sync_live_once(session, client)
-            did_bulk = self._sync_bulk_once(session, client)
-            return did_live or did_bulk
-
-    def _reset_stale_in_flight(self, session: Session) -> None:
-        cutoff = utc_now() - timedelta(seconds=ORACLE_STALE_IN_FLIGHT_SECONDS)
-        for row in session.scalars(
-            select(OracleAttendanceOutbox).where(
-                OracleAttendanceOutbox.status == ORACLE_STATUS_IN_FLIGHT,
-                OracleAttendanceOutbox.last_attempt_at < cutoff,
-            )
-        ):
-            row.status = ORACLE_STATUS_FAILED_RETRYABLE
-            row.next_attempt_at = utc_now()
-            row.updated_at = utc_now()
-
-    def _sweep_missing_outbox_rows(self, session: Session, config: ActiveZoneConfig) -> int:
-        cutover = ensure_utc(config.oracle_cutover_utc) if config.oracle_cutover_utc else None
-        stmt = (
-            select(AttendanceEvent)
-            .outerjoin(
-                OracleAttendanceOutbox,
-                OracleAttendanceOutbox.attendance_event_id == AttendanceEvent.id,
-            )
-            .where(OracleAttendanceOutbox.id == None)  # noqa: E711
-            .order_by(AttendanceEvent.id.asc())
-            .limit(500)
-        )
-        if cutover is not None:
-            stmt = stmt.where(AttendanceEvent.device_event_time >= cutover)
-        events = session.scalars(stmt).all()
-        for event in events:
-            mode = DELIVERY_LIVE if event.source_type == SourceType.LIVE.value else DELIVERY_BULK
-            oracle_outbox_writer.enqueue_for_event(session, event, preferred_delivery=mode)
-        return len(events)
-
-    def _sync_live_once(self, session: Session, client: OracleAttendanceClient) -> bool:
-        now = utc_now()
-        row = session.scalar(
-            select(OracleAttendanceOutbox)
-            .where(
-                OracleAttendanceOutbox.status == ORACLE_STATUS_PENDING,
-                OracleAttendanceOutbox.delivery_mode == DELIVERY_LIVE,
-                OracleAttendanceOutbox.attempt_count == 0,
-                (
-                    (OracleAttendanceOutbox.next_attempt_at == None)  # noqa: E711
-                    | (OracleAttendanceOutbox.next_attempt_at <= now)
-                ),
-            )
-            .order_by(OracleAttendanceOutbox.id.asc())
-            .limit(1)
-        )
-        if row is None:
+        config = self._load_config()
+        if not config or not config.oracle_attendance_configured:
             return False
-        event = session.get(AttendanceEvent, row.attendance_event_id)
-        if event is None:
-            self._mark_permanent(row, 0, "Local attendance event was deleted.")
-            return True
-        try:
-            payload = build_oracle_event_payload(event)
-        except ValueError as exc:
-            self._mark_blocked_identity(row, str(exc))
-            return True
+        self._reset_stale_in_flight()
+        swept_count = self._sweep_missing_outbox_rows(config)
+        client = OracleAttendanceClient(
+            base_url=config.ords_base_url,
+            api_username=config.ords_api_username,
+            api_password=config.ords_api_password,
+        )
+        did_live = self._sync_live_once(client)
+        did_bulk = self._sync_bulk_once(client)
+        return bool(swept_count or did_live or did_bulk)
 
-        self._mark_in_flight(row, payload, DELIVERY_LIVE, None)
+    def _load_config(self) -> ActiveZoneConfig | None:
+        with self._session_scope() as session:
+            return config_manager.get(session)
+
+    def _reset_stale_in_flight(self) -> None:
+        def operation(session: Session) -> None:
+            cutoff = utc_now() - timedelta(seconds=ORACLE_STALE_IN_FLIGHT_SECONDS)
+            for row in session.scalars(
+                select(OracleAttendanceOutbox).where(
+                    OracleAttendanceOutbox.status == ORACLE_STATUS_IN_FLIGHT,
+                    OracleAttendanceOutbox.last_attempt_at < cutoff,
+                )
+            ):
+                row.status = ORACLE_STATUS_FAILED_RETRYABLE
+                row.next_attempt_at = utc_now()
+                row.updated_at = utc_now()
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _sweep_missing_outbox_rows(self, config: ActiveZoneConfig) -> int:
+        def operation(session: Session) -> int:
+            cutover = ensure_utc(config.oracle_cutover_utc) if config.oracle_cutover_utc else None
+            stmt = (
+                select(AttendanceEvent)
+                .outerjoin(
+                    OracleAttendanceOutbox,
+                    OracleAttendanceOutbox.attendance_event_id == AttendanceEvent.id,
+                )
+                .where(OracleAttendanceOutbox.id == None)  # noqa: E711
+                .order_by(AttendanceEvent.id.asc())
+                .limit(500)
+            )
+            if cutover is not None:
+                stmt = stmt.where(AttendanceEvent.device_event_time >= cutover)
+            events = session.scalars(stmt).all()
+            for event in events:
+                mode = DELIVERY_LIVE if event.source_type == SourceType.LIVE.value else DELIVERY_BULK
+                oracle_outbox_writer.enqueue_for_event(session, event, preferred_delivery=mode)
+            return len(events)
+
+        return self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _sync_live_once(self, client: OracleAttendanceClient) -> bool:
+        claim = self._claim_live_event()
+        if not claim.did_work:
+            return False
+        if claim.item is None:
+            return True
         try:
-            status, data, response_text = client.post_live(payload)
+            status, data, response_text = client.post_live(claim.item.payload)
         except Exception as exc:
-            self._mark_retryable(row, None, str(exc))
+            self._finalize_live_result(claim.item.row_id, None, None, str(exc))
             self._record_service_event("ORACLE_ENDPOINT_OUTAGE", str(exc))
             return True
 
-        if status in {200, 201} and data and data.get("success") is True:
-            self._mark_acked(row, status)
-        elif status == 409:
-            self._mark_acked(row, status)
-        elif status in {400, 422}:
-            self._mark_permanent(row, status, _response_error(data, response_text))
-        elif status in {401, 403}:
-            self._mark_retryable(row, status, _response_error(data, response_text), delay_seconds=900)
-            self._record_service_event("ORACLE_AUTH_FAILED", f"HTTP {status}: {_response_error(data, response_text)}")
-        else:
-            self._mark_retryable(row, status, _response_error(data, response_text))
+        self._finalize_live_result(claim.item.row_id, status, data, response_text)
         return True
 
-    def _sync_bulk_once(self, session: Session, client: OracleAttendanceClient) -> bool:
-        now = utc_now()
-        rows = session.scalars(
-            select(OracleAttendanceOutbox)
-            .where(
-                OracleAttendanceOutbox.status.in_(
-                    [ORACLE_STATUS_PENDING, ORACLE_STATUS_FAILED_RETRYABLE]
-                ),
-                ~(
-                    (OracleAttendanceOutbox.delivery_mode == DELIVERY_LIVE)
-                    & (OracleAttendanceOutbox.attempt_count == 0)
-                ),
-                (
-                    (OracleAttendanceOutbox.next_attempt_at == None)  # noqa: E711
-                    | (OracleAttendanceOutbox.next_attempt_at <= now)
-                ),
+    def _claim_live_event(self) -> _LiveClaim:
+        def operation(session: Session) -> _LiveClaim:
+            now = utc_now()
+            row = session.scalar(
+                select(OracleAttendanceOutbox)
+                .where(
+                    OracleAttendanceOutbox.status == ORACLE_STATUS_PENDING,
+                    OracleAttendanceOutbox.delivery_mode == DELIVERY_LIVE,
+                    OracleAttendanceOutbox.attempt_count == 0,
+                    (
+                        (OracleAttendanceOutbox.next_attempt_at == None)  # noqa: E711
+                        | (OracleAttendanceOutbox.next_attempt_at <= now)
+                    ),
+                )
+                .order_by(OracleAttendanceOutbox.id.asc())
+                .limit(1)
             )
-            .order_by(OracleAttendanceOutbox.id.asc())
-            .limit(ORACLE_BULK_CHUNK_SIZE)
-        ).all()
-        if not rows:
-            return False
-
-        payload_events: list[dict[str, Any]] = []
-        send_rows: list[OracleAttendanceOutbox] = []
-        batch_uid = f"ZONE-ORDS-{utc_now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        for row in rows:
+            if row is None:
+                return _LiveClaim(False)
             event = session.get(AttendanceEvent, row.attendance_event_id)
             if event is None:
                 self._mark_permanent(row, 0, "Local attendance event was deleted.")
-                continue
+                return _LiveClaim(True)
             try:
                 payload = build_oracle_event_payload(event)
             except ValueError as exc:
                 self._mark_blocked_identity(row, str(exc))
-                continue
-            payload_events.append(payload)
-            send_rows.append(row)
-            self._mark_in_flight(row, payload, DELIVERY_BULK, batch_uid)
+                return _LiveClaim(True)
 
-        if not send_rows:
+            self._mark_in_flight(row, payload, DELIVERY_LIVE, None)
+            return _LiveClaim(True, _ClaimedOracleEvent(row.id, row.event_uid, payload))
+
+        return self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _finalize_live_result(
+        self,
+        row_id: int,
+        status: int | None,
+        data: dict[str, Any] | None,
+        response_text: str | None,
+    ) -> None:
+        def operation(session: Session) -> None:
+            row = session.get(OracleAttendanceOutbox, row_id)
+            if row is None:
+                return
+            if status in {200, 201} and data and data.get("success") is True:
+                self._mark_acked(row, status)
+            elif status == 409:
+                self._mark_acked(row, status)
+            elif status in {400, 422}:
+                self._mark_permanent(row, status, _response_error(data, response_text))
+            elif status in {401, 403}:
+                error = _response_error(data, response_text)
+                self._mark_retryable(row, status, error, delay_seconds=900)
+                self._record_service_event("ORACLE_AUTH_FAILED", f"HTTP {status}: {error}")
+            else:
+                self._mark_retryable(row, status, _response_error(data, response_text))
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _sync_bulk_once(self, client: OracleAttendanceClient) -> bool:
+        claim = self._claim_bulk_events()
+        if not claim.did_work:
+            return False
+        items = claim.items or []
+        if not items or not claim.batch_uid:
             return True
 
+        payload_events = [item.payload for item in items]
         try:
-            status, data, response_text = client.post_bulk(batch_uid=batch_uid, events=payload_events)
+            status, data, response_text = client.post_bulk(
+                batch_uid=claim.batch_uid,
+                events=payload_events,
+            )
         except Exception as exc:
-            for row in send_rows:
-                self._mark_retryable(row, None, str(exc))
+            self._finalize_bulk_transport_error(items, str(exc))
             self._record_service_event("ORACLE_ENDPOINT_OUTAGE", str(exc))
             return True
 
-        if status in {200, 201} and _bulk_response_clean(data, len(send_rows)):
-            for row in send_rows:
-                self._mark_acked(row, status)
-            return True
-
-        if status in {401, 403}:
-            error = _response_error(data, response_text)
-            for row in send_rows:
-                self._mark_retryable(row, status, error, delay_seconds=900)
-            self._record_service_event("ORACLE_AUTH_FAILED", f"HTTP {status}: {error}")
-            return True
-
-        details = _bulk_result_status_by_event_uid(data)
-        for row in send_rows:
-            detail = details.get(row.event_uid)
-            if detail == "DUPLICATE_EXISTING":
-                self._mark_acked(row, status)
-            elif detail == "INVALID":
-                self._mark_permanent(row, status, _response_error(data, response_text))
-            else:
-                self._mark_retryable(row, status, _response_error(data, response_text))
+        self._finalize_bulk_result(items, status, data, response_text)
         return True
+
+    def _claim_bulk_events(self) -> _BulkClaim:
+        def operation(session: Session) -> _BulkClaim:
+            now = utc_now()
+            rows = session.scalars(
+                select(OracleAttendanceOutbox)
+                .where(
+                    OracleAttendanceOutbox.status.in_(
+                        [ORACLE_STATUS_PENDING, ORACLE_STATUS_FAILED_RETRYABLE]
+                    ),
+                    ~(
+                        (OracleAttendanceOutbox.delivery_mode == DELIVERY_LIVE)
+                        & (OracleAttendanceOutbox.attempt_count == 0)
+                    ),
+                    (
+                        (OracleAttendanceOutbox.next_attempt_at == None)  # noqa: E711
+                        | (OracleAttendanceOutbox.next_attempt_at <= now)
+                    ),
+                )
+                .order_by(OracleAttendanceOutbox.id.asc())
+                .limit(ORACLE_BULK_CHUNK_SIZE)
+            ).all()
+            if not rows:
+                return _BulkClaim(False)
+
+            items: list[_ClaimedOracleEvent] = []
+            batch_uid = f"ZONE-ORDS-{utc_now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            did_work = False
+            for row in rows:
+                did_work = True
+                event = session.get(AttendanceEvent, row.attendance_event_id)
+                if event is None:
+                    self._mark_permanent(row, 0, "Local attendance event was deleted.")
+                    continue
+                try:
+                    payload = build_oracle_event_payload(event)
+                except ValueError as exc:
+                    self._mark_blocked_identity(row, str(exc))
+                    continue
+                self._mark_in_flight(row, payload, DELIVERY_BULK, batch_uid)
+                items.append(_ClaimedOracleEvent(row.id, row.event_uid, payload))
+            return _BulkClaim(did_work, batch_uid, items)
+
+        return self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _finalize_bulk_transport_error(self, items: list[_ClaimedOracleEvent], error: str) -> None:
+        def operation(session: Session) -> None:
+            for item in items:
+                row = session.get(OracleAttendanceOutbox, item.row_id)
+                if row is not None:
+                    self._mark_retryable(row, None, error)
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
+
+    def _finalize_bulk_result(
+        self,
+        items: list[_ClaimedOracleEvent],
+        status: int,
+        data: dict[str, Any] | None,
+        response_text: str | None,
+    ) -> None:
+        def operation(session: Session) -> None:
+            if status in {200, 201} and _bulk_response_clean(data, len(items)):
+                for item in items:
+                    row = session.get(OracleAttendanceOutbox, item.row_id)
+                    if row is not None:
+                        self._mark_acked(row, status)
+                return
+
+            if status in {401, 403}:
+                error = _response_error(data, response_text)
+                for item in items:
+                    row = session.get(OracleAttendanceOutbox, item.row_id)
+                    if row is not None:
+                        self._mark_retryable(row, status, error, delay_seconds=900)
+                self._record_service_event("ORACLE_AUTH_FAILED", f"HTTP {status}: {error}")
+                return
+
+            details = _bulk_result_status_by_event_uid(data)
+            error = _response_error(data, response_text)
+            for item in items:
+                row = session.get(OracleAttendanceOutbox, item.row_id)
+                if row is None:
+                    continue
+                detail = details.get(item.event_uid)
+                if detail == "DUPLICATE_EXISTING":
+                    self._mark_acked(row, status)
+                elif detail == "INVALID":
+                    self._mark_permanent(row, status, error)
+                else:
+                    self._mark_retryable(row, status, error)
+
+        self._run_db(operation, attempts=6, base_delay_seconds=0.1)
 
     def _mark_in_flight(
         self,
@@ -411,7 +557,7 @@ class OracleSyncWorker(threading.Thread):
 
     def _record_service_event(self, event_type: str, description: str) -> None:
         try:
-            with session_scope() as session:
+            with self._session_scope() as session:
                 session.add(ServiceEvent(event_type=event_type, description=description[:1000]))
         except Exception:
             pass
