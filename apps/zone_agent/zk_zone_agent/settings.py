@@ -43,6 +43,10 @@ class ZoneSettings(BaseSettings):
     device_user_io_retry_delay_seconds: float = 0.75
     live_poll_reconcile_enabled: bool = True
     live_poll_reconcile_interval_seconds: int = 300
+    reconcile_watchdog_enabled: bool = True
+    reconcile_watchdog_startup_delay_seconds: int = 15
+    reconcile_watchdog_interval_seconds: int = 60
+    reconcile_watchdog_command_timeout_seconds: float = 300
     reconcile_commit_batch_size: int = 250
     drift_threshold_seconds: int = 120
     jump_threshold_seconds: int = 15

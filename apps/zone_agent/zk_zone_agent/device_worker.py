@@ -95,6 +95,8 @@ class DeviceWorker(threading.Thread):
     def run(self) -> None:
         backoff = 5
         while not self.stop_event.is_set():
+            reconcile_stop: threading.Event | None = None
+            reconcile_thread: threading.Thread | None = None
             session = self.session_factory()
             device = session.scalar(select(Device).where(Device.device_id == self.device_id))
             session.close()
@@ -108,12 +110,17 @@ class DeviceWorker(threading.Thread):
                 self._set_active_client(client)
                 self._on_connected(client)
                 self.command_available.set()
+                reconcile_stop, reconcile_thread = self._start_reconcile_watchdog()
                 self._live_loop(client)
             except Exception as exc:
                 self._mark_offline(f"{exc}. Retrying in {backoff} seconds.")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, 60)
             finally:
+                if reconcile_stop is not None:
+                    reconcile_stop.set()
+                if reconcile_thread is not None:
+                    reconcile_thread.join(timeout=2)
                 self.command_available.clear()
                 self._clear_active_client(client)
                 self._fail_pending_commands(
@@ -202,7 +209,39 @@ class DeviceWorker(threading.Thread):
         self._close_outage("Device reconnected.")
         self._clock_check(client)
         self.pending_startup_reconcile = True
-        self.last_live_poll_reconcile_monotonic = time.monotonic()
+        self.last_live_poll_reconcile_monotonic = None
+
+    def _start_reconcile_watchdog(
+        self,
+    ) -> tuple[threading.Event, threading.Thread] | tuple[None, None]:
+        if not settings.live_poll_reconcile_enabled or not settings.reconcile_watchdog_enabled:
+            return None, None
+        reconcile_stop = threading.Event()
+        thread = threading.Thread(
+            target=self._reconcile_watchdog_loop,
+            args=(reconcile_stop,),
+            name=f"attendance-reconcile-watchdog-{self.device_id}",
+            daemon=True,
+        )
+        thread.start()
+        return reconcile_stop, thread
+
+    def _reconcile_watchdog_loop(self, reconcile_stop: threading.Event) -> None:
+        startup_delay = max(0, settings.reconcile_watchdog_startup_delay_seconds)
+        interval = max(1, settings.reconcile_watchdog_interval_seconds)
+        if reconcile_stop.wait(startup_delay):
+            return
+        while not self.stop_event.is_set() and not reconcile_stop.is_set():
+            try:
+                self._submit_command(
+                    "reconcile_attendance",
+                    None,
+                    settings.reconcile_watchdog_command_timeout_seconds,
+                )
+            except Exception as exc:
+                self._record_device_worker_warning(f"Attendance reconcile watchdog failed: {exc}")
+            if reconcile_stop.wait(interval):
+                return
 
     def _live_loop(self, client: ZKClient) -> None:
         self._drain_commands(client)
@@ -323,6 +362,9 @@ class DeviceWorker(threading.Thread):
                         raise RuntimeError("Invalid bulk user update command.")
                     self._run_bulk_user_update_job(client, command.payload)
                     command.result = True
+                    should_restart_live_capture = True
+                elif command.kind == "reconcile_attendance":
+                    command.result = self._live_poll_reconcile_if_due(client)
                     should_restart_live_capture = True
                 else:
                     raise RuntimeError(f"Unknown device command {command.kind}.")

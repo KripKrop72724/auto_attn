@@ -163,6 +163,99 @@ def test_live_poll_reconcile_captures_new_attendance_once(tmp_path):
         assert session.query(AttendanceEvent).count() == 1
 
 
+def test_reconcile_command_captures_missing_attendance_through_device_queue(tmp_path):
+    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'zone.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
+    trusted_now = datetime(2026, 5, 13, 10, 0, tzinfo=timezone.utc)
+    trusted_time = TrustedTimeService(wall_clock=lambda: trusted_now, monotonic_ns=lambda: 0)
+    with session_factory() as session:
+        trusted_time.update_from_head_office(trusted_now, session)
+        session.add(
+            Device(
+                device_id="MAIN-GATE",
+                label="Main Gate",
+                ip="192.168.110.137",
+                port=4370,
+                comm_key_encrypted=protect_secret("1979"),
+                serial="ADZV211860253",
+                enabled=True,
+                last_clock_status="OK",
+            )
+        )
+        session.add(DeviceUser(device_id="MAIN-GATE", user_id="5", employee_name="Ali"))
+        session.commit()
+
+    worker = DeviceWorker(
+        device_id="MAIN-GATE",
+        zone_config=ActiveZoneConfig(
+            zone_id="RWP-ZONE-01",
+            zone_name="Rawalpindi Main Office",
+            timezone="Asia/Karachi",
+            head_office_url="http://127.0.0.1:8080",
+            zone_token="token",
+            setup_completed=True,
+        ),
+        stop_event=threading.Event(),
+        trusted_time=trusted_time,
+        session_factory=session_factory,
+        live_poll_reconcile_interval_seconds=0,
+    )
+    client = _PollOnlyClient(
+        [
+            ZKAttendance(
+                user_id="5",
+                timestamp=trusted_now,
+                punch=0,
+                uid="5",
+                raw={"source": "test"},
+            )
+        ]
+    )
+    worker.pending_startup_reconcile = True
+    command = _DeviceCommand(kind="reconcile_attendance", payload=None, done=threading.Event())
+    worker.command_queue.put(command)
+
+    worker._drain_commands(client)
+
+    assert command.done.is_set()
+    assert command.error is None
+    assert command.result == 1
+    with session_factory() as session:
+        row = session.query(AttendanceEvent).one()
+        assert row.source_type == SourceType.DUMP_STARTUP.value
+
+
+def test_reconcile_watchdog_submits_reconcile_command(monkeypatch):
+    worker = _command_worker()
+    calls = []
+    submitted = threading.Event()
+    reconcile_stop = threading.Event()
+    monkeypatch.setattr("zk_zone_agent.device_worker.settings.reconcile_watchdog_startup_delay_seconds", 0)
+    monkeypatch.setattr("zk_zone_agent.device_worker.settings.reconcile_watchdog_interval_seconds", 60)
+    monkeypatch.setattr(
+        "zk_zone_agent.device_worker.settings.reconcile_watchdog_command_timeout_seconds",
+        123,
+    )
+
+    def submit(kind, payload, timeout_seconds):
+        calls.append((kind, payload, timeout_seconds))
+        submitted.set()
+
+    worker._submit_command = submit
+    thread = threading.Thread(
+        target=worker._reconcile_watchdog_loop,
+        args=(reconcile_stop,),
+        daemon=True,
+    )
+    thread.start()
+    assert submitted.wait(1)
+    reconcile_stop.set()
+    thread.join(timeout=1)
+
+    assert calls == [("reconcile_attendance", None, 123)]
+
+
 def test_reconnect_closes_sqlite_outage_with_utc_aware_duration(tmp_path):
     engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'zone.db'}")
     Base.metadata.create_all(engine)
