@@ -78,6 +78,17 @@ jobs:
           path: dist/zk-zone-agent/**
           if-no-files-found: error
 
+      - name: Build State Life HR Enrollment portable EXE
+        shell: pwsh
+        run: ./installer/windows/build_hr.ps1
+
+      - name: Upload State Life HR Enrollment portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-life-hr-enrollment-windows-exe
+          path: dist/StateLifeHREnrollment.exe
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
@@ -96,6 +107,7 @@ jobs:
           mkdir -p release-assets
           cp release-artifacts/auto-attn-python-dist/* release-assets/
           cp release-artifacts/zk-zone-agent-windows-installer/*.exe release-assets/
+          cp release-artifacts/state-life-hr-enrollment-windows-exe/*.exe release-assets/
           (
             cd release-artifacts
             zip -r ../release-assets/zk-zone-agent-pyinstaller-payload.zip zk-zone-agent-pyinstaller-payload

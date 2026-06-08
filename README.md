@@ -43,12 +43,24 @@ ZK_ZONE_BRUTEFORCE_ENABLED=true zk-zone-agent --host 127.0.0.1 --port 7860
 
 The brute-force flow is opt-in per candidate, requires local operator confirmation, refuses public IPs, and refuses already configured live devices unless explicitly allowed through the API.
 
+## State Life HR Enrollment App
+
+The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a portable native app for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco devices, finds or creates regular employee users, and triggers fingerprint enrollment on the selected machine. The app does not expose Zone Agent admin tools or device controls.
+
+The HR app uses comm key `1979` by default. IT can override it by creating:
+
+```text
+C:\ProgramData\State Life Insurance Corporation\HR Enrollment\secrets\comm_key.txt
+```
+
+The file must contain only the numeric comm key.
+
 ## Shipping
 
 The repository ships through GitHub Actions:
 
 - `CI` runs lint, tests, and Python package build across Ubuntu/Windows and Python 3.11/3.12.
-- `Shipping CD` builds Python distributions on Ubuntu and the Windows Zone Agent installer on `windows-latest`.
+- `Shipping CD` builds Python distributions on Ubuntu, the Windows Zone Agent installer, and the State Life HR Enrollment portable EXE on `windows-latest`.
 - Tag pushes matching `v*` publish a GitHub Release with the Python package and Windows installer artifacts.
 
 To cut a release:

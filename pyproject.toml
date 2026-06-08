@@ -38,10 +38,11 @@ dev = [
 [project.scripts]
 zk-zone-agent = "zk_zone_agent.__main__:main"
 zk-head-office = "zk_head_office.__main__:main"
+state-life-hr-enrollment = "zk_hr_enrollment.__main__:main"
 
 [tool.setuptools]
-packages = ["zk_common", "zk_zone_agent", "zk_head_office"]
-package-dir = { "zk_common" = "packages/common/zk_common", "zk_zone_agent" = "apps/zone_agent/zk_zone_agent", "zk_head_office" = "apps/head_office/zk_head_office" }
+packages = ["zk_common", "zk_zone_agent", "zk_head_office", "zk_hr_enrollment"]
+package-dir = { "zk_common" = "packages/common/zk_common", "zk_zone_agent" = "apps/zone_agent/zk_zone_agent", "zk_head_office" = "apps/head_office/zk_head_office", "zk_hr_enrollment" = "apps/hr_enrollment/zk_hr_enrollment" }
 include-package-data = false
 
 [tool.setuptools.package-data]
@@ -49,7 +50,7 @@ zk_zone_agent = ["templates/*.html", "static/*"]
 zk_head_office = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["apps/zone_agent", "apps/head_office", "packages/common"]
+pythonpath = ["apps/zone_agent", "apps/head_office", "apps/hr_enrollment", "packages/common"]
 testpaths = ["tests"]
 
 [tool.ruff]

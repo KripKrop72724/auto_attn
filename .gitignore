@@ -17,3 +17,6 @@ build/
 *.log
 local-data/
 installer/windows/Output/
+firmware/zone_lite/sdkconfig
+firmware/zone_lite/build/
+firmware/zone_lite/main/zone_lite_config.h

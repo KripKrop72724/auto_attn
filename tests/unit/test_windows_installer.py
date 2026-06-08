@@ -19,3 +19,17 @@ def test_windows_installer_uses_nssm_service_wrapper():
     assert "Find-NssmExe" in build
     assert "Copy-Item -Force $NssmExe" in build
     assert "--collect-all webauthn" in build
+
+
+def test_windows_cd_builds_state_life_hr_portable_exe():
+    root = Path(__file__).resolve().parents[2]
+    build = (root / "installer/windows/build_hr.ps1").read_text()
+    cd = (root / ".github/workflows/cd.yml").read_text()
+
+    assert "--name StateLifeHREnrollment" in build
+    assert "--onefile" in build
+    assert "--noconsole" in build
+    assert "apps\\hr_enrollment\\zk_hr_enrollment\\__main__.py" in build
+    assert "StateLifeHREnrollment.exe" in build
+    assert "state-life-hr-enrollment-windows-exe" in cd
+    assert "dist/StateLifeHREnrollment.exe" in cd
