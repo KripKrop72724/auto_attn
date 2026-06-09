@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,6 +36,34 @@
 #include "zone_lite_config.h"
 #else
 #include "zone_lite_config.example.h"
+#endif
+
+#ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
+#define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
+#endif
+#ifndef ZONE_LITE_ZKT_RECOVERY_FAILURES
+#define ZONE_LITE_ZKT_RECOVERY_FAILURES 2
+#endif
+#ifndef ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS
+#define ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS (30 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_ZKT_REBOOT_WAIT_MS
+#define ZONE_LITE_ZKT_REBOOT_WAIT_MS 90000
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_PORT
+#define ZONE_LITE_ZKT_TELNET_PORT 23
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_USERNAME
+#define ZONE_LITE_ZKT_TELNET_USERNAME "root"
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_PASSWORD
+#define ZONE_LITE_ZKT_TELNET_PASSWORD ""
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_EXPECT_BANNER
+#define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER "Linux"
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
+#define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"
 #endif
 
 #define CMD_OPTIONS_RRQ 11
@@ -86,6 +115,8 @@
 #define ZKT_KEEPALIVE_COUNT 3
 #define ZKT_LIVE_REREGISTER_INTERVAL_MS (10 * 60 * 1000)
 #define ZKT_DISCOVERY_RESTART_AFTER_FAILURES 5
+#define ZKT_TELNET_BUFFER_SIZE 768
+#define ZKT_TELNET_IO_TIMEOUT_MS 5000
 
 static const char *TAG = "zone_lite";
 static EventGroupHandle_t wifi_event_group;
@@ -145,6 +176,8 @@ typedef struct {
 static char g_device_serial[80] = "";
 static uint64_t *g_seen_hashes;
 static size_t g_seen_count;
+static uint32_t g_last_authenticated_zkt_ip;
+static uint32_t g_last_zkt_tcp_candidate_ip;
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -803,6 +836,210 @@ static bool tcp_connect_with_timeout(uint32_t host_order_ip, uint16_t port, int 
     }
     configure_zkt_socket(sock);
     *out_sock = sock;
+    return true;
+}
+
+static void ip_to_text(uint32_t host_order_ip, char *out, size_t out_len)
+{
+    struct in_addr addr = {.s_addr = htonl(host_order_ip)};
+    inet_ntoa_r(addr, out, out_len);
+}
+
+static bool text_contains_ci(const char *haystack, const char *needle)
+{
+    if (needle == NULL || needle[0] == '\0') {
+        return true;
+    }
+    if (haystack == NULL) {
+        return false;
+    }
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p != '\0'; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i] != '\0' &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t telnet_read_text(int sock, char *out, size_t out_len, int timeout_ms)
+{
+    if (out_len == 0) {
+        return 0;
+    }
+    size_t written = 0;
+    out[0] = '\0';
+    int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
+    while (written + 1 < out_len) {
+        int64_t remaining_ms = deadline_ms - (esp_timer_get_time() / 1000);
+        if (remaining_ms <= 0) {
+            break;
+        }
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sock, &read_fds);
+        struct timeval tv = {
+            .tv_sec = (int)(remaining_ms / 1000),
+            .tv_usec = (int)((remaining_ms % 1000) * 1000),
+        };
+        int rc = select(sock + 1, &read_fds, NULL, NULL, &tv);
+        if (rc <= 0) {
+            break;
+        }
+        uint8_t rx[128];
+        int got = recv(sock, rx, sizeof(rx), 0);
+        if (got <= 0) {
+            break;
+        }
+        for (int i = 0; i < got && written + 1 < out_len; i++) {
+            if (rx[i] == 255) {
+                i += 2;
+                continue;
+            }
+            if (rx[i] != '\0') {
+                out[written++] = (char)rx[i];
+            }
+        }
+        out[written] = '\0';
+    }
+    return written;
+}
+
+static bool telnet_send_line(int sock, const char *value)
+{
+    char line[160];
+    int len = snprintf(line, sizeof(line), "%s\r\n", value);
+    if (len <= 0 || len >= (int)sizeof(line)) {
+        return false;
+    }
+    return send_all(sock, (const uint8_t *)line, (size_t)len);
+}
+
+static bool zkt_telnet_reboot(uint32_t host_order_ip)
+{
+    char ip_text[16];
+    ip_to_text(host_order_ip, ip_text, sizeof(ip_text));
+    ESP_LOGW(
+        TAG,
+        "Attempting ZKT telnet OS recovery reboot on %s:%d",
+        ip_text,
+        ZONE_LITE_ZKT_TELNET_PORT);
+
+    int sock = -1;
+    if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_TELNET_PORT, ZKT_TELNET_IO_TIMEOUT_MS, &sock)) {
+        ESP_LOGW(TAG, "Could not connect to ZKT telnet recovery target %s:%d", ip_text, ZONE_LITE_ZKT_TELNET_PORT);
+        return false;
+    }
+
+    char text[ZKT_TELNET_BUFFER_SIZE];
+    bool ok = false;
+    telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
+    if (!text_contains_ci(text, "login:")) {
+        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not show a login prompt", ip_text);
+        goto done;
+    }
+    if (ZONE_LITE_ZKT_TELNET_EXPECT_BANNER[0] != '\0' &&
+        !text_contains_ci(text, ZONE_LITE_ZKT_TELNET_EXPECT_BANNER)) {
+        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not match the expected banner", ip_text);
+        goto done;
+    }
+
+    if (!telnet_send_line(sock, ZONE_LITE_ZKT_TELNET_USERNAME)) {
+        goto done;
+    }
+    telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
+    if (!text_contains_ci(text, "password:")) {
+        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not ask for a password", ip_text);
+        goto done;
+    }
+
+    if (!telnet_send_line(sock, ZONE_LITE_ZKT_TELNET_PASSWORD)) {
+        goto done;
+    }
+    telnet_read_text(sock, text, sizeof(text), 2000);
+    if (text_contains_ci(text, "login incorrect")) {
+        ESP_LOGW(TAG, "ZKT telnet recovery login failed for %s", ip_text);
+        goto done;
+    }
+
+    if (!telnet_send_line(sock, "id")) {
+        goto done;
+    }
+    telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
+    if (text_contains_ci(text, "login incorrect") || !text_contains_ci(text, "uid=")) {
+        ESP_LOGW(TAG, "ZKT telnet recovery could not confirm a shell on %s", ip_text);
+        goto done;
+    }
+
+    if (!telnet_send_line(sock, "sync")) {
+        goto done;
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
+    if (!telnet_send_line(sock, ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND)) {
+        goto done;
+    }
+    ESP_LOGW(TAG, "ZKT telnet recovery reboot command sent to %s", ip_text);
+    ok = true;
+
+done:
+    close(sock);
+    return ok;
+}
+
+static uint32_t configured_preferred_zkt_ip(void)
+{
+    struct in_addr preferred_addr;
+    if (inet_aton(ZONE_LITE_ZKT_PREFERRED_IP, &preferred_addr) == 0) {
+        return 0;
+    }
+    return ntohl(preferred_addr.s_addr);
+}
+
+static uint32_t zkt_recovery_target_ip(void)
+{
+    if (g_last_zkt_tcp_candidate_ip != 0) {
+        return g_last_zkt_tcp_candidate_ip;
+    }
+    uint32_t preferred = configured_preferred_zkt_ip();
+    if (preferred != 0) {
+        return preferred;
+    }
+    return g_last_authenticated_zkt_ip;
+}
+
+static bool maybe_reboot_zkt_for_recovery(uint32_t discovery_failures, int64_t *last_reboot_ms)
+{
+    if (!ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED ||
+        discovery_failures < ZONE_LITE_ZKT_RECOVERY_FAILURES) {
+        return false;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (*last_reboot_ms > 0 && now_ms - *last_reboot_ms < ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS) {
+        ESP_LOGW(TAG, "Skipping ZKT telnet recovery because reboot cooldown is active");
+        return false;
+    }
+
+    uint32_t target_ip = zkt_recovery_target_ip();
+    if (target_ip == 0) {
+        ESP_LOGW(TAG, "Skipping ZKT telnet recovery because no recovery target is known");
+        return false;
+    }
+
+    // When the ZKT application service is stuck, port 4370 can accept TCP but
+    // never answer protocol commands. Recovery must use the OS telnet service.
+    if (!zkt_telnet_reboot(target_ip)) {
+        return false;
+    }
+
+    *last_reboot_ms = esp_timer_get_time() / 1000;
+    ESP_LOGW(TAG, "Waiting %d ms for ZKT device to reboot", ZONE_LITE_ZKT_REBOOT_WAIT_MS);
+    vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
     return true;
 }
 
@@ -1602,10 +1839,10 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS, &sock)) {
         return false;
     }
+    g_last_zkt_tcp_candidate_ip = host_order_ip;
 
     char ip_text[16];
-    struct in_addr addr = {.s_addr = htonl(host_order_ip)};
-    inet_ntoa_r(addr, ip_text, sizeof(ip_text));
+    ip_to_text(host_order_ip, ip_text, sizeof(ip_text));
 
     bool ok = false;
     zk_context_t ctx = {0};
@@ -1638,6 +1875,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
         (long)records,
         ZONE_LITE_ZONE_DEVICE_ID);
     *selected_ip = host_order_ip;
+    g_last_authenticated_zkt_ip = host_order_ip;
     ok = true;
 
 done:
@@ -1650,6 +1888,7 @@ done:
 
 static bool discover_zkt(uint32_t *selected_ip)
 {
+    g_last_zkt_tcp_candidate_ip = 0;
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip_info;
     if (netif == NULL || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
@@ -1665,15 +1904,11 @@ static bool discover_zkt(uint32_t *selected_ip)
         broadcast = network | 0xffU;
         host_count = 254;
     }
-    uint32_t preferred = 0;
-    struct in_addr preferred_addr;
-    if (inet_aton(ZONE_LITE_ZKT_PREFERRED_IP, &preferred_addr) != 0) {
-        preferred = ntohl(preferred_addr.s_addr);
-        if (preferred != 0 && preferred != own_ip && preferred != ntohl(ip_info.gw.addr)) {
-            ESP_LOGI(TAG, "Trying preferred ZKT IP %s:%d", ZONE_LITE_ZKT_PREFERRED_IP, ZONE_LITE_ZKT_PORT);
-            if (probe_zkt_device(preferred, selected_ip)) {
-                return true;
-            }
+    uint32_t preferred = configured_preferred_zkt_ip();
+    if (preferred != 0 && preferred != own_ip && preferred != ntohl(ip_info.gw.addr)) {
+        ESP_LOGI(TAG, "Trying preferred ZKT IP %s:%d", ZONE_LITE_ZKT_PREFERRED_IP, ZONE_LITE_ZKT_PORT);
+        if (probe_zkt_device(preferred, selected_ip)) {
+            return true;
         }
     }
     ESP_LOGI(TAG, "Scanning %lu hosts for ZKT TCP port %d", (unsigned long)host_count, ZONE_LITE_ZKT_PORT);
@@ -1956,6 +2191,7 @@ static void gateway_task(void *arg)
 {
     (void)arg;
     uint32_t discovery_failures = 0;
+    int64_t last_zkt_reboot_ms = 0;
     while (true) {
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
             ESP_LOGW(TAG, "Waiting for Wi-Fi before ZKT discovery");
@@ -1974,6 +2210,9 @@ static void gateway_task(void *arg)
                 ZONE_LITE_ZKT_PORT,
                 (unsigned long)discovery_failures,
                 ZKT_DISCOVERY_RESTART_AFTER_FAILURES);
+            if (maybe_reboot_zkt_for_recovery(discovery_failures, &last_zkt_reboot_ms)) {
+                discovery_failures = 0;
+            }
             if (discovery_failures >= ZKT_DISCOVERY_RESTART_AFTER_FAILURES) {
                 ESP_LOGE(TAG, "Restarting ESP32 after repeated ZKT discovery failures");
                 vTaskDelay(pdMS_TO_TICKS(1000));

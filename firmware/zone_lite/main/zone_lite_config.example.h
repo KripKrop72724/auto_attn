@@ -22,3 +22,15 @@
 #define ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS 450
 #define ZONE_LITE_DISCOVERY_RETRY_DELAY_MS 15000
 #define ZONE_LITE_RECONCILE_INTERVAL_MS 60000
+
+// Optional ZKT OS recovery. Keep disabled unless the attendance device has a
+// confirmed telnet account dedicated to controlled recovery.
+#define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
+#define ZONE_LITE_ZKT_RECOVERY_FAILURES 2
+#define ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS (30 * 60 * 1000)
+#define ZONE_LITE_ZKT_REBOOT_WAIT_MS 90000
+#define ZONE_LITE_ZKT_TELNET_PORT 23
+#define ZONE_LITE_ZKT_TELNET_USERNAME "root"
+#define ZONE_LITE_ZKT_TELNET_PASSWORD "replace-me"
+#define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER "Linux"
+#define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"

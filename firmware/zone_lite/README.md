@@ -1,39 +1,57 @@
 # Zone Lite ESP32 Firmware
 
-ESP32-S3 firmware for a Zone Lite attendance gateway. The board connects to the configured Wi-Fi network, discovers an authenticated ZKT device on TCP port 4370, captures attendance, keeps a local SPIFFS outbox, and sends signed HTTPS batches directly to Oracle ORDS.
+Firmware for an ESP32-S3 Zone Lite gateway.
 
-## Runtime behavior
+Current milestone:
 
-- Auto-connects to Wi-Fi.
-- Tries the configured preferred ZKT IP first, then scans the local subnet for the first authenticated ZKT device on port 4370.
-- Loads the ZKT user table and applies Zone identity parsing:
-  - `Name-13digitCNIC` sends a normal punch.
-  - `Name-S-13digitCNIC` sends `raw_punch: "T"`.
-  - Missing or invalid CNIC rows are blocked locally.
-- On startup, reads the ZKT attendance dump but enqueues only records from the ZKT device's current local month.
-- Sends live punch events immediately.
-- Runs a 1-minute reconcile dump, also filtered to the current local month, so missed live punches are recovered without replaying old history.
-- Deduplicates by Zone-compatible `event_uid`.
-- Persists unsynced rows in SPIFFS and retries after power, Wi-Fi, or ORDS outages.
+- Connects to Wi-Fi.
+- Scans the DHCP subnet for the first host accepting ZKT TCP port `4370`.
+- Confirms the host by running ZKT `CMD_CONNECT` and Comm Key auth.
+- Reads basic identity/time/count information from the selected device.
+- Repeats discovery so DHCP IP changes are handled without reflashing.
+- Optionally recovers a stuck ZKT device through OS telnet reboot.
 
-## Local config
+Create local secrets before building:
 
-Create `main/zone_lite_config.h` from `main/zone_lite_config.example.h`. The local config is intentionally ignored by Git because it contains Wi-Fi, ZKT, and ORDS credentials.
-
-## Build and flash
-
-```sh
-. ~/esp/esp-idf/export.sh
-idf.py -B build -DIDF_TARGET=esp32s3 build
-idf.py -B build -p /dev/cu.usbmodem101 flash
+```bash
+cp main/zone_lite_config.example.h main/zone_lite_config.h
 ```
 
-To clear only the durable outbox/storage partition:
+`main/zone_lite_config.h` is ignored by git.
 
-```sh
+ZKT recovery:
+
+Some ZKT devices can enter a state where TCP `4370` accepts connections but the
+ZKT application service no longer responds to protocol commands. For that stuck
+state, recovery must be done through the device OS telnet service.
+
+Enable `ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED` only after confirming the device
+telnet account. The firmware logs into telnet, confirms a shell with `id`, sends
+`sync`, sends `ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND`, waits
+`ZONE_LITE_ZKT_REBOOT_WAIT_MS`, and then resumes normal discovery and capture.
+The recovery path is cooldown protected to avoid reboot loops.
+
+Build:
+
+```bash
 . ~/esp/esp-idf/export.sh
-python "$IDF_PATH/components/partition_table/parttool.py" \
-  --port /dev/cu.usbmodem101 \
-  --partition-table-file build/partition_table/partition-table.bin \
-  erase_partition --partition-name storage
+idf.py -DIDF_TARGET=esp32s3 -DPROJECT_VER=0.1.0 build
 ```
+
+Flash:
+
+```bash
+idf.py -p /dev/cu.usbmodem1234561 flash
+```
+
+If flashing reports `No serial data received`, put the ESP32-S3 in ROM
+download mode manually:
+
+1. Hold `BOOT`.
+2. Tap/release `RESET` or `EN`.
+3. Keep holding `BOOT` for about two seconds.
+4. Release `BOOT`.
+5. Run the flash command again.
+
+Some DevKitC-1 boards also work by holding `BOOT` during the flash command and
+releasing it once esptool connects.
