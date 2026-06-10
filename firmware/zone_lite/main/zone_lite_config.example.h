@@ -16,12 +16,19 @@
 #define ZONE_LITE_ORDS_BASE_URL "https://example.invalid/ords/slic_hrm/raw_attn_capture_event"
 #define ZONE_LITE_ORDS_USERNAME "slic_zone_agent"
 #define ZONE_LITE_ORDS_PASSWORD "replace-me"
+#define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
+#define ZONE_LITE_ORDS_TIMEOUT_MS 15000
+#define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
+#define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
 
 // Discovery scans the DHCP subnet and accepts the first host that passes
 // ZKT CMD_CONNECT + Comm Key authentication.
 #define ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS 450
 #define ZONE_LITE_DISCOVERY_RETRY_DELAY_MS 15000
 #define ZONE_LITE_RECONCILE_INTERVAL_MS 60000
+#define ZONE_LITE_SNTP_SERVER "pool.ntp.org"
+#define ZONE_LITE_SNTP_SYNC_TIMEOUT_MS 15000
+#define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
 
 // ESP32-S3-DevKitC-1 onboard addressable RGB LED. If a board revision or clone
 // uses a different RGB pin, override only ZONE_LITE_LED_GPIO in local config.

@@ -20,6 +20,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -68,6 +69,15 @@
 #ifndef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
 #define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"
 #endif
+#ifndef ZONE_LITE_SNTP_SERVER
+#define ZONE_LITE_SNTP_SERVER "pool.ntp.org"
+#endif
+#ifndef ZONE_LITE_SNTP_SYNC_TIMEOUT_MS
+#define ZONE_LITE_SNTP_SYNC_TIMEOUT_MS 15000
+#endif
+#ifndef ZONE_LITE_MIN_VALID_UNIX_TIME
+#define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
+#endif
 
 #define CMD_OPTIONS_RRQ 11
 #define CMD_USERTEMP_RRQ 9
@@ -110,8 +120,18 @@
 #define MAX_USERS 512
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
-#define ORDS_BULK_CHUNK_SIZE 5000
-#define ORDS_TIMEOUT_MS 20000
+#ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
+#define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
+#endif
+#ifndef ZONE_LITE_ORDS_TIMEOUT_MS
+#define ZONE_LITE_ORDS_TIMEOUT_MS 15000
+#endif
+#ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS
+#define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
+#endif
+#ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS
+#define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
+#endif
 #define ZKT_IO_TIMEOUT_SEC 8
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
@@ -181,6 +201,10 @@ static uint64_t *g_seen_hashes;
 static size_t g_seen_count;
 static uint32_t g_last_authenticated_zkt_ip;
 static uint32_t g_last_zkt_tcp_candidate_ip;
+static bool g_sntp_started;
+static bool g_time_synced;
+static int64_t g_ords_next_attempt_ms;
+static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -1005,7 +1029,7 @@ static uint32_t configured_preferred_zkt_ip(void)
 
 static uint32_t zkt_recovery_target_ip(void)
 {
-    if (g_last_zkt_tcp_candidate_ip != 0) {
+    if (g_last_authenticated_zkt_ip != 0 && g_last_zkt_tcp_candidate_ip != 0) {
         return g_last_zkt_tcp_candidate_ip;
     }
     uint32_t preferred = configured_preferred_zkt_ip();
@@ -1639,11 +1663,102 @@ static size_t reconcile_attendance_dump(
     return added;
 }
 
+static bool system_time_is_valid(void)
+{
+    time_t now = 0;
+    time(&now);
+    return now >= ZONE_LITE_MIN_VALID_UNIX_TIME;
+}
+
+static void log_system_time(const char *message)
+{
+    time_t now = 0;
+    struct tm utc = {0};
+    char timestamp[32];
+    time(&now);
+    gmtime_r(&now, &utc);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    ESP_LOGI(TAG, "%s: %s", message, timestamp);
+}
+
+static bool ensure_system_time_synced(void)
+{
+    if (g_time_synced || system_time_is_valid()) {
+        g_time_synced = true;
+        return true;
+    }
+
+    if (!g_sntp_started) {
+        esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(ZONE_LITE_SNTP_SERVER);
+        esp_err_t err = esp_netif_sntp_init(&config);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Could not start SNTP time sync: %s", esp_err_to_name(err));
+            return false;
+        }
+        g_sntp_started = true;
+        ESP_LOGI(TAG, "SNTP time sync started using %s", ZONE_LITE_SNTP_SERVER);
+    }
+
+    esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(ZONE_LITE_SNTP_SYNC_TIMEOUT_MS));
+    if (err != ESP_OK && err != ESP_ERR_NOT_FINISHED) {
+        ESP_LOGW(TAG, "SNTP time sync not ready yet: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    g_time_synced = system_time_is_valid();
+    if (!g_time_synced) {
+        ESP_LOGW(TAG, "System time is still invalid after SNTP sync");
+        log_system_time("Current system UTC time");
+    } else {
+        log_system_time("System UTC time synchronized");
+    }
+    return g_time_synced;
+}
+
+static bool ords_send_allowed(void)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    return g_ords_next_attempt_ms == 0 || now_ms >= g_ords_next_attempt_ms;
+}
+
+static void ords_mark_success(void)
+{
+    g_ords_next_attempt_ms = 0;
+    g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
+}
+
+static void ords_mark_failure(void)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    uint32_t backoff_ms = g_ords_failure_backoff_ms;
+    if (backoff_ms == 0) {
+        backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
+    }
+    g_ords_next_attempt_ms = now_ms + backoff_ms;
+    if (backoff_ms < ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS / 2) {
+        g_ords_failure_backoff_ms = backoff_ms * 2;
+    } else {
+        g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS;
+    }
+    ESP_LOGW(TAG, "ORDS send failed; retrying in %lu ms", (unsigned long)backoff_ms);
+}
+
 static int http_post_json(const char *url, const char *json, char **response_body)
 {
+    if (!ensure_system_time_synced()) {
+        return -1;
+    }
+    log_system_time("HTTPS system UTC time");
+    ESP_LOGI(
+        TAG,
+        "HTTPS payload=%u heap_internal=%u heap_psram=%u",
+        (unsigned)strlen(json),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     esp_http_client_config_t cfg = {
         .url = url,
-        .timeout_ms = ORDS_TIMEOUT_MS,
+        .timeout_ms = ZONE_LITE_ORDS_TIMEOUT_MS,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -1693,11 +1808,76 @@ static bool oracle_send_live(const char *event_json)
     int status = http_post_json(url, event_json, &body);
     bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS live status=%d ok=%s", status, ok ? "true" : "false");
-    if (!ok) {
+    if (ok) {
+        ords_mark_success();
+    } else {
+        ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }
     free(body);
     return ok;
+}
+
+static char *build_bulk_payload(char **events, size_t count, const char *batch_uid)
+{
+    const char *prefix = "{\"batch_uid\":\"";
+    const char *middle = "\",\"events\":[";
+    const char *suffix = "]}";
+    size_t payload_len = strlen(prefix) + strlen(batch_uid) + strlen(middle) + strlen(suffix);
+    size_t included = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (events[i] == NULL || events[i][0] == '\0') {
+            continue;
+        }
+        payload_len += strlen(events[i]);
+        if (included > 0) {
+            payload_len++;
+        }
+        included++;
+    }
+    if (included == 0) {
+        return NULL;
+    }
+
+    char *payload = heap_caps_malloc(payload_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (payload == NULL) {
+        payload = malloc(payload_len + 1);
+    }
+    if (payload == NULL) {
+        return NULL;
+    }
+
+    char *write_at = payload;
+    size_t len = strlen(prefix);
+    memcpy(write_at, prefix, len);
+    write_at += len;
+    len = strlen(batch_uid);
+    memcpy(write_at, batch_uid, len);
+    write_at += len;
+    len = strlen(middle);
+    memcpy(write_at, middle, len);
+    write_at += len;
+
+    included = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (events[i] == NULL || events[i][0] == '\0') {
+            continue;
+        }
+        if (included > 0) {
+            *write_at++ = ',';
+        }
+        len = strlen(events[i]);
+        memcpy(write_at, events[i], len);
+        write_at += len;
+        included++;
+    }
+
+    len = strlen(suffix);
+    memcpy(write_at, suffix, len);
+    write_at += len;
+    *write_at = '\0';
+    return payload;
 }
 
 static bool oracle_send_bulk(char **events, size_t count)
@@ -1705,19 +1885,9 @@ static bool oracle_send_bulk(char **events, size_t count)
     if (count == 0) {
         return true;
     }
-    cJSON *root = cJSON_CreateObject();
     char batch_uid[64];
     snprintf(batch_uid, sizeof(batch_uid), "ZONE-ORDS-%lld", (long long)(esp_timer_get_time() / 1000));
-    cJSON_AddStringToObject(root, "batch_uid", batch_uid);
-    cJSON *array = cJSON_AddArrayToObject(root, "events");
-    for (size_t i = 0; i < count; i++) {
-        cJSON *event = cJSON_Parse(events[i]);
-        if (event != NULL) {
-            cJSON_AddItemToArray(array, event);
-        }
-    }
-    char *payload = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    char *payload = build_bulk_payload(events, count, batch_uid);
     if (payload == NULL) {
         return false;
     }
@@ -1727,7 +1897,10 @@ static bool oracle_send_bulk(char **events, size_t count)
     int status = http_post_json(url, payload, &body);
     bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS bulk count=%u status=%d ok=%s", (unsigned)count, status, ok ? "true" : "false");
-    if (!ok) {
+    if (ok) {
+        ords_mark_success();
+    } else {
+        ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }
     free(body);
@@ -1735,7 +1908,7 @@ static bool oracle_send_bulk(char **events, size_t count)
     return ok;
 }
 
-static void append_acked_uid_from_json(const char *event_json)
+static void append_acked_uid_from_json_to_file(const char *event_json, FILE *acked_file)
 {
     cJSON *root = cJSON_Parse(event_json);
     if (root == NULL) {
@@ -1743,7 +1916,11 @@ static void append_acked_uid_from_json(const char *event_json)
     }
     cJSON *uid = cJSON_GetObjectItemCaseSensitive(root, "event_uid");
     if (cJSON_IsString(uid)) {
-        append_line(ACKED_PATH, uid->valuestring);
+        if (acked_file != NULL) {
+            append_line_to_open_file(acked_file, ACKED_PATH, uid->valuestring);
+        } else {
+            append_line(ACKED_PATH, uid->valuestring);
+        }
         seen_add(uid->valuestring);
     }
     cJSON_Delete(root);
@@ -1784,6 +1961,9 @@ static void oracle_drain_pending(bool live_first)
         return;
     }
     led_status_set_backlog(true);
+    if (!ords_send_allowed()) {
+        return;
+    }
     led_status_set(LED_STATUS_SYNCING);
 
     FILE *in = fopen(PENDING_PATH, "r");
@@ -1797,17 +1977,25 @@ static void oracle_drain_pending(bool live_first)
         led_status_fault(LED_STATUS_FATAL);
         return;
     }
+    FILE *acked_file = fopen(ACKED_PATH, "a");
+    if (acked_file == NULL) {
+        ESP_LOGW(TAG, "Could not keep %s open for ack appends", ACKED_PATH);
+    }
 
-    char **bulk = calloc(ORDS_BULK_CHUNK_SIZE, sizeof(char *));
+    char **bulk = calloc(ZONE_LITE_ORDS_BULK_CHUNK_SIZE, sizeof(char *));
     if (bulk == NULL) {
         fclose(in);
         fclose(out);
+        if (acked_file != NULL) {
+            fclose(acked_file);
+        }
         led_status_fault(LED_STATUS_FATAL);
         return;
     }
     size_t bulk_count = 0;
     char line[MAX_EVENT_JSON];
     bool failed = false;
+    bool made_progress = false;
 
     while (fgets(line, sizeof(line), in) != NULL) {
         line[strcspn(line, "\r\n")] = '\0';
@@ -1816,7 +2004,8 @@ static void oracle_drain_pending(bool live_first)
         }
         if (live_first && bulk_count == 0) {
             if (oracle_send_live(line)) {
-                append_acked_uid_from_json(line);
+                append_acked_uid_from_json_to_file(line, acked_file);
+                made_progress = true;
                 live_first = false;
                 continue;
             }
@@ -1832,13 +2021,14 @@ static void oracle_drain_pending(bool live_first)
             continue;
         }
         bulk_count++;
-        if (bulk_count == ORDS_BULK_CHUNK_SIZE) {
+        if (bulk_count == ZONE_LITE_ORDS_BULK_CHUNK_SIZE) {
             if (oracle_send_bulk(bulk, bulk_count)) {
                 for (size_t i = 0; i < bulk_count; i++) {
-                    append_acked_uid_from_json(bulk[i]);
+                    append_acked_uid_from_json_to_file(bulk[i], acked_file);
                     free(bulk[i]);
                     bulk[i] = NULL;
                 }
+                made_progress = true;
             } else {
                 failed = true;
                 for (size_t i = 0; i < bulk_count; i++) {
@@ -1858,8 +2048,9 @@ static void oracle_drain_pending(bool live_first)
     if (!failed && bulk_count > 0) {
         if (oracle_send_bulk(bulk, bulk_count)) {
             for (size_t i = 0; i < bulk_count; i++) {
-                append_acked_uid_from_json(bulk[i]);
+                append_acked_uid_from_json_to_file(bulk[i], acked_file);
             }
+            made_progress = true;
         } else {
             failed = true;
             for (size_t i = 0; i < bulk_count; i++) {
@@ -1870,6 +2061,17 @@ static void oracle_drain_pending(bool live_first)
     for (size_t i = 0; i < bulk_count; i++) {
         free(bulk[i]);
     }
+    if (failed && !made_progress) {
+        fclose(in);
+        fclose(out);
+        if (acked_file != NULL) {
+            fclose(acked_file);
+        }
+        (void)remove(PENDING_TMP_PATH);
+        led_status_set_backlog(true);
+        free(bulk);
+        return;
+    }
     if (failed) {
         while (fgets(line, sizeof(line), in) != NULL) {
             fputs(line, out);
@@ -1877,6 +2079,9 @@ static void oracle_drain_pending(bool live_first)
     }
     fclose(in);
     fclose(out);
+    if (acked_file != NULL) {
+        fclose(acked_file);
+    }
     if (!replace_pending_with_backup()) {
         (void)remove(PENDING_TMP_PATH);
         led_status_fault(LED_STATUS_FATAL);
@@ -2100,8 +2305,6 @@ static void gateway_run(uint32_t host_order_ip)
         ESP_LOGW(TAG, "Skipping startup dump because ZKT device time could not be read");
         led_status_fault(LED_STATUS_ZKT_FAILURE);
     }
-    oracle_drain_pending(false);
-
     uint8_t rx[1024];
     zk_response_t response = {0};
     (void)zk_send_command(sock, &ctx, CMD_CANCELCAPTURE, NULL, 0, rx, sizeof(rx), &response);
@@ -2112,6 +2315,7 @@ static void gateway_run(uint32_t host_order_ip)
         free(users);
         return;
     }
+    oracle_drain_pending(false);
 
     int64_t last_reconcile = esp_timer_get_time() / 1000;
     int64_t last_live_register = last_reconcile;
