@@ -37,6 +37,9 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $
   --onefile `
   --clean `
   --noconsole `
+  --paths "apps\hr_enrollment" `
+  --paths "apps\zone_agent" `
+  --paths "packages\common" `
   --collect-all zk_hr_enrollment `
   --collect-all zk_zone_agent `
   --collect-all zk_common `

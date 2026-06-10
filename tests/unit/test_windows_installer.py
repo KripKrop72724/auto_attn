@@ -29,6 +29,9 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "--name StateLifeHREnrollment" in build
     assert "--onefile" in build
     assert "--noconsole" in build
+    assert '--paths "apps\\hr_enrollment"' in build
+    assert '--paths "apps\\zone_agent"' in build
+    assert '--paths "packages\\common"' in build
     assert "Assert-PythonModule" in build
     assert "--collect-all psutil" in build
     assert "--hidden-import psutil._psutil_windows" in build
