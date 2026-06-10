@@ -8,7 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:  # pragma: no cover - exercised by packaged EXE health checks.
+    psutil = None
 
 from zk_zone_agent.settings import settings
 
@@ -59,10 +62,19 @@ class NetworkScanner:
         max_hosts_per_subnet: int | None = None,
     ) -> list[DiscoveredSubnet]:
         include_public = settings.scan_include_public_subnets if include_public is None else include_public
-        max_hosts_per_subnet = max_hosts_per_subnet or settings.scan_max_hosts_per_subnet
+        max_hosts_per_subnet = max(1, int(max_hosts_per_subnet or settings.scan_max_hosts_per_subnet))
+        if psutil is None:
+            raise RuntimeError(
+                "Network scanning dependency 'psutil' is missing. Rebuild the Windows EXE from "
+                "the latest shipping workflow so all runtime components are bundled."
+            )
         networks: dict[tuple[str, str], DiscoveredSubnet] = {}
-        stats = psutil.net_if_stats()
-        for interface_name, addrs in psutil.net_if_addrs().items():
+        try:
+            stats = psutil.net_if_stats()
+            interface_addrs = psutil.net_if_addrs()
+        except Exception as exc:
+            raise RuntimeError(f"Could not inspect Windows network adapters: {exc}") from exc
+        for interface_name, addrs in interface_addrs.items():
             if self._excluded_interface(interface_name):
                 continue
             stat = stats.get(interface_name)
@@ -71,11 +83,19 @@ class NetworkScanner:
             for addr in addrs:
                 if getattr(addr, "family", None) != socket.AF_INET:
                     continue
-                ip = ipaddress.ip_address(addr.address)
+                try:
+                    ip = ipaddress.ip_address(getattr(addr, "address", ""))
+                except ValueError:
+                    continue
+                if not isinstance(ip, ipaddress.IPv4Address):
+                    continue
                 if self._excluded_address(ip, include_public=include_public):
                     continue
                 netmask = addr.netmask or "255.255.255.0"
-                network = ipaddress.ip_network(f"{addr.address}/{netmask}", strict=False)
+                try:
+                    network = ipaddress.ip_network(f"{addr.address}/{netmask}", strict=False)
+                except ValueError:
+                    continue
                 network = self._cap_network_to_host_subnet(network, ip, max_hosts_per_subnet)
                 key = (str(network), interface_name)
                 networks[key] = DiscoveredSubnet(
@@ -132,7 +152,7 @@ class NetworkScanner:
                 open=True,
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
-        except OSError as exc:
+        except Exception as exc:
             return ScanCandidate(ip=ip, port=port, open=False, error=str(exc))
 
     def scan(
@@ -146,8 +166,8 @@ class NetworkScanner:
     ) -> list[ScanCandidate]:
         port = port or settings.scan_port
         timeout = timeout or settings.scan_timeout_seconds
-        max_workers = max_workers or settings.scan_concurrency
-        max_hosts_per_subnet = max_hosts_per_subnet or settings.scan_max_hosts_per_subnet
+        max_workers = max(1, int(max_workers or settings.scan_concurrency))
+        max_hosts_per_subnet = max(1, int(max_hosts_per_subnet or settings.scan_max_hosts_per_subnet))
         if subnets:
             subnet_items = [
                 DiscoveredSubnet(
@@ -171,7 +191,10 @@ class NetworkScanner:
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
             future_map = {pool.submit(self._probe, ip, port, timeout): ip for ip in targets}
             for future in as_completed(future_map):
-                candidate = future.result()
+                try:
+                    candidate = future.result()
+                except Exception:
+                    continue
                 if candidate.open:
                     subnet = targets[candidate.ip]
                     results.append(

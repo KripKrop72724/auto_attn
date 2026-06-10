@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
+from zk_hr_enrollment import __main__ as hr_main
 from zk_hr_enrollment.config import DEFAULT_COMM_KEY, CommKeyConfigError, read_comm_key
 from zk_hr_enrollment.identity import (
     build_machine_name,
@@ -12,7 +14,15 @@ from zk_hr_enrollment.identity import (
     users_matching_cnic,
 )
 from zk_hr_enrollment.service import EmployeeRecord, HREnrollmentService
-from zk_hr_enrollment.zkt import EnrollmentUser, FingerTemplate, ScannedDevice, ZKDeviceSession, probe_device
+from zk_hr_enrollment.zkt import (
+    EnrollmentUser,
+    FingerTemplate,
+    RuntimeDependencyError,
+    ScannedDevice,
+    ZKDeviceSession,
+    probe_device,
+    scan_zkt_devices,
+)
 from zk_zone_agent.network_scanner import ScanCandidate
 
 
@@ -93,6 +103,18 @@ def test_zkt_create_user_always_writes_regular_privilege():
     assert conn.calls[0]["password"] == ""
     assert conn.calls[0]["group_id"] == ""
     assert conn.calls[0]["card"] == 0
+
+
+def test_zkt_session_skips_malformed_templates():
+    session = ZKDeviceSession(ip="192.168.110.137", port=4370, comm_key=1979)
+    session.conn = SimpleNamespace(
+        get_templates=lambda: [
+            SimpleNamespace(uid="bad", fid=4, valid=1, size=1196),
+            SimpleNamespace(uid=7, fid=4, valid=1, size=1196),
+        ]
+    )
+
+    assert session.get_templates() == [FingerTemplate(uid=7, fid=4, valid=1, size=1196)]
 
 
 def test_service_creates_employee_with_auto_id_and_detects_duplicates():
@@ -181,6 +203,38 @@ def test_probe_device_falls_back_to_udp_after_tcp_failure():
     assert calls == [False, True]
     assert device.force_udp is True
     assert device.serial == "SERIAL"
+
+
+def test_scan_zkt_devices_surfaces_missing_runtime_dependency():
+    class FakeScanner:
+        def scan(self):
+            return [ScanCandidate(ip="192.168.110.137", port=4370, open=True)]
+
+    def missing_dependency_opener(**_kwargs):
+        raise RuntimeDependencyError("missing bundled dependency")
+
+    with pytest.raises(RuntimeDependencyError, match="missing bundled dependency"):
+        scan_zkt_devices(
+            comm_key=1979,
+            scanner=FakeScanner(),
+            session_opener=missing_dependency_opener,
+        )
+
+
+def test_health_check_fails_when_required_dependency_is_missing(monkeypatch):
+    imported = []
+
+    def fake_import(module_name):
+        imported.append(module_name)
+        if module_name == "psutil":
+            raise ModuleNotFoundError("No module named 'psutil'", name="psutil")
+
+    monkeypatch.setattr(hr_main.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hr_main.importlib, "import_module", fake_import)
+    monkeypatch.setattr(hr_main, "log_exception", lambda *_args, **_kwargs: None)
+
+    assert hr_main._run_health_check() == 1
+    assert "psutil" in imported
 
 
 @dataclass

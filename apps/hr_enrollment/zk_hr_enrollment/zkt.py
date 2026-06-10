@@ -8,6 +8,10 @@ from types import TracebackType
 from zk_zone_agent.network_scanner import NetworkScanner, ScanCandidate, network_scanner
 
 
+class RuntimeDependencyError(RuntimeError):
+    """Raised when the packaged EXE is missing a required runtime dependency."""
+
+
 @dataclass(frozen=True)
 class ScannedDevice:
     ip: str
@@ -68,7 +72,13 @@ class ZKDeviceSession:
         self.conn = None
 
     def __enter__(self) -> ZKDeviceSession:
-        from zk import ZK  # type: ignore
+        try:
+            from zk import ZK  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeDependencyError(
+                "The bundled ZKT device library is missing. Rebuild the Windows EXE from "
+                "the latest shipping workflow so all runtime components are included."
+            ) from exc
 
         zk = ZK(
             self.ip,
@@ -102,10 +112,20 @@ class ZKDeviceSession:
         )
 
     def get_users(self) -> list[EnrollmentUser]:
-        return [_user_from_pyzk(user) for user in self._require_conn().get_users()]
+        return [
+            _user_from_pyzk(user)
+            for user in (self._require_conn().get_users() or [])
+            if user is not None
+        ]
 
     def get_templates(self) -> list[FingerTemplate]:
-        return [_template_from_pyzk(template) for template in self._require_conn().get_templates()]
+        templates: list[FingerTemplate] = []
+        for template in self._require_conn().get_templates() or []:
+            try:
+                templates.append(_template_from_pyzk(template))
+            except (TypeError, ValueError):
+                continue
+        return templates
 
     def create_user(self, *, uid: int, user_id: str, name: str) -> EnrollmentUser:
         conn = self._require_conn()
@@ -172,6 +192,8 @@ def probe_device(
                     interface_name=candidate.interface_name,
                 )
         except Exception as exc:
+            if isinstance(exc, RuntimeDependencyError):
+                raise
             last_error = exc
     raise RuntimeError(f"Could not validate ZKT device at {candidate.ip}:{candidate.port}: {last_error}")
 
@@ -202,6 +224,8 @@ def scan_zkt_devices(
         for future in as_completed(future_map):
             try:
                 devices.append(future.result())
+            except RuntimeDependencyError:
+                raise
             except Exception:
                 continue
     return sorted(devices, key=lambda device: tuple(int(part) for part in device.ip.split(".")))
@@ -238,4 +262,3 @@ def _template_from_pyzk(template) -> FingerTemplate:
         valid=int(getattr(template, "valid", 0)),
         size=int(getattr(template, "size", 0)),
     )
-

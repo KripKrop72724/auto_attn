@@ -29,6 +29,11 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "--name StateLifeHREnrollment" in build
     assert "--onefile" in build
     assert "--noconsole" in build
+    assert "Assert-PythonModule" in build
+    assert "--collect-all psutil" in build
+    assert "--hidden-import psutil._psutil_windows" in build
+    assert "--health-check" in build
+    assert "StateLifeHREnrollment.exe failed its packaged dependency health check" in build
     assert "apps\\hr_enrollment\\zk_hr_enrollment\\__main__.py" in build
     assert "StateLifeHREnrollment.exe" in build
     assert "state-life-hr-enrollment-windows-exe" in cd

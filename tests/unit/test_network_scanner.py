@@ -1,6 +1,8 @@
 import socket
 from types import SimpleNamespace
 
+import pytest
+
 from zk_zone_agent.network_scanner import NetworkScanner
 
 
@@ -41,6 +43,15 @@ def test_discover_interfaces_filters_and_caps_large_lan(monkeypatch):
 
     assert [str(item.network) for item in subnets] == ["192.168.10.0/24"]
     assert subnets[0].interface_name == "Ethernet"
+
+
+def test_discover_interfaces_reports_missing_psutil(monkeypatch):
+    import zk_zone_agent.network_scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "psutil", None)
+
+    with pytest.raises(RuntimeError, match="psutil"):
+        NetworkScanner().discover_interfaces()
 
 
 def test_scan_returns_open_port_4370_candidates():

@@ -6,6 +6,11 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 from zk_hr_enrollment import APP_NAME, BRAND_NAME
+from zk_hr_enrollment.diagnostics import (
+    friendly_exception_message,
+    log_exception,
+    message_with_log,
+)
 from zk_hr_enrollment.identity import FINGER_LABELS
 from zk_hr_enrollment.service import EmployeeRecord, HREnrollmentService
 from zk_hr_enrollment.zkt import ScannedDevice
@@ -18,10 +23,12 @@ class HREnrollmentApp(tk.Tk):
         self.devices: dict[str, ScannedDevice] = {}
         self.current_record: EmployeeRecord | None = None
         self.task_queue: queue.Queue = queue.Queue()
+        self.busy = False
 
         self.title(f"{BRAND_NAME} - {APP_NAME}")
         self.geometry("900x650")
         self.minsize(820, 600)
+        self.report_callback_exception = self._handle_callback_exception
 
         self.device_var = tk.StringVar()
         self.cnic_var = tk.StringVar()
@@ -51,13 +58,13 @@ class HREnrollmentApp(tk.Tk):
 
         device_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Device Selection", padding=12)
         device_frame.pack(fill=tk.X, pady=(18, 10))
-        ttk.Button(
+        self.scan_button = ttk.Button(
             device_frame,
             text="Scan Network",
             style="Action.TButton",
             command=self.scan_devices,
-        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        self.scan_button = device_frame.grid_slaves(row=0, column=0)[0]
+        )
+        self.scan_button.grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
         self.device_combo = ttk.Combobox(
             device_frame,
             textvariable=self.device_var,
@@ -65,21 +72,19 @@ class HREnrollmentApp(tk.Tk):
             width=84,
         )
         self.device_combo.grid(row=0, column=1, sticky=tk.EW)
+        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_changed)
         device_frame.columnconfigure(1, weight=1)
 
         employee_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Employee", padding=12)
         employee_frame.pack(fill=tk.X, pady=10)
         ttk.Label(employee_frame, text="CNIC").grid(row=0, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(employee_frame, textvariable=self.cnic_var, width=28).grid(
-            row=0, column=1, sticky=tk.W, pady=4, padx=(8, 18)
-        )
+        self.cnic_entry = ttk.Entry(employee_frame, textvariable=self.cnic_var, width=28)
+        self.cnic_entry.grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 18))
         ttk.Label(employee_frame, text="Full Name").grid(row=1, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(employee_frame, textvariable=self.name_var, width=54).grid(
-            row=1, column=1, columnspan=3, sticky=tk.EW, pady=4, padx=(8, 0)
-        )
-        ttk.Checkbutton(employee_frame, text="Shift worker", variable=self.shift_var).grid(
-            row=0, column=2, sticky=tk.W, pady=4
-        )
+        self.name_entry = ttk.Entry(employee_frame, textvariable=self.name_var, width=54)
+        self.name_entry.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=4, padx=(8, 0))
+        self.shift_check = ttk.Checkbutton(employee_frame, text="Shift worker", variable=self.shift_var)
+        self.shift_check.grid(row=0, column=2, sticky=tk.W, pady=4)
         self.search_button = ttk.Button(
             employee_frame,
             text="Search Employee",
@@ -126,6 +131,9 @@ class HREnrollmentApp(tk.Tk):
 
     def scan_devices(self) -> None:
         self.current_record = None
+        self.devices = {}
+        self.device_var.set("")
+        self.device_combo["values"] = []
         self.finger_summary_var.set("No employee selected")
         self._run_task("Scanning network for ZKT devices", self.service.scan_devices, self._on_scan_complete)
 
@@ -134,6 +142,7 @@ class HREnrollmentApp(tk.Tk):
         if device is None:
             return
         cnic = self.cnic_var.get()
+        self._clear_record("Searching employee")
         self._run_task(
             "Searching employee on selected device",
             lambda: self.service.search_employee(device, cnic),
@@ -144,13 +153,17 @@ class HREnrollmentApp(tk.Tk):
         device = self._selected_device()
         if device is None:
             return
+        full_name = self.name_var.get()
+        cnic = self.cnic_var.get()
+        shift_worker = self.shift_var.get()
+        self._clear_record("Creating employee")
         self._run_task(
             "Creating regular employee on selected device",
             lambda: self.service.create_employee(
                 device,
-                full_name=self.name_var.get(),
-                cnic=self.cnic_var.get(),
-                shift_worker=self.shift_var.get(),
+                full_name=full_name,
+                cnic=cnic,
+                shift_worker=shift_worker,
             ),
             self._on_create_complete,
         )
@@ -160,10 +173,15 @@ class HREnrollmentApp(tk.Tk):
         if device is None or self.current_record is None:
             messagebox.showerror(BRAND_NAME, "Search or create an employee before enrollment.")
             return
-        finger_id = _selected_finger_id(self.finger_var.get())
+        record = self.current_record
+        try:
+            finger_id = _selected_finger_id(self.finger_var.get())
+        except ValueError:
+            messagebox.showerror(BRAND_NAME, "Finger selection is invalid.")
+            return
         self._run_task(
             "Waiting for fingerprint enrollment on the device",
-            lambda: self.service.enroll_finger(device, record=self.current_record, finger_id=finger_id),
+            lambda: self.service.enroll_finger(device, record=record, finger_id=finger_id),
             self._on_enroll_complete,
         )
 
@@ -200,6 +218,13 @@ class HREnrollmentApp(tk.Tk):
             f"Device user {record.user_id}: {record.machine_name} | {record.finger_summary}"
         )
 
+    def _clear_record(self, reason: str = "No employee selected") -> None:
+        self.current_record = None
+        self.finger_summary_var.set(reason)
+
+    def _on_device_changed(self, _event=None) -> None:
+        self._clear_record("Search or create an employee on the selected device")
+
     def _selected_device(self) -> ScannedDevice | None:
         label = self.device_var.get()
         device = self.devices.get(label)
@@ -209,6 +234,9 @@ class HREnrollmentApp(tk.Tk):
         return device
 
     def _run_task(self, label: str, func, on_success) -> None:
+        if self.busy:
+            self._append_status("Another operation is already running.")
+            return
         self._append_status(f"{label}...")
         self._set_busy(True)
 
@@ -228,22 +256,37 @@ class HREnrollmentApp(tk.Tk):
                 if kind == "success":
                     callback(payload)
                 else:
-                    self._append_status(f"{label} failed: {payload}")
-                    messagebox.showerror(BRAND_NAME, str(payload))
+                    log_path = log_exception(label, payload)
+                    message = friendly_exception_message(payload)
+                    self._append_status(f"{label} failed: {message}")
+                    messagebox.showerror(BRAND_NAME, message_with_log(message, log_path))
         except queue.Empty:
             pass
         self.after(100, self._poll_tasks)
 
     def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         for button in (self.scan_button, self.search_button, self.create_button, self.enroll_button):
             button.configure(state=state)
+        combo_state = tk.DISABLED if busy else "readonly"
+        for combo in (self.device_combo, self.finger_combo):
+            combo.configure(state=combo_state)
+        entry_state = tk.DISABLED if busy else tk.NORMAL
+        for widget in (self.cnic_entry, self.name_entry, self.shift_check):
+            widget.configure(state=entry_state)
 
     def _append_status(self, message: str) -> None:
         self.status_text.configure(state="normal")
         self.status_text.insert(tk.END, f"{message}\n")
         self.status_text.see(tk.END)
         self.status_text.configure(state="disabled")
+
+    def _handle_callback_exception(self, exc_type, exc, tb) -> None:
+        log_path = log_exception("tk callback", exc, tb)
+        message = friendly_exception_message(exc)
+        self._append_status(f"Operation failed: {message}")
+        messagebox.showerror(BRAND_NAME, message_with_log(message, log_path))
 
 
 def run_app() -> None:
