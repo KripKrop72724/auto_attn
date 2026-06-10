@@ -23,6 +23,14 @@
 #define ZONE_LITE_DISCOVERY_RETRY_DELAY_MS 15000
 #define ZONE_LITE_RECONCILE_INTERVAL_MS 60000
 
+// ESP32-S3-DevKitC-1 onboard addressable RGB LED. If a board revision or clone
+// uses a different RGB pin, override only ZONE_LITE_LED_GPIO in local config.
+#define ZONE_LITE_LED_ENABLED 1
+#define ZONE_LITE_LED_GPIO 48
+#define ZONE_LITE_LED_BRIGHTNESS 96
+#define ZONE_LITE_LED_FAULT_LATCH_MS 180000
+#define ZONE_LITE_LED_ACTIVITY_FLASH_MS 250
+
 // Optional ZKT OS recovery. Keep disabled unless the attendance device has a
 // confirmed telnet account dedicated to controlled recovery.
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0

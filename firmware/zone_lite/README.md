@@ -10,6 +10,7 @@ Current milestone:
 - Reads basic identity/time/count information from the selected device.
 - Repeats discovery so DHCP IP changes are handled without reflashing.
 - Optionally recovers a stuck ZKT device through OS telnet reboot.
+- Shows production status on the ESP32-S3 onboard RGB LED.
 
 Create local secrets before building:
 
@@ -30,6 +31,25 @@ telnet account. The firmware logs into telnet, confirms a shell with `id`, sends
 `sync`, sends `ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND`, waits
 `ZONE_LITE_ZKT_REBOOT_WAIT_MS`, and then resumes normal discovery and capture.
 The recovery path is cooldown protected to avoid reboot loops.
+
+LED status:
+
+The ESP32-S3 DevKitC-1 onboard RGB LED defaults to GPIO `48`. The LED is
+operator-facing and always shows the highest-priority current state or latched
+fault.
+
+- White pulse: booting or initializing local storage.
+- Blue blink: Wi-Fi connecting or reconnecting.
+- Cyan pulse/solid: discovering ZKT, then ZKT authenticated.
+- Purple pulse: startup dump, reconcile, or ORDS drain in progress.
+- Green solid: healthy live capture registered.
+- Green flash: live punch captured and queued.
+- Amber heartbeat: durable outbox backlog remains.
+- Orange blink: ORDS/Oracle send failure.
+- Yellow blink: ZKT protocol/auth failure before recovery.
+- Red fast blink: telnet recovery reboot in progress.
+- Red solid: fatal local failure.
+- Magenta blink: identity row blocked locally.
 
 Build:
 

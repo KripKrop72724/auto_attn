@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_err.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -37,6 +38,8 @@
 #else
 #include "zone_lite_config.example.h"
 #endif
+
+#include "led_status.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -1033,13 +1036,16 @@ static bool maybe_reboot_zkt_for_recovery(uint32_t discovery_failures, int64_t *
 
     // When the ZKT application service is stuck, port 4370 can accept TCP but
     // never answer protocol commands. Recovery must use the OS telnet service.
+    led_status_set(LED_STATUS_RECOVERY_REBOOT);
     if (!zkt_telnet_reboot(target_ip)) {
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         return false;
     }
 
     *last_reboot_ms = esp_timer_get_time() / 1000;
     ESP_LOGW(TAG, "Waiting %d ms for ZKT device to reboot", ZONE_LITE_ZKT_REBOOT_WAIT_MS);
     vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
+    led_status_set(LED_STATUS_ZKT_DISCOVERING);
     return true;
 }
 
@@ -1323,6 +1329,24 @@ static void load_seen_from_file(const char *path)
     fclose(f);
 }
 
+static bool file_has_nonempty_line(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return false;
+    }
+    char line[MAX_EVENT_JSON];
+    bool has_line = false;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (line[strspn(line, "\r\n")] != '\0') {
+            has_line = true;
+            break;
+        }
+    }
+    fclose(f);
+    return has_line;
+}
+
 static void restore_pending_backup_if_needed(void)
 {
     struct stat pending_stat;
@@ -1353,6 +1377,7 @@ static void storage_init(void)
     }
     if (g_seen_hashes == NULL) {
         ESP_LOGE(TAG, "Could not allocate event UID cache");
+        led_status_fault(LED_STATUS_FATAL);
     }
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
@@ -1360,11 +1385,18 @@ static void storage_init(void)
         .max_files = 8,
         .format_if_mount_failed = true,
     };
-    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+    esp_err_t spiffs_ret = esp_vfs_spiffs_register(&conf);
+    if (spiffs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not mount SPIFFS storage: %s", esp_err_to_name(spiffs_ret));
+        led_status_fault(LED_STATUS_FATAL);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_ERROR_CHECK(spiffs_ret);
+    }
     restore_pending_backup_if_needed();
     load_seen_from_file(PENDING_PATH);
     load_seen_from_file(BLOCKED_PATH);
     load_seen_from_file(ACKED_PATH);
+    led_status_set_backlog(file_has_nonempty_line(PENDING_PATH));
     ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_count);
 }
 
@@ -1410,12 +1442,14 @@ static enqueue_result_t enqueue_event_to_files(
     enqueue_result_t result = ENQUEUE_PENDING;
     if (event->cnic[0] == '\0') {
         append_line_to_open_file(blocked_file, BLOCKED_PATH, json);
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
         result = ENQUEUE_BLOCKED;
         if (strcmp(capturetype, "LIVE") == 0) {
             ESP_LOGW(TAG, "Blocked LIVE identity user_id=%s event_uid=%s", event->user_id, event->event_uid);
         }
     } else {
         append_line_to_open_file(pending_file, PENDING_PATH, json);
+        led_status_set_backlog(true);
         if (strcmp(capturetype, "LIVE") == 0) {
             ESP_LOGI(TAG, "Queued LIVE event_uid=%s user_id=%s raw=%s", event->event_uid, event->user_id, event->raw_punch ? "T" : "F");
         }
@@ -1659,6 +1693,9 @@ static bool oracle_send_live(const char *event_json)
     int status = http_post_json(url, event_json, &body);
     bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS live status=%d ok=%s", status, ok ? "true" : "false");
+    if (!ok) {
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
+    }
     free(body);
     return ok;
 }
@@ -1690,6 +1727,9 @@ static bool oracle_send_bulk(char **events, size_t count)
     int status = http_post_json(url, payload, &body);
     bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS bulk count=%u status=%d ok=%s", (unsigned)count, status, ok ? "true" : "false");
+    if (!ok) {
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
+    }
     free(body);
     free(payload);
     return ok;
@@ -1739,13 +1779,22 @@ static bool replace_pending_with_backup(void)
 
 static void oracle_drain_pending(bool live_first)
 {
+    if (!file_has_nonempty_line(PENDING_PATH)) {
+        led_status_set_backlog(false);
+        return;
+    }
+    led_status_set_backlog(true);
+    led_status_set(LED_STATUS_SYNCING);
+
     FILE *in = fopen(PENDING_PATH, "r");
     if (in == NULL) {
+        led_status_set_backlog(false);
         return;
     }
     FILE *out = fopen(PENDING_TMP_PATH, "w");
     if (out == NULL) {
         fclose(in);
+        led_status_fault(LED_STATUS_FATAL);
         return;
     }
 
@@ -1753,6 +1802,7 @@ static void oracle_drain_pending(bool live_first)
     if (bulk == NULL) {
         fclose(in);
         fclose(out);
+        led_status_fault(LED_STATUS_FATAL);
         return;
     }
     size_t bulk_count = 0;
@@ -1829,6 +1879,12 @@ static void oracle_drain_pending(bool live_first)
     fclose(out);
     if (!replace_pending_with_backup()) {
         (void)remove(PENDING_TMP_PATH);
+        led_status_fault(LED_STATUS_FATAL);
+    }
+    bool has_backlog = failed || file_has_nonempty_line(PENDING_PATH);
+    led_status_set_backlog(has_backlog);
+    if (!has_backlog) {
+        led_status_set(LED_STATUS_HEALTHY);
     }
     free(bulk);
 }
@@ -1848,6 +1904,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
     zk_context_t ctx = {0};
     if (!zk_connect_and_auth(sock, &ctx)) {
         ESP_LOGW(TAG, "%s:%d answered TCP but failed ZKT auth", ip_text, ZONE_LITE_ZKT_PORT);
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         goto done;
     }
     char serial[80] = {0};
@@ -1876,6 +1933,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
         ZONE_LITE_ZONE_DEVICE_ID);
     *selected_ip = host_order_ip;
     g_last_authenticated_zkt_ip = host_order_ip;
+    led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     ok = true;
 
 done:
@@ -1888,6 +1946,7 @@ done:
 
 static bool discover_zkt(uint32_t *selected_ip)
 {
+    led_status_set(LED_STATUS_ZKT_DISCOVERING);
     g_last_zkt_tcp_candidate_ip = 0;
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip_info;
@@ -1956,7 +2015,10 @@ static bool process_live_packet(const uint8_t *data, size_t len, const user_tabl
         }
         attendance_event_t event;
         if (build_attendance_event(&event, users, user_id, 0, timestamp, status, punch)) {
-            enqueue_event(&event, "LIVE");
+            enqueue_result_t result = enqueue_event(&event, "LIVE");
+            if (result == ENQUEUE_PENDING) {
+                led_status_event(LED_EVENT_LIVE_PUNCH);
+            }
             any = true;
         }
     }
@@ -1972,9 +2034,15 @@ static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
     if (!zk_send_command(sock, ctx, CMD_REG_EVENT, flags, sizeof(flags), rx, sizeof(rx), &response) ||
         !zk_status_ok(response.code)) {
         ESP_LOGW(TAG, "Could not %s ZKT live attendance events", enable ? "register" : "unregister");
+        if (enable) {
+            led_status_fault(LED_STATUS_ZKT_FAILURE);
+        }
         return false;
     }
     ESP_LOGI(TAG, "ZKT live attendance events %s", enable ? "registered" : "unregistered");
+    if (enable) {
+        led_status_set(LED_STATUS_HEALTHY);
+    }
     return true;
 }
 
@@ -1982,19 +2050,23 @@ static void gateway_run(uint32_t host_order_ip)
 {
     int sock = -1;
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, 3000, &sock)) {
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         return;
     }
     zk_context_t ctx = {0};
     if (!zk_connect_and_auth(sock, &ctx)) {
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         close(sock);
         return;
     }
+    led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     (void)zk_read_option(sock, &ctx, "~SerialNumber", g_device_serial, sizeof(g_device_serial));
     int32_t user_count = 0;
     int32_t records = 0;
     struct tm device_now;
     if (!zk_get_counts(sock, &ctx, &user_count, &records)) {
         ESP_LOGW(TAG, "Could not read initial ZKT counts; reconnecting");
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         zk_disconnect(sock, &ctx);
         close(sock);
         return;
@@ -2008,11 +2080,13 @@ static void gateway_run(uint32_t host_order_ip)
     }
     if (!zk_load_users(sock, &ctx, users, user_count)) {
         ESP_LOGW(TAG, "Could not load ZKT users; reconnecting before sync");
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
         zk_disconnect(sock, &ctx);
         close(sock);
         free(users);
         return;
     }
+    led_status_set(LED_STATUS_SYNCING);
     if (zk_get_time_parts(sock, &ctx, &device_now)) {
         reconcile_attendance_dump(
             sock,
@@ -2024,6 +2098,7 @@ static void gateway_run(uint32_t host_order_ip)
             device_now.tm_mon + 1);
     } else {
         ESP_LOGW(TAG, "Skipping startup dump because ZKT device time could not be read");
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
     }
     oracle_drain_pending(false);
 
@@ -2053,12 +2128,14 @@ static void gateway_run(uint32_t host_order_ip)
                 top.marker_2 != MACHINE_PREPARE_DATA_2 ||
                 top.length < sizeof(zk_header_t) || top.length > 2048) {
                 ESP_LOGW(TAG, "ZKT live socket returned an invalid packet; reconnecting");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
                 break;
             }
             uint8_t *packet = malloc(top.length);
             if (packet == NULL || !recv_exact(sock, packet, top.length)) {
                 free(packet);
                 ESP_LOGW(TAG, "Could not read complete ZKT live packet; reconnecting");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
                 break;
             }
             zk_header_t *header = (zk_header_t *)packet;
@@ -2067,9 +2144,13 @@ static void gateway_run(uint32_t host_order_ip)
                 process_live_packet(packet + sizeof(zk_header_t), top.length - sizeof(zk_header_t), users);
                 if (!zk_send_ack_only(sock, ctx.session_id)) {
                     ESP_LOGW(TAG, "Could not ACK ZKT live event; reconnecting");
+                    led_status_fault(LED_STATUS_ZKT_FAILURE);
                     keep_session = false;
                 }
                 oracle_drain_pending(true);
+                if (!file_has_nonempty_line(PENDING_PATH)) {
+                    led_status_set(LED_STATUS_HEALTHY);
+                }
             }
             free(packet);
             if (!keep_session) {
@@ -2077,6 +2158,7 @@ static void gateway_run(uint32_t host_order_ip)
             }
         } else if (rc < 0) {
             ESP_LOGW(TAG, "ZKT live socket select failed; reconnecting");
+            led_status_fault(LED_STATUS_ZKT_FAILURE);
             break;
         }
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -2086,16 +2168,19 @@ static void gateway_run(uint32_t host_order_ip)
             int32_t refreshed_records = 0;
             if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) {
                 ESP_LOGW(TAG, "ZKT health check failed during reconcile; reconnecting");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
                 break;
             }
             if (refreshed_users != user_count) {
                 user_count = refreshed_users;
                 if (!zk_load_users(sock, &ctx, users, user_count)) {
                     ESP_LOGW(TAG, "Could not refresh ZKT users; reconnecting");
+                    led_status_fault(LED_STATUS_ZKT_FAILURE);
                     break;
                 }
             }
             if (zk_get_time_parts(sock, &ctx, &device_now)) {
+                led_status_set(LED_STATUS_SYNCING);
                 reconcile_attendance_dump(
                     sock,
                     &ctx,
@@ -2106,9 +2191,13 @@ static void gateway_run(uint32_t host_order_ip)
                     device_now.tm_mon + 1);
             } else {
                 ESP_LOGW(TAG, "ZKT time read failed during reconcile; reconnecting");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
                 break;
             }
             oracle_drain_pending(false);
+            if (!file_has_nonempty_line(PENDING_PATH)) {
+                led_status_set(LED_STATUS_HEALTHY);
+            }
             now_ms = esp_timer_get_time() / 1000;
             if (now_ms - last_live_register >= ZKT_LIVE_REREGISTER_INTERVAL_MS) {
                 if (!zk_register_attlog_events(sock, &ctx, true)) {
@@ -2129,9 +2218,11 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     (void)arg;
     (void)event_data;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        led_status_set(LED_STATUS_WIFI_CONNECTING);
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        led_status_set(LED_STATUS_WIFI_CONNECTING);
         if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             wifi_retry_count++;
@@ -2143,6 +2234,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi connected with IP " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
+        led_status_set(LED_STATUS_ZKT_DISCOVERING);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -2169,6 +2261,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG, "Wi-Fi power save disabled for long-lived ZKT sockets");
+    led_status_set(LED_STATUS_WIFI_CONNECTING);
     ESP_LOGI(TAG, "Connecting to Wi-Fi SSID %s", ZONE_LITE_WIFI_SSID);
 }
 
@@ -2184,6 +2277,7 @@ static bool wait_for_wifi(void)
         return true;
     }
     ESP_LOGE(TAG, "Could not connect to Wi-Fi SSID %s", ZONE_LITE_WIFI_SSID);
+    led_status_fault(LED_STATUS_FATAL);
     return false;
 }
 
@@ -2204,6 +2298,7 @@ static void gateway_task(void *arg)
             ESP_LOGW(TAG, "ZKT session ended; rediscovering");
         } else {
             discovery_failures++;
+            led_status_fault(LED_STATUS_ZKT_FAILURE);
             ESP_LOGW(
                 TAG,
                 "No authenticated ZKT device found on port %d (failure %lu/%d)",
@@ -2215,6 +2310,7 @@ static void gateway_task(void *arg)
             }
             if (discovery_failures >= ZKT_DISCOVERY_RESTART_AFTER_FAILURES) {
                 ESP_LOGE(TAG, "Restarting ESP32 after repeated ZKT discovery failures");
+                led_status_fault(LED_STATUS_FATAL);
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 esp_restart();
             }
@@ -2227,6 +2323,8 @@ void app_main(void)
 {
     setenv("TZ", "UTC0", 1);
     tzset();
+    led_status_init();
+    led_status_set(LED_STATUS_BOOTING);
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -2239,5 +2337,8 @@ void app_main(void)
     if (!wait_for_wifi()) {
         return;
     }
-    xTaskCreate(gateway_task, "zone_gateway", 16384, NULL, 5, NULL);
+    if (xTaskCreate(gateway_task, "zone_gateway", 16384, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Could not start Zone Lite gateway task");
+        led_status_fault(LED_STATUS_FATAL);
+    }
 }
