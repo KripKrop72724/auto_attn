@@ -47,7 +47,6 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $
   --collect-all psutil `
   --hidden-import tkinter `
   --hidden-import psutil `
-  --hidden-import psutil._psutil_common `
   --hidden-import psutil._psutil_windows `
   --hidden-import win32timezone `
   "apps\hr_enrollment\zk_hr_enrollment\__main__.py"
@@ -58,6 +57,10 @@ if (!(Test-Path $DistExe)) {
 
 $HealthCheck = Start-Process -FilePath $DistExe -ArgumentList "--health-check" -Wait -PassThru
 if ($HealthCheck.ExitCode -ne 0) {
+  $HealthLog = Join-Path $env:ProgramData "State Life Insurance Corporation\HR Enrollment\logs\hr_enrollment.log"
+  if (Test-Path $HealthLog) {
+    Get-Content $HealthLog -Tail 120
+  }
   throw "StateLifeHREnrollment.exe failed its packaged dependency health check."
 }
 

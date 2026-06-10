@@ -24,7 +24,6 @@ CRITICAL_MODULES = (
 )
 
 WINDOWS_CRITICAL_MODULES = (
-    "psutil._psutil_common",
     "psutil._psutil_windows",
     "win32timezone",
 )
