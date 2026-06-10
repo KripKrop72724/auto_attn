@@ -132,6 +132,12 @@
 #ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
 #endif
+#ifndef ZONE_LITE_ZKT_USER_REFRESH_RETRIES
+#define ZONE_LITE_ZKT_USER_REFRESH_RETRIES 3
+#endif
+#ifndef ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS
+#define ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS 2000
+#endif
 #define ZKT_IO_TIMEOUT_SEC 8
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
@@ -1172,6 +1178,46 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
     free(data);
     ESP_LOGI(TAG, "Loaded %u users", (unsigned)users->count);
     return true;
+}
+
+static bool zk_refresh_users_preserving_current(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
+{
+    user_table_t *updated = calloc(1, sizeof(user_table_t));
+    if (updated == NULL) {
+        ESP_LOGW(TAG, "Could not allocate temporary ZKT user table for refresh");
+        return false;
+    }
+    bool ok = zk_load_users(sock, ctx, updated, user_count);
+    if (ok) {
+        memcpy(users, updated, sizeof(*users));
+    }
+    free(updated);
+    return ok;
+}
+
+static bool zk_refresh_users_after_count_change(
+    int sock,
+    zk_context_t *ctx,
+    user_table_t *users,
+    int32_t old_count,
+    int32_t new_count)
+{
+    ESP_LOGI(TAG, "ZKT user count changed %ld -> %ld; refreshing user cache", (long)old_count, (long)new_count);
+    led_status_set(LED_STATUS_SYNCING);
+    for (int attempt = 1; attempt <= ZONE_LITE_ZKT_USER_REFRESH_RETRIES; attempt++) {
+        if (zk_refresh_users_preserving_current(sock, ctx, users, new_count)) {
+            return true;
+        }
+        ESP_LOGW(
+            TAG,
+            "ZKT user refresh attempt %d/%d failed after count change",
+            attempt,
+            ZONE_LITE_ZKT_USER_REFRESH_RETRIES);
+        if (attempt < ZONE_LITE_ZKT_USER_REFRESH_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS));
+        }
+    }
+    return false;
 }
 
 static const zkt_user_t *find_user_by_user_id(const user_table_t *users, const char *user_id)
@@ -2376,12 +2422,12 @@ static void gateway_run(uint32_t host_order_ip)
                 break;
             }
             if (refreshed_users != user_count) {
-                user_count = refreshed_users;
-                if (!zk_load_users(sock, &ctx, users, user_count)) {
-                    ESP_LOGW(TAG, "Could not refresh ZKT users; reconnecting");
+                if (!zk_refresh_users_after_count_change(sock, &ctx, users, user_count, refreshed_users)) {
+                    ESP_LOGW(TAG, "Could not refresh ZKT users after count change; reconnecting");
                     led_status_fault(LED_STATUS_ZKT_FAILURE);
                     break;
                 }
+                user_count = refreshed_users;
             }
             if (zk_get_time_parts(sock, &ctx, &device_now)) {
                 led_status_set(LED_STATUS_SYNCING);
