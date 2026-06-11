@@ -78,7 +78,7 @@ create or replace package body slic_zkt_truth_api as
                    'duplicate_existing_count' value nvl(p_duplicate_existing_count, 0),
                    'datasync_zero_count' value nvl(p_datasync_zero_count, 0),
                    'invalid_count' value nvl(p_invalid_count, 0),
-                   'conflicts' value coalesce(p_conflicts_json, '[]') format json
+                   'conflicts' value coalesce(p_conflicts_json, to_clob('[]')) format json
                    returning clob)
           into v_json
           from dual;
@@ -111,8 +111,16 @@ create or replace package body slic_zkt_truth_api as
         v_username varchar2(512);
         v_password varchar2(1024);
     begin
-        v_username := owa_util.get_cgi_env('HTTP_X_API_USERNAME');
-        v_password := owa_util.get_cgi_env('HTTP_X_API_PASSWORD');
+        v_username := coalesce(
+            owa_util.get_cgi_env('HTTP_X_API_USERNAME'),
+            owa_util.get_cgi_env('X_API_USERNAME'),
+            owa_util.get_cgi_env('X-API-Username'),
+            owa_util.get_cgi_env('x-api-username'));
+        v_password := coalesce(
+            owa_util.get_cgi_env('HTTP_X_API_PASSWORD'),
+            owa_util.get_cgi_env('X_API_PASSWORD'),
+            owa_util.get_cgi_env('X-API-Password'),
+            owa_util.get_cgi_env('x-api-password'));
 
         if nvl(v_username, chr(0)) <> c_api_username
            or nvl(v_password, chr(0)) <> c_api_password then
@@ -793,59 +801,37 @@ create or replace package body slic_zkt_truth_api as
 end slic_zkt_truth_api;
 /
 
+declare
+    l_module_name varchar2(255);
 begin
     begin
-        ords.delete_module(p_module_name => 'raw_attn_capture_event');
+        select name
+          into l_module_name
+          from user_ords_modules
+         where uri_prefix = '/raw_attn_capture_event/'
+           and rownum = 1;
     exception
-        when others then
+        when no_data_found then
+            l_module_name := 'raw_attendance_capture';
+            ords.define_module(
+                p_module_name => l_module_name,
+                p_base_path => '/raw_attn_capture_event/',
+                p_items_per_page => 0,
+                p_status => 'PUBLISHED',
+                p_comments => 'ZKT raw attendance capture API with authoritative truth reconcile');
+    end;
+
+    begin
+        ords.define_template(
+            p_module_name => l_module_name,
+            p_pattern => 'raw-captures/reconcile');
+    exception
+        when dup_val_on_index then
             null;
     end;
 
-    ords.define_module(
-        p_module_name => 'raw_attn_capture_event',
-        p_base_path => '/raw_attn_capture_event/',
-        p_items_per_page => 0,
-        p_status => 'PUBLISHED',
-        p_comments => 'ZKT raw attendance capture API with authoritative truth reconcile');
-
-    ords.define_template(
-        p_module_name => 'raw_attn_capture_event',
-        p_pattern => 'raw-captures');
-
     ords.define_handler(
-        p_module_name => 'raw_attn_capture_event',
-        p_pattern => 'raw-captures',
-        p_method => 'POST',
-        p_source_type => ords.source_type_plsql,
-        p_items_per_page => 0,
-        p_source => q'[
-begin
-    slic_zkt_truth_api.post_live(:body_text);
-end;
-]');
-
-    ords.define_template(
-        p_module_name => 'raw_attn_capture_event',
-        p_pattern => 'raw-captures/bulk');
-
-    ords.define_handler(
-        p_module_name => 'raw_attn_capture_event',
-        p_pattern => 'raw-captures/bulk',
-        p_method => 'POST',
-        p_source_type => ords.source_type_plsql,
-        p_items_per_page => 0,
-        p_source => q'[
-begin
-    slic_zkt_truth_api.post_bulk(:body_text);
-end;
-]');
-
-    ords.define_template(
-        p_module_name => 'raw_attn_capture_event',
-        p_pattern => 'raw-captures/reconcile');
-
-    ords.define_handler(
-        p_module_name => 'raw_attn_capture_event',
+        p_module_name => l_module_name,
         p_pattern => 'raw-captures/reconcile',
         p_method => 'POST',
         p_source_type => ords.source_type_plsql,
