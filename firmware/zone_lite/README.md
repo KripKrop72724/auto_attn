@@ -11,6 +11,8 @@ Current milestone:
 - Repeats discovery so DHCP IP changes are handled without reflashing.
 - Optionally recovers a stuck ZKT device through OS telnet reboot.
 - Shows production status on the ESP32-S3 onboard RGB LED.
+- Can POST a full current-month ZKT truth snapshot to ORDS reconcile so Oracle
+  raw rows converge back to the ZKT machine.
 
 Create local secrets before building:
 
@@ -47,6 +49,7 @@ fault.
 - Amber heartbeat: durable outbox backlog remains.
 - Orange blink: ORDS/Oracle send failure.
 - Yellow blink: ZKT protocol/auth failure before recovery.
+- Amber/yellow warning blink: Oracle raw rows were repaired from ZKT truth.
 - Red fast blink: telnet recovery reboot in progress.
 - Red solid: fatal local failure.
 - Magenta blink: identity row blocked locally.

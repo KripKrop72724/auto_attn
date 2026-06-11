@@ -20,6 +20,8 @@
 #define ZONE_LITE_ORDS_TIMEOUT_MS 15000
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
+#define ZONE_LITE_ORDS_RECONCILE_ENABLED 1
+#define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
 
 // Discovery scans the DHCP subnet and accepts the first host that passes
 // ZKT CMD_CONNECT + Comm Key authentication.

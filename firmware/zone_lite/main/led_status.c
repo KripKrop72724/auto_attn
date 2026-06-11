@@ -88,6 +88,8 @@ static int priority_for_status(led_status_t status)
         return 80;
     case LED_STATUS_ZKT_FAILURE:
         return 75;
+    case LED_STATUS_TRUTH_REPAIR:
+        return 72;
     case LED_STATUS_BLOCKED_IDENTITY:
         return 70;
     case LED_STATUS_SYNCING:
@@ -111,7 +113,8 @@ static int priority_for_status(led_status_t status)
 static bool is_fault_status(led_status_t status)
 {
     return status == LED_STATUS_ORDS_FAILURE || status == LED_STATUS_ZKT_FAILURE ||
-           status == LED_STATUS_BLOCKED_IDENTITY || status == LED_STATUS_FATAL;
+           status == LED_STATUS_TRUTH_REPAIR || status == LED_STATUS_BLOCKED_IDENTITY ||
+           status == LED_STATUS_FATAL;
 }
 
 static led_status_t select_status(const led_state_t *state, int64_t tick_ms, bool *live_flash)
@@ -187,6 +190,9 @@ static void render_status(led_status_t status, bool live_flash, int64_t tick_ms)
         break;
     case LED_STATUS_ZKT_FAILURE:
         set_rgb(slow_on ? 255 : 0, slow_on ? 220 : 0, 0);
+        break;
+    case LED_STATUS_TRUTH_REPAIR:
+        set_rgb(slow_on ? 255 : 0, slow_on ? 170 : 0, 0);
         break;
     case LED_STATUS_RECOVERY_REBOOT:
         set_rgb(fast_on ? 255 : 0, 0, 0);

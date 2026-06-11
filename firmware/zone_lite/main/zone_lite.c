@@ -132,6 +132,12 @@
 #ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
 #endif
+#ifndef ZONE_LITE_ORDS_RECONCILE_ENABLED
+#define ZONE_LITE_ORDS_RECONCILE_ENABLED 1
+#endif
+#ifndef ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS
+#define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
+#endif
 #ifndef ZONE_LITE_ZKT_USER_REFRESH_RETRIES
 #define ZONE_LITE_ZKT_USER_REFRESH_RETRIES 3
 #endif
@@ -211,6 +217,9 @@ static bool g_sntp_started;
 static bool g_time_synced;
 static int64_t g_ords_next_attempt_ms;
 static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
+static bool g_truth_reconcile_warning;
+
+static bool oracle_send_reconcile(char **events, size_t count, int year, int month);
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -1586,8 +1595,10 @@ static bool build_attendance_event(
     uint8_t punch)
 {
     memset(out, 0, sizeof(*out));
-    const zkt_user_t *user = find_user_by_user_id(users, user_id);
-    if (user == NULL && uid != 0) {
+    const zkt_user_t *user = NULL;
+    if (user_id != NULL && user_id[0] != '\0') {
+        user = find_user_by_user_id(users, user_id);
+    } else if (uid != 0) {
         user = find_user_by_uid(users, uid);
     }
     if (user != NULL) {
@@ -1676,6 +1687,12 @@ static size_t reconcile_attendance_dump(
     size_t duplicates = 0;
     size_t filtered = 0;
     size_t skipped = 0;
+    bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED && filter_year > 0 && filter_month > 0;
+    bool truth_overflow = false;
+    bool truth_build_failed = false;
+    char **truth_events = NULL;
+    size_t truth_count = 0;
+    size_t truth_capacity = truth_enabled ? ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS : 0;
     ESP_LOGI(
         TAG,
         "Reconciling %ld attendance records packet_size=%lu month_filter=%04d-%02d",
@@ -1690,6 +1707,17 @@ static size_t reconcile_attendance_dump(
     FILE *blocked_file = fopen(BLOCKED_PATH, "a");
     if (blocked_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
+    }
+    if (truth_enabled) {
+        truth_events = heap_caps_calloc(truth_capacity, sizeof(char *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (truth_events == NULL) {
+            truth_events = calloc(truth_capacity, sizeof(char *));
+        }
+        if (truth_events == NULL) {
+            ESP_LOGE(TAG, "Could not allocate ORDS truth reconcile event list capacity=%u", (unsigned)truth_capacity);
+            led_status_fault(LED_STATUS_FATAL);
+            truth_enabled = false;
+        }
     }
     while (remain >= record_size) {
         char user_id[32] = "";
@@ -1730,6 +1758,18 @@ static size_t reconcile_attendance_dump(
         }
         attendance_event_t event;
         if (build_attendance_event(&event, users, user_id, uid, timestamp, status, punch)) {
+            if (truth_enabled && event.cnic[0] != '\0') {
+                if (truth_count < truth_capacity) {
+                    char *truth_json = event_to_json(&event, "MANUAL_REPROCESS");
+                    if (truth_json != NULL) {
+                        truth_events[truth_count++] = truth_json;
+                    } else {
+                        truth_build_failed = true;
+                    }
+                } else {
+                    truth_overflow = true;
+                }
+            }
             enqueue_result_t result = enqueue_event_to_files(&event, capturetype, pending_file, blocked_file);
             if (result == ENQUEUE_PENDING) {
                 added++;
@@ -1757,9 +1797,33 @@ static size_t reconcile_attendance_dump(
         fclose(blocked_file);
     }
     free(data);
+    if (truth_enabled) {
+        if (truth_overflow) {
+            ESP_LOGE(TAG, "Skipping ORDS truth reconcile because current-month truth exceeded capacity=%u", (unsigned)truth_capacity);
+            led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+        } else if (truth_build_failed) {
+            ESP_LOGE(TAG, "Skipping ORDS truth reconcile because one or more truth events could not be serialized");
+            led_status_fault(LED_STATUS_FATAL);
+        } else if (blocked > 0 || skipped > 0) {
+            ESP_LOGW(
+                TAG,
+                "Skipping ORDS truth reconcile because current-month dump has blocked=%u skipped=%u identity gaps",
+                (unsigned)blocked,
+                (unsigned)skipped);
+            led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+        } else {
+            (void)oracle_send_reconcile(truth_events, truth_count, filter_year, filter_month);
+        }
+    }
+    if (truth_events != NULL) {
+        for (size_t i = 0; i < truth_count; i++) {
+            free(truth_events[i]);
+        }
+        free(truth_events);
+    }
     ESP_LOGI(
         TAG,
-        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u",
+        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u truth=%u",
         capturetype,
         (unsigned)processed,
         (unsigned)added,
@@ -1767,7 +1831,8 @@ static size_t reconcile_attendance_dump(
         (unsigned)blocked,
         (unsigned)duplicates,
         (unsigned)filtered,
-        (unsigned)skipped);
+        (unsigned)skipped,
+        (unsigned)truth_count);
     return added;
 }
 
@@ -2011,6 +2076,230 @@ static bool oracle_send_bulk(char **events, size_t count)
         ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }
+    free(body);
+    free(payload);
+    return ok;
+}
+
+static int days_in_month(int year, int month)
+{
+    static const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1 || month > 12) {
+        return 0;
+    }
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
+        return 29;
+    }
+    return days[month - 1];
+}
+
+static char *json_escape_alloc(const char *value)
+{
+    if (value == NULL) {
+        value = "";
+    }
+    size_t len = strlen(value);
+    char *escaped = malloc((len * 2) + 1);
+    if (escaped == NULL) {
+        return NULL;
+    }
+    char *out = escaped;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)value[i];
+        if (ch == '"' || ch == '\\') {
+            *out++ = '\\';
+            *out++ = (char)ch;
+        } else if (ch >= 0x20) {
+            *out++ = (char)ch;
+        }
+    }
+    *out = '\0';
+    return escaped;
+}
+
+static char *build_reconcile_payload(char **events, size_t count, int year, int month)
+{
+    int last_day = days_in_month(year, month);
+    if (last_day == 0) {
+        return NULL;
+    }
+    char *zone_id = json_escape_alloc(ZONE_LITE_ZONE_ID);
+    char *device_id = json_escape_alloc(ZONE_LITE_ZONE_DEVICE_ID);
+    char *device_serial = json_escape_alloc(g_device_serial[0] ? g_device_serial : "unknown");
+    if (zone_id == NULL || device_id == NULL || device_serial == NULL) {
+        free(zone_id);
+        free(device_id);
+        free(device_serial);
+        return NULL;
+    }
+
+    char header[512];
+    int header_len = snprintf(
+        header,
+        sizeof(header),
+        "{\"api_version\":1,\"zone_id\":\"%s\",\"device_id\":\"%s\",\"device_serial\":\"%s\","
+        "\"window_start\":\"%04d-%02d-01\",\"window_end\":\"%04d-%02d-%02d\","
+        "\"mode\":\"authoritative_replace\",\"events\":[",
+        zone_id,
+        device_id,
+        device_serial,
+        year,
+        month,
+        year,
+        month,
+        last_day);
+    free(zone_id);
+    free(device_id);
+    free(device_serial);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
+        return NULL;
+    }
+
+    const char *suffix = "]}";
+    size_t payload_len = (size_t)header_len + strlen(suffix);
+    size_t included = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (events[i] == NULL || events[i][0] == '\0') {
+            continue;
+        }
+        payload_len += strlen(events[i]);
+        if (included > 0) {
+            payload_len++;
+        }
+        included++;
+    }
+
+    char *payload = heap_caps_malloc(payload_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (payload == NULL) {
+        payload = malloc(payload_len + 1);
+    }
+    if (payload == NULL) {
+        return NULL;
+    }
+
+    char *write_at = payload;
+    memcpy(write_at, header, (size_t)header_len);
+    write_at += header_len;
+    included = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (events[i] == NULL || events[i][0] == '\0') {
+            continue;
+        }
+        if (included > 0) {
+            *write_at++ = ',';
+        }
+        size_t len = strlen(events[i]);
+        memcpy(write_at, events[i], len);
+        write_at += len;
+        included++;
+    }
+    size_t suffix_len = strlen(suffix);
+    memcpy(write_at, suffix, suffix_len);
+    write_at += suffix_len;
+    *write_at = '\0';
+    return payload;
+}
+
+static bool oracle_reconcile_body_ok(const char *body, int *deleted, int *corrected, int *invalid)
+{
+    *deleted = 0;
+    *corrected = 0;
+    *invalid = 0;
+    if (body == NULL || body[0] == '\0') {
+        return true;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (root == NULL) {
+        return true;
+    }
+    cJSON *success = cJSON_GetObjectItemCaseSensitive(root, "success");
+    bool ok = !cJSON_IsBool(success) || cJSON_IsTrue(success);
+    cJSON *deleted_item = cJSON_GetObjectItemCaseSensitive(root, "deleted_count");
+    cJSON *corrected_item = cJSON_GetObjectItemCaseSensitive(root, "corrected_count");
+    cJSON *invalid_item = cJSON_GetObjectItemCaseSensitive(root, "invalid_count");
+    if (cJSON_IsNumber(deleted_item)) {
+        *deleted = deleted_item->valueint;
+    }
+    if (cJSON_IsNumber(corrected_item)) {
+        *corrected = corrected_item->valueint;
+    }
+    if (cJSON_IsNumber(invalid_item)) {
+        *invalid = invalid_item->valueint;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool oracle_send_reconcile(char **events, size_t count, int year, int month)
+{
+    if (!ZONE_LITE_ORDS_RECONCILE_ENABLED) {
+        return true;
+    }
+    if (!ords_send_allowed()) {
+        ESP_LOGI(TAG, "Skipping ORDS truth reconcile until current ORDS backoff expires");
+        return false;
+    }
+    if (count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
+        ESP_LOGE(TAG, "Truth reconcile has %u events, above safety limit %u", (unsigned)count, (unsigned)ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS);
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+        return false;
+    }
+
+    char *payload = build_reconcile_payload(events, count, year, month);
+    if (payload == NULL) {
+        ESP_LOGE(TAG, "Could not build ORDS truth reconcile payload count=%u", (unsigned)count);
+        led_status_fault(LED_STATUS_FATAL);
+        return false;
+    }
+
+    char url[288];
+    snprintf(url, sizeof(url), "%s/raw-captures/reconcile", ZONE_LITE_ORDS_BASE_URL);
+    char *body = NULL;
+    int status = http_post_json(url, payload, &body);
+    int deleted = 0;
+    int corrected = 0;
+    int invalid = 0;
+    bool body_ok = oracle_reconcile_body_ok(body, &deleted, &corrected, &invalid);
+    bool ok = (status == 200 || status == 201) && body_ok;
+
+    if (status == 404 || status == 405) {
+        ESP_LOGW(TAG, "ORDS truth reconcile endpoint is not deployed yet status=%d; legacy outbox remains active", status);
+        free(body);
+        free(payload);
+        return false;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "ORDS truth reconcile count=%u month=%04d-%02d status=%d ok=%s deleted=%d corrected=%d invalid=%d",
+        (unsigned)count,
+        year,
+        month,
+        status,
+        ok ? "true" : "false",
+        deleted,
+        corrected,
+        invalid);
+
+    if (ok) {
+        ords_mark_success();
+        if (deleted > 0 || corrected > 0 || invalid > 0) {
+            g_truth_reconcile_warning = true;
+            ESP_LOGW(TAG, "Oracle raw table was repaired from ZKT truth deleted=%d corrected=%d invalid=%d", deleted, corrected, invalid);
+            led_status_fault(invalid > 0 ? LED_STATUS_BLOCKED_IDENTITY : LED_STATUS_TRUTH_REPAIR);
+        } else if (g_truth_reconcile_warning) {
+            g_truth_reconcile_warning = false;
+            ESP_LOGI(TAG, "ORDS truth reconcile is clean after previous repair warning");
+        }
+    } else if (status == 400) {
+        ESP_LOGW(TAG, "ORDS rejected truth reconcile payload status=400 body=%s", body ? body : "");
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+    } else {
+        ESP_LOGW(TAG, "ORDS truth reconcile failed status=%d body=%s", status, body ? body : "");
+        ords_mark_failure();
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
+    }
+
     free(body);
     free(payload);
     return ok;
