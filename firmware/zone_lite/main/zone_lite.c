@@ -1135,6 +1135,28 @@ static void copy_zk_string(char *out, size_t out_len, const uint8_t *data, size_
     trim_spaces(out);
 }
 
+static uint32_t choose_zk_record_size(
+    uint32_t total_size,
+    uint32_t reported_count,
+    const uint32_t *preferred_sizes,
+    size_t preferred_count)
+{
+    if (reported_count > 0 && total_size % reported_count == 0) {
+        uint32_t candidate = total_size / reported_count;
+        for (size_t i = 0; i < preferred_count; i++) {
+            if (candidate == preferred_sizes[i]) {
+                return candidate;
+            }
+        }
+    }
+    for (size_t i = 0; i < preferred_count; i++) {
+        if (preferred_sizes[i] > 0 && total_size % preferred_sizes[i] == 0) {
+            return preferred_sizes[i];
+        }
+    }
+    return 0;
+}
+
 static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
 {
     memset(users, 0, sizeof(*users));
@@ -1150,11 +1172,31 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
         return false;
     }
     uint32_t total_size = read_le32(data);
-    uint32_t packet_size = user_count > 0 ? total_size / (uint32_t)user_count : 0;
+    static const uint32_t user_record_sizes[] = {72, 28};
+    uint32_t packet_size = choose_zk_record_size(
+        total_size,
+        (uint32_t)user_count,
+        user_record_sizes,
+        sizeof(user_record_sizes) / sizeof(user_record_sizes[0]));
+    if (packet_size == 0) {
+        ESP_LOGW(TAG, "Unsupported ZKT user table size total=%lu users=%ld", (unsigned long)total_size, (long)user_count);
+        free(data);
+        return false;
+    }
+    uint32_t parsed_users = total_size / packet_size;
+    if (parsed_users != (uint32_t)user_count) {
+        ESP_LOGW(
+            TAG,
+            "ZKT user count changed during read reported=%ld parsed=%lu packet_size=%lu",
+            (long)user_count,
+            (unsigned long)parsed_users,
+            (unsigned long)packet_size);
+        user_count = (int32_t)parsed_users;
+    }
     const uint8_t *p = data + 4;
     size_t remain = len - 4;
     ESP_LOGI(TAG, "Reading %ld ZKT users packet_size=%lu", (long)user_count, (unsigned long)packet_size);
-    while (users->count < MAX_USERS) {
+    while (users->count < MAX_USERS && remain >= packet_size) {
         if (packet_size == 28 && remain >= 28) {
             zkt_user_t *u = &users->rows[users->count++];
             snprintf(u->uid, sizeof(u->uid), "%u", read_le16(p));
@@ -1163,7 +1205,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
             parse_machine_identity(u);
             p += 28;
             remain -= 28;
-        } else if (remain >= 72) {
+        } else if (packet_size == 72 && remain >= 72) {
             zkt_user_t *u = &users->rows[users->count++];
             snprintf(u->uid, sizeof(u->uid), "%u", read_le16(p));
             copy_zk_string(u->name, sizeof(u->name), p + 11, 24);
@@ -1223,7 +1265,7 @@ static bool zk_refresh_users_after_count_change(
 static const zkt_user_t *find_user_by_user_id(const user_table_t *users, const char *user_id)
 {
     for (size_t i = 0; i < users->count; i++) {
-        if (strcmp(users->rows[i].user_id, user_id) == 0 || strcmp(users->rows[i].uid, user_id) == 0) {
+        if (strcmp(users->rows[i].user_id, user_id) == 0) {
             return &users->rows[i];
         }
     }
@@ -1604,7 +1646,27 @@ static size_t reconcile_attendance_dump(
         return 0;
     }
     uint32_t total_size = read_le32(data);
-    uint32_t record_size = records > 0 ? total_size / (uint32_t)records : 0;
+    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+    uint32_t record_size = choose_zk_record_size(
+        total_size,
+        (uint32_t)records,
+        attendance_record_sizes,
+        sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
+    if (record_size == 0) {
+        ESP_LOGW(TAG, "Unsupported ZKT attendance table size total=%lu records=%ld", (unsigned long)total_size, (long)records);
+        free(data);
+        return 0;
+    }
+    uint32_t parsed_records = total_size / record_size;
+    if (parsed_records != (uint32_t)records) {
+        ESP_LOGW(
+            TAG,
+            "ZKT attendance count changed during read reported=%ld parsed=%lu packet_size=%lu",
+            (long)records,
+            (unsigned long)parsed_records,
+            (unsigned long)record_size);
+        records = (int32_t)parsed_records;
+    }
     const uint8_t *p = data + 4;
     size_t remain = len - 4;
     size_t processed = 0;
@@ -1629,7 +1691,7 @@ static size_t reconcile_attendance_dump(
     if (blocked_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
     }
-    while (remain >= record_size && record_size > 0) {
+    while (remain >= record_size) {
         char user_id[32] = "";
         uint16_t uid = 0;
         uint32_t timestamp = 0;
@@ -1647,7 +1709,7 @@ static size_t reconcile_attendance_dump(
             timestamp = read_le32(p + 4);
             status = p[8];
             punch = p[9];
-        } else if (remain >= 40) {
+        } else if (record_size == 40 && remain >= 40) {
             uid = read_le16(p);
             copy_zk_string(user_id, sizeof(user_id), p + 2, 24);
             status = p[26];
