@@ -69,6 +69,24 @@
 #ifndef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
 #define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"
 #endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED
+#define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 0
+#endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_HOUR
+#define ZONE_LITE_DAILY_ZKT_REBOOT_HOUR 3
+#endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_MINUTE
+#define ZONE_LITE_DAILY_ZKT_REBOOT_MINUTE 0
+#endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES
+#define ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES 300
+#endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES
+#define ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES 30
+#endif
+#ifndef ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS
+#define ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS (5 * 60 * 1000)
+#endif
 #ifndef ZONE_LITE_SNTP_SERVER
 #define ZONE_LITE_SNTP_SERVER "pool.ntp.org"
 #endif
@@ -218,6 +236,8 @@ static bool g_time_synced;
 static int64_t g_ords_next_attempt_ms;
 static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
 static bool g_truth_reconcile_warning;
+static int g_daily_zkt_reboot_completed_day = -1;
+static int64_t g_daily_zkt_reboot_last_attempt_ms;
 
 static bool oracle_send_reconcile(char **events, size_t count, int year, int month);
 
@@ -968,13 +988,13 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     ip_to_text(host_order_ip, ip_text, sizeof(ip_text));
     ESP_LOGW(
         TAG,
-        "Attempting ZKT telnet OS recovery reboot on %s:%d",
+        "Attempting ZKT telnet OS reboot on %s:%d",
         ip_text,
         ZONE_LITE_ZKT_TELNET_PORT);
 
     int sock = -1;
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_TELNET_PORT, ZKT_TELNET_IO_TIMEOUT_MS, &sock)) {
-        ESP_LOGW(TAG, "Could not connect to ZKT telnet recovery target %s:%d", ip_text, ZONE_LITE_ZKT_TELNET_PORT);
+        ESP_LOGW(TAG, "Could not connect to ZKT telnet reboot target %s:%d", ip_text, ZONE_LITE_ZKT_TELNET_PORT);
         return false;
     }
 
@@ -982,12 +1002,12 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     bool ok = false;
     telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
     if (!text_contains_ci(text, "login:")) {
-        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not show a login prompt", ip_text);
+        ESP_LOGW(TAG, "ZKT telnet reboot target %s did not show a login prompt", ip_text);
         goto done;
     }
     if (ZONE_LITE_ZKT_TELNET_EXPECT_BANNER[0] != '\0' &&
         !text_contains_ci(text, ZONE_LITE_ZKT_TELNET_EXPECT_BANNER)) {
-        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not match the expected banner", ip_text);
+        ESP_LOGW(TAG, "ZKT telnet reboot target %s did not match the expected banner", ip_text);
         goto done;
     }
 
@@ -996,7 +1016,7 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     }
     telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
     if (!text_contains_ci(text, "password:")) {
-        ESP_LOGW(TAG, "ZKT telnet recovery target %s did not ask for a password", ip_text);
+        ESP_LOGW(TAG, "ZKT telnet reboot target %s did not ask for a password", ip_text);
         goto done;
     }
 
@@ -1005,7 +1025,7 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     }
     telnet_read_text(sock, text, sizeof(text), 2000);
     if (text_contains_ci(text, "login incorrect")) {
-        ESP_LOGW(TAG, "ZKT telnet recovery login failed for %s", ip_text);
+        ESP_LOGW(TAG, "ZKT telnet reboot login failed for %s", ip_text);
         goto done;
     }
 
@@ -1014,7 +1034,7 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     }
     telnet_read_text(sock, text, sizeof(text), ZKT_TELNET_IO_TIMEOUT_MS);
     if (text_contains_ci(text, "login incorrect") || !text_contains_ci(text, "uid=")) {
-        ESP_LOGW(TAG, "ZKT telnet recovery could not confirm a shell on %s", ip_text);
+        ESP_LOGW(TAG, "ZKT telnet reboot could not confirm a shell on %s", ip_text);
         goto done;
     }
 
@@ -1025,7 +1045,7 @@ static bool zkt_telnet_reboot(uint32_t host_order_ip)
     if (!telnet_send_line(sock, ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND)) {
         goto done;
     }
-    ESP_LOGW(TAG, "ZKT telnet recovery reboot command sent to %s", ip_text);
+    ESP_LOGW(TAG, "ZKT telnet reboot command sent to %s", ip_text);
     ok = true;
 
 done:
@@ -1886,6 +1906,117 @@ static bool ensure_system_time_synced(void)
         log_system_time("System UTC time synchronized");
     }
     return g_time_synced;
+}
+
+static bool daily_zkt_reboot_local_time(struct tm *local_time, int *local_day_key)
+{
+    if (!ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED) {
+        return false;
+    }
+    if (!ensure_system_time_synced()) {
+        return false;
+    }
+
+    time_t now = 0;
+    time(&now);
+    now += (time_t)ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES * 60;
+    gmtime_r(&now, local_time);
+    if (local_day_key != NULL) {
+        *local_day_key = ((local_time->tm_year + 1900) * 1000) + local_time->tm_yday;
+    }
+    return true;
+}
+
+static bool daily_zkt_reboot_in_window(const struct tm *local_time)
+{
+    int scheduled_minute = (ZONE_LITE_DAILY_ZKT_REBOOT_HOUR * 60) + ZONE_LITE_DAILY_ZKT_REBOOT_MINUTE;
+    int local_minute = (local_time->tm_hour * 60) + local_time->tm_min;
+    int window_minutes = ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES;
+    if (scheduled_minute < 0 || scheduled_minute >= 24 * 60 || window_minutes <= 0) {
+        return false;
+    }
+    if (window_minutes >= 24 * 60) {
+        return true;
+    }
+
+    int elapsed = local_minute - scheduled_minute;
+    if (elapsed < 0) {
+        elapsed += 24 * 60;
+    }
+    return elapsed >= 0 && elapsed < window_minutes;
+}
+
+static bool daily_zkt_reboot_should_attempt(int *local_day_key)
+{
+    struct tm local_time = {0};
+    int day_key = -1;
+    if (!daily_zkt_reboot_local_time(&local_time, &day_key)) {
+        return false;
+    }
+    if (day_key == g_daily_zkt_reboot_completed_day || !daily_zkt_reboot_in_window(&local_time)) {
+        return false;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int64_t retry_delay_ms = ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS;
+    if (retry_delay_ms <= 0) {
+        retry_delay_ms = 5 * 60 * 1000;
+    }
+    if (g_daily_zkt_reboot_last_attempt_ms > 0 &&
+        now_ms - g_daily_zkt_reboot_last_attempt_ms < retry_delay_ms) {
+        return false;
+    }
+
+    g_daily_zkt_reboot_last_attempt_ms = now_ms;
+    if (local_day_key != NULL) {
+        *local_day_key = day_key;
+    }
+    ESP_LOGW(
+        TAG,
+        "Daily ZKT maintenance reboot due at local %02d:%02d day=%d",
+        local_time.tm_hour,
+        local_time.tm_min,
+        day_key);
+    return true;
+}
+
+static void daily_zkt_reboot_mark_complete(int local_day_key)
+{
+    g_daily_zkt_reboot_completed_day = local_day_key;
+    ESP_LOGW(TAG, "Daily ZKT maintenance reboot completed for local day=%d", local_day_key);
+}
+
+static uint32_t daily_zkt_reboot_target_ip(void)
+{
+    uint32_t preferred = configured_preferred_zkt_ip();
+    if (preferred != 0) {
+        return preferred;
+    }
+    return g_last_authenticated_zkt_ip;
+}
+
+static bool daily_zkt_reboot_try_target(uint32_t target_ip, int local_day_key)
+{
+    if (target_ip == 0) {
+        ESP_LOGW(TAG, "Skipping daily ZKT maintenance reboot because no target IP is known");
+        return false;
+    }
+
+    char ip_text[16];
+    ip_to_text(target_ip, ip_text, sizeof(ip_text));
+    ESP_LOGW(TAG, "Starting daily ZKT maintenance reboot for %s", ip_text);
+    led_status_set(LED_STATUS_RECOVERY_REBOOT);
+    if (!zkt_telnet_reboot(target_ip)) {
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
+        ESP_LOGW(TAG, "Daily ZKT maintenance reboot failed for %s", ip_text);
+        return false;
+    }
+
+    daily_zkt_reboot_mark_complete(local_day_key);
+    ESP_LOGW(TAG, "Waiting %d ms after daily ZKT maintenance reboot", ZONE_LITE_ZKT_REBOOT_WAIT_MS);
+    vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
+    led_status_set(LED_STATUS_ZKT_DISCOVERING);
+    return true;
 }
 
 static bool ords_send_allowed(void)
@@ -2807,6 +2938,46 @@ static void gateway_run(uint32_t host_order_ip)
                 last_live_register = now_ms;
             }
         }
+
+        int daily_reboot_day = -1;
+        if (daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
+            int32_t refreshed_users = 0;
+            int32_t refreshed_records = 0;
+            if (zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) {
+                if (refreshed_users != user_count) {
+                    if (zk_refresh_users_after_count_change(sock, &ctx, users, user_count, refreshed_users)) {
+                        user_count = refreshed_users;
+                    } else {
+                        ESP_LOGW(TAG, "Continuing daily reboot after user refresh failure");
+                    }
+                }
+                if (zk_get_time_parts(sock, &ctx, &device_now)) {
+                    led_status_set(LED_STATUS_SYNCING);
+                    reconcile_attendance_dump(
+                        sock,
+                        &ctx,
+                        users,
+                        refreshed_records,
+                        "LIVE_POLL",
+                        device_now.tm_year + 1900,
+                        device_now.tm_mon + 1);
+                } else {
+                    ESP_LOGW(TAG, "Continuing daily reboot after ZKT time read failure");
+                    led_status_fault(LED_STATUS_ZKT_FAILURE);
+                }
+            } else {
+                ESP_LOGW(TAG, "Continuing daily reboot after ZKT count read failure");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
+            }
+
+            oracle_drain_pending(false);
+            if (daily_zkt_reboot_try_target(host_order_ip, daily_reboot_day)) {
+                break;
+            }
+            if (!file_has_nonempty_line(PENDING_PATH)) {
+                led_status_set(LED_STATUS_HEALTHY);
+            }
+        }
     }
     (void)zk_register_attlog_events(sock, &ctx, false);
     zk_disconnect(sock, &ctx);
@@ -2891,6 +3062,13 @@ static void gateway_task(void *arg)
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
             ESP_LOGW(TAG, "Waiting for Wi-Fi before ZKT discovery");
             (void)wait_for_wifi();
+        }
+        int daily_reboot_day = -1;
+        if (daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
+            if (daily_zkt_reboot_try_target(daily_zkt_reboot_target_ip(), daily_reboot_day)) {
+                discovery_failures = 0;
+                continue;
+            }
         }
         uint32_t selected_ip = 0;
         if (discover_zkt(&selected_ip)) {
