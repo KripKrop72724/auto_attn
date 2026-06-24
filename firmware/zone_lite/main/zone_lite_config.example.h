@@ -22,6 +22,11 @@
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_MAX_MS (10 * 60 * 1000)
 #define ZONE_LITE_ORDS_RECONCILE_ENABLED 1
 #define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
+// Optional PEM CA chain bundle dedicated to the ORDS endpoint. Keep this as
+// root/intermediate CA material, not a short-lived leaf/server certificate.
+// Include the issuing intermediate if the endpoint or ESP TLS stack needs it.
+// When NULL, firmware uses the ESP-IDF built-in certificate bundle.
+#define ZONE_LITE_ORDS_CA_CERT_PEM NULL
 
 // Discovery scans the DHCP subnet and accepts the first host that passes
 // ZKT CMD_CONNECT + Comm Key authentication.
