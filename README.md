@@ -45,7 +45,7 @@ The brute-force flow is opt-in per candidate, requires local operator confirmati
 
 ## State Life HR Enrollment App
 
-The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a portable native app for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco devices, finds or creates regular employee users, and triggers fingerprint enrollment on the selected machine. The app does not expose Zone Agent admin tools or device controls.
+The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a portable native app for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco port `4370` candidates, finds or creates regular employee users, and triggers fingerprint enrollment on the selected machine. The app does not expose Zone Agent admin tools or device controls.
 
 The HR app uses comm key `1979` by default. IT can override it by creating:
 
@@ -60,6 +60,10 @@ ESP32 for the duration of HR fingerprint enrollment. The ESP32 keeps a long-live
 open for live capture, and many ZKT devices only handle one SDK client reliably at a time. If
 enrollment times out after the finger was saved, the HR app reconnects and verifies the template
 before reporting failure.
+
+Network scan follows the candidate-first behavior used by the older dump tool: any local host with
+TCP `4370` open is shown, even if the SDK validation step is busy or inconclusive. Unvalidated
+candidates are validated when selected actions run, using TCP first and then UDP.
 
 ## Shipping
 
