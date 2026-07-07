@@ -19,6 +19,7 @@ from zk_hr_enrollment.zkt import (
     FingerTemplate,
     RuntimeDependencyError,
     ScannedDevice,
+    ZKCommunicationError,
     ZKDeviceSession,
     probe_device,
     scan_zkt_devices,
@@ -124,7 +125,7 @@ def test_service_creates_employee_with_auto_id_and_detects_duplicates():
         ],
         templates=[],
     )
-    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_: fake)
+    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_, **__: fake)
 
     record = service.create_employee(
         DEVICE,
@@ -156,7 +157,7 @@ def test_enrollment_success_uses_post_read_verification_even_when_sdk_returns_fa
         templates=[],
         enroll_result=False,
     )
-    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_: fake)
+    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_, **__: fake)
     record = EmployeeRecord(
         uid="7",
         user_id="7",
@@ -173,6 +174,69 @@ def test_enrollment_success_uses_post_read_verification_even_when_sdk_returns_fa
     assert outcome.sdk_result is False
     assert outcome.before_fingers == []
     assert outcome.after_fingers == [4]
+
+
+def test_enrollment_timeout_reconnects_and_verifies_saved_template():
+    first = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+    )
+    second = FakeSession(
+        users=first.users,
+        templates=[FingerTemplate(uid=7, fid=4, valid=1, size=1196)],
+    )
+    sessions = iter([first, second])
+    seen_timeouts = []
+
+    def session_factory(*_args, timeout: float):
+        seen_timeouts.append(timeout)
+        return next(sessions)
+
+    service = HREnrollmentService(
+        comm_key_provider=lambda: 1979,
+        session_factory=session_factory,
+        command_timeout=20,
+        enrollment_timeout=120,
+    )
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    outcome = service.enroll_finger(DEVICE, record=record, finger_id=4)
+
+    assert outcome.success is True
+    assert outcome.after_fingers == [4]
+    assert outcome.sdk_result is None
+    assert seen_timeouts == [120, 20]
+    assert "reconnected and verified" in outcome.message
+
+
+def test_enrollment_timeout_reports_unverified_interrupted_enrollment():
+    fake = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+    )
+    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_, **__: fake)
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted by a device communication timeout"):
+        service.enroll_finger(DEVICE, record=record, finger_id=4)
 
 
 def test_probe_device_falls_back_to_udp_after_tcp_failure():
@@ -242,6 +306,7 @@ class FakeSession:
     users: list[EnrollmentUser]
     templates: list[FingerTemplate]
     enroll_result: object = True
+    enroll_error: BaseException | None = None
 
     def __enter__(self):
         return self
@@ -261,5 +326,7 @@ class FakeSession:
         return user
 
     def enroll_finger(self, *, uid: str | int, user_id: str, finger_id: int):
+        if self.enroll_error is not None:
+            raise self.enroll_error
         self.templates.append(FingerTemplate(uid=int(uid), fid=int(finger_id), valid=1, size=1196))
         return self.enroll_result
