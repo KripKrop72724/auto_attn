@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from zk_hr_enrollment import __main__ as hr_main
+from zk_hr_enrollment import zkt as zkt_module
 from zk_hr_enrollment.config import DEFAULT_COMM_KEY, CommKeyConfigError, read_comm_key
 from zk_hr_enrollment.identity import (
     build_machine_name,
@@ -269,7 +270,7 @@ def test_probe_device_falls_back_to_udp_after_tcp_failure():
     assert device.serial == "SERIAL"
 
 
-def test_scan_zkt_devices_surfaces_missing_runtime_dependency():
+def test_scan_zkt_devices_keeps_open_candidate_when_validation_fails():
     class FakeScanner:
         def scan(self):
             return [ScanCandidate(ip="192.168.110.137", port=4370, open=True)]
@@ -277,12 +278,46 @@ def test_scan_zkt_devices_surfaces_missing_runtime_dependency():
     def missing_dependency_opener(**_kwargs):
         raise RuntimeDependencyError("missing bundled dependency")
 
-    with pytest.raises(RuntimeDependencyError, match="missing bundled dependency"):
-        scan_zkt_devices(
-            comm_key=1979,
-            scanner=FakeScanner(),
-            session_opener=missing_dependency_opener,
-        )
+    devices = scan_zkt_devices(
+        comm_key=1979,
+        scanner=FakeScanner(),
+        session_opener=missing_dependency_opener,
+    )
+
+    assert len(devices) == 1
+    assert devices[0].ip == "192.168.110.137"
+    assert devices[0].validated is False
+    assert devices[0].force_udp is None
+    assert "open ZKT port" in devices[0].label
+
+
+def test_auto_protocol_session_tries_udp_after_tcp_failure(monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.force_udp = kwargs["force_udp"]
+            calls.append(self.force_udp)
+
+        def __enter__(self):
+            if not self.force_udp:
+                raise RuntimeError("tcp failed")
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(zkt_module, "ZKDeviceSession", FakeSession)
+
+    with zkt_module.open_zkt_session(
+        ip="192.168.110.137",
+        port=4370,
+        comm_key=1979,
+        force_udp=None,
+    ) as session:
+        assert session.force_udp is True
+
+    assert calls == [False, True]
 
 
 def test_health_check_fails_when_required_dependency_is_missing(monkeypatch):
