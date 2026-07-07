@@ -17,7 +17,6 @@ from zk_hr_enrollment.zkt import (
     EnrollmentUser,
     FingerTemplate,
     ScannedDevice,
-    ZKDeviceSession,
     is_device_communication_error,
     open_zkt_session,
     scan_zkt_devices,
@@ -225,7 +224,7 @@ def _default_session_factory(
     comm_key: int,
     *,
     timeout: float = DEFAULT_COMMAND_TIMEOUT,
-) -> ZKDeviceSession:
+) -> AbstractContextManager:
     return open_zkt_session(
         ip=device.ip,
         port=device.port,
