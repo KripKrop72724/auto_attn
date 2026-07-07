@@ -13,9 +13,16 @@ from zk_hr_enrollment.identity import (
     parse_machine_identity,
     users_matching_cnic,
 )
+from zk_hr_enrollment.official_sdk import (
+    OfficialFaceEnrollmentResult,
+    OfficialSdkUnavailable,
+    enroll_face_with_official_sdk,
+)
 from zk_hr_enrollment.zkt import (
+    BiometricCounts,
     EnrollmentUser,
     FingerTemplate,
+    RemoteEnrollmentResult,
     ScannedDevice,
     is_device_communication_error,
     open_zkt_session,
@@ -54,9 +61,13 @@ class EnrollmentOutcome:
     before_fingers: list[int]
     after_fingers: list[int]
     message: str
+    modality: str = "fingerprint"
+    face_count_before: int | None = None
+    face_count_after: int | None = None
 
 
 SessionFactory = Callable[..., AbstractContextManager]
+FaceEnroller = Callable[..., OfficialFaceEnrollmentResult]
 DEFAULT_COMMAND_TIMEOUT = 20
 DEFAULT_ENROLLMENT_TIMEOUT = 120
 
@@ -68,12 +79,14 @@ class HREnrollmentService:
         comm_key_provider: Callable[[], int] = read_comm_key,
         session_factory: SessionFactory | None = None,
         device_scanner: Callable[[int], list[ScannedDevice]] | None = None,
+        face_enroller: FaceEnroller | None = None,
         command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
         enrollment_timeout: float = DEFAULT_ENROLLMENT_TIMEOUT,
     ) -> None:
         self.comm_key_provider = comm_key_provider
         self.session_factory = session_factory or _default_session_factory
         self.device_scanner = device_scanner or (lambda comm_key: scan_zkt_devices(comm_key=comm_key))
+        self.face_enroller = face_enroller or enroll_face_with_official_sdk
         self.command_timeout = command_timeout
         self.enrollment_timeout = enrollment_timeout
 
@@ -182,19 +195,22 @@ class HREnrollmentService:
                     last_error = exc
                     if attempt_number < len(attempts):
                         continue
-                    raise
+                    return self._enroll_face_after_finger_failure(
+                        device,
+                        record,
+                        before_fingers=first_before or [],
+                    )
             if finger_id not in after:
                 last_error = enrollment_error or RuntimeError(
                     "Enrollment did not complete. The selected finger was not saved."
                 )
                 if attempt_number < len(attempts):
                     continue
-                if enrollment_error is not None:
-                    raise RuntimeError(
-                        "Enrollment was interrupted by a device communication timeout, and the selected "
-                        "finger could not be verified afterward. Search the employee again before retrying."
-                    ) from enrollment_error
-                raise RuntimeError("Enrollment did not complete. The selected finger was not saved.")
+                return self._enroll_face_after_finger_failure(
+                    device,
+                    record,
+                    before_fingers=first_before or [],
+                )
 
             updated = EmployeeRecord(
                 uid=record.uid,
@@ -229,6 +245,150 @@ class HREnrollmentService:
             "before retrying."
         ) from last_error
 
+    def enroll_face(
+        self,
+        device: ScannedDevice,
+        *,
+        record: EmployeeRecord,
+    ) -> EnrollmentOutcome:
+        if str(record.privilege or "0") not in {"", "0", "None"}:
+            raise ValueError("This device user is not a regular employee. Ask IT to review it.")
+        first_before_fingers, first_counts = self._read_face_state(device, record)
+        first_face_before = first_counts.faces if first_counts is not None else None
+
+        official_error: BaseException | None = None
+        try:
+            official_result = self.face_enroller(
+                ip=device.ip,
+                port=device.port,
+                comm_key=self.comm_key_provider(),
+                user_id=record.user_id,
+                timeout=self.enrollment_timeout,
+            )
+        except OfficialSdkUnavailable as exc:
+            official_error = exc
+        except Exception as exc:
+            official_error = exc
+            raise RuntimeError(
+                "Official ZKTeco face enrollment failed before the device saved a face. "
+                "Cancel on the device, search the employee again, and retry face enrollment."
+            ) from exc
+        else:
+            after_fingers, after_counts = self._read_face_state(device, record)
+            face_after = after_counts.faces if after_counts is not None else None
+            if _face_completed(official_result) or _count_increased(first_face_before, face_after):
+                return _face_outcome(
+                    record,
+                    sdk_result=official_result,
+                    before_fingers=first_before_fingers,
+                    after_fingers=after_fingers,
+                    face_before=first_face_before,
+                    face_after=face_after,
+                    message="Face enrollment completed through the official ZKTeco SDK.",
+                )
+            raise RuntimeError(
+                "Official ZKTeco face enrollment started, but the device did not save a face before "
+                "the timeout. Cancel on the device, search the employee again, and retry face enrollment."
+            )
+
+        face_error: BaseException | None = None
+        last_counts: BiometricCounts | None = None
+        attempts = _enrollment_attempt_devices(device)
+        for attempt_number, attempt_device in enumerate(attempts, start=1):
+            before_fingers: list[int] = []
+            after_fingers: list[int] = []
+            before_counts: BiometricCounts | None = None
+            after_counts: BiometricCounts | None = None
+            sdk_result: object = None
+            enrollment_error: BaseException | None = None
+            with self._session(attempt_device, timeout=self.enrollment_timeout) as session:
+                users = session.get_users()
+                user = next((item for item in users if str(item.uid) == str(record.uid)), None)
+                if user is None:
+                    raise ValueError("Employee was not found on the selected device. Search again.")
+                before_templates = session.get_templates()
+                before_fingers = _template_fids(before_templates, record.uid)
+                before_counts = _safe_counts(session)
+                try:
+                    sdk_result = session.enroll_face(uid=record.uid, user_id=record.user_id)
+                    after_counts = _safe_counts(session)
+                    after_templates = session.get_templates()
+                    after_fingers = _template_fids(after_templates, record.uid)
+                except Exception as exc:
+                    if not is_device_communication_error(exc):
+                        raise
+                    enrollment_error = exc
+            if enrollment_error is not None:
+                face_error = enrollment_error
+                after_counts, after_fingers = self._verify_face_after_interrupted_enrollment(
+                    attempt_device,
+                    record,
+                )
+            last_counts = after_counts or before_counts
+            face_before = first_face_before
+            face_after = last_counts.faces if last_counts is not None else None
+            if _face_completed(sdk_result) or _count_increased(face_before, face_after):
+                updated = EmployeeRecord(
+                    uid=record.uid,
+                    user_id=record.user_id,
+                    machine_name=record.machine_name,
+                    cnic=record.cnic,
+                    shift_worker=record.shift_worker,
+                    privilege=record.privilege,
+                    enrolled_fingers=after_fingers or before_fingers,
+                )
+                detail = ""
+                if face_before is not None and face_after is not None:
+                    detail = f" Face templates: {face_before} -> {face_after}."
+                message = "Face enrollment completed on the device." + detail
+                if enrollment_error is not None:
+                    message = "Face enrollment was interrupted, then verified after reconnect." + detail
+                elif attempt_number > 1:
+                    message = "Face enrollment completed after retrying the alternate ZKT protocol." + detail
+                return EnrollmentOutcome(
+                    success=True,
+                    record=updated,
+                    sdk_result=sdk_result,
+                    before_fingers=first_before_fingers or [],
+                    after_fingers=updated.enrolled_fingers,
+                    message=message,
+                    modality="face",
+                    face_count_before=face_before,
+                    face_count_after=face_after,
+                )
+            if attempt_number < len(attempts):
+                continue
+        official_detail = ""
+        if official_error is not None:
+            official_detail = f" Official SDK path was unavailable: {official_error}"
+        raise RuntimeError(
+            "Face enrollment did not complete. Cancel on the device, search the employee again, "
+            f"and retry face enrollment.{official_detail}"
+        ) from face_error
+
+    def _enroll_face_after_finger_failure(
+        self,
+        device: ScannedDevice,
+        record: EmployeeRecord,
+        *,
+        before_fingers: list[int],
+    ) -> EnrollmentOutcome:
+        try:
+            outcome = self.enroll_face(device, record=record)
+        except Exception as exc:
+            raise RuntimeError(
+                "Fingerprint enrollment failed after two attempts, and the face fallback also failed. "
+                "Cancel on the device, search the employee again, and retry face enrollment."
+            ) from exc
+        return replace(
+            outcome,
+            before_fingers=before_fingers,
+            message=(
+                "Fingerprint enrollment failed after two attempts, so the app used face enrollment. "
+                f"{outcome.message}"
+            ),
+        )
+
     def _session(self, device: ScannedDevice, *, timeout: float) -> AbstractContextManager:
         return self.session_factory(device, self.comm_key_provider(), timeout=timeout)
 
@@ -251,6 +411,31 @@ class HREnrollmentService:
                     "follow-up verification. Search the employee again after the device is idle."
                 ) from enrollment_error
             raise
+
+    def _verify_face_after_interrupted_enrollment(
+        self,
+        device: ScannedDevice,
+        record: EmployeeRecord,
+    ) -> tuple[BiometricCounts | None, list[int]]:
+        with self._session(device, timeout=self.command_timeout) as session:
+            reset = getattr(session, "reset_enrollment_state", None)
+            if callable(reset):
+                reset()
+            counts = _safe_counts(session)
+            return counts, _template_fids(session.get_templates(), record.uid)
+
+    def _read_face_state(
+        self,
+        device: ScannedDevice,
+        record: EmployeeRecord,
+    ) -> tuple[list[int], BiometricCounts | None]:
+        with self._session(device, timeout=self.command_timeout) as session:
+            users = session.get_users()
+            user = next((item for item in users if str(item.uid) == str(record.uid)), None)
+            if user is None:
+                raise ValueError("Employee was not found on the selected device. Search again.")
+            templates = session.get_templates()
+            return _template_fids(templates, record.uid), _safe_counts(session)
 
 
 def _default_session_factory(
@@ -276,6 +461,61 @@ def _enrollment_attempt_devices(device: ScannedDevice) -> list[ScannedDevice]:
     else:
         protocols = [True, False]
     return [replace(device, force_udp=force_udp) for force_udp in protocols]
+
+
+def _safe_counts(session) -> BiometricCounts | None:
+    get_counts = getattr(session, "get_biometric_counts", None)
+    if not callable(get_counts):
+        return None
+    try:
+        return get_counts()
+    except Exception:
+        return None
+
+
+def _count_increased(before: int | None, after: int | None) -> bool:
+    return before is not None and after is not None and after > before
+
+
+def _face_completed(result: object) -> bool:
+    if isinstance(result, (OfficialFaceEnrollmentResult, RemoteEnrollmentResult)):
+        return result.completed
+    return bool(result)
+
+
+def _face_outcome(
+    record: EmployeeRecord,
+    *,
+    sdk_result: object,
+    before_fingers: list[int],
+    after_fingers: list[int],
+    face_before: int | None,
+    face_after: int | None,
+    message: str,
+) -> EnrollmentOutcome:
+    updated = EmployeeRecord(
+        uid=record.uid,
+        user_id=record.user_id,
+        machine_name=record.machine_name,
+        cnic=record.cnic,
+        shift_worker=record.shift_worker,
+        privilege=record.privilege,
+        enrolled_fingers=after_fingers,
+    )
+    detail = ""
+    if face_before is not None and face_after is not None:
+        detail = f" Face templates: {face_before} -> {face_after}."
+    return EnrollmentOutcome(
+        success=True,
+        record=updated,
+        sdk_result=sdk_result,
+        before_fingers=before_fingers,
+        after_fingers=after_fingers,
+        message=message + detail,
+        modality="face",
+        face_count_before=face_before,
+        face_count_after=face_after,
+    )
 
 
 def _record_from_user(user: EnrollmentUser, templates: list[FingerTemplate]) -> EmployeeRecord:
