@@ -119,6 +119,58 @@ def test_zkt_session_skips_malformed_templates():
     assert session.get_templates() == [FingerTemplate(uid=7, fid=4, valid=1, size=1196)]
 
 
+def test_zkt_enrollment_resets_capture_state_around_sdk_call():
+    class FakeConnection:
+        def __init__(self):
+            self.calls = []
+
+        def free_data(self):
+            self.calls.append("free_data")
+
+        def cancel_capture(self):
+            self.calls.append("cancel_capture")
+
+        def cancel_enroll(self):
+            self.calls.append("cancel_enroll")
+
+        def verify_user(self):
+            self.calls.append("verify_user")
+
+        def enable_device(self):
+            self.calls.append("enable_device")
+
+        def reg_event(self, flags):
+            self.calls.append(("reg_event", flags))
+
+        def refresh_data(self):
+            self.calls.append("refresh_data")
+
+        def enroll_user(self, **kwargs):
+            self.calls.append(("enroll_user", kwargs))
+            return True
+
+    conn = FakeConnection()
+    session = ZKDeviceSession(ip="192.168.110.137", port=4370, comm_key=1979)
+    session.conn = conn
+
+    assert session.enroll_finger(uid="7", user_id="7", finger_id=4) is True
+    assert conn.calls == [
+        "free_data",
+        "cancel_capture",
+        "cancel_enroll",
+        "verify_user",
+        "enable_device",
+        ("enroll_user", {"uid": 7, "temp_id": 4, "user_id": "7"}),
+        ("reg_event", 0),
+        "cancel_capture",
+        "cancel_enroll",
+        "verify_user",
+        "free_data",
+        "refresh_data",
+        "enable_device",
+    ]
+
+
 def test_service_creates_employee_with_auto_id_and_detects_duplicates():
     fake = FakeSession(
         users=[
@@ -217,6 +269,48 @@ def test_enrollment_timeout_reconnects_and_verifies_saved_template():
     assert outcome.sdk_result is None
     assert seen_timeouts == [120, 20]
     assert "reconnected and verified" in outcome.message
+
+
+def test_enrollment_timeout_retries_alternate_protocol_when_template_not_saved():
+    first_attempt = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+    )
+    verify_after_first = FakeSession(users=first_attempt.users, templates=[])
+    second_attempt = FakeSession(users=first_attempt.users, templates=[])
+    sessions = iter([first_attempt, verify_after_first, second_attempt])
+    seen_protocols = []
+    seen_timeouts = []
+
+    def session_factory(device, _comm_key, *, timeout: float):
+        seen_protocols.append(device.force_udp)
+        seen_timeouts.append(timeout)
+        return next(sessions)
+
+    service = HREnrollmentService(
+        comm_key_provider=lambda: 1979,
+        session_factory=session_factory,
+        command_timeout=20,
+        enrollment_timeout=120,
+    )
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    outcome = service.enroll_finger(DEVICE, record=record, finger_id=4)
+
+    assert outcome.success is True
+    assert outcome.after_fingers == [4]
+    assert seen_protocols == [False, False, True]
+    assert seen_timeouts == [120, 20, 120]
+    assert "alternate ZKT protocol" in outcome.message
 
 
 def test_enrollment_timeout_reports_unverified_interrupted_enrollment():
