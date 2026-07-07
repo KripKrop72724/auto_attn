@@ -18,6 +18,7 @@ from zk_hr_enrollment.zkt import (
     FingerTemplate,
     ScannedDevice,
     ZKDeviceSession,
+    is_device_communication_error,
     open_zkt_session,
     scan_zkt_devices,
 )
@@ -56,7 +57,9 @@ class EnrollmentOutcome:
     message: str
 
 
-SessionFactory = Callable[[ScannedDevice, int], AbstractContextManager]
+SessionFactory = Callable[..., AbstractContextManager]
+DEFAULT_COMMAND_TIMEOUT = 20
+DEFAULT_ENROLLMENT_TIMEOUT = 120
 
 
 class HREnrollmentService:
@@ -66,17 +69,21 @@ class HREnrollmentService:
         comm_key_provider: Callable[[], int] = read_comm_key,
         session_factory: SessionFactory | None = None,
         device_scanner: Callable[[int], list[ScannedDevice]] | None = None,
+        command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+        enrollment_timeout: float = DEFAULT_ENROLLMENT_TIMEOUT,
     ) -> None:
         self.comm_key_provider = comm_key_provider
         self.session_factory = session_factory or _default_session_factory
         self.device_scanner = device_scanner or (lambda comm_key: scan_zkt_devices(comm_key=comm_key))
+        self.command_timeout = command_timeout
+        self.enrollment_timeout = enrollment_timeout
 
     def scan_devices(self) -> list[ScannedDevice]:
         return self.device_scanner(self.comm_key_provider())
 
     def search_employee(self, device: ScannedDevice, cnic: str) -> EmployeeSearchResult:
         cnic = normalize_cnic(cnic)
-        with self._session(device) as session:
+        with self._session(device, timeout=self.command_timeout) as session:
             users = session.get_users()
             templates = session.get_templates()
         matches = users_matching_cnic(users, cnic)
@@ -112,7 +119,7 @@ class HREnrollmentService:
     ) -> EmployeeRecord:
         cnic = normalize_cnic(cnic)
         machine_name = build_machine_name(full_name, cnic, shift_worker=shift_worker)
-        with self._session(device) as session:
+        with self._session(device, timeout=self.command_timeout) as session:
             users = session.get_users()
             if users_matching_cnic(users, cnic):
                 raise ValueError("This CNIC already exists on the selected device. Search again.")
@@ -133,7 +140,11 @@ class HREnrollmentService:
             raise ValueError("Finger selection is invalid.")
         if str(record.privilege or "0") not in {"", "0", "None"}:
             raise ValueError("This device user is not a regular employee. Ask IT to review it.")
-        with self._session(device) as session:
+        enrollment_error: BaseException | None = None
+        sdk_result: object = None
+        after: list[int] = []
+        before: list[int] = []
+        with self._session(device, timeout=self.enrollment_timeout) as session:
             users = session.get_users()
             user = next((item for item in users if str(item.uid) == str(record.uid)), None)
             if user is None:
@@ -142,9 +153,20 @@ class HREnrollmentService:
             before = _template_fids(before_templates, record.uid)
             if finger_id in before:
                 raise ValueError("Selected finger is already enrolled. Choose an empty finger slot.")
-            sdk_result = session.enroll_finger(uid=record.uid, user_id=record.user_id, finger_id=finger_id)
-            after_templates = session.get_templates()
-            after = _template_fids(after_templates, record.uid)
+            try:
+                sdk_result = session.enroll_finger(
+                    uid=record.uid,
+                    user_id=record.user_id,
+                    finger_id=finger_id,
+                )
+                after_templates = session.get_templates()
+                after = _template_fids(after_templates, record.uid)
+            except Exception as exc:
+                if not is_device_communication_error(exc):
+                    raise
+                enrollment_error = exc
+        if enrollment_error is not None:
+            after = self._verify_fingers_after_interrupted_enrollment(device, record, enrollment_error)
         success = finger_id in after
         updated = EmployeeRecord(
             uid=record.uid,
@@ -156,26 +178,59 @@ class HREnrollmentService:
             enrolled_fingers=after,
         )
         if not success:
+            if enrollment_error is not None:
+                raise RuntimeError(
+                    "Enrollment was interrupted by a device communication timeout, and the selected "
+                    "finger could not be verified afterward. Search the employee again before retrying."
+                ) from enrollment_error
             raise RuntimeError("Enrollment did not complete. The selected finger was not saved.")
+        message = "Fingerprint enrollment completed and was verified on the device."
+        if enrollment_error is not None:
+            message = (
+                "Fingerprint enrollment was saved on the device, but the device did not send the "
+                "final confirmation. The app reconnected and verified the saved finger."
+            )
         return EnrollmentOutcome(
             success=True,
             record=updated,
             sdk_result=sdk_result,
             before_fingers=before,
             after_fingers=after,
-            message="Fingerprint enrollment completed and was verified on the device.",
+            message=message,
         )
 
-    def _session(self, device: ScannedDevice) -> AbstractContextManager:
-        return self.session_factory(device, self.comm_key_provider())
+    def _session(self, device: ScannedDevice, *, timeout: float) -> AbstractContextManager:
+        return self.session_factory(device, self.comm_key_provider(), timeout=timeout)
+
+    def _verify_fingers_after_interrupted_enrollment(
+        self,
+        device: ScannedDevice,
+        record: EmployeeRecord,
+        enrollment_error: BaseException,
+    ) -> list[int]:
+        try:
+            with self._session(device, timeout=self.command_timeout) as session:
+                return _template_fids(session.get_templates(), record.uid)
+        except Exception as exc:
+            if is_device_communication_error(exc):
+                raise RuntimeError(
+                    "The device stopped responding during enrollment and did not respond to the "
+                    "follow-up verification. Search the employee again after the device is idle."
+                ) from enrollment_error
+            raise
 
 
-def _default_session_factory(device: ScannedDevice, comm_key: int) -> ZKDeviceSession:
+def _default_session_factory(
+    device: ScannedDevice,
+    comm_key: int,
+    *,
+    timeout: float = DEFAULT_COMMAND_TIMEOUT,
+) -> ZKDeviceSession:
     return open_zkt_session(
         ip=device.ip,
         port=device.port,
         comm_key=comm_key,
-        timeout=10,
+        timeout=timeout,
         force_udp=device.force_udp,
     )
 
@@ -202,4 +257,3 @@ def _template_fids(templates: list[FingerTemplate], uid: str | int) -> list[int]
             if str(template.uid) == uid_text and int(template.valid) == 1
         }
     )
-
