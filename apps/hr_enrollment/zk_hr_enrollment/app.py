@@ -54,7 +54,7 @@ class HREnrollmentApp(tk.Tk):
         header = ttk.Frame(root)
         header.pack(fill=tk.X)
         ttk.Label(header, text=BRAND_NAME, style="Title.TLabel").pack(anchor=tk.W)
-        ttk.Label(header, text="Employee fingerprint enrollment", style="Brand.TLabel").pack(anchor=tk.W)
+        ttk.Label(header, text="Employee biometric enrollment", style="Brand.TLabel").pack(anchor=tk.W)
 
         device_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Device Selection", padding=12)
         device_frame.pack(fill=tk.X, pady=(18, 10))
@@ -101,7 +101,7 @@ class HREnrollmentApp(tk.Tk):
         self.create_button.grid(row=2, column=2, sticky=tk.W, pady=(10, 0), padx=(0, 8))
         employee_frame.columnconfigure(3, weight=1)
 
-        finger_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Finger Enrollment", padding=12)
+        finger_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Biometric Enrollment", padding=12)
         finger_frame.pack(fill=tk.X, pady=10)
         ttk.Label(finger_frame, text="Finger").grid(row=0, column=0, sticky=tk.W)
         self.finger_combo = ttk.Combobox(
@@ -118,9 +118,16 @@ class HREnrollmentApp(tk.Tk):
             style="Action.TButton",
             command=self.enroll_finger,
         )
-        self.enroll_button.grid(row=0, column=2, sticky=tk.W)
+        self.enroll_button.grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        self.face_button = ttk.Button(
+            finger_frame,
+            text="Enroll Face",
+            style="Action.TButton",
+            command=self.enroll_face,
+        )
+        self.face_button.grid(row=0, column=3, sticky=tk.W)
         ttk.Label(finger_frame, textvariable=self.finger_summary_var).grid(
-            row=1, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
+            row=1, column=0, columnspan=4, sticky=tk.W, pady=(10, 0)
         )
 
         status_frame = ttk.LabelFrame(root, text=f"{BRAND_NAME} - Status", padding=12)
@@ -185,6 +192,18 @@ class HREnrollmentApp(tk.Tk):
             self._on_enroll_complete,
         )
 
+    def enroll_face(self) -> None:
+        device = self._selected_device()
+        if device is None or self.current_record is None:
+            messagebox.showerror(BRAND_NAME, "Search or create an employee before enrollment.")
+            return
+        record = self.current_record
+        self._run_task(
+            "Waiting for face enrollment on the device",
+            lambda: self.service.enroll_face(device, record=record),
+            self._on_enroll_complete,
+        )
+
     def _on_scan_complete(self, devices: list[ScannedDevice]) -> None:
         self.devices = {device.label: device for device in devices}
         self.device_combo["values"] = list(self.devices)
@@ -217,7 +236,10 @@ class HREnrollmentApp(tk.Tk):
     def _on_enroll_complete(self, outcome) -> None:
         self._set_record(outcome.record)
         self._append_status(outcome.message)
-        self._append_status(f"Verified fingers: {outcome.record.finger_summary}.")
+        if getattr(outcome, "modality", "fingerprint") == "face":
+            self._append_status(f"Current fingers: {outcome.record.finger_summary}.")
+        else:
+            self._append_status(f"Verified fingers: {outcome.record.finger_summary}.")
 
     def _set_record(self, record: EmployeeRecord) -> None:
         self.current_record = record
@@ -280,7 +302,13 @@ class HREnrollmentApp(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
-        for button in (self.scan_button, self.search_button, self.create_button, self.enroll_button):
+        for button in (
+            self.scan_button,
+            self.search_button,
+            self.create_button,
+            self.enroll_button,
+            self.face_button,
+        ):
             button.configure(state=state)
         combo_state = tk.DISABLED if busy else "readonly"
         for combo in (self.device_combo, self.finger_combo):
