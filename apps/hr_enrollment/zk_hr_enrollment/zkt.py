@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +18,10 @@ class RuntimeDependencyError(RuntimeError):
 
 class ZKCommunicationError(RuntimeError):
     """Raised when a ZKT device connection drops or times out during an operation."""
+
+
+FACE_TEMPLATE_ID = 111
+FACE_EVENT_WAIT_SECONDS = 70
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,24 @@ class FingerTemplate:
     fid: int
     valid: int
     size: int
+
+
+@dataclass(frozen=True)
+class BiometricCounts:
+    users: int | None
+    fingers: int | None
+    faces: int | None
+    users_capacity: int | None
+    fingers_capacity: int | None
+    faces_capacity: int | None
+
+
+@dataclass(frozen=True)
+class RemoteEnrollmentResult:
+    started: bool
+    completed: bool
+    event_count: int
+    event_codes: tuple[int, ...]
 
 
 class ZKDeviceSession:
@@ -170,6 +194,18 @@ class ZKDeviceSession:
                 continue
         return templates
 
+    def get_biometric_counts(self) -> BiometricCounts:
+        conn = self._require_conn()
+        self._device_call("read biometric counts", conn.read_sizes)
+        return BiometricCounts(
+            users=_optional_int(getattr(conn, "users", None)),
+            fingers=_optional_int(getattr(conn, "fingers", None)),
+            faces=_optional_int(getattr(conn, "faces", None)),
+            users_capacity=_optional_int(getattr(conn, "users_cap", None)),
+            fingers_capacity=_optional_int(getattr(conn, "fingers_cap", None)),
+            faces_capacity=_optional_int(getattr(conn, "faces_cap", None)),
+        )
+
     def create_user(self, *, uid: int, user_id: str, name: str) -> EnrollmentUser:
         conn = self._require_conn()
         self._device_call(
@@ -204,6 +240,22 @@ class ZKDeviceSession:
         finally:
             _safe_recover_enrollment_state(conn)
 
+    def enroll_face(self, *, uid: str | int, user_id: str):
+        conn = self._require_conn()
+        _safe_prepare_enrollment_state(conn)
+        try:
+            return self._device_call(
+                "enroll face",
+                lambda: self._start_remote_enrollment(
+                    conn,
+                    user_id=str(user_id),
+                    template_id=FACE_TEMPLATE_ID,
+                    wait_seconds=min(float(self.timeout), FACE_EVENT_WAIT_SECONDS),
+                ),
+            )
+        finally:
+            _safe_recover_enrollment_state(conn)
+
     def reset_enrollment_state(self) -> None:
         _safe_recover_enrollment_state(self._require_conn())
 
@@ -222,6 +274,75 @@ class ZKDeviceSession:
                     "The device timed out or closed the connection."
                 ) from exc
             raise
+
+    def _start_remote_enrollment(
+        self,
+        conn,
+        *,
+        user_id: str,
+        template_id: int,
+        wait_seconds: float,
+    ) -> RemoteEnrollmentResult | object:
+        send_command = getattr(conn, "_ZK__send_command", None)
+        sock = getattr(conn, "_ZK__sock", None)
+        ack_ok = getattr(conn, "_ZK__ack_ok", None)
+        if not callable(send_command) or sock is None or not callable(ack_ok):
+            return conn.enroll_user(uid=int(user_id), temp_id=int(template_id), user_id=str(user_id))
+
+        if bool(getattr(conn, "tcp", not self.force_udp)):
+            command_string = struct.pack("<24sbb", str(user_id).encode(), int(template_id), 1)
+            code_offset = 16
+        else:
+            command_string = struct.pack("<Ib", int(user_id), int(template_id))
+            code_offset = 8
+
+        cmd_response = send_command(self._cmd_startenroll(), command_string)
+        if not cmd_response.get("status"):
+            raise RuntimeError(f"Device rejected remote enrollment for template {template_id}.")
+
+        event_codes: list[int] = []
+        completed = False
+        previous_timeout = getattr(sock, "gettimeout", lambda: None)()
+        try:
+            sock.settimeout(2)
+            deadline = time.monotonic() + max(1, wait_seconds)
+            while time.monotonic() < deadline:
+                try:
+                    data_recv = sock.recv(1032)
+                except socket.timeout:
+                    continue
+                ack_ok()
+                code = _event_result_code(data_recv, code_offset)
+                if code is not None:
+                    event_codes.append(code)
+                if code == 0:
+                    completed = True
+                    break
+                if code in {4, 5, 6}:
+                    break
+        finally:
+            try:
+                sock.settimeout(previous_timeout)
+            except Exception:
+                pass
+
+        return RemoteEnrollmentResult(
+            started=True,
+            completed=completed,
+            event_count=len(event_codes),
+            event_codes=tuple(event_codes),
+        )
+
+    @staticmethod
+    def _cmd_startenroll() -> int:
+        try:
+            from zk import const  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeDependencyError(
+                "The bundled ZKT device library is missing. Rebuild the Windows EXE from "
+                "the latest shipping workflow so all runtime components are included."
+            ) from exc
+        return int(const.CMD_STARTENROLL)
 
 
 class AutoProtocolZKDeviceSession(AbstractContextManager):
@@ -365,6 +486,22 @@ def _safe_call(func):
     try:
         return func()
     except Exception:
+        return None
+
+
+def _optional_int(value) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_result_code(data: bytes, offset: int) -> int | None:
+    if len(data) <= offset + 1:
+        return None
+    try:
+        return struct.unpack("H", data.ljust(offset + 2, b"\x00")[offset : offset + 2])[0]
+    except struct.error:
         return None
 
 
