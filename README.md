@@ -65,6 +65,12 @@ Network scan follows the candidate-first behavior used by the older dump tool: a
 TCP `4370` open is shown, even if the SDK validation step is busy or inconclusive. Unvalidated
 candidates are validated when selected actions run, using TCP first and then UDP.
 
+Some uFace/TFT devices can accept the SDK enrollment command but keep the screen on a loading state
+instead of returning the registration events expected by `pyzk`. The HR app now clears stale
+capture/enrollment state before and after enrollment, reconnects to verify whether the template was
+saved, and retries the enrollment once with the alternate ZKT protocol when the first protocol did
+not save the selected finger.
+
 ## Shipping
 
 The repository ships through GitHub Actions:
