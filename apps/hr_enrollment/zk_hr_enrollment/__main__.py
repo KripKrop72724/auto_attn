@@ -21,10 +21,13 @@ CRITICAL_MODULES = (
     "zk_zone_agent.network_scanner",
     "zk_hr_enrollment.app",
     "zk_hr_enrollment.zkt",
+    "zk_hr_enrollment.official_sdk",
 )
 
 WINDOWS_CRITICAL_MODULES = (
     "psutil._psutil_windows",
+    "pythoncom",
+    "win32com.client",
     "win32timezone",
 )
 
