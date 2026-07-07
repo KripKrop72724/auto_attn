@@ -14,9 +14,12 @@ from zk_hr_enrollment.identity import (
     normalize_cnic,
     users_matching_cnic,
 )
+from zk_hr_enrollment.official_sdk import OfficialFaceEnrollmentResult
 from zk_hr_enrollment.service import EmployeeRecord, HREnrollmentService
 from zk_hr_enrollment.zkt import (
+    BiometricCounts,
     EnrollmentUser,
+    FACE_TEMPLATE_ID,
     FingerTemplate,
     RuntimeDependencyError,
     ScannedDevice,
@@ -171,6 +174,44 @@ def test_zkt_enrollment_resets_capture_state_around_sdk_call():
     ]
 
 
+def test_zkt_face_enrollment_uses_face_template_id():
+    class FakeConnection:
+        def __init__(self):
+            self.calls = []
+
+        def free_data(self):
+            self.calls.append("free_data")
+
+        def cancel_capture(self):
+            self.calls.append("cancel_capture")
+
+        def cancel_enroll(self):
+            self.calls.append("cancel_enroll")
+
+        def verify_user(self):
+            self.calls.append("verify_user")
+
+        def enable_device(self):
+            self.calls.append("enable_device")
+
+        def reg_event(self, flags):
+            self.calls.append(("reg_event", flags))
+
+        def refresh_data(self):
+            self.calls.append("refresh_data")
+
+        def enroll_user(self, **kwargs):
+            self.calls.append(("enroll_user", kwargs))
+            return True
+
+    conn = FakeConnection()
+    session = ZKDeviceSession(ip="192.168.110.137", port=4370, comm_key=1979)
+    session.conn = conn
+
+    assert session.enroll_face(uid="7", user_id="7") is True
+    assert ("enroll_user", {"uid": 7, "temp_id": FACE_TEMPLATE_ID, "user_id": "7"}) in conn.calls
+
+
 def test_service_creates_employee_with_auto_id_and_detects_duplicates():
     fake = FakeSession(
         users=[
@@ -313,11 +354,71 @@ def test_enrollment_timeout_retries_alternate_protocol_when_template_not_saved()
     assert "alternate ZKT protocol" in outcome.message
 
 
-def test_enrollment_timeout_reports_unverified_interrupted_enrollment():
-    fake = FakeSession(
+def test_enrollment_timeout_falls_back_to_face_after_two_failed_finger_attempts():
+    first_attempt = FakeSession(
         users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
         templates=[],
         enroll_error=ZKCommunicationError("timed out"),
+    )
+    verify_after_first = FakeSession(users=first_attempt.users, templates=[], faces=9)
+    second_attempt = FakeSession(
+        users=first_attempt.users,
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+    )
+    verify_after_second = FakeSession(users=first_attempt.users, templates=[], faces=9)
+    face_precheck = FakeSession(users=first_attempt.users, templates=[], faces=9)
+    face_attempt = FakeSession(users=first_attempt.users, templates=[], faces=9)
+    sessions = iter(
+        [
+            first_attempt,
+            verify_after_first,
+            second_attempt,
+            verify_after_second,
+            face_precheck,
+            face_attempt,
+        ]
+    )
+    seen_protocols = []
+    seen_timeouts = []
+
+    def session_factory(device, _comm_key, *, timeout: float):
+        seen_protocols.append(device.force_udp)
+        seen_timeouts.append(timeout)
+        return next(sessions)
+
+    service = HREnrollmentService(
+        comm_key_provider=lambda: 1979,
+        session_factory=session_factory,
+        command_timeout=20,
+        enrollment_timeout=120,
+    )
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    outcome = service.enroll_finger(DEVICE, record=record, finger_id=4)
+
+    assert outcome.success is True
+    assert outcome.modality == "face"
+    assert outcome.face_count_before == 9
+    assert outcome.face_count_after == 10
+    assert seen_protocols == [False, False, True, True, False, False]
+    assert seen_timeouts == [120, 20, 120, 20, 20, 120]
+    assert "app used face enrollment" in outcome.message
+
+
+def test_direct_face_enrollment_reports_face_count_change():
+    fake = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        faces=4,
     )
     service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_, **__: fake)
     record = EmployeeRecord(
@@ -330,7 +431,75 @@ def test_enrollment_timeout_reports_unverified_interrupted_enrollment():
         enrolled_fingers=[],
     )
 
-    with pytest.raises(RuntimeError, match="interrupted by a device communication timeout"):
+    outcome = service.enroll_face(DEVICE, record=record)
+
+    assert outcome.success is True
+    assert outcome.modality == "face"
+    assert outcome.face_count_before == 4
+    assert outcome.face_count_after == 5
+
+
+def test_direct_face_enrollment_prefers_official_sdk_when_available():
+    users = [EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")]
+    sessions = iter(
+        [
+            FakeSession(users=users, templates=[], faces=4),
+            FakeSession(users=users, templates=[], faces=5),
+        ]
+    )
+    official_calls = []
+
+    def session_factory(*_args, **_kwargs):
+        return next(sessions)
+
+    def face_enroller(**kwargs):
+        official_calls.append(kwargs)
+        return OfficialFaceEnrollmentResult(started=True, completed=True)
+
+    service = HREnrollmentService(
+        comm_key_provider=lambda: 1979,
+        session_factory=session_factory,
+        face_enroller=face_enroller,
+    )
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    outcome = service.enroll_face(DEVICE, record=record)
+
+    assert outcome.success is True
+    assert outcome.modality == "face"
+    assert outcome.face_count_before == 4
+    assert outcome.face_count_after == 5
+    assert official_calls[0]["user_id"] == "7"
+    assert "official ZKTeco SDK" in outcome.message
+
+
+def test_enrollment_timeout_reports_face_fallback_failure():
+    fake = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+        face_error=ZKCommunicationError("face timed out"),
+    )
+    service = HREnrollmentService(comm_key_provider=lambda: 1979, session_factory=lambda *_, **__: fake)
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    with pytest.raises(RuntimeError, match="face fallback also failed"):
         service.enroll_finger(DEVICE, record=record, finger_id=4)
 
 
@@ -436,6 +605,9 @@ class FakeSession:
     templates: list[FingerTemplate]
     enroll_result: object = True
     enroll_error: BaseException | None = None
+    face_result: object = True
+    face_error: BaseException | None = None
+    faces: int = 0
 
     def __enter__(self):
         return self
@@ -449,6 +621,16 @@ class FakeSession:
     def get_templates(self):
         return self.templates
 
+    def get_biometric_counts(self):
+        return BiometricCounts(
+            users=len(self.users),
+            fingers=len(self.templates),
+            faces=self.faces,
+            users_capacity=10000,
+            fingers_capacity=2000,
+            faces_capacity=3000,
+        )
+
     def create_user(self, *, uid: int, user_id: str, name: str):
         user = EnrollmentUser(uid=str(uid), user_id=user_id, name=name, privilege="0")
         self.users.append(user)
@@ -459,3 +641,9 @@ class FakeSession:
             raise self.enroll_error
         self.templates.append(FingerTemplate(uid=int(uid), fid=int(finger_id), valid=1, size=1196))
         return self.enroll_result
+
+    def enroll_face(self, *, uid: str | int, user_id: str):
+        if self.face_error is not None:
+            raise self.face_error
+        self.faces += 1
+        return self.face_result
