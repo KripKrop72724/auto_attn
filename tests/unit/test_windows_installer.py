@@ -35,6 +35,8 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "Assert-PythonModule" in build
     assert "--collect-all psutil" in build
     assert "--hidden-import psutil._psutil_windows" in build
+    assert "--hidden-import pythoncom" in build
+    assert "--hidden-import win32com.client" in build
     assert "--hidden-import psutil._psutil_common" not in build
     assert "--health-check" in build
     assert "Get-Content $HealthLog -Tail 120" in build
