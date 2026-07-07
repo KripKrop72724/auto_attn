@@ -190,10 +190,17 @@ class HREnrollmentApp(tk.Tk):
         self.device_combo["values"] = list(self.devices)
         if devices:
             self.device_var.set(devices[0].label)
-            self._append_status(f"Found {len(devices)} ZKT device(s). Select one to continue.")
+            validated = sum(1 for device in devices if device.validated)
+            if validated == len(devices):
+                self._append_status(f"Found {len(devices)} ZKT device(s). Select one to continue.")
+            else:
+                self._append_status(
+                    f"Found {len(devices)} open ZKT port candidate(s); {validated} validated now. "
+                    "Unvalidated candidates can still be selected and will be tried with TCP then UDP."
+                )
         else:
             self.device_var.set("")
-            self._append_status("No compatible ZKT devices were found on the connected network.")
+            self._append_status("No open ZKT port candidates were found on the connected network.")
 
     def _on_search_complete(self, result) -> None:
         self.current_record = result.record if result.found else None
@@ -224,6 +231,12 @@ class HREnrollmentApp(tk.Tk):
 
     def _on_device_changed(self, _event=None) -> None:
         self._clear_record("Search or create an employee on the selected device")
+        device = self.devices.get(self.device_var.get())
+        if device is not None and not device.validated:
+            self._append_status(
+                f"Selected {device.ip}:{device.port}. It was found by port scan and will be validated "
+                "when the next command runs."
+            )
 
     def _selected_device(self) -> ScannedDevice | None:
         label = self.device_var.get()
