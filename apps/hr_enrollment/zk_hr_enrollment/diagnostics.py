@@ -47,8 +47,16 @@ def friendly_exception_message(exc: BaseException) -> str:
         )
     if isinstance(exc, ValueError):
         return str(exc) or "The entered employee information is invalid."
+    if type(exc).__name__ == "ZKCommunicationError":
+        return (
+            "The selected ZKT device did not respond reliably. If an ESP32 or Zone Agent is "
+            "attached to this device, pause it during HR enrollment, then search the employee again."
+        )
     if isinstance(exc, TimeoutError):
-        return "The selected ZKT device did not respond in time. Check power, network, and comm-key."
+        return (
+            "The selected ZKT device did not respond in time. Check power/network, and pause any "
+            "ESP32 or Zone Agent that is already connected to the device."
+        )
     if isinstance(exc, OSError):
         return f"Windows or the network rejected the operation: {exc}"
     if isinstance(exc, RuntimeError):
