@@ -74,9 +74,9 @@ not save the selected finger.
 For uFace devices where remote fingerprint enrollment reaches the device screen but never returns
 fingerprint events to the SDK, HR can use **Enroll Face** directly. On Windows PCs that have the
 official ZKTeco `zkemkeeper.dll` COM SDK registered, the app uses the official `StartEnrollEx`
-face path. If that SDK is not available, the app tries the controlled pyzk face-start path and then
-verifies whether the face count increased; it does not treat a device ACK alone as a successful
-face enrollment.
+face path and then verifies whether the face count increased. The app does not use pyzk face index
+`111` as a fallback on uFace devices because that firmware can open a stuck remote fingerprint
+screen instead of the face enrollment workflow.
 
 ## Shipping
 
