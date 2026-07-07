@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -10,6 +11,10 @@ from zk_zone_agent.network_scanner import NetworkScanner, ScanCandidate, network
 
 class RuntimeDependencyError(RuntimeError):
     """Raised when the packaged EXE is missing a required runtime dependency."""
+
+
+class ZKCommunicationError(RuntimeError):
+    """Raised when a ZKT device connection drops or times out during an operation."""
 
 
 @dataclass(frozen=True)
@@ -63,12 +68,16 @@ class ZKDeviceSession:
         comm_key: int,
         timeout: float = 10,
         force_udp: bool = False,
+        connect_attempts: int = 2,
+        retry_delay: float = 0.75,
     ) -> None:
         self.ip = ip
         self.port = port
         self.comm_key = comm_key
         self.timeout = timeout
         self.force_udp = force_udp
+        self.connect_attempts = max(1, int(connect_attempts))
+        self.retry_delay = max(0, float(retry_delay))
         self.conn = None
 
     def __enter__(self) -> ZKDeviceSession:
@@ -80,16 +89,37 @@ class ZKDeviceSession:
                 "the latest shipping workflow so all runtime components are included."
             ) from exc
 
-        zk = ZK(
-            self.ip,
-            port=self.port,
-            timeout=self.timeout,
-            password=self.comm_key,
-            force_udp=self.force_udp,
-            ommit_ping=True,
-        )
-        self.conn = zk.connect()
-        return self
+        last_error: Exception | None = None
+        for attempt in range(1, self.connect_attempts + 1):
+            zk = ZK(
+                self.ip,
+                port=self.port,
+                timeout=self.timeout,
+                password=self.comm_key,
+                force_udp=self.force_udp,
+                ommit_ping=True,
+            )
+            try:
+                self.conn = zk.connect()
+                return self
+            except Exception as exc:
+                if isinstance(exc, RuntimeDependencyError):
+                    raise
+                last_error = exc
+                self.conn = None
+                if attempt >= self.connect_attempts or not is_device_communication_error(exc):
+                    break
+                if self.retry_delay:
+                    time.sleep(self.retry_delay)
+
+        if last_error is not None and is_device_communication_error(last_error):
+            raise ZKCommunicationError(
+                f"Could not connect to ZKT device {self.ip}:{self.port}. "
+                "The device timed out or closed the connection."
+            ) from last_error
+        if last_error is not None:
+            raise last_error
+        raise ZKCommunicationError(f"Could not connect to ZKT device {self.ip}:{self.port}.")
 
     def __exit__(
         self,
@@ -100,6 +130,8 @@ class ZKDeviceSession:
         if self.conn is not None:
             try:
                 self.conn.disconnect()
+            except Exception:
+                pass
             finally:
                 self.conn = None
 
@@ -114,13 +146,17 @@ class ZKDeviceSession:
     def get_users(self) -> list[EnrollmentUser]:
         return [
             _user_from_pyzk(user)
-            for user in (self._require_conn().get_users() or [])
+            for user in self._device_call("read users", lambda: self._require_conn().get_users() or [])
             if user is not None
         ]
 
     def get_templates(self) -> list[FingerTemplate]:
         templates: list[FingerTemplate] = []
-        for template in self._require_conn().get_templates() or []:
+        raw_templates = self._device_call(
+            "read fingerprint templates",
+            lambda: self._require_conn().get_templates() or [],
+        )
+        for template in raw_templates:
             try:
                 templates.append(_template_from_pyzk(template))
             except (TypeError, ValueError):
@@ -129,14 +165,17 @@ class ZKDeviceSession:
 
     def create_user(self, *, uid: int, user_id: str, name: str) -> EnrollmentUser:
         conn = self._require_conn()
-        conn.set_user(
-            uid=uid,
-            name=name,
-            privilege=0,
-            password="",
-            group_id="",
-            user_id=user_id,
-            card=0,
+        self._device_call(
+            "create user",
+            lambda: conn.set_user(
+                uid=uid,
+                name=name,
+                privilege=0,
+                password="",
+                group_id="",
+                user_id=user_id,
+                card=0,
+            ),
         )
         users = self.get_users()
         created = next(
@@ -148,12 +187,31 @@ class ZKDeviceSession:
         return created
 
     def enroll_finger(self, *, uid: str | int, user_id: str, finger_id: int):
-        return self._require_conn().enroll_user(uid=int(uid), temp_id=int(finger_id), user_id=str(user_id))
+        conn = self._require_conn()
+        try:
+            return self._device_call(
+                "enroll fingerprint",
+                lambda: conn.enroll_user(uid=int(uid), temp_id=int(finger_id), user_id=str(user_id)),
+            )
+        except ZKCommunicationError:
+            _safe_cancel_capture(conn)
+            raise
 
     def _require_conn(self):
         if self.conn is None:
             raise RuntimeError("ZKT device is not connected.")
         return self.conn
+
+    def _device_call(self, operation: str, func):
+        try:
+            return func()
+        except Exception as exc:
+            if is_device_communication_error(exc):
+                raise ZKCommunicationError(
+                    f"Could not {operation} on ZKT device {self.ip}:{self.port}. "
+                    "The device timed out or closed the connection."
+                ) from exc
+            raise
 
 
 SessionOpener = Callable[..., ZKDeviceSession]
@@ -236,6 +294,40 @@ def _safe_call(func):
         return func()
     except Exception:
         return None
+
+
+def is_device_communication_error(exc: BaseException) -> bool:
+    if isinstance(exc, ZKCommunicationError):
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    name = type(exc).__name__.lower()
+    if name in {"zknetworkerror", "connectionreseterror", "timeout"}:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "timed out",
+            "timeout",
+            "forcibly closed",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+        )
+    )
+
+
+def _safe_cancel_capture(conn) -> None:
+    for method_name in ("cancel_capture", "cancel_enroll", "free_data"):
+        method = getattr(conn, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+        except Exception:
+            pass
+        return
 
 
 def _user_from_pyzk(user) -> EnrollmentUser:
