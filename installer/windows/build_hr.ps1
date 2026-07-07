@@ -22,6 +22,9 @@ foreach ($Module in @(
   "zk_common",
   "zk_zone_agent.network_scanner",
   "zk_hr_enrollment.app",
+  "zk_hr_enrollment.official_sdk",
+  "pythoncom",
+  "win32com.client",
   "win32timezone"
 )) {
   Assert-PythonModule $Module
@@ -48,6 +51,8 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $
   --hidden-import tkinter `
   --hidden-import psutil `
   --hidden-import psutil._psutil_windows `
+  --hidden-import pythoncom `
+  --hidden-import win32com.client `
   --hidden-import win32timezone `
   "apps\hr_enrollment\zk_hr_enrollment\__main__.py"
 
