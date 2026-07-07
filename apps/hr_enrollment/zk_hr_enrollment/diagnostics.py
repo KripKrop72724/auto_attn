@@ -49,8 +49,9 @@ def friendly_exception_message(exc: BaseException) -> str:
         return str(exc) or "The entered employee information is invalid."
     if type(exc).__name__ == "ZKCommunicationError":
         return (
-            "The selected ZKT device did not respond reliably. If an ESP32 or Zone Agent is "
-            "attached to this device, pause it during HR enrollment, then search the employee again."
+            "The selected ZKT device did not respond reliably. The app tried to reset the device "
+            "enrollment state; if the screen is still loading, cancel on the device, search the "
+            "employee again, and retry enrollment."
         )
     if isinstance(exc, TimeoutError):
         return (
