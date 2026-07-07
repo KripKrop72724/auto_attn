@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from types import TracebackType
 
@@ -24,19 +25,25 @@ class ScannedDevice:
     serial: str | None
     platform: str | None
     device_name: str | None
-    force_udp: bool
+    force_udp: bool | None = None
     subnet: str | None = None
     interface_name: str | None = None
+    validated: bool = True
+    validation_error: str | None = None
 
     @property
     def label(self) -> str:
-        parts = [self.ip]
+        parts = [f"{self.ip}:{self.port}"]
         if self.device_name:
             parts.append(self.device_name)
         if self.platform:
             parts.append(self.platform)
         if self.serial:
             parts.append(self.serial)
+        if not self.validated:
+            parts.append("open ZKT port - not validated yet")
+        elif self.force_udp is True:
+            parts.append("UDP")
         return " | ".join(parts)
 
 
@@ -214,10 +221,56 @@ class ZKDeviceSession:
             raise
 
 
-SessionOpener = Callable[..., ZKDeviceSession]
+class AutoProtocolZKDeviceSession(AbstractContextManager):
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = dict(kwargs)
+        self.session: ZKDeviceSession | None = None
+
+    def __enter__(self) -> ZKDeviceSession:
+        last_error: Exception | None = None
+        for force_udp in (False, True):
+            session = ZKDeviceSession(**{**self.kwargs, "force_udp": force_udp})
+            try:
+                self.session = session.__enter__()
+                return self.session
+            except Exception as exc:
+                if isinstance(exc, RuntimeDependencyError):
+                    raise
+                last_error = exc
+                try:
+                    session.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
+        if last_error is not None and is_device_communication_error(last_error):
+            ip = self.kwargs.get("ip", "unknown")
+            port = self.kwargs.get("port", "unknown")
+            raise ZKCommunicationError(
+                f"Could not connect to ZKT device {ip}:{port}. "
+                "TCP and UDP both timed out or closed the connection."
+            ) from last_error
+        if last_error is not None:
+            raise last_error
+        raise ZKCommunicationError("Could not connect to ZKT device.")
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self.session is not None:
+            try:
+                self.session.__exit__(exc_type, exc, tb)
+            finally:
+                self.session = None
 
 
-def open_zkt_session(**kwargs) -> ZKDeviceSession:
+SessionOpener = Callable[..., AbstractContextManager]
+
+
+def open_zkt_session(**kwargs) -> AbstractContextManager:
+    if kwargs.get("force_udp") is None:
+        return AutoProtocolZKDeviceSession(**kwargs)
     return ZKDeviceSession(**kwargs)
 
 
@@ -280,13 +333,29 @@ def scan_zkt_devices(
             for candidate in candidates
         }
         for future in as_completed(future_map):
+            candidate = future_map[future]
             try:
                 devices.append(future.result())
             except RuntimeDependencyError:
-                raise
-            except Exception:
-                continue
+                devices.append(_candidate_device(candidate, "Missing ZKT runtime dependency."))
+            except Exception as exc:
+                devices.append(_candidate_device(candidate, str(exc)))
     return sorted(devices, key=lambda device: tuple(int(part) for part in device.ip.split(".")))
+
+
+def _candidate_device(candidate: ScanCandidate, validation_error: str | None = None) -> ScannedDevice:
+    return ScannedDevice(
+        ip=candidate.ip,
+        port=candidate.port,
+        serial=None,
+        platform=None,
+        device_name=None,
+        force_udp=None,
+        subnet=candidate.subnet,
+        interface_name=candidate.interface_name,
+        validated=False,
+        validation_error=validation_error,
+    )
 
 
 def _safe_call(func):
