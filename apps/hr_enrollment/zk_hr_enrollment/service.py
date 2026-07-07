@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from zk_hr_enrollment.config import read_comm_key
 from zk_hr_enrollment.identity import (
@@ -139,64 +139,95 @@ class HREnrollmentService:
             raise ValueError("Finger selection is invalid.")
         if str(record.privilege or "0") not in {"", "0", "None"}:
             raise ValueError("This device user is not a regular employee. Ask IT to review it.")
-        enrollment_error: BaseException | None = None
-        sdk_result: object = None
-        after: list[int] = []
-        before: list[int] = []
-        with self._session(device, timeout=self.enrollment_timeout) as session:
-            users = session.get_users()
-            user = next((item for item in users if str(item.uid) == str(record.uid)), None)
-            if user is None:
-                raise ValueError("Employee was not found on the selected device. Search again.")
-            before_templates = session.get_templates()
-            before = _template_fids(before_templates, record.uid)
-            if finger_id in before:
-                raise ValueError("Selected finger is already enrolled. Choose an empty finger slot.")
-            try:
-                sdk_result = session.enroll_finger(
-                    uid=record.uid,
-                    user_id=record.user_id,
-                    finger_id=finger_id,
-                )
-                after_templates = session.get_templates()
-                after = _template_fids(after_templates, record.uid)
-            except Exception as exc:
-                if not is_device_communication_error(exc):
-                    raise
-                enrollment_error = exc
-        if enrollment_error is not None:
-            after = self._verify_fingers_after_interrupted_enrollment(device, record, enrollment_error)
-        success = finger_id in after
-        updated = EmployeeRecord(
-            uid=record.uid,
-            user_id=record.user_id,
-            machine_name=record.machine_name,
-            cnic=record.cnic,
-            shift_worker=record.shift_worker,
-            privilege=record.privilege,
-            enrolled_fingers=after,
-        )
-        if not success:
+
+        attempts = _enrollment_attempt_devices(device)
+        first_before: list[int] | None = None
+        last_error: BaseException | None = None
+        for attempt_number, attempt_device in enumerate(attempts, start=1):
+            enrollment_error: BaseException | None = None
+            sdk_result: object = None
+            after: list[int] = []
+            before: list[int] = []
+            with self._session(attempt_device, timeout=self.enrollment_timeout) as session:
+                users = session.get_users()
+                user = next((item for item in users if str(item.uid) == str(record.uid)), None)
+                if user is None:
+                    raise ValueError("Employee was not found on the selected device. Search again.")
+                before_templates = session.get_templates()
+                before = _template_fids(before_templates, record.uid)
+                if first_before is None:
+                    first_before = before
+                if finger_id in before:
+                    raise ValueError("Selected finger is already enrolled. Choose an empty finger slot.")
+                try:
+                    sdk_result = session.enroll_finger(
+                        uid=record.uid,
+                        user_id=record.user_id,
+                        finger_id=finger_id,
+                    )
+                    after_templates = session.get_templates()
+                    after = _template_fids(after_templates, record.uid)
+                except Exception as exc:
+                    if not is_device_communication_error(exc):
+                        raise
+                    enrollment_error = exc
             if enrollment_error is not None:
-                raise RuntimeError(
-                    "Enrollment was interrupted by a device communication timeout, and the selected "
-                    "finger could not be verified afterward. Search the employee again before retrying."
-                ) from enrollment_error
-            raise RuntimeError("Enrollment did not complete. The selected finger was not saved.")
-        message = "Fingerprint enrollment completed and was verified on the device."
-        if enrollment_error is not None:
-            message = (
-                "Fingerprint enrollment was saved on the device, but the device did not send the "
-                "final confirmation. The app reconnected and verified the saved finger."
+                try:
+                    after = self._verify_fingers_after_interrupted_enrollment(
+                        attempt_device,
+                        record,
+                        enrollment_error,
+                    )
+                except RuntimeError as exc:
+                    last_error = exc
+                    if attempt_number < len(attempts):
+                        continue
+                    raise
+            if finger_id not in after:
+                last_error = enrollment_error or RuntimeError(
+                    "Enrollment did not complete. The selected finger was not saved."
+                )
+                if attempt_number < len(attempts):
+                    continue
+                if enrollment_error is not None:
+                    raise RuntimeError(
+                        "Enrollment was interrupted by a device communication timeout, and the selected "
+                        "finger could not be verified afterward. Search the employee again before retrying."
+                    ) from enrollment_error
+                raise RuntimeError("Enrollment did not complete. The selected finger was not saved.")
+
+            updated = EmployeeRecord(
+                uid=record.uid,
+                user_id=record.user_id,
+                machine_name=record.machine_name,
+                cnic=record.cnic,
+                shift_worker=record.shift_worker,
+                privilege=record.privilege,
+                enrolled_fingers=after,
             )
-        return EnrollmentOutcome(
-            success=True,
-            record=updated,
-            sdk_result=sdk_result,
-            before_fingers=before,
-            after_fingers=after,
-            message=message,
-        )
+            message = "Fingerprint enrollment completed and was verified on the device."
+            if enrollment_error is not None:
+                message = (
+                    "Fingerprint enrollment was saved on the device, but the device did not send the "
+                    "final confirmation. The app reconnected and verified the saved finger."
+                )
+            elif attempt_number > 1:
+                message = (
+                    "Fingerprint enrollment completed after retrying the alternate ZKT protocol, "
+                    "and was verified on the device."
+                )
+            return EnrollmentOutcome(
+                success=True,
+                record=updated,
+                sdk_result=sdk_result,
+                before_fingers=first_before or [],
+                after_fingers=after,
+                message=message,
+            )
+        raise RuntimeError(
+            "Enrollment did not complete after trying both ZKT protocols. Search the employee again "
+            "before retrying."
+        ) from last_error
 
     def _session(self, device: ScannedDevice, *, timeout: float) -> AbstractContextManager:
         return self.session_factory(device, self.comm_key_provider(), timeout=timeout)
@@ -209,6 +240,9 @@ class HREnrollmentService:
     ) -> list[int]:
         try:
             with self._session(device, timeout=self.command_timeout) as session:
+                reset = getattr(session, "reset_enrollment_state", None)
+                if callable(reset):
+                    reset()
                 return _template_fids(session.get_templates(), record.uid)
         except Exception as exc:
             if is_device_communication_error(exc):
@@ -232,6 +266,16 @@ def _default_session_factory(
         timeout=timeout,
         force_udp=device.force_udp,
     )
+
+
+def _enrollment_attempt_devices(device: ScannedDevice) -> list[ScannedDevice]:
+    if device.force_udp is None:
+        protocols: list[bool] = [False, True]
+    elif device.force_udp is False:
+        protocols = [False, True]
+    else:
+        protocols = [True, False]
+    return [replace(device, force_udp=force_udp) for force_udp in protocols]
 
 
 def _record_from_user(user: EnrollmentUser, templates: list[FingerTemplate]) -> EmployeeRecord:
