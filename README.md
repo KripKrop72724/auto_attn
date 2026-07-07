@@ -71,6 +71,13 @@ capture/enrollment state before and after enrollment, reconnects to verify wheth
 saved, and retries the enrollment once with the alternate ZKT protocol when the first protocol did
 not save the selected finger.
 
+For uFace devices where remote fingerprint enrollment reaches the device screen but never returns
+fingerprint events to the SDK, HR can use **Enroll Face** directly. On Windows PCs that have the
+official ZKTeco `zkemkeeper.dll` COM SDK registered, the app uses the official `StartEnrollEx`
+face path. If that SDK is not available, the app tries the controlled pyzk face-start path and then
+verifies whether the face count increased; it does not treat a device ACK alone as a successful
+face enrollment.
+
 ## Shipping
 
 The repository ships through GitHub Actions:
