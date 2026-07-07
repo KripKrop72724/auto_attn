@@ -55,6 +55,12 @@ C:\ProgramData\State Life Insurance Corporation\HR Enrollment\secrets\comm_key.t
 
 The file must contain only the numeric comm key.
 
+When an ESP32 Zone Lite unit is permanently attached to the same ZKT device, pause or power off the
+ESP32 for the duration of HR fingerprint enrollment. The ESP32 keeps a long-lived ZKT SDK session
+open for live capture, and many ZKT devices only handle one SDK client reliably at a time. If
+enrollment times out after the finger was saved, the HR app reconnects and verifies the template
+before reporting failure.
+
 ## Shipping
 
 The repository ships through GitHub Actions:
