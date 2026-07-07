@@ -195,14 +195,17 @@ class ZKDeviceSession:
 
     def enroll_finger(self, *, uid: str | int, user_id: str, finger_id: int):
         conn = self._require_conn()
+        _safe_prepare_enrollment_state(conn)
         try:
             return self._device_call(
                 "enroll fingerprint",
                 lambda: conn.enroll_user(uid=int(uid), temp_id=int(finger_id), user_id=str(user_id)),
             )
-        except ZKCommunicationError:
-            _safe_cancel_capture(conn)
-            raise
+        finally:
+            _safe_recover_enrollment_state(conn)
+
+    def reset_enrollment_state(self) -> None:
+        _safe_recover_enrollment_state(self._require_conn())
 
     def _require_conn(self):
         if self.conn is None:
@@ -387,16 +390,32 @@ def is_device_communication_error(exc: BaseException) -> bool:
     )
 
 
-def _safe_cancel_capture(conn) -> None:
-    for method_name in ("cancel_capture", "cancel_enroll", "free_data"):
-        method = getattr(conn, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            method()
-        except Exception:
-            pass
+def _safe_prepare_enrollment_state(conn) -> None:
+    _safe_device_method(conn, "free_data")
+    _safe_device_method(conn, "cancel_capture")
+    _safe_device_method(conn, "cancel_enroll")
+    _safe_device_method(conn, "verify_user")
+    _safe_device_method(conn, "enable_device")
+
+
+def _safe_recover_enrollment_state(conn) -> None:
+    _safe_device_method(conn, "reg_event", 0)
+    _safe_device_method(conn, "cancel_capture")
+    _safe_device_method(conn, "cancel_enroll")
+    _safe_device_method(conn, "verify_user")
+    _safe_device_method(conn, "free_data")
+    _safe_device_method(conn, "refresh_data")
+    _safe_device_method(conn, "enable_device")
+
+
+def _safe_device_method(conn, method_name: str, *args) -> None:
+    method = getattr(conn, method_name, None)
+    if not callable(method):
         return
+    try:
+        method(*args)
+    except Exception:
+        pass
 
 
 def _user_from_pyzk(user) -> EnrollmentUser:
