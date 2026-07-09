@@ -45,7 +45,11 @@ The brute-force flow is opt-in per candidate, requires local operator confirmati
 
 ## State Life HR Enrollment App
 
-The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a portable native app for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco port `4370` candidates, finds or creates regular employee users, and triggers fingerprint enrollment on the selected machine. The app does not expose Zone Agent admin tools or device controls.
+The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a 32-bit portable native app
+for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco port `4370`
+candidates, finds or creates regular employee users, and triggers fingerprint enrollment on the
+selected machine. The app does not expose Zone Agent admin tools or device controls. The HR EXE is
+intentionally 32-bit because ZKTeco `zkemkeeper.dll` deployments are commonly 32-bit COM components.
 
 The HR app uses comm key `1979` by default. IT can override it by creating:
 
@@ -84,6 +88,7 @@ Standalone SDK on the HR Windows PC. Alternatively, place a licensed `zkemkeeper
 `StateLifeHREnrollment.exe` and run the EXE once as Administrator so it can register the COM class.
 For custom builds, set `ZKEMKEEPER_DLL=C:\path\to\zkemkeeper.dll` before running
 `installer\windows\build_hr.ps1`; the build will bundle that DLL next to the portable EXE payload.
+Use 32-bit Python for that build if the provided SDK DLL is 32-bit.
 
 ## Shipping
 
