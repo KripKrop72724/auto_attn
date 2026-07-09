@@ -271,10 +271,10 @@ class HREnrollmentService:
             raise RuntimeError(
                 "Face enrollment on this uFace device requires the official ZKTeco Windows SDK "
                 "(zkemkeeper.dll). Install/register the ZKTeco Standalone SDK on this Windows PC, "
-                "or place zkemkeeper.dll beside StateLifeHREnrollment.exe and run the app once as "
-                "Administrator so it can register the COM class. The pyzk face fallback is disabled "
-                "because this firmware opens a stuck Remote Enroll Fingerprint screen for face index "
-                "111 instead of the face enrollment workflow."
+                "or place the full official SDK DLL folder beside StateLifeHREnrollment.exe and run "
+                "the app once as Administrator so it can register the COM class. The pyzk face "
+                "fallback is disabled because this firmware opens a stuck Remote Enroll Fingerprint "
+                "screen for face index 111 instead of the face enrollment workflow."
             ) from exc
         except Exception as exc:
             raise RuntimeError(
