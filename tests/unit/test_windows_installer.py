@@ -33,12 +33,16 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert '--paths "apps\\zone_agent"' in build
     assert '--paths "packages\\common"' in build
     assert "Assert-PythonModule" in build
+    assert "--no-deps -e" in build
     assert "--collect-all psutil" in build
     assert "--hidden-import psutil._psutil_windows" in build
     assert "--hidden-import pythoncom" in build
     assert "--hidden-import win32com.client" in build
     assert "ZKEMKEEPER_DLL" in build
     assert "--add-binary" in build
+    assert "commpro.dll" in build
+    assert "zkemsdk.dll" in build
+    assert "HR_REQUIRE_ZKEMKEEPER_DLL" in build
     assert "ZKTeco zkemkeeper.dll is commonly 32-bit" in build
     assert "--hidden-import psutil._psutil_common" not in build
     assert "--health-check" in build
@@ -49,3 +53,7 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "state-life-hr-enrollment-windows-exe" in cd
     assert "dist/StateLifeHREnrollment.exe" in cd
     assert 'architecture: "x86"' in cd
+    assert "ZKEMKEEPER_SDK_URL" in cd
+    assert "zkteco-sdk.zip" in cd
+    assert "gh release download zkteco-sdk" in cd
+    assert "Restore ZKTeco SDK DLL for HR Enrollment" in cd
