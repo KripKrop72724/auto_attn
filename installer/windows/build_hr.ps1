@@ -30,6 +30,11 @@ foreach ($Module in @(
   Assert-PythonModule $Module
 }
 
+$PythonBits = (& $Python -c "import struct; print(struct.calcsize('P') * 8)").Trim()
+if ($PythonBits -ne "32") {
+  Write-Warning "Building a $PythonBits-bit HR EXE. ZKTeco zkemkeeper.dll is commonly 32-bit; use 32-bit Python if face enrollment cannot load the COM SDK."
+}
+
 $DistExe = Join-Path $RepoRoot "dist\StateLifeHREnrollment.exe"
 $BuildDir = Join-Path $RepoRoot "build\StateLifeHREnrollment"
 $SpecFile = Join-Path $RepoRoot "StateLifeHREnrollment.spec"
