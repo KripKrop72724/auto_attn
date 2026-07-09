@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+.tools/
 .coverage
 htmlcov/
 dist/
@@ -19,6 +20,7 @@ build/
 *.log
 local-data/
 installer/windows/Output/
+installer/windows/vendor/
 firmware/zone_lite/sdkconfig
 firmware/zone_lite/build/
 firmware/zone_lite/main/zone_lite_config.h
