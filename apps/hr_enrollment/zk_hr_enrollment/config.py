@@ -11,7 +11,7 @@ SECRET_RELATIVE_PATH = Path(BRAND_NAME) / "HR Enrollment" / "secrets" / "comm_ke
 
 
 class CommKeyConfigError(ValueError):
-    """Raised when the hidden comm-key override file is present but invalid."""
+    """Kept for compatibility with older builds that supported comm-key overrides."""
 
 
 def comm_key_secret_path() -> Path:
@@ -20,19 +20,10 @@ def comm_key_secret_path() -> Path:
 
 
 def read_comm_key(secret_path: Path | None = None) -> int:
-    path = secret_path or comm_key_secret_path()
-    if not path.exists():
-        return DEFAULT_COMM_KEY
-    value = path.read_text(encoding="utf-8").strip()
-    try:
-        key = int(value)
-    except ValueError as exc:
-        raise CommKeyConfigError(
-            f"The hidden comm-key file is invalid. Ask IT to fix {path}."
-        ) from exc
-    if key < 0:
-        raise CommKeyConfigError(
-            f"The hidden comm-key file must contain a non-negative integer. Ask IT to fix {path}."
-        )
-    return key
+    """Return the fixed State Life ZKT comm key.
 
+    ``secret_path`` is accepted for compatibility with older builds, but hidden
+    overrides are intentionally ignored so this HR app always uses 1979.
+    """
+    _ = secret_path
+    return DEFAULT_COMM_KEY
