@@ -22,6 +22,9 @@ class ZKCommunicationError(RuntimeError):
 
 FACE_TEMPLATE_ID = 111
 FACE_EVENT_WAIT_SECONDS = 70
+FINGER_ENROLL_TAPS = 3
+FINGER_ENROLL_CONTINUE_CODE = 0x64
+ENROLL_REJECTED_CODES = {4, 5, 6}
 
 
 @dataclass(frozen=True)
@@ -235,7 +238,14 @@ class ZKDeviceSession:
         try:
             return self._device_call(
                 "enroll fingerprint",
-                lambda: conn.enroll_user(uid=int(uid), temp_id=int(finger_id), user_id=str(user_id)),
+                lambda: self._start_remote_enrollment(
+                    conn,
+                    uid=int(uid),
+                    user_id=str(user_id),
+                    template_id=int(finger_id),
+                    wait_seconds=float(self.timeout),
+                    expected_continue_events=FINGER_ENROLL_TAPS,
+                ),
             )
         finally:
             _safe_recover_enrollment_state(conn)
@@ -248,9 +258,11 @@ class ZKDeviceSession:
                 "enroll face",
                 lambda: self._start_remote_enrollment(
                     conn,
+                    uid=int(uid),
                     user_id=str(user_id),
                     template_id=FACE_TEMPLATE_ID,
                     wait_seconds=min(float(self.timeout), FACE_EVENT_WAIT_SECONDS),
+                    expected_continue_events=0,
                 ),
             )
         finally:
@@ -279,15 +291,17 @@ class ZKDeviceSession:
         self,
         conn,
         *,
+        uid: int,
         user_id: str,
         template_id: int,
         wait_seconds: float,
+        expected_continue_events: int,
     ) -> RemoteEnrollmentResult | object:
         send_command = getattr(conn, "_ZK__send_command", None)
         sock = getattr(conn, "_ZK__sock", None)
         ack_ok = getattr(conn, "_ZK__ack_ok", None)
         if not callable(send_command) or sock is None or not callable(ack_ok):
-            return conn.enroll_user(uid=int(user_id), temp_id=int(template_id), user_id=str(user_id))
+            return conn.enroll_user(uid=int(uid), temp_id=int(template_id), user_id=str(user_id))
 
         if bool(getattr(conn, "tcp", not self.force_udp)):
             command_string = struct.pack("<24sbb", str(user_id).encode(), int(template_id), 1)
@@ -302,6 +316,7 @@ class ZKDeviceSession:
 
         event_codes: list[int] = []
         completed = False
+        continue_events = 0
         previous_timeout = getattr(sock, "gettimeout", lambda: None)()
         try:
             sock.settimeout(2)
@@ -315,10 +330,13 @@ class ZKDeviceSession:
                 code = _event_result_code(data_recv, code_offset)
                 if code is not None:
                     event_codes.append(code)
-                if code == 0:
+                if code == FINGER_ENROLL_CONTINUE_CODE and expected_continue_events:
+                    continue_events += 1
+                    continue
+                if code == 0 and continue_events >= expected_continue_events:
                     completed = True
                     break
-                if code in {4, 5, 6}:
+                if code in ENROLL_REJECTED_CODES:
                     break
         finally:
             try:
