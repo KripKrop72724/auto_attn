@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -69,6 +70,7 @@ SessionFactory = Callable[..., AbstractContextManager]
 FaceEnroller = Callable[..., OfficialFaceEnrollmentResult]
 DEFAULT_COMMAND_TIMEOUT = 20
 DEFAULT_ENROLLMENT_TIMEOUT = 120
+DEFAULT_VERIFICATION_RETRY_DELAYS = (2.0, 5.0, 10.0, 20.0)
 
 
 class HREnrollmentService:
@@ -81,6 +83,7 @@ class HREnrollmentService:
         face_enroller: FaceEnroller | None = None,
         command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
         enrollment_timeout: float = DEFAULT_ENROLLMENT_TIMEOUT,
+        verification_retry_delays: tuple[float, ...] = DEFAULT_VERIFICATION_RETRY_DELAYS,
     ) -> None:
         self.comm_key_provider = comm_key_provider
         self.session_factory = session_factory or _default_session_factory
@@ -88,6 +91,7 @@ class HREnrollmentService:
         self.face_enroller = face_enroller or enroll_face_with_official_sdk
         self.command_timeout = command_timeout
         self.enrollment_timeout = enrollment_timeout
+        self.verification_retry_delays = tuple(max(0.0, float(delay)) for delay in verification_retry_delays)
 
     def scan_devices(self) -> list[ScannedDevice]:
         return self.device_scanner(self.comm_key_provider())
@@ -266,9 +270,11 @@ class HREnrollmentService:
         except OfficialSdkUnavailable as exc:
             raise RuntimeError(
                 "Face enrollment on this uFace device requires the official ZKTeco Windows SDK "
-                "(zkemkeeper.dll). The pyzk face fallback is disabled because this firmware opens "
-                "a stuck Remote Enroll Fingerprint screen for face index 111 instead of the face "
-                "enrollment workflow."
+                "(zkemkeeper.dll). Install/register the ZKTeco Standalone SDK on this Windows PC, "
+                "or place zkemkeeper.dll beside StateLifeHREnrollment.exe and run the app once as "
+                "Administrator so it can register the COM class. The pyzk face fallback is disabled "
+                "because this firmware opens a stuck Remote Enroll Fingerprint screen for face index "
+                "111 instead of the face enrollment workflow."
             ) from exc
         except Exception as exc:
             raise RuntimeError(
@@ -325,32 +331,52 @@ class HREnrollmentService:
         record: EmployeeRecord,
         enrollment_error: BaseException,
     ) -> list[int]:
-        try:
-            with self._session(device, timeout=self.command_timeout) as session:
-                reset = getattr(session, "reset_enrollment_state", None)
-                if callable(reset):
-                    reset()
-                return _template_fids(session.get_templates(), record.uid)
-        except Exception as exc:
-            if is_device_communication_error(exc):
-                raise RuntimeError(
-                    "The device stopped responding during enrollment and did not respond to the "
-                    "follow-up verification. Search the employee again after the device is idle."
-                ) from enrollment_error
-            raise
+        last_error: BaseException | None = None
+        for delay in (0.0, *self.verification_retry_delays):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self._session(device, timeout=self.command_timeout) as session:
+                    reset = getattr(session, "reset_enrollment_state", None)
+                    if callable(reset):
+                        reset()
+                    return _template_fids(session.get_templates(), record.uid)
+            except Exception as exc:
+                if not is_device_communication_error(exc):
+                    raise
+                last_error = exc
+        raise RuntimeError(
+            "The device stopped responding during enrollment and did not respond to follow-up "
+            "verification after several retries. Cancel on the device, wait for the normal clock "
+            "screen, search the employee again, and retry enrollment."
+        ) from (last_error or enrollment_error)
 
     def _read_face_state(
         self,
         device: ScannedDevice,
         record: EmployeeRecord,
     ) -> tuple[list[int], BiometricCounts | None]:
-        with self._session(device, timeout=self.command_timeout) as session:
-            users = session.get_users()
-            user = next((item for item in users if str(item.uid) == str(record.uid)), None)
-            if user is None:
-                raise ValueError("Employee was not found on the selected device. Search again.")
-            templates = session.get_templates()
-            return _template_fids(templates, record.uid), _safe_counts(session)
+        last_error: BaseException | None = None
+        for delay in (0.0, *self.verification_retry_delays):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self._session(device, timeout=self.command_timeout) as session:
+                    users = session.get_users()
+                    user = next((item for item in users if str(item.uid) == str(record.uid)), None)
+                    if user is None:
+                        raise ValueError("Employee was not found on the selected device. Search again.")
+                    templates = session.get_templates()
+                    return _template_fids(templates, record.uid), _safe_counts(session)
+            except Exception as exc:
+                if not is_device_communication_error(exc):
+                    raise
+                last_error = exc
+        raise RuntimeError(
+            "The device is still busy from the previous enrollment attempt and did not respond after "
+            "several retries. Cancel on the device, wait for the normal clock screen, search the "
+            "employee again, and retry enrollment."
+        ) from last_error
 
 
 def _default_session_factory(
