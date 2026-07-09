@@ -6,7 +6,15 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $RepoRoot
 
-& $Python -m pip install -e ".[dev]"
+& $Python -m pip install --upgrade pip
+& $Python -m pip install --upgrade `
+  pyinstaller `
+  psutil `
+  pydantic-settings `
+  pyzk `
+  pywin32 `
+  tzdata
+& $Python -m pip install --no-deps -e "."
 
 function Assert-PythonModule {
   param([string]$Module)
@@ -40,12 +48,46 @@ $BuildDir = Join-Path $RepoRoot "build\StateLifeHREnrollment"
 $SpecFile = Join-Path $RepoRoot "StateLifeHREnrollment.spec"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $SpecFile
 
-$ZkemkeeperArgs = @()
-if ($env:ZKEMKEEPER_DLL) {
-  if (!(Test-Path $env:ZKEMKEEPER_DLL)) {
-    throw "ZKEMKEEPER_DLL points to a missing file: $env:ZKEMKEEPER_DLL"
+$DefaultZkemkeeperDll = Join-Path $RepoRoot "installer\windows\vendor\zkemkeeper.dll"
+if (!$env:ZKEMKEEPER_DLL -and (Test-Path $DefaultZkemkeeperDll)) {
+  $env:ZKEMKEEPER_DLL = $DefaultZkemkeeperDll
+}
+if (!$env:ZKEMKEEPER_DLL) {
+  throw "ZKEMKEEPER_DLL is required for the HR Enrollment EXE. Provide installer\windows\vendor\zkemkeeper.dll or set ZKEMKEEPER_DLL to the licensed ZKTeco SDK DLL."
+}
+if (!(Test-Path $env:ZKEMKEEPER_DLL)) {
+  throw "ZKEMKEEPER_DLL points to a missing file: $env:ZKEMKEEPER_DLL"
+}
+$ZkemkeeperSdkDir = Split-Path -Parent (Resolve-Path $env:ZKEMKEEPER_DLL)
+$RequiredZkemkeeperDlls = @(
+  "commpro.dll",
+  "comms.dll",
+  "plcommpro.dll",
+  "plcomms.dll",
+  "plrscagent.dll",
+  "plrscomm.dll",
+  "pltcpcomm.dll",
+  "rscagent.dll",
+  "rscomm.dll",
+  "tcpcomm.dll",
+  "usbcomm.dll",
+  "zkemkeeper.dll",
+  "zkemsdk.dll"
+)
+$MissingZkemkeeperDlls = @(
+  foreach ($DllName in $RequiredZkemkeeperDlls) {
+    if (!(Test-Path (Join-Path $ZkemkeeperSdkDir $DllName))) {
+      $DllName
+    }
   }
-  $ZkemkeeperArgs = @("--add-binary", "$($env:ZKEMKEEPER_DLL);.")
+)
+if ($MissingZkemkeeperDlls.Count -gt 0) {
+  throw "The ZKTeco SDK DLL folder is incomplete. Missing: $($MissingZkemkeeperDlls -join ', '). Provide the official 32-bit SDK DLL set in installer\windows\vendor or next to ZKEMKEEPER_DLL."
+}
+
+$ZkemkeeperArgs = @()
+foreach ($Dll in Get-ChildItem -Path $ZkemkeeperSdkDir -Filter "*.dll" -File) {
+  $ZkemkeeperArgs += @("--add-binary", "$($Dll.FullName);.")
 }
 
 & $Python -m PyInstaller `
@@ -74,6 +116,7 @@ if (!(Test-Path $DistExe)) {
   throw "Expected portable HR enrollment EXE was not created at $DistExe"
 }
 
+$env:HR_REQUIRE_ZKEMKEEPER_DLL = "1"
 $HealthCheck = Start-Process -FilePath $DistExe -ArgumentList "--health-check" -Wait -PassThru
 if ($HealthCheck.ExitCode -ne 0) {
   $HealthLog = Join-Path $env:ProgramData "State Life Insurance Corporation\HR Enrollment\logs\hr_enrollment.log"
