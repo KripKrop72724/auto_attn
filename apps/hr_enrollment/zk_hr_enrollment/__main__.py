@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import os
 import platform
 import sys
 
@@ -60,6 +61,13 @@ def _run_health_check() -> int:
     try:
         for module_name in modules:
             importlib.import_module(module_name)
+        if platform.system() == "Windows" and os.environ.get("HR_REQUIRE_ZKEMKEEPER_DLL") == "1":
+            from zk_hr_enrollment.official_sdk import find_missing_zkemkeeper_payloads
+
+            missing_payloads = find_missing_zkemkeeper_payloads()
+            if missing_payloads:
+                missing = ", ".join(missing_payloads)
+                raise RuntimeError(f"The packaged HR Enrollment EXE is missing ZKTeco SDK DLLs: {missing}.")
         return 0
     except Exception as exc:
         log_exception("health-check", exc)
