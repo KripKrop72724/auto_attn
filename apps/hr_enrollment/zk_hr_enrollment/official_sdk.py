@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from zk_hr_enrollment.zkt import FACE_TEMPLATE_ID
 
@@ -14,6 +17,10 @@ class OfficialSdkUnavailable(RuntimeError):
 
 class OfficialSdkEnrollmentError(RuntimeError):
     """Raised when the ZKTeco COM SDK rejects or fails a remote enrollment."""
+
+
+ZKEMKEEPER_PROG_ID = "zkemkeeper.ZKEM.1"
+ZKEMKEEPER_DLL_NAME = "zkemkeeper.dll"
 
 
 @dataclass(frozen=True)
@@ -57,16 +64,11 @@ def enroll_face_with_official_sdk(
             completed.set()
 
     try:
-        try:
-            zkem = win32com.client.Dispatch("zkemkeeper.ZKEM.1")
-        except Exception as exc:
-            raise OfficialSdkUnavailable(
-                "zkemkeeper.dll is not registered on this Windows PC."
-            ) from exc
+        zkem = _dispatch_zkem(win32com.client)
 
-        event_sink = None
+        _event_sink = None
         try:
-            event_sink = win32com.client.WithEvents(zkem, ZkemEvents)
+            _event_sink = win32com.client.WithEvents(zkem, ZkemEvents)
         except Exception:
             pass
 
@@ -108,6 +110,71 @@ def enroll_face_with_official_sdk(
                 except Exception:
                     pass
         pythoncom.CoUninitialize()
+
+
+def _dispatch_zkem(win32_client):
+    try:
+        return win32_client.Dispatch(ZKEMKEEPER_PROG_ID)
+    except Exception as first_error:
+        registered_path = _try_register_nearby_zkemkeeper()
+        if registered_path is not None:
+            try:
+                return win32_client.Dispatch(ZKEMKEEPER_PROG_ID)
+            except Exception as second_error:
+                raise OfficialSdkUnavailable(
+                    "zkemkeeper.dll was found and registration was attempted, but Windows still "
+                    f"could not create {ZKEMKEEPER_PROG_ID}. Run StateLifeHREnrollment.exe once "
+                    "as Administrator, or install the official ZKTeco Standalone SDK on this PC."
+                ) from second_error
+        raise OfficialSdkUnavailable(
+            "zkemkeeper.dll is not registered on this Windows PC. Install the official ZKTeco "
+            "Standalone SDK, or place zkemkeeper.dll beside StateLifeHREnrollment.exe and run the "
+            "app once as Administrator so the COM class can be registered."
+        ) from first_error
+
+
+def _try_register_nearby_zkemkeeper() -> Path | None:
+    for dll_path in _candidate_zkemkeeper_paths():
+        if not dll_path.exists():
+            continue
+        if _register_zkemkeeper(dll_path):
+            return dll_path
+    return None
+
+
+def _candidate_zkemkeeper_paths() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    env_path = os.environ.get("ZKEMKEEPER_DLL")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates.append(executable_dir / ZKEMKEEPER_DLL_NAME)
+
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        candidates.append(Path(bundle_dir) / ZKEMKEEPER_DLL_NAME)
+
+    candidates.extend(
+        [
+            Path.cwd() / ZKEMKEEPER_DLL_NAME,
+            Path(os.environ.get("WINDIR", r"C:\Windows")) / "SysWOW64" / ZKEMKEEPER_DLL_NAME,
+            Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / ZKEMKEEPER_DLL_NAME,
+        ]
+    )
+    return tuple(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def _register_zkemkeeper(dll_path: Path) -> bool:
+    try:
+        completed = subprocess.run(
+            ["regsvr32", "/s", str(dll_path)],
+            check=False,
+            timeout=20,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
 
 
 def _optional_bool_call(obj, method_name: str, *args) -> bool | None:
