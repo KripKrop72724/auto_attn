@@ -86,9 +86,19 @@ screen instead of the face enrollment workflow.
 If **Enroll Face** reports that `zkemkeeper.dll` is not registered, install the official ZKTeco
 Standalone SDK on the HR Windows PC. Alternatively, place a licensed `zkemkeeper.dll` beside
 `StateLifeHREnrollment.exe` and run the EXE once as Administrator so it can register the COM class.
-For custom builds, set `ZKEMKEEPER_DLL=C:\path\to\zkemkeeper.dll` before running
-`installer\windows\build_hr.ps1`; the build will bundle that DLL next to the portable EXE payload.
-Use 32-bit Python for that build if the provided SDK DLL is 32-bit.
+For custom builds, place the official 32-bit SDK DLL folder under
+`installer\windows\vendor`, or set `ZKEMKEEPER_DLL=C:\path\to\sdk\zkemkeeper.dll`
+before running `installer\windows\build_hr.ps1`; the build bundles the full DLL folder
+next to the portable EXE payload. The required DLL set is `commpro.dll`, `comms.dll`,
+`plcommpro.dll`, `plcomms.dll`, `plrscagent.dll`, `plrscomm.dll`, `pltcpcomm.dll`,
+`rscagent.dll`, `rscomm.dll`, `tcpcomm.dll`, `usbcomm.dll`, `zkemkeeper.dll`, and
+`zkemsdk.dll`. Use 32-bit Python for that build because the official SDK DLLs are 32-bit.
+
+GitHub Actions cannot store the SDK DLL set as a normal repository secret because the payload is
+larger than the Actions secret size limit. For shipping CD, upload a private release asset named
+`zkteco-sdk.zip` to the `zkteco-sdk` tag, or set repository secret `ZKEMKEEPER_SDK_URL` to a
+private zip URL that contains the SDK DLLs. The workflow also honors repository variable
+`ZKEMKEEPER_DLL_SHA256` to pin the expected `zkemkeeper.dll` hash.
 
 ## Shipping
 
