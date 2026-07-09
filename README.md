@@ -84,7 +84,7 @@ face path and then verifies whether the face count increased. The app does not u
 screen instead of the face enrollment workflow.
 
 If **Enroll Face** reports that `zkemkeeper.dll` is not registered, install the official ZKTeco
-Standalone SDK on the HR Windows PC. Alternatively, place a licensed `zkemkeeper.dll` beside
+Standalone SDK on the HR Windows PC. Alternatively, place the full official SDK DLL folder beside
 `StateLifeHREnrollment.exe` and run the EXE once as Administrator so it can register the COM class.
 For custom builds, place the official 32-bit SDK DLL folder under
 `installer\windows\vendor`, or set `ZKEMKEEPER_DLL=C:\path\to\sdk\zkemkeeper.dll`
