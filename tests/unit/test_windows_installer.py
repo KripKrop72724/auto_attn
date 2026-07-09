@@ -39,6 +39,7 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "--hidden-import win32com.client" in build
     assert "ZKEMKEEPER_DLL" in build
     assert "--add-binary" in build
+    assert "ZKTeco zkemkeeper.dll is commonly 32-bit" in build
     assert "--hidden-import psutil._psutil_common" not in build
     assert "--health-check" in build
     assert "Get-Content $HealthLog -Tail 120" in build
@@ -47,3 +48,4 @@ def test_windows_cd_builds_state_life_hr_portable_exe():
     assert "StateLifeHREnrollment.exe" in build
     assert "state-life-hr-enrollment-windows-exe" in cd
     assert "dist/StateLifeHREnrollment.exe" in cd
+    assert 'architecture: "x86"' in cd
