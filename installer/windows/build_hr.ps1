@@ -35,6 +35,14 @@ $BuildDir = Join-Path $RepoRoot "build\StateLifeHREnrollment"
 $SpecFile = Join-Path $RepoRoot "StateLifeHREnrollment.spec"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $SpecFile
 
+$ZkemkeeperArgs = @()
+if ($env:ZKEMKEEPER_DLL) {
+  if (!(Test-Path $env:ZKEMKEEPER_DLL)) {
+    throw "ZKEMKEEPER_DLL points to a missing file: $env:ZKEMKEEPER_DLL"
+  }
+  $ZkemkeeperArgs = @("--add-binary", "$($env:ZKEMKEEPER_DLL);.")
+}
+
 & $Python -m PyInstaller `
   --name StateLifeHREnrollment `
   --onefile `
@@ -54,6 +62,7 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DistExe, $BuildDir, $
   --hidden-import pythoncom `
   --hidden-import win32com.client `
   --hidden-import win32timezone `
+  @ZkemkeeperArgs `
   "apps\hr_enrollment\zk_hr_enrollment\__main__.py"
 
 if (!(Test-Path $DistExe)) {
