@@ -66,10 +66,11 @@ TCP `4370` open is shown, even if the SDK validation step is busy or inconclusiv
 candidates are validated when selected actions run, using TCP first and then UDP.
 
 Some uFace/TFT devices can accept the SDK enrollment command but keep the screen on a loading state
-instead of returning the registration events expected by `pyzk`. The HR app now clears stale
-capture/enrollment state before and after enrollment, reconnects to verify whether the template was
-saved, and retries the enrollment once with the alternate ZKT protocol when the first protocol did
-not save the selected finger.
+instead of returning the registration events expected by `pyzk`. The HR app now drives the remote
+fingerprint event loop itself, waits for the three accepted finger taps, clears stale
+capture/enrollment state before and after enrollment, reconnects with a short settling retry window
+to verify whether the template was saved, and retries the enrollment once with the alternate ZKT
+protocol when the first protocol did not save the selected finger.
 
 For uFace devices where remote fingerprint enrollment reaches the device screen but never returns
 fingerprint events to the SDK, HR can use **Enroll Face** directly. On Windows PCs that have the
@@ -77,6 +78,12 @@ official ZKTeco `zkemkeeper.dll` COM SDK registered, the app uses the official `
 face path and then verifies whether the face count increased. The app does not use pyzk face index
 `111` as a fallback on uFace devices because that firmware can open a stuck remote fingerprint
 screen instead of the face enrollment workflow.
+
+If **Enroll Face** reports that `zkemkeeper.dll` is not registered, install the official ZKTeco
+Standalone SDK on the HR Windows PC. Alternatively, place a licensed `zkemkeeper.dll` beside
+`StateLifeHREnrollment.exe` and run the EXE once as Administrator so it can register the COM class.
+For custom builds, set `ZKEMKEEPER_DLL=C:\path\to\zkemkeeper.dll` before running
+`installer\windows\build_hr.ps1`; the build will bundle that DLL next to the portable EXE payload.
 
 ## Shipping
 
