@@ -166,7 +166,9 @@ class HREnrollmentApp(tk.Tk):
         if manual or self.last_scan_signature is None:
             self._append_status(f"{label}...")
         self._set_scan_busy(True)
-        on_success = lambda devices: self._on_scan_complete(devices, manual=manual)
+
+        def on_success(devices: list[ScannedDevice]) -> None:
+            self._on_scan_complete(devices, manual=manual)
 
         def worker() -> None:
             try:
