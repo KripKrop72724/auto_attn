@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import struct
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -22,6 +24,7 @@ from zk_hr_enrollment.zkt import (
     FACE_TEMPLATE_ID,
     FingerTemplate,
     RuntimeDependencyError,
+    RemoteEnrollmentResult,
     ScannedDevice,
     ZKCommunicationError,
     ZKDeviceSession,
@@ -174,6 +177,82 @@ def test_zkt_enrollment_resets_capture_state_around_sdk_call():
     ]
 
 
+def test_zkt_fingerprint_enrollment_reads_three_tap_event_sequence():
+    class FakeSocket:
+        def __init__(self):
+            self.timeouts = []
+            self.packets = [
+                _event_packet(0),
+                _event_packet(0x64),
+                _event_packet(0),
+                _event_packet(0x64),
+                _event_packet(0),
+                _event_packet(0x64),
+                _event_packet(0),
+            ]
+
+        def gettimeout(self):
+            return 30
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def recv(self, _size):
+            if not self.packets:
+                raise socket.timeout()
+            return self.packets.pop(0)
+
+    class FakeConnection:
+        tcp = True
+
+        def __init__(self):
+            self.calls = []
+            self.sock = FakeSocket()
+            setattr(self, "_ZK__sock", self.sock)
+            setattr(self, "_ZK__send_command", self._send_command)
+            setattr(self, "_ZK__ack_ok", self._ack_ok)
+
+        def _send_command(self, command, command_string=b""):
+            self.calls.append(("send", command, command_string))
+            return {"status": True}
+
+        def _ack_ok(self):
+            self.calls.append("ack")
+
+        def free_data(self):
+            self.calls.append("free_data")
+
+        def cancel_capture(self):
+            self.calls.append("cancel_capture")
+
+        def cancel_enroll(self):
+            self.calls.append("cancel_enroll")
+
+        def verify_user(self):
+            self.calls.append("verify_user")
+
+        def enable_device(self):
+            self.calls.append("enable_device")
+
+        def reg_event(self, flags):
+            self.calls.append(("reg_event", flags))
+
+        def refresh_data(self):
+            self.calls.append("refresh_data")
+
+    conn = FakeConnection()
+    session = ZKDeviceSession(ip="192.168.110.137", port=4370, comm_key=1979, timeout=120)
+    session.conn = conn
+
+    result = session.enroll_finger(uid="7", user_id="7", finger_id=4)
+
+    assert isinstance(result, RemoteEnrollmentResult)
+    assert result.completed is True
+    assert result.event_codes == (0, 0x64, 0, 0x64, 0, 0x64, 0)
+    assert conn.calls.count("ack") == 7
+    assert conn.sock.timeouts[-1] == 30
+
+
 def test_zkt_face_enrollment_uses_face_template_id():
     class FakeConnection:
         def __init__(self):
@@ -310,6 +389,47 @@ def test_enrollment_timeout_reconnects_and_verifies_saved_template():
     assert outcome.sdk_result is None
     assert seen_timeouts == [120, 20]
     assert "reconnected and verified" in outcome.message
+
+
+def test_enrollment_timeout_retries_verification_until_device_is_idle():
+    first = FakeSession(
+        users=[EnrollmentUser(uid="7", user_id="7", name="MAsad-6110112009989", privilege="0")],
+        templates=[],
+        enroll_error=ZKCommunicationError("timed out"),
+    )
+    second = FakeSession(
+        users=first.users,
+        templates=[FingerTemplate(uid=7, fid=4, valid=1, size=1196)],
+    )
+    sessions = iter([first, BusySession(ZKCommunicationError("still loading")), second])
+    seen_timeouts = []
+
+    def session_factory(*_args, timeout: float):
+        seen_timeouts.append(timeout)
+        return next(sessions)
+
+    service = HREnrollmentService(
+        comm_key_provider=lambda: 1979,
+        session_factory=session_factory,
+        command_timeout=20,
+        enrollment_timeout=120,
+        verification_retry_delays=(0,),
+    )
+    record = EmployeeRecord(
+        uid="7",
+        user_id="7",
+        machine_name="MAsad-6110112009989",
+        cnic="6110112009989",
+        shift_worker=False,
+        privilege="0",
+        enrolled_fingers=[],
+    )
+
+    outcome = service.enroll_finger(DEVICE, record=record, finger_id=4)
+
+    assert outcome.success is True
+    assert outcome.after_fingers == [4]
+    assert seen_timeouts == [120, 20, 20]
 
 
 def test_enrollment_timeout_retries_alternate_protocol_when_template_not_saved():
@@ -687,3 +807,20 @@ class FakeSession:
             raise self.face_error
         self.faces += 1
         return self.face_result
+
+
+@dataclass
+class BusySession:
+    error: BaseException
+
+    def __enter__(self):
+        raise self.error
+
+    def __exit__(self, *_args):
+        return None
+
+
+def _event_packet(code: int, offset: int = 16) -> bytes:
+    data = bytearray(24)
+    struct.pack_into("H", data, offset, code)
+    return bytes(data)
