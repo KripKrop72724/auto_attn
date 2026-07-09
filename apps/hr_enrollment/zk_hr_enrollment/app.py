@@ -16,6 +16,10 @@ from zk_hr_enrollment.service import EmployeeRecord, HREnrollmentService
 from zk_hr_enrollment.zkt import ScannedDevice
 
 
+AUTO_SCAN_INITIAL_DELAY_MS = 1000
+AUTO_SCAN_INTERVAL_MS = 30000
+
+
 class HREnrollmentApp(tk.Tk):
     def __init__(self, service: HREnrollmentService | None = None) -> None:
         super().__init__()
@@ -24,6 +28,8 @@ class HREnrollmentApp(tk.Tk):
         self.current_record: EmployeeRecord | None = None
         self.task_queue: queue.Queue = queue.Queue()
         self.busy = False
+        self.scan_busy = False
+        self.last_scan_signature: tuple[str, ...] | None = None
 
         self.title(f"{BRAND_NAME} - {APP_NAME}")
         self.geometry("900x650")
@@ -40,6 +46,7 @@ class HREnrollmentApp(tk.Tk):
         self._build_ui()
         self._set_busy(False)
         self.after(100, self._poll_tasks)
+        self.after(AUTO_SCAN_INITIAL_DELAY_MS, self._auto_scan_devices)
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
@@ -137,12 +144,44 @@ class HREnrollmentApp(tk.Tk):
         self._append_status(f"{BRAND_NAME} HR enrollment is ready.")
 
     def scan_devices(self) -> None:
+        self._start_device_scan(manual=True)
+
+    def _auto_scan_devices(self) -> None:
+        self._start_device_scan(manual=False)
+        self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_devices)
+
+    def _start_device_scan(self, *, manual: bool) -> None:
+        if self.busy:
+            if manual:
+                self._append_status("Finish the current operation before scanning again.")
+            return
+        if self.scan_busy:
+            if manual:
+                self._append_status("A network scan is already running.")
+            return
+        if manual:
+            self.last_scan_signature = None
+            self._clear_scan_selection()
+        label = "Scanning network for ZKT devices"
+        if manual or self.last_scan_signature is None:
+            self._append_status(f"{label}...")
+        self._set_scan_busy(True)
+        on_success = lambda devices: self._on_scan_complete(devices, manual=manual)
+
+        def worker() -> None:
+            try:
+                self.task_queue.put(("scan_success", label, self.service.scan_devices(), on_success))
+            except Exception as exc:
+                self.task_queue.put(("scan_error", label, exc, manual))
+
+        threading.Thread(target=worker, name="hr-enrollment-network-scan", daemon=True).start()
+
+    def _clear_scan_selection(self) -> None:
         self.current_record = None
         self.devices = {}
         self.device_var.set("")
         self.device_combo["values"] = []
         self.finger_summary_var.set("No employee selected")
-        self._run_task("Scanning network for ZKT devices", self.service.scan_devices, self._on_scan_complete)
 
     def search_employee(self) -> None:
         device = self._selected_device()
@@ -204,22 +243,35 @@ class HREnrollmentApp(tk.Tk):
             self._on_enroll_complete,
         )
 
-    def _on_scan_complete(self, devices: list[ScannedDevice]) -> None:
+    def _on_scan_complete(self, devices: list[ScannedDevice], *, manual: bool = True) -> None:
+        previous_label = self.device_var.get()
+        previous_record = self.current_record
+        labels = tuple(device.label for device in devices)
+        changed = labels != self.last_scan_signature
+        self.last_scan_signature = labels
         self.devices = {device.label: device for device in devices}
         self.device_combo["values"] = list(self.devices)
         if devices:
-            self.device_var.set(devices[0].label)
-            validated = sum(1 for device in devices if device.validated)
-            if validated == len(devices):
-                self._append_status(f"Found {len(devices)} ZKT device(s). Select one to continue.")
+            if previous_label in self.devices:
+                self.device_var.set(previous_label)
             else:
+                self.device_var.set(devices[0].label)
+            validated = sum(1 for device in devices if device.validated)
+            if previous_record is not None and previous_label and previous_label != self.device_var.get():
+                self._clear_record("Selected device changed; search or create the employee again")
+            if validated == len(devices) and (manual or changed):
+                self._append_status(f"Found {len(devices)} ZKT device(s). Select one to continue.")
+            elif manual or changed:
                 self._append_status(
                     f"Found {len(devices)} open ZKT port candidate(s); {validated} validated now. "
                     "Unvalidated candidates can still be selected and will be tried with TCP then UDP."
                 )
         else:
             self.device_var.set("")
-            self._append_status("No open ZKT port candidates were found on the connected network.")
+            if previous_record is not None and previous_label:
+                self._clear_record("Selected device is no longer visible; search or create the employee again")
+            if manual or changed:
+                self._append_status("No open ZKT port candidates were found on the connected network.")
 
     def _on_search_complete(self, result) -> None:
         self.current_record = result.record if result.found else None
@@ -272,6 +324,9 @@ class HREnrollmentApp(tk.Tk):
         if self.busy:
             self._append_status("Another operation is already running.")
             return
+        if self.scan_busy:
+            self._append_status("A network scan is finishing. Try again in a moment.")
+            return
         self._append_status(f"{label}...")
         self._set_busy(True)
 
@@ -287,33 +342,50 @@ class HREnrollmentApp(tk.Tk):
         try:
             while True:
                 kind, label, payload, callback = self.task_queue.get_nowait()
-                self._set_busy(False)
-                if kind == "success":
+                if kind == "scan_success":
+                    self._set_scan_busy(False)
                     callback(payload)
-                else:
+                elif kind == "scan_error":
+                    self._set_scan_busy(False)
                     log_path = log_exception(label, payload)
                     message = friendly_exception_message(payload)
                     self._append_status(f"{label} failed: {message}")
-                    messagebox.showerror(BRAND_NAME, message_with_log(message, log_path))
+                    if callback:
+                        messagebox.showerror(BRAND_NAME, message_with_log(message, log_path))
+                else:
+                    self._set_busy(False)
+                    if kind == "success":
+                        callback(payload)
+                    else:
+                        log_path = log_exception(label, payload)
+                        message = friendly_exception_message(payload)
+                        self._append_status(f"{label} failed: {message}")
+                        messagebox.showerror(BRAND_NAME, message_with_log(message, log_path))
         except queue.Empty:
             pass
         self.after(100, self._poll_tasks)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
-        state = tk.DISABLED if busy else tk.NORMAL
-        for button in (
-            self.scan_button,
-            self.search_button,
-            self.create_button,
-            self.enroll_button,
-            self.face_button,
-        ):
-            button.configure(state=state)
-        combo_state = tk.DISABLED if busy else "readonly"
+        self._refresh_control_states()
+
+    def _set_scan_busy(self, busy: bool) -> None:
+        self.scan_busy = busy
+        self._refresh_control_states()
+
+    def _refresh_control_states(self) -> None:
+        action_blocked = self.busy or self.scan_busy
+        action_state = tk.DISABLED if action_blocked else tk.NORMAL
+        self.scan_button.configure(
+            state=action_state,
+            text="Scanning..." if self.scan_busy else "Scan Network",
+        )
+        for button in (self.search_button, self.create_button, self.enroll_button, self.face_button):
+            button.configure(state=action_state)
+        combo_state = tk.DISABLED if action_blocked else "readonly"
         for combo in (self.device_combo, self.finger_combo):
             combo.configure(state=combo_state)
-        entry_state = tk.DISABLED if busy else tk.NORMAL
+        entry_state = tk.DISABLED if self.busy else tk.NORMAL
         for widget in (self.cnic_entry, self.name_entry, self.shift_check):
             widget.configure(state=entry_state)
 
