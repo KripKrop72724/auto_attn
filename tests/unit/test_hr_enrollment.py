@@ -9,7 +9,8 @@ import pytest
 
 from zk_hr_enrollment import __main__ as hr_main
 from zk_hr_enrollment import zkt as zkt_module
-from zk_hr_enrollment.config import DEFAULT_COMM_KEY, CommKeyConfigError, read_comm_key
+from zk_hr_enrollment.app import AUTO_SCAN_INITIAL_DELAY_MS, AUTO_SCAN_INTERVAL_MS
+from zk_hr_enrollment.config import DEFAULT_COMM_KEY, read_comm_key
 from zk_hr_enrollment.identity import (
     build_machine_name,
     next_numeric_user_id,
@@ -44,14 +45,22 @@ DEVICE = ScannedDevice(
 )
 
 
-def test_comm_key_defaults_to_1979_and_rejects_invalid_file(tmp_path):
+def test_comm_key_is_fixed_to_1979_even_with_old_override_file(tmp_path):
+    assert DEFAULT_COMM_KEY == 1979
     assert read_comm_key(tmp_path / "missing.txt") == DEFAULT_COMM_KEY
 
-    invalid = tmp_path / "comm_key.txt"
-    invalid.write_text("not-a-number", encoding="utf-8")
+    old_override = tmp_path / "comm_key.txt"
+    old_override.write_text("1234", encoding="utf-8")
+    assert read_comm_key(old_override) == DEFAULT_COMM_KEY
 
-    with pytest.raises(CommKeyConfigError, match="hidden comm-key file is invalid"):
-        read_comm_key(invalid)
+    old_invalid_override = tmp_path / "invalid-comm-key.txt"
+    old_invalid_override.write_text("not-a-number", encoding="utf-8")
+    assert read_comm_key(old_invalid_override) == DEFAULT_COMM_KEY
+
+
+def test_hr_app_auto_scan_defaults_are_enabled():
+    assert AUTO_SCAN_INITIAL_DELAY_MS == 1000
+    assert AUTO_SCAN_INTERVAL_MS == 30000
 
 
 def test_machine_name_uses_alias_shift_marker_and_zkt_byte_limit():
