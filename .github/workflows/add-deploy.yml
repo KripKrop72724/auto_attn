@@ -9,16 +9,46 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: add-production
   cancel-in-progress: false
 
 jobs:
+  announce:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mark production deployment pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -nc \
+            --arg state pending \
+            --arg context 'ADD production deployment' \
+            --arg description 'Waiting for the self-hosted production runner' \
+            --arg target_url "$TARGET_URL" \
+            '{state: $state, context: $context, description: $description, target_url: $target_url}')"
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/statuses/$DEPLOY_SHA" \
+            --data "$payload"
+
   deploy:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    needs: announce
     # The repository has a single production server registered as a
     # self-hosted runner. Avoid host-OS labels so that server can claim the
     # deployment job regardless of its Linux architecture labels.
@@ -51,3 +81,38 @@ jobs:
       - name: Show diagnostics on failure
         if: failure()
         run: docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250
+
+  report:
+    if: always() && needs.announce.result == 'success'
+    needs: [announce, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish production deployment result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$DEPLOY_RESULT" = success ]; then
+            state=success
+            description='Production services are healthy on ports 8095 and 8096'
+          else
+            state=failure
+            description="Production deployment failed: $DEPLOY_RESULT"
+          fi
+          payload="$(jq -nc \
+            --arg state "$state" \
+            --arg context 'ADD production deployment' \
+            --arg description "$description" \
+            --arg target_url "$TARGET_URL" \
+            '{state: $state, context: $context, description: $description, target_url: $target_url}')"
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/statuses/$DEPLOY_SHA" \
+            --data "$payload"
