@@ -56,8 +56,19 @@ Create a root `.env.add` from `.env.add.example`, then run:
 ./deploy/add/deploy.sh
 ```
 
-The self-hosted GitHub runner loads its secret file from `$HOME/.config/auto-attn/add.env` by
-default. Set the repository variable `ADD_ENV_FILE` if the runner uses another absolute path.
+On the Windows production runner, use `deploy/add/deploy.ps1`. The runner service needs Docker
+named-pipe access once; from an Administrator PowerShell on that server run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\add\grant-runner-docker-access.ps1
+```
+
+The script grants Docker access only to the runner-specific local group, starts the Docker service
+when needed, and restarts the Actions runner so the new token membership takes effect.
+
+The self-hosted GitHub runner first checks the repository variable `ADD_ENV_FILE`, then its default
+`$HOME/.config/auto-attn/add.env` path, and finally the encrypted repository secret
+`ADD_ENV_FILE_CONTENT`. The temporary workspace copy is deleted after every deployment attempt.
 Public DNS/TLS should reverse proxy the two domains as shown in `deploy/add/Caddyfile.example`.
 The production routes are expected to terminate TLS before forwarding
 `attendancedevices.slichealth.com` to `127.0.0.1:8095` and `autoattn.slichealth.com` to
