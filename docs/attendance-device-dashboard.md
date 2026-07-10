@@ -63,8 +63,11 @@ named-pipe access once; from an Administrator PowerShell on that server run:
 powershell -ExecutionPolicy Bypass -File .\deploy\add\grant-runner-docker-access.ps1
 ```
 
-The script grants Docker access only to the runner-specific local group, starts the Docker service
-when needed, and restarts the Actions runner so the new token membership takes effect.
+The script verifies that the Actions service uses `NETWORK SERVICE`, grants that service account
+Docker named-pipe access, starts the Docker service when needed, and restarts the Actions runner so
+the new token membership takes effect. Windows does not permit nesting the runner-created local
+group inside the machine-local `docker-users` group. On a shared server, prefer reconfiguring the
+runner under a dedicated service account and add only that account to `docker-users`.
 
 The self-hosted GitHub runner first checks the repository variable `ADD_ENV_FILE`, then its default
 `$HOME/.config/auto-attn/add.env` path, and finally the encrypted repository secret
