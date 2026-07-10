@@ -49,12 +49,13 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     needs: announce
-    # The repository has a single production server registered as a
-    # self-hosted runner. Avoid host-OS labels so that server can claim the
-    # deployment job regardless of its Linux architecture labels.
-    runs-on: self-hosted
+    # WIN-80SOHNEH66P is the repository's production server runner.
+    runs-on: [self-hosted, Windows, X64]
     environment: add-production
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,23 +65,40 @@ jobs:
         env:
           CONFIGURED_ENV_FILE: ${{ vars.ADD_ENV_FILE }}
         run: |
-          set -euo pipefail
-          source_file="${CONFIGURED_ENV_FILE:-$HOME/.config/auto-attn/add.env}"
-          test -r "$source_file"
-          install -m 600 "$source_file" .env.add
+          $ErrorActionPreference = 'Stop'
+          if ($env:CONFIGURED_ENV_FILE) {
+            $sourceFile = $env:CONFIGURED_ENV_FILE
+          } else {
+            $sourceFile = Join-Path $HOME '.config\auto-attn\add.env'
+          }
+          if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+            throw "Protected ADD environment file is missing: $sourceFile"
+          }
+          Copy-Item -LiteralPath $sourceFile -Destination '.env.add' -Force
 
       - name: Deploy ports 8095 and 8096
-        run: ./deploy/add/deploy.sh
+        run: .\deploy\add\deploy.ps1
 
       - name: Verify ADD services
         run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8096/health/ready
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8095/health/live
+          $ErrorActionPreference = 'Stop'
+          & curl.exe --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8096/health/ready
+          if ($LASTEXITCODE -ne 0) { throw 'ADD backend readiness check failed' }
+          & curl.exe --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8095/health/live
+          if ($LASTEXITCODE -ne 0) { throw 'ADD frontend liveness check failed' }
 
       - name: Show diagnostics on failure
         if: failure()
-        run: docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250
+        run: |
+          if (Test-Path -LiteralPath '.env.add') {
+            docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250
+          } else {
+            Write-Host 'No workspace environment file was created; deployment stopped before Compose.'
+          }
+
+      - name: Remove workspace secret copy
+        if: always()
+        run: Remove-Item -LiteralPath '.env.add' -Force -ErrorAction SilentlyContinue
 
   report:
     if: always() && needs.announce.result == 'success'
