@@ -64,17 +64,27 @@ jobs:
       - name: Load deployment secrets
         env:
           CONFIGURED_ENV_FILE: ${{ vars.ADD_ENV_FILE }}
+          CONFIGURED_ENV_CONTENT: ${{ secrets.ADD_ENV_FILE_CONTENT }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:CONFIGURED_ENV_FILE) {
             $sourceFile = $env:CONFIGURED_ENV_FILE
-          } else {
+          } elseif (Test-Path -LiteralPath (Join-Path $HOME '.config\auto-attn\add.env') -PathType Leaf) {
             $sourceFile = Join-Path $HOME '.config\auto-attn\add.env'
+          } else {
+            $sourceFile = $null
           }
-          if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
-            throw "Protected ADD environment file is missing: $sourceFile"
+          if ($sourceFile) {
+            if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+              throw "Protected ADD environment file is missing: $sourceFile"
+            }
+            Copy-Item -LiteralPath $sourceFile -Destination '.env.add' -Force
+          } elseif ($env:CONFIGURED_ENV_CONTENT) {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText((Join-Path $PWD '.env.add'), $env:CONFIGURED_ENV_CONTENT, $utf8NoBom)
+          } else {
+            throw 'Neither ADD_ENV_FILE nor ADD_ENV_FILE_CONTENT is configured.'
           }
-          Copy-Item -LiteralPath $sourceFile -Destination '.env.add' -Force
 
       - name: Deploy ports 8095 and 8096
         run: .\deploy\add\deploy.ps1
