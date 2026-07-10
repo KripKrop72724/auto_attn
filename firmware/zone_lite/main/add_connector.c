@@ -324,7 +324,7 @@ static void heartbeat_task(void *arg)
             wifi_ap_record_t ap = {0};
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
-            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.0.0");
+            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.0.1");
             cJSON_AddNumberToObject(payload, "config_version", 2);
             cJSON_AddNumberToObject(payload, "uptime_seconds", (double)(esp_timer_get_time() / 1000000));
             cJSON_AddNumberToObject(payload, "rssi", rssi);
@@ -352,6 +352,8 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(zkt_json, "user_record_size", zkt.user_record_size);
             json_add_epoch(zkt_json, "backoff_until", zkt.backoff_until_epoch);
             json_add_epoch(zkt_json, "stability_since", zkt.stability_since_epoch);
+            json_add_epoch(zkt_json, "last_reconcile_at", zkt.last_reconcile_epoch);
+            json_add_epoch(zkt_json, "next_restart_at", zkt.next_restart_epoch);
             char *json = cJSON_PrintUnformatted(payload);
             cJSON_Delete(payload);
             if (json) {

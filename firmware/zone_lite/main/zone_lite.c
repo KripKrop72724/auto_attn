@@ -2269,6 +2269,55 @@ static bool daily_zkt_reboot_local_time(struct tm *local_time, int *local_day_ke
     return true;
 }
 
+static int64_t daily_zkt_reboot_next_epoch(void)
+{
+    if (!ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED || !system_time_is_valid()) {
+        return 0;
+    }
+
+    const int hours[] = {
+        ZONE_LITE_RESTART_SLOT_1_HOUR,
+        ZONE_LITE_RESTART_SLOT_2_HOUR,
+        ZONE_LITE_RESTART_SLOT_3_HOUR,
+    };
+    time_t utc_now = 0;
+    time(&utc_now);
+    int64_t offset_seconds = (int64_t)ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES * 60;
+    int64_t local_now = (int64_t)utc_now + offset_seconds;
+    int64_t local_day_start = local_now - (local_now % (24 * 60 * 60));
+    time_t local_clock = (time_t)local_now;
+    struct tm local_time = {0};
+    gmtime_r(&local_clock, &local_time);
+    int local_day_key = ((local_time.tm_year + 1900) * 1000) + local_time.tm_yday;
+    int64_t window_seconds = (int64_t)ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES * 60;
+    int64_t next_local = 0;
+
+    for (size_t i = 0; i < sizeof(hours) / sizeof(hours[0]); i++) {
+        if (hours[i] < 0 || hours[i] >= 24) continue;
+        int64_t scheduled_local = local_day_start + ((int64_t)hours[i] * 60 * 60);
+        int slot_key = local_day_key * 10 + (int)i;
+        if (window_seconds > 0 && scheduled_local <= local_now &&
+            local_now < scheduled_local + window_seconds &&
+            slot_key != g_daily_zkt_reboot_completed_day) {
+            // This slot is currently due (or awaiting its bounded retry).
+            return (int64_t)utc_now;
+        }
+        if (scheduled_local > local_now && (next_local == 0 || scheduled_local < next_local)) {
+            next_local = scheduled_local;
+        }
+    }
+
+    if (next_local == 0) {
+        int earliest_hour = 24;
+        for (size_t i = 0; i < sizeof(hours) / sizeof(hours[0]); i++) {
+            if (hours[i] >= 0 && hours[i] < earliest_hour) earliest_hour = hours[i];
+        }
+        if (earliest_hour >= 24) return 0;
+        next_local = local_day_start + (24 * 60 * 60) + ((int64_t)earliest_hour * 60 * 60);
+    }
+    return next_local - offset_seconds;
+}
+
 static int daily_zkt_reboot_slot_in_window(const struct tm *local_time)
 {
     const int hours[] = {
@@ -2368,6 +2417,8 @@ static bool daily_zkt_reboot_try_target(uint32_t target_ip, int local_day_key)
     }
 
     daily_zkt_reboot_mark_complete(local_day_key);
+    g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
+    add_connector_set_zkt(&g_add_zkt);
     ESP_LOGW(TAG, "Waiting %d ms after daily ZKT maintenance reboot", ZONE_LITE_ZKT_REBOOT_WAIT_MS);
     vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
     led_status_set(LED_STATUS_ZKT_DISCOVERING);
@@ -3118,6 +3169,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
     g_add_zkt.user_count = users;
     g_add_zkt.attendance_count = records;
     g_add_zkt.probe_latency_ms = (uint32_t)(uptime_ms() - probe_started_ms);
+    g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     ESP_LOGI(
         TAG,
         "Selected ZKT device %s:%d serial=%s name=%s platform=%s time=%s users=%ld records=%ld device_id=%s",
@@ -3428,15 +3480,39 @@ static int64_t gateway_run(uint32_t host_order_ip)
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, 3000, &sock)) return 0;
     zk_context_t ctx = {0};
     if (!zk_connect_and_auth(sock, &ctx)) { close(sock); return 0; }
-    zkt_mark_authenticated(host_order_ip, "live session authenticated");
-    led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
-    (void)zk_read_option(sock, &ctx, "~SerialNumber", g_device_serial, sizeof(g_device_serial));
+
+    char serial[80] = {0};
+    char device_name[80] = {0};
+    char platform[80] = {0};
+    char device_time[32] = {0};
+    char ip_text[16] = {0};
+    if (!zk_read_option(sock, &ctx, "~SerialNumber", serial, sizeof(serial))) {
+        add_connector_log("ERROR", "zkt", "ZKT_SERIAL_UNREADABLE", "Authenticated live session did not return a terminal serial");
+        zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
+    }
+    strlcpy(g_device_serial, serial, sizeof(g_device_serial));
     if (ZONE_LITE_ZKT_EXPECTED_SERIAL[0] != '\0' &&
         strcmp(g_device_serial, ZONE_LITE_ZKT_EXPECTED_SERIAL) != 0) {
         add_connector_log("CRITICAL", "zkt", "ZKT_SERIAL_CHANGED", "Live session serial changed after discovery; session rejected");
         zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
     }
+    if (g_add_zkt.model[0]) {
+        strlcpy(device_name, g_add_zkt.model, sizeof(device_name));
+    } else {
+        (void)zk_read_option(sock, &ctx, "~DeviceName", device_name, sizeof(device_name));
+    }
+    if (g_add_zkt.platform[0]) {
+        strlcpy(platform, g_add_zkt.platform, sizeof(platform));
+    } else {
+        (void)zk_read_option(sock, &ctx, "~Platform", platform, sizeof(platform));
+    }
+    (void)zk_get_time(sock, &ctx, device_time, sizeof(device_time));
+    ip_to_text(host_order_ip, ip_text, sizeof(ip_text));
     strlcpy(g_add_zkt.serial, g_device_serial, sizeof(g_add_zkt.serial));
+    strlcpy(g_add_zkt.model, device_name, sizeof(g_add_zkt.model));
+    strlcpy(g_add_zkt.platform, platform, sizeof(g_add_zkt.platform));
+    strlcpy(g_add_zkt.ip_address, ip_text, sizeof(g_add_zkt.ip_address));
+    if (device_time[0]) strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
     int32_t user_count = 0;
     int32_t records = 0;
     struct tm device_now = {0};
@@ -3445,7 +3521,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
     }
     g_add_zkt.user_count = user_count;
     g_add_zkt.attendance_count = records;
-    add_connector_set_zkt(&g_add_zkt);
+    g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
+    zkt_mark_authenticated(host_order_ip, "live session authenticated and identified");
+    led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     user_table_t *users = heap_caps_calloc(1, sizeof(user_table_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!users) users = calloc(1, sizeof(user_table_t));
     if (!users) {
@@ -3526,12 +3604,13 @@ static int64_t gateway_run(uint32_t host_order_ip)
 
         if (now_ms - last_time_sample >= 60000) {
             last_time_sample = now_ms;
+            g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
             char device_time[32] = {0};
             if (zk_get_time(sock, &ctx, device_time, sizeof(device_time))) {
                 strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
                 g_add_zkt.consecutive_successes++;
-                add_connector_set_zkt(&g_add_zkt);
             }
+            add_connector_set_zkt(&g_add_zkt);
         }
 
         if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
@@ -3555,6 +3634,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
             bool truth_due = last_synced_attendance_count < 0 ||
                 last_full_truth_reconcile == 0 ||
                 now_ms - last_full_truth_reconcile >= ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
+            bool reconcile_succeeded = true;
             if (counter_mismatch || truth_due) {
                 char reason[192];
                 snprintf(
@@ -3582,6 +3662,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     live_events_since_sync = 0;
                     last_full_truth_reconcile = now_ms;
                 } else {
+                    reconcile_succeeded = false;
                     add_connector_log(
                         "ERROR",
                         "reconcile",
@@ -3603,6 +3684,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
             }
             g_add_zkt.user_count = refreshed_users;
             g_add_zkt.attendance_count = refreshed_records;
+            if (reconcile_succeeded) g_add_zkt.last_reconcile_epoch = epoch_now();
             add_connector_set_zkt(&g_add_zkt);
             add_connector_set_activity("LIVE_CAPTURE");
             if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
@@ -3618,6 +3700,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_activity("SCHEDULED_RESTART");
             if (zk_protocol_restart(sock, &ctx)) {
                 daily_zkt_reboot_mark_complete(restart_slot);
+                g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
+                add_connector_set_zkt(&g_add_zkt);
                 add_connector_log("INFO", "zkt", "SCHEDULED_RESTART", "ZKT accepted its scheduled protocol restart");
                 restarted = true;
                 break;
@@ -3717,6 +3801,8 @@ static void gateway_task(void *arg)
             ESP_LOGW(TAG, "Waiting for Wi-Fi before ZKT discovery");
             (void)wait_for_wifi();
         }
+        g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
+        add_connector_set_zkt(&g_add_zkt);
         int daily_reboot_day = -1;
         if (daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
             if (daily_zkt_reboot_try_target(daily_zkt_reboot_target_ip(), daily_reboot_day)) {
@@ -3818,6 +3904,8 @@ void app_main(void)
         return;
     }
     (void)ensure_system_time_synced();
+    g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
+    add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");

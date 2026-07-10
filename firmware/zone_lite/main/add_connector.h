@@ -34,6 +34,8 @@ typedef struct {
     uint32_t user_record_size;
     int64_t backoff_until_epoch;
     int64_t stability_since_epoch;
+    int64_t last_reconcile_epoch;
+    int64_t next_restart_epoch;
 } add_zkt_telemetry_t;
 
 void add_connector_init(void);

@@ -68,7 +68,9 @@ def test_heartbeat_tracks_flapping_and_transition_history(db: Session):
             "user_record_size": 72,
         },
     )
-    result = update_heartbeat(db, connector=connector, boot_id="boot-1", sequence=1, payload=payload)
+    result = update_heartbeat(
+        db, connector=connector, boot_id="boot-1", sequence=1, payload=payload
+    )
     db.commit()
 
     assert result["state"] == "FLAPPING"
@@ -77,6 +79,64 @@ def test_heartbeat_tracks_flapping_and_transition_history(db: Session):
     assert transition and transition.to_state == "FLAPPING"
     alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
     assert alert and alert.severity == "WARNING"
+
+
+def test_heartbeat_tracks_reconcile_and_restart_schedule(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="zone-lite-2.0.1",
+        zkt={
+            "online": True,
+            "connection_state": "ONLINE",
+            "backoff_until": "2026-07-10T15:01:00Z",
+            "stability_since": "2026-07-10T15:02:00Z",
+            "last_reconcile_at": "2026-07-10T15:03:00Z",
+            "next_restart_at": "2026-07-10T17:00:00Z",
+        },
+    )
+    update_heartbeat(db, connector=connector, boot_id="boot-1", sequence=1, payload=payload)
+    db.commit()
+
+    zkt = connector.zkt_device
+    assert zkt.backoff_until.replace(tzinfo=timezone.utc) == datetime(
+        2026, 7, 10, 15, 1, tzinfo=timezone.utc
+    )
+    assert zkt.stability_since.replace(tzinfo=timezone.utc) == datetime(
+        2026, 7, 10, 15, 2, tzinfo=timezone.utc
+    )
+    assert zkt.last_reconcile_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 7, 10, 15, 3, tzinfo=timezone.utc
+    )
+    assert zkt.next_restart_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 7, 10, 17, 0, tzinfo=timezone.utc
+    )
+
+    # Current-state nulls clear, while an omitted last successful reconcile is
+    # intentionally retained across connector reboots.
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="boot-2",
+        sequence=2,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.0.1",
+            zkt={
+                "online": True,
+                "connection_state": "RECOVERING",
+                "backoff_until": None,
+                "stability_since": None,
+                "next_restart_at": None,
+            },
+        ),
+    )
+    db.commit()
+
+    assert zkt.backoff_until is None
+    assert zkt.stability_since is None
+    assert zkt.next_restart_at is None
+    assert zkt.last_reconcile_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 7, 10, 15, 3, tzinfo=timezone.utc
+    )
 
 
 def test_snapshot_admin_lease_and_durable_command_result(db: Session):

@@ -31,7 +31,7 @@ from zk_add.models import (
 from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
-from zk_common.time_utils import ensure_utc, utc_now
+from zk_common.time_utils import ensure_utc, parse_datetime, utc_now
 
 
 ACTIVE_COMMAND_STATES = {"QUEUED", "DISPATCHED", "ACKNOWLEDGED", "RUNNING"}
@@ -224,8 +224,12 @@ def update_heartbeat(
         previous_state = zkt.connection_state
         zkt.online = reported_state in {"ONLINE", "RECOVERING"}
         zkt.connection_state = reported_state
-        zkt.consecutive_failures = int(zkt_payload.get("consecutive_failures", zkt.consecutive_failures))
-        zkt.consecutive_successes = int(zkt_payload.get("consecutive_successes", zkt.consecutive_successes))
+        zkt.consecutive_failures = int(
+            zkt_payload.get("consecutive_failures", zkt.consecutive_failures)
+        )
+        zkt.consecutive_successes = int(
+            zkt_payload.get("consecutive_successes", zkt.consecutive_successes)
+        )
         zkt.flap_count_15m = int(zkt_payload.get("flap_count_15m", zkt.flap_count_15m))
         zkt.probe_latency_ms = zkt_payload.get("probe_latency_ms", zkt.probe_latency_ms)
         observed_record_size = zkt_payload.get("user_record_size")
@@ -243,7 +247,9 @@ def update_heartbeat(
         zkt.firmware_version = zkt_payload.get("firmware_version") or zkt.firmware_version
         zkt.user_count = zkt_payload.get("user_count", zkt.user_count)
         zkt.attendance_count = zkt_payload.get("attendance_count", zkt.attendance_count)
-        zkt.device_time_drift_seconds = zkt_payload.get("drift_seconds", zkt.device_time_drift_seconds)
+        zkt.device_time_drift_seconds = zkt_payload.get(
+            "drift_seconds", zkt.device_time_drift_seconds
+        )
         zkt.last_seen_at = now
         zkt.updated_at = now
         if reported_state in {"ONLINE", "RECOVERING"}:
@@ -251,12 +257,17 @@ def update_heartbeat(
             zkt.offline_since = None
         elif zkt.offline_since is None:
             zkt.offline_since = now
-        for field_name in ("backoff_until", "stability_since"):
-            value = zkt_payload.get(field_name)
-            if value:
-                from zk_common.time_utils import parse_datetime
-
-                setattr(zkt, field_name, parse_datetime(value))
+        # Null explicitly clears current-state timestamps. Omitted fields are
+        # left alone so older firmware cannot erase newer backend state.
+        for field_name in ("backoff_until", "stability_since", "next_restart_at"):
+            if field_name in zkt_payload:
+                value = zkt_payload[field_name]
+                setattr(zkt, field_name, parse_datetime(value) if value else None)
+        # A rebooted connector initially reports no completed reconcile. Keep
+        # the last known successful one until a newer success is reported.
+        last_reconcile = zkt_payload.get("last_reconcile_at")
+        if last_reconcile:
+            zkt.last_reconcile_at = parse_datetime(last_reconcile)
         if previous_state != reported_state:
             zkt.last_transition_at = now
             session.add(
@@ -274,14 +285,19 @@ def update_heartbeat(
         if reported_state == "FLAPPING":
             connector.lifecycle_state = "FLAPPING"
             connector.last_error_code = "ZKT_CONNECTION_FLAPPING"
-            connector.last_error_message = "ZKT connectivity is unstable; connector is in protective backoff."
+            connector.last_error_message = (
+                "ZKT connectivity is unstable; connector is in protective backoff."
+            )
             upsert_alert(
                 session,
                 connector,
                 code="ZKT_CONNECTION_FLAPPING",
                 severity="WARNING",
                 message=connector.last_error_message,
-                details={"flaps_15m": zkt.flap_count_15m, "backoff_until": zkt_payload.get("backoff_until")},
+                details={
+                    "flaps_15m": zkt.flap_count_15m,
+                    "backoff_until": zkt_payload.get("backoff_until"),
+                },
             )
         elif reported_state in {"OFFLINE", "RETRY_WAIT", "DISCOVERING"}:
             connector.lifecycle_state = "DEGRADED"
@@ -292,12 +308,8 @@ def update_heartbeat(
         sample = zkt_payload.get("device_time")
         sampled_at = zkt_payload.get("device_time_sampled_at")
         if sample:
-            from zk_common.time_utils import parse_datetime
-
             zkt.sampled_device_time = parse_datetime(sample)
         if sampled_at:
-            from zk_common.time_utils import parse_datetime
-
             zkt.device_time_sampled_at = parse_datetime(sampled_at)
         if zkt.sampled_device_time and zkt.device_time_sampled_at:
             zkt.device_time_drift_seconds = (
@@ -317,7 +329,9 @@ def update_heartbeat(
         if zkt.expected_serial and zkt.serial and zkt.expected_serial != zkt.serial:
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = "ZKT_SERIAL_MISMATCH"
-            connector.last_error_message = "Authenticated ZKT serial does not match the assigned device."
+            connector.last_error_message = (
+                "Authenticated ZKT serial does not match the assigned device."
+            )
             zkt.online = False
             upsert_alert(
                 session,
@@ -526,10 +540,7 @@ def ingest_logs(session: Session, *, connector: Connector, logs: list) -> int:
 
 def redact_context(value: dict) -> dict:
     blocked = {"password", "token", "secret", "comm_key", "cnic", "authorization"}
-    return {
-        key: "[REDACTED]" if key.lower() in blocked else item
-        for key, item in value.items()
-    }
+    return {key: "[REDACTED]" if key.lower() in blocked else item for key, item in value.items()}
 
 
 def redact_text(value: str) -> str:
@@ -579,7 +590,9 @@ def create_command(
         desired_state=desired_state,
         idempotency_key=idempotency_key,
         actor=actor,
-        expires_at=None if expires_in_seconds is None else now + timedelta(seconds=expires_in_seconds),
+        expires_at=None
+        if expires_in_seconds is None
+        else now + timedelta(seconds=expires_in_seconds),
     )
     session.add(command)
     session.flush()
@@ -707,18 +720,25 @@ def resolve_alert(session: Session, connector: Connector, *, code: str) -> None:
 
 def fleet_counts(session: Session) -> dict:
     rows = session.execute(
-        select(Connector.lifecycle_state, func.count(Connector.id)).group_by(Connector.lifecycle_state)
+        select(Connector.lifecycle_state, func.count(Connector.id)).group_by(
+            Connector.lifecycle_state
+        )
     ).all()
     counts = {state.lower(): count for state, count in rows}
     counts["total"] = sum(counts.values())
-    counts["open_alerts"] = session.scalar(
-        select(func.count(DeviceAlert.id)).where(DeviceAlert.state == "OPEN")
-    ) or 0
-    counts["active_leases"] = session.scalar(
-        select(func.count(TemporaryAdminLease.id)).where(
-            TemporaryAdminLease.state.in_(["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"])
+    counts["open_alerts"] = (
+        session.scalar(select(func.count(DeviceAlert.id)).where(DeviceAlert.state == "OPEN")) or 0
+    )
+    counts["active_leases"] = (
+        session.scalar(
+            select(func.count(TemporaryAdminLease.id)).where(
+                TemporaryAdminLease.state.in_(
+                    ["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]
+                )
+            )
         )
-    ) or 0
+        or 0
+    )
     return counts
 
 
@@ -831,7 +851,9 @@ def create_admin_lease(
     active = session.scalar(
         select(TemporaryAdminLease).where(
             TemporaryAdminLease.zkt_device_id == zkt.id,
-            TemporaryAdminLease.state.in_(["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]),
+            TemporaryAdminLease.state.in_(
+                ["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]
+            ),
         )
     )
     if active:

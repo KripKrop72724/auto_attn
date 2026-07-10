@@ -55,8 +55,9 @@
 #define ZONE_LITE_SNTP_SYNC_TIMEOUT_MS 15000
 #define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
 
-// Optional preventive maintenance reboot. When enabled, the ESP32 attempts one
-// telnet reboot of the ZKT device inside the local daily maintenance window.
+// Preventive maintenance restarts. When enabled, the ESP32 attempts an
+// authenticated protocol restart in each configured local-time window, with a
+// bounded recovery-channel fallback only when explicitly configured.
 #define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 0
 #define ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES 300
 #define ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES 30
