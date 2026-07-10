@@ -75,6 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare non-secret container build environment
+        run: install -m 600 .env.add.example .env.add
       - name: Validate Compose model
         run: docker compose --env-file .env.add.example -f docker-compose.add.yml config --quiet
       - name: Build ADD containers
