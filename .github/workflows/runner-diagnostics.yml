@@ -1,0 +1,55 @@
+name: Runner Diagnostics
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/runner-diagnostics.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-access:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 5
+    steps:
+      - name: Probe Docker endpoints without secrets
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host 'Identity:'
+          whoami
+          whoami /groups
+
+          Write-Host 'Docker services:'
+          Get-Service -Name '*docker*' -ErrorAction SilentlyContinue |
+            Select-Object Name, Status, StartType
+
+          Write-Host 'Docker contexts:'
+          docker context ls
+
+          Write-Host 'Visible Docker named pipes:'
+          Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*docker*' } |
+            Select-Object -ExpandProperty Name
+
+          Write-Host 'docker-users membership:'
+          Get-LocalGroupMember -Group 'docker-users' -ErrorAction SilentlyContinue |
+            Select-Object Name, ObjectClass, PrincipalSource
+
+          $endpoints = @(
+            'npipe:////./pipe/docker_engine',
+            'npipe:////./pipe/dockerDesktopLinuxEngine',
+            'tcp://127.0.0.1:2375'
+          )
+          foreach ($endpoint in $endpoints) {
+            $env:DOCKER_HOST = $endpoint
+            Write-Host "Testing $endpoint"
+            docker version --format '{{json .Server}}'
+            Write-Host "exit=$LASTEXITCODE"
+          }
+          Remove-Item Env:DOCKER_HOST -ErrorAction SilentlyContinue
+
+          Write-Host 'TCP 2375 listening:'
+          Test-NetConnection -ComputerName 127.0.0.1 -Port 2375 -InformationLevel Quiet
