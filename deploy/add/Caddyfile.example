@@ -1,0 +1,7 @@
+attendancedevices.slichealth.com {
+    reverse_proxy 127.0.0.1:8095
+}
+
+autoattn.slichealth.com {
+    reverse_proxy 127.0.0.1:8096
+}

@@ -1,0 +1,81 @@
+name: ADD CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/add_backend/**"
+      - "apps/add_frontend/**"
+      - "firmware/zone_lite/**"
+      - "docker-compose.add.yml"
+      - "pyproject.toml"
+      - "tests/unit/test_add_backend.py"
+      - ".github/workflows/add-*.yml"
+  pull_request:
+    paths:
+      - "apps/add_backend/**"
+      - "apps/add_frontend/**"
+      - "firmware/zone_lite/**"
+      - "docker-compose.add.yml"
+      - "pyproject.toml"
+      - "tests/unit/test_add_backend.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: add-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m ruff check apps/add_backend tests/unit/test_add_backend.py
+      - run: python -m pytest -q tests/unit/test_add_backend.py
+        env:
+          ADD_PII_FERNET_KEY: 8Fc5uXV7nq_f54kj7ny7QpOqOM9S7AdHfWvk9v7VgjQ=
+          ADD_PII_LOOKUP_KEY: ci-only-lookup-key
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/add_frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: corepack enable && corepack prepare pnpm@11.7.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ESP32-S3 firmware with ESP-IDF 5.5.3
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project/firmware/zone_lite
+          espressif/idf:v5.5.3
+          idf.py build
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose model
+        run: docker compose --env-file .env.add.example -f docker-compose.add.yml config --quiet
+      - name: Build ADD containers
+        run: docker compose --env-file .env.add.example -f docker-compose.add.yml build

@@ -1,0 +1,53 @@
+name: Deploy ADD
+
+on:
+  workflow_run:
+    workflows: ["ADD CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: add-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    # The repository has a single production server registered as a
+    # self-hosted runner. Avoid host-OS labels so that server can claim the
+    # deployment job regardless of its Linux architecture labels.
+    runs-on: self-hosted
+    environment: add-production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Load deployment secrets
+        env:
+          CONFIGURED_ENV_FILE: ${{ vars.ADD_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          source_file="${CONFIGURED_ENV_FILE:-$HOME/.config/auto-attn/add.env}"
+          test -r "$source_file"
+          install -m 600 "$source_file" .env.add
+
+      - name: Deploy ports 8095 and 8096
+        run: ./deploy/add/deploy.sh
+
+      - name: Verify ADD services
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8096/health/ready
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8095/health/live
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250

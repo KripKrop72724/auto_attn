@@ -9,6 +9,7 @@
 #define ZONE_LITE_ZKT_PORT 4370
 #define ZONE_LITE_ZKT_COMM_KEY 0
 #define ZONE_LITE_ZKT_PREFERRED_IP "0.0.0.0"
+#define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
 #define ZONE_LITE_ZONE_DEVICE_ID "1"
 #define ZONE_LITE_ZONE_ID "SLIC-TOWER-11-FLOOR"
 #define ZONE_LITE_ZONE_NAME "SLIC-TOWER-11-FLOOR"
@@ -28,11 +29,26 @@
 // When NULL, firmware uses the ESP-IDF built-in certificate bundle.
 #define ZONE_LITE_ORDS_CA_CERT_PEM NULL
 
+// ADD uses an outbound-only TLS WebSocket. Provision each connector with its own token.
+#define ZONE_LITE_ADD_ENABLED 0
+#define ZONE_LITE_ADD_WS_URL "wss://autoattn.example.com/device/v1/stream?connector_id=replace-me"
+#define ZONE_LITE_ADD_CONNECTOR_ID "replace-me"
+#define ZONE_LITE_ADD_DEVICE_TOKEN "replace-me"
+#define ZONE_LITE_ADD_HEARTBEAT_SECONDS 15
+#define ZONE_LITE_ADD_RECONNECT_MS 30000
+
 // Discovery scans the DHCP subnet and accepts the first host that passes
 // ZKT CMD_CONNECT + Comm Key authentication.
 #define ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS 450
 #define ZONE_LITE_DISCOVERY_RETRY_DELAY_MS 15000
-#define ZONE_LITE_RECONCILE_INTERVAL_MS 60000
+#define ZONE_LITE_DISCOVERY_FULL_SCAN_INTERVAL_MS (15 * 60 * 1000)
+#define ZONE_LITE_RECONCILE_INTERVAL_MS (15 * 60 * 1000)
+#define ZONE_LITE_FULL_TRUTH_RECONCILE_MS (6 * 60 * 60 * 1000LL)
+#define ZONE_LITE_RECOVERY_STABILITY_MS (2 * 60 * 1000)
+#define ZONE_LITE_FLAP_WINDOW_MS (15 * 60 * 1000)
+#define ZONE_LITE_FLAP_THRESHOLD 3
+#define ZONE_LITE_FLAP_QUIET_MS (5 * 60 * 1000)
+#define ZONE_LITE_ZKT_BACKOFF_MAX_MS (10 * 60 * 1000)
 #define ZONE_LITE_ZKT_USER_REFRESH_RETRIES 3
 #define ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS 2000
 #define ZONE_LITE_SNTP_SERVER "pool.ntp.org"
@@ -42,18 +58,19 @@
 // Optional preventive maintenance reboot. When enabled, the ESP32 attempts one
 // telnet reboot of the ZKT device inside the local daily maintenance window.
 #define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 0
-#define ZONE_LITE_DAILY_ZKT_REBOOT_HOUR 3
-#define ZONE_LITE_DAILY_ZKT_REBOOT_MINUTE 0
 #define ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES 300
 #define ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES 30
 #define ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS (5 * 60 * 1000)
+#define ZONE_LITE_RESTART_SLOT_1_HOUR 2
+#define ZONE_LITE_RESTART_SLOT_2_HOUR 12
+#define ZONE_LITE_RESTART_SLOT_3_HOUR 22
 
 // ESP32-S3-DevKitC-1 onboard addressable RGB LED. If a board revision or clone
 // uses a different RGB pin, override only ZONE_LITE_LED_GPIO in local config.
 #define ZONE_LITE_LED_ENABLED 1
 #define ZONE_LITE_LED_GPIO 48
 #define ZONE_LITE_LED_BRIGHTNESS 96
-#define ZONE_LITE_LED_FAULT_LATCH_MS 180000
+#define ZONE_LITE_LED_FAULT_LATCH_MS (2 * 60 * 1000)
 #define ZONE_LITE_LED_ACTIVITY_FLASH_MS 250
 
 // Optional ZKT OS recovery. Keep disabled unless the attendance device has a

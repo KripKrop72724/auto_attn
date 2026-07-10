@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -27,11 +28,13 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 #include "mbedtls/sha256.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #if __has_include("zone_lite_config.h")
@@ -41,6 +44,7 @@
 #endif
 
 #include "led_status.h"
+#include "add_connector.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -96,9 +100,13 @@
 #ifndef ZONE_LITE_MIN_VALID_UNIX_TIME
 #define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
 #endif
+#ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
+#define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
+#endif
 
 #define CMD_OPTIONS_RRQ 11
 #define CMD_USERTEMP_RRQ 9
+#define CMD_USER_WRQ 8
 #define CMD_ATTLOG_RRQ 13
 #define CMD_GET_FREE_SIZES 50
 #define CMD_STARTVERIFY 60
@@ -107,6 +115,7 @@
 #define CMD_REG_EVENT 500
 #define CMD_CONNECT 1000
 #define CMD_EXIT 1001
+#define CMD_RESTART 1004
 #define CMD_AUTH 1102
 #define CMD_FREE_DATA 1502
 #define CMD_READ_WITH_BUFFER 1503
@@ -135,7 +144,8 @@
 #define PENDING_BACKUP_PATH STORAGE_BASE "/pending.bak"
 #define BLOCKED_PATH STORAGE_BASE "/blocked_identity.jsonl"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
-#define MAX_USERS 512
+#define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
+#define MAX_USERS 2048
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
@@ -156,23 +166,57 @@
 #ifndef ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS
 #define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
 #endif
+#ifndef ZONE_LITE_ORDS_CA_CERT_PEM
+#define ZONE_LITE_ORDS_CA_CERT_PEM NULL
+#endif
 #ifndef ZONE_LITE_ZKT_USER_REFRESH_RETRIES
 #define ZONE_LITE_ZKT_USER_REFRESH_RETRIES 3
 #endif
 #ifndef ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS
 #define ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS 2000
 #endif
+#ifndef ZONE_LITE_DISCOVERY_FULL_SCAN_INTERVAL_MS
+#define ZONE_LITE_DISCOVERY_FULL_SCAN_INTERVAL_MS (15 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_RECOVERY_STABILITY_MS
+#define ZONE_LITE_RECOVERY_STABILITY_MS (2 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_FLAP_WINDOW_MS
+#define ZONE_LITE_FLAP_WINDOW_MS (15 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_FLAP_THRESHOLD
+#define ZONE_LITE_FLAP_THRESHOLD 3
+#endif
+#ifndef ZONE_LITE_FLAP_QUIET_MS
+#define ZONE_LITE_FLAP_QUIET_MS (5 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_ZKT_BACKOFF_MAX_MS
+#define ZONE_LITE_ZKT_BACKOFF_MAX_MS (10 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_RESTART_SLOT_1_HOUR
+#define ZONE_LITE_RESTART_SLOT_1_HOUR 2
+#endif
+#ifndef ZONE_LITE_RESTART_SLOT_2_HOUR
+#define ZONE_LITE_RESTART_SLOT_2_HOUR 12
+#endif
+#ifndef ZONE_LITE_RESTART_SLOT_3_HOUR
+#define ZONE_LITE_RESTART_SLOT_3_HOUR 22
+#endif
+#ifndef ZONE_LITE_FULL_TRUTH_RECONCILE_MS
+#define ZONE_LITE_FULL_TRUTH_RECONCILE_MS (6 * 60 * 60 * 1000LL)
+#endif
 #define ZKT_IO_TIMEOUT_SEC 8
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
 #define ZKT_KEEPALIVE_COUNT 3
-#define ZKT_LIVE_REREGISTER_INTERVAL_MS (10 * 60 * 1000)
+#define ZKT_LIVE_REREGISTER_INTERVAL_MS (30 * 60 * 1000)
 #define ZKT_DISCOVERY_RESTART_AFTER_FAILURES 5
 #define ZKT_TELNET_BUFFER_SIZE 768
 #define ZKT_TELNET_IO_TIMEOUT_MS 5000
 
 static const char *TAG = "zone_lite";
 static EventGroupHandle_t wifi_event_group;
+static SemaphoreHandle_t g_storage_lock;
 static int wifi_retry_count;
 
 typedef struct {
@@ -208,11 +252,17 @@ typedef struct {
     char employee_name[64];
     char cnic[16];
     bool raw_punch;
+    uint8_t privilege;
+    char password[9];
+    uint32_t card;
+    char group_id[8];
+    uint8_t record_size;
 } zkt_user_t;
 
 typedef struct {
     zkt_user_t rows[MAX_USERS];
     size_t count;
+    uint8_t record_size;
 } user_table_t;
 
 typedef struct {
@@ -238,8 +288,135 @@ static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITI
 static bool g_truth_reconcile_warning;
 static int g_daily_zkt_reboot_completed_day = -1;
 static int64_t g_daily_zkt_reboot_last_attempt_ms;
+static int64_t g_last_full_scan_ms;
+static int64_t g_flap_window_started_ms;
+static int64_t g_session_stable_since_ms;
+static add_zkt_telemetry_t g_add_zkt;
+static bool g_temp_admin_active;
+static uint16_t g_temp_admin_uid;
+static int64_t g_temp_admin_expires_epoch;
 
 static bool oracle_send_reconcile(char **events, size_t count, int year, int month);
+
+static int64_t uptime_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static int64_t epoch_now(void)
+{
+    time_t now = 0;
+    time(&now);
+    return (int64_t)now;
+}
+
+static void nvs_save_runtime_state(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("zone_lite", NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    (void)nvs_set_u32(handle, "zkt_ip", g_last_authenticated_zkt_ip);
+    (void)nvs_set_i32(handle, "restart_slot", g_daily_zkt_reboot_completed_day);
+    (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
+    (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
+    (void)nvs_set_i64(handle, "lease_exp", g_temp_admin_expires_epoch);
+    (void)nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void nvs_load_runtime_state(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("zone_lite", NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    uint8_t active = 0;
+    int32_t restart_slot = -1;
+    (void)nvs_get_u32(handle, "zkt_ip", &g_last_authenticated_zkt_ip);
+    if (nvs_get_i32(handle, "restart_slot", &restart_slot) == ESP_OK) {
+        g_daily_zkt_reboot_completed_day = (int)restart_slot;
+    }
+    (void)nvs_get_u8(handle, "lease_active", &active);
+    (void)nvs_get_u16(handle, "lease_uid", &g_temp_admin_uid);
+    (void)nvs_get_i64(handle, "lease_exp", &g_temp_admin_expires_epoch);
+    g_temp_admin_active = active != 0;
+    nvs_close(handle);
+}
+
+static void zkt_publish_state(const char *state, const char *reason, bool online)
+{
+    strlcpy(g_add_zkt.connection_state, state, sizeof(g_add_zkt.connection_state));
+    strlcpy(g_add_zkt.transition_reason, reason ? reason : "", sizeof(g_add_zkt.transition_reason));
+    g_add_zkt.online = online;
+    add_connector_set_zkt(&g_add_zkt);
+    add_connector_set_activity(state);
+}
+
+static void zkt_count_transition(void)
+{
+    int64_t now_ms = uptime_ms();
+    if (g_flap_window_started_ms == 0 || now_ms - g_flap_window_started_ms > ZONE_LITE_FLAP_WINDOW_MS) {
+        g_flap_window_started_ms = now_ms;
+        g_add_zkt.flap_count_15m = 0;
+    }
+    g_add_zkt.flap_count_15m++;
+}
+
+static uint32_t zkt_failure_backoff_ms(void)
+{
+    uint32_t shift = g_add_zkt.consecutive_failures > 6 ? 6 : g_add_zkt.consecutive_failures;
+    uint32_t value = ZONE_LITE_DISCOVERY_RETRY_DELAY_MS << (shift > 0 ? shift - 1 : 0);
+    if (value > ZONE_LITE_ZKT_BACKOFF_MAX_MS) value = ZONE_LITE_ZKT_BACKOFF_MAX_MS;
+    value += esp_random() % 5000;
+    if (g_add_zkt.flap_count_15m >= ZONE_LITE_FLAP_THRESHOLD && value < ZONE_LITE_FLAP_QUIET_MS) {
+        value = ZONE_LITE_FLAP_QUIET_MS + (esp_random() % 30000);
+    }
+    return value;
+}
+
+static uint32_t zkt_mark_failure(const char *reason)
+{
+    bool was_online = g_add_zkt.online || strcmp(g_add_zkt.connection_state, "RECOVERING") == 0;
+    if (was_online) zkt_count_transition();
+    g_add_zkt.online = false;
+    g_add_zkt.consecutive_failures++;
+    g_add_zkt.consecutive_successes = 0;
+    uint32_t backoff = zkt_failure_backoff_ms();
+    int64_t epoch = epoch_now();
+    g_add_zkt.backoff_until_epoch = epoch > 1700000000 ? epoch + (backoff / 1000) : 0;
+    if (g_add_zkt.flap_count_15m >= ZONE_LITE_FLAP_THRESHOLD) {
+        zkt_publish_state("FLAPPING", reason, false);
+        led_status_set(LED_STATUS_ZKT_FLAPPING);
+    } else if (g_add_zkt.consecutive_failures == 1) {
+        zkt_publish_state("SUSPECT", reason, false);
+    } else {
+        zkt_publish_state("RETRY_WAIT", reason, false);
+    }
+    add_connector_log("WARN", "zkt", "ZKT_CONNECTION_LOST", reason);
+    return backoff;
+}
+
+static void zkt_mark_authenticated(uint32_t ip, const char *reason)
+{
+    if (!g_add_zkt.online) zkt_count_transition();
+    g_add_zkt.consecutive_successes++;
+    g_add_zkt.consecutive_failures = 0;
+    g_add_zkt.backoff_until_epoch = 0;
+    g_session_stable_since_ms = uptime_ms();
+    g_add_zkt.stability_since_epoch = epoch_now();
+    g_last_authenticated_zkt_ip = ip;
+    nvs_save_runtime_state();
+    zkt_publish_state("RECOVERING", reason, true);
+}
+
+static void zkt_mark_stable(void)
+{
+    if (strcmp(g_add_zkt.connection_state, "ONLINE") == 0) return;
+    g_add_zkt.consecutive_successes = g_add_zkt.consecutive_successes < 3 ? 3 : g_add_zkt.consecutive_successes;
+    zkt_publish_state("ONLINE", "stable authenticated session", true);
+    add_connector_log("INFO", "zkt", "ZKT_STABLE", "ZKT session passed the recovery stability window");
+}
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -858,6 +1035,16 @@ static void zk_disconnect(int sock, zk_context_t *ctx)
     (void)zk_send_command(sock, ctx, CMD_EXIT, NULL, 0, rx, sizeof(rx), &response);
 }
 
+static bool zk_protocol_restart(int sock, zk_context_t *ctx)
+{
+    uint8_t rx[128];
+    zk_response_t response = {0};
+    bool ok = zk_send_command(sock, ctx, CMD_RESTART, NULL, 0, rx, sizeof(rx), &response) &&
+              response.code == CMD_ACK_OK;
+    ESP_LOGW(TAG, "ZKT protocol restart response=%u ok=%s", response.code, ok ? "true" : "false");
+    return ok;
+}
+
 static bool tcp_connect_with_timeout(uint32_t host_order_ip, uint16_t port, int timeout_ms, int *out_sock)
 {
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -1064,14 +1251,11 @@ static uint32_t configured_preferred_zkt_ip(void)
 
 static uint32_t zkt_recovery_target_ip(void)
 {
-    if (g_last_authenticated_zkt_ip != 0 && g_last_zkt_tcp_candidate_ip != 0) {
-        return g_last_zkt_tcp_candidate_ip;
-    }
+    // Never issue an OS-level recovery command to a merely open TCP candidate.
+    // Only an IP that previously completed ZKT authentication is eligible.
+    if (g_last_authenticated_zkt_ip != 0) return g_last_authenticated_zkt_ip;
     uint32_t preferred = configured_preferred_zkt_ip();
-    if (preferred != 0) {
-        return preferred;
-    }
-    return g_last_authenticated_zkt_ip;
+    return preferred != 0 && preferred == g_last_authenticated_zkt_ip ? preferred : 0;
 }
 
 static bool maybe_reboot_zkt_for_recovery(uint32_t discovery_failures, int64_t *last_reboot_ms)
@@ -1213,6 +1397,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
         return false;
     }
     uint32_t parsed_users = total_size / packet_size;
+    users->record_size = (uint8_t)packet_size;
     if (parsed_users != (uint32_t)user_count) {
         ESP_LOGW(
             TAG,
@@ -1229,16 +1414,26 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
         if (packet_size == 28 && remain >= 28) {
             zkt_user_t *u = &users->rows[users->count++];
             snprintf(u->uid, sizeof(u->uid), "%u", read_le16(p));
+            u->privilege = p[2];
+            copy_zk_string(u->password, sizeof(u->password), p + 3, 5);
             copy_zk_string(u->name, sizeof(u->name), p + 8, 8);
+            u->card = read_le32(p + 16);
+            snprintf(u->group_id, sizeof(u->group_id), "%u", p[21]);
             snprintf(u->user_id, sizeof(u->user_id), "%lu", (unsigned long)read_le32(p + 24));
+            u->record_size = 28;
             parse_machine_identity(u);
             p += 28;
             remain -= 28;
         } else if (packet_size == 72 && remain >= 72) {
             zkt_user_t *u = &users->rows[users->count++];
             snprintf(u->uid, sizeof(u->uid), "%u", read_le16(p));
+            u->privilege = p[2];
+            copy_zk_string(u->password, sizeof(u->password), p + 3, 8);
             copy_zk_string(u->name, sizeof(u->name), p + 11, 24);
+            u->card = read_le32(p + 35);
+            copy_zk_string(u->group_id, sizeof(u->group_id), p + 40, 7);
             copy_zk_string(u->user_id, sizeof(u->user_id), p + 48, 24);
+            u->record_size = 72;
             parse_machine_identity(u);
             p += 72;
             remain -= 72;
@@ -1253,7 +1448,8 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
 
 static bool zk_refresh_users_preserving_current(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
 {
-    user_table_t *updated = calloc(1, sizeof(user_table_t));
+    user_table_t *updated = heap_caps_calloc(1, sizeof(user_table_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (updated == NULL) updated = calloc(1, sizeof(user_table_t));
     if (updated == NULL) {
         ESP_LOGW(TAG, "Could not allocate temporary ZKT user table for refresh");
         return false;
@@ -1266,29 +1462,108 @@ static bool zk_refresh_users_preserving_current(int sock, zk_context_t *ctx, use
     return ok;
 }
 
-static bool zk_refresh_users_after_count_change(
+static zkt_user_t *find_mutable_user_by_uid(user_table_t *users, const char *uid)
+{
+    for (size_t i = 0; i < users->count; i++) {
+        if (strcmp(users->rows[i].uid, uid) == 0) return &users->rows[i];
+    }
+    return NULL;
+}
+
+static bool zk_write_user(
     int sock,
     zk_context_t *ctx,
-    user_table_t *users,
-    int32_t old_count,
-    int32_t new_count)
+    zkt_user_t *user,
+    const char *new_name,
+    int new_privilege)
 {
-    ESP_LOGI(TAG, "ZKT user count changed %ld -> %ld; refreshing user cache", (long)old_count, (long)new_count);
-    led_status_set(LED_STATUS_SYNCING);
-    for (int attempt = 1; attempt <= ZONE_LITE_ZKT_USER_REFRESH_RETRIES; attempt++) {
-        if (zk_refresh_users_preserving_current(sock, ctx, users, new_count)) {
-            return true;
-        }
-        ESP_LOGW(
-            TAG,
-            "ZKT user refresh attempt %d/%d failed after count change",
-            attempt,
-            ZONE_LITE_ZKT_USER_REFRESH_RETRIES);
-        if (attempt < ZONE_LITE_ZKT_USER_REFRESH_RETRIES) {
-            vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_USER_REFRESH_RETRY_DELAY_MS));
-        }
+    if (!user || (new_privilege != 0 && new_privilege != 14)) return false;
+    const char *name = new_name && new_name[0] ? new_name : user->name;
+    size_t name_limit = user->record_size == 28 ? 8 : 24;
+    if (strlen(name) > name_limit) {
+        ESP_LOGW(TAG, "Refusing user write: name is too wide for %u-byte record", user->record_size);
+        return false;
     }
-    return false;
+    uint8_t packet[72] = {0};
+    uint16_t uid = (uint16_t)strtoul(user->uid, NULL, 10);
+    write_le16(packet, uid);
+    packet[2] = (uint8_t)new_privilege;
+    if (user->record_size == 28) {
+        memcpy(packet + 3, user->password, strnlen(user->password, 5));
+        memcpy(packet + 8, name, strlen(name));
+        write_le32(packet + 16, user->card);
+        packet[21] = (uint8_t)strtoul(user->group_id, NULL, 10);
+        write_le32(packet + 24, (uint32_t)strtoul(user->user_id, NULL, 10));
+    } else if (user->record_size == 72) {
+        memcpy(packet + 3, user->password, strnlen(user->password, 8));
+        memcpy(packet + 11, name, strlen(name));
+        write_le32(packet + 35, user->card);
+        memcpy(packet + 40, user->group_id, strnlen(user->group_id, 7));
+        memcpy(packet + 48, user->user_id, strnlen(user->user_id, 24));
+    } else {
+        return false;
+    }
+    uint8_t rx[1024];
+    zk_response_t response = {0};
+    if (!zk_send_command(
+            sock,
+            ctx,
+            CMD_USER_WRQ,
+            packet,
+            user->record_size,
+            rx,
+            sizeof(rx),
+            &response) || response.code != CMD_ACK_OK) {
+        ESP_LOGW(TAG, "ZKT user write failed uid=%s response=%u", user->uid, response.code);
+        return false;
+    }
+    user->privilege = (uint8_t)new_privilege;
+    strlcpy(user->name, name, sizeof(user->name));
+    parse_machine_identity(user);
+    return true;
+}
+
+static void iso_system_now(char out[32])
+{
+    time_t now = 0;
+    time(&now);
+    struct tm value = {0};
+    gmtime_r(&now, &value);
+    strftime(out, 32, "%Y-%m-%dT%H:%M:%SZ", &value);
+}
+
+static bool add_send_user_snapshot(const user_table_t *users)
+{
+    cJSON *payload = cJSON_CreateObject();
+    if (!payload) return false;
+    char snapshot_id[80];
+    snprintf(
+        snapshot_id,
+        sizeof(snapshot_id),
+        "snapshot-%08lx-%08lx",
+        (unsigned long)epoch_now(),
+        (unsigned long)esp_random());
+    char observed[32];
+    iso_system_now(observed);
+    cJSON_AddStringToObject(payload, "snapshot_id", snapshot_id);
+    cJSON_AddBoolToObject(payload, "complete", true);
+    cJSON_AddStringToObject(payload, "observed_at", observed);
+    cJSON *rows = cJSON_AddArrayToObject(payload, "users");
+    for (size_t i = 0; i < users->count; i++) {
+        const zkt_user_t *user = &users->rows[i];
+        cJSON *row = cJSON_CreateObject();
+        cJSON_AddStringToObject(row, "uid", user->uid);
+        cJSON_AddStringToObject(row, "user_id", user->user_id);
+        cJSON_AddStringToObject(row, "name", user->name);
+        cJSON_AddNumberToObject(row, "privilege", user->privilege);
+        cJSON_AddNumberToObject(row, "card", user->card);
+        cJSON_AddItemToArray(rows, row);
+    }
+    char *json = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    bool ok = json && add_connector_send_payload("user_snapshot", json);
+    free(json);
+    return ok;
 }
 
 static const zkt_user_t *find_user_by_user_id(const user_table_t *users, const char *user_id)
@@ -1399,26 +1674,26 @@ static bool seen_add(const char *uid)
     return false;
 }
 
-static void append_line(const char *path, const char *line)
+static bool append_line(const char *path, const char *line)
 {
     FILE *f = fopen(path, "a");
     if (f == NULL) {
         ESP_LOGE(TAG, "Could not open %s for append", path);
-        return;
+        return false;
     }
-    fputs(line, f);
-    fputc('\n', f);
-    fclose(f);
+    bool ok = fputs(line, f) >= 0 && fputc('\n', f) != EOF && fflush(f) == 0;
+    if (ok && fsync(fileno(f)) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) ESP_LOGE(TAG, "Durable append failed for %s errno=%d", path, errno);
+    return ok;
 }
 
-static void append_line_to_open_file(FILE *f, const char *path, const char *line)
+static bool append_line_to_open_file(FILE *f, const char *path, const char *line)
 {
     if (f != NULL) {
-        fputs(line, f);
-        fputc('\n', f);
-        return;
+        return fputs(line, f) >= 0 && fputc('\n', f) != EOF;
     }
-    append_line(path, line);
+    return append_line(path, line);
 }
 
 static bool extract_event_uid(const char *line, char uid[65])
@@ -1565,7 +1840,41 @@ typedef enum {
     ENQUEUE_DUPLICATE = 0,
     ENQUEUE_PENDING,
     ENQUEUE_BLOCKED,
+    ENQUEUE_STORAGE_ERROR,
 } enqueue_result_t;
+
+static bool add_send_attendance_event(const attendance_event_t *event, const char *capturetype)
+{
+    cJSON *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "batch_id", event->event_uid);
+    cJSON *events = cJSON_AddArrayToObject(payload, "events");
+    cJSON *row = cJSON_CreateObject();
+    cJSON_AddStringToObject(row, "event_uid", event->event_uid);
+    cJSON_AddStringToObject(row, "user_id", event->user_id);
+    char raw_name[128];
+    if (event->cnic[0]) {
+        snprintf(raw_name, sizeof(raw_name), "%s%s-%s", event->employee_name, event->raw_punch ? "-S" : "", event->cnic);
+        cJSON_AddStringToObject(row, "raw_name", raw_name);
+    } else if (event->employee_name[0]) {
+        cJSON_AddStringToObject(row, "raw_name", event->employee_name);
+    }
+    cJSON_AddStringToObject(row, "device_event_time", event->timestamp);
+    char captured[32];
+    iso_system_now(captured);
+    cJSON_AddStringToObject(row, "captured_at", captured);
+    cJSON_AddStringToObject(row, "source", capturetype);
+    cJSON_AddNumberToObject(row, "status", event->status);
+    cJSON_AddNumberToObject(row, "punch", event->punch);
+    cJSON_AddBoolToObject(row, "raw_punch", event->raw_punch);
+    cJSON_AddStringToObject(row, "clock_quality", "OK");
+    cJSON_AddItemToObject(row, "raw_event", cJSON_CreateObject());
+    cJSON_AddItemToArray(events, row);
+    char *json = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    bool ok = json && add_connector_enqueue_attendance(json);
+    free(json);
+    return ok;
+}
 
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
@@ -1582,27 +1891,47 @@ static enqueue_result_t enqueue_event_to_files(
     }
     enqueue_result_t result = ENQUEUE_PENDING;
     if (event->cnic[0] == '\0') {
-        append_line_to_open_file(blocked_file, BLOCKED_PATH, json);
+        if (!append_line_to_open_file(blocked_file, BLOCKED_PATH, json)) {
+            free(json);
+            led_status_fault(LED_STATUS_FATAL);
+            return ENQUEUE_STORAGE_ERROR;
+        }
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
         result = ENQUEUE_BLOCKED;
         if (strcmp(capturetype, "LIVE") == 0) {
             ESP_LOGW(TAG, "Blocked LIVE identity user_id=%s event_uid=%s", event->user_id, event->event_uid);
         }
     } else {
-        append_line_to_open_file(pending_file, PENDING_PATH, json);
+        if (!append_line_to_open_file(pending_file, PENDING_PATH, json)) {
+            free(json);
+            led_status_fault(LED_STATUS_FATAL);
+            return ENQUEUE_STORAGE_ERROR;
+        }
         led_status_set_backlog(true);
         if (strcmp(capturetype, "LIVE") == 0) {
             ESP_LOGI(TAG, "Queued LIVE event_uid=%s user_id=%s raw=%s", event->event_uid, event->user_id, event->raw_punch ? "T" : "F");
         }
     }
-    seen_add(event->event_uid);
+    if (!seen_add(event->event_uid)) {
+        ESP_LOGW(TAG, "Event persisted but volatile dedup cache could not record %s", event->event_uid);
+    }
+    if (!add_send_attendance_event(event, capturetype)) {
+        ESP_LOGE(TAG, "Attendance persisted for ORDS but could not be added to the independent ADD outbox");
+        led_status_fault(LED_STATUS_FATAL);
+    }
     free(json);
     return result;
 }
 
 static enqueue_result_t enqueue_event(const attendance_event_t *event, const char *capturetype)
 {
-    return enqueue_event_to_files(event, capturetype, NULL, NULL);
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Could not lock durable attendance outbox");
+        return ENQUEUE_STORAGE_ERROR;
+    }
+    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL);
+    xSemaphoreGive(g_storage_lock);
+    return result;
 }
 
 static bool build_attendance_event(
@@ -1646,19 +1975,21 @@ static bool zk_timestamp_in_month(uint32_t timestamp, int year, int month)
     return decoded.tm_year + 1900 == year && decoded.tm_mon + 1 == month;
 }
 
-static size_t reconcile_attendance_dump(
+static bool reconcile_attendance_dump(
     int sock,
     zk_context_t *ctx,
     const user_table_t *users,
     int32_t records,
     const char *capturetype,
     int filter_year,
-    int filter_month)
+    int filter_month,
+    size_t *added_out)
 {
+    if (added_out) *added_out = 0;
     uint8_t *data = NULL;
     size_t len = 0;
     if (records <= 0) {
-        return 0;
+        return true;
     }
     int32_t refreshed_users = 0;
     int32_t refreshed_records = 0;
@@ -1674,7 +2005,7 @@ static size_t reconcile_attendance_dump(
     if (!zk_read_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &data, &len) || len < 4) {
         ESP_LOGW(TAG, "Could not read attendance dump");
         free(data);
-        return 0;
+        return false;
     }
     uint32_t total_size = read_le32(data);
     static const uint32_t attendance_record_sizes[] = {40, 16, 8};
@@ -1686,7 +2017,7 @@ static size_t reconcile_attendance_dump(
     if (record_size == 0) {
         ESP_LOGW(TAG, "Unsupported ZKT attendance table size total=%lu records=%ld", (unsigned long)total_size, (long)records);
         free(data);
-        return 0;
+        return false;
     }
     uint32_t parsed_records = total_size / record_size;
     if (parsed_records != (uint32_t)records) {
@@ -1720,6 +2051,11 @@ static size_t reconcile_attendance_dump(
         (unsigned long)record_size,
         filter_year,
         filter_month);
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Skipping reconcile because attendance storage is busy");
+        free(data);
+        return false;
+    }
     FILE *pending_file = fopen(PENDING_PATH, "a");
     if (pending_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", PENDING_PATH);
@@ -1811,11 +2147,16 @@ static size_t reconcile_attendance_dump(
         }
     }
     if (pending_file != NULL) {
+        (void)fflush(pending_file);
+        (void)fsync(fileno(pending_file));
         fclose(pending_file);
     }
     if (blocked_file != NULL) {
+        (void)fflush(blocked_file);
+        (void)fsync(fileno(blocked_file));
         fclose(blocked_file);
     }
+    xSemaphoreGive(g_storage_lock);
     free(data);
     if (truth_enabled) {
         if (truth_overflow) {
@@ -1853,7 +2194,8 @@ static size_t reconcile_attendance_dump(
         (unsigned)filtered,
         (unsigned)skipped,
         (unsigned)truth_count);
-    return added;
+    if (added_out) *added_out = added;
+    return true;
 }
 
 static bool system_time_is_valid(void)
@@ -1927,23 +2269,23 @@ static bool daily_zkt_reboot_local_time(struct tm *local_time, int *local_day_ke
     return true;
 }
 
-static bool daily_zkt_reboot_in_window(const struct tm *local_time)
+static int daily_zkt_reboot_slot_in_window(const struct tm *local_time)
 {
-    int scheduled_minute = (ZONE_LITE_DAILY_ZKT_REBOOT_HOUR * 60) + ZONE_LITE_DAILY_ZKT_REBOOT_MINUTE;
+    const int hours[] = {
+        ZONE_LITE_RESTART_SLOT_1_HOUR,
+        ZONE_LITE_RESTART_SLOT_2_HOUR,
+        ZONE_LITE_RESTART_SLOT_3_HOUR,
+    };
     int local_minute = (local_time->tm_hour * 60) + local_time->tm_min;
     int window_minutes = ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES;
-    if (scheduled_minute < 0 || scheduled_minute >= 24 * 60 || window_minutes <= 0) {
-        return false;
+    if (window_minutes <= 0) return -1;
+    for (size_t i = 0; i < sizeof(hours) / sizeof(hours[0]); i++) {
+        int scheduled_minute = hours[i] * 60;
+        if (scheduled_minute < 0 || scheduled_minute >= 24 * 60) continue;
+        int elapsed = local_minute - scheduled_minute;
+        if (elapsed >= 0 && elapsed < window_minutes) return (int)i;
     }
-    if (window_minutes >= 24 * 60) {
-        return true;
-    }
-
-    int elapsed = local_minute - scheduled_minute;
-    if (elapsed < 0) {
-        elapsed += 24 * 60;
-    }
-    return elapsed >= 0 && elapsed < window_minutes;
+    return -1;
 }
 
 static bool daily_zkt_reboot_should_attempt(int *local_day_key)
@@ -1953,9 +2295,12 @@ static bool daily_zkt_reboot_should_attempt(int *local_day_key)
     if (!daily_zkt_reboot_local_time(&local_time, &day_key)) {
         return false;
     }
-    if (day_key == g_daily_zkt_reboot_completed_day || !daily_zkt_reboot_in_window(&local_time)) {
+    int slot = daily_zkt_reboot_slot_in_window(&local_time);
+    if (slot < 0 || g_temp_admin_active) {
         return false;
     }
+    int slot_key = day_key * 10 + slot;
+    if (slot_key == g_daily_zkt_reboot_completed_day) return false;
 
     int64_t now_ms = esp_timer_get_time() / 1000;
     int64_t retry_delay_ms = ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS;
@@ -1969,21 +2314,22 @@ static bool daily_zkt_reboot_should_attempt(int *local_day_key)
 
     g_daily_zkt_reboot_last_attempt_ms = now_ms;
     if (local_day_key != NULL) {
-        *local_day_key = day_key;
+        *local_day_key = slot_key;
     }
     ESP_LOGW(
         TAG,
         "Daily ZKT maintenance reboot due at local %02d:%02d day=%d",
         local_time.tm_hour,
         local_time.tm_min,
-        day_key);
+        slot_key);
     return true;
 }
 
 static void daily_zkt_reboot_mark_complete(int local_day_key)
 {
     g_daily_zkt_reboot_completed_day = local_day_key;
-    ESP_LOGW(TAG, "Daily ZKT maintenance reboot completed for local day=%d", local_day_key);
+    nvs_save_runtime_state();
+    ESP_LOGW(TAG, "Scheduled ZKT maintenance reboot completed for slot=%d", local_day_key);
 }
 
 static uint32_t daily_zkt_reboot_target_ip(void)
@@ -2006,9 +2352,18 @@ static bool daily_zkt_reboot_try_target(uint32_t target_ip, int local_day_key)
     ip_to_text(target_ip, ip_text, sizeof(ip_text));
     ESP_LOGW(TAG, "Starting daily ZKT maintenance reboot for %s", ip_text);
     led_status_set(LED_STATUS_RECOVERY_REBOOT);
-    if (!zkt_telnet_reboot(target_ip)) {
+    int sock = -1;
+    zk_context_t ctx = {0};
+    bool restarted = tcp_connect_with_timeout(target_ip, ZONE_LITE_ZKT_PORT, 3000, &sock) &&
+                     zk_connect_and_auth(sock, &ctx) && zk_protocol_restart(sock, &ctx);
+    if (sock >= 0) close(sock);
+    if (!restarted && target_ip == g_last_authenticated_zkt_ip) {
+        ESP_LOGW(TAG, "Authenticated protocol restart failed; attempting configured recovery channel");
+        restarted = zkt_telnet_reboot(target_ip);
+    }
+    if (!restarted) {
         led_status_fault(LED_STATUS_ZKT_FAILURE);
-        ESP_LOGW(TAG, "Daily ZKT maintenance reboot failed for %s", ip_text);
+        ESP_LOGW(TAG, "Scheduled ZKT maintenance reboot failed for %s", ip_text);
         return false;
     }
 
@@ -2047,24 +2402,50 @@ static void ords_mark_failure(void)
     ESP_LOGW(TAG, "ORDS send failed; retrying in %lu ms", (unsigned long)backoff_ms);
 }
 
-static int http_post_json(const char *url, const char *json, char **response_body)
-{
-    if (!ensure_system_time_synced()) {
-        return -1;
-    }
-    log_system_time("HTTPS system UTC time");
-    ESP_LOGI(
-        TAG,
-        "HTTPS payload=%u heap_internal=%u heap_psram=%u",
-        (unsigned)strlen(json),
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} http_response_buffer_t;
 
+static esp_err_t http_capture_event(esp_http_client_event_t *event)
+{
+    http_response_buffer_t *buffer = event ? event->user_data : NULL;
+    if (!buffer || event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
+    size_t available = buffer->capacity > buffer->length ? buffer->capacity - buffer->length - 1 : 0;
+    size_t copy = (size_t)event->data_len < available ? (size_t)event->data_len : available;
+    if (copy > 0) {
+        memcpy(buffer->data + buffer->length, event->data, copy);
+        buffer->length += copy;
+        buffer->data[buffer->length] = '\0';
+    }
+    return ESP_OK;
+}
+
+static int http_post_json_with_tls_source(
+    const char *url,
+    const char *json,
+    char **response_body,
+    const char *ca_cert_pem,
+    const char *tls_source)
+{
+    http_response_buffer_t captured = {
+        .data = response_body ? calloc(1, 8192) : NULL,
+        .capacity = response_body ? 8192 : 0,
+    };
     esp_http_client_config_t cfg = {
         .url = url,
         .timeout_ms = ZONE_LITE_ORDS_TIMEOUT_MS,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = http_capture_event,
+        .user_data = &captured,
     };
+    if (ca_cert_pem != NULL && ca_cert_pem[0] != '\0') {
+        cfg.cert_pem = ca_cert_pem;
+    } else {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    ESP_LOGI(TAG, "HTTPS trust source: %s", tls_source);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
         return -1;
@@ -2076,17 +2457,48 @@ static int http_post_json(const char *url, const char *json, char **response_bod
     esp_http_client_set_post_field(client, json, strlen(json));
     esp_err_t err = esp_http_client_perform(client);
     int status = err == ESP_OK ? esp_http_client_get_status_code(client) : -1;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTPS POST failed using %s: %s", tls_source, esp_err_to_name(err));
+    }
     if (response_body != NULL) {
-        int len = esp_http_client_get_content_length(client);
-        if (len > 0 && len < 8192) {
-            *response_body = calloc(1, len + 1);
-            if (*response_body != NULL) {
-                (void)esp_http_client_read_response(client, *response_body, len);
-            }
+        if (err == ESP_OK && captured.data != NULL) {
+            *response_body = captured.data;
+            captured.data = NULL;
+        } else {
+            *response_body = NULL;
         }
     }
+    free(captured.data);
     esp_http_client_cleanup(client);
     return status;
+}
+
+static int http_post_json(const char *url, const char *json, char **response_body)
+{
+    if (response_body != NULL) {
+        *response_body = NULL;
+    }
+    if (!ensure_system_time_synced()) {
+        return -1;
+    }
+    log_system_time("HTTPS system UTC time");
+    ESP_LOGI(
+        TAG,
+        "HTTPS payload=%u heap_internal=%u heap_psram=%u",
+        (unsigned)strlen(json),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    const char *ords_ca_cert_pem = ZONE_LITE_ORDS_CA_CERT_PEM;
+    if (ords_ca_cert_pem != NULL && ords_ca_cert_pem[0] != '\0') {
+        int status = http_post_json_with_tls_source(url, json, response_body, ords_ca_cert_pem, "configured ORDS CA");
+        if (status >= 0) {
+            return status;
+        }
+        ESP_LOGW(TAG, "Configured ORDS CA failed; retrying with ESP-IDF certificate bundle");
+    }
+
+    return http_post_json_with_tls_source(url, json, response_body, NULL, "ESP-IDF certificate bundle");
 }
 
 static bool oracle_success_body(const char *body)
@@ -2104,13 +2516,27 @@ static bool oracle_success_body(const char *body)
     return ok;
 }
 
+static bool oracle_duplicate_body(const char *body)
+{
+    if (!body || !body[0]) return false;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) return false;
+    cJSON *duplicate = cJSON_GetObjectItemCaseSensitive(root, "duplicate");
+    cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+    bool ok = cJSON_IsTrue(duplicate) ||
+              (cJSON_IsString(status) && strcasecmp(status->valuestring, "duplicate") == 0);
+    cJSON_Delete(root);
+    return ok;
+}
+
 static bool oracle_send_live(const char *event_json)
 {
     char url[256];
     snprintf(url, sizeof(url), "%s/raw-captures", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
     int status = http_post_json(url, event_json, &body);
-    bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
+    bool ok = (status == 409 && oracle_duplicate_body(body)) ||
+              ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS live status=%d ok=%s", status, ok ? "true" : "false");
     if (ok) {
         ords_mark_success();
@@ -2190,7 +2616,13 @@ static bool oracle_send_bulk(char **events, size_t count)
         return true;
     }
     char batch_uid[64];
-    snprintf(batch_uid, sizeof(batch_uid), "ZONE-ORDS-%lld", (long long)(esp_timer_get_time() / 1000));
+    snprintf(
+        batch_uid,
+        sizeof(batch_uid),
+        "Z-%08lx-%08lx-%08lx",
+        (unsigned long)epoch_now(),
+        (unsigned long)(esp_timer_get_time() / 1000),
+        (unsigned long)esp_random());
     char *payload = build_bulk_payload(events, count, batch_uid);
     if (payload == NULL) {
         return false;
@@ -2199,7 +2631,8 @@ static bool oracle_send_bulk(char **events, size_t count)
     snprintf(url, sizeof(url), "%s/raw-captures/bulk", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
     int status = http_post_json(url, payload, &body);
-    bool ok = status == 409 || ((status == 200 || status == 201) && oracle_success_body(body));
+    bool ok = (status == 409 && oracle_duplicate_body(body)) ||
+              ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS bulk count=%u status=%d ok=%s", (unsigned)count, status, ok ? "true" : "false");
     if (ok) {
         ords_mark_success();
@@ -2482,7 +2915,7 @@ static bool replace_pending_with_backup(void)
     return false;
 }
 
-static void oracle_drain_pending(bool live_first)
+static void oracle_drain_pending_locked(bool live_first)
 {
     if (!file_has_nonempty_line(PENDING_PATH)) {
         led_status_set_backlog(false);
@@ -2622,8 +3055,27 @@ static void oracle_drain_pending(bool live_first)
     free(bulk);
 }
 
+static void oracle_drain_pending(bool live_first)
+{
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return;
+    oracle_drain_pending_locked(live_first);
+    xSemaphoreGive(g_storage_lock);
+}
+
+static void ords_uploader_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
+            oracle_drain_pending(true);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
 {
+    int64_t probe_started_ms = uptime_ms();
     int sock = -1;
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS, &sock)) {
         return false;
@@ -2652,6 +3104,20 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
     (void)zk_get_time(sock, &ctx, device_time, sizeof(device_time));
     (void)zk_get_counts(sock, &ctx, &users, &records);
     snprintf(g_device_serial, sizeof(g_device_serial), "%s", serial[0] ? serial : "unknown");
+    if (ZONE_LITE_ZKT_EXPECTED_SERIAL[0] != '\0' &&
+        strcmp(g_device_serial, ZONE_LITE_ZKT_EXPECTED_SERIAL) != 0) {
+        ESP_LOGE(TAG, "Rejecting authenticated ZKT %s because serial %s does not match assignment", ip_text, g_device_serial);
+        add_connector_log("CRITICAL", "zkt", "ZKT_SERIAL_MISMATCH", "Authenticated terminal serial does not match the connector assignment");
+        goto done;
+    }
+    strlcpy(g_add_zkt.serial, g_device_serial, sizeof(g_add_zkt.serial));
+    strlcpy(g_add_zkt.model, device_name, sizeof(g_add_zkt.model));
+    strlcpy(g_add_zkt.platform, platform, sizeof(g_add_zkt.platform));
+    strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+    strlcpy(g_add_zkt.ip_address, ip_text, sizeof(g_add_zkt.ip_address));
+    g_add_zkt.user_count = users;
+    g_add_zkt.attendance_count = records;
+    g_add_zkt.probe_latency_ms = (uint32_t)(uptime_ms() - probe_started_ms);
     ESP_LOGI(
         TAG,
         "Selected ZKT device %s:%d serial=%s name=%s platform=%s time=%s users=%ld records=%ld device_id=%s",
@@ -2665,21 +3131,22 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
         (long)records,
         ZONE_LITE_ZONE_DEVICE_ID);
     *selected_ip = host_order_ip;
-    g_last_authenticated_zkt_ip = host_order_ip;
+    zkt_mark_authenticated(host_order_ip, "authenticated discovery probe");
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     ok = true;
 
 done:
-    if (ok) {
+    if (ctx.session_id != 0) {
         zk_disconnect(sock, &ctx);
     }
     close(sock);
     return ok;
 }
 
-static bool discover_zkt(uint32_t *selected_ip)
+static bool discover_zkt(uint32_t *selected_ip, uint32_t skip_ip)
 {
     led_status_set(LED_STATUS_ZKT_DISCOVERING);
+    zkt_publish_state("DISCOVERING", "searching for authenticated ZKT terminal", false);
     g_last_zkt_tcp_candidate_ip = 0;
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip_info;
@@ -2697,15 +3164,30 @@ static bool discover_zkt(uint32_t *selected_ip)
         host_count = 254;
     }
     uint32_t preferred = configured_preferred_zkt_ip();
-    if (preferred != 0 && preferred != own_ip && preferred != ntohl(ip_info.gw.addr)) {
+    if (preferred != 0 && preferred != skip_ip && preferred != own_ip && preferred != ntohl(ip_info.gw.addr)) {
         ESP_LOGI(TAG, "Trying preferred ZKT IP %s:%d", ZONE_LITE_ZKT_PREFERRED_IP, ZONE_LITE_ZKT_PORT);
         if (probe_zkt_device(preferred, selected_ip)) {
             return true;
         }
     }
+    if (g_last_authenticated_zkt_ip != 0 && g_last_authenticated_zkt_ip != skip_ip &&
+        g_last_authenticated_zkt_ip != preferred &&
+        g_last_authenticated_zkt_ip != own_ip && g_last_authenticated_zkt_ip != ntohl(ip_info.gw.addr)) {
+        char last_ip[16];
+        ip_to_text(g_last_authenticated_zkt_ip, last_ip, sizeof(last_ip));
+        ESP_LOGI(TAG, "Trying last authenticated ZKT IP %s:%d", last_ip, ZONE_LITE_ZKT_PORT);
+        if (probe_zkt_device(g_last_authenticated_zkt_ip, selected_ip)) return true;
+    }
+    int64_t now_ms = uptime_ms();
+    if (g_last_full_scan_ms > 0 && now_ms - g_last_full_scan_ms < ZONE_LITE_DISCOVERY_FULL_SCAN_INTERVAL_MS) {
+        ESP_LOGI(TAG, "Skipping full subnet scan during protective discovery interval");
+        return false;
+    }
+    g_last_full_scan_ms = now_ms;
     ESP_LOGI(TAG, "Scanning %lu hosts for ZKT TCP port %d", (unsigned long)host_count, ZONE_LITE_ZKT_PORT);
     for (uint32_t candidate = network + 1; candidate < broadcast; candidate++) {
-        if (candidate == own_ip || candidate == ntohl(ip_info.gw.addr) || candidate == preferred) {
+        if (candidate == own_ip || candidate == ntohl(ip_info.gw.addr) ||
+            candidate == preferred || candidate == skip_ip) {
             continue;
         }
         if (probe_zkt_device(candidate, selected_ip)) {
@@ -2716,9 +3198,9 @@ static bool discover_zkt(uint32_t *selected_ip)
     return false;
 }
 
-static bool process_live_packet(const uint8_t *data, size_t len, const user_table_t *users)
+static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users)
 {
-    bool any = false;
+    size_t observed = 0;
     while (len >= 12) {
         char user_id[32] = "";
         uint8_t status = 0;
@@ -2752,10 +3234,10 @@ static bool process_live_packet(const uint8_t *data, size_t len, const user_tabl
             if (result == ENQUEUE_PENDING) {
                 led_status_event(LED_EVENT_LIVE_PUNCH);
             }
-            any = true;
+            observed++;
         }
     }
-    return any;
+    return observed;
 }
 
 static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
@@ -2779,210 +3261,381 @@ static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
     return true;
 }
 
-static void gateway_run(uint32_t host_order_ip)
+static bool command_was_processed(const char *command_id)
 {
+    FILE *file = fopen(PROCESSED_COMMANDS_PATH, "r");
+    if (!file) return false;
+    char line[96];
+    bool found = false;
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, command_id) == 0) { found = true; break; }
+    }
+    fclose(file);
+    return found;
+}
+
+static void mark_command_processed(const char *command_id)
+{
+    if (!command_was_processed(command_id)) (void)append_line(PROCESSED_COMMANDS_PATH, command_id);
+}
+
+static void temp_admin_clear(void)
+{
+    g_temp_admin_active = false;
+    g_temp_admin_uid = 0;
+    g_temp_admin_expires_epoch = 0;
+    nvs_save_runtime_state();
+}
+
+static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *users)
+{
+    if (!g_temp_admin_active) return true;
+    int64_t now = epoch_now();
+    if (now >= ZONE_LITE_MIN_VALID_UNIX_TIME && now < g_temp_admin_expires_epoch) return true;
+    char uid[16];
+    snprintf(uid, sizeof(uid), "%u", g_temp_admin_uid);
+    zkt_user_t *user = find_mutable_user_by_uid(users, uid);
+    if (!user) {
+        add_connector_log("CRITICAL", "enrollment", "LEASE_USER_MISSING", "Temporary administrator user is missing from the terminal snapshot");
+        return false;
+    }
+    if (user->privilege == 0 || zk_write_user(sock, ctx, user, NULL, 0)) {
+        temp_admin_clear();
+        add_connector_log("INFO", "enrollment", "LEASE_REVOKED_LOCAL", "Temporary administrator privilege was revoked by the ESP watchdog");
+        return true;
+    }
+    add_connector_log("CRITICAL", "enrollment", "LEASE_REVOKE_FAILED", "Temporary administrator privilege could not be revoked; retrying");
+    led_status_fault(LED_STATUS_FATAL);
+    return false;
+}
+
+static bool process_add_commands(
+    int sock,
+    zk_context_t *ctx,
+    user_table_t *users,
+    int32_t *user_count)
+{
+    add_command_t command;
+    while (add_connector_take_command(&command)) {
+        if (command_was_processed(command.command_id)) {
+            char duplicate_result[192] = "{\"duplicate\":true}";
+            if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
+                g_temp_admin_active && g_temp_admin_uid == (uint16_t)strtoul(command.uid, NULL, 10)) {
+                snprintf(
+                    duplicate_result,
+                    sizeof(duplicate_result),
+                    "{\"duplicate\":true,\"verified_privilege\":14,\"expires_epoch\":%lld}",
+                    (long long)g_temp_admin_expires_epoch);
+            }
+            (void)add_connector_command_update(command.command_id, "SUCCEEDED", NULL, NULL, duplicate_result);
+            continue;
+        }
+        (void)add_connector_command_update(command.command_id, "RUNNING", NULL, NULL, "{}");
+        bool ok = false;
+        const char *error_code = "COMMAND_UNSUPPORTED";
+        const char *error_message = "The requested command is not supported by this firmware.";
+        char result[192] = "{}";
+        if (strcmp(command.command_type, "REFRESH_USERS") == 0) {
+            int32_t records = 0;
+            if (zk_get_counts(sock, ctx, user_count, &records) &&
+                zk_refresh_users_preserving_current(sock, ctx, users, *user_count)) {
+                g_add_zkt.user_count = *user_count;
+                g_add_zkt.attendance_count = records;
+                add_connector_set_zkt(&g_add_zkt);
+                ok = add_send_user_snapshot(users);
+                if (!ok) {
+                    error_code = "ADD_SNAPSHOT_SEND_FAILED";
+                    error_message = "User snapshot was read but could not be delivered to ADD.";
+                }
+            } else {
+                error_code = "ZKT_USER_READ_FAILED";
+                error_message = "The terminal user table could not be read and verified.";
+            }
+        } else if (strcmp(command.command_type, "UPDATE_USER") == 0 ||
+                   strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 ||
+                   strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0) {
+            zkt_user_t *user = find_mutable_user_by_uid(users, command.uid);
+            if (!user) {
+                error_code = "USER_NOT_FOUND";
+                error_message = "The requested UID is not present on this terminal.";
+            } else if (user->record_size == 28) {
+                error_code = "LEGACY_USER_RECORD_READ_ONLY";
+                error_message = "This legacy 8-byte-name record is intentionally read-only.";
+            } else {
+                int privilege = user->privilege;
+                const char *name = NULL;
+                if (strcmp(command.command_type, "UPDATE_USER") == 0) {
+                    if (command.has_privilege) privilege = command.privilege;
+                    if (command.has_name) name = command.name;
+                } else if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0) {
+                    privilege = 14;
+                } else {
+                    privilege = 0;
+                }
+                ok = zk_write_user(sock, ctx, user, name, privilege);
+                if (!ok) {
+                    error_code = "ZKT_USER_WRITE_FAILED";
+                    error_message = "The terminal did not acknowledge and verify the user write.";
+                } else if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0) {
+                    if (!ensure_system_time_synced()) {
+                        (void)zk_write_user(sock, ctx, user, NULL, 0);
+                        ok = false;
+                        error_code = "TRUSTED_TIME_UNAVAILABLE";
+                        error_message = "The elevation was rolled back because trusted time is unavailable.";
+                    } else {
+                        g_temp_admin_active = true;
+                        g_temp_admin_uid = (uint16_t)strtoul(user->uid, NULL, 10);
+                        g_temp_admin_expires_epoch = epoch_now() + 600;
+                        nvs_save_runtime_state();
+                        snprintf(result, sizeof(result), "{\"verified_privilege\":14,\"expires_epoch\":%lld}", (long long)g_temp_admin_expires_epoch);
+                    }
+                } else if (strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0) {
+                    temp_admin_clear();
+                    snprintf(result, sizeof(result), "{\"verified_privilege\":0}");
+                } else {
+                    snprintf(result, sizeof(result), "{\"verified_privilege\":%d}", privilege);
+                }
+                if (ok) (void)add_send_user_snapshot(users);
+            }
+        } else if (strcmp(command.command_type, "RESTART_ZKT") == 0) {
+            if (g_temp_admin_active) {
+                error_code = "ACTIVE_ADMIN_LEASE";
+                error_message = "Restart is blocked until the temporary administrator is revoked.";
+            } else {
+                ok = zk_protocol_restart(sock, ctx);
+                if (!ok) {
+                    error_code = "ZKT_RESTART_FAILED";
+                    error_message = "The authenticated protocol restart was not acknowledged.";
+                }
+            }
+        }
+        if (ok) {
+            mark_command_processed(command.command_id);
+            (void)add_connector_command_update(command.command_id, "SUCCEEDED", NULL, NULL, result);
+            if (strcmp(command.command_type, "RESTART_ZKT") == 0) return true;
+        } else {
+            (void)add_connector_command_update(command.command_id, "FAILED", error_code, error_message, "{}");
+        }
+    }
+    return false;
+}
+
+static int64_t gateway_run(uint32_t host_order_ip)
+{
+    int64_t session_started_ms = uptime_ms();
     int sock = -1;
-    if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, 3000, &sock)) {
-        led_status_fault(LED_STATUS_ZKT_FAILURE);
-        return;
-    }
+    if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, 3000, &sock)) return 0;
     zk_context_t ctx = {0};
-    if (!zk_connect_and_auth(sock, &ctx)) {
-        led_status_fault(LED_STATUS_ZKT_FAILURE);
-        close(sock);
-        return;
-    }
+    if (!zk_connect_and_auth(sock, &ctx)) { close(sock); return 0; }
+    zkt_mark_authenticated(host_order_ip, "live session authenticated");
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     (void)zk_read_option(sock, &ctx, "~SerialNumber", g_device_serial, sizeof(g_device_serial));
+    if (ZONE_LITE_ZKT_EXPECTED_SERIAL[0] != '\0' &&
+        strcmp(g_device_serial, ZONE_LITE_ZKT_EXPECTED_SERIAL) != 0) {
+        add_connector_log("CRITICAL", "zkt", "ZKT_SERIAL_CHANGED", "Live session serial changed after discovery; session rejected");
+        zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
+    }
+    strlcpy(g_add_zkt.serial, g_device_serial, sizeof(g_add_zkt.serial));
     int32_t user_count = 0;
     int32_t records = 0;
-    struct tm device_now;
+    struct tm device_now = {0};
     if (!zk_get_counts(sock, &ctx, &user_count, &records)) {
-        ESP_LOGW(TAG, "Could not read initial ZKT counts; reconnecting");
-        led_status_fault(LED_STATUS_ZKT_FAILURE);
-        zk_disconnect(sock, &ctx);
-        close(sock);
-        return;
+        zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
     }
-    user_table_t *users = calloc(1, sizeof(user_table_t));
-    if (users == NULL) {
+    g_add_zkt.user_count = user_count;
+    g_add_zkt.attendance_count = records;
+    add_connector_set_zkt(&g_add_zkt);
+    user_table_t *users = heap_caps_calloc(1, sizeof(user_table_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!users) users = calloc(1, sizeof(user_table_t));
+    if (!users) {
         ESP_LOGE(TAG, "Could not allocate ZKT user table");
-        zk_disconnect(sock, &ctx);
-        close(sock);
-        return;
+        zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
     }
     if (!zk_load_users(sock, &ctx, users, user_count)) {
-        ESP_LOGW(TAG, "Could not load ZKT users; reconnecting before sync");
-        led_status_fault(LED_STATUS_ZKT_FAILURE);
-        zk_disconnect(sock, &ctx);
-        close(sock);
-        free(users);
-        return;
+        zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
-    led_status_set(LED_STATUS_SYNCING);
-    if (zk_get_time_parts(sock, &ctx, &device_now)) {
-        reconcile_attendance_dump(
-            sock,
-            &ctx,
-            users,
-            records,
-            "DUMP_STARTUP",
-            device_now.tm_year + 1900,
-            device_now.tm_mon + 1);
-    } else {
-        ESP_LOGW(TAG, "Skipping startup dump because ZKT device time could not be read");
-        led_status_fault(LED_STATUS_ZKT_FAILURE);
-    }
+    g_add_zkt.user_record_size = users->record_size;
+    add_connector_set_zkt(&g_add_zkt);
+    (void)add_connector_consume_connected_edge();
+    (void)add_send_user_snapshot(users);
+
     uint8_t rx[1024];
     zk_response_t response = {0};
     (void)zk_send_command(sock, &ctx, CMD_CANCELCAPTURE, NULL, 0, rx, sizeof(rx), &response);
     (void)zk_send_command(sock, &ctx, CMD_STARTVERIFY, NULL, 0, rx, sizeof(rx), &response);
     if (!zk_register_attlog_events(sock, &ctx, true)) {
-        zk_disconnect(sock, &ctx);
-        close(sock);
-        free(users);
-        return;
+        zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
-    oracle_drain_pending(false);
 
-    int64_t last_reconcile = esp_timer_get_time() / 1000;
-    int64_t last_live_register = last_reconcile;
+    int64_t now_ms = uptime_ms();
+    int64_t last_reconcile = now_ms - ZONE_LITE_RECONCILE_INTERVAL_MS + ZONE_LITE_RECOVERY_STABILITY_MS;
+    int64_t last_live_register = now_ms;
+    int64_t last_user_integrity = now_ms;
+    int64_t last_time_sample = 0;
+    int64_t last_full_truth_reconcile = 0;
+    int32_t last_synced_attendance_count = -1;
+    size_t live_events_since_sync = 0;
+    bool restarted = false;
     while (true) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(sock, &read_fds);
-        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         int rc = select(sock + 1, &read_fds, NULL, NULL, &tv);
         if (rc > 0 && FD_ISSET(sock, &read_fds)) {
             zk_tcp_header_t top;
             if (!recv_exact(sock, (uint8_t *)&top, sizeof(top)) ||
-                top.marker_1 != MACHINE_PREPARE_DATA_1 ||
-                top.marker_2 != MACHINE_PREPARE_DATA_2 ||
-                top.length < sizeof(zk_header_t) || top.length > 2048) {
-                ESP_LOGW(TAG, "ZKT live socket returned an invalid packet; reconnecting");
-                led_status_fault(LED_STATUS_ZKT_FAILURE);
+                top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
+                top.length < sizeof(zk_header_t) || top.length > 4096) {
+                ESP_LOGW(TAG, "ZKT live socket returned an invalid packet");
                 break;
             }
             uint8_t *packet = malloc(top.length);
-            if (packet == NULL || !recv_exact(sock, packet, top.length)) {
-                free(packet);
-                ESP_LOGW(TAG, "Could not read complete ZKT live packet; reconnecting");
-                led_status_fault(LED_STATUS_ZKT_FAILURE);
-                break;
+            if (!packet || !recv_exact(sock, packet, top.length)) {
+                free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
             }
             zk_header_t *header = (zk_header_t *)packet;
-            bool keep_session = true;
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
-                process_live_packet(packet + sizeof(zk_header_t), top.length - sizeof(zk_header_t), users);
-                if (!zk_send_ack_only(sock, ctx.session_id)) {
-                    ESP_LOGW(TAG, "Could not ACK ZKT live event; reconnecting");
-                    led_status_fault(LED_STATUS_ZKT_FAILURE);
-                    keep_session = false;
-                }
-                oracle_drain_pending(true);
-                if (!file_has_nonempty_line(PENDING_PATH)) {
-                    led_status_set(LED_STATUS_HEALTHY);
-                }
+                live_events_since_sync += process_live_packet(
+                    packet + sizeof(zk_header_t),
+                    top.length - sizeof(zk_header_t),
+                    users);
+                if (!zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
             }
             free(packet);
-            if (!keep_session) {
-                break;
-            }
         } else if (rc < 0) {
-            ESP_LOGW(TAG, "ZKT live socket select failed; reconnecting");
-            led_status_fault(LED_STATUS_ZKT_FAILURE);
+            ESP_LOGW(TAG, "ZKT live socket select failed errno=%d", errno);
             break;
         }
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS) {
-            last_reconcile = now_ms;
-            int32_t refreshed_users = 0;
-            int32_t refreshed_records = 0;
-            if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) {
-                ESP_LOGW(TAG, "ZKT health check failed during reconcile; reconnecting");
-                led_status_fault(LED_STATUS_ZKT_FAILURE);
-                break;
-            }
-            if (refreshed_users != user_count) {
-                if (!zk_refresh_users_after_count_change(sock, &ctx, users, user_count, refreshed_users)) {
-                    ESP_LOGW(TAG, "Could not refresh ZKT users after count change; reconnecting");
-                    led_status_fault(LED_STATUS_ZKT_FAILURE);
-                    break;
-                }
-                user_count = refreshed_users;
-            }
-            if (zk_get_time_parts(sock, &ctx, &device_now)) {
-                led_status_set(LED_STATUS_SYNCING);
-                reconcile_attendance_dump(
-                    sock,
-                    &ctx,
-                    users,
-                    refreshed_records,
-                    "LIVE_POLL",
-                    device_now.tm_year + 1900,
-                    device_now.tm_mon + 1);
-            } else {
-                ESP_LOGW(TAG, "ZKT time read failed during reconcile; reconnecting");
-                led_status_fault(LED_STATUS_ZKT_FAILURE);
-                break;
-            }
-            oracle_drain_pending(false);
-            if (!file_has_nonempty_line(PENDING_PATH)) {
-                led_status_set(LED_STATUS_HEALTHY);
-            }
-            now_ms = esp_timer_get_time() / 1000;
-            if (now_ms - last_live_register >= ZKT_LIVE_REREGISTER_INTERVAL_MS) {
-                if (!zk_register_attlog_events(sock, &ctx, true)) {
-                    break;
-                }
-                last_live_register = now_ms;
+
+        now_ms = uptime_ms();
+        if (now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+            zkt_mark_stable();
+            if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
+        }
+        if (process_add_commands(sock, &ctx, users, &user_count)) {
+            restarted = true;
+            break;
+        }
+        if (add_connector_consume_connected_edge()) {
+            add_connector_log("INFO", "add", "ADD_RECONNECTED", "ADD channel recovered; publishing a fresh full user snapshot");
+            (void)add_send_user_snapshot(users);
+        }
+        (void)temp_admin_revoke_if_due(sock, &ctx, users);
+
+        if (now_ms - last_time_sample >= 60000) {
+            last_time_sample = now_ms;
+            char device_time[32] = {0};
+            if (zk_get_time(sock, &ctx, device_time, sizeof(device_time))) {
+                strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+                g_add_zkt.consecutive_successes++;
+                add_connector_set_zkt(&g_add_zkt);
             }
         }
 
-        int daily_reboot_day = -1;
-        if (daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
+        if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
+            now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+            last_reconcile = now_ms;
             int32_t refreshed_users = 0;
             int32_t refreshed_records = 0;
-            if (zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) {
-                if (refreshed_users != user_count) {
-                    if (zk_refresh_users_after_count_change(sock, &ctx, users, user_count, refreshed_users)) {
-                        user_count = refreshed_users;
-                    } else {
-                        ESP_LOGW(TAG, "Continuing daily reboot after user refresh failure");
-                    }
-                }
-                if (zk_get_time_parts(sock, &ctx, &device_now)) {
-                    led_status_set(LED_STATUS_SYNCING);
-                    reconcile_attendance_dump(
+            add_connector_set_activity("RECONCILING");
+            if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) break;
+            bool integrity_due = now_ms - last_user_integrity >= (6 * 60 * 60 * 1000LL);
+            if (refreshed_users != user_count || integrity_due) {
+                if (!zk_refresh_users_preserving_current(sock, &ctx, users, refreshed_users)) break;
+                user_count = refreshed_users;
+                last_user_integrity = now_ms;
+                (void)add_send_user_snapshot(users);
+            }
+            int64_t record_delta = last_synced_attendance_count >= 0
+                ? (int64_t)refreshed_records - last_synced_attendance_count
+                : -1;
+            bool counter_mismatch = record_delta < 0 || (uint64_t)record_delta != live_events_since_sync;
+            bool truth_due = last_synced_attendance_count < 0 ||
+                last_full_truth_reconcile == 0 ||
+                now_ms - last_full_truth_reconcile >= ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
+            if (counter_mismatch || truth_due) {
+                char reason[192];
+                snprintf(
+                    reason,
+                    sizeof(reason),
+                    "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s",
+                    (long long)record_delta,
+                    (unsigned)live_events_since_sync,
+                    truth_due ? "true" : "false");
+                ESP_LOGI(TAG, "%s", reason);
+                add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
+                if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
+                led_status_set(LED_STATUS_SYNCING);
+                size_t added = 0;
+                if (reconcile_attendance_dump(
                         sock,
                         &ctx,
                         users,
                         refreshed_records,
-                        "LIVE_POLL",
+                        "RECONCILE_15M",
                         device_now.tm_year + 1900,
-                        device_now.tm_mon + 1);
+                        device_now.tm_mon + 1,
+                        &added)) {
+                    last_synced_attendance_count = refreshed_records;
+                    live_events_since_sync = 0;
+                    last_full_truth_reconcile = now_ms;
                 } else {
-                    ESP_LOGW(TAG, "Continuing daily reboot after ZKT time read failure");
-                    led_status_fault(LED_STATUS_ZKT_FAILURE);
+                    add_connector_log(
+                        "ERROR",
+                        "reconcile",
+                        "FULL_RECONCILE_FAILED",
+                        "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
                 }
             } else {
-                ESP_LOGW(TAG, "Continuing daily reboot after ZKT count read failure");
-                led_status_fault(LED_STATUS_ZKT_FAILURE);
+                char summary[160];
+                snprintf(
+                    summary,
+                    sizeof(summary),
+                    "Light reconcile passed: device_delta=%lld matched %u live events; heavy dump skipped",
+                    (long long)record_delta,
+                    (unsigned)live_events_since_sync);
+                ESP_LOGI(TAG, "%s", summary);
+                add_connector_log("INFO", "reconcile", "LIGHT_RECONCILE_OK", summary);
+                last_synced_attendance_count = refreshed_records;
+                live_events_since_sync = 0;
             }
+            g_add_zkt.user_count = refreshed_users;
+            g_add_zkt.attendance_count = refreshed_records;
+            add_connector_set_zkt(&g_add_zkt);
+            add_connector_set_activity("LIVE_CAPTURE");
+            if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
+        }
 
-            oracle_drain_pending(false);
-            if (daily_zkt_reboot_try_target(host_order_ip, daily_reboot_day)) {
+        if (now_ms - last_live_register >= ZKT_LIVE_REREGISTER_INTERVAL_MS) {
+            if (!zk_register_attlog_events(sock, &ctx, true)) break;
+            last_live_register = now_ms;
+        }
+
+        int restart_slot = -1;
+        if (daily_zkt_reboot_should_attempt(&restart_slot)) {
+            add_connector_set_activity("SCHEDULED_RESTART");
+            if (zk_protocol_restart(sock, &ctx)) {
+                daily_zkt_reboot_mark_complete(restart_slot);
+                add_connector_log("INFO", "zkt", "SCHEDULED_RESTART", "ZKT accepted its scheduled protocol restart");
+                restarted = true;
                 break;
-            }
-            if (!file_has_nonempty_line(PENDING_PATH)) {
-                led_status_set(LED_STATUS_HEALTHY);
             }
         }
     }
-    (void)zk_register_attlog_events(sock, &ctx, false);
-    zk_disconnect(sock, &ctx);
+    if (!restarted) {
+        (void)zk_register_attlog_events(sock, &ctx, false);
+        zk_disconnect(sock, &ctx);
+    }
     close(sock);
     free(users);
+    int64_t duration = uptime_ms() - session_started_ms;
+    if (restarted) {
+        zkt_publish_state("RESTARTING", "ZKT protocol restart accepted", false);
+        vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
+    }
+    return duration;
 }
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -3058,6 +3711,7 @@ static void gateway_task(void *arg)
     (void)arg;
     uint32_t discovery_failures = 0;
     int64_t last_zkt_reboot_ms = 0;
+    int64_t offline_started_ms = 0;
     while (true) {
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
             ESP_LOGW(TAG, "Waiting for Wi-Fi before ZKT discovery");
@@ -3071,30 +3725,68 @@ static void gateway_task(void *arg)
             }
         }
         uint32_t selected_ip = 0;
-        if (discover_zkt(&selected_ip)) {
-            discovery_failures = 0;
-            gateway_run(selected_ip);
-            ESP_LOGW(TAG, "ZKT session ended; rediscovering");
-        } else {
-            discovery_failures++;
-            led_status_fault(LED_STATUS_ZKT_FAILURE);
-            ESP_LOGW(
-                TAG,
-                "No authenticated ZKT device found on port %d (failure %lu/%d)",
-                ZONE_LITE_ZKT_PORT,
-                (unsigned long)discovery_failures,
-                ZKT_DISCOVERY_RESTART_AFTER_FAILURES);
-            if (maybe_reboot_zkt_for_recovery(discovery_failures, &last_zkt_reboot_ms)) {
+        uint32_t directly_tried_ip = 0;
+        if (g_last_authenticated_zkt_ip != 0) {
+            directly_tried_ip = g_last_authenticated_zkt_ip;
+            char direct_ip[16];
+            ip_to_text(directly_tried_ip, direct_ip, sizeof(direct_ip));
+            ESP_LOGI(TAG, "Opening one live session to last authenticated ZKT %s:%d", direct_ip, ZONE_LITE_ZKT_PORT);
+            zkt_publish_state("CONNECTING", "opening live session to last authenticated terminal", false);
+            int64_t session_duration = gateway_run(directly_tried_ip);
+            if (session_duration > 0) {
                 discovery_failures = 0;
-            }
-            if (discovery_failures >= ZKT_DISCOVERY_RESTART_AFTER_FAILURES) {
-                ESP_LOGE(TAG, "Restarting ESP32 after repeated ZKT discovery failures");
-                led_status_fault(LED_STATUS_FATAL);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_restart();
+                offline_started_ms = 0;
+                if (strcmp(g_add_zkt.connection_state, "RESTARTING") == 0) {
+                    continue;
+                }
+                uint32_t backoff = zkt_mark_failure(
+                    session_duration < ZONE_LITE_RECOVERY_STABILITY_MS
+                        ? "ZKT session ended before the stability window"
+                        : "established ZKT session disconnected");
+                ESP_LOGW(
+                    TAG,
+                    "ZKT session ended after %lld ms; retrying in %lu ms",
+                    (long long)session_duration,
+                    (unsigned long)backoff);
+                vTaskDelay(pdMS_TO_TICKS(backoff));
+                continue;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_DISCOVERY_RETRY_DELAY_MS));
+        if (discover_zkt(&selected_ip, directly_tried_ip)) {
+            discovery_failures = 0;
+            offline_started_ms = 0;
+            int64_t session_duration = gateway_run(selected_ip);
+            if (strcmp(g_add_zkt.connection_state, "RESTARTING") == 0) {
+                discovery_failures = 0;
+                continue;
+            }
+            uint32_t backoff = zkt_mark_failure(
+                session_duration < ZONE_LITE_RECOVERY_STABILITY_MS
+                    ? "ZKT session ended before the stability window"
+                    : "established ZKT session disconnected");
+            ESP_LOGW(TAG, "ZKT session ended after %lld ms; retrying in %lu ms", (long long)session_duration, (unsigned long)backoff);
+            vTaskDelay(pdMS_TO_TICKS(backoff));
+            continue;
+        } else {
+            discovery_failures++;
+            if (offline_started_ms == 0) offline_started_ms = uptime_ms();
+            uint32_t backoff = zkt_mark_failure("authenticated discovery did not find the assigned ZKT");
+            ESP_LOGW(
+                TAG,
+                "No authenticated ZKT device found on port %d (failure %lu, backoff=%lu ms)",
+                ZONE_LITE_ZKT_PORT,
+                (unsigned long)discovery_failures,
+                (unsigned long)backoff);
+            bool continuously_offline = uptime_ms() - offline_started_ms >= (10 * 60 * 1000);
+            bool flapping = strcmp(g_add_zkt.connection_state, "FLAPPING") == 0;
+            if (continuously_offline && !flapping &&
+                maybe_reboot_zkt_for_recovery(discovery_failures, &last_zkt_reboot_ms)) {
+                discovery_failures = 0;
+                offline_started_ms = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(backoff));
+            continue;
+        }
     }
 }
 
@@ -3110,13 +3802,28 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    nvs_load_runtime_state();
+    g_storage_lock = xSemaphoreCreateMutex();
+    if (!g_storage_lock) {
+        ESP_LOGE(TAG, "Could not create durable storage lock");
+        led_status_fault(LED_STATUS_FATAL);
+        return;
+    }
+    add_connector_init();
+    zkt_publish_state("BOOTING", "ESP32 firmware boot", false);
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);
     storage_init();
     wifi_init_sta();
     if (!wait_for_wifi()) {
         return;
     }
-    if (xTaskCreate(gateway_task, "zone_gateway", 16384, NULL, 5, NULL) != pdPASS) {
+    (void)ensure_system_time_synced();
+    add_connector_start();
+    if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");
+        led_status_fault(LED_STATUS_FATAL);
+    }
+    if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start Zone Lite gateway task");
         led_status_fault(LED_STATUS_FATAL);
     }

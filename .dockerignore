@@ -1,0 +1,16 @@
+.git
+.github
+.env*
+.venv*
+.tools
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+**/dist
+**/build
+local-data
+outputs
+firmware/zone_lite/main/zone_lite_config.h
+firmware/zone_lite/sdkconfig

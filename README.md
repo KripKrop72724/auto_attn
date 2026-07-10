@@ -3,12 +3,31 @@
 [![CI](https://github.com/KripKrop72724/auto_attn/actions/workflows/ci.yml/badge.svg)](https://github.com/KripKrop72724/auto_attn/actions/workflows/ci.yml)
 [![Shipping CD](https://github.com/KripKrop72724/auto_attn/actions/workflows/cd.yml/badge.svg)](https://github.com/KripKrop72724/auto_attn/actions/workflows/cd.yml)
 
-This repository contains a greenfield Python POC with two runnable products:
+The primary production path in this repository is now **Attendance Device Dashboard (ADD) +
+ESP32 Zone Lite**. ADD provides centralized visibility and control for ESP32–ZKT pairs, while the
+connector preserves live capture and local delivery when either the terminal or internet path is
+intermittent. The previous Windows Zone Agent, Head Office POC, and HR enrollment executable remain
+in the tree only for controlled transition and rollback until ADD acceptance is signed off.
+
+The legacy POC contains two runnable products:
 
 - **Zone Agent**: local Windows/branch service that talks to ZKTeco devices over LAN, stores data in SQLite first, monitors device and PC clock tampering, records outages, and syncs queued records to head office.
 - **Head Office**: central FastAPI server and dashboard that receives zone data, revalidates trust status, and reports attendance, outages, clock checks, and incidents.
 
 ## Quick Start
+
+For ADD, copy `.env.add.example` to `.env.add`, provision unique secrets, and run:
+
+```bash
+./deploy/add/deploy.sh
+```
+
+Then open <http://127.0.0.1:8095>. The ADD API and outbound ESP32 WebSocket gateway listen on
+port `8096`. Production deployment, connector provisioning, enrollment safety, and older-terminal
+flapping behavior are documented in
+[`docs/attendance-device-dashboard.md`](docs/attendance-device-dashboard.md).
+
+For the legacy POC:
 
 ```bash
 python3 -m venv .venv
@@ -43,7 +62,13 @@ ZK_ZONE_BRUTEFORCE_ENABLED=true zk-zone-agent --host 127.0.0.1 --port 7860
 
 The brute-force flow is opt-in per candidate, requires local operator confirmation, refuses public IPs, and refuses already configured live devices unless explicitly allowed through the API.
 
-## State Life HR Enrollment App
+## Legacy State Life HR Enrollment App
+
+This application is frozen for transition only. ADD temporary administrator leases replace its
+operational role: an authorized dashboard operator selects a terminal and employee, grants a
+10-minute administrator window, and the ESP32 enforces automatic privilege rollback locally. Do
+not remove the legacy binary from an active site until that site's ADD enrollment workflow has
+passed acceptance and rollback testing.
 
 The Windows shipping workflow also builds `StateLifeHREnrollment.exe`, a 32-bit portable native app
 for **State Life Insurance Corporation** HR enrollment. It scans local ZKTeco port `4370`

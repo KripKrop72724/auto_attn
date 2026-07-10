@@ -27,7 +27,7 @@
 #define ZONE_LITE_LED_BRIGHTNESS 96
 #endif
 #ifndef ZONE_LITE_LED_FAULT_LATCH_MS
-#define ZONE_LITE_LED_FAULT_LATCH_MS 180000
+#define ZONE_LITE_LED_FAULT_LATCH_MS (2 * 60 * 1000)
 #endif
 #ifndef ZONE_LITE_LED_ACTIVITY_FLASH_MS
 #define ZONE_LITE_LED_ACTIVITY_FLASH_MS 250
@@ -88,6 +88,8 @@ static int priority_for_status(led_status_t status)
         return 80;
     case LED_STATUS_ZKT_FAILURE:
         return 75;
+    case LED_STATUS_ZKT_FLAPPING:
+        return 74;
     case LED_STATUS_TRUTH_REPAIR:
         return 72;
     case LED_STATUS_BLOCKED_IDENTITY:
@@ -190,6 +192,9 @@ static void render_status(led_status_t status, bool live_flash, int64_t tick_ms)
         break;
     case LED_STATUS_ZKT_FAILURE:
         set_rgb(slow_on ? 255 : 0, slow_on ? 220 : 0, 0);
+        break;
+    case LED_STATUS_ZKT_FLAPPING:
+        set_rgb(fast_on ? 255 : 0, fast_on ? 120 : 40, fast_on ? 0 : 90);
         break;
     case LED_STATUS_TRUTH_REPAIR:
         set_rgb(slow_on ? 255 : 0, slow_on ? 170 : 0, 0);
