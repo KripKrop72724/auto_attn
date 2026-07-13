@@ -24,6 +24,7 @@ typedef struct {
     char model[80];
     char platform[80];
     char device_time[32];
+    int64_t device_time_sampled_epoch;
     char transition_reason[96];
     int32_t user_count;
     int32_t attendance_count;
