@@ -122,49 +122,96 @@ jobs:
   verify-public:
     if: needs.deploy.result == 'success'
     needs: deploy
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        shell: powershell
     steps:
-      - name: Verify production-origin TLS, UI, API, and proxy routing
+      - name: Verify API and UI through a Pakistan public-network probe
         run: |
-          $ErrorActionPreference = 'Stop'
-          $targets = @(
-            @{ Host = 'autoattn.slichealth.com'; Uri = 'https://autoattn.slichealth.com/health/live'; Contains = '"ok":true' },
-            @{ Host = 'autoattn.slichealth.com'; Uri = 'https://autoattn.slichealth.com/health/ready'; Contains = '"database":true' },
-            @{ Host = 'attendancedevices.slichealth.com'; Uri = 'https://attendancedevices.slichealth.com/health/ui'; Contains = '"ok":true' },
-            @{ Host = 'attendancedevices.slichealth.com'; Uri = 'https://attendancedevices.slichealth.com/'; Contains = 'Attendance Device Dashboard' }
-          )
-          foreach ($target in $targets) {
-            $failure = $null
-            for ($attempt = 1; $attempt -le 4; $attempt++) {
-              try {
-                # The public edge does not support NAT hairpinning from the
-                # production server. Connect to the local TLS origin while
-                # retaining the real hostname for SNI and certificate checks.
-                $resolution = "$($target.Host):443:127.0.0.1"
-                $response = @(& curl.exe --fail --silent --show-error `
-                  --connect-timeout 5 --max-time 15 --resolve $resolution $target.Uri 2>&1)
-                if ($LASTEXITCODE -ne 0) {
-                  throw (($response | ForEach-Object { "$_" }) -join "`n")
+          set -euo pipefail
+
+          verify_from_pakistan() {
+            local host="$1"
+            local path="$2"
+            local marker="$3"
+            local payload response measurement_id result state
+
+            payload="$(jq -nc \
+              --arg target "$host" \
+              --arg path "$path" \
+              '{
+                target: $target,
+                type: "http",
+                locations: [{country: "PK"}],
+                limit: 1,
+                measurementOptions: {
+                  protocol: "HTTPS",
+                  request: {method: "GET", path: $path}
                 }
-                $content = ($response | ForEach-Object { "$_" }) -join "`n"
-                if ($content -notmatch [regex]::Escape($target.Contains)) {
-                  throw 'Expected response marker is missing.'
-                }
-                $failure = $null
+              }')"
+
+            for _ in 1 2 3; do
+              if response="$(curl --fail --silent --show-error \
+                --connect-timeout 10 --max-time 20 \
+                --header 'Content-Type: application/json' \
+                --data "$payload" \
+                https://api.globalping.io/v1/measurements)" && \
+                measurement_id="$(jq -er '.id' <<<"$response")"; then
                 break
-              } catch {
-                $failure = $_.Exception.Message
-                if ($attempt -lt 4) { Start-Sleep -Seconds 5 }
-              }
-            }
-            if ($failure) {
-              throw "Public verification failed for $($target.Uri): $failure"
-            }
+              fi
+              measurement_id=''
+              sleep 5
+            done
+
+            if [ -z "$measurement_id" ]; then
+              echo "Unable to schedule the public-network verification for $host." >&2
+              return 1
+            fi
+
+            for _ in $(seq 1 20); do
+              sleep 3
+              result="$(curl --fail --silent --show-error \
+                --connect-timeout 10 --max-time 20 \
+                "https://api.globalping.io/v1/measurements/$measurement_id")"
+              state="$(jq -r '.status' <<<"$result")"
+              if [ "$state" = 'in-progress' ]; then
+                continue
+              fi
+              if [ "$state" != 'finished' ]; then
+                echo "Public-network verification ended in state $state for $host." >&2
+                return 1
+              fi
+              if ! jq -e --arg marker "$marker" '
+                (.results | length) > 0 and
+                all(.results[];
+                  .probe.country == "PK" and
+                  .result.statusCode == 200 and
+                  ((.result.rawBody // "") | contains($marker))
+                )
+              ' <<<"$result" >/dev/null; then
+                echo "Pakistan public-network verification failed for $host$path." >&2
+                jq -r '.results[] |
+                  "probe=\(.probe.country)/\(.probe.city) status=\(.result.statusCode // "none")"' \
+                  <<<"$result" >&2
+                return 1
+              fi
+              jq -r '.results[] |
+                "Verified \(.probe.country)/\(.probe.city) -> status \(.result.statusCode)"' \
+                <<<"$result"
+              return 0
+            done
+
+            echo "Pakistan public-network verification timed out for $host." >&2
+            return 1
           }
+
+          verify_from_pakistan \
+            'autoattn.slichealth.com' \
+            '/health/ready' \
+            '"database":true'
+          verify_from_pakistan \
+            'attendancedevices.slichealth.com' \
+            '/' \
+            'Attendance Device Dashboard'
 
   report:
     if: always() && needs.announce.result == 'success'
@@ -183,7 +230,7 @@ jobs:
           set -euo pipefail
           if [ "$DEPLOY_RESULT" = success ] && [ "$VERIFY_RESULT" = success ]; then
             state=success
-            description='ADD is healthy locally and on both public domains'
+            description='ADD origin and both public domains are healthy from Pakistan'
           else
             state=failure
             description="Deployment=$DEPLOY_RESULT public-verification=$VERIFY_RESULT"
