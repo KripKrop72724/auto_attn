@@ -73,7 +73,7 @@ Build:
 
 ```bash
 . ~/esp/esp-idf/export.sh
-idf.py -DIDF_TARGET=esp32s3 -DPROJECT_VER=2.0.1 build
+idf.py -DIDF_TARGET=esp32s3 -DPROJECT_VER=2.0.2 build
 ```
 
 Flash:
