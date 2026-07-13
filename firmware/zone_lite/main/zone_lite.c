@@ -151,6 +151,7 @@
 #define MAX_USERS 2048
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
+#define ADD_RECONCILE_BATCH_EVENTS 6
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -1573,6 +1574,12 @@ static bool json_add_utf8_string(cJSON *object, const char *key, const char *val
     size_t write_at = 0;
     bool changed = false;
     while (read_at < input_len) {
+        if (input[read_at] < 0x20 || input[read_at] == 0x7f) {
+            safe[write_at++] = '?';
+            read_at++;
+            changed = true;
+            continue;
+        }
         size_t sequence = valid_utf8_sequence_length(input + read_at, input_len - read_at);
         if (sequence == 0) {
             safe[write_at++] = '?';
@@ -2007,12 +2014,10 @@ typedef enum {
     ENQUEUE_STORAGE_ERROR,
 } enqueue_result_t;
 
-static bool add_send_attendance_event(const attendance_event_t *event, const char *capturetype)
+static cJSON *add_attendance_json_row(const attendance_event_t *event, const char *capturetype)
 {
-    cJSON *payload = cJSON_CreateObject();
-    cJSON_AddStringToObject(payload, "batch_id", event->event_uid);
-    cJSON *events = cJSON_AddArrayToObject(payload, "events");
     cJSON *row = cJSON_CreateObject();
+    if (!row) return NULL;
     cJSON_AddStringToObject(row, "event_uid", event->event_uid);
     json_add_utf8_string(row, "user_id", event->user_id);
     char raw_name[128];
@@ -2032,7 +2037,19 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
     cJSON_AddBoolToObject(row, "raw_punch", event->raw_punch);
     cJSON_AddStringToObject(row, "clock_quality", "OK");
     cJSON_AddItemToObject(row, "raw_event", cJSON_CreateObject());
-    cJSON_AddItemToArray(events, row);
+    return row;
+}
+
+static bool add_enqueue_attendance_events(cJSON *events, const char *batch_id)
+{
+    if (!events) return false;
+    cJSON *payload = cJSON_CreateObject();
+    if (!payload) {
+        cJSON_Delete(events);
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "batch_id", batch_id);
+    cJSON_AddItemToObject(payload, "events", events);
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     bool ok = json && add_connector_enqueue_attendance(json);
@@ -2040,11 +2057,25 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
     return ok;
 }
 
+static bool add_send_attendance_event(const attendance_event_t *event, const char *capturetype)
+{
+    cJSON *events = cJSON_CreateArray();
+    cJSON *row = add_attendance_json_row(event, capturetype);
+    if (!events || !row) {
+        cJSON_Delete(events);
+        cJSON_Delete(row);
+        return false;
+    }
+    cJSON_AddItemToArray(events, row);
+    return add_enqueue_attendance_events(events, event->event_uid);
+}
+
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype,
     FILE *pending_file,
-    FILE *blocked_file)
+    FILE *blocked_file,
+    bool publish_add)
 {
     if (seen_contains(event->event_uid)) {
         return ENQUEUE_DUPLICATE;
@@ -2079,7 +2110,7 @@ static enqueue_result_t enqueue_event_to_files(
     if (!seen_add(event->event_uid)) {
         ESP_LOGW(TAG, "Event persisted but volatile dedup cache could not record %s", event->event_uid);
     }
-    if (!add_send_attendance_event(event, capturetype)) {
+    if (publish_add && !add_send_attendance_event(event, capturetype)) {
         ESP_LOGE(TAG, "Attendance persisted for ORDS but could not be added to the independent ADD outbox");
         led_status_fault(LED_STATUS_FATAL);
     }
@@ -2093,7 +2124,7 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
         ESP_LOGE(TAG, "Could not lock durable attendance outbox");
         return ENQUEUE_STORAGE_ERROR;
     }
-    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL);
+    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL, true);
     xSemaphoreGive(g_storage_lock);
     return result;
 }
@@ -2205,6 +2236,10 @@ static bool reconcile_attendance_dump(
     bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED && filter_year > 0 && filter_month > 0;
     bool truth_overflow = false;
     bool truth_build_failed = false;
+    bool add_delivery_failed = false;
+    cJSON *add_batch_events = NULL;
+    size_t add_batch_count = 0;
+    char add_batch_id[80] = {0};
     char **truth_events = NULL;
     size_t truth_count = 0;
     size_t truth_capacity = truth_enabled ? ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS : 0;
@@ -2290,7 +2325,8 @@ static bool reconcile_attendance_dump(
                     truth_overflow = true;
                 }
             }
-            enqueue_result_t result = enqueue_event_to_files(&event, capturetype, pending_file, blocked_file);
+            enqueue_result_t result = enqueue_event_to_files(
+                &event, capturetype, pending_file, blocked_file, false);
             if (result == ENQUEUE_PENDING) {
                 added++;
                 pending++;
@@ -2299,6 +2335,34 @@ static bool reconcile_attendance_dump(
                 blocked++;
             } else {
                 duplicates++;
+            }
+            // ADD receives a batched truth stream independently of the ORDS
+            // dedup state.  This lets a reboot repair dashboard history even
+            // when the same event was already accepted by ORDS.
+            if (!add_delivery_failed) {
+                if (!add_batch_events) {
+                    add_batch_events = cJSON_CreateArray();
+                    snprintf(add_batch_id, sizeof(add_batch_id), "truth-%s", event.event_uid);
+                }
+                cJSON *add_row = add_attendance_json_row(&event, capturetype);
+                if (!add_batch_events || !add_row) {
+                    cJSON_Delete(add_row);
+                    cJSON_Delete(add_batch_events);
+                    add_batch_events = NULL;
+                    add_batch_count = 0;
+                    add_delivery_failed = true;
+                } else {
+                    cJSON_AddItemToArray(add_batch_events, add_row);
+                    add_batch_count++;
+                    if (add_batch_count >= ADD_RECONCILE_BATCH_EVENTS) {
+                        if (!add_enqueue_attendance_events(add_batch_events, add_batch_id)) {
+                            add_delivery_failed = true;
+                        }
+                        add_batch_events = NULL;
+                        add_batch_count = 0;
+                        add_batch_id[0] = '\0';
+                    }
+                }
             }
         } else {
             skipped++;
@@ -2309,6 +2373,12 @@ static bool reconcile_attendance_dump(
         if ((processed % 50) == 0) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
+    }
+    if (add_batch_events) {
+        if (!add_enqueue_attendance_events(add_batch_events, add_batch_id)) {
+            add_delivery_failed = true;
+        }
+        add_batch_events = NULL;
     }
     if (pending_file != NULL) {
         (void)fflush(pending_file);
@@ -2345,6 +2415,16 @@ static bool reconcile_attendance_dump(
             free(truth_events[i]);
         }
         free(truth_events);
+    }
+    if (add_delivery_failed) {
+        ESP_LOGW(
+            TAG,
+            "ADD truth batching reached its durable queue limit; live punches remain prioritized and the six-hour truth cycle will repair history");
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ADD_TRUTH_QUEUE_SATURATED",
+            "Dashboard truth backlog reached its bounded durable queue; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
     ESP_LOGI(
         TAG,
@@ -3478,6 +3558,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
     strlcpy(g_add_zkt.model, device_name, sizeof(g_add_zkt.model));
     strlcpy(g_add_zkt.platform, platform, sizeof(g_add_zkt.platform));
     strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+    if (device_time[0]) g_add_zkt.device_time_sampled_epoch = epoch_now();
     strlcpy(g_add_zkt.ip_address, ip_text, sizeof(g_add_zkt.ip_address));
     g_add_zkt.user_count = users;
     g_add_zkt.attendance_count = records;
@@ -3825,7 +3906,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
     strlcpy(g_add_zkt.model, device_name, sizeof(g_add_zkt.model));
     strlcpy(g_add_zkt.platform, platform, sizeof(g_add_zkt.platform));
     strlcpy(g_add_zkt.ip_address, ip_text, sizeof(g_add_zkt.ip_address));
-    if (device_time[0]) strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+    if (device_time[0]) {
+        strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+        g_add_zkt.device_time_sampled_epoch = epoch_now();
+    }
     int32_t user_count = 0;
     int32_t records = 0;
     struct tm device_now = {0};
@@ -3921,6 +4005,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
             char device_time[32] = {0};
             if (zk_get_time(sock, &ctx, device_time, sizeof(device_time))) {
                 strlcpy(g_add_zkt.device_time, device_time, sizeof(g_add_zkt.device_time));
+                g_add_zkt.device_time_sampled_epoch = epoch_now();
                 g_add_zkt.consecutive_successes++;
             }
             add_connector_set_zkt(&g_add_zkt);
