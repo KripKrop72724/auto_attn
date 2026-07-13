@@ -369,6 +369,7 @@ function FleetView({
     (overview.degraded || 0) +
     (overview.flapping || 0) +
     (overview.quarantined_duplicate_serial || 0)
+  const delivery = overview.ords_delivery
   return (
     <>
       <PageHeader
@@ -378,8 +379,9 @@ function FleetView({
       />
       <section className="metric-grid" aria-label="Fleet key indicators">
         <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" />
-        <Metric label="Needs review" value={attention} detail={`${overview.open_alerts} open alerts`} icon="alert" />
+        <Metric label="Needs review" value={overview.open_alerts} detail={`${attention} devices degraded or offline`} icon="alert" />
         <Metric label="Enrollment access" value={overview.active_leases} detail="Temporary 10-minute leases" icon="shield" />
+        <Metric label="ORDS delivery queue" value={delivery?.backlog ?? 0} detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`} icon="clock" />
         <Metric label="National footprint" value={overview.total} detail="Authorized ESP–ZKT pairs" icon="server" />
       </section>
       <section className="panel">

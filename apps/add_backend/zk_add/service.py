@@ -702,16 +702,22 @@ def enrich_undelivered_attendance(
     cnic = decrypt_cnic(user.cnic_encrypted)
     if not cnic:
         return 0
+    eligible_statuses = {
+        "BLOCKED_IDENTITY",
+        "PENDING",
+        "FAILED_RETRYABLE",
+        "RETRYING",  # Compatibility with rows written before the durable outbox rename.
+    }
     rows = session.scalars(
         select(AttendanceEvent).where(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.user_id == user.user_id,
-            AttendanceEvent.ords_status.in_(["BLOCKED_IDENTITY", "PENDING", "RETRYING"]),
+            AttendanceEvent.ords_status.in_(eligible_statuses),
         )
     ).all()
     changed = 0
     for row in rows:
-        if row.ords_status not in {"BLOCKED_IDENTITY", "PENDING", "RETRYING"}:
+        if row.ords_status not in eligible_statuses:
             continue
         row.device_user_id = user.id
         row.display_name = user.display_name
@@ -720,10 +726,16 @@ def enrich_undelivered_attendance(
         row.cnic_last4 = user.cnic_last4
         row.raw_punch = row.raw_punch or user.shift_worker
         row.ords_status = "PENDING"
-        if session.scalar(
+        outbox = session.scalar(
             select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
-        ) is None:
+        )
+        if outbox is None:
             session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
         changed += 1
     return changed
 

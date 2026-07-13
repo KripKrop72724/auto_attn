@@ -107,7 +107,23 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
       return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
     }
     if (path.includes('/api/v1/overview')) {
-      return response({ total: 1, online: 1, open_alerts: 0, active_leases: 0 })
+      return response({
+        total: 1,
+        online: 1,
+        open_alerts: 1,
+        active_leases: 0,
+        ords_delivery: {
+          backlog: 12,
+          pending: 9,
+          retrying: 3,
+          in_flight: 0,
+          blocked_identity: 2,
+          quarantined: 1,
+          acknowledged: 24,
+          oldest_backlog_at: '2026-07-13T12:00:00Z',
+          last_attempt_at: '2026-07-13T12:05:00Z',
+        },
+      })
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
@@ -138,6 +154,9 @@ describe('State Life ADD interface', () => {
     expect(screen.getByAltText('State Life Insurance Corporation')).toBeTruthy()
     expect(screen.queryByText(/register connector/i)).toBeNull()
     expect(screen.getByText(/secure auto-onboarding enabled/i)).toBeTruthy()
+    expect(screen.getByText('ORDS delivery queue')).toBeTruthy()
+    expect(await screen.findByText('12')).toBeTruthy()
+    expect(await screen.findByText(/3 retrying · 2 identity blocked · 1 quarantined/i)).toBeTruthy()
   })
 
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {

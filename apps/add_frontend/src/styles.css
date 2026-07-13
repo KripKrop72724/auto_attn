@@ -203,7 +203,7 @@ input::placeholder { color: #777777; }
 .page-header h1 { margin-bottom: 10px; font-size: clamp(30px, 3vw, 45px); line-height: 1.05; letter-spacing: -.045em; }
 .page-header > div > p:last-child { max-width: 760px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.65; }
 
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 24px; }
 .metric-card { min-height: 142px; display: flex; align-items: center; gap: 16px; padding: 23px; border: 1px solid var(--line); background: #ffffff; }
 .metric-icon { width: 45px; height: 45px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid rgba(0,148,218,.42); color: var(--blue); background: rgba(0,148,218,.06); }
 .metric-icon svg { width: 22px; }

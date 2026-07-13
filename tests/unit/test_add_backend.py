@@ -63,7 +63,14 @@ from zk_add.service import (
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 from zk_add.web import app, get_db
-from zk_add.worker import event_uid_is_valid, ords_delivery_succeeded
+from zk_add.worker import (
+    apply_ords_delivery_result,
+    event_uid_is_valid,
+    ords_delivery_metrics,
+    ords_delivery_succeeded,
+    ords_failure_category,
+    ords_failure_is_permanent,
+)
 
 
 MAC = "e0:72:a1:d6:f3:28"
@@ -801,9 +808,13 @@ def test_missing_identity_is_unblocked_but_acked_attendance_is_immutable(db: Ses
     )
     assert row.ords_status == "PENDING"
     assert decrypt_cnic(row.cnic_encrypted) == CNIC
-    assert db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
-    row.ords_status = "ACKED"
-    original_encrypted = row.cnic_encrypted
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    assert outbox
+    row.ords_status = "FAILED_RETRYABLE"
+    outbox.status = "FAILED_RETRYABLE"
+    outbox.next_attempt_at = utc_now() + timedelta(minutes=10)
+    outbox.last_http_status = 503
+    outbox.last_error = "HTTP_503"
     second = update_device_user_command(
         db,
         connector=connector,
@@ -825,8 +836,39 @@ def test_missing_identity_is_unblocked_but_acked_attendance_is_immutable(db: Ses
         error_code=None,
         error_message=None,
     )
+    assert row.ords_status == "PENDING"
+    assert decrypt_cnic(row.cnic_encrypted) == "6110112345671"
+    assert outbox.status == "PENDING"
+    assert outbox.next_attempt_at is None
+    assert outbox.last_http_status is None
+    assert outbox.last_error is None
+
+    row.ords_status = "ACKED"
+    outbox.status = "ACKED"
+    original_encrypted = row.cnic_encrypted
+    third = update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name=None,
+        cnic="3520212345671",
+        shift_worker=None,
+        privilege=None,
+        expected_version=user.row_version,
+        idempotency_key="enrich-identity-0003",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=third.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 0},
+        error_code=None,
+        error_message=None,
+    )
     assert row.cnic_encrypted == original_encrypted
-    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    assert decrypt_cnic(row.cnic_encrypted) == "6110112345671"
 
 
 def test_deleted_identity_tombstone_attributes_later_punches(db: Session):
@@ -993,6 +1035,65 @@ def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent
     assert ords_delivery_succeeded(409, {"message": "resource already exists"})
     assert ords_delivery_succeeded(201, {"success": True})
     assert not ords_delivery_succeeded(400, {"success": False})
+
+
+def test_ords_delivery_quarantines_poison_rows_and_redacts_failures(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    first = event(event_uid="1" * 64)
+    second = event(event_uid="2" * 64)
+    third = event(event_uid="3" * 64)
+    ingest_attendance(db, connector=connector, events=[first, second, third])
+    db.flush()
+    outboxes = db.scalars(select(OrdsOutbox).order_by(OrdsOutbox.id.asc())).all()
+    assert len(outboxes) == 3
+    for outbox in outboxes:
+        outbox.status = "IN_FLIGHT"
+        outbox.attempt_count = 1
+
+    apply_ords_delivery_result(
+        db,
+        claimed_id=outboxes[0].id,
+        status=400,
+        body={"success": False, "message": f"Rejected {CNIC}"},
+        transport_error=None,
+        response_parsed=True,
+    )
+    assert outboxes[0].status == "QUARANTINED_ORDS_REJECTED"
+    assert outboxes[0].last_error == "HTTP_400"
+    assert CNIC not in outboxes[0].last_error
+    assert db.scalar(
+        select(DeviceAlert).where(DeviceAlert.code == "ORDS_EVENT_REJECTED")
+    )
+
+    apply_ords_delivery_result(
+        db,
+        claimed_id=outboxes[1].id,
+        status=503,
+        body={"success": False, "message": f"Retry {CNIC}"},
+        transport_error=None,
+        response_parsed=True,
+    )
+    assert outboxes[1].status == "FAILED_RETRYABLE"
+    assert outboxes[1].last_error == "HTTP_503"
+    assert CNIC not in outboxes[1].last_error
+    assert db.scalar(
+        select(DeviceAlert).where(DeviceAlert.code == "ORDS_DELIVERY_FAILED")
+    )
+
+    outboxes[2].status = "BLOCKED_IDENTITY"
+
+    metrics = ords_delivery_metrics(db)
+    assert metrics["backlog"] == 2
+    assert metrics["retrying"] == 1
+    assert metrics["blocked_identity"] == 1
+    assert metrics["quarantined"] == 1
+    assert ords_failure_is_permanent(400)
+    assert ords_failure_is_permanent(422)
+    assert not ords_failure_is_permanent(401)
+    assert ords_failure_category(
+        None, transport_error="Read Timeout: secret", response_parsed=False
+    ) == "TRANSPORT_ERROR"
 
 
 def test_raw_machine_name_is_encrypted_at_rest(db: Session):

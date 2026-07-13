@@ -7,7 +7,8 @@ import json
 import re
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import Session
 
 from zk_add.db import session_scope
 from zk_add.crypto import decrypt_cnic
@@ -30,6 +31,7 @@ from zk_add.service import (
     apply_user_command_terminal_state,
     oracle_payload,
     queue_due_revokes,
+    resolve_alert,
     serialize_command,
     upsert_alert,
 )
@@ -38,6 +40,23 @@ from zk_add.time_utils import utc_now
 
 
 EVENT_UID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ORDS_DELIVERY_BATCH_SIZE = 8
+ORDS_DELIVERY_CONCURRENCY = 4
+ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
+ORDS_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
+ORDS_UNDELIVERED_STATUSES = ORDS_ACTIVE_STATUSES | {"BLOCKED_IDENTITY"}
+ORDS_SAFE_TRANSPORT_ERRORS = {
+    "ConnectError",
+    "ConnectTimeout",
+    "NetworkError",
+    "PoolTimeout",
+    "ReadError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "TimeoutException",
+    "WriteError",
+    "WriteTimeout",
+}
 
 
 def event_uid_is_valid(value: object) -> bool:
@@ -53,6 +72,56 @@ def ords_delivery_succeeded(status: int | None, body: object) -> bool:
         and isinstance(body, dict)
         and body.get("success") is True
     )
+
+
+def ords_failure_is_permanent(status: int | None) -> bool:
+    """Payload-level client rejections cannot improve by retrying the same event."""
+    return status in ORDS_PERMANENT_REJECTION_STATUSES
+
+
+def ords_failure_category(
+    status: int | None, *, transport_error: str | None = None, response_parsed: bool = True
+) -> str:
+    """Return a bounded non-PII failure category suitable for storage and alerts."""
+    if transport_error:
+        safe_error = transport_error if transport_error in ORDS_SAFE_TRANSPORT_ERRORS else "Error"
+        normalized = re.sub(r"[^A-Za-z0-9_]", "_", safe_error).upper()[:60]
+        return f"TRANSPORT_{normalized}"
+    if status is None:
+        return "TRANSPORT_UNKNOWN"
+    if not response_parsed:
+        return f"HTTP_{status}_INVALID_JSON"
+    return f"HTTP_{status}"
+
+
+def ords_delivery_metrics(session: Session) -> dict:
+    rows = session.execute(
+        select(OrdsOutbox.status, func.count(OrdsOutbox.id)).group_by(OrdsOutbox.status)
+    ).all()
+    counts = {status.lower(): int(count) for status, count in rows}
+    backlog = sum(
+        count for status, count in counts.items() if status.upper() in ORDS_UNDELIVERED_STATUSES
+    )
+    quarantined = sum(
+        count for status, count in counts.items() if status.upper().startswith("QUARANTINED")
+    )
+    oldest_backlog_at = session.scalar(
+        select(func.min(OrdsOutbox.created_at)).where(
+            OrdsOutbox.status.in_(ORDS_UNDELIVERED_STATUSES)
+        )
+    )
+    last_attempt_at = session.scalar(select(func.max(OrdsOutbox.last_attempt_at)))
+    return {
+        "backlog": backlog,
+        "pending": counts.get("pending", 0),
+        "retrying": counts.get("failed_retryable", 0),
+        "in_flight": counts.get("in_flight", 0),
+        "blocked_identity": counts.get("blocked_identity", 0),
+        "quarantined": quarantined,
+        "acknowledged": counts.get("acked", 0),
+        "oldest_backlog_at": oldest_backlog_at,
+        "last_attempt_at": last_attempt_at,
+    }
 
 
 async def maintenance_loop(stop: asyncio.Event) -> None:
@@ -168,14 +237,11 @@ async def maintenance_tick() -> None:
                     command.attempt_count += 1
     for update in connector_updates:
         await browser_events.publish("device", update)
-    await deliver_ords_once()
+    await deliver_ords_batch()
 
 
-async def deliver_ords_once() -> None:
-    if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
-        return
-    claimed_id = None
-    payload = None
+def claim_ords_batch(limit: int) -> list[tuple[int, dict, int]]:
+    claims: list[tuple[int, dict, int]] = []
     with session_scope() as session:
         now = utc_now()
         # A process interruption after claiming a row must not strand it in
@@ -189,16 +255,24 @@ async def deliver_ords_once() -> None:
         ).all():
             stale.status = "FAILED_RETRYABLE"
             stale.next_attempt_at = now
-            stale.last_error = "Recovered a stale in-flight delivery after backend interruption."
+            stale.last_error = "RECOVERED_STALE_IN_FLIGHT"
             event = session.get(AttendanceEvent, stale.attendance_event_id) if stale.attendance_event_id else None
             if event:
                 event.ords_status = "FAILED_RETRYABLE"
 
         candidates = session.scalars(
-            select(OrdsOutbox).where(
+            select(OrdsOutbox)
+            .where(
                 OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE"]),
-                (OrdsOutbox.next_attempt_at == None) | (OrdsOutbox.next_attempt_at <= now),  # noqa: E711
-            ).order_by(OrdsOutbox.id.asc()).limit(100)
+                (OrdsOutbox.next_attempt_at == None)  # noqa: E711
+                | (OrdsOutbox.next_attempt_at <= now),
+            )
+            .order_by(
+                case((OrdsOutbox.status == "PENDING", 0), else_=1),
+                OrdsOutbox.id.asc(),
+            )
+            .limit(max(200, limit * 20))
+            .with_for_update(skip_locked=True)
         ).all()
         for row in candidates:
             event = (
@@ -224,52 +298,171 @@ async def deliver_ords_once() -> None:
             row.status = "IN_FLIGHT"
             row.attempt_count += 1
             row.last_attempt_at = now
+            row.next_attempt_at = None
+            row.last_error = None
             row.payload_hash = hashlib.sha256(
                 json.dumps(candidate_payload, separators=(",", ":"), sort_keys=True).encode()
             ).hexdigest()
-            claimed_id = row.id
-            payload = candidate_payload
-            break
-    if claimed_id is None or payload is None:
+            claims.append((row.id, candidate_payload, connector.id))
+            if len(claims) >= limit:
+                break
+    return claims
+
+
+async def post_ords_claim(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    url: str,
+    claim: tuple[int, dict, int],
+) -> tuple[int, int, int | None, object, str | None, bool]:
+    row_id, payload, connector_id = claim
+    status: int | None = None
+    body: object = None
+    transport_error: str | None = None
+    response_parsed = True
+    try:
+        async with semaphore:
+            response = await client.post(url, json=payload)
+        status = response.status_code
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                response_parsed = False
+        elif status != 409:
+            response_parsed = False
+    except Exception as exc:
+        transport_error = type(exc).__name__
+        response_parsed = False
+    return row_id, connector_id, status, body, transport_error, response_parsed
+
+
+def apply_ords_delivery_result(
+    session: Session,
+    *,
+    claimed_id: int,
+    status: int | None,
+    body: object,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+    connector = session.get(Connector, event.connector_id) if event else None
+    row.last_http_status = status
+    category = ords_failure_category(
+        status,
+        transport_error=transport_error,
+        response_parsed=response_parsed,
+    )
+    if ords_delivery_succeeded(status, body):
+        row.status = "ACKED"
+        row.acknowledged_at = utc_now()
+        row.next_attempt_at = None
+        row.last_error = None
+        if event:
+            event.ords_status = "ACKED"
+        if connector is not None:
+            remaining_failure = session.scalar(
+                select(OrdsOutbox.id)
+                .join(
+                    AttendanceEvent,
+                    AttendanceEvent.id == OrdsOutbox.attendance_event_id,
+                )
+                .where(
+                    AttendanceEvent.connector_id == connector.id,
+                    OrdsOutbox.status == "FAILED_RETRYABLE",
+                )
+                .limit(1)
+            )
+            if remaining_failure is None:
+                resolve_alert(session, connector, code="ORDS_DELIVERY_FAILED")
+        return
+
+    if ords_failure_is_permanent(status):
+        row.status = "QUARANTINED_ORDS_REJECTED"
+        row.next_attempt_at = None
+        row.last_error = category
+        if event:
+            event.ords_status = "QUARANTINED_ORDS_REJECTED"
+        if connector is not None:
+            upsert_alert(
+                session,
+                connector,
+                code="ORDS_EVENT_REJECTED",
+                severity="HIGH",
+                message=(
+                    "Oracle permanently rejected a preserved attendance event; "
+                    "later queued events continue."
+                ),
+                details={
+                    "failure_category": category,
+                    "http_status": status,
+                },
+            )
+        return
+
+    row.status = "FAILED_RETRYABLE"
+    row.last_error = category
+    delay = min(600, 2 ** min(row.attempt_count, 9))
+    row.next_attempt_at = utc_now() + timedelta(seconds=delay)
+    if event:
+        event.ords_status = "FAILED_RETRYABLE"
+    if connector is not None:
+        severity = "HIGH" if status in {401, 403, 404, 405} else "WARNING"
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity=severity,
+            message="Oracle attendance delivery is retrying; preserved events remain queued.",
+            details={
+                "failure_category": category,
+                "http_status": status,
+                "attempt_count": row.attempt_count,
+            },
+        )
+
+
+async def deliver_ords_batch(
+    *,
+    limit: int = ORDS_DELIVERY_BATCH_SIZE,
+    concurrency: int = ORDS_DELIVERY_CONCURRENCY,
+) -> None:
+    if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
+        return
+    claims = claim_ords_batch(max(1, limit))
+    if not claims:
         return
     url = settings.ords_base_url.rstrip("/") + "/raw-captures"
-    status = None
-    body = None
-    error = None
-    try:
-        async with httpx.AsyncClient(timeout=settings.ords_timeout_seconds) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "X-API-Username": settings.ords_username,
-                    "X-API-Password": settings.ords_password,
-                },
-                json=payload,
-            )
-            status = response.status_code
-            body = response.json() if response.content else None
-    except Exception as exc:
-        error = str(exc)
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
+    async with httpx.AsyncClient(
+        timeout=settings.ords_timeout_seconds,
+        headers={
+            "X-API-Username": settings.ords_username,
+            "X-API-Password": settings.ords_password,
+        },
+    ) as client:
+        results = await asyncio.gather(
+            *(post_ords_claim(client, semaphore, url, claim) for claim in claims)
+        )
     with session_scope() as session:
-        row = session.get(OrdsOutbox, claimed_id)
-        if row is None:
-            return
-        event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
-        if ords_delivery_succeeded(status, body):
-            row.status = "ACKED"
-            row.acknowledged_at = utc_now()
-            row.last_http_status = status
-            row.last_error = None
-            if event:
-                event.ords_status = "ACKED"
-        else:
-            row.status = "FAILED_RETRYABLE"
-            row.last_http_status = status
-            row.last_error = error or str(body)[:1000]
-            delay = min(600, 2 ** min(row.attempt_count, 9))
-            row.next_attempt_at = utc_now() + timedelta(seconds=delay)
-            if event:
-                event.ords_status = "FAILED_RETRYABLE"
+        for row_id, _connector_id, status, body, error, parsed in results:
+            apply_ords_delivery_result(
+                session,
+                claimed_id=row_id,
+                status=status,
+                body=body,
+                transport_error=error,
+                response_parsed=parsed,
+            )
+
+
+async def deliver_ords_once() -> None:
+    """Compatibility wrapper for targeted tests and operational callers."""
+    await deliver_ords_batch(limit=1, concurrency=1)
 
 
 def retention_tick() -> None:

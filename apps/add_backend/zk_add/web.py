@@ -96,7 +96,7 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.settings import settings
-from zk_add.worker import maintenance_loop
+from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.time_utils import utc_now
 
 
@@ -291,7 +291,9 @@ def session_info(auth: tuple[Session, AdminContext] = Depends(require_admin)):
 @app.get("/api/v1/overview")
 def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
-    return fleet_counts(db)
+    result = fleet_counts(db)
+    result["ords_delivery"] = ords_delivery_metrics(db)
+    return result
 
 
 @app.post("/device/v2/onboard")

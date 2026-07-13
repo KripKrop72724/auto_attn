@@ -120,6 +120,13 @@ Then sign in, select a live connector, confirm live log movement, ZKT time sampl
 attendance filters, alert rendering, and next restart. Do not perform a user write until the device
 is certified writable and the snapshot is complete.
 
+The Fleet view exposes the backend ORDS backlog plus retrying, identity-blocked, and quarantined
+counts. Delivery is claimed in small bounded batches with limited concurrency. Payload-level `400`,
+`413`, and `422` responses are preserved as quarantined events so one poison row cannot block later
+attendance; transport, authorization, endpoint, throttling, and server failures remain durably
+retryable. ADD stores only a redacted failure category and HTTP status in its alert details, never an
+ORDS response body or CNIC.
+
 ## Alert response
 
 | Alert/state | Immediate action | Do not do |

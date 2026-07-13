@@ -14,7 +14,14 @@ import os
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session
 
-from zk_add.models import AttendanceEvent, Connector, DeviceAlert, DeviceUser, ZKTDevice
+from zk_add.models import (
+    AttendanceEvent,
+    Connector,
+    DeviceAlert,
+    DeviceUser,
+    OrdsOutbox,
+    ZKTDevice,
+)
 from zk_add.time_utils import utc_now
 
 
@@ -79,24 +86,31 @@ def prepare() -> None:
         )
         session.add_all([first, second])
         session.flush()
+        attendance = AttendanceEvent(
+            event_uid="f" * 64,
+            connector_id=connector.id,
+            zkt_device_id=zkt.id,
+            device_user_id=first.id,
+            device_serial=zkt.serial,
+            uid=first.uid,
+            user_id=first.user_id,
+            display_name=first.display_name,
+            cnic_encrypted=first.cnic_encrypted,
+            cnic_lookup_hash=first.cnic_lookup_hash,
+            cnic_last4=first.cnic_last4,
+            device_event_time=now,
+            captured_at=now,
+            source="LIVE",
+            raw_event={},
+            ords_status="FAILED_RETRYABLE",
+        )
+        session.add(attendance)
+        session.flush()
         session.add(
-            AttendanceEvent(
-                event_uid="f" * 64,
-                connector_id=connector.id,
-                zkt_device_id=zkt.id,
-                device_user_id=first.id,
-                device_serial=zkt.serial,
-                uid=first.uid,
-                user_id=first.user_id,
-                display_name=first.display_name,
-                cnic_encrypted=first.cnic_encrypted,
-                cnic_lookup_hash=first.cnic_lookup_hash,
-                cnic_last4=first.cnic_last4,
-                device_event_time=now,
-                captured_at=now,
-                source="LIVE",
-                raw_event={},
-                ords_status="ACKED",
+            OrdsOutbox(
+                attendance_event_id=attendance.id,
+                status="FAILED_RETRYABLE",
+                last_error="legacy response body containing CNIC 3520212345671",
             )
         )
         session.commit()
@@ -123,11 +137,13 @@ def verify() -> None:
             .order_by(DeviceUser.uid)
         ).all()
         attendance = session.scalars(select(AttendanceEvent)).all()
+        ords_rows = session.scalars(select(OrdsOutbox)).all()
         alerts = session.scalars(
             select(DeviceAlert).where(DeviceAlert.code == "DUPLICATE_USER_CNIC")
         ).all()
         assert len(users) == 2
         assert len(attendance) == 1
+        assert len(ords_rows) == 1
         assert len(alerts) == 1
         assert alerts[0].state == "OPEN"
         assert alerts[0].details == {"affected_users": 2}
@@ -137,7 +153,8 @@ def verify() -> None:
         ]
         assert {row.identity_conflict_code for row in users} == {"DUPLICATE_CNIC"}
         assert attendance[0].device_user_id == users[0].id
-        assert attendance[0].ords_status == "ACKED"
+        assert attendance[0].ords_status == "FAILED_RETRYABLE"
+        assert ords_rows[0].last_error == "LEGACY_ERROR_REDACTED"
 
     with engine.connect() as connection:
         definition = connection.scalar(

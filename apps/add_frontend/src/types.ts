@@ -69,6 +69,17 @@ export interface Overview {
   quarantined_duplicate_serial?: number
   open_alerts: number
   active_leases: number
+  ords_delivery?: {
+    backlog: number
+    pending: number
+    retrying: number
+    in_flight: number
+    blocked_identity: number
+    quarantined: number
+    acknowledged: number
+    oldest_backlog_at: string | null
+    last_attempt_at: string | null
+  }
 }
 
 export interface DeviceUser {
