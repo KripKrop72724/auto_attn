@@ -56,7 +56,7 @@
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
 #define ADD_TRANSPORT_RESTART_GUARD_MS 45000
-#define ADD_OUTBOX_LINE_BYTES 4096
+#define ADD_OUTBOX_LINE_BYTES 8192
 #define ADD_OUTBOX_MAX_BYTES (4 * 1024 * 1024)
 #define ADD_LIVE_OUTBOX_MAX_BYTES (512 * 1024)
 #define ADD_OUTBOX_COMPACT_MIN_BYTES (256 * 1024)
@@ -839,22 +839,25 @@ static void preserve_corrupt_outbox_row(const char *line)
     fclose(file);
 }
 
-bool add_connector_enqueue_attendance(const char *payload_json)
+static char *attendance_outbox_record_line(const char *payload_json, bool *live_out)
 {
-    if (!ZONE_LITE_ADD_ENABLED) return true;
-    if (!payload_json) return false;
+    if (!payload_json) return NULL;
     cJSON *payload = cJSON_Parse(payload_json);
     if (!payload || !cJSON_IsObject(payload)) {
         cJSON_Delete(payload);
-        return false;
+        return NULL;
     }
     if (!attendance_payload_is_valid(payload)) {
         ESP_LOGE(TAG, "Refusing to enqueue an invalid ADD attendance payload");
         cJSON_Delete(payload);
-        return false;
+        return NULL;
     }
     bool live = attendance_payload_is_live(payload);
     cJSON *record = cJSON_CreateObject();
+    if (!record) {
+        cJSON_Delete(payload);
+        return NULL;
+    }
     cJSON_AddStringToObject(record, "type", "attendance_batch");
     cJSON_AddItemToObject(record, "payload", payload);
     char *line = cJSON_PrintUnformatted(record);
@@ -867,8 +870,18 @@ bool add_connector_enqueue_attendance(const char *payload_json)
             (unsigned long)line_len,
             (unsigned)ADD_OUTBOX_LINE_BYTES);
         free(line);
-        return false;
+        return NULL;
     }
+    if (live_out) *live_out = live;
+    return line;
+}
+
+bool add_connector_enqueue_attendance(const char *payload_json)
+{
+    if (!ZONE_LITE_ADD_ENABLED) return true;
+    bool live = false;
+    char *line = attendance_outbox_record_line(payload_json, &live);
+    if (!line) return false;
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
@@ -895,6 +908,61 @@ bool add_connector_enqueue_attendance(const char *payload_json)
     }
     free(line);
     return ok;
+}
+
+bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count)
+{
+    if (!ZONE_LITE_ADD_ENABLED || count == 0) return true;
+    if (!payloads || !s_bulk_outbox.lock ||
+        xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting to append ADD reconcile batches");
+        return false;
+    }
+
+    bool ok = true;
+    if (s_bulk_outbox.offset > 0 && !compact_outbox_locked(&s_bulk_outbox, true)) {
+        ok = false;
+    }
+    struct stat st = {0};
+    off_t current = stat(s_bulk_outbox.path, &st) == 0 ? st.st_size : 0;
+    FILE *file = ok ? fopen(s_bulk_outbox.path, "a") : NULL;
+    if (!file) ok = false;
+    uint32_t written = 0;
+    for (size_t i = 0; ok && i < count; i++) {
+        bool live = false;
+        char *line = attendance_outbox_record_line(payloads[i], &live);
+        size_t line_len = line ? strlen(line) : 0;
+        if (!line || live) {
+            ESP_LOGE(TAG, "Rejected an invalid payload from the ADD reconcile bulk append");
+            free(line);
+            ok = false;
+            break;
+        }
+        if (current + (off_t)line_len + 1 > s_bulk_outbox.max_bytes) {
+            ESP_LOGE(TAG, "ADD reconcile attendance outbox is full; preserving existing rows");
+            free(line);
+            ok = false;
+            break;
+        }
+        if (fprintf(file, "%s\n", line) <= 0) {
+            free(line);
+            ok = false;
+            break;
+        }
+        current += (off_t)line_len + 1;
+        written++;
+        free(line);
+    }
+    if (file) {
+        if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
+        fclose(file);
+    }
+    s_bulk_outbox.depth += written;
+    xSemaphoreGive(s_bulk_outbox.lock);
+    if (written > 0) {
+        ESP_LOGI(TAG, "Durably appended %lu ADD reconcile batch(es) with one flash sync", (unsigned long)written);
+    }
+    return ok && written == count;
 }
 
 static void outbox_task(void *arg)
