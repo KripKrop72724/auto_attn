@@ -130,6 +130,11 @@ those rows intentionally do not enter the ORDS outbox until identity is repaired
 only one open alert per connector and condition code; repeated observations update that alert rather
 than flooding the operations queue.
 
+Every deployment records credential-free `OPTIONS` reachability from both the Windows runner host and
+the running API container, plus boolean proxy-presence signals. The probe never sends credentials or
+prints a response body. A degraded route remains visible as `ORDS_DELIVERY_FAILED`; queued attendance
+is retained and retried with bounded backoff while network routing is repaired.
+
 ## Alert response
 
 | Alert/state | Immediate action | Do not do |

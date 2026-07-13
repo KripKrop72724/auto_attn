@@ -106,6 +106,59 @@ jobs:
       - name: Transactionally deploy ports 8095 and 8096
         run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
 
+      - name: Record credential-free Oracle egress diagnostics
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = 'https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures'
+          $targetUri = [Uri]$target
+          $proxyUri = [System.Net.WebRequest]::DefaultWebProxy.GetProxy($targetUri)
+          $defaultProxyUsed = $proxyUri -and $proxyUri.AbsoluteUri -ne $targetUri.AbsoluteUri
+          $proxyEnvironmentPresent = -not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -or `
+            -not [string]::IsNullOrWhiteSpace($env:HTTP_PROXY)
+
+          $hostResult = 'ERROR_UNKNOWN'
+          try {
+            $response = Invoke-WebRequest -UseBasicParsing -Method Options -Uri $target -TimeoutSec 12
+            $hostResult = "HTTP_$($response.StatusCode)"
+          } catch {
+            $hostResult = "ERROR_$($_.Exception.GetType().Name)"
+          }
+
+          $probe = @'
+          import httpx
+          target = "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures"
+          try:
+              response = httpx.options(target, timeout=12)
+              print(f"HTTP_{response.status_code}")
+          except Exception as exc:
+              print(f"ERROR_{type(exc).__name__}")
+              raise SystemExit(2)
+          '@
+          $arguments = @(
+            'compose', '--env-file', '.env.add', '-f', 'docker-compose.add.yml',
+            'exec', '-T', 'add-api', 'python', '-c', $probe
+          )
+          $previousPreference = $ErrorActionPreference
+          try {
+            $ErrorActionPreference = 'Continue'
+            $containerOutput = & docker @arguments 2>&1
+            $containerExit = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $previousPreference
+          }
+          $containerResult = (($containerOutput | ForEach-Object { "$_" }) -join '').Trim()
+          if ($containerResult -notmatch '^(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)$') {
+            $containerResult = 'ERROR_UNEXPECTED_PROBE_OUTPUT'
+          }
+
+          Write-Host "ORDS host probe=$hostResult"
+          Write-Host "ORDS container probe=$containerResult"
+          Write-Host "Runner default proxy used=$defaultProxyUsed"
+          Write-Host "Runner proxy environment present=$proxyEnvironmentPresent"
+          if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {
+            Write-Warning 'ORDS egress is degraded; attendance remains preserved in the bounded retry queue.'
+          }
+
       - name: Show bounded container state on failure
         if: failure()
         run: |
