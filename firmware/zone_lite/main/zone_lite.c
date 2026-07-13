@@ -37,14 +37,11 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
-#if __has_include("zone_lite_config.h")
-#include "zone_lite_config.h"
-#else
 #include "zone_lite_config.example.h"
-#endif
 
 #include "led_status.h"
 #include "add_connector.h"
+#include "zone_config.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -74,7 +71,7 @@
 #define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"
 #endif
 #ifndef ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED
-#define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 0
+#define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 1
 #endif
 #ifndef ZONE_LITE_DAILY_ZKT_REBOOT_HOUR
 #define ZONE_LITE_DAILY_ZKT_REBOOT_HOUR 3
@@ -107,6 +104,7 @@
 #define CMD_OPTIONS_RRQ 11
 #define CMD_USERTEMP_RRQ 9
 #define CMD_USER_WRQ 8
+#define CMD_DELETE_USER 18
 #define CMD_ATTLOG_RRQ 13
 #define CMD_GET_FREE_SIZES 50
 #define CMD_STARTVERIFY 60
@@ -148,6 +146,7 @@
 #define CORRUPT_ORDS_PATH STORAGE_BASE "/corrupt_ords.jsonl"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
+#define CANCELLED_COMMANDS_PATH STORAGE_BASE "/add_cancelled.txt"
 #define MAX_USERS 2048
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
@@ -210,6 +209,48 @@
 #ifndef ZONE_LITE_FULL_TRUTH_RECONCILE_MS
 #define ZONE_LITE_FULL_TRUTH_RECONCILE_MS (6 * 60 * 60 * 1000LL)
 #endif
+
+// Per-device NVS provisioning overrides compile-time development defaults.
+#undef ZONE_LITE_WIFI_SSID
+#define ZONE_LITE_WIFI_SSID (zone_config_get()->wifi_ssid)
+#undef ZONE_LITE_WIFI_PASSWORD
+#define ZONE_LITE_WIFI_PASSWORD (zone_config_get()->wifi_password)
+#undef ZONE_LITE_ZKT_PORT
+#define ZONE_LITE_ZKT_PORT (zone_config_get()->zkt_port)
+#undef ZONE_LITE_ZKT_COMM_KEY
+#define ZONE_LITE_ZKT_COMM_KEY (zone_config_get()->zkt_comm_key)
+#undef ZONE_LITE_ZKT_PREFERRED_IP
+#define ZONE_LITE_ZKT_PREFERRED_IP (zone_config_get()->zkt_preferred_ip)
+#undef ZONE_LITE_ZKT_EXPECTED_SERIAL
+#define ZONE_LITE_ZKT_EXPECTED_SERIAL (zone_config_get()->zkt_expected_serial)
+#undef ZONE_LITE_ZONE_DEVICE_ID
+#define ZONE_LITE_ZONE_DEVICE_ID (zone_config_get()->zone_device_id)
+#undef ZONE_LITE_ZONE_ID
+#define ZONE_LITE_ZONE_ID (zone_config_get()->zone_id)
+#undef ZONE_LITE_ORDS_BASE_URL
+#define ZONE_LITE_ORDS_BASE_URL (zone_config_get()->ords_base_url)
+#undef ZONE_LITE_ORDS_USERNAME
+#define ZONE_LITE_ORDS_USERNAME (zone_config_get()->ords_username)
+#undef ZONE_LITE_ORDS_PASSWORD
+#define ZONE_LITE_ORDS_PASSWORD (zone_config_get()->ords_password)
+#undef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
+#define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED (zone_config_get()->zkt_recovery_enabled)
+#undef ZONE_LITE_ZKT_RECOVERY_FAILURES
+#define ZONE_LITE_ZKT_RECOVERY_FAILURES (zone_config_get()->zkt_recovery_failures)
+#undef ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS
+#define ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS (zone_config_get()->zkt_recovery_cooldown_ms)
+#undef ZONE_LITE_ZKT_REBOOT_WAIT_MS
+#define ZONE_LITE_ZKT_REBOOT_WAIT_MS (zone_config_get()->zkt_reboot_wait_ms)
+#undef ZONE_LITE_ZKT_TELNET_PORT
+#define ZONE_LITE_ZKT_TELNET_PORT (zone_config_get()->zkt_telnet_port)
+#undef ZONE_LITE_ZKT_TELNET_USERNAME
+#define ZONE_LITE_ZKT_TELNET_USERNAME (zone_config_get()->zkt_telnet_username)
+#undef ZONE_LITE_ZKT_TELNET_PASSWORD
+#define ZONE_LITE_ZKT_TELNET_PASSWORD (zone_config_get()->zkt_telnet_password)
+#undef ZONE_LITE_ZKT_TELNET_EXPECT_BANNER
+#define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER (zone_config_get()->zkt_telnet_banner)
+#undef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
+#define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND (zone_config_get()->zkt_telnet_command)
 #define ZKT_IO_TIMEOUT_SEC 8
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
@@ -268,6 +309,7 @@ typedef struct {
     zkt_user_t rows[MAX_USERS];
     size_t count;
     uint8_t record_size;
+    bool complete;
 } user_table_t;
 
 typedef struct {
@@ -285,6 +327,9 @@ static char g_device_serial[80] = "";
 static uint64_t *g_seen_hashes;
 static size_t g_seen_count;
 static uint32_t g_last_authenticated_zkt_ip;
+static int32_t g_last_synced_attendance_count = -1;
+static int64_t g_last_full_truth_reconcile_epoch;
+static int64_t g_last_full_truth_reconcile_ms;
 static uint32_t g_last_zkt_tcp_candidate_ip;
 static bool g_sntp_started;
 static bool g_time_synced;
@@ -322,6 +367,8 @@ static void nvs_save_runtime_state(void)
         return;
     }
     (void)nvs_set_u32(handle, "zkt_ip", g_last_authenticated_zkt_ip);
+    (void)nvs_set_i32(handle, "attn_count", g_last_synced_attendance_count);
+    (void)nvs_set_i64(handle, "truth_epoch", g_last_full_truth_reconcile_epoch);
     (void)nvs_set_i32(handle, "restart_slot", g_daily_zkt_reboot_completed_day);
     (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
     (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
@@ -339,6 +386,8 @@ static void nvs_load_runtime_state(void)
     uint8_t active = 0;
     int32_t restart_slot = -1;
     (void)nvs_get_u32(handle, "zkt_ip", &g_last_authenticated_zkt_ip);
+    (void)nvs_get_i32(handle, "attn_count", &g_last_synced_attendance_count);
+    (void)nvs_get_i64(handle, "truth_epoch", &g_last_full_truth_reconcile_epoch);
     if (nvs_get_i32(handle, "restart_slot", &restart_slot) == ESP_OK) {
         g_daily_zkt_reboot_completed_day = (int)restart_slot;
     }
@@ -410,8 +459,11 @@ static void zkt_mark_authenticated(uint32_t ip, const char *reason)
     g_add_zkt.backoff_until_epoch = 0;
     g_session_stable_since_ms = uptime_ms();
     g_add_zkt.stability_since_epoch = epoch_now();
+    bool authenticated_ip_changed = g_last_authenticated_zkt_ip != ip;
     g_last_authenticated_zkt_ip = ip;
-    nvs_save_runtime_state();
+    if (authenticated_ip_changed) {
+        nvs_save_runtime_state();
+    }
     zkt_publish_state("RECOVERING", reason, true);
 }
 
@@ -1378,6 +1430,7 @@ static uint32_t choose_zk_record_size(
 static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
 {
     memset(users, 0, sizeof(*users));
+    users->complete = true;
     if (user_count <= 0) {
         return true;
     }
@@ -1402,6 +1455,19 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
         return false;
     }
     uint32_t parsed_users = total_size / packet_size;
+    users->complete = parsed_users <= MAX_USERS;
+    if (!users->complete) {
+        ESP_LOGE(
+            TAG,
+            "ZKT user snapshot truncated parsed=%lu capacity=%u; all writes disabled",
+            (unsigned long)parsed_users,
+            (unsigned)MAX_USERS);
+        add_connector_log(
+            "CRITICAL",
+            "users",
+            "USER_SNAPSHOT_TRUNCATED",
+            "The complete ZKT user table did not fit safely; user writes are disabled.");
+    }
     users->record_size = (uint8_t)packet_size;
     if (parsed_users != (uint32_t)user_count) {
         ESP_LOGW(
@@ -1528,6 +1594,68 @@ static bool zk_write_user(
     return true;
 }
 
+static bool zk_delete_user(int sock, zk_context_t *ctx, uint16_t uid)
+{
+    uint8_t packet[2];
+    write_le16(packet, uid);
+    uint8_t rx[1024];
+    zk_response_t response = {0};
+    bool ok = zk_send_command(
+                  sock,
+                  ctx,
+                  CMD_DELETE_USER,
+                  packet,
+                  sizeof(packet),
+                  rx,
+                  sizeof(rx),
+                  &response) &&
+              response.code == CMD_ACK_OK;
+    if (!ok) {
+        ESP_LOGW(TAG, "ZKT user delete failed uid=%u response=%u", uid, response.code);
+    }
+    return ok;
+}
+
+static bool user_matches_command(const zkt_user_t *user, const add_command_t *command)
+{
+    if (!user || !command) return false;
+    if (command->uid[0] && strcmp(user->uid, command->uid) != 0) return false;
+    if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) return false;
+    if (command->has_name && strcmp(user->name, command->name) != 0) return false;
+    if (command->has_privilege && user->privilege != command->privilege) return false;
+    return true;
+}
+
+static bool user_matches_expected_state(const zkt_user_t *user, const add_command_t *command)
+{
+    if (!user || !command) return false;
+    if (command->uid[0] && strcmp(user->uid, command->uid) != 0) return false;
+    if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) return false;
+    if (command->has_expected_name && strcmp(user->name, command->expected_name) != 0) {
+        return false;
+    }
+    if (command->has_expected_privilege &&
+        user->privilege != command->expected_privilege) {
+        return false;
+    }
+    return true;
+}
+
+static bool command_error_is_retryable(const char *error_code)
+{
+    if (!error_code) return false;
+    return strcmp(error_code, "ZKT_USER_READ_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_USER_CREATE_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_USER_DELETE_VERIFY_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_USER_WRITE_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_USER_REREAD_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_USER_POSTCONDITION_FAILED") == 0 ||
+           strcmp(error_code, "ZKT_RESTART_FAILED") == 0 ||
+           strcmp(error_code, "ADD_SNAPSHOT_SEND_FAILED") == 0 ||
+           strcmp(error_code, "TRUSTED_TIME_UNAVAILABLE") == 0 ||
+           strcmp(error_code, "IDENTITY_TOMBSTONE_PERSIST_FAILED") == 0;
+}
+
 static void iso_system_now(char out[32])
 {
     time_t now = 0;
@@ -1612,7 +1740,7 @@ static bool add_send_user_snapshot(const user_table_t *users)
     char observed[32];
     iso_system_now(observed);
     cJSON_AddStringToObject(payload, "snapshot_id", snapshot_id);
-    cJSON_AddBoolToObject(payload, "complete", true);
+    cJSON_AddBoolToObject(payload, "complete", users->complete);
     cJSON_AddStringToObject(payload, "observed_at", observed);
     cJSON *rows = cJSON_AddArrayToObject(payload, "users");
     size_t sanitized_fields = 0;
@@ -1946,7 +2074,7 @@ static void storage_init(void)
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
         .partition_label = NULL,
-        .max_files = 8,
+        .max_files = 16,
         .format_if_mount_failed = true,
     };
     esp_err_t spiffs_ret = esp_vfs_spiffs_register(&conf);
@@ -2174,6 +2302,13 @@ static bool build_attendance_event(
         out->employee_name[0] = '\0';
         out->cnic[0] = '\0';
         out->raw_punch = false;
+        (void)add_connector_lookup_identity(
+            out->user_id,
+            out->employee_name,
+            sizeof(out->employee_name),
+            out->cnic,
+            sizeof(out->cnic),
+            &out->raw_punch);
     }
     out->status = status;
     out->punch = punch;
@@ -2960,7 +3095,7 @@ static oracle_delivery_result_t oracle_send_live(const char *event_json)
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
         return ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
     }
-    char url[256];
+    char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
     int status = http_post_json(url, normalized_event, &body);
@@ -3086,7 +3221,7 @@ static bool oracle_send_bulk(char **events, size_t count)
     if (payload == NULL) {
         return false;
     }
-    char url[256];
+    char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures/bulk", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
     int status = http_post_json(url, payload, &body);
@@ -3276,7 +3411,7 @@ static bool oracle_send_reconcile(char **events, size_t count, int year, int mon
         return false;
     }
 
-    char url[288];
+    char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures/reconcile", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
     int status = http_post_json(url, payload, &body);
@@ -3774,6 +3909,23 @@ static bool command_was_processed(const char *command_id)
     return found;
 }
 
+static bool command_was_cancelled(const char *command_id)
+{
+    FILE *file = fopen(CANCELLED_COMMANDS_PATH, "r");
+    if (!file) return false;
+    char line[96];
+    bool found = false;
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, command_id) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
 static void mark_command_processed(const char *command_id)
 {
     if (!command_was_processed(command_id)) (void)append_line(PROCESSED_COMMANDS_PATH, command_id);
@@ -3799,10 +3951,26 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
         add_connector_log("CRITICAL", "enrollment", "LEASE_USER_MISSING", "Temporary administrator user is missing from the terminal snapshot");
         return false;
     }
-    if (user->privilege == 0 || zk_write_user(sock, ctx, user, NULL, 0)) {
+    if (user->privilege == 0) {
         temp_admin_clear();
         add_connector_log("INFO", "enrollment", "LEASE_REVOKED_LOCAL", "Temporary administrator privilege was revoked by the ESP watchdog");
         return true;
+    }
+    if (zk_write_user(sock, ctx, user, NULL, 0)) {
+        int32_t verified_users = 0;
+        int32_t verified_records = 0;
+        if (zk_get_counts(sock, ctx, &verified_users, &verified_records) &&
+            zk_refresh_users_preserving_current(sock, ctx, users, verified_users)) {
+            zkt_user_t *verified = find_mutable_user_by_uid(users, uid);
+            if (verified && verified->privilege == 0) {
+                g_add_zkt.user_count = verified_users;
+                g_add_zkt.attendance_count = verified_records;
+                add_connector_set_zkt(&g_add_zkt);
+                temp_admin_clear();
+                add_connector_log("INFO", "enrollment", "LEASE_REVOKED_LOCAL", "Temporary administrator privilege was revoked and verified by reread");
+                return true;
+            }
+        }
     }
     add_connector_log("CRITICAL", "enrollment", "LEASE_REVOKE_FAILED", "Temporary administrator privilege could not be revoked; retrying");
     led_status_fault(LED_STATUS_FATAL);
@@ -3817,6 +3985,28 @@ static bool process_add_commands(
 {
     add_command_t command;
     while (add_connector_take_command(&command)) {
+        if (command_was_cancelled(command.command_id)) {
+            (void)add_connector_command_update(
+                command.command_id,
+                "CANCELLED",
+                "COMMAND_CANCELLED",
+                "The command was cancelled before terminal execution.",
+                "{}");
+            (void)add_connector_command_complete(command.command_id);
+            continue;
+        }
+        int64_t command_now = epoch_now();
+        if (command.expires_epoch > 0 && command_now >= ZONE_LITE_MIN_VALID_UNIX_TIME &&
+            command_now >= command.expires_epoch) {
+            (void)add_connector_command_update(
+                command.command_id,
+                "EXPIRED",
+                "COMMAND_EXPIRED",
+                "The command expired before terminal execution; no mutation was attempted.",
+                "{}");
+            (void)add_connector_command_complete(command.command_id);
+            continue;
+        }
         if (command_was_processed(command.command_id)) {
             char duplicate_result[192] = "{\"duplicate\":true}";
             if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
@@ -3828,6 +4018,7 @@ static bool process_add_commands(
                     (long long)g_temp_admin_expires_epoch);
             }
             (void)add_connector_command_update(command.command_id, "SUCCEEDED", NULL, NULL, duplicate_result);
+            (void)add_connector_command_complete(command.command_id);
             continue;
         }
         (void)add_connector_command_update(command.command_id, "RUNNING", NULL, NULL, "{}");
@@ -3851,17 +4042,155 @@ static bool process_add_commands(
                 error_code = "ZKT_USER_READ_FAILED";
                 error_message = "The terminal user table could not be read and verified.";
             }
-        } else if (strcmp(command.command_type, "UPDATE_USER") == 0 ||
+        } else if (strcmp(command.command_type, "CREATE_USER") == 0 ||
+                   strcmp(command.command_type, "UPDATE_USER") == 0 ||
+                   strcmp(command.command_type, "DELETE_USER") == 0 ||
                    strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 ||
                    strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0) {
-            zkt_user_t *user = find_mutable_user_by_uid(users, command.uid);
-            if (!user) {
-                error_code = "USER_NOT_FOUND";
-                error_message = "The requested UID is not present on this terminal.";
-            } else if (user->record_size == 28) {
+            int32_t before_users = 0;
+            int32_t before_records = 0;
+            if (command.expected_serial[0] &&
+                strcmp(command.expected_serial, g_device_serial) != 0) {
+                error_code = "ZKT_SERIAL_PRECONDITION_FAILED";
+                error_message = "The authenticated terminal serial no longer matches the command target.";
+            } else if (!zk_get_counts(sock, ctx, &before_users, &before_records) ||
+                !zk_refresh_users_preserving_current(sock, ctx, users, before_users)) {
+                error_code = "ZKT_USER_READ_FAILED";
+                error_message = "A fresh terminal read could not be completed before mutation.";
+            } else if (!users->complete) {
+                error_code = "USER_SNAPSHOT_TRUNCATED";
+                error_message = "Writes are disabled because the full user table does not fit safely.";
+            } else if (users->record_size != 72) {
                 error_code = "LEGACY_USER_RECORD_READ_ONLY";
                 error_message = "This legacy 8-byte-name record is intentionally read-only.";
+            } else if (strcmp(command.command_type, "CREATE_USER") == 0) {
+                zkt_user_t *uid_match = find_mutable_user_by_uid(users, command.uid);
+                const zkt_user_t *id_match = find_user_by_user_id(users, command.user_id);
+                if ((uid_match || id_match) && uid_match == id_match &&
+                    user_matches_command(uid_match, &command)) {
+                    ok = true;
+                } else if (uid_match || id_match) {
+                    error_code = "USER_IDENTIFIER_CONFLICT";
+                    error_message = "The allocated UID or user ID is already held by another user.";
+                } else {
+                    zkt_user_t candidate = {0};
+                    strlcpy(candidate.uid, command.uid, sizeof(candidate.uid));
+                    strlcpy(candidate.user_id, command.user_id, sizeof(candidate.user_id));
+                    strlcpy(candidate.name, command.name, sizeof(candidate.name));
+                    strlcpy(candidate.group_id, "1", sizeof(candidate.group_id));
+                    candidate.record_size = 72;
+                    candidate.privilege = 0;
+                    ok = zk_write_user(sock, ctx, &candidate, command.name, 0);
+                }
+                int32_t after_users = 0;
+                int32_t after_records = 0;
+                if (ok && (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
+                           !zk_refresh_users_preserving_current(sock, ctx, users, after_users))) {
+                    ok = false;
+                }
+                zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
+                if (ok && !user_matches_command(verified, &command)) ok = false;
+                if (!ok && strcmp(error_code, "COMMAND_UNSUPPORTED") == 0) {
+                    error_code = "ZKT_USER_CREATE_FAILED";
+                    error_message = "The created user was not present with the requested values after reread.";
+                }
+                if (ok) {
+                    *user_count = after_users;
+                    snprintf(
+                        result,
+                        sizeof(result),
+                        "{\"verified_uid\":\"%s\",\"verified_user_id\":\"%s\",\"user_count\":%ld}",
+                        command.uid,
+                        command.user_id,
+                        (long)after_users);
+                }
+            } else if (strcmp(command.command_type, "DELETE_USER") == 0) {
+                zkt_user_t *user = find_mutable_user_by_uid(users, command.uid);
+                if (!command.has_tombstone) {
+                    error_code = "IDENTITY_TOMBSTONE_REQUIRED";
+                    error_message = "Deletion was refused because no durable identity tombstone was supplied.";
+                } else if (user && !user_matches_expected_state(user, &command)) {
+                    error_code = "USER_PRECONDITION_FAILED";
+                    error_message = "The fresh terminal user no longer matches the expected identity and version state.";
+                } else if (!add_connector_persist_command_tombstone(&command)) {
+                    error_code = "IDENTITY_TOMBSTONE_PERSIST_FAILED";
+                    error_message = "The encrypted ESP identity tombstone could not be committed before deletion.";
+                } else {
+                    if (user) ok = zk_delete_user(sock, ctx, (uint16_t)strtoul(user->uid, NULL, 10));
+                    else ok = true;
+                    int32_t after_users = 0;
+                    int32_t after_records = 0;
+                    if (ok && (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
+                               !zk_refresh_users_preserving_current(sock, ctx, users, after_users))) {
+                        ok = false;
+                    }
+                    bool absent = find_mutable_user_by_uid(users, command.uid) == NULL;
+                    if (ok && (!absent || before_records != after_records)) ok = false;
+                    if (!ok) {
+                        error_code = "ZKT_USER_DELETE_VERIFY_FAILED";
+                        error_message = "User absence or unchanged attendance count could not be verified.";
+                    } else {
+                        *user_count = after_users;
+                        snprintf(
+                            result,
+                            sizeof(result),
+                            "{\"user_absent\":true,\"attendance_count_before\":%ld,\"attendance_count_after\":%ld,\"user_count\":%ld}",
+                            (long)before_records,
+                            (long)after_records,
+                            (long)after_users);
+                    }
+                }
             } else {
+                zkt_user_t *user = find_mutable_user_by_uid(users, command.uid);
+                if (!user) {
+                    error_code = "USER_NOT_FOUND";
+                    error_message = "The requested UID is not present on this terminal.";
+                } else if (
+                    strcmp(command.command_type, "UPDATE_USER") == 0 &&
+                    user_matches_command(user, &command)) {
+                    ok = true;
+                    snprintf(
+                        result,
+                        sizeof(result),
+                        "{\"duplicate\":true,\"verified_privilege\":%d}",
+                        user->privilege);
+                } else if (
+                    strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
+                    user->privilege == 14) {
+                    int64_t deadline = command.lease_expires_epoch > 0
+                        ? command.lease_expires_epoch
+                        : epoch_now() + 600;
+                    if (deadline <= epoch_now()) {
+                        error_code = "COMMAND_EXPIRED";
+                        error_message = "The enrollment lease deadline passed before recovery completed.";
+                    } else {
+                        g_temp_admin_active = true;
+                        g_temp_admin_uid = (uint16_t)strtoul(user->uid, NULL, 10);
+                        g_temp_admin_expires_epoch = deadline;
+                        nvs_save_runtime_state();
+                        ok = true;
+                        snprintf(
+                            result,
+                            sizeof(result),
+                            "{\"duplicate\":true,\"verified_privilege\":14,\"expires_epoch\":%lld}",
+                            (long long)deadline);
+                    }
+                } else if (
+                    strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0 &&
+                    user->privilege == 0) {
+                    temp_admin_clear();
+                    ok = true;
+                    snprintf(result, sizeof(result), "{\"duplicate\":true,\"verified_privilege\":0}");
+                } else if (
+                    strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
+                    command.lease_expires_epoch > 0 &&
+                    command.lease_expires_epoch <= epoch_now()) {
+                    error_code = "COMMAND_EXPIRED";
+                    error_message = "The enrollment lease deadline passed before elevation started.";
+                } else if (!user_matches_expected_state(user, &command)) {
+                    error_code = "USER_PRECONDITION_FAILED";
+                    error_message = "The fresh terminal user no longer matches the command precondition.";
+                } else {
                 int privilege = user->privilege;
                 const char *name = NULL;
                 if (strcmp(command.command_type, "UPDATE_USER") == 0) {
@@ -3883,19 +4212,82 @@ static bool process_add_commands(
                         error_code = "TRUSTED_TIME_UNAVAILABLE";
                         error_message = "The elevation was rolled back because trusted time is unavailable.";
                     } else {
-                        g_temp_admin_active = true;
-                        g_temp_admin_uid = (uint16_t)strtoul(user->uid, NULL, 10);
-                        g_temp_admin_expires_epoch = epoch_now() + 600;
-                        nvs_save_runtime_state();
-                        snprintf(result, sizeof(result), "{\"verified_privilege\":14,\"expires_epoch\":%lld}", (long long)g_temp_admin_expires_epoch);
+                        int32_t after_users = 0;
+                        int32_t after_records = 0;
+                        if (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
+                            !zk_refresh_users_preserving_current(sock, ctx, users, after_users)) {
+                            ok = false;
+                            error_code = "ZKT_USER_REREAD_FAILED";
+                            error_message = "Administrator elevation could not be verified by reread.";
+                        } else {
+                            zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
+                            if (!verified || verified->privilege != 14) {
+                                ok = false;
+                                error_code = "ZKT_USER_POSTCONDITION_FAILED";
+                                error_message = "Administrator elevation did not persist after reread.";
+                            } else {
+                                g_temp_admin_active = true;
+                                g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
+                                g_temp_admin_expires_epoch = command.lease_expires_epoch > 0
+                                    ? command.lease_expires_epoch
+                                    : epoch_now() + 600;
+                                if (g_temp_admin_expires_epoch <= epoch_now()) {
+                                    g_temp_admin_active = true;
+                                    g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
+                                    nvs_save_runtime_state();
+                                    (void)temp_admin_revoke_if_due(sock, ctx, users);
+                                    ok = false;
+                                    error_code = "COMMAND_EXPIRED";
+                                    error_message = "The enrollment lease deadline passed before elevation verification.";
+                                }
+                                nvs_save_runtime_state();
+                                if (ok) {
+                                    snprintf(result, sizeof(result), "{\"verified_privilege\":14,\"expires_epoch\":%lld}", (long long)g_temp_admin_expires_epoch);
+                                }
+                            }
+                        }
                     }
                 } else if (strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0) {
-                    temp_admin_clear();
-                    snprintf(result, sizeof(result), "{\"verified_privilege\":0}");
+                    int32_t after_users = 0;
+                    int32_t after_records = 0;
+                    if (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
+                        !zk_refresh_users_preserving_current(sock, ctx, users, after_users)) {
+                        ok = false;
+                        error_code = "ZKT_USER_REREAD_FAILED";
+                        error_message = "Administrator revocation could not be verified by reread.";
+                    } else {
+                        zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
+                        if (!verified || verified->privilege != 0) {
+                            ok = false;
+                            error_code = "ZKT_USER_POSTCONDITION_FAILED";
+                            error_message = "Administrator revocation did not persist after reread.";
+                        } else {
+                            temp_admin_clear();
+                            snprintf(result, sizeof(result), "{\"verified_privilege\":0}");
+                        }
+                    }
                 } else {
-                    snprintf(result, sizeof(result), "{\"verified_privilege\":%d}", privilege);
+                    int32_t after_users = 0;
+                    int32_t after_records = 0;
+                    if (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
+                        !zk_refresh_users_preserving_current(sock, ctx, users, after_users)) {
+                        ok = false;
+                        error_code = "ZKT_USER_REREAD_FAILED";
+                        error_message = "The terminal write ACK could not be verified by reread.";
+                    } else {
+                        zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
+                        if (!verified || verified->privilege != privilege ||
+                            (name && strcmp(verified->name, name) != 0)) {
+                            ok = false;
+                            error_code = "ZKT_USER_POSTCONDITION_FAILED";
+                            error_message = "The terminal reread did not match the requested user values.";
+                        } else {
+                            snprintf(result, sizeof(result), "{\"verified_privilege\":%d}", privilege);
+                        }
+                    }
                 }
                 if (ok) (void)add_send_user_snapshot(users);
+                }
             }
         } else if (strcmp(command.command_type, "RESTART_ZKT") == 0) {
             if (g_temp_admin_active) {
@@ -3910,11 +4302,35 @@ static bool process_add_commands(
             }
         }
         if (ok) {
+            if (strcmp(command.command_type, "CREATE_USER") == 0 ||
+                strcmp(command.command_type, "DELETE_USER") == 0) {
+                (void)add_send_user_snapshot(users);
+            }
             mark_command_processed(command.command_id);
             (void)add_connector_command_update(command.command_id, "SUCCEEDED", NULL, NULL, result);
+            (void)add_connector_command_complete(command.command_id);
             if (strcmp(command.command_type, "RESTART_ZKT") == 0) return true;
         } else {
-            (void)add_connector_command_update(command.command_id, "FAILED", error_code, error_message, "{}");
+            int64_t retry_now = epoch_now();
+            bool not_expired = command.expires_epoch <= 0 ||
+                retry_now < ZONE_LITE_MIN_VALID_UNIX_TIME || retry_now < command.expires_epoch;
+            if (not_expired && command_error_is_retryable(error_code)) {
+                (void)add_connector_command_update(
+                    command.command_id,
+                    "RETRYING",
+                    error_code,
+                    error_message,
+                    "{}");
+                add_connector_command_retry(command.command_id);
+            } else {
+                (void)add_connector_command_update(
+                    command.command_id,
+                    strcmp(error_code, "COMMAND_EXPIRED") == 0 ? "EXPIRED" : "FAILED",
+                    error_code,
+                    error_message,
+                    "{}");
+                (void)add_connector_command_complete(command.command_id);
+            }
         }
     }
     return false;
@@ -4001,8 +4417,6 @@ static int64_t gateway_run(uint32_t host_order_ip)
     int64_t last_live_register = now_ms;
     int64_t last_user_integrity = now_ms;
     int64_t last_time_sample = 0;
-    int64_t last_full_truth_reconcile = 0;
-    int32_t last_synced_attendance_count = -1;
     size_t live_events_since_sync = 0;
     bool restarted = false;
     while (true) {
@@ -4078,13 +4492,23 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 last_user_integrity = now_ms;
                 (void)add_send_user_snapshot(users);
             }
-            int64_t record_delta = last_synced_attendance_count >= 0
-                ? (int64_t)refreshed_records - last_synced_attendance_count
+            int64_t record_delta = g_last_synced_attendance_count >= 0
+                ? (int64_t)refreshed_records - g_last_synced_attendance_count
                 : -1;
             bool counter_mismatch = record_delta < 0 || (uint64_t)record_delta != live_events_since_sync;
-            bool truth_due = last_synced_attendance_count < 0 ||
-                last_full_truth_reconcile == 0 ||
-                now_ms - last_full_truth_reconcile >= ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
+            int64_t current_epoch = epoch_now();
+            bool epoch_valid = current_epoch > 1700000000;
+            bool truth_due = g_last_synced_attendance_count < 0 ||
+                (g_last_full_truth_reconcile_epoch == 0 && g_last_full_truth_reconcile_ms == 0);
+            if (!truth_due && epoch_valid && g_last_full_truth_reconcile_epoch > 0) {
+                int64_t elapsed_seconds = current_epoch - g_last_full_truth_reconcile_epoch;
+                truth_due = elapsed_seconds < 0 ||
+                    elapsed_seconds >= ZONE_LITE_FULL_TRUTH_RECONCILE_MS / 1000;
+            } else if (!truth_due && g_last_full_truth_reconcile_epoch == 0 &&
+                       g_last_full_truth_reconcile_ms > 0) {
+                truth_due = now_ms - g_last_full_truth_reconcile_ms >=
+                    ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
+            }
             bool reconcile_succeeded = true;
             if (counter_mismatch || truth_due) {
                 char reason[192];
@@ -4100,7 +4524,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
                 led_status_set(LED_STATUS_SYNCING);
                 size_t added = 0;
-                const char *reconcile_capturetype = last_synced_attendance_count < 0
+                const char *reconcile_capturetype = g_last_synced_attendance_count < 0
                     ? "DUMP_STARTUP"
                     : "DUMP_RECONNECT";
                 if (reconcile_attendance_dump(
@@ -4112,9 +4536,13 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         device_now.tm_year + 1900,
                         device_now.tm_mon + 1,
                         &added)) {
-                    last_synced_attendance_count = refreshed_records;
+                    g_last_synced_attendance_count = refreshed_records;
                     live_events_since_sync = 0;
-                    last_full_truth_reconcile = now_ms;
+                    g_last_full_truth_reconcile_ms = now_ms;
+                    if (epoch_valid) {
+                        g_last_full_truth_reconcile_epoch = current_epoch;
+                    }
+                    nvs_save_runtime_state();
                 } else {
                     reconcile_succeeded = false;
                     add_connector_log(
@@ -4133,8 +4561,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     (unsigned)live_events_since_sync);
                 ESP_LOGI(TAG, "%s", summary);
                 add_connector_log("INFO", "reconcile", "LIGHT_RECONCILE_OK", summary);
-                last_synced_attendance_count = refreshed_records;
+                g_last_synced_attendance_count = refreshed_records;
                 live_events_since_sync = 0;
+                nvs_save_runtime_state();
             }
             g_add_zkt.user_count = refreshed_users;
             g_add_zkt.attendance_count = refreshed_records;
@@ -4342,6 +4771,12 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(zone_config_init());
+    if (!zone_config_get()->provisioned) {
+        ESP_LOGE(TAG, "Encrypted per-device provisioning is required; network startup is blocked");
+        led_status_fault(LED_STATUS_FATAL);
+        return;
+    }
     nvs_load_runtime_state();
     g_storage_lock = xSemaphoreCreateMutex();
     if (!g_storage_lock) {

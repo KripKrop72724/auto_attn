@@ -1,81 +1,170 @@
-# Attendance Device Dashboard (ADD)
+# Attendance Device Dashboard architecture
 
-ADD is the command, control, and surveillance surface for ESP32–ZKT pairs. The browser UI is
-published on port `8095`; the API and outbound ESP32 control gateway are published on port `8096`.
-The connector initiates every internet connection, so no inbound branch firewall rule is required.
+## System boundary
 
-## Production model
+ADD is State Life's command, control, and surveillance center for Zone Lite ESP32–ZKT pairs across
+Pakistan. Zone Lite owns all terminal protocol traffic. The connector opens outbound TLS to ADD;
+the control plane never requires an inbound branch firewall rule and the browser never receives a
+ZKT Comm Key or terminal OS credential.
 
-- PostgreSQL is the durable source for devices, encrypted identities, attendance, commands,
-  temporary administrator leases, telemetry, alerts, and the hash-chained audit ledger.
-- Redis is reserved for horizontally scaled realtime fan-out and rate limits. A single API worker
-  is used until that fan-out adapter is enabled, preventing split-brain WebSocket ownership.
-- The ESP32 keeps live attendance registration open but does not perform HTTP uploads on the ZKT
-  socket task. ORDS delivery drains from a durable local outbox on a separate task.
-- Reconciliation starts only after a two-minute recovery stability window. Every 15 minutes the
-  ESP compares the terminal's attendance-count delta with live events already captured. A matching
-  delta completes as a light sync; a mismatch, counter reset, first boot, or six-hour truth window
-  triggers the full table read. This retains gap detection without repeatedly pulling tens of
-  thousands of rows from older models.
-- ORDS and ADD have independent flash-backed outboxes. ADD attendance is removed only after an
-  application-level WebSocket acknowledgement, so either destination may be unavailable without
-  losing the other delivery path. Backend reconnect also republishes a complete user snapshot.
-- Terminal restarts are scheduled at 02:00, 12:00, and 22:00 Pakistan time. An active enrollment
-  lease blocks restart.
-
-## Intermittent and older terminals
-
-Connector health and terminal health are independent. A live ESP32 can report a ZKT terminal as
-`SUSPECT`, `RETRY_WAIT`, `FLAPPING`, `RECOVERING`, or `ONLINE`. One failed probe does not create a
-hard outage. Repeated transitions enter a five-minute jittered quiet period; full subnet discovery
-is limited to once per 15 minutes. The last authenticated IP opens the live session directly, so a
-healthy steady-state boot needs one authenticated connection rather than a probe followed by a
-second connection. The ESP32 is not rebooted because a terminal is unavailable.
-
-After recovery, live capture is restored before any full reconciliation. Three consecutive healthy
-observations and a two-minute stable session clear the flapping alert. The dashboard retains the
-transition history and shows the next retry time.
-
-## Enrollment safety
-
-Only a certified 72-byte ZKT user record is writable. Legacy 28-byte records have eight-character
-names and cannot preserve the required CNIC suffix, so they remain read-only. A temporary elevation:
-
-1. requires the dashboard administrator password;
-2. verifies the user is currently regular and present;
-3. writes privilege `14` and verifies the ZKT acknowledgement;
-4. records the 10-minute deadline in ESP32 NVS;
-5. writes privilege `0` at expiry even if ADD is unreachable; and
-6. retries and raises a critical overdue alert if the ZKT itself is powered off.
-
-## Deployment
-
-Create a root `.env.add` from `.env.add.example`, then run:
-
-```sh
-./deploy/add/deploy.sh
+```mermaid
+flowchart LR
+    ZKT["ZKT terminal\nTCP 4370"] <-->|"one bounded session"| ESP["Zone Lite ESP32-S3"]
+    ESP -->|"signed onboarding + TLS WebSocket"| API["ADD API / gateway\n0.0.0.0:8096"]
+    ESP -->|"durable attendance delivery"| ORDS["State Life ORDS"]
+    API --> DB["PostgreSQL"]
+    API --> REDIS["Redis"]
+    UI["State Life ADD UI\n0.0.0.0:8095"] --> API
+    ADMIN["StateHealthAdmin"] --> UI
 ```
 
-On the Windows production runner, use `deploy/add/deploy.ps1`. The runner service needs Docker
-named-pipe access once; from an Administrator PowerShell on that server run:
+PostgreSQL is authoritative for connectors, encrypted identity metadata, attendance, commands,
+leases, telemetry, alerts, sessions, and the hash-chained audit ledger. Redis is private and
+reserved for realtime fan-out/rate limiting. One API worker owns connector WebSockets until a
+distributed ownership adapter is introduced.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\add\grant-runner-docker-access.ps1
-```
+## Automatic connector lifecycle
 
-The script verifies that the Actions service uses `NETWORK SERVICE`, grants that service account
-Docker named-pipe access, starts the Docker service when needed, and restarts the Actions runner so
-the new token membership takes effect. Windows does not permit nesting the runner-created local
-group inside the machine-local `docker-users` group. On a shared server, prefer reconfiguring the
-runner under a dedicated service account and add only that account to `docker-users`.
+1. Secure provisioning derives a unique bootstrap secret from the fleet root and ESP Wi-Fi MAC.
+2. The ESP posts its MAC, timestamp, nonce, body hash, and HMAC signature to `/device/v2/onboard`.
+3. ADD validates clock skew, consumes the nonce once, deterministically resolves the connector,
+   rotates its device token, and returns the public WebSocket URL.
+4. The previous token remains valid for a bounded overlap so a power loss between NVS write and
+   reconnect cannot strand the connector.
+5. The ESP saves the connector ID/token in encrypted NVS and opens the outbound device stream.
+6. Heartbeats, logs, terminal state, time samples, users, punches, and command results keep ADD in
+   live sync. No operator registration or activation code exists.
 
-The self-hosted GitHub runner first checks the repository variable `ADD_ENV_FILE`, then its default
-`$HOME/.config/auto-attn/add.env` path, and finally the encrypted repository secret
-`ADD_ENV_FILE_CONTENT`. The temporary workspace copy is deleted after every deployment attempt.
-Public DNS/TLS should reverse proxy the two domains as shown in `deploy/add/Caddyfile.example`.
-The production routes are expected to terminate TLS before forwarding
-`attendancedevices.slichealth.com` to `127.0.0.1:8095` and `autoattn.slichealth.com` to
-`127.0.0.1:8096`. Preserve WebSocket upgrade headers and do not expose PostgreSQL or Redis.
+Each authenticated request is bound to the connector ID, timestamp, one-use nonce, body SHA-256,
+and connector token. Replay, stale timestamp, wrong MAC, or wrong signature fails before any state
+mutation.
 
-Back up PostgreSQL with `deploy/add/backup.sh`; schedule it outside the application container and
-copy the encrypted output off-host.
+## Terminal identity and write certification
+
+The ESP reports serial, model/platform, firmware, MAC, user-record size, observations, and snapshot
+completeness. ADD certifies a write profile only after stable observations:
+
+- 72-byte record + complete snapshot: user writes may be enabled.
+- 28-byte record: read-only because the eight-byte name cannot preserve the required identity
+  representation.
+- Unknown/truncated/partial record: read-only.
+- One serial claimed by multiple active connectors: every claimant is quarantined; user mutations
+  and restart commands fail closed until the physical mapping is resolved.
+
+The certification fingerprint changes when terminal identity/profile changes. A change clears
+write certification until fresh stable observations arrive.
+
+## User lifecycle
+
+Users are always scoped to the selected terminal and have a stable ADD UUID independent of mutable
+ZKT UID/user-ID fields. The dashboard supports:
+
+- search by masked CNIC, employee/device ID, or name;
+- create with employee ID, full name, CNIC, and shift-worker flag;
+- edit missing or existing name/CNIC/shift fields;
+- display current role and grant the bounded administrator lease;
+- delete the ZKT identity without deleting punches.
+
+The exact byte-limited ZKT name preview is shown before a write. CNIC is accepted as thirteen digits,
+stored encrypted, indexed with a keyed lookup hash, returned only masked, and never placed in logs.
+Every mutation has an idempotency key, expected row version, expected terminal identity, encrypted
+desired state, expiry, and immutable audit record.
+
+### Delete invariant
+
+Delete uses only ZKT `CMD_DELETE_USER` after a fresh terminal read proves the expected serial,
+user-ID, UID, name, privilege, and version. The ESP writes a minimal encrypted tombstone before the
+delete, executes the command, rereads the user table, and verifies the identity is absent. It also
+reads the attendance count before and after; any count change makes the command fail. ADD retains
+all attendance and a masked tombstone, marks the user deleted, and never reuses that row as a new
+identity.
+
+## Ten-minute enrollment administrator lease
+
+The operator selects a device and existing user, enters the ADD password again, and requests a
+ten-minute lease. ADD and the ESP both enforce the deadline.
+
+1. ADD verifies the recent password step-up and that the device profile is writable.
+2. A fresh ESP read proves the user is present and regular privilege `0`.
+3. The ESP writes administrator privilege `14`, rereads it, persists the absolute revocation epoch
+   in encrypted NVS, and reports success.
+4. Manual newcomer enrollment is performed on the ZKT screen during the window.
+5. At expiry, the local watchdog writes privilege `0` even if ADD or the internet is unavailable.
+6. If the ZKT is offline, the revoke remains durable and retried without rapid reconnects; ADD shows
+   an overdue high-severity alert until a verified reread proves privilege `0`.
+
+Scheduled and operator restarts are blocked during an active lease. Re-requesting the same command
+cannot extend the deadline unless a new, separately authorized lease is created.
+
+## Connection lifecycle and intermittent terminals
+
+Terminal health is independent from ESP health. A connected ESP may report `DISCOVERING`,
+`SUSPECT`, `RETRY_WAIT`, `FLAPPING`, `RECOVERING`, or `ONLINE` for its ZKT.
+
+- The last authenticated IP is attempted directly; a successful connection becomes the live
+  session rather than being discarded after a probe.
+- Authentication, live registration, command work, and reconcile use one serialized terminal
+  owner. Every exit path unregisters events, sends protocol exit when safe, closes the socket, and
+  releases the owner.
+- A single failure does not declare a terminal offline. Backoff is exponential and bounded with
+  jitter. Repeated up/down transitions enter a five-minute quiet period.
+- Full subnet discovery is no more frequent than every fifteen minutes. A preferred IP of `0.0.0.0`
+  means safe DHCP discovery, not continuous scanning.
+- After recovery, live event capture is restored first. Three healthy observations and a two-minute
+  stable session are required before reconciliation or write capability resumes.
+- Recovery may restart a confirmed stuck terminal only after the configured failure threshold and
+  thirty-minute cooldown. It never reboots the ESP because the terminal is unavailable.
+
+This state machine specifically treats older ZKT models that appear briefly, disappear, and return
+as expected degraded equipment rather than a reason to hammer TCP `4370`.
+
+## Attendance reliability and reconcile
+
+The live socket registers attendance events and immediately appends each accepted event to durable
+flash. HTTP/WebSocket delivery runs on separate tasks, so slow internet cannot block the ZKT receive
+loop. ADD and ORDS acknowledgements advance independent outboxes.
+
+Every fifteen minutes, the connector compares count deltas against live punches already captured.
+A matching delta is a light reconcile. A mismatch, counter reset, first boot, or six-hour truth
+deadline requests a bounded table read. Live capture remains higher priority and resumes before a
+large truth operation. The encrypted-NVS count and truth checkpoint survives reconnects and ESP
+restarts, so an intermittent older terminal does not repeatedly trigger a full-history read. Event
+IDs are deterministic, making backend/ORDS retries idempotent.
+
+Malformed historical rows are isolated rather than blocking newer punches. Flash queues are
+bounded, checksummed, replayed after restart, and removed only after application-level acknowledgement.
+
+## Restart policy and time
+
+SNTP establishes ESP time. The terminal time, sampling time, drift, and next scheduled restart are
+visible live in ADD. Preventive ZKT restarts are enabled at 02:00, 12:00, and 22:00 Pakistan time.
+Each slot is persisted so an ESP reboot cannot repeat it. An authenticated ZKT protocol restart is
+preferred; the confirmed telnet path is a cooldown-protected fallback. Active leases defer restart.
+
+The operator can request a restart from ADD with password step-up. The command is idempotent,
+expires, and remains observable through queued, waiting, running, retrying, succeeded, failed,
+cancel-requested, cancelled, and expired states.
+
+## Dashboard behavior
+
+The responsive dashboard has Fleet, Users, Attendance, and Alerts workspaces plus a live device
+drawer. It uses the supplied State Life mark and only State Life blue `#0094DA`, white, and neutral
+tones. Error/warning/success meaning is reinforced with labels, icons, and patterns rather than
+red/amber/green theme colors.
+
+The UI includes keyboard focus management, visible focus, reduced-motion handling, masked PII,
+mobile layouts, explicit empty/loading/error states, and no registration option. Server-sent browser
+events update fleet status and logs while bounded polling provides recovery if an event stream drops.
+
+## Data retention
+
+- Attendance: immutable; no user-delete cascade.
+- Audit ledger: hash chained; mutation details recursively redacted.
+- Device logs: 14 days by default.
+- Telemetry: 30 days by default.
+- Admin sessions: 90 days maximum retention; normal sessions expire earlier.
+- Connector nonces and expired credentials: pruned by maintenance.
+
+Production backup, rollback, incident response, and post-deploy observation are defined in
+[production-runbook.md](production-runbook.md). Hardware proof is defined in
+[hardware-acceptance.md](hardware-acceptance.md).

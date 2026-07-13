@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -10,8 +8,18 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
-from zk_add.crypto import cnic_lookup, encrypt_cnic
-from zk_add.identity import parse_machine_name
+from zk_add.crypto import (
+    cnic_lookup,
+    decrypt_cnic,
+    decrypt_json,
+    decrypt_text,
+    encrypt_cnic,
+    encrypt_json,
+    encrypt_text,
+    mask_cnic,
+    normalize_cnic,
+)
+from zk_add.identity import build_machine_name, parse_machine_name
 from zk_add.models import (
     AttendanceEvent,
     Connector,
@@ -23,6 +31,7 @@ from zk_add.models import (
     DeviceLog,
     DeviceTelemetry,
     DeviceUser,
+    IdentityTombstone,
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
@@ -31,12 +40,23 @@ from zk_add.models import (
 from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
-from zk_common.time_utils import ensure_utc, parse_datetime, utc_now
+from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
-ACTIVE_COMMAND_STATES = {"QUEUED", "DISPATCHED", "ACKNOWLEDGED", "RUNNING"}
+ACTIVE_COMMAND_STATES = {
+    "QUEUED",
+    "WAITING_FOR_DEVICE",
+    "WAITING_FOR_ZKT",
+    "RETRYING",
+    "DISPATCHED",
+    "ACKNOWLEDGED",
+    "RUNNING",
+    "CANCEL_REQUESTED",
+}
 MUTATING_COMMANDS = {
+    "CREATE_USER",
     "UPDATE_USER",
+    "DELETE_USER",
     "GRANT_TEMP_ADMIN",
     "REVOKE_TEMP_ADMIN",
     "RESTART_ZKT",
@@ -60,78 +80,74 @@ def ensure_site(session: Session, zone_id: str, zone_name: str) -> Site:
     return site
 
 
-def create_connector(
+def onboard_connector(
     session: Session,
     *,
     hardware_id: str,
     zone_id: str,
     zone_name: str,
     device_id: str,
-    display_name: str,
+    firmware_version: str,
     expected_serial: str | None,
     actor: str,
     ip_address: str | None,
-) -> tuple[Connector, str]:
-    if session.scalar(select(Connector).where(Connector.hardware_id == hardware_id)):
-        raise ValueError("A connector with this hardware ID already exists.")
+) -> tuple[Connector, str, bool]:
     site = ensure_site(session, zone_id, zone_name)
-    connector_id = str(uuid4())
-    activation_code = secrets.token_urlsafe(32)
-    connector = Connector(
-        connector_id=connector_id,
-        hardware_id=hardware_id,
-        site_id=site.id,
-        zone_id=zone_id,
-        zone_name=zone_name,
-        device_id=device_id,
-        display_name=display_name,
-        activation_hash=connector_token_hash(activation_code),
-    )
-    session.add(connector)
-    session.flush()
-    session.add(
-        ZKTDevice(
-            connector_id=connector.id,
-            expected_serial=expected_serial,
-            serial=expected_serial,
-            certification_state="READ_ONLY",
-            capability_profile={
-                "read_users": True,
-                "read_attendance": True,
-                "user_write": False,
-                "admin_lease": False,
-                "protocol_restart": False,
-                "telnet_recovery": False,
-            },
+    connector = session.scalar(select(Connector).where(Connector.hardware_id == hardware_id))
+    created = connector is None
+    if connector is None:
+        connector = Connector(
+            connector_id=str(uuid4()),
+            hardware_id=hardware_id,
+            site_id=site.id,
+            zone_id=zone_id,
+            zone_name=zone_name,
+            device_id=device_id,
+            display_name=zone_name,
+            firmware_version=firmware_version,
+            lifecycle_state="ONBOARDING",
         )
-    )
-    append_audit(
-        session,
-        actor=actor,
-        action="CONNECTOR_CREATED",
-        target_type="connector",
-        target_id=connector_id,
-        outcome="SUCCESS",
-        ip_address=ip_address,
-        after={"hardware_id": hardware_id, "zone_id": zone_id, "device_id": device_id},
-    )
-    return connector, activation_code
-
-
-def activate_connector(
-    session: Session, *, connector_id: str, hardware_id: str, activation_code: str
-) -> tuple[Connector, str]:
-    connector = session.scalar(
-        select(Connector).where(
-            Connector.connector_id == connector_id,
-            Connector.hardware_id == hardware_id,
-            Connector.active == True,  # noqa: E712
+        session.add(connector)
+        session.flush()
+        session.add(
+            ZKTDevice(
+                connector_id=connector.id,
+                expected_serial=expected_serial,
+                serial=expected_serial,
+                certification_state="READ_ONLY",
+                capability_profile={
+                    "read_users": True,
+                    "read_attendance": True,
+                    "user_write": False,
+                    "create_user": False,
+                    "delete_user": False,
+                    "admin_lease": False,
+                    "protocol_restart": False,
+                    "telnet_recovery": False,
+                    "name_bytes": 24,
+                },
+            )
         )
-    )
-    if connector is None or not connector.activation_hash:
-        raise ValueError("Activation is invalid or has already been used.")
-    if not secrets.compare_digest(connector.activation_hash, connector_token_hash(activation_code)):
-        raise ValueError("Activation is invalid or has already been used.")
+    else:
+        connector.site_id = site.id
+        connector.zone_id = zone_id
+        connector.zone_name = zone_name
+        connector.device_id = device_id
+        connector.display_name = zone_name
+        connector.firmware_version = firmware_version
+        if connector.zkt_device and expected_serial and not connector.zkt_device.expected_serial:
+            connector.zkt_device.expected_serial = expected_serial
+
+    now = utc_now()
+    overlap_until = now + timedelta(seconds=settings.onboarding_token_overlap_seconds)
+    for credential in session.scalars(
+        select(ConnectorCredential).where(
+            ConnectorCredential.connector_id == connector.id,
+            ConnectorCredential.active == True,  # noqa: E712
+            ConnectorCredential.revoked_at == None,  # noqa: E711
+        )
+    ).all():
+        credential.valid_until = overlap_until
     raw_token = secrets.token_urlsafe(48)
     session.add(
         ConnectorCredential(
@@ -140,67 +156,108 @@ def activate_connector(
             token_last4=raw_token[-4:],
         )
     )
-    connector.activation_hash = None
-    connector.lifecycle_state = "ONLINE"
-    connector.updated_at = utc_now()
+    connector.onboarding_generation = (connector.onboarding_generation or 0) + 1
+    connector.last_onboarded_at = now
+    connector.updated_at = now
     append_audit(
         session,
-        actor=f"connector:{connector.connector_id}",
-        action="CONNECTOR_ACTIVATED",
+        actor=actor,
+        action="CONNECTOR_AUTO_ONBOARDED" if created else "CONNECTOR_TOKEN_ROTATED",
         target_type="connector",
         target_id=connector.connector_id,
         outcome="SUCCESS",
+        ip_address=ip_address,
+        after={
+            "hardware_id": hardware_id,
+            "zone_id": zone_id,
+            "device_id": device_id,
+            "generation": connector.onboarding_generation,
+        },
     )
-    return connector, raw_token
+    return connector, raw_token, created
 
 
-def seed_bootstrap_connector(session: Session) -> None:
-    if not settings.bootstrap_connector_id or not settings.bootstrap_connector_token:
+def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> None:
+    if not zkt.serial or not zkt.online:
         return
-    connector = session.scalar(
-        select(Connector).where(Connector.connector_id == settings.bootstrap_connector_id)
-    )
-    if connector is None:
-        site = ensure_site(session, settings.bootstrap_zone_id, settings.bootstrap_zone_name)
-        connector = Connector(
-            connector_id=settings.bootstrap_connector_id,
-            hardware_id=settings.bootstrap_hardware_id or settings.bootstrap_connector_id,
-            site_id=site.id,
-            zone_id=settings.bootstrap_zone_id,
-            zone_name=settings.bootstrap_zone_name,
-            device_id=settings.bootstrap_device_id,
-            display_name=settings.bootstrap_zone_name,
-            lifecycle_state="ONBOARDING",
+    if zkt.expected_serial and zkt.expected_serial != zkt.serial:
+        zkt.certification_state = "READ_ONLY"
+        zkt.writes_disabled_reason = "SERIAL_MISMATCH"
+        return
+    duplicates = session.scalars(
+        select(ZKTDevice).where(
+            ZKTDevice.serial == zkt.serial,
+            ZKTDevice.id != zkt.id,
         )
-        session.add(connector)
-        session.flush()
-        session.add(
-            ZKTDevice(
-                connector_id=connector.id,
-                expected_serial=settings.bootstrap_expected_serial,
-                serial=settings.bootstrap_expected_serial,
-                certification_state="READ_ONLY",
+    ).all()
+    if duplicates:
+        # A duplicate serial is ambiguous by definition. Quarantining only the
+        # newest claimant would leave an older connector able to mutate the same
+        # terminal, so every authenticated claimant is made read-only.
+        for claimed in [zkt, *duplicates]:
+            claimant = session.get(Connector, claimed.connector_id)
+            if claimant is None:
+                continue
+            claimant.lifecycle_state = "QUARANTINED_DUPLICATE_SERIAL"
+            claimant.last_error_code = "QUARANTINED_DUPLICATE_SERIAL"
+            claimant.last_error_message = (
+                "This ZKT serial is claimed by more than one authenticated connector."
             )
-        )
-    elif connector.zkt_device and settings.bootstrap_expected_serial:
-        connector.zkt_device.expected_serial = settings.bootstrap_expected_serial
-        if connector.zkt_device.serial is None:
-            connector.zkt_device.serial = settings.bootstrap_expected_serial
-    hashed = connector_token_hash(settings.bootstrap_connector_token)
-    credential = session.scalar(
-        select(ConnectorCredential).where(
-            ConnectorCredential.connector_id == connector.id,
-            ConnectorCredential.token_hash == hashed,
-        )
-    )
-    if credential is None:
-        session.add(
-            ConnectorCredential(
-                connector_id=connector.id,
-                token_hash=hashed,
-                token_last4=settings.bootstrap_connector_token[-4:],
+            claimed.certification_state = "QUARANTINED"
+            claimed.writes_disabled_reason = "DUPLICATE_SERIAL"
+            claimed.capability_profile = {
+                **(claimed.capability_profile or {}),
+                "user_write": False,
+                "create_user": False,
+                "delete_user": False,
+                "admin_lease": False,
+                "protocol_restart": False,
+                "telnet_recovery": False,
+            }
+            upsert_alert(
+                session,
+                claimant,
+                code="QUARANTINED_DUPLICATE_SERIAL",
+                severity="CRITICAL",
+                message=claimant.last_error_message,
+                details={"serial": zkt.serial},
             )
-        )
+        return
+
+    record_size = int((zkt.capability_profile or {}).get("observed_user_record_bytes", 0))
+    fingerprint = f"{zkt.serial}|{zkt.model or ''}|{zkt.platform or ''}|{record_size}"
+    if zkt.certification_fingerprint != fingerprint:
+        zkt.certification_fingerprint = fingerprint
+        zkt.certification_observations = 1
+    else:
+        zkt.certification_observations = min(zkt.certification_observations + 1, 1000)
+    if not zkt.stability_since:
+        return
+    stability_since = ensure_utc(zkt.stability_since)
+    if utc_now() - stability_since < timedelta(minutes=2):
+        return
+    if zkt.certification_observations < 2:
+        return
+
+    writable = record_size == 72 and zkt.snapshot_complete
+    zkt.certification_state = "CERTIFIED" if writable else "READ_ONLY"
+    zkt.writes_disabled_reason = None if writable else (
+        "LEGACY_28_BYTE_RECORD" if record_size == 28 else "FULL_USER_SNAPSHOT_REQUIRED"
+    )
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "read_users": True,
+        "read_attendance": True,
+        "user_write": writable,
+        "create_user": writable,
+        "delete_user": writable,
+        "admin_lease": writable,
+        "protocol_restart": record_size in {28, 72},
+        "telnet_recovery": False,
+        "name_bytes": 24 if record_size == 72 else 8,
+    }
+    if writable:
+        resolve_alert(session, connector, code="USER_SNAPSHOT_TRUNCATED")
 
 
 def update_heartbeat(
@@ -351,6 +408,8 @@ def update_heartbeat(
                 severity="CRITICAL",
                 message=connector.last_error_message,
             )
+        if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
+            auto_certify_zkt(session, connector, zkt)
     session.add(
         DeviceTelemetry(
             connector_id=connector.id,
@@ -362,7 +421,7 @@ def update_heartbeat(
             outbox_depth=payload.outbox_depth,
             current_activity=payload.current_activity,
             led_state=payload.led_state,
-            payload=payload.model_dump(mode="json"),
+            payload=redact_context(payload.model_dump(mode="json")),
         )
     )
     return serialize_connector(connector)
@@ -386,28 +445,32 @@ def replace_user_snapshot(
         incoming_user_ids.add(incoming.user_id)
 
     existing_rows = list(
-        session.scalars(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)).all()
+        session.scalars(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+        ).all()
     )
     rows_by_uid = {row.uid: row for row in existing_rows}
-    uid_claiming_user_id = {
-        incoming.user_id: incoming.uid for incoming in snapshot.users
-    }
-
-    # The ZKT terminal can reuse an employee ID after deleting/re-enrolling a
-    # user, and two existing UIDs can swap employee IDs in a single snapshot.
-    # Stage every changing/conflicting unique value before applying the final
-    # snapshot so PostgreSQL never observes a transient uniqueness violation.
-    staged = False
+    uid_claiming_user_id = {incoming.user_id: incoming.uid for incoming in snapshot.users}
+    if not snapshot.complete:
+        # A partial snapshot is evidence about rows that were observed, never
+        # evidence that an unobserved identity disappeared.  Refuse ambiguous
+        # UID/user-ID replacement until a complete table can resolve it.
+        for row in existing_rows:
+            claiming_uid = uid_claiming_user_id.get(row.user_id)
+            if claiming_uid not in {None, row.uid} and row.uid not in incoming_by_uid:
+                raise ValueError(
+                    "A partial user snapshot cannot replace an unobserved identity."
+                )
     for row in existing_rows:
         incoming = incoming_by_uid.get(row.uid)
         changes_user_id = incoming is not None and incoming.user_id != row.user_id
         claimed_by_other_uid = uid_claiming_user_id.get(row.user_id) not in {None, row.uid}
         if changes_user_id or claimed_by_other_uid:
-            row.user_id = f"__retired__{row.id}__{row.user_id}"[:100]
-            staged = True
-    if staged:
-        session.flush()
-
+            row.lifecycle_state = "STAGING"
+    session.flush()
     seen: set[str] = set()
     observed_at = ensure_utc(snapshot.observed_at)
     updated_at = utc_now()
@@ -416,40 +479,156 @@ def replace_user_snapshot(
         parsed = parse_machine_name(incoming.name)
         row = rows_by_uid.get(incoming.uid)
         if row is None:
+            conflicting = session.scalar(
+                select(DeviceUser).where(
+                    DeviceUser.zkt_device_id == zkt.id,
+                    DeviceUser.user_id == incoming.user_id,
+                    DeviceUser.lifecycle_state == "ACTIVE",
+                )
+            )
+            if conflicting is not None:
+                persist_identity_tombstone(session, zkt=zkt, user=conflicting)
+                conflicting.present = False
+                conflicting.lifecycle_state = "DELETED"
+                conflicting.deleted_at = updated_at
+                conflicting.deleted_by = "device:snapshot-replacement"
+                conflicting.row_version += 1
+                session.flush()
             row = DeviceUser(
                 zkt_device_id=zkt.id,
                 uid=incoming.uid,
                 user_id=incoming.user_id,
-                raw_name=incoming.name,
+                machine_name_encrypted=encrypt_text(incoming.name),
                 display_name=parsed.display_name,
                 row_version=1,
+                lifecycle_state="ACTIVE",
+                source="DEVICE_SNAPSHOT",
             )
             session.add(row)
+            session.flush()
             rows_by_uid[incoming.uid] = row
         else:
             row.row_version = (row.row_version or 0) + 1
         row.user_id = incoming.user_id
-        row.raw_name = incoming.name
-        row.display_name = parsed.display_name
-        row.cnic_encrypted = encrypt_cnic(parsed.cnic)
-        row.cnic_lookup_hash = cnic_lookup(parsed.cnic)
-        row.cnic_last4 = parsed.cnic[-4:] if parsed.cnic else None
-        row.shift_worker = parsed.shift_worker
+        row.machine_name_encrypted = encrypt_text(incoming.name)
+        if row.source != "ADD_MANAGED" or not row.display_name:
+            row.display_name = parsed.display_name
+        if parsed.cnic:
+            previous_hash = row.cnic_lookup_hash
+            row.cnic_encrypted = encrypt_cnic(parsed.cnic)
+            row.cnic_lookup_hash = cnic_lookup(parsed.cnic)
+            row.cnic_last4 = parsed.cnic[-4:]
+            row.shift_worker = parsed.shift_worker
+            if previous_hash != row.cnic_lookup_hash:
+                enrich_undelivered_attendance(session, zkt=zkt, user=row)
         row.privilege = incoming.privilege
         row.card = incoming.card
         row.present = True
+        row.lifecycle_state = "ACTIVE"
+        row.deleted_at = None
+        row.deleted_by = None
         row.snapshot_id = snapshot.snapshot_id
         row.observed_at = observed_at
         row.updated_at = updated_at
     if snapshot.complete:
         for row in existing_rows:
             if row.uid not in seen:
+                persist_identity_tombstone(session, zkt=zkt, user=row)
                 row.present = False
+                row.lifecycle_state = "DELETED"
+                row.deleted_at = updated_at
+                row.deleted_by = "device:complete-snapshot"
                 row.row_version += 1
                 row.updated_at = updated_at
-    zkt.user_count = len(snapshot.users)
+        zkt.user_count = len(snapshot.users)
+        zkt.snapshot_complete = True
+        if zkt.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED":
+            zkt.writes_disabled_reason = None
+    else:
+        for row in existing_rows:
+            if row.uid not in seen and row.lifecycle_state == "STAGING":
+                row.lifecycle_state = "ACTIVE"
+        zkt.snapshot_complete = False
+        zkt.writes_disabled_reason = "USER_SNAPSHOT_TRUNCATED"
+        zkt.certification_state = "READ_ONLY"
+        zkt.capability_profile = {
+            **(zkt.capability_profile or {}),
+            "user_write": False,
+            "create_user": False,
+            "delete_user": False,
+            "admin_lease": False,
+        }
+        upsert_alert(
+            session,
+            connector,
+            code="USER_SNAPSHOT_TRUNCATED",
+            severity="CRITICAL",
+            message="The connector reported a partial user snapshot; terminal writes are disabled.",
+            details={"snapshot_id": snapshot.snapshot_id, "rows_received": len(snapshot.users)},
+        )
     zkt.updated_at = utc_now()
     return len(snapshot.users)
+
+
+def persist_identity_tombstone(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser
+) -> IdentityTombstone:
+    existing = session.scalar(
+        select(IdentityTombstone).where(
+            IdentityTombstone.zkt_device_id == zkt.id,
+            IdentityTombstone.user_id == user.user_id,
+            IdentityTombstone.device_user_id == user.id,
+        )
+    )
+    if existing is not None:
+        return existing
+    row = IdentityTombstone(
+        zkt_device_id=zkt.id,
+        device_user_id=user.id,
+        device_serial=zkt.serial,
+        uid=user.uid,
+        user_id=user.user_id,
+        display_name_encrypted=encrypt_text(user.display_name) or "",
+        cnic_encrypted=user.cnic_encrypted,
+        cnic_lookup_hash=user.cnic_lookup_hash,
+        cnic_last4=user.cnic_last4,
+        shift_worker=user.shift_worker,
+        privilege=user.privilege,
+    )
+    session.add(row)
+    return row
+
+
+def enrich_undelivered_attendance(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser
+) -> int:
+    cnic = decrypt_cnic(user.cnic_encrypted)
+    if not cnic:
+        return 0
+    rows = session.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == user.user_id,
+            AttendanceEvent.ords_status.in_(["BLOCKED_IDENTITY", "PENDING", "RETRYING"]),
+        )
+    ).all()
+    changed = 0
+    for row in rows:
+        if row.ords_status not in {"BLOCKED_IDENTITY", "PENDING", "RETRYING"}:
+            continue
+        row.device_user_id = user.id
+        row.display_name = user.display_name
+        row.cnic_encrypted = user.cnic_encrypted
+        row.cnic_lookup_hash = user.cnic_lookup_hash
+        row.cnic_last4 = user.cnic_last4
+        row.raw_punch = row.raw_punch or user.shift_worker
+        row.ords_status = "PENDING"
+        if session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        ) is None:
+            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+        changed += 1
+    return changed
 
 
 def ingest_attendance(
@@ -468,56 +647,71 @@ def ingest_attendance(
             duplicates.append(incoming.event_uid)
             continue
         parsed = parse_machine_name(incoming.raw_name)
-        if not parsed.cnic:
-            user = session.scalar(
-                select(DeviceUser).where(
-                    DeviceUser.zkt_device_id == zkt.id,
-                    DeviceUser.user_id == incoming.user_id,
-                    DeviceUser.present == True,  # noqa: E712
-                )
+        user = session.scalar(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.user_id == incoming.user_id,
+                DeviceUser.lifecycle_state == "ACTIVE",
             )
-            if user:
-                parsed = parse_machine_name(user.raw_name)
+        )
+        tombstone = None
+        if user is None:
+            tombstone = session.scalar(
+                select(IdentityTombstone)
+                .where(
+                    IdentityTombstone.zkt_device_id == zkt.id,
+                    IdentityTombstone.user_id == incoming.user_id,
+                )
+                .order_by(IdentityTombstone.id.desc())
+            )
+        cnic = decrypt_cnic(user.cnic_encrypted) if user else parsed.cnic
+        display_name = user.display_name if user else parsed.display_name or incoming.raw_name
+        cnic_encrypted = user.cnic_encrypted if user else encrypt_cnic(cnic)
+        cnic_hash = user.cnic_lookup_hash if user else cnic_lookup(cnic)
+        cnic_last4 = user.cnic_last4 if user else (cnic[-4:] if cnic else None)
+        shift_worker = user.shift_worker if user else parsed.shift_worker
+        if not cnic and tombstone is not None:
+            cnic_encrypted = tombstone.cnic_encrypted
+            cnic_hash = tombstone.cnic_lookup_hash
+            cnic_last4 = tombstone.cnic_last4
+            cnic = decrypt_cnic(tombstone.cnic_encrypted)
+            display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
+            shift_worker = tombstone.shift_worker
         row = AttendanceEvent(
             event_uid=incoming.event_uid,
             connector_id=connector.id,
             zkt_device_id=zkt.id,
+            device_user_id=user.id if user else (tombstone.device_user_id if tombstone else None),
             device_serial=zkt.serial,
             uid=incoming.uid,
             user_id=incoming.user_id,
-            raw_name=incoming.raw_name,
-            display_name=parsed.display_name or incoming.raw_name,
-            cnic_encrypted=encrypt_cnic(parsed.cnic),
-            cnic_lookup_hash=cnic_lookup(parsed.cnic),
-            cnic_last4=parsed.cnic[-4:] if parsed.cnic else None,
+            display_name=display_name,
+            cnic_encrypted=cnic_encrypted,
+            cnic_lookup_hash=cnic_hash,
+            cnic_last4=cnic_last4,
             device_event_time=ensure_utc(incoming.device_event_time),
             captured_at=ensure_utc(incoming.captured_at),
             source=incoming.source,
             status=None if incoming.status is None else str(incoming.status),
             punch=None if incoming.punch is None else str(incoming.punch),
-            raw_punch=incoming.raw_punch or parsed.shift_worker,
+            raw_punch=incoming.raw_punch or shift_worker,
             clock_drift_seconds=incoming.clock_drift_seconds,
             clock_quality=incoming.clock_quality,
             boot_id=incoming.boot_id,
             sequence=incoming.sequence,
-            raw_event=incoming.raw_event,
-            ords_status="PENDING" if parsed.cnic else "BLOCKED_IDENTITY",
+            raw_event=sanitize_raw_event(incoming.raw_event),
+            ords_status="PENDING" if cnic else "BLOCKED_IDENTITY",
         )
         session.add(row)
         session.flush()
-        if parsed.cnic:
-            payload = oracle_payload(connector, zkt, row, parsed.cnic)
-            session.add(
-                OrdsOutbox(
-                    attendance_event_id=row.id,
-                    payload=payload,
-                    payload_hash=hashlib.sha256(
-                        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-                    ).hexdigest(),
-                )
-            )
+        if cnic:
+            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
         accepted.append(incoming.event_uid)
     return accepted, duplicates
+
+
+def sanitize_raw_event(value: dict) -> dict:
+    return redact_context(value, extra_blocked={"name", "raw_name"})
 
 
 def oracle_payload(connector: Connector, zkt: ZKTDevice, row: AttendanceEvent, cnic: str) -> dict:
@@ -583,15 +777,43 @@ def ingest_logs(session: Session, *, connector: Connector, logs: list) -> int:
     return accepted
 
 
-def redact_context(value: dict) -> dict:
-    blocked = {"password", "token", "secret", "comm_key", "cnic", "authorization"}
-    return {key: "[REDACTED]" if key.lower() in blocked else item for key, item in value.items()}
+def redact_context(value: dict, *, extra_blocked: set[str] | None = None) -> dict:
+    blocked = {
+        "password",
+        "token",
+        "secret",
+        "comm_key",
+        "cnic",
+        "authorization",
+        "wifi_password",
+        "ords_password",
+        "zkt_comm_key",
+        "bootstrap_secret",
+        "device_token",
+    } | (extra_blocked or set())
+
+    def sensitive(key: str) -> bool:
+        normalized = key.lower()
+        return normalized in blocked or normalized.endswith(
+            ("_password", "_secret", "_token", "_comm_key")
+        )
+
+    def redact(item: object, key: str = "") -> object:
+        if sensitive(key):
+            return "[REDACTED]"
+        if isinstance(item, dict):
+            return {str(child): redact(value, str(child)) for child, value in item.items()}
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        return item
+
+    return {str(key): redact(item, str(key)) for key, item in value.items()}
 
 
 def redact_text(value: str) -> str:
     import re
 
-    value = re.sub(r"\b\d{13}\b", "[CNIC-REDACTED]", value)
+    value = re.sub(r"\b\d{5}-?\d{7}-?\d\b", "[CNIC-REDACTED]", value)
     return value
 
 
@@ -615,6 +837,11 @@ def create_command(
     )
     if existing:
         return existing
+    if (
+        command_type in MUTATING_COMMANDS
+        and connector.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    ):
+        raise ValueError("This connector is quarantined because its ZKT serial is duplicated.")
     if command_type in MUTATING_COMMANDS:
         active = session.scalar(
             select(DeviceCommand).where(
@@ -626,46 +853,473 @@ def create_command(
         if active:
             raise ValueError(f"Device already has active command {active.command_id}.")
     now = utc_now()
+    zkt = connector.zkt_device
+    if not connector.connected:
+        initial_status = "WAITING_FOR_DEVICE"
+    elif command_type in MUTATING_COMMANDS and zkt and (
+        not zkt.online or zkt.connection_state in {"FLAPPING", "RETRY_WAIT", "OFFLINE"}
+    ):
+        initial_status = "WAITING_FOR_ZKT"
+    else:
+        initial_status = "QUEUED"
     command = DeviceCommand(
         command_id=str(uuid4()),
         connector_id=connector.id,
         command_type=command_type,
-        payload=payload,
-        expected_state=expected_state,
-        desired_state=desired_state,
+        payload_encrypted=encrypt_json(payload),
+        expected_state_encrypted=encrypt_json(expected_state),
+        desired_state_encrypted=encrypt_json(desired_state),
+        payload_summary=command_payload_summary(payload),
         idempotency_key=idempotency_key,
         actor=actor,
+        status=initial_status,
         expires_at=None
         if expires_in_seconds is None
         else now + timedelta(seconds=expires_in_seconds),
     )
     session.add(command)
     session.flush()
-    session.add(DeviceCommandEvent(command_id=command.id, status="QUEUED", details={}))
+    session.add(DeviceCommandEvent(command_id=command.id, status=initial_status, details={}))
     append_audit(
         session,
         actor=actor,
         action=f"COMMAND_{command_type}_QUEUED",
         target_type="connector",
         target_id=connector.connector_id,
-        outcome="QUEUED",
+        outcome=initial_status,
         after={"command_id": command.command_id},
     )
     return command
 
 
 def serialize_command(command: DeviceCommand) -> dict:
+    if command.status == "CANCEL_REQUESTED":
+        return {
+            "schema_version": "2",
+            "type": "command_cancel",
+            "command_id": command.command_id,
+        }
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "type": "command",
         "command_id": command.command_id,
         "command_type": command.command_type,
-        "payload": command.payload,
-        "expected_state": command.expected_state,
-        "desired_state": command.desired_state,
+        "payload": decrypt_json(command.payload_encrypted),
+        "expected_state": decrypt_json(command.expected_state_encrypted),
+        "desired_state": decrypt_json(command.desired_state_encrypted),
         "created_at": command.created_at.isoformat(),
         "expires_at": command.expires_at.isoformat() if command.expires_at else None,
+        "expires_epoch": int(command.expires_at.timestamp()) if command.expires_at else 0,
     }
+
+
+def command_payload_summary(payload: dict) -> dict:
+    allowed = {"user_key", "uid", "user_id", "lease_id", "duration_seconds", "reason"}
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
+def require_writable_user_profile(connector: Connector, capability: str) -> ZKTDevice:
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("No assigned ZKT device.")
+    if connector.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL":
+        raise ValueError("This connector is quarantined because its ZKT serial is duplicated.")
+    if zkt.certification_state != "CERTIFIED" or not zkt.capability_profile.get(
+        capability, False
+    ):
+        reason = zkt.writes_disabled_reason or "DEVICE_NOT_WRITE_CERTIFIED"
+        raise ValueError(f"This terminal is read-only ({reason}).")
+    if not zkt.snapshot_complete:
+        raise ValueError("A complete fresh user snapshot is required before user mutation.")
+    return zkt
+
+
+def ensure_no_active_user_operation(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser | None = None
+) -> None:
+    lease_statement = select(TemporaryAdminLease).where(
+        TemporaryAdminLease.zkt_device_id == zkt.id,
+        TemporaryAdminLease.state.in_(
+            ["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]
+        ),
+    )
+    if user is not None:
+        lease_statement = lease_statement.where(TemporaryAdminLease.device_user_id == user.id)
+    if session.scalar(lease_statement):
+        raise ValueError("An enrollment administrator lease is active for this user/device.")
+
+
+def allocate_device_identifiers(
+    session: Session, *, zkt: ZKTDevice, user_id_override: str | None
+) -> tuple[str, str]:
+    rows = session.scalars(
+        select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)
+    ).all()
+    used_uids = {int(row.uid) for row in rows if row.uid.isdigit()}
+    uid = max(used_uids, default=0) + 1
+    if uid > 65535:
+        raise ValueError("The terminal has no never-used 16-bit UID remaining.")
+    used_user_ids = {row.user_id for row in rows}
+    if user_id_override:
+        if user_id_override in used_user_ids:
+            raise ValueError("That employee/user ID has already been used on this terminal.")
+        user_id = user_id_override
+    else:
+        numeric_ids = [int(value) for value in used_user_ids if value.isdigit()]
+        user_id = str(max(numeric_ids, default=0) + 1)
+        while user_id in used_user_ids:
+            user_id = str(int(user_id) + 1)
+    if zkt.user_count is not None and zkt.user_count >= 65535:
+        raise ValueError("The terminal user capacity has been reached.")
+    return str(uid), user_id
+
+
+def find_user_by_key(session: Session, *, zkt: ZKTDevice, user_key: str) -> DeviceUser | None:
+    return session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == user_key,
+        )
+    )
+
+
+def find_idempotent_user_command(
+    session: Session,
+    *,
+    connector: Connector,
+    idempotency_key: str,
+    command_type: str,
+) -> tuple[DeviceUser | None, DeviceCommand] | None:
+    command = session.scalar(
+        select(DeviceCommand).where(
+            DeviceCommand.connector_id == connector.id,
+            DeviceCommand.idempotency_key == idempotency_key,
+        )
+    )
+    if command is None:
+        return None
+    if command.command_type != command_type:
+        raise ValueError("That idempotency key was already used for another operation.")
+    payload = decrypt_json(command.payload_encrypted)
+    user = session.scalar(
+        select(DeviceUser).where(DeviceUser.user_key == payload.get("user_key"))
+    )
+    return user, command
+
+
+def create_device_user_command(
+    session: Session,
+    *,
+    connector: Connector,
+    display_name: str,
+    cnic: str,
+    shift_worker: bool,
+    user_id_override: str | None,
+    idempotency_key: str,
+    actor: str,
+) -> tuple[DeviceUser, DeviceCommand]:
+    replay = find_idempotent_user_command(
+        session,
+        connector=connector,
+        idempotency_key=idempotency_key,
+        command_type="CREATE_USER",
+    )
+    if replay is not None:
+        user, existing = replay
+        if user is None:
+            raise ValueError("The idempotent create command no longer references a user.")
+        return user, existing
+    zkt = require_writable_user_profile(connector, "create_user")
+    ensure_no_active_user_operation(session, zkt=zkt)
+    normalized_cnic = normalize_cnic(cnic)
+    if normalized_cnic is None:
+        raise ValueError("CNIC must contain exactly 13 digits.")
+    lookup = cnic_lookup(normalized_cnic)
+    if session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.cnic_lookup_hash == lookup,
+            DeviceUser.lifecycle_state.in_(["ACTIVE", "PENDING"]),
+        )
+    ):
+        raise ValueError("That CNIC already belongs to a user on this terminal.")
+    uid, user_id = allocate_device_identifiers(
+        session, zkt=zkt, user_id_override=user_id_override
+    )
+    name_limit = int(zkt.capability_profile.get("name_bytes", 24))
+    machine_name = build_machine_name(
+        display_name=display_name,
+        cnic=normalized_cnic,
+        shift_worker=shift_worker,
+        byte_limit=name_limit,
+    )
+    now = utc_now()
+    user = DeviceUser(
+        zkt_device_id=zkt.id,
+        uid=uid,
+        user_id=user_id,
+        machine_name_encrypted=encrypt_text(machine_name),
+        display_name=" ".join(display_name.strip().split()),
+        cnic_encrypted=encrypt_cnic(normalized_cnic),
+        cnic_lookup_hash=lookup,
+        cnic_last4=normalized_cnic[-4:],
+        shift_worker=shift_worker,
+        privilege=0,
+        present=False,
+        lifecycle_state="PENDING",
+        source="ADD_MANAGED",
+        observed_at=now,
+        updated_at=now,
+    )
+    session.add(user)
+    session.flush()
+    audit = append_audit(
+        session,
+        actor=actor,
+        action="DEVICE_USER_CREATE_REQUESTED",
+        target_type="device_user",
+        target_id=user.user_key,
+        outcome="PENDING",
+        after={
+            "display_name": user.display_name,
+            "cnic": mask_cnic(normalized_cnic),
+            "shift_worker": shift_worker,
+            "privilege": 0,
+            "uid": uid,
+            "user_id": user_id,
+        },
+    )
+    session.flush()
+    user.create_audit_id = audit.id
+    command = create_command(
+        session,
+        connector=connector,
+        command_type="CREATE_USER",
+        payload={
+            "user_key": user.user_key,
+            "uid": uid,
+            "user_id": user_id,
+            "name": machine_name,
+            "privilege": 0,
+        },
+        expected_state={
+            "serial": zkt.serial,
+            "uid_absent": uid,
+            "user_id_absent": user_id,
+            "user_count": zkt.user_count,
+        },
+        desired_state={
+            "user_key": user.user_key,
+            "display_name": user.display_name,
+            "cnic": normalized_cnic,
+            "shift_worker": shift_worker,
+            "privilege": 0,
+            "machine_name": machine_name,
+        },
+        idempotency_key=idempotency_key,
+        actor=actor,
+        expires_in_seconds=settings.user_command_retry_seconds,
+    )
+    user.current_command_id = command.id
+    return user, command
+
+
+def update_device_user_command(
+    session: Session,
+    *,
+    connector: Connector,
+    user: DeviceUser,
+    display_name: str | None,
+    cnic: str | None,
+    shift_worker: bool | None,
+    privilege: int | None,
+    expected_version: int,
+    idempotency_key: str,
+    actor: str,
+) -> DeviceCommand:
+    replay = find_idempotent_user_command(
+        session,
+        connector=connector,
+        idempotency_key=idempotency_key,
+        command_type="UPDATE_USER",
+    )
+    if replay is not None:
+        existing_user, existing_command = replay
+        if existing_user is None or existing_user.id != user.id:
+            raise ValueError("That idempotency key belongs to another user.")
+        return existing_command
+    zkt = require_writable_user_profile(connector, "user_write")
+    if user.lifecycle_state != "ACTIVE" or not user.present:
+        raise ValueError("Device user is not active.")
+    if user.row_version != expected_version:
+        raise ValueError("User changed since it was loaded. Refresh and retry.")
+    ensure_no_active_user_operation(session, zkt=zkt, user=user)
+    current_cnic = decrypt_cnic(user.cnic_encrypted)
+    next_cnic = normalize_cnic(cnic) if cnic is not None else current_cnic
+    if next_cnic is None:
+        raise ValueError("CNIC cannot be cleared.")
+    next_lookup = cnic_lookup(next_cnic)
+    duplicate = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.cnic_lookup_hash == next_lookup,
+            DeviceUser.lifecycle_state == "ACTIVE",
+            DeviceUser.id != user.id,
+        )
+    )
+    if duplicate:
+        raise ValueError("That CNIC already belongs to another active user.")
+    next_display = " ".join((display_name or user.display_name).strip().split())
+    next_shift = user.shift_worker if shift_worker is None else shift_worker
+    next_privilege = user.privilege if privilege is None else privilege
+    machine_name = build_machine_name(
+        display_name=next_display,
+        cnic=next_cnic,
+        shift_worker=next_shift,
+        byte_limit=int(zkt.capability_profile.get("name_bytes", 24)),
+    )
+    desired = {
+        "user_key": user.user_key,
+        "display_name": next_display,
+        "cnic": next_cnic,
+        "shift_worker": next_shift,
+        "privilege": next_privilege,
+        "machine_name": machine_name,
+    }
+    current_machine_name = decrypt_text(user.machine_name_encrypted) or ""
+    audit = append_audit(
+        session,
+        actor=actor,
+        action="DEVICE_USER_UPDATE_REQUESTED",
+        target_type="device_user",
+        target_id=user.user_key,
+        outcome="PENDING",
+        before={
+            "display_name": user.display_name,
+            "cnic": mask_cnic(current_cnic),
+            "shift_worker": user.shift_worker,
+            "privilege": user.privilege,
+            "version": user.row_version,
+        },
+        after={
+            "display_name": next_display,
+            "cnic": mask_cnic(next_cnic),
+            "shift_worker": next_shift,
+            "privilege": next_privilege,
+        },
+    )
+    session.flush()
+    user.update_audit_id = audit.id
+    command = create_command(
+        session,
+        connector=connector,
+        command_type="UPDATE_USER",
+        payload={
+            "user_key": user.user_key,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "name": machine_name,
+            "privilege": next_privilege,
+        },
+        expected_state={
+            "serial": zkt.serial,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "row_version": user.row_version,
+            "name": current_machine_name,
+            "privilege": user.privilege,
+        },
+        desired_state=desired,
+        idempotency_key=idempotency_key,
+        actor=actor,
+        expires_in_seconds=settings.user_command_retry_seconds,
+    )
+    user.current_command_id = command.id
+    return command
+
+
+def delete_device_user_command(
+    session: Session,
+    *,
+    connector: Connector,
+    user: DeviceUser,
+    expected_version: int,
+    typed_confirmation: str,
+    idempotency_key: str,
+    actor: str,
+) -> DeviceCommand:
+    replay = find_idempotent_user_command(
+        session,
+        connector=connector,
+        idempotency_key=idempotency_key,
+        command_type="DELETE_USER",
+    )
+    if replay is not None:
+        existing_user, existing_command = replay
+        if existing_user is None or existing_user.id != user.id:
+            raise ValueError("That idempotency key belongs to another user.")
+        return existing_command
+    zkt = require_writable_user_profile(connector, "delete_user")
+    if user.lifecycle_state != "ACTIVE" or not user.present:
+        raise ValueError("Device user is not active.")
+    if user.row_version != expected_version:
+        raise ValueError("User changed since it was loaded. Refresh and retry.")
+    if typed_confirmation.strip() not in {user.display_name, user.user_id}:
+        raise ValueError("Typed confirmation must exactly match the user name or user ID.")
+    if user.privilege == 14:
+        raise ValueError("Demote this permanent administrator before deletion.")
+    ensure_no_active_user_operation(session, zkt=zkt, user=user)
+    persist_identity_tombstone(session, zkt=zkt, user=user)
+    cnic = decrypt_cnic(user.cnic_encrypted)
+    current_machine_name = decrypt_text(user.machine_name_encrypted) or ""
+    audit = append_audit(
+        session,
+        actor=actor,
+        action="DEVICE_USER_DELETE_REQUESTED",
+        target_type="device_user",
+        target_id=user.user_key,
+        outcome="PENDING",
+        before={
+            "display_name": user.display_name,
+            "cnic": mask_cnic(cnic),
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "version": user.row_version,
+        },
+        after={"present": False, "lifecycle_state": "DELETE_PENDING"},
+    )
+    session.flush()
+    user.delete_audit_id = audit.id
+    command = create_command(
+        session,
+        connector=connector,
+        command_type="DELETE_USER",
+        payload={
+            "user_key": user.user_key,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "tombstone": {
+                "display_name": user.display_name,
+                "cnic": cnic,
+                "shift_worker": user.shift_worker,
+            },
+        },
+        expected_state={
+            "serial": zkt.serial,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "row_version": user.row_version,
+            "name": current_machine_name,
+            "privilege": user.privilege,
+            "attendance_count": zkt.attendance_count,
+        },
+        desired_state={"user_key": user.user_key, "present": False},
+        idempotency_key=idempotency_key,
+        actor=actor,
+        expires_in_seconds=settings.user_command_retry_seconds,
+    )
+    user.current_command_id = command.id
+    return command
 
 
 def serialize_connector(connector: Connector) -> dict:
@@ -680,6 +1334,8 @@ def serialize_connector(connector: Connector) -> dict:
         "state": connector.lifecycle_state,
         "connected": connector.connected,
         "firmware_version": connector.firmware_version,
+        "onboarding_generation": connector.onboarding_generation,
+        "last_onboarded_at": connector.last_onboarded_at,
         "last_seen_at": connector.last_seen_at,
         "current_activity": connector.current_activity,
         "last_error_code": connector.last_error_code,
@@ -704,7 +1360,10 @@ def serialize_connector(connector: Connector) -> dict:
             "backoff_until": zkt.backoff_until,
             "probe_latency_ms": zkt.probe_latency_ms,
             "certification_state": zkt.certification_state,
+            "certification_observations": zkt.certification_observations,
             "capabilities": zkt.capability_profile,
+            "snapshot_complete": zkt.snapshot_complete,
+            "writes_disabled_reason": zkt.writes_disabled_reason,
             "user_count": zkt.user_count,
             "attendance_count": zkt.attendance_count,
             "device_time": zkt.sampled_device_time,
@@ -805,15 +1464,27 @@ def apply_command_update(
     )
     if command is None:
         raise ValueError("Unknown command ID.")
-    if command.status in {"SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"}:
+    if command.status in {"SUCCEEDED", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"}:
         return command
+    if status == "SUCCEEDED" and command.command_type == "DELETE_USER":
+        before_count = result.get("attendance_count_before")
+        after_count = result.get("attendance_count_after")
+        if result.get("user_absent") is not True or before_count != after_count:
+            status = "FAILED"
+            error_code = "DELETE_POSTCONDITION_FAILED"
+            error_message = (
+                "Delete verification did not prove user absence with unchanged attendance count."
+            )
     now = utc_now()
     command.status = status
     if status == "ACKNOWLEDGED":
         command.acknowledged_at = command.acknowledged_at or now
     elif status == "RUNNING":
         command.started_at = command.started_at or now
-    elif status in {"SUCCEEDED", "FAILED"}:
+    elif status in {"WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
+        command.error_code = error_code
+        command.error_message = error_message
+    elif status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
         command.completed_at = now
         command.result = result
         command.error_code = error_code
@@ -825,6 +1496,13 @@ def apply_command_update(
             details={"result": result, "error_code": error_code, "error_message": error_message},
         )
     )
+    if command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"} and status in {
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+    }:
+        apply_user_command_terminal_state(session, command=command, status=status)
     lease = None
     if command.command_type == "GRANT_TEMP_ADMIN":
         lease = session.scalar(
@@ -873,9 +1551,51 @@ def apply_command_update(
         target_type="command",
         target_id=command.command_id,
         outcome=status,
-        after={"error_code": error_code, "result": result},
+        after={"error_code": error_code, "result": redact_context(result)},
     )
     return command
+
+
+def apply_user_command_terminal_state(
+    session: Session, *, command: DeviceCommand, status: str
+) -> None:
+    payload = decrypt_json(command.payload_encrypted)
+    desired = decrypt_json(command.desired_state_encrypted)
+    user_key = payload.get("user_key") or desired.get("user_key")
+    if not user_key:
+        return
+    user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+    if user is None:
+        return
+    user.current_command_id = None
+    user.updated_at = utc_now()
+    if status != "SUCCEEDED":
+        if command.command_type == "CREATE_USER" and user.lifecycle_state == "PENDING":
+            user.lifecycle_state = "CREATE_FAILED"
+        return
+    if command.command_type == "CREATE_USER":
+        user.present = True
+        user.lifecycle_state = "ACTIVE"
+        user.observed_at = utc_now()
+        user.row_version += 1
+    elif command.command_type == "UPDATE_USER":
+        user.display_name = desired["display_name"]
+        user.cnic_encrypted = encrypt_cnic(desired["cnic"])
+        user.cnic_lookup_hash = cnic_lookup(desired["cnic"])
+        user.cnic_last4 = desired["cnic"][-4:]
+        user.shift_worker = bool(desired["shift_worker"])
+        user.privilege = int(desired["privilege"])
+        user.machine_name_encrypted = encrypt_text(desired["machine_name"])
+        user.row_version += 1
+        zkt = session.get(ZKTDevice, user.zkt_device_id)
+        if zkt:
+            enrich_undelivered_attendance(session, zkt=zkt, user=user)
+    elif command.command_type == "DELETE_USER":
+        user.present = False
+        user.lifecycle_state = "DELETED"
+        user.deleted_at = utc_now()
+        user.deleted_by = command.actor
+        user.row_version += 1
 
 
 def create_admin_lease(
@@ -888,11 +1608,7 @@ def create_admin_lease(
 ) -> tuple[TemporaryAdminLease, DeviceCommand]:
     if user.privilege != 0 or not user.present:
         raise ValueError("Only a present regular user can receive a temporary admin lease.")
-    zkt = connector.zkt_device
-    if zkt is None:
-        raise ValueError("Connector has no assigned ZKT device.")
-    if not zkt.capability_profile.get("admin_lease", False):
-        raise ValueError("This ZKT model is not certified for temporary administrator leases.")
+    zkt = require_writable_user_profile(connector, "admin_lease")
     active = session.scalar(
         select(TemporaryAdminLease).where(
             TemporaryAdminLease.zkt_device_id == zkt.id,
@@ -904,12 +1620,25 @@ def create_admin_lease(
     if active:
         raise ValueError(f"Device already has active lease {active.lease_id}.")
     lease_id = str(uuid4())
+    lease_expires_at = utc_now() + timedelta(seconds=600)
     command = create_command(
         session,
         connector=connector,
         command_type="GRANT_TEMP_ADMIN",
-        payload={"lease_id": lease_id, "uid": user.uid, "duration_seconds": 600},
-        expected_state={"uid": user.uid, "privilege": 0, "row_version": user.row_version},
+        payload={
+            "lease_id": lease_id,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "duration_seconds": 600,
+            "lease_expires_epoch": int(lease_expires_at.timestamp()),
+        },
+        expected_state={
+            "serial": zkt.serial,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "privilege": 0,
+            "row_version": user.row_version,
+        },
         desired_state={"privilege": 14},
         idempotency_key=idempotency_key,
         actor=actor,
@@ -948,17 +1677,36 @@ def queue_due_revokes(session: Session) -> list[DeviceCommand]:
         user = session.get(DeviceUser, lease.device_user_id)
         if connector is None or user is None:
             continue
-        command = create_command(
-            session,
-            connector=connector,
-            command_type="REVOKE_TEMP_ADMIN",
-            payload={"lease_id": lease.lease_id, "uid": user.uid},
-            expected_state={"uid": user.uid},
-            desired_state={"privilege": 0},
-            idempotency_key=f"revoke:{lease.lease_id}:{lease.revoke_command_id or 0}",
-            actor="system:lease-watchdog",
-            expires_in_seconds=None,
-        )
+        try:
+            command = create_command(
+                session,
+                connector=connector,
+                command_type="REVOKE_TEMP_ADMIN",
+                payload={"lease_id": lease.lease_id, "uid": user.uid, "user_id": user.user_id},
+                expected_state={
+                    "serial": zkt.serial,
+                    "uid": user.uid,
+                    "user_id": user.user_id,
+                    "privilege": 14,
+                },
+                desired_state={"privilege": 0},
+                idempotency_key=f"revoke:{lease.lease_id}:{lease.revoke_command_id or 0}",
+                actor="system:lease-watchdog",
+                expires_in_seconds=None,
+            )
+        except ValueError as exc:
+            lease.state = "OVERDUE"
+            lease.last_error = str(exc)
+            lease.updated_at = now
+            upsert_alert(
+                session,
+                connector,
+                code="ADMIN_REVOKE_OVERDUE",
+                severity="CRITICAL",
+                message="Temporary administrator is overdue and the connector cannot accept a revoke command.",
+                details={"lease_id": lease.lease_id},
+            )
+            continue
         lease.revoke_command_id = command.id
         lease.state = "REVOKING"
         lease.updated_at = now

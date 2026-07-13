@@ -1,14 +1,48 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { api, ApiError, queryString, setCsrfToken } from './api'
 import { Icon } from './Icon'
-import type { Alert, AttendanceEvent, ConnectionEvent, Device, DeviceLog, DeviceUser, Overview } from './types'
+import type {
+  Alert,
+  AttendanceEvent,
+  Command,
+  ConnectionEvent,
+  Device,
+  DeviceLog,
+  DeviceUser,
+  Overview,
+  UserCommandResponse,
+} from './types'
 
-type View = 'fleet' | 'attendance' | 'alerts'
-type DeviceTab = 'summary' | 'users' | 'enrollment' | 'logs' | 'control'
+type View = 'fleet' | 'users' | 'attendance' | 'alerts'
+type DrawerTab = 'overview' | 'logs' | 'control'
+type ToastState = { kind: 'notice' | 'error'; text: string } | null
+type UserDialogState =
+  | { mode: 'create' }
+  | { mode: 'edit'; user: DeviceUser }
+  | { mode: 'delete'; user: DeviceUser }
+  | { mode: 'lease'; user: DeviceUser }
+  | null
 
-const dateTime = (value?: string | null) => value
-  ? new Intl.DateTimeFormat('en-PK', { dateStyle: 'medium', timeStyle: 'medium', timeZone: 'Asia/Karachi' }).format(new Date(value))
-  : '—'
+const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
+const drawerTabs: DrawerTab[] = ['overview', 'logs', 'control']
+
+export const dateTime = (value?: string | null) =>
+  value
+    ? new Intl.DateTimeFormat('en-PK', {
+        dateStyle: 'medium',
+        timeStyle: 'medium',
+        timeZone: 'Asia/Karachi',
+      }).format(new Date(value))
+    : '—'
 
 const relativeTime = (value?: string | null) => {
   if (!value) return 'Never seen'
@@ -17,20 +51,187 @@ const relativeTime = (value?: string | null) => {
   if (Math.abs(seconds) < 60) return formatter.format(seconds, 'second')
   const minutes = Math.round(seconds / 60)
   if (Math.abs(minutes) < 60) return formatter.format(minutes, 'minute')
-  return formatter.format(Math.round(minutes / 60), 'hour')
+  const hours = Math.round(minutes / 60)
+  if (Math.abs(hours) < 48) return formatter.format(hours, 'hour')
+  return formatter.format(Math.round(hours / 24), 'day')
 }
 
-const stateClass = (state: string) => state.toLowerCase().replaceAll('_', '-')
-const idempotency = (prefix: string) => `${prefix}:${crypto.randomUUID()}`
+const idempotency = (prefix: string) => {
+  const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+  return `${prefix}:${id}`
+}
+
+const utf8Length = (value: string) => new TextEncoder().encode(value).length
+
+const utf8Prefix = (value: string, maxBytes: number) => {
+  let output = ''
+  for (const character of value) {
+    if (utf8Length(output + character) > maxBytes) break
+    output += character
+  }
+  return output
+}
+
+export function buildMachinePreview(
+  displayName: string,
+  cnic: string,
+  shiftWorker: boolean,
+  byteLimit = 24,
+) {
+  const canonical = displayName.trim().replace(/\s+/g, ' ')
+  const suffix = `-${shiftWorker ? 'S-' : ''}${cnic}`
+  return `${utf8Prefix(canonical, Math.max(0, byteLimit - utf8Length(suffix)))}${suffix}`
+}
+
+export function validateUserDraft(values: {
+  displayName: string
+  cnic: string
+  password: string
+  userIdOverride?: string
+}) {
+  if (!values.displayName.trim()) return 'Full name is required.'
+  if (!/^\d{13}$/.test(values.cnic)) return 'CNIC must contain exactly 13 digits.'
+  if (values.userIdOverride && !/^\d+$/.test(values.userIdOverride)) {
+    return 'The optional employee/user ID must be numeric.'
+  }
+  if (!values.password) return 'Password confirmation is required.'
+  return null
+}
+
+export const confirmationMatches = (value: string, user: DeviceUser) =>
+  value === user.display_name || value === user.user_id
+
+const statusPattern = (state: string) => {
+  const normalized = state.toUpperCase()
+  if (
+    ['ONLINE', 'SUCCEEDED', 'ACKED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED'].includes(
+      normalized,
+    )
+  )
+    return 'confirmed'
+  if (
+    ['OFFLINE', 'FAILED', 'CRITICAL', 'EXPIRED', 'QUARANTINED', 'BLOCKED_IDENTITY'].some(
+      (item) => normalized.includes(item),
+    )
+  )
+    return 'blocked'
+  if (
+    ['WAITING', 'RETRYING', 'DEGRADED', 'FLAPPING', 'PENDING', 'RUNNING'].some((item) =>
+      normalized.includes(item),
+    )
+  )
+    return 'waiting'
+  return 'notice'
+}
+
+export function StatusBadge({ state, live = false }: { state: string; live?: boolean }) {
+  const pattern = statusPattern(state)
+  const icon =
+    pattern === 'confirmed'
+      ? 'check'
+      : pattern === 'blocked'
+        ? 'alert'
+        : pattern === 'waiting'
+          ? 'pause'
+          : 'info'
+  return (
+    <span className={`status-badge pattern-${pattern}`} data-pattern={pattern}>
+      <Icon name={icon} />
+      <span>{state.replaceAll('_', ' ')}</span>
+      {live && <i aria-hidden="true" />}
+    </span>
+  )
+}
 
 function useToast() {
-  const [toast, setToast] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const [toast, setToast] = useState<ToastState>(null)
   useEffect(() => {
     if (!toast) return
-    const timer = window.setTimeout(() => setToast(null), 5000)
-    return () => window.clearTimeout(timer)
+    const timeout = window.setTimeout(() => setToast(null), 5000)
+    return () => window.clearTimeout(timeout)
   }, [toast])
-  return { toast, success: (text: string) => setToast({ kind: 'success', text }), error: (text: string) => setToast({ kind: 'error', text }) }
+  const notice = useCallback((text: string) => setToast({ kind: 'notice', text }), [])
+  const error = useCallback((text: string) => setToast({ kind: 'error', text }), [])
+  return useMemo(() => ({ toast, notice, error }), [error, notice, toast])
+}
+
+function Dialog({
+  titleId,
+  title,
+  description,
+  onClose,
+  children,
+  className = '',
+}: {
+  titleId: string
+  title: string
+  description?: string
+  onClose: () => void
+  children: ReactNode
+  className?: string
+}) {
+  const panel = useRef<HTMLDivElement>(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    const node = panel.current
+    const focusable = () =>
+      Array.from(
+        node?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ) || [],
+      )
+    focusable()[0]?.focus()
+    const handle = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeRef.current()
+      }
+      if (event.key === 'Tab') {
+        const items = focusable()
+        if (!items.length) return
+        const first = items[0]
+        const last = items[items.length - 1]
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault()
+          last.focus()
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault()
+          first.focus()
+        }
+      }
+    }
+    document.addEventListener('keydown', handle)
+    return () => {
+      document.removeEventListener('keydown', handle)
+      previous?.focus()
+    }
+  }, [])
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <div
+        ref={panel}
+        className={`dialog-panel ${className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? `${titleId}-description` : undefined}
+      >
+        <header className="dialog-header">
+          <div>
+            <p className="eyebrow">STATE LIFE · SECURE OPERATION</p>
+            <h2 id={titleId}>{title}</h2>
+            {description && <p id={`${titleId}-description`}>{description}</p>}
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog">
+            <Icon name="x" />
+          </button>
+        </header>
+        {children}
+      </div>
+    </div>
+  )
 }
 
 function Login({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
@@ -40,240 +241,791 @@ function Login({ onLogin }: { onLogin: (username: string, password: string) => P
   const [error, setError] = useState('')
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    setBusy(true); setError('')
-    try { await onLogin(username, password) } catch (err) { setError(err instanceof Error ? err.message : 'Sign in failed') } finally { setBusy(false) }
+    setBusy(true)
+    setError('')
+    try {
+      await onLogin(username, password)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Sign in failed.')
+    } finally {
+      setBusy(false)
+    }
   }
-  return <main className="login-shell">
-    <section className="login-story">
-      <div className="brand-mark"><span>SL</span><i /></div>
+  return (
+    <main className="login-shell">
+      <section className="login-brand" aria-label="State Life Attendance Device Dashboard">
+        <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
+        <p className="eyebrow inverse">ATTENDANCE DEVICE OPERATIONS</p>
+        <h1>One trusted view of every attendance terminal.</h1>
+        <p>
+          Command, control, and surveillance for authorized Zone Lite devices and their ZKT
+          terminals across Pakistan.
+        </p>
+        <div className="brand-proof">
+          <span><Icon name="shield" /> Signed device identity</span>
+          <span><Icon name="terminal" /> Durable command ledger</span>
+          <span><Icon name="pulse" /> Live attendance oversight</span>
+        </div>
+      </section>
+      <section className="login-form-side">
+        <form className="login-card" onSubmit={submit}>
+          <div className="compact-brand">
+            <img src="/state-life-logo.png" alt="" />
+            <span>State Life Insurance Corporation</span>
+          </div>
+          <p className="eyebrow">AUTHORIZED ACCESS</p>
+          <h2>Attendance Device Dashboard</h2>
+          <p className="supporting">Sign in to the national device operations console.</p>
+          <label>
+            Username
+            <input
+              autoComplete="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+          </label>
+          <label>
+            Password
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </label>
+          {error && (
+            <div className="message pattern-blocked" role="alert">
+              <Icon name="alert" /> {error}
+            </div>
+          )}
+          <button className="button primary full" disabled={busy || !username || !password}>
+            {busy ? 'Authenticating…' : 'Enter dashboard'} <Icon name="chevron" />
+          </button>
+          <small>Authorized State Life personnel only. Every operation is audited.</small>
+        </form>
+      </section>
+    </main>
+  )
+}
+
+function PageHeader({
+  eyebrow,
+  title,
+  description,
+  action,
+}: {
+  eyebrow: string
+  title: string
+  description: string
+  action?: ReactNode
+}) {
+  return (
+    <header className="page-header">
       <div>
-        <p className="eyebrow">STATE LIFE · ATTENDANCE OPERATIONS</p>
-        <h1>Every device.<br /><em>One command surface.</em></h1>
-        <p className="login-copy">Securely observe and operate ESP32–ZKT attendance pairs across Pakistan, with live state, reliable capture, and controlled enrollment.</p>
+        <p className="eyebrow">{eyebrow}</p>
+        <h1>{title}</h1>
+        <p>{description}</p>
       </div>
-      <div className="signal-art" aria-hidden="true"><i/><i/><i/><i/><span /></div>
-      <p className="story-foot">Encrypted control channel · Durable command ledger · Full operator audit trail</p>
-    </section>
-    <section className="login-panel">
-      <form className="login-card" onSubmit={submit}>
-        <div className="mobile-brand"><div className="brand-mark small"><span>SL</span><i /></div><b>Attendance Device Dashboard</b></div>
-        <p className="eyebrow">CONTROL ROOM ACCESS</p>
-        <h2>Welcome back</h2>
-        <p>Sign in to the national device operations console.</p>
-        <label>Username<input autoComplete="username" value={username} onChange={event => setUsername(event.target.value)} /></label>
-        <label>Password<input type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} autoFocus /></label>
-        {error && <div className="form-error"><Icon name="alert" />{error}</div>}
-        <button className="primary wide" disabled={busy || !username || !password}>{busy ? 'Authenticating…' : 'Enter command center'}<Icon name="chevron" /></button>
-        <small>Authorized State Life personnel only. All actions are recorded.</small>
-      </form>
-    </section>
-  </main>
+      {action}
+    </header>
+  )
 }
 
-function StatusPill({ state, pulse = false }: { state: string; pulse?: boolean }) {
-  return <span className={`status-pill ${stateClass(state)}`}>{pulse && <i />}{state.replaceAll('_', ' ')}</span>
+function Metric({ label, value, detail, icon }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name'] }) {
+  return (
+    <article className="metric-card">
+      <span className="metric-icon"><Icon name={icon} /></span>
+      <div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div>
+    </article>
+  )
 }
 
-function Kpi({ label, value, detail, tone, icon }: { label: string; value: number | string; detail: string; tone: string; icon: Parameters<typeof Icon>[0]['name'] }) {
-  return <article className={`kpi ${tone}`}><div className="kpi-icon"><Icon name={icon} /></div><div><p>{label}</p><strong>{value}</strong><span>{detail}</span></div></article>
-}
-
-function FleetView({ devices, overview, loading, onSelect, onAdd }: { devices: Device[]; overview: Overview; loading: boolean; onSelect: (device: Device) => void; onAdd: () => void }) {
+function FleetView({
+  devices,
+  overview,
+  loading,
+  onInspect,
+  onManageUsers,
+}: {
+  devices: Device[]
+  overview: Overview
+  loading: boolean
+  onInspect: (device: Device) => void
+  onManageUsers: (device: Device) => void
+}) {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('ALL')
-  const shown = devices.filter(device => (filter === 'ALL' || device.state === filter) && `${device.display_name} ${device.zone_name} ${device.hardware_id}`.toLowerCase().includes(query.toLowerCase()))
+  const shown = devices.filter(
+    (device) =>
+      (filter === 'ALL' || device.state === filter) &&
+      `${device.display_name} ${device.zone_name} ${device.hardware_id} ${device.zkt?.serial || ''}`
+        .toLowerCase()
+        .includes(query.toLowerCase()),
+  )
   const online = overview.online || 0
-  const pct = overview.total ? Math.round(online / overview.total * 100) : 0
-  return <>
-    <header className="page-header"><div><p className="eyebrow">NATIONAL FLEET</p><h1>Device command center</h1><p>Live operational state of every ESP32 and its assigned ZKT terminal.</p></div><button className="primary" onClick={onAdd}><Icon name="plus" />Register connector</button></header>
-    <section className="kpi-grid">
-      <Kpi label="Fleet availability" value={`${pct}%`} detail={`${online} of ${overview.total} connectors online`} tone="green" icon="pulse" />
-      <Kpi label="Needs attention" value={(overview.degraded || 0) + (overview.offline || 0) + ((overview as Overview & { flapping?: number }).flapping || 0)} detail={`${overview.open_alerts} open alerts`} tone="amber" icon="alert" />
-      <Kpi label="Active enrollment" value={overview.active_leases} detail="10-minute administrator leases" tone="blue" icon="shield" />
-      <Kpi label="Total footprint" value={overview.total} detail="ESP32–ZKT pairs registered" tone="neutral" icon="server" />
-    </section>
-    <section className="panel fleet-panel">
-      <div className="panel-head"><div><h2>Fleet status</h2><p>Connector and terminal state with anti-flap hysteresis.</p></div><div className="health-legend"><span><i className="online" />Online {overview.online || 0}</span><span><i className="degraded" />Degraded {(overview.degraded || 0) + ((overview as Overview & { flapping?: number }).flapping || 0)}</span><span><i className="offline" />Offline {overview.offline || 0}</span></div></div>
-      <div className="fleet-bar"><i style={{ width: `${overview.total ? (overview.online || 0) / overview.total * 100 : 0}%` }} /><b style={{ width: `${overview.total ? ((overview.degraded || 0) + ((overview as Overview & { flapping?: number }).flapping || 0)) / overview.total * 100 : 0}%` }} /><span /></div>
-      <div className="table-tools"><div className="search"><Icon name="search" /><input placeholder="Search zone, connector or hardware ID" value={query} onChange={event => setQuery(event.target.value)} /></div><select value={filter} onChange={event => setFilter(event.target.value)}><option value="ALL">All states</option><option>ONLINE</option><option>FLAPPING</option><option>DEGRADED</option><option>OFFLINE</option><option>ONBOARDING</option></select></div>
-      <div className="table-wrap"><table><thead><tr><th>Device</th><th>Connector</th><th>ZKT terminal</th><th>Activity</th><th>Last contact</th><th>Status</th><th /></tr></thead><tbody>
-        {loading && <tr><td colSpan={7}><div className="empty">Loading live fleet…</div></td></tr>}
-        {!loading && shown.map(device => <tr key={device.connector_id} onClick={() => onSelect(device)} className="clickable"><td><div className="device-name"><span className={`device-dot ${stateClass(device.state)}`}><Icon name="server" /></span><div><b>{device.display_name}</b><small>{device.zone_id}</small></div></div></td><td><code>{device.hardware_id}</code><small>FW {device.firmware_version || 'unknown'}</small></td><td>{device.zkt ? <><b>{device.zkt.model || 'ZKT device'}</b><small>{device.zkt.ip_address || 'Awaiting IP'} · {device.zkt.serial || 'No serial'}</small></> : <span className="muted">Not observed</span>}</td><td>{device.current_activity || 'Idle'}</td><td title={dateTime(device.last_seen_at)}>{relativeTime(device.last_seen_at)}</td><td><StatusPill state={device.state} pulse={device.connected} /></td><td><Icon className="row-chevron" name="chevron" /></td></tr>)}
-        {!loading && !shown.length && <tr><td colSpan={7}><div className="empty"><Icon name="server" /><b>No devices match this view</b><span>Register a connector or change the filters.</span></div></td></tr>}
-      </tbody></table></div>
-    </section>
-  </>
+  const availability = overview.total ? Math.round((online / overview.total) * 100) : 0
+  const attention =
+    (overview.offline || 0) +
+    (overview.degraded || 0) +
+    (overview.flapping || 0) +
+    (overview.quarantined_duplicate_serial || 0)
+  return (
+    <>
+      <PageHeader
+        eyebrow="NATIONAL FLEET"
+        title="Attendance device command center"
+        description="Live operational state of every authorized Zone Lite ESP and its assigned ZKT terminal."
+      />
+      <section className="metric-grid" aria-label="Fleet key indicators">
+        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" />
+        <Metric label="Needs review" value={attention} detail={`${overview.open_alerts} open alerts`} icon="alert" />
+        <Metric label="Enrollment access" value={overview.active_leases} detail="Temporary 10-minute leases" icon="shield" />
+        <Metric label="National footprint" value={overview.total} detail="Authorized ESP–ZKT pairs" icon="server" />
+      </section>
+      <section className="panel">
+        <header className="panel-header">
+          <div><h2>Live fleet</h2><p>State labels and border patterns remain readable without color.</p></div>
+          <div className="auto-onboard-note"><Icon name="shield" /> Secure auto-onboarding enabled</div>
+        </header>
+        <div className="toolbar">
+          <label className="search-field">
+            <span className="sr-only">Search fleet</span>
+            <Icon name="search" />
+            <input
+              placeholder="Search zone, MAC, serial, or terminal"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <label>
+            <span className="sr-only">Filter by state</span>
+            <select value={filter} onChange={(event) => setFilter(event.target.value)}>
+              <option value="ALL">All states</option>
+              <option value="ONLINE">Online</option>
+              <option value="DEGRADED">Degraded</option>
+              <option value="FLAPPING">Flapping</option>
+              <option value="OFFLINE">Offline</option>
+              <option value="ONBOARDING">Onboarding</option>
+              <option value="QUARANTINED_DUPLICATE_SERIAL">Quarantined</option>
+            </select>
+          </label>
+        </div>
+        <div className="device-list" aria-busy={loading}>
+          {loading && <div className="empty-state"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
+          {!loading && shown.map((device) => (
+            <article className={`device-card pattern-${statusPattern(device.state)}`} key={device.connector_id}>
+              <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
+                <span className="device-symbol"><Icon name="server" /></span>
+                <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
+                <span className="device-terminal"><strong>{device.zkt?.model || 'Awaiting terminal identity'}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
+                <span className="device-activity"><strong>{device.current_activity || 'Idle'}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                <StatusBadge state={device.state} live={device.connected} />
+                <Icon name="chevron" />
+              </button>
+              <div className="device-card-actions">
+                <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
+                <span>FW {device.firmware_version || 'unknown'} · {device.zkt?.certification_state || 'uncertified'}</span>
+              </div>
+            </article>
+          ))}
+          {!loading && !shown.length && (
+            <div className="empty-state">
+              <Icon name="server" />
+              <h3>{devices.length ? 'No devices match these filters.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
+              <p>{devices.length ? 'Change the search or state filter.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
+            </div>
+          )}
+        </div>
+      </section>
+    </>
+  )
 }
 
-function AttendanceView({ devices, liveRevision }: { devices: Device[]; liveRevision: number }) {
-  const [rows, setRows] = useState<AttendanceEvent[]>([])
-  const [filters, setFilters] = useState({ device_id: '', q: '', cnic: '', punch: '', clock_quality: '', from_time: '', to_time: '' })
+export function CommandProgress({
+  command,
+  onCancel,
+}: {
+  command: Command
+  onCancel: (command: Command) => Promise<void>
+}) {
+  const canCancel = !['RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(command.status)
+  return (
+    <section className={`command-progress pattern-${statusPattern(command.status)}`} aria-live="polite">
+      <span className="command-symbol"><Icon name={command.status === 'SUCCEEDED' ? 'check' : command.status === 'FAILED' ? 'alert' : 'refresh'} /></span>
+      <div>
+        <p className="eyebrow">{command.type.replaceAll('_', ' ')}</p>
+        <h3>{command.status.replaceAll('_', ' ')}</h3>
+        <p>{command.error_message || command.error_code || `Command ${command.command_id.slice(0, 8)} is durably tracked.`}</p>
+      </div>
+      {canCancel && <button className="button secondary" onClick={() => void onCancel(command)}>Cancel before execution</button>}
+    </section>
+  )
+}
+
+function UserOperationDialog({
+  state,
+  device,
+  onClose,
+  onCommand,
+  toast,
+}: {
+  state: Exclude<UserDialogState, null>
+  device: Device
+  onClose: () => void
+  onCommand: (command: Command) => void
+  toast: ReturnType<typeof useToast>
+}) {
+  const user = state.mode === 'create' ? null : state.user
+  const [displayName, setDisplayName] = useState(user?.display_name || '')
+  const [cnic, setCnic] = useState('')
+  const [shiftWorker, setShiftWorker] = useState(user?.shift_worker || false)
+  const [privilege, setPrivilege] = useState<0 | 14>(user?.privilege || 0)
+  const [userIdOverride, setUserIdOverride] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const preview = cnic
+    ? buildMachinePreview(displayName, cnic, shiftWorker)
+    : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    if (state.mode === 'create') {
+      const validation = validateUserDraft({ displayName, cnic, password, userIdOverride })
+      if (validation) return setError(validation)
+    } else if (!password) {
+      return setError('Password confirmation is required.')
+    } else if (state.mode === 'delete' && !confirmationMatches(confirmation, state.user)) {
+      return setError('Type the exact full name or user ID to confirm deletion.')
+    }
+    setBusy(true)
+    try {
+      if (state.mode === 'create') {
+        const response = await api<UserCommandResponse>(`/api/v2/devices/${device.connector_id}/users`, {
+          method: 'POST',
+          body: JSON.stringify({
+            display_name: displayName.trim(),
+            cnic,
+            shift_worker: shiftWorker,
+            user_id_override: userIdOverride || null,
+            password,
+            idempotency_key: idempotency('create-user'),
+          }),
+        })
+        onCommand(response.command)
+        toast.notice('User creation is queued and will be verified by a terminal reread.')
+      } else if (state.mode === 'edit') {
+        const response = await api<UserCommandResponse>(
+          `/api/v2/devices/${device.connector_id}/users/${state.user.user_key}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              display_name: displayName.trim(),
+              ...(cnic ? { cnic } : {}),
+              shift_worker: shiftWorker,
+              privilege,
+              expected_version: state.user.row_version,
+              password,
+              idempotency_key: idempotency('update-user'),
+            }),
+          },
+        )
+        onCommand(response.command)
+        toast.notice('User update is queued with optimistic version checks.')
+      } else if (state.mode === 'delete') {
+        const response = await api<UserCommandResponse>(
+          `/api/v2/devices/${device.connector_id}/users/${state.user.user_key}`,
+          {
+            method: 'DELETE',
+            body: JSON.stringify({
+              expected_version: state.user.row_version,
+              typed_confirmation: confirmation,
+              password,
+              idempotency_key: idempotency('delete-user'),
+            }),
+          },
+        )
+        onCommand(response.command)
+        toast.notice('Deletion is queued. Attendance counts must remain unchanged.')
+      } else {
+        const response = await api<{ command: Command }>(`/api/v1/devices/${device.connector_id}/admin-leases`, {
+          method: 'POST',
+          body: JSON.stringify({
+            uid: state.user.uid,
+            password,
+            idempotency_key: idempotency('enrollment-lease'),
+          }),
+        })
+        onCommand(response.command)
+        toast.notice('Temporary administrator access is queued for 10 minutes.')
+      }
+      onClose()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The operation could not be queued.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copy = {
+    create: ['Add user to selected terminal', 'Creates a regular user on this ZKT only.'],
+    edit: ['Edit device user', 'Name, replacement CNIC, shift status, and permanent role are verified after write.'],
+    delete: ['Delete user from terminal', 'The user is removed; punches and identity history remain permanently preserved.'],
+    lease: ['Grant enrollment access', 'The selected regular user becomes administrator for 10 minutes, then reverts automatically.'],
+  } as const
+  const [title, description] = copy[state.mode]
+  return (
+    <Dialog titleId="user-operation-title" title={title} description={description} onClose={onClose}>
+      <form className="dialog-body" onSubmit={submit}>
+        {(state.mode === 'create' || state.mode === 'edit') && (
+          <>
+            <div className="form-grid">
+              <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} /></label>
+              <label>{state.mode === 'edit' ? 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
+              {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, 24))} /></label>}
+              {state.mode === 'edit' && <label>Permanent role<select value={privilege} onChange={(event) => setPrivilege(Number(event.target.value) as 0 | 14)}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select></label>}
+            </div>
+            <label className="check-field"><input type="checkbox" checked={shiftWorker} onChange={(event) => setShiftWorker(event.target.checked)} /><span><strong>Shift worker</strong><small>Adds the -S- identity marker used for raw-punch handling.</small></span></label>
+            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : 'Stored CNIC remains write-only.'}</small></div>
+          </>
+        )}
+        {state.mode === 'delete' && (
+          <div className="destructive-copy pattern-blocked">
+            <Icon name="trash" />
+            <div><h3>{state.user.display_name}</h3><p>UID {state.user.uid} · User ID {state.user.user_id}</p><p>ADD and ZKT attendance records will not be deleted.</p></div>
+          </div>
+        )}
+        {state.mode === 'lease' && (
+          <div className="info-copy pattern-waiting"><Icon name="clock" /><div><h3>10-minute automatic lease</h3><p>{state.user.display_name} will be elevated only on {device.display_name}. The ESP watchdog revokes access even if ADD disconnects.</p></div></div>
+        )}
+        {state.mode === 'delete' && <label>Type “{state.user.display_name}” or “{state.user.user_id}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>}
+        <label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
+        <footer className="dialog-actions">
+          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className={`button ${state.mode === 'delete' ? 'destructive' : 'primary'}`} disabled={busy}>{busy ? 'Queuing…' : state.mode === 'delete' ? 'Delete user safely' : state.mode === 'lease' ? 'Grant 10-minute access' : 'Confirm operation'}</button>
+        </footer>
+      </form>
+    </Dialog>
+  )
+}
+
+function UsersView({
+  devices,
+  selectedDeviceId,
+  onSelectDevice,
+  revision,
+  toast,
+  refreshFleet,
+}: {
+  devices: Device[]
+  selectedDeviceId: string
+  onSelectDevice: (id: string) => void
+  revision: number
+  toast: ReturnType<typeof useToast>
+  refreshFleet: () => Promise<void>
+}) {
+  const selected = devices.find((device) => device.connector_id === selectedDeviceId)
+  const [rows, setRows] = useState<DeviceUser[]>([])
   const [loading, setLoading] = useState(false)
-  const load = useCallback(async () => { setLoading(true); try { const result = await api<{ rows: AttendanceEvent[] }>('/api/v1/attendance' + queryString(filters)); setRows(result.rows) } finally { setLoading(false) } }, [filters])
-  useEffect(() => { void load() }, [load, liveRevision])
-  return <><header className="page-header"><div><p className="eyebrow">CAPTURE LEDGER</p><h1>Attendance events</h1><p>Filter live and reconciled punches across every certified terminal.</p></div><button className="secondary" onClick={() => void load()}><Icon name="refresh" />Refresh</button></header>
-    <section className="panel"><div className="filter-grid"><label>Device<select value={filters.device_id} onChange={event => setFilters({ ...filters, device_id: event.target.value })}><option value="">All devices</option>{devices.map(device => <option value={device.connector_id} key={device.connector_id}>{device.display_name}</option>)}</select></label><label>Name / user ID<input value={filters.q} onChange={event => setFilters({ ...filters, q: event.target.value })} placeholder="Search employee" /></label><label>CNIC<input inputMode="numeric" maxLength={13} value={filters.cnic} onChange={event => setFilters({ ...filters, cnic: event.target.value.replace(/\D/g, '') })} placeholder="13 digits" /></label><label>Punch<select value={filters.punch} onChange={event => setFilters({ ...filters, punch: event.target.value })}><option value="">All punches</option><option value="0">Check in</option><option value="1">Check out</option></select></label><label>Clock quality<select value={filters.clock_quality} onChange={event => setFilters({ ...filters, clock_quality: event.target.value })}><option value="">Any quality</option><option>OK</option><option>DRIFTED</option><option>UNKNOWN</option></select></label><label>From<input type="datetime-local" value={filters.from_time} onChange={event => setFilters({ ...filters, from_time: event.target.value })} /></label><label>To<input type="datetime-local" value={filters.to_time} onChange={event => setFilters({ ...filters, to_time: event.target.value })} /></label></div>
-      <div className="table-wrap"><table><thead><tr><th>Employee</th><th>Event time</th><th>Device</th><th>Capture</th><th>Clock</th><th>Oracle delivery</th></tr></thead><tbody>{loading && <tr><td colSpan={6}><div className="empty">Loading capture ledger…</div></td></tr>}{!loading && rows.map(row => <tr key={row.event_uid}><td><b>{row.display_name || 'Unknown employee'}</b><small>{row.cnic_masked || `User ${row.user_id}`}</small></td><td><b>{dateTime(row.device_event_time)}</b><small>Received {relativeTime(row.received_at)}</small></td><td>{row.device_serial || 'Unreported serial'}</td><td><StatusPill state={row.source} /><small>Punch {row.punch ?? '—'}</small></td><td><StatusPill state={row.clock_quality} /><small>{row.clock_drift_seconds == null ? 'No drift sample' : `${Math.round(row.clock_drift_seconds)}s drift`}</small></td><td><StatusPill state={row.ords_status} /></td></tr>)}{!loading && !rows.length && <tr><td colSpan={6}><div className="empty"><Icon name="clock" /><b>No attendance matches these filters</b></div></td></tr>}</tbody></table></div>
-    </section></>
+  const [query, setQuery] = useState('')
+  const [identity, setIdentity] = useState('ALL')
+  const [role, setRole] = useState('ALL')
+  const [dialog, setDialog] = useState<UserDialogState>(null)
+  const [command, setCommand] = useState<Command | null>(null)
+
+  const load = useCallback(async () => {
+    if (!selected) return setRows([])
+    setLoading(true)
+    try {
+      const compact = query.replace(/\D/g, '')
+      const cnicSearch = compact.length === 13 && compact === query.replace(/[\s-]/g, '')
+      const result = await api<{ rows: DeviceUser[] }>(
+        `/api/v2/devices/${selected.connector_id}/users${queryString({
+          q: cnicSearch ? undefined : query,
+          cnic: cnicSearch ? compact : undefined,
+          identity: identity === 'ALL' ? undefined : identity,
+          privilege: role === 'ALL' ? undefined : role,
+        })}`,
+      )
+      setRows(result.rows)
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Unable to load users.')
+    } finally {
+      setLoading(false)
+    }
+  }, [identity, query, role, selected, toast.error])
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => void load(), 250)
+    return () => window.clearTimeout(timeout)
+  }, [load, revision])
+
+  useEffect(() => {
+    if (!command || terminalCommandStates.has(command.status)) return
+    const timeout = window.setTimeout(async () => {
+      try {
+        const updated = await api<Command>(`/api/v2/commands/${command.command_id}`)
+        setCommand(updated)
+        if (terminalCommandStates.has(updated.status)) {
+          await Promise.all([load(), refreshFleet()])
+          if (updated.status === 'SUCCEEDED') toast.notice(`${updated.type.replaceAll('_', ' ')} completed and was verified.`)
+          else toast.error(updated.error_message || `${updated.type.replaceAll('_', ' ')} ended as ${updated.status}.`)
+        }
+      } catch (reason) {
+        toast.error(reason instanceof Error ? reason.message : 'Unable to refresh command state.')
+      }
+    }, 1600)
+    return () => window.clearTimeout(timeout)
+  }, [command, load, refreshFleet, toast.error, toast.notice])
+
+  const cancel = async (row: Command) => {
+    try {
+      setCommand(await api<Command>(`/api/v2/commands/${row.command_id}/cancel`, { method: 'POST', body: '{}' }))
+      await load()
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Unable to cancel command.')
+    }
+  }
+
+  const writable = Boolean(
+    selected?.zkt?.certification_state === 'CERTIFIED' &&
+      selected.zkt.snapshot_complete &&
+      selected.zkt.capabilities.user_write,
+  )
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="SELECTED-TERMINAL USER CONTROL"
+        title="Device users"
+        description="Create, enrich, edit, elevate, and safely remove identities on one selected ZKT terminal."
+        action={selected && <button className="button primary" disabled={!writable} onClick={() => setDialog({ mode: 'create' })}><Icon name="userPlus" /> Add user</button>}
+      />
+      <section className="panel selection-panel">
+        <label>Selected terminal<select value={selectedDeviceId} onChange={(event) => onSelectDevice(event.target.value)}><option value="">Choose a terminal</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name} · {device.zkt?.serial || 'awaiting serial'}</option>)}</select></label>
+        {selected && <div className="selected-device-summary"><StatusBadge state={selected.state} live={selected.connected} /><span>{selected.zkt?.model || 'ZKT terminal'} · {selected.zkt?.ip_address || 'No IP'}</span><span>Users {selected.zkt?.user_count ?? '—'} · Last sync {relativeTime(selected.last_seen_at)}</span></div>}
+      </section>
+      {!selected ? (
+        <section className="panel empty-state"><Icon name="users" /><h2>Select a terminal to manage its users.</h2><p>Mutations are always scoped to one selected ZKT device.</p></section>
+      ) : (
+        <>
+          {!writable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{selected.zkt?.writes_disabled_reason || 'The terminal is not yet write-certified or its complete snapshot is pending.'}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ_ONLY'} /></div>}
+          {command && <CommandProgress command={command} onCancel={cancel} />}
+          <section className="panel">
+            <div className="toolbar user-toolbar">
+              <label className="search-field"><span className="sr-only">Search users</span><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name, user ID, or exact CNIC" /></label>
+              <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing</option></select></label>
+              <label><span className="sr-only">Role</span><select value={role} onChange={(event) => setRole(event.target.value)}><option value="ALL">All roles</option><option value="0">Regular users</option><option value="14">Administrators</option></select></label>
+              <button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh users</button>
+            </div>
+            <div className="user-table" aria-busy={loading}>
+              <div className="user-table-head"><span>Identity</span><span>Terminal record</span><span>Role & shift</span><span>Last sync</span><span>Actions</span></div>
+              {loading && <div className="empty-state compact"><Icon name="refresh" /><p>Reading the selected terminal user view…</p></div>}
+              {!loading && rows.map((user) => (
+                <article key={user.user_key} className={`user-row ${user.identity_complete ? '' : 'identity-missing'}`}>
+                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
+                  <div><strong>User {user.user_id}</strong><small>UID {user.uid} · v{user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
+                  <div><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} /><small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small></div>
+                  <div><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>
+                  <div className="row-actions">
+                    <button className="icon-button" disabled={!writable} onClick={() => setDialog({ mode: 'edit', user })} aria-label={`Edit ${user.display_name}`}><Icon name="edit" /></button>
+                    <button className="icon-button" disabled={!writable || user.privilege !== 0} onClick={() => setDialog({ mode: 'lease', user })} aria-label={`Grant enrollment access to ${user.display_name}`}><Icon name="shield" /></button>
+                    <button className="icon-button" disabled={!writable || user.privilege === 14} onClick={() => setDialog({ mode: 'delete', user })} aria-label={`Delete ${user.display_name}`}><Icon name="trash" /></button>
+                  </div>
+                </article>
+              ))}
+              {!loading && !rows.length && <div className="empty-state"><Icon name="users" /><h3>No users match this selected-terminal view.</h3><p>Change the filters or add the first ADD-managed user.</p></div>}
+            </div>
+          </section>
+        </>
+      )}
+      {dialog && selected && <UserOperationDialog state={dialog} device={selected} onClose={() => setDialog(null)} onCommand={setCommand} toast={toast} />}
+    </>
+  )
 }
 
-function AlertsView({ devices, toast }: { devices: Device[]; toast: ReturnType<typeof useToast> }) {
+function AttendanceView({ devices, revision }: { devices: Device[]; revision: number }) {
+  const [rows, setRows] = useState<AttendanceEvent[]>([])
+  const [loading, setLoading] = useState(false)
+  const [filters, setFilters] = useState({ device_id: '', q: '', cnic: '', punch: '', clock_quality: '', from_time: '', to_time: '' })
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const response = await api<{ rows: AttendanceEvent[] }>(`/api/v1/attendance${queryString(filters)}`)
+      setRows(response.rows)
+    } finally {
+      setLoading(false)
+    }
+  }, [filters])
+  useEffect(() => { void load() }, [load, revision])
+  return (
+    <>
+      <PageHeader eyebrow="IMMUTABLE CAPTURE LEDGER" title="Attendance events" description="Filter live and reconciled punches without changing terminal history." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <section className="panel">
+        <div className="filter-grid">
+          <label>Device<select value={filters.device_id} onChange={(event) => setFilters({ ...filters, device_id: event.target.value })}><option value="">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label>
+          <label>Name / user ID<input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} /></label>
+          <label>Exact CNIC<input inputMode="numeric" value={filters.cnic} onChange={(event) => setFilters({ ...filters, cnic: event.target.value.replace(/\D/g, '').slice(0, 13) })} placeholder="13 digits" /></label>
+          <label>Punch<select value={filters.punch} onChange={(event) => setFilters({ ...filters, punch: event.target.value })}><option value="">All punches</option><option value="0">Check in</option><option value="1">Check out</option></select></label>
+          <label>Clock quality<select value={filters.clock_quality} onChange={(event) => setFilters({ ...filters, clock_quality: event.target.value })}><option value="">Any quality</option><option value="OK">OK</option><option value="DRIFTED">Drifted</option><option value="UNKNOWN">Unknown</option></select></label>
+          <label>From<input type="datetime-local" value={filters.from_time} onChange={(event) => setFilters({ ...filters, from_time: event.target.value })} /></label>
+          <label>To<input type="datetime-local" value={filters.to_time} onChange={(event) => setFilters({ ...filters, to_time: event.target.value })} /></label>
+        </div>
+        <div className="attendance-table">
+          <div className="attendance-head"><span>Employee</span><span>Event time</span><span>Terminal</span><span>Capture</span><span>Delivery</span></div>
+          {loading && <div className="empty-state compact">Loading attendance ledger…</div>}
+          {!loading && rows.map((row) => <article key={row.event_uid}><div><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id}`}</small></div><div><strong>{dateTime(row.device_event_time)}</strong><small>Received {relativeTime(row.received_at)}</small></div><div><strong>{row.device_serial || 'Unreported serial'}</strong><small>UID {row.uid || '—'} · User {row.user_id}</small></div><div><StatusBadge state={row.source} /><small>Punch {row.punch ?? '—'} · {row.clock_quality}</small></div><div><StatusBadge state={row.ords_status} /><small>{row.clock_drift_seconds == null ? 'No drift sample' : `${Math.round(row.clock_drift_seconds)}s clock drift`}</small></div></article>)}
+          {!loading && !rows.length && <div className="empty-state"><Icon name="clock" /><h3>No attendance matches these filters.</h3></div>}
+        </div>
+      </section>
+    </>
+  )
+}
+
+function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: ReturnType<typeof useToast>; revision: number }) {
   const [rows, setRows] = useState<(Alert & { device: Device })[]>([])
   const load = useCallback(async () => {
-    const results = await Promise.all(devices.map(async device => ({ device, alerts: (await api<{ rows: Alert[] }>(`/api/v1/devices/${device.connector_id}/alerts`)).rows })))
-    setRows(results.flatMap(result => result.alerts.map(alert => ({ ...alert, device: result.device }))).sort((a, b) => +new Date(b.last_seen_at) - +new Date(a.last_seen_at)))
+    const responses = await Promise.all(devices.map(async (device) => ({ device, rows: (await api<{ rows: Alert[] }>(`/api/v1/devices/${device.connector_id}/alerts`)).rows })))
+    setRows(responses.flatMap((response) => response.rows.map((row) => ({ ...row, device: response.device }))).sort((a, b) => +new Date(b.last_seen_at) - +new Date(a.last_seen_at)))
   }, [devices])
-  useEffect(() => { void load() }, [load])
-  const acknowledge = async (row: Alert) => { try { await api(`/api/v1/alerts/${row.id}/acknowledge`, { method: 'POST', body: '{}' }); toast.success('Alert acknowledged'); await load() } catch (err) { toast.error(err instanceof Error ? err.message : 'Unable to acknowledge alert') } }
-  return <><header className="page-header"><div><p className="eyebrow">OPERATIONS QUEUE</p><h1>Alerts & exceptions</h1><p>Prioritized device conditions requiring operator review.</p></div><button className="secondary" onClick={() => void load()}><Icon name="refresh" />Refresh</button></header><section className="alert-list">{rows.map(row => <article className={`alert-card ${row.severity.toLowerCase()}`} key={`${row.device.connector_id}-${row.id}`}><div className="alert-symbol"><Icon name="alert" /></div><div className="alert-body"><div><StatusPill state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h3>{row.message}</h3><p>{row.code} · First observed {dateTime(row.first_seen_at)} · Last observed {relativeTime(row.last_seen_at)}</p></div><div>{row.state === 'OPEN' ? <button className="secondary small" onClick={() => void acknowledge(row)}><Icon name="check" />Acknowledge</button> : <StatusPill state={row.state} />}</div></article>)}{!rows.length && <div className="panel empty-state"><Icon name="shield" /><h2>No device alerts</h2><p>The fleet has no recorded exceptions.</p></div>}</section></>
+  useEffect(() => { void load() }, [load, revision])
+  const acknowledge = async (row: Alert) => {
+    try {
+      await api(`/api/v1/alerts/${row.id}/acknowledge`, { method: 'POST', body: '{}' })
+      toast.notice('Alert acknowledged with an audit entry.')
+      await load()
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Unable to acknowledge alert.')
+    }
+  }
+  return (
+    <>
+      <PageHeader eyebrow="OPERATIONS QUEUE" title="Alerts and exceptions" description="Device conditions prioritized with labels, icons, and border patterns." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <section className="alert-list">
+        {rows.map((row) => <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p></div>{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</article>)}
+        {!rows.length && <div className="panel empty-state"><Icon name="shield" /><h2>No recorded device exceptions.</h2><p>The queue will update from live ESP telemetry.</p></div>}
+      </section>
+    </>
+  )
 }
 
-function DeviceDrawer({ seed, liveRevision, onClose, toast, onRefresh }: { seed: Device; liveRevision: number; onClose: () => void; toast: ReturnType<typeof useToast>; onRefresh: () => Promise<void> }) {
+function DeviceDrawer({
+  seed,
+  revision,
+  onClose,
+  onManageUsers,
+  toast,
+}: {
+  seed: Device
+  revision: number
+  onClose: () => void
+  onManageUsers: (device: Device) => void
+  toast: ReturnType<typeof useToast>
+}) {
   const [device, setDevice] = useState(seed)
-  const [tab, setTab] = useState<DeviceTab>('summary')
-  const [users, setUsers] = useState<DeviceUser[]>([])
+  const [tab, setTab] = useState<DrawerTab>('overview')
   const [logs, setLogs] = useState<DeviceLog[]>([])
   const [connections, setConnections] = useState<ConnectionEvent[]>([])
-  const [userQuery, setUserQuery] = useState('')
-  const [selectedUser, setSelectedUser] = useState<DeviceUser | null>(null)
-  const [busy, setBusy] = useState(false)
   const [password, setPassword] = useState('')
-  const [restartReason, setRestartReason] = useState('Operator-requested health refresh')
-  const [editName, setEditName] = useState('')
-  const [editPrivilege, setEditPrivilege] = useState(0)
-  const logsEnd = useRef<HTMLDivElement>(null)
-  const seenLiveRevision = useRef(liveRevision)
-  const loadDevice = useCallback(async () => {
-    const [nextDevice, history] = await Promise.all([
-      api<Device>(`/api/v1/devices/${seed.connector_id}`),
-      api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=8`),
-    ])
-    setDevice(nextDevice); setConnections(history.rows)
-  }, [seed.connector_id])
-  const loadUsers = useCallback(async () => {
-    const result = await api<{ rows: DeviceUser[] }>('/api/v1/users' + queryString({ device_id: seed.connector_id, q: userQuery, limit: 500 }))
-    setUsers(result.rows)
-  }, [seed.connector_id, userQuery])
-  const loadLogs = useCallback(async () => {
-    const result = await api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=500`)
-    setLogs(result.rows.reverse())
-  }, [seed.connector_id])
-  useEffect(() => { void loadDevice() }, [loadDevice])
-  useEffect(() => { if (tab === 'users' || tab === 'enrollment') void loadUsers() }, [tab, loadUsers])
-  useEffect(() => {
-    if (tab !== 'logs') return
-    void loadLogs()
-    const timer = window.setInterval(() => void loadLogs(), 5000)
-    return () => window.clearInterval(timer)
-  }, [tab, loadLogs])
-  useEffect(() => {
-    if (seenLiveRevision.current === liveRevision) return
-    seenLiveRevision.current = liveRevision
-    void loadDevice()
-    if (tab === 'users' || tab === 'enrollment') void loadUsers()
-    if (tab === 'logs') void loadLogs()
-  }, [liveRevision, loadDevice, loadLogs, loadUsers, tab])
-  useEffect(() => { logsEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [logs])
-  const run = async (action: () => Promise<unknown>, success: string) => {
-    setBusy(true)
-    try { await action(); toast.success(success); await loadDevice(); await onRefresh() } catch (err) { toast.error(err instanceof Error ? err.message : 'Command failed') } finally { setBusy(false) }
-  }
-  const refreshUsers = () => run(() => api(`/api/v1/devices/${device.connector_id}/users/refresh`, { method: 'POST', body: '{}' }), 'User refresh queued')
-  const openEdit = (user: DeviceUser) => { setSelectedUser(user); setEditName(user.display_name); setEditPrivilege(user.privilege) }
-  const saveUser = async () => {
-    if (!selectedUser) return
-    await run(() => api(`/api/v1/devices/${device.connector_id}/users/${encodeURIComponent(selectedUser.uid)}`, { method: 'PATCH', body: JSON.stringify({ display_name: editName, privilege: editPrivilege, expected_version: selectedUser.row_version, idempotency_key: idempotency('user') }) }), 'User update queued')
-    setSelectedUser(null); await loadUsers()
-  }
-  const grantLease = async (user: DeviceUser) => {
-    if (!password) { toast.error('Enter your dashboard password to authorize enrollment'); return }
-    await run(() => api(`/api/v1/devices/${device.connector_id}/admin-leases`, { method: 'POST', body: JSON.stringify({ uid: user.uid, password, idempotency_key: idempotency('lease') }) }), `${user.display_name} is being elevated for 10 minutes`)
-    setPassword('')
-  }
-  const revokeLease = () => device.active_lease && run(() => api(`/api/v1/admin-leases/${device.active_lease!.lease_id}/revoke`, { method: 'POST', body: '{}' }), 'Immediate privilege revocation queued')
-  const restart = async () => {
-    if (!password) { toast.error('Enter your dashboard password to authorize restart'); return }
-    await run(() => api(`/api/v1/devices/${device.connector_id}/restart`, { method: 'POST', body: JSON.stringify({ reason: restartReason, password, idempotency_key: idempotency('restart') }) }), 'Safe ZKT restart queued')
-    setPassword('')
-  }
-  const certify = () => run(() => api(`/api/v1/devices/${device.connector_id}/certify`, { method: 'POST', body: JSON.stringify({ read_users: true, read_attendance: true, user_write: true, admin_lease: true, protocol_restart: true, telnet_recovery: false, name_bytes: 24 }) }), 'Device capability profile certified')
-
-  return <div className="drawer-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><aside className="device-drawer">
-    <header className="drawer-head"><div className={`device-dot large ${stateClass(device.state)}`}><Icon name="server" /></div><div><div className="drawer-title"><h2>{device.display_name}</h2><StatusPill state={device.state} pulse={device.connected} /></div><p>{device.zone_id} · Connector {device.hardware_id}</p></div><button className="icon-button" onClick={onClose} aria-label="Close"><Icon name="x" /></button></header>
-    <nav className="tabs">{(['summary', 'users', 'enrollment', 'logs', 'control'] as DeviceTab[]).map(value => <button className={tab === value ? 'active' : ''} onClick={() => setTab(value)} key={value}>{value}</button>)}</nav>
-    <div className="drawer-content">
-      {tab === 'summary' && <div className="summary-grid">
-        <section className="detail-card wide"><div className="detail-head"><div><p className="eyebrow">LIVE PAIR HEALTH</p><h3>Connector → terminal</h3></div><button className="icon-button" onClick={() => void loadDevice()}><Icon name="refresh" /></button></div><div className="link-health"><div className={device.connected ? 'good' : 'bad'}><Icon name="wifi" /><b>ESP32 connector</b><span>{device.connected ? 'Live control channel' : 'Disconnected'}</span></div><i /><div className={device.zkt?.online ? 'good' : 'bad'}><Icon name="server" /><b>ZKT terminal</b><span>{device.zkt?.connection_state || 'UNOBSERVED'}{device.zkt?.backoff_until ? ` · retry ${relativeTime(device.zkt.backoff_until)}` : ''}</span></div></div>{device.last_error_code && <div className="inline-alert"><Icon name="alert" /><div><b>{device.last_error_code}</b><span>{device.current_activity || 'Device requires attention'}</span></div></div>}</section>
-        <section className="detail-card"><p>Terminal time</p><strong>{device.zkt?.device_time ? new Intl.DateTimeFormat('en-PK', { timeStyle: 'medium', timeZone: 'Asia/Karachi' }).format(new Date(device.zkt.device_time)) : '—'}</strong><span>Sampled {relativeTime(device.zkt?.device_time_sampled_at)}</span></section>
-        <section className="detail-card"><p>Clock drift</p><strong>{device.zkt?.drift_seconds == null ? '—' : `${Math.round(device.zkt.drift_seconds)}s`}</strong><span>{Math.abs(device.zkt?.drift_seconds || 0) < 120 ? 'Within capture guardrail' : 'Requires correction'}</span></section>
-        <section className="detail-card"><p>Registered users</p><strong>{device.zkt?.user_count ?? '—'}</strong><span>{device.zkt?.attendance_count ?? '—'} records on terminal</span></section>
-        <section className="detail-card"><p>Connectivity stability</p><strong>{device.zkt?.flap_count_15m ?? 0}</strong><span>transitions in the last 15 minutes · {device.zkt?.probe_latency_ms ?? '—'} ms probe</span></section>
-        <section className="detail-card"><p>Next scheduled restart</p><strong className="small-strong">{dateTime(device.zkt?.next_restart_at)}</strong><span>02:00 · 12:00 · 22:00 PKT</span></section>
-        <section className="detail-card wide"><p className="eyebrow">IDENTITY & CAPABILITIES</p><dl><div><dt>ZKT serial</dt><dd>{device.zkt?.serial || 'Awaiting authenticated discovery'}</dd></div><div><dt>IP address</dt><dd>{device.zkt?.ip_address || 'Discovery pending'}</dd></div><div><dt>Model / platform</dt><dd>{device.zkt?.model || 'Unknown'} / {device.zkt?.platform || 'Unknown'}</dd></div><div><dt>Certification</dt><dd><StatusPill state={device.zkt?.certification_state || 'UNOBSERVED'} /></dd></div><div><dt>User record</dt><dd>{String(device.zkt?.capabilities?.observed_user_record_bytes || 'Unknown')} bytes</dd></div><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unreported'}</dd></div><div><dt>Last reconcile</dt><dd>{dateTime(device.zkt?.last_reconcile_at)}</dd></div></dl></section>
-        <section className="detail-card wide"><p className="eyebrow">RECENT CONNECTIVITY TRANSITIONS</p><div className="transition-list">{connections.map(item => <div key={item.id}><time>{dateTime(item.observed_at)}</time><StatusPill state={item.from_state || 'START'} /><Icon name="chevron" /><StatusPill state={item.to_state} /><span>{item.reason || 'Connector state observation'}</span></div>)}{!connections.length && <p className="muted">No state transitions have been reported yet.</p>}</div></section>
-      </div>}
-      {tab === 'users' && <section><div className="section-head"><div><h3>Terminal users</h3><p>Names and permanent roles stored on this ZKT terminal.</p></div><button className="secondary" disabled={busy} onClick={() => void refreshUsers()}><Icon name="refresh" />Read from ZKT</button></div><div className="search full"><Icon name="search" /><input placeholder="Search name, UID or user ID" value={userQuery} onChange={event => setUserQuery(event.target.value)} /></div><div className="user-list">{users.map(user => <article key={user.uid}><div className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</div><div><b>{user.display_name}</b><span>{user.cnic_masked || 'CNIC unavailable'} · User {user.user_id}</span></div><StatusPill state={user.privilege === 14 ? 'ADMIN' : 'USER'} /><button className="icon-button" onClick={() => openEdit(user)} title="Edit user"><Icon name="edit" /></button></article>)}{!users.length && <div className="empty"><Icon name="users" /><b>No users have been synchronized</b><span>Run “Read from ZKT” after the terminal is online.</span></div>}</div></section>}
-      {tab === 'enrollment' && <section><div className="section-head"><div><h3>Temporary enrollment administrator</h3><p>Elevate one existing regular user for exactly 10 minutes.</p></div></div>{device.active_lease && <div className={`lease-banner ${stateClass(device.active_lease.state)}`}><Icon name="shield" /><div><b>Lease {device.active_lease.state.toLowerCase()}</b><span>{device.active_lease.expires_at ? `Automatic revoke ${relativeTime(device.active_lease.expires_at)}` : 'Waiting for terminal verification'}</span></div><button className="danger small" disabled={busy} onClick={() => void revokeLease()}>Revoke now</button></div>}<label className="confirm-password">Dashboard password<input type="password" value={password} onChange={event => setPassword(event.target.value)} placeholder="Required for each elevation" /></label><div className="user-list enrollment">{users.filter(user => user.privilege === 0).map(user => <article key={user.uid}><div className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</div><div><b>{user.display_name}</b><span>{user.cnic_masked || `User ${user.user_id}`}</span></div><button className="primary small" disabled={busy || Boolean(device.active_lease)} onClick={() => void grantLease(user)}><Icon name="shield" />Elevate 10 min</button></article>)}{!users.length && <div className="empty"><Icon name="users" /><b>No eligible users available</b></div>}</div><div className="safety-note"><Icon name="alert" /><p><b>Fail-safe behavior</b><span>The ESP32 records the lease locally and revokes it even if the dashboard connection drops. If the terminal is powered off, revocation is enforced immediately when it returns and the fleet raises a critical overdue alert.</span></p></div></section>}
-      {tab === 'logs' && <section className="log-section"><div className="section-head"><div><h3>Live connector log</h3><p>Redacted, device-originated diagnostics. Refreshes every 5 seconds.</p></div><button className="secondary" onClick={() => void loadLogs()}><Icon name="refresh" />Refresh</button></div><div className="terminal"><div className="terminal-top"><i /><i /><i /><span>{device.hardware_id} / serial monitor</span></div><div className="terminal-lines">{logs.map(row => <div key={row.id} className={row.level.toLowerCase()}><time>{new Date(row.received_at).toLocaleTimeString('en-PK', { hour12: false })}</time><b>{row.level.padEnd(8)}</b><em>{row.subsystem}</em><span>{row.message}</span></div>)}{!logs.length && <div className="terminal-empty">Waiting for connector logs…</div>}<div ref={logsEnd} /></div></div></section>}
-      {tab === 'control' && <section><div className="section-head"><div><h3>Protected terminal controls</h3><p>High-impact commands require an explicit operator confirmation.</p></div></div><article className="control-card"><div className="control-icon"><Icon name="shield" /></div><div><h4>Capability certification</h4><p>Writes remain locked until the connector observes the certified 72-byte user record. Legacy 28-byte / 8-character-name terminals stay read-only because they cannot preserve CNIC identity.</p><StatusPill state={device.zkt?.certification_state || 'UNOBSERVED'} /></div><button className="secondary" disabled={busy || Number(device.zkt?.capabilities?.observed_user_record_bytes) !== 72} onClick={() => void certify()}>Certify profile</button></article><article className="control-card danger-zone"><div className="control-icon"><Icon name="power" /></div><div><h4>Restart ZKT terminal</h4><p>Uses the authenticated ZKT protocol, closes the session cleanly, waits 90 seconds, and verifies the same serial returns.</p><label>Reason<input value={restartReason} onChange={event => setRestartReason(event.target.value)} /></label><label>Dashboard password<input type="password" value={password} onChange={event => setPassword(event.target.value)} /></label></div><button className="danger" disabled={busy || Boolean(device.active_lease) || !device.zkt?.capabilities?.protocol_restart} onClick={() => void restart()}><Icon name="power" />Restart safely</button></article></section>}
-    </div>
-    {selectedUser && <div className="modal-layer"><form className="mini-modal" onSubmit={event => { event.preventDefault(); void saveUser() }}><div className="modal-head"><div><p className="eyebrow">EDIT TERMINAL USER</p><h3>{selectedUser.display_name}</h3></div><button type="button" className="icon-button" onClick={() => setSelectedUser(null)}><Icon name="x" /></button></div><label>Display name<input value={editName} onChange={event => setEditName(event.target.value)} /></label><label>Permanent role<select value={editPrivilege} onChange={event => setEditPrivilege(Number(event.target.value))}><option value={0}>Regular user</option><option value={14}>Administrator</option></select></label><p className="field-note">The CNIC suffix is preserved automatically and never exposed to the browser.</p><div className="modal-actions"><button type="button" className="secondary" onClick={() => setSelectedUser(null)}>Cancel</button><button className="primary" disabled={busy}>Queue update</button></div></form></div>}
-  </aside></div>
-}
-
-function RegisterConnector({ onClose, onCreated, toast }: { onClose: () => void; onCreated: () => Promise<void>; toast: ReturnType<typeof useToast> }) {
-  const [form, setForm] = useState({ display_name: '', hardware_id: '', zone_id: '', zone_name: '', device_id: '', expected_serial: '' })
-  const [result, setResult] = useState<{ connector_id: string; activation_code: string } | null>(null)
+  const [reason, setReason] = useState('Operator-requested terminal health refresh')
   const [busy, setBusy] = useState(false)
-  const submit = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true)
+  const load = useCallback(async () => {
+    const [detail, logResult, history] = await Promise.all([
+      api<Device>(`/api/v1/devices/${seed.connector_id}`),
+      api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=250`),
+      api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=40`),
+    ])
+    setDevice(detail)
+    setLogs(logResult.rows)
+    setConnections(history.rows)
+  }, [seed.connector_id])
+  useEffect(() => { void load() }, [load, revision])
+  const restart = async () => {
+    if (!password) return toast.error('Confirm the administrator password before restart.')
+    setBusy(true)
     try {
-      const response = await api<{ connector: Device; activation_code: string }>('/api/v1/connectors', { method: 'POST', body: JSON.stringify({ ...form, expected_serial: form.expected_serial || null }) })
-      setResult({ connector_id: response.connector.connector_id, activation_code: response.activation_code }); await onCreated(); toast.success('Connector registered')
-    } catch (err) { toast.error(err instanceof Error ? err.message : 'Registration failed') } finally { setBusy(false) }
+      await api(`/api/v1/devices/${device.connector_id}/restart`, { method: 'POST', body: JSON.stringify({ reason, password, idempotency_key: idempotency('restart') }) })
+      toast.notice('Authenticated ZKT restart is queued.')
+      setPassword('')
+      await load()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Restart could not be queued.')
+    } finally {
+      setBusy(false)
+    }
   }
-  return <div className="modal-layer fixed"><form className="register-modal" onSubmit={submit}><div className="modal-head"><div><p className="eyebrow">SECURE ONBOARDING</p><h2>Register ESP32 connector</h2><p>Create a single-use activation bundle for a new device pair.</p></div><button type="button" className="icon-button" onClick={onClose}><Icon name="x" /></button></div>{result ? <div className="activation-result"><Icon name="check" /><h3>Registration ready</h3><p>Copy these values into the connector’s protected provisioning process. The activation code is shown once.</p><label>Connector ID<code>{result.connector_id}</code></label><label>One-time activation code<code>{result.activation_code}</code></label><button type="button" className="primary wide" onClick={onClose}>Done</button></div> : <><div className="form-grid"><label>Display name<input required value={form.display_name} onChange={event => setForm({ ...form, display_name: event.target.value })} placeholder="SLICTOWER · 3rd Floor" /></label><label>ESP hardware ID<input required value={form.hardware_id} onChange={event => setForm({ ...form, hardware_id: event.target.value })} placeholder="ESP32 MAC address" /></label><label>Zone ID<input required value={form.zone_id} onChange={event => setForm({ ...form, zone_id: event.target.value })} /></label><label>Zone name<input required value={form.zone_name} onChange={event => setForm({ ...form, zone_name: event.target.value })} /></label><label>Device ID<input required value={form.device_id} onChange={event => setForm({ ...form, device_id: event.target.value })} /></label><label>Expected ZKT serial<input value={form.expected_serial} onChange={event => setForm({ ...form, expected_serial: event.target.value })} placeholder="Recommended" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={busy}>{busy ? 'Registering…' : 'Register connector'}</button></div></>}</form></div>
+  const refreshUsers = async () => {
+    try {
+      await api(`/api/v1/devices/${device.connector_id}/users/refresh`, { method: 'POST', body: '{}' })
+      toast.notice('A complete terminal user reread was requested.')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Refresh could not be queued.')
+    }
+  }
+  const handleTabKey = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    let next = index
+    if (event.key === 'ArrowRight') next = (index + 1) % drawerTabs.length
+    else if (event.key === 'ArrowLeft') next = (index - 1 + drawerTabs.length) % drawerTabs.length
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = drawerTabs.length - 1
+    else return
+    event.preventDefault()
+    setTab(drawerTabs[next])
+    event.currentTarget.parentElement
+      ?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]
+      ?.focus()
+  }
+  return (
+    <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
+      <div className="drawer-status"><StatusBadge state={device.state} live={device.connected} /><span>{device.current_activity || 'Idle'} · Last contact {relativeTime(device.last_seen_at)}</span></div>
+      <div className="tabs" role="tablist" aria-label="Device details">
+        {drawerTabs.map((item, index) => (
+          <button
+            id={`device-tab-${item}`}
+            key={item}
+            role="tab"
+            aria-controls="device-tabpanel"
+            aria-selected={tab === item}
+            tabIndex={tab === item ? 0 : -1}
+            className={tab === item ? 'active' : ''}
+            onClick={() => setTab(item)}
+            onKeyDown={(event) => handleTabKey(event, index)}
+          >
+            {item === 'logs' ? 'Live logs' : item}
+          </button>
+        ))}
+      </div>
+      <div
+        id="device-tabpanel"
+        className="drawer-content"
+        role="tabpanel"
+        aria-labelledby={`device-tab-${tab}`}
+      >
+        {tab === 'overview' && <div className="overview-grid">
+          <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
+          <article className="detail-card"><p className="eyebrow">ZKT TERMINAL</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
+          <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
+          <article className="detail-card"><p className="eyebrow">CAPTURE HEALTH</p><h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3><p>{device.zkt?.user_count ?? '—'} users · Last 15-minute reconciliation {relativeTime(device.zkt?.last_reconcile_at)}</p></article>
+          {device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
+          <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
+        </div>}
+        {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${statusPattern(row.level)}`}><time>{dateTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}
+        {tab === 'control' && <div className="control-stack">
+          <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
+          <article className="control-card"><span><Icon name="refresh" /></span><div><h3>Refresh terminal users</h3><p>Request a complete serialized user table reread without opening a competing ZKT connection.</p></div><button className="button secondary" onClick={() => void refreshUsers()}>Request reread</button></article>
+          <article className="control-card pattern-blocked"><span><Icon name="power" /></span><div><h3>Restart ZKT terminal</h3><p>Issues an authenticated protocol restart. Active enrollment leases block this operation.</p><label>Reason<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label></div><button className="button destructive" disabled={busy} onClick={() => void restart()}>{busy ? 'Queuing…' : 'Restart terminal'}</button></article>
+          {device.active_command && <CommandProgress command={device.active_command} onCancel={async () => undefined} />}
+        </div>}
+      </div>
+    </Dialog>
+  )
 }
 
 export default function App() {
-  const [session, setSession] = useState<{ username: string; csrf_token: string } | null | undefined>(undefined)
+  const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
+  const [username, setUsername] = useState('')
   const [view, setView] = useState<View>('fleet')
   const [devices, setDevices] = useState<Device[]>([])
   const [overview, setOverview] = useState<Overview>({ total: 0, open_alerts: 0, active_leases: 0 })
   const [loading, setLoading] = useState(true)
-  const [liveRevision, setLiveRevision] = useState(0)
-  const [selected, setSelected] = useState<Device | null>(null)
-  const [registering, setRegistering] = useState(false)
+  const [revision, setRevision] = useState(0)
+  const [selectedDeviceId, setSelectedDeviceId] = useState('')
+  const [drawer, setDrawer] = useState<Device | null>(null)
   const toast = useToast()
-  const loadFleet = useCallback(async () => {
+
+  const refreshFleet = useCallback(async () => {
+    setLoading(true)
     try {
-      const [deviceResult, overviewResult] = await Promise.all([api<{ rows: Device[] }>('/api/v1/devices'), api<Overview>('/api/v1/overview')])
-      setDevices(deviceResult.rows); setOverview(overviewResult)
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) setSession(null)
-      else toast.error(err instanceof Error ? err.message : 'Unable to load fleet')
-    } finally { setLoading(false) }
-  }, []) // toast callbacks intentionally excluded; they are recreated with render state.
-  useEffect(() => { api<{ username: string; csrf_token: string }>('/api/v1/auth/session').then(value => { setCsrfToken(value.csrf_token); setSession(value) }).catch(() => setSession(null)) }, [])
-  useEffect(() => { if (session) void loadFleet() }, [session, loadFleet])
+      const [counts, fleet] = await Promise.all([
+        api<Overview>('/api/v1/overview'),
+        api<{ rows: Device[] }>('/api/v1/devices'),
+      ])
+      setOverview(counts)
+      setDevices(fleet.rows)
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
+      else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')
+    } finally {
+      setLoading(false)
+    }
+  }, [toast.error])
+
   useEffect(() => {
-    if (!session) return
-    const events = new EventSource('/events/v1/stream', { withCredentials: true })
-    const refresh = () => { setLiveRevision(value => value + 1); void loadFleet() }
-    for (const event of [
-      'device', 'heartbeat', 'alert', 'backend_error',
-      'command', 'command_update',
-      'attendance', 'attendance_batch',
-      'users', 'user_snapshot', 'log',
-    ]) events.addEventListener(event, refresh)
-    events.onerror = () => { /* Browser reconnects with Last-Event-ID automatically. */ }
-    const fallback = window.setInterval(refresh, 30000)
-    return () => { events.close(); window.clearInterval(fallback) }
-  }, [session, loadFleet])
-  const login = async (username: string, password: string) => { const value = await api<{ username: string; csrf_token: string }>('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }); setCsrfToken(value.csrf_token); setSession(value) }
-  const logout = async () => { try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally { setCsrfToken(''); setSession(null) } }
-  const nav = useMemo(() => [{ value: 'fleet' as const, label: 'Fleet', icon: 'grid' as const }, { value: 'attendance' as const, label: 'Attendance', icon: 'clock' as const }, { value: 'alerts' as const, label: 'Alerts', icon: 'alert' as const }], [])
-  if (session === undefined) return <div className="boot"><div className="brand-mark"><span>SL</span><i /></div><p>Opening command center…</p></div>
-  if (!session) return <Login onLogin={login} />
-  return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark small"><span>SL</span><i /></div><div><b>Attendance</b><span>Device Dashboard</span></div></div><nav>{nav.map(item => <button key={item.value} className={view === item.value ? 'active' : ''} onClick={() => setView(item.value)}><Icon name={item.icon} />{item.label}{item.value === 'alerts' && overview.open_alerts > 0 && <i className="nav-count">{overview.open_alerts}</i>}</button>)}</nav><div className="sidebar-foot"><div className="system-state"><i /><div><b>ADD backend live</b><span>Secure control channel</span></div></div><button onClick={() => void logout()}><Icon name="logout" />Sign out</button></div></aside><main className="workspace"><div className="topbar"><div className="mobile-title"><div className="brand-mark tiny"><span>SL</span><i /></div><b>ADD Command Center</b></div><div className="freshness"><i /><span>Live fleet sync</span><time>{new Intl.DateTimeFormat('en-PK', { timeStyle: 'short', timeZone: 'Asia/Karachi' }).format(new Date())} PKT</time></div><div className="operator"><span>SA</span><div><b>{session.username}</b><small>National administrator</small></div></div></div><div className="page-content">{view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onSelect={setSelected} onAdd={() => setRegistering(true)} />}{view === 'attendance' && <AttendanceView devices={devices} liveRevision={liveRevision} />}{view === 'alerts' && <AlertsView devices={devices} toast={toast} />}</div></main>{selected && <DeviceDrawer seed={selected} liveRevision={liveRevision} onClose={() => setSelected(null)} toast={toast} onRefresh={loadFleet} />}{registering && <RegisterConnector onClose={() => setRegistering(false)} onCreated={loadFleet} toast={toast} />}{toast.toast && <div className={`toast ${toast.toast.kind}`}>{toast.toast.kind === 'success' ? <Icon name="check" /> : <Icon name="alert" />}{toast.toast.text}</div>}</div>
+    api<{ username: string; csrf_token: string }>('/api/v1/auth/session')
+      .then((session) => {
+        setCsrfToken(session.csrf_token)
+        setUsername(session.username)
+        setAuthState('authenticated')
+      })
+      .catch(() => setAuthState('anonymous'))
+  }, [])
+
+  useEffect(() => {
+    if (authState !== 'authenticated') return
+    void refreshFleet()
+    if (typeof EventSource === 'undefined') return
+    const stream = new EventSource('/events/v1/stream', { withCredentials: true })
+    stream.onmessage = () => setRevision((value) => value + 1)
+    stream.addEventListener('device', () => { setRevision((value) => value + 1); void refreshFleet() })
+    return () => stream.close()
+  }, [authState, refreshFleet])
+
+  useEffect(() => {
+    if (authState === 'authenticated') void refreshFleet()
+  }, [revision, authState, refreshFleet])
+
+  const login = async (loginUsername: string, password: string) => {
+    const response = await api<{ username: string; csrf_token: string }>('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: loginUsername, password }),
+    })
+    setCsrfToken(response.csrf_token)
+    setUsername(response.username)
+    setAuthState('authenticated')
+  }
+
+  const logout = async () => {
+    try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally {
+      setCsrfToken('')
+      setAuthState('anonymous')
+      setDevices([])
+    }
+  }
+
+  const manageUsers = (device: Device) => {
+    setSelectedDeviceId(device.connector_id)
+    setDrawer(null)
+    setView('users')
+  }
+
+  const nav = useMemo(() => [
+    { id: 'fleet' as const, label: 'Fleet', icon: 'grid' as const },
+    { id: 'users' as const, label: 'Users', icon: 'users' as const },
+    { id: 'attendance' as const, label: 'Attendance', icon: 'clock' as const },
+    { id: 'alerts' as const, label: 'Alerts', icon: 'alert' as const },
+  ], [])
+
+  if (authState === 'loading') return <main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
+  if (authState === 'anonymous') return <Login onLogin={login} />
+
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <a className="app-brand" href="#fleet" onClick={() => setView('fleet')}><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><span><strong>Attendance Device Dashboard</strong><small>National command center</small></span></a>
+        <nav aria-label="Primary navigation">{nav.map((item) => <button key={item.id} className={view === item.id ? 'active' : ''} aria-current={view === item.id ? 'page' : undefined} onClick={() => setView(item.id)}><Icon name={item.icon} />{item.label}{item.id === 'alerts' && overview.open_alerts > 0 && <span className="nav-count" aria-label={`${overview.open_alerts} open alerts`}>{overview.open_alerts}</span>}</button>)}</nav>
+        <div className="operator-area"><span className="live-sync"><i /> Live sync</span><span><strong>{username}</strong><small>State Life operator</small></span><button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><Icon name="logout" /></button></div>
+      </header>
+      <main className="page-content">
+        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={setDrawer} onManageUsers={manageUsers} />}
+        {view === 'users' && <UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={setSelectedDeviceId} revision={revision} toast={toast} refreshFleet={refreshFleet} />}
+        {view === 'attendance' && <AttendanceView devices={devices} revision={revision} />}
+        {view === 'alerts' && <AlertsView devices={devices} toast={toast} revision={revision} />}
+      </main>
+      {drawer && <DeviceDrawer seed={drawer} revision={revision} onClose={() => setDrawer(null)} onManageUsers={manageUsers} toast={toast} />}
+      {toast.toast && <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role="status" aria-live="polite"><Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />{toast.toast.text}</div>}
+    </div>
+  )
 }

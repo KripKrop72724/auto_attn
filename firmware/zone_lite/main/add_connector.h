@@ -8,12 +8,29 @@ typedef struct {
     char command_id[48];
     char command_type[32];
     char uid[16];
+    char user_id[32];
+    char user_key[48];
     char name[64];
     char lease_id[48];
+    char expected_serial[80];
+    char expected_name[64];
+    char tombstone_display_name[256];
+    char tombstone_cnic[16];
     int privilege;
+    int expected_privilege;
+    int expected_version;
     int duration_seconds;
+    int32_t expected_attendance_count;
+    int64_t expires_epoch;
+    int64_t lease_expires_epoch;
     bool has_name;
     bool has_privilege;
+    bool has_expected_name;
+    bool has_expected_privilege;
+    bool has_expected_version;
+    bool has_expected_attendance_count;
+    bool has_tombstone;
+    bool tombstone_shift_worker;
 } add_command_t;
 
 typedef struct {
@@ -47,6 +64,16 @@ uint32_t add_connector_outbox_depth(void);
 void add_connector_set_activity(const char *activity);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
+void add_connector_command_retry(const char *command_id);
+bool add_connector_command_complete(const char *command_id);
+bool add_connector_persist_command_tombstone(const add_command_t *command);
+bool add_connector_lookup_identity(
+    const char *user_id,
+    char *display_name,
+    size_t display_name_size,
+    char *cnic,
+    size_t cnic_size,
+    bool *shift_worker);
 bool add_connector_command_update(
     const char *command_id,
     const char *status,

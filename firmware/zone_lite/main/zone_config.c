@@ -1,0 +1,189 @@
+#include "zone_config.h"
+
+#include <string.h>
+
+#include "esp_log.h"
+#include "nvs.h"
+
+#include "zone_lite_config.example.h"
+
+#ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
+#define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
+#endif
+#ifndef ZONE_LITE_ADD_ENABLED
+#define ZONE_LITE_ADD_ENABLED 0
+#endif
+#ifndef ZONE_LITE_ADD_ONBOARD_URL
+#define ZONE_LITE_ADD_ONBOARD_URL "https://autoattn.slichealth.com/device/v2/onboard"
+#endif
+#ifndef ZONE_LITE_ADD_WS_URL
+#define ZONE_LITE_ADD_WS_URL ""
+#endif
+#ifndef ZONE_LITE_ADD_CONNECTOR_ID
+#define ZONE_LITE_ADD_CONNECTOR_ID ""
+#endif
+#ifndef ZONE_LITE_ADD_DEVICE_TOKEN
+#define ZONE_LITE_ADD_DEVICE_TOKEN ""
+#endif
+#ifndef ZONE_LITE_ADD_BOOTSTRAP_SECRET
+#define ZONE_LITE_ADD_BOOTSTRAP_SECRET ""
+#endif
+#ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
+#define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
+#endif
+#ifndef ZONE_LITE_ZKT_RECOVERY_FAILURES
+#define ZONE_LITE_ZKT_RECOVERY_FAILURES 2
+#endif
+#ifndef ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS
+#define ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS (30 * 60 * 1000)
+#endif
+#ifndef ZONE_LITE_ZKT_REBOOT_WAIT_MS
+#define ZONE_LITE_ZKT_REBOOT_WAIT_MS 90000
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_PORT
+#define ZONE_LITE_ZKT_TELNET_PORT 23
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_USERNAME
+#define ZONE_LITE_ZKT_TELNET_USERNAME "root"
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_PASSWORD
+#define ZONE_LITE_ZKT_TELNET_PASSWORD ""
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_EXPECT_BANNER
+#define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER "Linux"
+#endif
+#ifndef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
+#define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"
+#endif
+
+static const char *TAG = "zone_config";
+static zone_config_t s_config;
+
+static void copy_default(char *target, size_t size, const char *value)
+{
+    strlcpy(target, value ? value : "", size);
+}
+
+static void read_string(nvs_handle_t handle, const char *key, char *target, size_t size)
+{
+    size_t required = size;
+    if (nvs_get_str(handle, key, target, &required) != ESP_OK) {
+        return;
+    }
+    target[size - 1] = '\0';
+}
+
+static void load_defaults(void)
+{
+    memset(&s_config, 0, sizeof(s_config));
+    copy_default(s_config.wifi_ssid, sizeof(s_config.wifi_ssid), ZONE_LITE_WIFI_SSID);
+    copy_default(s_config.wifi_password, sizeof(s_config.wifi_password), ZONE_LITE_WIFI_PASSWORD);
+    s_config.zkt_port = ZONE_LITE_ZKT_PORT;
+    s_config.zkt_comm_key = ZONE_LITE_ZKT_COMM_KEY;
+    copy_default(s_config.zkt_preferred_ip, sizeof(s_config.zkt_preferred_ip), ZONE_LITE_ZKT_PREFERRED_IP);
+    copy_default(s_config.zkt_expected_serial, sizeof(s_config.zkt_expected_serial), ZONE_LITE_ZKT_EXPECTED_SERIAL);
+    copy_default(s_config.zone_device_id, sizeof(s_config.zone_device_id), ZONE_LITE_ZONE_DEVICE_ID);
+    copy_default(s_config.zone_id, sizeof(s_config.zone_id), ZONE_LITE_ZONE_ID);
+    copy_default(s_config.zone_name, sizeof(s_config.zone_name), ZONE_LITE_ZONE_NAME);
+    copy_default(s_config.ords_base_url, sizeof(s_config.ords_base_url), ZONE_LITE_ORDS_BASE_URL);
+    copy_default(s_config.ords_username, sizeof(s_config.ords_username), ZONE_LITE_ORDS_USERNAME);
+    copy_default(s_config.ords_password, sizeof(s_config.ords_password), ZONE_LITE_ORDS_PASSWORD);
+    s_config.zkt_recovery_enabled = ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED != 0;
+    s_config.zkt_recovery_failures = ZONE_LITE_ZKT_RECOVERY_FAILURES;
+    s_config.zkt_recovery_cooldown_ms = ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS;
+    s_config.zkt_reboot_wait_ms = ZONE_LITE_ZKT_REBOOT_WAIT_MS;
+    s_config.zkt_telnet_port = ZONE_LITE_ZKT_TELNET_PORT;
+    copy_default(s_config.zkt_telnet_username, sizeof(s_config.zkt_telnet_username), ZONE_LITE_ZKT_TELNET_USERNAME);
+    copy_default(s_config.zkt_telnet_password, sizeof(s_config.zkt_telnet_password), ZONE_LITE_ZKT_TELNET_PASSWORD);
+    copy_default(s_config.zkt_telnet_banner, sizeof(s_config.zkt_telnet_banner), ZONE_LITE_ZKT_TELNET_EXPECT_BANNER);
+    copy_default(s_config.zkt_telnet_command, sizeof(s_config.zkt_telnet_command), ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND);
+    s_config.add_enabled = ZONE_LITE_ADD_ENABLED != 0;
+    copy_default(s_config.add_onboard_url, sizeof(s_config.add_onboard_url), ZONE_LITE_ADD_ONBOARD_URL);
+    copy_default(s_config.add_ws_url, sizeof(s_config.add_ws_url), ZONE_LITE_ADD_WS_URL);
+    copy_default(s_config.bootstrap_secret, sizeof(s_config.bootstrap_secret), ZONE_LITE_ADD_BOOTSTRAP_SECRET);
+    copy_default(s_config.connector_id, sizeof(s_config.connector_id), ZONE_LITE_ADD_CONNECTOR_ID);
+    copy_default(s_config.device_token, sizeof(s_config.device_token), ZONE_LITE_ADD_DEVICE_TOKEN);
+}
+
+esp_err_t zone_config_init(void)
+{
+    load_defaults();
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "No encrypted per-device provisioning namespace; firmware remains inert");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+    uint8_t provisioned = 0;
+    (void)nvs_get_u8(handle, "provisioned", &provisioned);
+    s_config.provisioned = provisioned == 1;
+    read_string(handle, "wifi_ssid", s_config.wifi_ssid, sizeof(s_config.wifi_ssid));
+    read_string(handle, "wifi_pass", s_config.wifi_password, sizeof(s_config.wifi_password));
+    (void)nvs_get_u16(handle, "zkt_port", &s_config.zkt_port);
+    (void)nvs_get_u32(handle, "zkt_key", &s_config.zkt_comm_key);
+    read_string(handle, "zkt_ip", s_config.zkt_preferred_ip, sizeof(s_config.zkt_preferred_ip));
+    read_string(handle, "zkt_serial", s_config.zkt_expected_serial, sizeof(s_config.zkt_expected_serial));
+    read_string(handle, "zone_dev", s_config.zone_device_id, sizeof(s_config.zone_device_id));
+    read_string(handle, "zone_id", s_config.zone_id, sizeof(s_config.zone_id));
+    read_string(handle, "zone_name", s_config.zone_name, sizeof(s_config.zone_name));
+    read_string(handle, "ords_url", s_config.ords_base_url, sizeof(s_config.ords_base_url));
+    read_string(handle, "ords_user", s_config.ords_username, sizeof(s_config.ords_username));
+    read_string(handle, "ords_pass", s_config.ords_password, sizeof(s_config.ords_password));
+    uint8_t enabled = s_config.zkt_recovery_enabled;
+    (void)nvs_get_u8(handle, "rec_enable", &enabled);
+    s_config.zkt_recovery_enabled = enabled == 1;
+    (void)nvs_get_u32(handle, "rec_fails", &s_config.zkt_recovery_failures);
+    (void)nvs_get_u32(handle, "rec_cool", &s_config.zkt_recovery_cooldown_ms);
+    (void)nvs_get_u32(handle, "reboot_wait", &s_config.zkt_reboot_wait_ms);
+    (void)nvs_get_u16(handle, "tel_port", &s_config.zkt_telnet_port);
+    read_string(handle, "tel_user", s_config.zkt_telnet_username, sizeof(s_config.zkt_telnet_username));
+    read_string(handle, "tel_pass", s_config.zkt_telnet_password, sizeof(s_config.zkt_telnet_password));
+    read_string(handle, "tel_banner", s_config.zkt_telnet_banner, sizeof(s_config.zkt_telnet_banner));
+    read_string(handle, "tel_cmd", s_config.zkt_telnet_command, sizeof(s_config.zkt_telnet_command));
+    enabled = s_config.add_enabled;
+    (void)nvs_get_u8(handle, "add_enabled", &enabled);
+    s_config.add_enabled = enabled == 1;
+    read_string(handle, "add_onboard", s_config.add_onboard_url, sizeof(s_config.add_onboard_url));
+    read_string(handle, "add_ws", s_config.add_ws_url, sizeof(s_config.add_ws_url));
+    read_string(handle, "boot_secret", s_config.bootstrap_secret, sizeof(s_config.bootstrap_secret));
+    read_string(handle, "conn_id", s_config.connector_id, sizeof(s_config.connector_id));
+    read_string(handle, "dev_token", s_config.device_token, sizeof(s_config.device_token));
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Loaded per-device provisioning for zone=%s", s_config.zone_id);
+    return ESP_OK;
+}
+
+const zone_config_t *zone_config_get(void)
+{
+    return &s_config;
+}
+
+bool zone_config_needs_onboarding(void)
+{
+    return s_config.add_enabled && s_config.bootstrap_secret[0] != '\0' &&
+           (s_config.connector_id[0] == '\0' || s_config.device_token[0] == '\0' ||
+            s_config.add_ws_url[0] == '\0');
+}
+
+esp_err_t zone_config_save_connector(
+    const char *connector_id,
+    const char *device_token,
+    const char *ws_url)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(handle, "conn_id", connector_id)) == ESP_OK &&
+        (err = nvs_set_str(handle, "dev_token", device_token)) == ESP_OK &&
+        (err = nvs_set_str(handle, "add_ws", ws_url)) == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        copy_default(s_config.connector_id, sizeof(s_config.connector_id), connector_id);
+        copy_default(s_config.device_token, sizeof(s_config.device_token), device_token);
+        copy_default(s_config.add_ws_url, sizeof(s_config.add_ws_url), ws_url);
+    }
+    return err;
+}

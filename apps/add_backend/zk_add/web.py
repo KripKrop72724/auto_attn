@@ -22,22 +22,25 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add.audit import append_audit
-from zk_add.crypto import cnic_lookup, decrypt_cnic, mask_cnic
+from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
 from zk_add.db import SessionLocal, init_db, session_scope
-from zk_add.identity import build_machine_name
 from zk_add.models import (
     AdminSession,
     AttendanceEvent,
     Connector,
     DeviceAlert,
     DeviceCommand,
+    DeviceCommandEvent,
     DeviceConnectionEvent,
     DeviceLog,
     DeviceUser,
+    IdentityTombstone,
+    OnboardingNonce,
     TemporaryAdminLease,
     ZKTDevice,
 )
@@ -47,14 +50,15 @@ from zk_add.schemas import (
     AlertAcknowledgeRequest,
     AttendanceBatchRequest,
     CommandUpdate,
-    ConnectorActivateRequest,
-    ConnectorCreateRequest,
     Envelope,
     HeartbeatPayload,
     LoginRequest,
+    OnboardRequest,
     DeviceLogIn,
     LogBatchRequest,
     RestartRequest,
+    UserCreateRequest,
+    UserDeleteRequest,
     UserSnapshotRequest,
     UserUpdateRequest,
 )
@@ -70,25 +74,30 @@ from zk_add.security import (
     require_step_up,
     verify_admin_password,
 )
+from zk_add.onboarding import normalize_mac, verify_onboarding_signature
 from zk_add.service import (
+    ACTIVE_COMMAND_STATES,
     apply_command_update,
+    apply_user_command_terminal_state,
     create_admin_lease,
     create_command,
-    create_connector,
+    create_device_user_command,
+    delete_device_user_command,
     fleet_counts,
     ingest_attendance,
     ingest_logs,
     replace_user_snapshot,
     resolve_alert,
-    seed_bootstrap_connector,
+    onboard_connector,
     serialize_command,
     serialize_connector,
     update_heartbeat,
+    update_device_user_command,
     upsert_alert,
 )
 from zk_add.settings import settings
 from zk_add.worker import maintenance_loop
-from zk_common.time_utils import utc_now
+from zk_add.time_utils import utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -111,8 +120,6 @@ async def lifespan(_app: FastAPI):
     settings.require_production_secrets()
     if settings.auto_create_schema:
         init_db()
-    with session_scope() as session:
-        seed_bootstrap_connector(session)
     stop = asyncio.Event()
     task = asyncio.create_task(maintenance_loop(stop))
     yield
@@ -131,7 +138,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-Id"],
 )
 
@@ -202,7 +209,8 @@ def health_ready(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}") from exc
+        logger.exception("ADD database readiness check failed")
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     return {"ok": True, "database": True, "server_utc": utc_now()}
 
 
@@ -286,44 +294,98 @@ def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     return fleet_counts(db)
 
 
-@app.post("/api/v1/connectors")
-def create_connector_route(
+@app.post("/device/v2/onboard")
+async def onboard(
     request: Request,
-    body: ConnectorCreateRequest,
-    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+    body: OnboardRequest,
+    x_zone_mac: str | None = Header(default=None, alias="X-Zone-MAC"),
+    timestamp: str | None = Header(default=None, alias="X-ADD-Timestamp"),
+    nonce: str | None = Header(default=None, alias="X-ADD-Nonce"),
+    supplied_body_hash: str | None = Header(default=None, alias="X-ADD-Body-SHA256"),
+    signature: str | None = Header(default=None, alias="X-ADD-Signature"),
+    db: Session = Depends(get_db),
 ):
-    db, context = auth
+    if not all([x_zone_mac, timestamp, nonce, supplied_body_hash, signature]):
+        raise HTTPException(status_code=401, detail="Missing signed onboarding headers.")
     try:
-        connector, activation_code = create_connector(
-            db,
-            hardware_id=body.hardware_id,
-            zone_id=body.zone_id,
-            zone_name=body.zone_name,
-            device_id=body.device_id,
-            display_name=body.display_name,
-            expected_serial=body.expected_serial,
-            actor=context.username,
-            ip_address=client_ip(request),
-        )
+        header_mac = normalize_mac(x_zone_mac or "")
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"connector": serialize_connector(connector), "activation_code": activation_code}
-
-
-@app.post("/device/v1/activate")
-def activate(body: ConnectorActivateRequest, db: Session = Depends(get_db)):
-    from zk_add.service import activate_connector
-
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if header_mac != body.hardware_id:
+        raise HTTPException(status_code=401, detail="Onboarding MAC does not match the body.")
+    if db.scalar(
+        select(OnboardingNonce).where(
+            OnboardingNonce.hardware_id == header_mac,
+            OnboardingNonce.nonce == nonce,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Onboarding nonce replay rejected.")
+    raw_body = await request.body()
     try:
-        connector, token = activate_connector(
-            db,
-            connector_id=body.connector_id,
-            hardware_id=body.hardware_id,
-            activation_code=body.activation_code,
+        verified = verify_onboarding_signature(
+            mac=header_mac,
+            method=request.method,
+            path=request.url.path,
+            timestamp=timestamp or "",
+            nonce=nonce or "",
+            supplied_body_hash=supplied_body_hash or "",
+            signature=signature or "",
+            body=raw_body,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    return {"ok": True, "connector_id": connector.connector_id, "device_token": token}
+    except Exception:
+        verified = False
+    if not verified:
+        raise HTTPException(status_code=401, detail="Invalid or expired onboarding signature.")
+    from zk_add.time_utils import parse_datetime
+
+    # Serialize onboarding for one MAC. This closes both the nonce-check race
+    # and the first-onboard unique-hardware race without locking the fleet.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:hardware_id, 0))"),
+            {"hardware_id": header_mac},
+        )
+    if db.scalar(
+        select(OnboardingNonce).where(
+            OnboardingNonce.hardware_id == header_mac,
+            OnboardingNonce.nonce == nonce,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Onboarding nonce replay rejected.")
+
+    db.add(
+        OnboardingNonce(
+            hardware_id=header_mac,
+            nonce=nonce or "",
+            request_timestamp=parse_datetime(timestamp or ""),
+        )
+    )
+    connector, token, created = onboard_connector(
+        db,
+        hardware_id=header_mac,
+        zone_id=body.zone_id,
+        zone_name=body.zone_name,
+        device_id=body.device_id,
+        firmware_version=body.firmware_version,
+        expected_serial=body.expected_serial,
+        actor=f"esp:{header_mac}",
+        ip_address=client_ip(request),
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Onboarding replay or conflict rejected.") from exc
+    ws_url = f"{settings.public_device_ws_url}?connector_id={connector.connector_id}"
+    return {
+        "ok": True,
+        "created": created,
+        "connector_id": connector.connector_id,
+        "device_token": token,
+        "ws_url": ws_url,
+        "schema_version": "2",
+        "token_overlap_seconds": settings.onboarding_token_overlap_seconds,
+    }
 
 
 @app.get("/api/v1/devices")
@@ -363,7 +425,7 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
     active_command = db.scalar(
         select(DeviceCommand).where(
             DeviceCommand.connector_id == connector.id,
-            DeviceCommand.status.in_(["QUEUED", "DISPATCHED", "ACKNOWLEDGED", "RUNNING"]),
+            DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
         ).order_by(DeviceCommand.created_at.asc()).limit(1)
     )
     active_lease = None
@@ -379,58 +441,6 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         "active_command": serialize_command(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
-
-
-@app.post("/api/v1/devices/{connector_id}/certify")
-def certify_device(
-    request: Request,
-    connector_id: str,
-    capabilities: dict,
-    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
-):
-    db, context = auth
-    connector = connector_or_404(db, connector_id)
-    if connector.zkt_device is None:
-        raise HTTPException(status_code=409, detail="No ZKT device has been observed.")
-    zkt = connector.zkt_device
-    if zkt.expected_serial and zkt.serial != zkt.expected_serial:
-        raise HTTPException(status_code=409, detail="ZKT serial assignment has not been verified.")
-    observed_record_size = int((zkt.capability_profile or {}).get("observed_user_record_bytes", 0))
-    requests_writes = any(
-        bool(capabilities.get(name))
-        for name in ("user_write", "admin_lease", "protocol_restart")
-    )
-    if requests_writes and observed_record_size != 72:
-        raise HTTPException(
-            status_code=409,
-            detail="Write capabilities require an observed 72-byte ZKT user record.",
-        )
-    allowed = {
-        "read_users",
-        "read_attendance",
-        "user_write",
-        "admin_lease",
-        "protocol_restart",
-        "telnet_recovery",
-        "name_bytes",
-    }
-    capabilities = {key: value for key, value in capabilities.items() if key in allowed}
-    capabilities["observed_user_record_bytes"] = observed_record_size
-    before = connector.zkt_device.capability_profile
-    connector.zkt_device.capability_profile = capabilities
-    connector.zkt_device.certification_state = "CERTIFIED"
-    append_audit(
-        db,
-        actor=context.username,
-        action="DEVICE_CERTIFIED",
-        target_type="zkt_device",
-        target_id=str(connector.zkt_device.id),
-        outcome="SUCCESS",
-        ip_address=client_ip(request),
-        before=before,
-        after=capabilities,
-    )
-    return serialize_connector(connector)
 
 
 @app.get("/api/v1/users")
@@ -460,8 +470,11 @@ def list_users(
             or_(DeviceUser.display_name.ilike(like), DeviceUser.user_id.ilike(like), DeviceUser.uid.ilike(like))
         )
     if cnic:
+        normalized = normalize_cnic(cnic)
+        if normalized is None:
+            raise HTTPException(status_code=422, detail="CNIC must contain exactly 13 digits.")
         try:
-            lookup = cnic_lookup(cnic)
+            lookup = cnic_lookup(normalized)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         statement = statement.where(DeviceUser.cnic_lookup_hash == lookup)
@@ -470,6 +483,58 @@ def list_users(
     rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
     return {"rows": [serialize_user(row) for row in rows[:limit]], "next_cursor": next_cursor}
+
+
+@app.get("/api/v2/devices/{connector_id}/users")
+def list_device_users_v2(
+    connector_id: str,
+    q: str | None = None,
+    cnic: str | None = None,
+    privilege: int | None = None,
+    identity: str | None = None,
+    present: bool = True,
+    limit: int = Query(default=200, ge=1, le=500),
+    cursor: int | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        return {"rows": [], "next_cursor": None, "device": serialize_connector(connector)}
+    statement = select(DeviceUser).where(
+        DeviceUser.zkt_device_id == zkt.id,
+        DeviceUser.present == present,
+        DeviceUser.lifecycle_state == ("ACTIVE" if present else "DELETED"),
+    )
+    if cursor:
+        statement = statement.where(DeviceUser.id > cursor)
+    if q:
+        like = f"%{q.strip()}%"
+        statement = statement.where(
+            or_(
+                DeviceUser.display_name.ilike(like),
+                DeviceUser.user_id.ilike(like),
+                DeviceUser.uid.ilike(like),
+            )
+        )
+    if cnic:
+        normalized = normalize_cnic(cnic)
+        if normalized is None:
+            raise HTTPException(status_code=422, detail="CNIC must contain exactly 13 digits.")
+        statement = statement.where(DeviceUser.cnic_lookup_hash == cnic_lookup(normalized))
+    if privilege is not None:
+        statement = statement.where(DeviceUser.privilege == privilege)
+    if identity == "COMPLETE":
+        statement = statement.where(DeviceUser.cnic_lookup_hash != None)  # noqa: E711
+    elif identity == "MISSING":
+        statement = statement.where(DeviceUser.cnic_lookup_hash == None)  # noqa: E711
+    rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
+    return {
+        "rows": [serialize_user(row, zkt=zkt) for row in rows[:limit]],
+        "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
+        "device": serialize_connector(connector),
+    }
 
 
 @app.post("/api/v1/devices/{connector_id}/users/refresh", status_code=202)
@@ -498,53 +563,110 @@ async def refresh_users(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.patch("/api/v1/devices/{connector_id}/users/{uid}", status_code=202)
-async def update_user(
+@app.post("/api/v2/devices/{connector_id}/users", status_code=202)
+async def create_user_v2(
     connector_id: str,
-    uid: str,
+    body: UserCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        user, command = create_device_user_command(
+            db,
+            connector=connector,
+            display_name=body.display_name,
+            cnic=body.cnic,
+            shift_worker=body.shift_worker,
+            user_id_override=body.user_id_override,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await dispatch_command(connector, command)
+    return {"user": serialize_user(user, zkt=connector.zkt_device), "command": command_response(command)}
+
+
+@app.patch("/api/v2/devices/{connector_id}/users/{user_key}", status_code=202)
+async def update_user_v2(
+    connector_id: str,
+    user_key: str,
     body: UserUpdateRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
     zkt = connector.zkt_device
     if zkt is None:
         raise HTTPException(status_code=409, detail="No assigned ZKT device.")
-    if not zkt.capability_profile.get("user_write", False):
-        raise HTTPException(status_code=409, detail="This ZKT profile is read-only until certified.")
-    user = db.scalar(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id, DeviceUser.uid == uid))
-    if user is None or not user.present:
-        raise HTTPException(status_code=404, detail="Device user not found.")
-    if user.row_version != body.expected_version:
-        raise HTTPException(status_code=409, detail="User changed since it was loaded. Refresh and retry.")
-    desired: dict = {}
-    if body.display_name is not None:
-        name_limit = int(zkt.capability_profile.get("name_bytes", 24))
-        try:
-            desired["name"] = build_machine_name(
-                display_name=body.display_name,
-                current_raw_name=user.raw_name,
-                byte_limit=name_limit,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if body.privilege is not None:
-        desired["privilege"] = body.privilege
-    if not desired:
-        raise HTTPException(status_code=422, detail="No user changes supplied.")
-    command = create_command(
-        db,
-        connector=connector,
-        command_type="UPDATE_USER",
-        payload={"uid": user.uid, **desired},
-        expected_state={"uid": user.uid, "user_id": user.user_id, "row_version": user.row_version},
-        desired_state=desired,
-        idempotency_key=body.idempotency_key,
-        actor=context.username,
+    user = db.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == user_key,
+        )
     )
+    if user is None:
+        raise HTTPException(status_code=404, detail="Device user not found.")
+    try:
+        command = update_device_user_command(
+            db,
+            connector=connector,
+            user=user,
+            display_name=body.display_name,
+            cnic=body.cnic,
+            shift_worker=body.shift_worker,
+            privilege=body.privilege,
+            expected_version=body.expected_version,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
     await dispatch_command(connector, command)
-    return command_response(command)
+    return {"user": serialize_user(user, zkt=zkt), "command": command_response(command)}
+
+
+@app.delete("/api/v2/devices/{connector_id}/users/{user_key}", status_code=202)
+async def delete_user_v2(
+    connector_id: str,
+    user_key: str,
+    body: UserDeleteRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    user = db.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == user_key,
+        )
+    )
+    if user is None:
+        raise HTTPException(status_code=404, detail="Device user not found.")
+    try:
+        command = delete_device_user_command(
+            db,
+            connector=connector,
+            user=user,
+            expected_version=body.expected_version,
+            typed_confirmation=body.typed_confirmation,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await dispatch_command(connector, command)
+    return {"user": serialize_user(user, zkt=zkt), "command": command_response(command)}
 
 
 @app.post("/api/v1/devices/{connector_id}/admin-leases", status_code=202)
@@ -595,8 +717,13 @@ async def revoke_admin_lease(
         db,
         connector=connector,
         command_type="REVOKE_TEMP_ADMIN",
-        payload={"lease_id": lease.lease_id, "uid": user.uid},
-        expected_state={"uid": user.uid},
+        payload={"lease_id": lease.lease_id, "uid": user.uid, "user_id": user.user_id},
+        expected_state={
+            "serial": zkt.serial if zkt else None,
+            "uid": user.uid,
+            "user_id": user.user_id,
+            "privilege": 14,
+        },
         desired_state={"privilege": 0},
         idempotency_key=f"manual-revoke:{lease.lease_id}",
         actor=context.username,
@@ -679,7 +806,10 @@ def attendance(
             )
         )
     if cnic:
-        statement = statement.where(AttendanceEvent.cnic_lookup_hash == cnic_lookup(cnic))
+        normalized = normalize_cnic(cnic)
+        if normalized is None:
+            raise HTTPException(status_code=422, detail="CNIC must contain exactly 13 digits.")
+        statement = statement.where(AttendanceEvent.cnic_lookup_hash == cnic_lookup(normalized))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:
@@ -687,11 +817,11 @@ def attendance(
     if clock_quality:
         statement = statement.where(AttendanceEvent.clock_quality == clock_quality)
     if from_time:
-        from zk_common.time_utils import parse_datetime
+        from zk_add.time_utils import parse_datetime
 
         statement = statement.where(AttendanceEvent.device_event_time >= parse_datetime(from_time))
     if to_time:
-        from zk_common.time_utils import parse_datetime
+        from zk_add.time_utils import parse_datetime
 
         statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
     rows = db.scalars(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
@@ -792,11 +922,60 @@ def acknowledge_alert(
 
 
 @app.get("/api/v1/commands/{command_id}")
+@app.get("/api/v2/commands/{command_id}")
 def command(command_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
     row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Command not found.")
+    return command_response(row)
+
+
+@app.post("/api/v2/commands/{command_id}/cancel")
+async def cancel_command(
+    command_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Command not found.")
+    if row.status == "CANCEL_REQUESTED":
+        return command_response(row)
+    if row.status in {"RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
+        raise HTTPException(status_code=409, detail="This command can no longer be cancelled.")
+    connector = db.get(Connector, row.connector_id)
+    can_cancel_locally = row.attempt_count == 0 and row.status in {
+        "QUEUED",
+        "WAITING_FOR_DEVICE",
+        "WAITING_FOR_ZKT",
+    }
+    row.status = "CANCELLED" if can_cancel_locally else "CANCEL_REQUESTED"
+    if can_cancel_locally:
+        row.completed_at = utc_now()
+        apply_user_command_terminal_state(db, command=row, status="CANCELLED")
+    db.add(
+        DeviceCommandEvent(
+            command_id=row.id,
+            status=row.status,
+            details={"requested_by": context.username},
+        )
+    )
+    append_audit(
+        db,
+        actor=context.username,
+        action=f"COMMAND_{row.command_type}_{row.status}",
+        target_type="command",
+        target_id=row.command_id,
+        outcome=row.status,
+    )
+    db.commit()
+    if connector and not can_cancel_locally:
+        await connector_hub.send(
+            connector.connector_id,
+            {"schema_version": "2", "type": "command_cancel", "command_id": row.command_id},
+        )
+    await browser_events.publish("command", command_response(row))
     return command_response(row)
 
 
@@ -893,12 +1072,12 @@ async def poll_commands(auth: tuple[Session, Connector] = Depends(require_connec
     rows = db.scalars(
         select(DeviceCommand).where(
             DeviceCommand.connector_id == connector.id,
-            DeviceCommand.status.in_(["QUEUED", "DISPATCHED"]),
+            DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
             or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now()),  # noqa: E711
         ).order_by(DeviceCommand.created_at.asc()).limit(10)
     ).all()
     for row in rows:
-        if row.status == "QUEUED":
+        if row.status in {"QUEUED", "WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
             row.status = "DISPATCHED"
             row.dispatched_at = utc_now()
             row.attempt_count += 1
@@ -929,8 +1108,25 @@ async def command_result(
 
 
 @app.get("/device/v1/config")
+@app.get("/device/v2/config")
 async def device_config(auth: tuple[Session, Connector] = Depends(require_connector)):
-    _db, connector = auth
+    db, connector = auth
+    tombstones = []
+    if connector.zkt_device:
+        for row in db.scalars(
+            select(IdentityTombstone)
+            .where(IdentityTombstone.zkt_device_id == connector.zkt_device.id)
+            .order_by(IdentityTombstone.id.asc())
+        ).all():
+            tombstones.append(
+                {
+                    "uid": row.uid,
+                    "user_id": row.user_id,
+                    "display_name": decrypt_text(row.display_name_encrypted),
+                    "cnic": decrypt_cnic(row.cnic_encrypted),
+                    "shift_worker": row.shift_worker,
+                }
+            )
     return {
         "config_version": connector.config_version,
         "heartbeat_seconds": settings.heartbeat_interval_seconds,
@@ -941,16 +1137,16 @@ async def device_config(auth: tuple[Session, Connector] = Depends(require_connec
         "restart_window_minutes": 30,
         "restart_jitter_minutes": 10,
         "led_fault_latch_seconds": 120,
+        "identity_tombstones": tombstones,
     }
 
 
 @app.websocket("/device/v1/stream")
+@app.websocket("/device/v2/stream")
 async def device_stream(websocket: WebSocket):
     connector_id = websocket.query_params.get("connector_id") or websocket.headers.get("X-ADD-Connector-Id")
     authorization = websocket.headers.get("Authorization", "")
     token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        token = websocket.query_params.get("token", "")
     if not connector_id or not token:
         await websocket.close(code=4401)
         return
@@ -969,6 +1165,27 @@ async def device_stream(websocket: WebSocket):
             connector.lifecycle_state = "ONLINE"
             connector.last_seen_at = utc_now()
     await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
+    with session_scope() as db:
+        connector = db.get(Connector, connector_pk)
+        rows = []
+        if connector and connector.zkt_device:
+            for item in db.scalars(
+                select(IdentityTombstone)
+                .where(IdentityTombstone.zkt_device_id == connector.zkt_device.id)
+                .order_by(IdentityTombstone.id.asc())
+            ).all():
+                rows.append(
+                    {
+                        "uid": item.uid,
+                        "user_id": item.user_id,
+                        "display_name": decrypt_text(item.display_name_encrypted),
+                        "cnic": decrypt_cnic(item.cnic_encrypted),
+                        "shift_worker": item.shift_worker,
+                    }
+                )
+    await websocket.send_json(
+        {"schema_version": "2", "type": "identity_catalog", "rows": rows}
+    )
     await send_pending_commands(connector_id)
     try:
         while True:
@@ -1132,7 +1349,7 @@ async def send_pending_commands(connector_id: str) -> None:
         rows = db.scalars(
             select(DeviceCommand).where(
                 DeviceCommand.connector_id == connector.id,
-                DeviceCommand.status.in_(["QUEUED", "DISPATCHED"]),
+                DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
                 or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now()),  # noqa: E711
             ).order_by(DeviceCommand.created_at.asc())
         ).all()
@@ -1145,7 +1362,12 @@ async def dispatch_command(connector: Connector, command: DeviceCommand) -> None
     if await connector_hub.send(connector.connector_id, serialize_command(command)):
         with session_scope() as db:
             row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command.command_id))
-            if row and row.status == "QUEUED":
+            if row and row.status in {
+                "QUEUED",
+                "WAITING_FOR_DEVICE",
+                "WAITING_FOR_ZKT",
+                "RETRYING",
+            }:
                 row.status = "DISPATCHED"
                 row.dispatched_at = utc_now()
                 row.attempt_count += 1
@@ -1168,21 +1390,29 @@ def command_response(row: DeviceCommand) -> dict:
     }
 
 
-def serialize_user(row: DeviceUser) -> dict:
+def serialize_user(row: DeviceUser, *, zkt: ZKTDevice | None = None) -> dict:
     cnic = decrypt_cnic(row.cnic_encrypted)
+    machine_name = decrypt_text(row.machine_name_encrypted) or ""
+    if cnic and machine_name:
+        machine_name = machine_name.replace(cnic, mask_cnic(cnic) or "[CNIC]")
     return {
         "id": row.id,
+        "user_key": row.user_key,
         "uid": row.uid,
         "user_id": row.user_id,
-        "raw_name": row.raw_name,
         "display_name": row.display_name,
         "cnic_masked": mask_cnic(cnic),
         "cnic_available": bool(cnic),
+        "identity_complete": bool(cnic and row.display_name),
         "shift_worker": row.shift_worker,
         "privilege": row.privilege,
         "present": row.present,
+        "lifecycle_state": row.lifecycle_state,
         "row_version": row.row_version,
         "observed_at": row.observed_at,
+        "machine_name_preview": machine_name or None,
+        "current_command_state": "PENDING" if row.current_command_id else None,
+        "read_only": bool(zkt and zkt.certification_state != "CERTIFIED"),
     }
 
 

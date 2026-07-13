@@ -12,6 +12,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
@@ -23,12 +24,14 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "mbedtls/md.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/sha256.h"
 
-#if __has_include("zone_lite_config.h")
-#include "zone_lite_config.h"
-#else
+#include "zone_config.h"
+
 #include "zone_lite_config.example.h"
-#endif
 
 #ifndef ZONE_LITE_ADD_ENABLED
 #define ZONE_LITE_ADD_ENABLED 0
@@ -49,7 +52,7 @@
 #define ZONE_LITE_ADD_RECONNECT_MS 30000
 #endif
 
-#define ADD_COMMAND_QUEUE_DEPTH 8
+#define ADD_COMMAND_QUEUE_DEPTH 32
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES 8192
 #define ADD_ACK_TIMEOUT_MS 15000
@@ -71,6 +74,12 @@
 #define ADD_LIVE_OUTBOX_CURSOR_PATH "/storage/add_live.pos"
 #define ADD_LIVE_OUTBOX_CURSOR_TMP_PATH "/storage/add_live.pos.tmp"
 #define ADD_CORRUPT_OUTBOX_PATH "/storage/add_corrupt.jsonl"
+#define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
+#define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
+#define ADD_COMMAND_LINE_BYTES 12288
+#define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
+#define ADD_IDENTITY_CATALOG_TMP_PATH "/storage/add_identities.tmp"
+#define ADD_CANCELLED_COMMANDS_PATH "/storage/add_cancelled.txt"
 
 typedef struct {
     const char *path;
@@ -92,6 +101,7 @@ static QueueHandle_t s_commands;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
+static SemaphoreHandle_t s_command_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
 static char s_boot_id[48];
@@ -100,7 +110,12 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+static bool s_onboarding_task_started;
+static bool s_command_inbox_restored;
 static char s_waiting_ack[80];
+static char s_running_command_id[48];
+static char s_queued_command_ids[ADD_COMMAND_QUEUE_DEPTH][48];
+static size_t s_queued_command_count;
 static add_outbox_t s_bulk_outbox = {
     .path = ADD_OUTBOX_PATH,
     .tmp_path = ADD_OUTBOX_TMP_PATH,
@@ -253,7 +268,7 @@ static bool send_payload(
     bool wait_for_ack,
     char message_id_out[80])
 {
-    if (!ZONE_LITE_ADD_ENABLED || !type || !payload_json) {
+    if (!zone_config_get()->add_enabled || !type || !payload_json) {
         return false;
     }
     uint32_t sanitized_bytes = 0;
@@ -300,9 +315,9 @@ static bool send_payload(
     char sent_at[32];
     iso_utc(now, sent_at);
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "schema_version", "1");
+    cJSON_AddStringToObject(root, "schema_version", "2");
     cJSON_AddStringToObject(root, "message_id", message_id);
-    cJSON_AddStringToObject(root, "connector_id", ZONE_LITE_ADD_CONNECTOR_ID);
+    cJSON_AddStringToObject(root, "connector_id", zone_config_get()->connector_id);
     cJSON_AddStringToObject(root, "boot_id", s_boot_id);
     cJSON_AddNumberToObject(root, "seq", (double)seq);
     cJSON_AddStringToObject(root, "sent_at", sent_at);
@@ -335,6 +350,414 @@ static bool send_payload(
 bool add_connector_send_payload(const char *type, const char *payload_json)
 {
     return send_payload(type, payload_json, false, NULL);
+}
+
+static const char *storage_key_material(void)
+{
+    const zone_config_t *runtime = zone_config_get();
+    return runtime->bootstrap_secret[0] ? runtime->bootstrap_secret : runtime->device_token;
+}
+
+static char *encrypt_storage_json(const char *plain)
+{
+    const char *material = storage_key_material();
+    if (!plain || !material || material[0] == '\0') return NULL;
+    size_t plain_len = strlen(plain);
+    size_t raw_len = 1 + 12 + 16 + plain_len;
+    unsigned char *raw = malloc(raw_len);
+    if (!raw) return NULL;
+    raw[0] = 1;
+    for (size_t index = 0; index < 12; index += 4) {
+        uint32_t value = esp_random();
+        memcpy(raw + 1 + index, &value, 4);
+    }
+    unsigned char key[32];
+    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    mbedtls_gcm_context context;
+    mbedtls_gcm_init(&context);
+    int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (result == 0) {
+        result = mbedtls_gcm_crypt_and_tag(
+            &context,
+            MBEDTLS_GCM_ENCRYPT,
+            plain_len,
+            raw + 1,
+            12,
+            NULL,
+            0,
+            (const unsigned char *)plain,
+            raw + 29,
+            16,
+            raw + 13);
+    }
+    mbedtls_gcm_free(&context);
+    if (result != 0) {
+        free(raw);
+        return NULL;
+    }
+    size_t encoded_size = ((raw_len + 2) / 3) * 4 + 1;
+    unsigned char *encoded = malloc(encoded_size);
+    size_t encoded_len = 0;
+    if (!encoded || mbedtls_base64_encode(encoded, encoded_size, &encoded_len, raw, raw_len) != 0) {
+        free(raw);
+        free(encoded);
+        return NULL;
+    }
+    encoded[encoded_len] = '\0';
+    free(raw);
+    return (char *)encoded;
+}
+
+static char *decrypt_storage_line(const char *line)
+{
+    if (!line) return NULL;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '{') return strdup(line);
+    const char *material = storage_key_material();
+    if (!material || material[0] == '\0') return NULL;
+    size_t encoded_len = strcspn(line, "\r\n");
+    size_t raw_size = (encoded_len * 3) / 4 + 4;
+    unsigned char *raw = malloc(raw_size);
+    size_t raw_len = 0;
+    if (!raw || mbedtls_base64_decode(
+                    raw,
+                    raw_size,
+                    &raw_len,
+                    (const unsigned char *)line,
+                    encoded_len) != 0 ||
+        raw_len < 29 || raw[0] != 1) {
+        free(raw);
+        return NULL;
+    }
+    size_t plain_len = raw_len - 29;
+    unsigned char *plain = calloc(1, plain_len + 1);
+    unsigned char key[32];
+    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    mbedtls_gcm_context context;
+    mbedtls_gcm_init(&context);
+    int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (result == 0) {
+        result = mbedtls_gcm_auth_decrypt(
+            &context,
+            plain_len,
+            raw + 1,
+            12,
+            NULL,
+            0,
+            raw + 13,
+            16,
+            raw + 29,
+            plain);
+    }
+    mbedtls_gcm_free(&context);
+    free(raw);
+    if (result != 0) {
+        free(plain);
+        return NULL;
+    }
+    return (char *)plain;
+}
+
+static bool persist_identity_catalog(cJSON *root)
+{
+    char *plain = cJSON_PrintUnformatted(root);
+    char *encrypted = encrypt_storage_json(plain);
+    FILE *file = encrypted ? fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w") : NULL;
+    bool ok = file && fprintf(file, "%s\n", encrypted) > 0 && fflush(file) == 0 &&
+              fsync(fileno(file)) == 0;
+    if (file) fclose(file);
+    free(plain);
+    free(encrypted);
+    if (ok) {
+        (void)remove(ADD_IDENTITY_CATALOG_PATH);
+        ok = rename(ADD_IDENTITY_CATALOG_TMP_PATH, ADD_IDENTITY_CATALOG_PATH) == 0;
+    }
+    if (!ok) (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
+    return ok;
+}
+
+bool add_connector_persist_command_tombstone(const add_command_t *command)
+{
+    if (!command || !command->has_tombstone || !command->user_id[0]) return false;
+    cJSON *root = NULL;
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        char *plain = decrypt_storage_line(line);
+        root = plain ? cJSON_Parse(plain) : NULL;
+        free(plain);
+    }
+    if (file) fclose(file);
+    free(line);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "schema_version", "2");
+        cJSON_AddStringToObject(root, "type", "identity_catalog");
+        cJSON_AddArrayToObject(root, "rows");
+    }
+    cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
+    if (!cJSON_IsArray(rows)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "rows");
+        rows = cJSON_AddArrayToObject(root, "rows");
+    }
+    cJSON *target = NULL;
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+        cJSON *user_id = cJSON_GetObjectItemCaseSensitive(row, "user_id");
+        if (cJSON_IsString(user_id) && strcmp(user_id->valuestring, command->user_id) == 0) {
+            target = row;
+            break;
+        }
+    }
+    if (!target) {
+        target = cJSON_CreateObject();
+        cJSON_AddItemToArray(rows, target);
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(target, "uid");
+    cJSON_DeleteItemFromObjectCaseSensitive(target, "user_id");
+    cJSON_DeleteItemFromObjectCaseSensitive(target, "display_name");
+    cJSON_DeleteItemFromObjectCaseSensitive(target, "cnic");
+    cJSON_DeleteItemFromObjectCaseSensitive(target, "shift_worker");
+    cJSON_AddStringToObject(target, "uid", command->uid);
+    cJSON_AddStringToObject(target, "user_id", command->user_id);
+    cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name);
+    cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic);
+    cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker);
+    bool ok = persist_identity_catalog(root);
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool append_cancelled_command(const char *command_id)
+{
+    FILE *file = fopen(ADD_CANCELLED_COMMANDS_PATH, "a");
+    bool ok = file && fprintf(file, "%s\n", command_id) > 0 && fflush(file) == 0 &&
+              fsync(fileno(file)) == 0;
+    if (file) fclose(file);
+    return ok;
+}
+
+static bool parse_command_object(cJSON *root, add_command_t *command)
+{
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *command_id = cJSON_GetObjectItemCaseSensitive(root, "command_id");
+    cJSON *command_type = cJSON_GetObjectItemCaseSensitive(root, "command_type");
+    cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+    cJSON *expected = cJSON_GetObjectItemCaseSensitive(root, "expected_state");
+    if (!command || !cJSON_IsString(type) || strcmp(type->valuestring, "command") != 0 ||
+        !cJSON_IsString(command_id) || !cJSON_IsString(command_type) || !cJSON_IsObject(payload)) {
+        return false;
+    }
+    memset(command, 0, sizeof(*command));
+    strlcpy(command->command_id, command_id->valuestring, sizeof(command->command_id));
+    strlcpy(command->command_type, command_type->valuestring, sizeof(command->command_type));
+    cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_epoch");
+    if (cJSON_IsNumber(expires)) command->expires_epoch = (int64_t)expires->valuedouble;
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(payload, "uid");
+    if (cJSON_IsString(value)) strlcpy(command->uid, value->valuestring, sizeof(command->uid));
+    value = cJSON_GetObjectItemCaseSensitive(payload, "user_id");
+    if (cJSON_IsString(value)) strlcpy(command->user_id, value->valuestring, sizeof(command->user_id));
+    value = cJSON_GetObjectItemCaseSensitive(payload, "user_key");
+    if (cJSON_IsString(value)) strlcpy(command->user_key, value->valuestring, sizeof(command->user_key));
+    value = cJSON_GetObjectItemCaseSensitive(payload, "name");
+    if (cJSON_IsString(value)) {
+        strlcpy(command->name, value->valuestring, sizeof(command->name));
+        command->has_name = true;
+    }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "lease_id");
+    if (cJSON_IsString(value)) strlcpy(command->lease_id, value->valuestring, sizeof(command->lease_id));
+    value = cJSON_GetObjectItemCaseSensitive(payload, "privilege");
+    if (cJSON_IsNumber(value)) {
+        command->privilege = value->valueint;
+        command->has_privilege = true;
+    }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "duration_seconds");
+    if (cJSON_IsNumber(value)) command->duration_seconds = value->valueint;
+    value = cJSON_GetObjectItemCaseSensitive(payload, "lease_expires_epoch");
+    if (cJSON_IsNumber(value)) command->lease_expires_epoch = (int64_t)value->valuedouble;
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(expected, "attendance_count")
+                : NULL;
+    if (cJSON_IsNumber(value)) {
+        command->expected_attendance_count = value->valueint;
+        command->has_expected_attendance_count = true;
+    }
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(expected, "serial")
+                : NULL;
+    if (cJSON_IsString(value)) {
+        strlcpy(
+            command->expected_serial,
+            value->valuestring,
+            sizeof(command->expected_serial));
+    }
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(expected, "name")
+                : NULL;
+    if (cJSON_IsString(value)) {
+        strlcpy(command->expected_name, value->valuestring, sizeof(command->expected_name));
+        command->has_expected_name = true;
+    }
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(expected, "privilege")
+                : NULL;
+    if (cJSON_IsNumber(value)) {
+        command->expected_privilege = value->valueint;
+        command->has_expected_privilege = true;
+    }
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(expected, "row_version")
+                : NULL;
+    if (cJSON_IsNumber(value)) {
+        command->expected_version = value->valueint;
+        command->has_expected_version = true;
+    }
+    cJSON *tombstone = cJSON_GetObjectItemCaseSensitive(payload, "tombstone");
+    if (cJSON_IsObject(tombstone)) {
+        cJSON *display_name = cJSON_GetObjectItemCaseSensitive(tombstone, "display_name");
+        cJSON *cnic = cJSON_GetObjectItemCaseSensitive(tombstone, "cnic");
+        cJSON *shift_worker = cJSON_GetObjectItemCaseSensitive(tombstone, "shift_worker");
+        if (cJSON_IsString(display_name) && (cJSON_IsString(cnic) || cJSON_IsNull(cnic))) {
+            strlcpy(
+                command->tombstone_display_name,
+                display_name->valuestring,
+                sizeof(command->tombstone_display_name));
+            if (cJSON_IsString(cnic)) {
+                strlcpy(
+                    command->tombstone_cnic,
+                    cnic->valuestring,
+                    sizeof(command->tombstone_cnic));
+            }
+            command->tombstone_shift_worker = cJSON_IsTrue(shift_worker);
+            command->has_tombstone = true;
+        }
+    }
+    return true;
+}
+
+static bool command_journal_contains_locked(const char *command_id)
+{
+    FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
+    if (!file) return false;
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool found = false;
+    while (line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+        if (cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0) found = true;
+        cJSON_Delete(root);
+        free(plain);
+        if (found) break;
+    }
+    free(line);
+    fclose(file);
+    return found;
+}
+
+static bool command_journal_append(cJSON *root, const char *command_id)
+{
+    if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        return false;
+    }
+    if (command_journal_contains_locked(command_id)) {
+        xSemaphoreGive(s_command_lock);
+        return true;
+    }
+    char *plain = cJSON_PrintUnformatted(root);
+    char *line = encrypt_storage_json(plain);
+    FILE *file = line ? fopen(ADD_COMMAND_INBOX_PATH, "a") : NULL;
+    bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
+              fsync(fileno(file)) == 0;
+    if (file) fclose(file);
+    free(line);
+    free(plain);
+    xSemaphoreGive(s_command_lock);
+    return ok;
+}
+
+static bool command_is_scheduled_locked(const char *command_id)
+{
+    if (strcmp(s_running_command_id, command_id) == 0) return true;
+    for (size_t index = 0; index < s_queued_command_count; index++) {
+        if (strcmp(s_queued_command_ids[index], command_id) == 0) return true;
+    }
+    return false;
+}
+
+static void command_mark_queued_locked(const char *command_id)
+{
+    if (command_is_scheduled_locked(command_id) ||
+        s_queued_command_count >= ADD_COMMAND_QUEUE_DEPTH) {
+        return;
+    }
+    strlcpy(
+        s_queued_command_ids[s_queued_command_count++],
+        command_id,
+        sizeof(s_queued_command_ids[0]));
+}
+
+static void command_unmark_queued_locked(const char *command_id)
+{
+    for (size_t index = 0; index < s_queued_command_count; index++) {
+        if (strcmp(s_queued_command_ids[index], command_id) != 0) continue;
+        if (index + 1 < s_queued_command_count) {
+            memmove(
+                &s_queued_command_ids[index],
+                &s_queued_command_ids[index + 1],
+                (s_queued_command_count - index - 1) * sizeof(s_queued_command_ids[0]));
+        }
+        s_queued_command_count--;
+        memset(s_queued_command_ids[s_queued_command_count], 0, sizeof(s_queued_command_ids[0]));
+        return;
+    }
+}
+
+static bool queue_command_if_idle(const add_command_t *command)
+{
+    if (!command || !s_command_lock ||
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+    if (command_is_scheduled_locked(command->command_id)) {
+        xSemaphoreGive(s_command_lock);
+        return true;
+    }
+    bool queued = xQueueSend(s_commands, command, 0) == pdTRUE;
+    if (queued) command_mark_queued_locked(command->command_id);
+    xSemaphoreGive(s_command_lock);
+    return queued;
+}
+
+static void restore_command_inbox(void)
+{
+    if (s_command_inbox_restored || !s_command_lock ||
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        return;
+    }
+    FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    uint32_t restored = 0;
+    while (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        add_command_t command;
+        if (root && parse_command_object(root, &command) &&
+            xQueueSend(s_commands, &command, 0) == pdTRUE) {
+            command_mark_queued_locked(command.command_id);
+            restored++;
+        }
+        cJSON_Delete(root);
+        free(plain);
+    }
+    if (file) fclose(file);
+    free(line);
+    s_command_inbox_restored = true;
+    xSemaphoreGive(s_command_lock);
+    if (restored > 0) {
+        ESP_LOGW(TAG, "Restored %lu durable ADD command(s) after boot", (unsigned long)restored);
+    }
 }
 
 static void parse_inbound(const char *data, size_t len)
@@ -386,40 +809,63 @@ static void parse_inbound(const char *data, size_t len)
         cJSON_Delete(root);
         return;
     }
-    cJSON *command_id = cJSON_GetObjectItemCaseSensitive(root, "command_id");
-    cJSON *command_type = cJSON_GetObjectItemCaseSensitive(root, "command_type");
-    cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
-    if (!cJSON_IsString(type) || strcmp(type->valuestring, "command") != 0 ||
-        !cJSON_IsString(command_id) || !cJSON_IsString(command_type) || !cJSON_IsObject(payload)) {
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "identity_catalog") == 0) {
+        if (!persist_identity_catalog(root)) {
+            ESP_LOGE(TAG, "Could not persist encrypted ADD identity tombstone catalog");
+        } else {
+            ESP_LOGI(TAG, "Updated encrypted ADD identity tombstone catalog");
+        }
         cJSON_Delete(root);
         return;
     }
-    add_command_t command = {0};
-    strlcpy(command.command_id, command_id->valuestring, sizeof(command.command_id));
-    strlcpy(command.command_type, command_type->valuestring, sizeof(command.command_type));
-    cJSON *value = cJSON_GetObjectItemCaseSensitive(payload, "uid");
-    if (cJSON_IsString(value)) strlcpy(command.uid, value->valuestring, sizeof(command.uid));
-    value = cJSON_GetObjectItemCaseSensitive(payload, "name");
-    if (cJSON_IsString(value)) {
-        strlcpy(command.name, value->valuestring, sizeof(command.name));
-        command.has_name = true;
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "command_cancel") == 0) {
+        cJSON *command_id = cJSON_GetObjectItemCaseSensitive(root, "command_id");
+        if (cJSON_IsString(command_id)) {
+            bool running = false;
+            if (xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                running = strcmp(s_running_command_id, command_id->valuestring) == 0;
+                xSemaphoreGive(s_command_lock);
+            }
+            if (running) {
+                (void)add_connector_command_update(
+                    command_id->valuestring,
+                    "RUNNING",
+                    "COMMAND_ALREADY_RUNNING",
+                    "Cancellation arrived after terminal execution had started.",
+                    "{}");
+            } else if (append_cancelled_command(command_id->valuestring)) {
+                (void)add_connector_command_update(
+                    command_id->valuestring,
+                    "CANCELLED",
+                    "COMMAND_CANCELLED",
+                    "The command was cancelled before terminal execution.",
+                    "{}");
+                (void)add_connector_command_complete(command_id->valuestring);
+            }
+        }
+        cJSON_Delete(root);
+        return;
     }
-    value = cJSON_GetObjectItemCaseSensitive(payload, "lease_id");
-    if (cJSON_IsString(value)) strlcpy(command.lease_id, value->valuestring, sizeof(command.lease_id));
-    value = cJSON_GetObjectItemCaseSensitive(payload, "privilege");
-    if (cJSON_IsNumber(value)) {
-        command.privilege = value->valueint;
-        command.has_privilege = true;
+    add_command_t command;
+    if (!parse_command_object(root, &command)) {
+        cJSON_Delete(root);
+        return;
     }
-    value = cJSON_GetObjectItemCaseSensitive(payload, "duration_seconds");
-    if (cJSON_IsNumber(value)) command.duration_seconds = value->valueint;
-    if (xQueueSend(s_commands, &command, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Command queue full; rejecting %s", command.command_id);
+    if (!command_journal_append(root, command.command_id)) {
+        ESP_LOGE(TAG, "Could not durably journal ADD command %s", command.command_id);
         add_connector_command_update(
             command.command_id,
             "FAILED",
-            "COMMAND_QUEUE_FULL",
-            "Connector is busy; retry this command.",
+            "COMMAND_JOURNAL_FAILED",
+            "Command was not acknowledged because durable storage failed.",
+            "{}");
+    } else if (!queue_command_if_idle(&command)) {
+        ESP_LOGW(TAG, "Command queue full; rejecting %s", command.command_id);
+        add_connector_command_update(
+            command.command_id,
+            "RETRYING",
+            "COMMAND_EXECUTOR_BUSY",
+            "Command is durable and waiting for the serialized executor.",
             "{}");
     } else {
         add_connector_command_update(command.command_id, "ACKNOWLEDGED", NULL, NULL, "{}");
@@ -494,8 +940,8 @@ static void heartbeat_task(void *arg)
             wifi_ap_record_t ap = {0};
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
-            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.0.2");
-            cJSON_AddNumberToObject(payload, "config_version", 2);
+            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.1.0");
+            cJSON_AddNumberToObject(payload, "config_version", 3);
             cJSON_AddNumberToObject(payload, "uptime_seconds", (double)(esp_timer_get_time() / 1000000));
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
@@ -878,7 +1324,7 @@ static char *attendance_outbox_record_line(const char *payload_json, bool *live_
 
 bool add_connector_enqueue_attendance(const char *payload_json)
 {
-    if (!ZONE_LITE_ADD_ENABLED) return true;
+    if (!zone_config_get()->add_enabled) return true;
     bool live = false;
     char *line = attendance_outbox_record_line(payload_json, &live);
     if (!line) return false;
@@ -912,7 +1358,7 @@ bool add_connector_enqueue_attendance(const char *payload_json)
 
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count)
 {
-    if (!ZONE_LITE_ADD_ENABLED || count == 0) return true;
+    if (!zone_config_get()->add_enabled || count == 0) return true;
     if (!payloads || !s_bulk_outbox.lock ||
         xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out waiting to append ADD reconcile batches");
@@ -1039,7 +1485,7 @@ static void outbox_task(void *arg)
 
 void add_connector_init(void)
 {
-    if (!ZONE_LITE_ADD_ENABLED || s_started) {
+    if (!zone_config_get()->add_enabled || s_started) {
         return;
     }
     s_lock = xSemaphoreCreateMutex();
@@ -1047,6 +1493,7 @@ void add_connector_init(void)
     s_live_outbox.lock = xSemaphoreCreateMutex();
     s_bulk_outbox.lock = xSemaphoreCreateMutex();
     s_ack_sem = xSemaphoreCreateBinary();
+    s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -1057,21 +1504,173 @@ void add_connector_init(void)
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned long)esp_random());
     strlcpy(s_zkt.connection_state, "BOOTING", sizeof(s_zkt.connection_state));
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
-                s_ack_sem && s_commands;
+                s_ack_sem && s_command_lock && s_commands;
 }
 
-void add_connector_start(void)
+typedef struct {
+    char body[1536];
+    size_t used;
+} onboarding_response_t;
+
+static esp_err_t onboarding_http_event(esp_http_client_event_t *event)
 {
-    if (!s_started || s_client || ZONE_LITE_ADD_WS_URL[0] == '\0' ||
-        ZONE_LITE_ADD_CONNECTOR_ID[0] == '\0' || ZONE_LITE_ADD_DEVICE_TOKEN[0] == '\0') {
+    onboarding_response_t *response = event ? event->user_data : NULL;
+    if (!response || event->event_id != HTTP_EVENT_ON_DATA || !event->data || event->data_len <= 0) {
+        return ESP_OK;
+    }
+    size_t available = sizeof(response->body) - response->used - 1;
+    size_t copy = (size_t)event->data_len < available ? (size_t)event->data_len : available;
+    if (copy > 0) {
+        memcpy(response->body + response->used, event->data, copy);
+        response->used += copy;
+        response->body[response->used] = '\0';
+    }
+    return ESP_OK;
+}
+
+static void hex_bytes(const unsigned char *value, size_t length, char *output)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t index = 0; index < length; index++) {
+        output[index * 2] = digits[value[index] >> 4];
+        output[index * 2 + 1] = digits[value[index] & 0x0f];
+    }
+    output[length * 2] = '\0';
+}
+
+static bool perform_onboarding(void)
+{
+    const zone_config_t *runtime = zone_config_get();
+    if (!zone_config_needs_onboarding()) return true;
+    time_t now;
+    time(&now);
+    if (now < 1767225600) {
+        ESP_LOGW(TAG, "Trusted time unavailable; delaying ADD onboarding");
+        return false;
+    }
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char mac_text[18];
+    snprintf(
+        mac_text,
+        sizeof(mac_text),
+        "%02x:%02x:%02x:%02x:%02x:%02x",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char timestamp[32];
+    iso_utc(now, timestamp);
+    unsigned char nonce_bytes[16];
+    for (size_t index = 0; index < sizeof(nonce_bytes); index += 4) {
+        uint32_t value = esp_random();
+        memcpy(nonce_bytes + index, &value, 4);
+    }
+    char nonce[33];
+    hex_bytes(nonce_bytes, sizeof(nonce_bytes), nonce);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "hardware_id", mac_text);
+    cJSON_AddStringToObject(root, "zone_id", runtime->zone_id);
+    cJSON_AddStringToObject(root, "zone_name", runtime->zone_name);
+    cJSON_AddStringToObject(root, "device_id", runtime->zone_device_id);
+    cJSON_AddStringToObject(root, "firmware_version", "zone-lite-2.1.0");
+    if (runtime->zkt_expected_serial[0]) {
+        cJSON_AddStringToObject(root, "expected_serial", runtime->zkt_expected_serial);
+    }
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) return false;
+
+    unsigned char body_digest[32];
+    mbedtls_sha256((const unsigned char *)body, strlen(body), body_digest, 0);
+    char body_hash[65];
+    hex_bytes(body_digest, sizeof(body_digest), body_hash);
+    char material[256];
+    snprintf(
+        material,
+        sizeof(material),
+        "POST\n/device/v2/onboard\n%s\n%s\n%s",
+        timestamp,
+        nonce,
+        body_hash);
+    unsigned char signature_bytes[32];
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    int hmac_result = mbedtls_md_hmac(
+        md,
+        (const unsigned char *)runtime->bootstrap_secret,
+        strlen(runtime->bootstrap_secret),
+        (const unsigned char *)material,
+        strlen(material),
+        signature_bytes);
+    if (hmac_result != 0) {
+        free(body);
+        return false;
+    }
+    char signature[65];
+    hex_bytes(signature_bytes, sizeof(signature_bytes), signature);
+
+    onboarding_response_t response = {0};
+    esp_http_client_config_t config = {
+        .url = runtime->add_onboard_url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 15000,
+        .event_handler = onboarding_http_event,
+        .user_data = &response,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(body);
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Zone-MAC", mac_text);
+    esp_http_client_set_header(client, "X-ADD-Timestamp", timestamp);
+    esp_http_client_set_header(client, "X-ADD-Nonce", nonce);
+    esp_http_client_set_header(client, "X-ADD-Body-SHA256", body_hash);
+    esp_http_client_set_header(client, "X-ADD-Signature", signature);
+    esp_http_client_set_post_field(client, body, (int)strlen(body));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(body);
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "ADD onboarding failed transport=%s status=%d", esp_err_to_name(err), status);
+        return false;
+    }
+    cJSON *reply = cJSON_Parse(response.body);
+    cJSON *connector_id = reply ? cJSON_GetObjectItemCaseSensitive(reply, "connector_id") : NULL;
+    cJSON *device_token = reply ? cJSON_GetObjectItemCaseSensitive(reply, "device_token") : NULL;
+    cJSON *ws_url = reply ? cJSON_GetObjectItemCaseSensitive(reply, "ws_url") : NULL;
+    bool valid = cJSON_IsString(connector_id) && cJSON_IsString(device_token) &&
+                 cJSON_IsString(ws_url);
+    if (valid) {
+        err = zone_config_save_connector(
+            connector_id->valuestring,
+            device_token->valuestring,
+            ws_url->valuestring);
+        valid = err == ESP_OK;
+    }
+    cJSON_Delete(reply);
+    if (!valid) {
+        ESP_LOGE(TAG, "ADD onboarding response could not be persisted");
+        return false;
+    }
+    ESP_LOGI(TAG, "ADD automatic onboarding completed for connector %.8s…", zone_config_get()->connector_id);
+    return true;
+}
+
+static void start_websocket(void)
+{
+    const zone_config_t *runtime = zone_config_get();
+    if (!s_started || s_client || runtime->add_ws_url[0] == '\0' ||
+        runtime->connector_id[0] == '\0' || runtime->device_token[0] == '\0') {
         return;
     }
     char headers[512];
-    snprintf(headers, sizeof(headers), "Authorization: Bearer %s\r\nX-ADD-Connector-Id: %s\r\n", ZONE_LITE_ADD_DEVICE_TOKEN, ZONE_LITE_ADD_CONNECTOR_ID);
+    snprintf(headers, sizeof(headers), "Authorization: Bearer %s\r\nX-ADD-Connector-Id: %s\r\n", runtime->device_token, runtime->connector_id);
     esp_websocket_client_config_t config = {
-        .uri = ZONE_LITE_ADD_WS_URL,
+        .uri = runtime->add_ws_url,
         .headers = headers,
-        .subprotocol = "add-device-v1",
+        .subprotocol = "add-device-v2",
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = ZONE_LITE_ADD_RECONNECT_MS,
         .ping_interval_sec = 20,
@@ -1109,6 +1708,36 @@ void add_connector_start(void)
         (unsigned long)s_bulk_outbox.depth);
     xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, NULL);
     xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, NULL);
+}
+
+static void onboarding_task(void *arg)
+{
+    (void)arg;
+    uint32_t delay_ms = 5000;
+    while (zone_config_needs_onboarding()) {
+        if (perform_onboarding()) break;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        if (delay_ms < 300000) delay_ms *= 2;
+        if (delay_ms > 300000) delay_ms = 300000;
+    }
+    start_websocket();
+    s_onboarding_task_started = false;
+    vTaskDelete(NULL);
+}
+
+void add_connector_start(void)
+{
+    if (!s_started || s_client || s_onboarding_task_started) return;
+    restore_command_inbox();
+    if (zone_config_needs_onboarding()) {
+        s_onboarding_task_started = true;
+        if (xTaskCreate(onboarding_task, "add_onboard", 10240, NULL, 4, NULL) != pdPASS) {
+            s_onboarding_task_started = false;
+            ESP_LOGE(TAG, "Could not start ADD onboarding task");
+        }
+        return;
+    }
+    start_websocket();
 }
 
 bool add_connector_is_connected(void)
@@ -1170,7 +1799,102 @@ void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry)
 
 bool add_connector_take_command(add_command_t *out)
 {
-    return s_commands && out && xQueueReceive(s_commands, out, 0) == pdTRUE;
+    if (!s_commands || !out || xQueueReceive(s_commands, out, 0) != pdTRUE) return false;
+    if (s_command_lock && xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        command_unmark_queued_locked(out->command_id);
+        strlcpy(s_running_command_id, out->command_id, sizeof(s_running_command_id));
+        xSemaphoreGive(s_command_lock);
+    }
+    return true;
+}
+
+void add_connector_command_retry(const char *command_id)
+{
+    if (!command_id || !s_command_lock ||
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return;
+    }
+    if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
+    xSemaphoreGive(s_command_lock);
+}
+
+bool add_connector_command_complete(const char *command_id)
+{
+    if (!command_id || !s_command_lock ||
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        return false;
+    }
+    if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
+    command_unmark_queued_locked(command_id);
+    FILE *input = fopen(ADD_COMMAND_INBOX_PATH, "r");
+    if (!input) {
+        xSemaphoreGive(s_command_lock);
+        return true;
+    }
+    FILE *output = fopen(ADD_COMMAND_INBOX_TMP_PATH, "w");
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool ok = output && line;
+    while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, input)) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+        bool remove = cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0;
+        cJSON_Delete(root);
+        free(plain);
+        if (!remove && fputs(line, output) == EOF) ok = false;
+    }
+    if (output && (fflush(output) != 0 || fsync(fileno(output)) != 0)) ok = false;
+    fclose(input);
+    if (output) fclose(output);
+    free(line);
+    if (ok) {
+        (void)remove(ADD_COMMAND_INBOX_PATH);
+        ok = rename(ADD_COMMAND_INBOX_TMP_PATH, ADD_COMMAND_INBOX_PATH) == 0;
+    }
+    if (!ok) (void)remove(ADD_COMMAND_INBOX_TMP_PATH);
+    xSemaphoreGive(s_command_lock);
+    return ok;
+}
+
+bool add_connector_lookup_identity(
+    const char *user_id,
+    char *display_name,
+    size_t display_name_size,
+    char *cnic,
+    size_t cnic_size,
+    bool *shift_worker)
+{
+    if (!user_id || !user_id[0]) return false;
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool found = false;
+    if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+        cJSON *row = NULL;
+        cJSON_ArrayForEach(row, rows) {
+            cJSON *candidate = cJSON_GetObjectItemCaseSensitive(row, "user_id");
+            if (!cJSON_IsString(candidate) || strcmp(candidate->valuestring, user_id) != 0) continue;
+            cJSON *name = cJSON_GetObjectItemCaseSensitive(row, "display_name");
+            cJSON *identity = cJSON_GetObjectItemCaseSensitive(row, "cnic");
+            cJSON *shift = cJSON_GetObjectItemCaseSensitive(row, "shift_worker");
+            if (display_name && display_name_size && cJSON_IsString(name)) {
+                strlcpy(display_name, name->valuestring, display_name_size);
+            }
+            if (cnic && cnic_size && cJSON_IsString(identity)) {
+                strlcpy(cnic, identity->valuestring, cnic_size);
+            }
+            if (shift_worker) *shift_worker = cJSON_IsTrue(shift);
+            found = true;
+            break;
+        }
+        cJSON_Delete(root);
+        free(plain);
+    }
+    if (file) fclose(file);
+    free(line);
+    return found;
 }
 
 bool add_connector_command_update(

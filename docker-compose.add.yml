@@ -3,6 +3,7 @@ name: attendance-device-dashboard
 services:
   postgres:
     image: postgres:16-alpine
+    init: true
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${ADD_POSTGRES_DB:-attendance_devices}
@@ -17,9 +18,11 @@ services:
       retries: 20
     networks: [add-private]
     mem_limit: 1g
+    security_opt: [no-new-privileges:true]
 
   redis:
     image: redis:7-alpine
+    init: true
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     volumes:
@@ -31,19 +34,25 @@ services:
       retries: 20
     networks: [add-private]
     mem_limit: 384m
+    security_opt: [no-new-privileges:true]
 
   add-api:
+    image: state-life/add-api:production
     build:
       context: .
       dockerfile: apps/add_backend/Dockerfile
     restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     env_file: .env.add
     environment:
       ADD_DATABASE_URL: postgresql+psycopg://${ADD_POSTGRES_USER:-add_service}:${ADD_POSTGRES_PASSWORD}@postgres:5432/${ADD_POSTGRES_DB:-attendance_devices}
       ADD_REDIS_URL: redis://redis:6379/0
       ADD_AUTO_CREATE_SCHEMA: "false"
       ADD_ADMIN_COOKIE_SECURE: ${ADD_ADMIN_COOKIE_SECURE:-true}
-    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --forwarded-allow-ips '*' --workers 1"]
+    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1"]
     ports:
       - "0.0.0.0:8096:8096"
     depends_on:
@@ -57,18 +66,26 @@ services:
       start_period: 30s
     networks: [add-private]
     mem_limit: 768m
+    security_opt: [no-new-privileges:true]
 
   add-web:
+    image: state-life/add-web:production
     build:
       context: .
       dockerfile: apps/add_frontend/Dockerfile
     restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=32m,mode=0755
+      - /var/run:size=4m,mode=0755
     ports:
       - "0.0.0.0:8095:80"
     depends_on:
       add-api: { condition: service_healthy }
     networks: [add-private]
     mem_limit: 192m
+    security_opt: [no-new-privileges:true]
 
 networks:
   add-private:

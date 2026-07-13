@@ -1,39 +1,84 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import timedelta, timezone
 
 import pytest
 from cryptography.fernet import Fernet
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from zk_add.crypto import decrypt_cnic, decrypt_json, decrypt_text
 from zk_add.db import Base
-from zk_add.models import AttendanceEvent, DeviceAlert, DeviceConnectionEvent, DeviceUser, OrdsOutbox
+from zk_add.identity import build_machine_name
+from zk_add.models import (
+    AttendanceEvent,
+    AuditEvent,
+    Connector,
+    ConnectorCredential,
+    DeviceAlert,
+    DeviceConnectionEvent,
+    DeviceUser,
+    IdentityTombstone,
+    OnboardingNonce,
+    OrdsOutbox,
+    TemporaryAdminLease,
+)
+from zk_add.onboarding import derive_bootstrap_secret, verify_onboarding_signature
+from zk_add.protocol import body_sha256, sign_request, signature_material
 from zk_add.schemas import (
     AttendanceBatchRequest,
     AttendanceEventIn,
     HeartbeatPayload,
+    UserCreateRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
+    UserUpdateRequest,
+)
+from zk_add.security import (
+    ADMIN_COOKIE,
+    AdminContext,
+    create_admin_session,
+    hash_admin_password,
+    require_step_up,
 )
 from zk_add.service import (
     apply_command_update,
     create_admin_lease,
-    create_connector,
+    create_command,
+    create_device_user_command,
+    delete_device_user_command,
     ingest_attendance,
+    onboard_connector,
+    oracle_payload,
     replace_user_snapshot,
+    serialize_command,
+    update_device_user_command,
     update_heartbeat,
 )
 from zk_add.settings import settings
+from zk_add.time_utils import utc_now
+from zk_add.web import app, get_db
 from zk_add.worker import event_uid_is_valid, ords_delivery_succeeded
+
+
+MAC = "e0:72:a1:d6:f3:28"
+SERIAL = "ADZV211860253"
+CNIC = "3520212345671"
 
 
 @pytest.fixture()
 def db() -> Session:
     settings.pii_fernet_key = Fernet.generate_key().decode()
     settings.pii_lookup_key = "test-lookup-key-with-enough-entropy"
+    settings.fleet_root_secret = "test-fleet-root-secret-with-enough-entropy"
+    settings.admin_username = "StateHealthAdmin"
+    settings.admin_password_hash = hash_admin_password("correct-password")
+    settings.admin_cookie_secure = False
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -42,17 +87,23 @@ def db() -> Session:
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         yield session
+    app.dependency_overrides.clear()
 
 
-def connector_fixture(db: Session):
-    connector, _activation = create_connector(
+def connector_fixture(
+    db: Session,
+    *,
+    hardware_id: str = MAC,
+    expected_serial: str | None = SERIAL,
+) -> Connector:
+    connector, _token, _created = onboard_connector(
         db,
-        hardware_id="e0:72:a1:d6:f3:28",
+        hardware_id=hardware_id,
         zone_id="ZONE-SLICTOWER-3FL",
         zone_name="ZONE-SLICTOWER-3FL",
         device_id="1",
-        display_name="SLICTOWER · 3rd Floor",
-        expected_serial="ADZV211860253",
+        firmware_version="2.1.0",
+        expected_serial=expected_serial,
         actor="test",
         ip_address="127.0.0.1",
     )
@@ -60,7 +111,756 @@ def connector_fixture(db: Session):
     return connector
 
 
-def test_attendance_rejects_corrupt_event_uids():
+def make_writable(connector: Connector) -> None:
+    connector.connected = True
+    connector.lifecycle_state = "ONLINE"
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.serial = SERIAL
+    zkt.online = True
+    zkt.connection_state = "ONLINE"
+    zkt.certification_state = "CERTIFIED"
+    zkt.snapshot_complete = True
+    zkt.user_count = zkt.user_count or 0
+    zkt.attendance_count = zkt.attendance_count or 0
+    zkt.capability_profile = {
+        "observed_user_record_bytes": 72,
+        "read_users": True,
+        "read_attendance": True,
+        "user_write": True,
+        "create_user": True,
+        "delete_user": True,
+        "admin_lease": True,
+        "protocol_restart": True,
+        "name_bytes": 24,
+    }
+
+
+def snapshot_user(
+    db: Session,
+    connector: Connector,
+    *,
+    uid: str = "7",
+    user_id: str = "1007",
+    name: str = f"Ayesha-{CNIC}",
+    privilege: int = 0,
+) -> DeviceUser:
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id=f"snapshot-{uid}-{user_id}",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=uid,
+                    user_id=user_id,
+                    name=name,
+                    privilege=privilege,
+                )
+            ],
+        ),
+    )
+    db.flush()
+    return db.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == connector.zkt_device.id,
+            DeviceUser.uid == uid,
+            DeviceUser.lifecycle_state == "ACTIVE",
+        )
+    )
+
+
+def event(*, event_uid: str, user_id: str = "1007", raw_name: str | None = None):
+    return AttendanceEventIn(
+        event_uid=event_uid,
+        uid="7",
+        user_id=user_id,
+        raw_name=raw_name,
+        device_event_time=utc_now(),
+        captured_at=utc_now(),
+        source="LIVE",
+        punch=0,
+        status=0,
+        clock_quality="OK",
+        raw_event={"raw_name": raw_name, "safe": "retained"},
+    )
+
+
+def test_request_signing_fixed_compatibility_vector():
+    body = b'{"hello":"world"}'
+    digest = "93a23971a914e5eacbf0a8d25154cda309c3c1c72fbb9914d47c60f3cb681588"
+    assert body_sha256(body) == digest
+    assert signature_material(
+        method="post",
+        path="/device/v2/onboard",
+        timestamp="2026-07-13T12:34:56Z",
+        nonce="fixed-nonce-0001",
+        body_hash=digest,
+    ) == "\n".join(
+        ["POST", "/device/v2/onboard", "2026-07-13T12:34:56Z", "fixed-nonce-0001", digest]
+    )
+    assert sign_request(
+        token="fixed-test-token",
+        method="post",
+        path="/device/v2/onboard",
+        timestamp="2026-07-13T12:34:56Z",
+        nonce="fixed-nonce-0001",
+        body_hash=digest,
+    ) == "42ae3518fe8b10ca97ef881e407a16c0610d6d469d21d11dcaf7d168c3b36552"
+
+
+def test_signed_onboarding_is_automatic_replay_safe_and_idempotent(db: Session):
+    body_dict = {
+        "hardware_id": MAC,
+        "zone_id": "ZONE-SLICTOWER-3FL",
+        "zone_name": "ZONE-SLICTOWER-3FL",
+        "device_id": "1",
+        "firmware_version": "2.1.0",
+        "expected_serial": SERIAL,
+    }
+    body = json.dumps(body_dict, separators=(",", ":")).encode()
+    timestamp = utc_now().isoformat().replace("+00:00", "Z")
+    secret = derive_bootstrap_secret(MAC)
+
+    def headers(nonce: str) -> dict[str, str]:
+        digest = body_sha256(body)
+        return {
+            "Content-Type": "application/json",
+            "X-Zone-MAC": MAC,
+            "X-ADD-Timestamp": timestamp,
+            "X-ADD-Nonce": nonce,
+            "X-ADD-Body-SHA256": digest,
+            "X-ADD-Signature": sign_request(
+                token=secret,
+                method="POST",
+                path="/device/v2/onboard",
+                timestamp=timestamp,
+                nonce=nonce,
+                body_hash=digest,
+            ),
+        }
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    first = client.post("/device/v2/onboard", content=body, headers=headers("nonce-one"))
+    assert first.status_code == 200, first.text
+    first_payload = first.json()
+    assert first_payload["created"] is True
+    assert first_payload["schema_version"] == "2"
+    assert first_payload["device_token"]
+
+    replay = client.post("/device/v2/onboard", content=body, headers=headers("nonce-one"))
+    assert replay.status_code == 409
+
+    second = client.post("/device/v2/onboard", content=body, headers=headers("nonce-two"))
+    assert second.status_code == 200, second.text
+    second_payload = second.json()
+    assert second_payload["created"] is False
+    assert second_payload["connector_id"] == first_payload["connector_id"]
+    assert second_payload["device_token"] != first_payload["device_token"]
+    assert db.scalar(select(func.count(Connector.id))) == 1
+    assert db.scalar(select(func.count(OnboardingNonce.id))) == 2
+    credentials = db.scalars(select(ConnectorCredential).order_by(ConnectorCredential.id)).all()
+    assert len(credentials) == 2
+    assert credentials[0].valid_until is not None
+
+
+def test_onboarding_rejects_expired_or_modified_requests(db: Session):
+    body = b"{}"
+    digest = body_sha256(body)
+    stale = (utc_now() - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    signature = sign_request(
+        token=derive_bootstrap_secret(MAC),
+        method="POST",
+        path="/device/v2/onboard",
+        timestamp=stale,
+        nonce="stale-nonce",
+        body_hash=digest,
+    )
+    assert not verify_onboarding_signature(
+        mac=MAC,
+        method="POST",
+        path="/device/v2/onboard",
+        timestamp=stale,
+        nonce="stale-nonce",
+        supplied_body_hash=digest,
+        signature=signature,
+        body=body,
+    )
+    assert not verify_onboarding_signature(
+        mac=MAC,
+        method="POST",
+        path="/device/v2/onboard",
+        timestamp=utc_now().isoformat(),
+        nonce="fresh-nonce",
+        supplied_body_hash=digest,
+        signature=signature,
+        body=b'{"changed":true}',
+    )
+
+
+def test_existing_connector_rebind_preserves_history_and_rotates_token(db: Session):
+    connector = connector_fixture(db)
+    original_id = connector.id
+    db.add(
+        DeviceAlert(
+            connector_id=connector.id,
+            code="HISTORY_MARKER",
+            severity="HIGH",
+            state="OPEN",
+            message="keep me",
+        )
+    )
+    db.commit()
+    rebound, _token, created = onboard_connector(
+        db,
+        hardware_id=MAC,
+        zone_id="ZONE-SLICTOWER-3FL",
+        zone_name="Updated display name",
+        device_id="1",
+        firmware_version="2.1.0",
+        expected_serial=SERIAL,
+        actor="test-rebind",
+        ip_address="127.0.0.1",
+    )
+    db.commit()
+    assert not created
+    assert rebound.id == original_id
+    assert db.scalar(select(DeviceAlert).where(DeviceAlert.code == "HISTORY_MARKER"))
+
+
+def test_duplicate_serial_claim_is_quarantined(db: Session):
+    first = connector_fixture(db)
+    first.zkt_device.serial = SERIAL
+    first.zkt_device.online = True
+    second = connector_fixture(
+        db,
+        hardware_id="e0:72:a1:d6:f3:29",
+        expected_serial=SERIAL,
+    )
+    update_heartbeat(
+        db,
+        connector=second,
+        boot_id="second-boot",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="2.1.0",
+            zkt={
+                "online": True,
+                "connection_state": "ONLINE",
+                "serial": SERIAL,
+                "user_record_size": 72,
+                "stability_since": (utc_now() - timedelta(minutes=3)).isoformat(),
+            },
+        ),
+    )
+    assert second.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    assert second.zkt_device.certification_state == "QUARANTINED"
+    assert first.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    assert first.zkt_device.certification_state == "QUARANTINED"
+    assert first.zkt_device.capability_profile["user_write"] is False
+    assert db.scalar(
+        select(DeviceAlert).where(DeviceAlert.code == "QUARANTINED_DUPLICATE_SERIAL")
+    )
+
+
+def test_28_byte_terminal_auto_certifies_read_only(db: Session):
+    connector = connector_fixture(db)
+    connector.zkt_device.snapshot_complete = True
+    stable = (utc_now() - timedelta(minutes=3)).isoformat()
+    payload = HeartbeatPayload(
+        firmware_version="2.1.0",
+        zkt={
+            "online": True,
+            "connection_state": "ONLINE",
+            "serial": SERIAL,
+            "user_record_size": 28,
+            "stability_since": stable,
+        },
+    )
+    update_heartbeat(db, connector=connector, boot_id="boot", sequence=1, payload=payload)
+    update_heartbeat(db, connector=connector, boot_id="boot", sequence=2, payload=payload)
+    assert connector.zkt_device.certification_state == "READ_ONLY"
+    assert connector.zkt_device.writes_disabled_reason == "LEGACY_28_BYTE_RECORD"
+    assert connector.zkt_device.capability_profile["user_write"] is False
+
+
+def test_partial_snapshot_never_deletes_unseen_users_and_disables_writes(db: Session):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="complete",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name="One"),
+                UserSnapshotRow(uid="2", user_id="1002", name="Two"),
+            ],
+        ),
+    )
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="partial",
+            complete=False,
+            observed_at=utc_now(),
+            users=[UserSnapshotRow(uid="1", user_id="1001", name="One updated")],
+        ),
+    )
+    unseen = db.scalar(select(DeviceUser).where(DeviceUser.uid == "2"))
+    assert unseen.present and unseen.lifecycle_state == "ACTIVE"
+    assert connector.zkt_device.snapshot_complete is False
+    assert connector.zkt_device.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED"
+    assert db.scalar(select(DeviceAlert).where(DeviceAlert.code == "USER_SNAPSHOT_TRUNCATED"))
+
+
+def test_partial_snapshot_rejects_ambiguous_identity_replacement(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector, uid="1", user_id="1001", name="Original")
+    with pytest.raises(ValueError, match="partial user snapshot"):
+        replace_user_snapshot(
+            db,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="ambiguous-partial",
+                complete=False,
+                observed_at=utc_now(),
+                users=[UserSnapshotRow(uid="9", user_id="1001", name="Replacement")],
+            ),
+        )
+    original = db.scalar(select(DeviceUser).where(DeviceUser.uid == "1"))
+    assert original.present and original.lifecycle_state == "ACTIVE"
+
+
+def test_user_create_update_delete_is_idempotent_encrypted_and_immutable(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user, create = create_device_user_command(
+        db,
+        connector=connector,
+        display_name="Ayesha Fatima with a deliberately long full name",
+        cnic=CNIC,
+        shift_worker=True,
+        user_id_override="5001",
+        idempotency_key="create-user-0001",
+        actor="StateHealthAdmin",
+    )
+    same_user, same_create = create_device_user_command(
+        db,
+        connector=connector,
+        display_name="ignored on replay",
+        cnic="6110112345671",
+        shift_worker=False,
+        user_id_override=None,
+        idempotency_key="create-user-0001",
+        actor="StateHealthAdmin",
+    )
+    assert same_user.id == user.id and same_create.id == create.id
+    assert user.cnic_encrypted and CNIC not in user.cnic_encrypted
+    assert CNIC not in create.payload_summary.values()
+    payload = serialize_command(create)["payload"]
+    assert len(payload["name"].encode("utf-8")) <= 24
+    assert payload["name"].endswith(f"-S-{CNIC}")
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=create.command_id,
+        status="SUCCEEDED",
+        result={"verified_uid": user.uid, "verified_user_id": user.user_id},
+        error_code=None,
+        error_message=None,
+    )
+    assert user.present and user.lifecycle_state == "ACTIVE"
+
+    attendance = event(event_uid="a" * 64, user_id=user.user_id)
+    ingest_attendance(db, connector=connector, events=[attendance])
+    attendance_count = db.scalar(select(func.count(AttendanceEvent.id)))
+    update = update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name="Ayesha Fatima",
+        cnic="6110112345671",
+        shift_worker=False,
+        privilege=14,
+        expected_version=user.row_version,
+        idempotency_key="update-user-0001",
+        actor="StateHealthAdmin",
+    )
+    assert update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name="ignored",
+        cnic=None,
+        shift_worker=None,
+        privilege=None,
+        expected_version=user.row_version,
+        idempotency_key="update-user-0001",
+        actor="StateHealthAdmin",
+    ).id == update.id
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=update.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 14},
+        error_code=None,
+        error_message=None,
+    )
+    assert user.display_name == "Ayesha Fatima"
+    assert decrypt_cnic(user.cnic_encrypted) == "6110112345671"
+    assert user.privilege == 14
+    with pytest.raises(ValueError, match="Demote"):
+        delete_device_user_command(
+            db,
+            connector=connector,
+            user=user,
+            expected_version=user.row_version,
+            typed_confirmation=user.display_name,
+            idempotency_key="delete-user-blocked",
+            actor="StateHealthAdmin",
+        )
+
+    demote = update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name=None,
+        cnic=None,
+        shift_worker=None,
+        privilege=0,
+        expected_version=user.row_version,
+        idempotency_key="demote-user-0001",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=demote.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 0},
+        error_code=None,
+        error_message=None,
+    )
+    connector.zkt_device.attendance_count = 42
+    delete = delete_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        expected_version=user.row_version,
+        typed_confirmation=user.display_name,
+        idempotency_key="delete-user-0001",
+        actor="StateHealthAdmin",
+    )
+    expected = decrypt_json(delete.expected_state_encrypted)
+    payload = decrypt_json(delete.payload_encrypted)
+    assert expected["attendance_count"] == 42
+    assert expected["privilege"] == 0
+    assert payload["tombstone"] == {
+        "display_name": user.display_name,
+        "cnic": "6110112345671",
+        "shift_worker": False,
+    }
+    assert "tombstone" not in delete.payload_summary
+    assert db.scalar(select(IdentityTombstone).where(IdentityTombstone.device_user_id == user.id))
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=delete.command_id,
+        status="SUCCEEDED",
+        result={
+            "user_absent": True,
+            "attendance_count_before": 42,
+            "attendance_count_after": 42,
+        },
+        error_code=None,
+        error_message=None,
+    )
+    assert not user.present and user.lifecycle_state == "DELETED"
+    assert db.scalar(select(func.count(AttendanceEvent.id))) == attendance_count
+    audit_rows = db.scalars(
+        select(AuditEvent).where(AuditEvent.target_id == user.user_key)
+    ).all()
+    assert audit_rows
+    assert all(CNIC not in json.dumps(row.before) + json.dumps(row.after) for row in audit_rows)
+
+
+def test_delete_postcondition_failure_keeps_user_active(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    connector.zkt_device.attendance_count = 10
+    command = delete_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        expected_version=user.row_version,
+        typed_confirmation=user.user_id,
+        idempotency_key="delete-failure-0001",
+        actor="StateHealthAdmin",
+    )
+    result = apply_command_update(
+        db,
+        connector=connector,
+        command_id=command.command_id,
+        status="SUCCEEDED",
+        result={
+            "user_absent": True,
+            "attendance_count_before": 10,
+            "attendance_count_after": 9,
+        },
+        error_code=None,
+        error_message=None,
+    )
+    assert result.status == "FAILED"
+    assert result.error_code == "DELETE_POSTCONDITION_FAILED"
+    assert user.present and user.lifecycle_state == "ACTIVE"
+
+
+def test_active_enrollment_lease_blocks_user_mutation(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    db.add(
+        TemporaryAdminLease(
+            lease_id="active-lease",
+            zkt_device_id=connector.zkt_device.id,
+            device_user_id=user.id,
+            state="ACTIVE",
+            original_privilege=0,
+        )
+    )
+    db.flush()
+    with pytest.raises(ValueError, match="lease is active"):
+        update_device_user_command(
+            db,
+            connector=connector,
+            user=user,
+            display_name="Changed",
+            cnic=None,
+            shift_worker=None,
+            privilege=None,
+            expected_version=user.row_version,
+            idempotency_key="blocked-by-lease",
+            actor="StateHealthAdmin",
+        )
+
+
+def test_missing_identity_is_unblocked_but_acked_attendance_is_immutable(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name="Identity Missing")
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="b" * 64, raw_name="Identity Missing")],
+    )
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == "b" * 64))
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    command = update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name=None,
+        cnic=CNIC,
+        shift_worker=None,
+        privilege=None,
+        expected_version=user.row_version,
+        idempotency_key="enrich-identity-0001",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=command.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 0},
+        error_code=None,
+        error_message=None,
+    )
+    assert row.ords_status == "PENDING"
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    assert db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    row.ords_status = "ACKED"
+    original_encrypted = row.cnic_encrypted
+    second = update_device_user_command(
+        db,
+        connector=connector,
+        user=user,
+        display_name=None,
+        cnic="6110112345671",
+        shift_worker=None,
+        privilege=None,
+        expected_version=user.row_version,
+        idempotency_key="enrich-identity-0002",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=second.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 0},
+        error_code=None,
+        error_message=None,
+    )
+    assert row.cnic_encrypted == original_encrypted
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+
+
+def test_deleted_identity_tombstone_attributes_later_punches(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    from zk_add.service import persist_identity_tombstone
+
+    persist_identity_tombstone(db, zkt=connector.zkt_device, user=user)
+    user.present = False
+    user.lifecycle_state = "DELETED"
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="c" * 64, raw_name="")],
+    )
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == "c" * 64))
+    assert row.device_user_id == user.id
+    assert row.display_name == user.display_name
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+
+
+def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="2.1.0",
+        zkt={
+            "online": False,
+            "connection_state": "FLAPPING",
+            "serial": SERIAL,
+            "ip_address": "192.168.110.137",
+            "model": "MB20/ID",
+            "platform": "ZLM60_TFT",
+            "consecutive_failures": 3,
+            "flap_count_15m": 4,
+            "user_record_size": 72,
+            "backoff_until": (utc_now() + timedelta(minutes=2)).isoformat(),
+        },
+    )
+    result = update_heartbeat(
+        db, connector=connector, boot_id="boot-1", sequence=1, payload=payload
+    )
+    assert result["state"] == "FLAPPING"
+    transition = db.scalar(select(DeviceConnectionEvent))
+    assert transition and transition.to_state == "FLAPPING"
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
+    assert alert and alert.severity == "WARNING"
+
+
+def test_admin_lease_result_is_durable(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name=f"Ayesha-S-{CNIC}")
+    lease, command = create_admin_lease(
+        db,
+        connector=connector,
+        user=user,
+        idempotency_key="lease-test-0001",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=command.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 14, "expires_epoch": 1_900_000_000},
+        error_code=None,
+        error_message=None,
+    )
+    assert lease.state == "ACTIVE"
+    expires_at = lease.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    assert int(expires_at.timestamp()) == 1_900_000_000
+
+
+def test_step_up_authentication_rejects_wrong_password(db: Session):
+    _raw, row = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    context = AdminContext(row.id, row.username, row.csrf_token, row.last_step_up_at)
+    require_step_up("correct-password", db, context)
+    with pytest.raises(HTTPException) as exc:
+        require_step_up("wrong-password", db, context)
+    assert exc.value.status_code == 403
+
+
+def test_cnic_validation_machine_projection_and_browser_secrecy():
+    with pytest.raises(ValidationError):
+        UserCreateRequest.model_validate(
+            {
+                "display_name": "User",
+                "cnic": "123",
+                "password": "x",
+                "idempotency_key": "create-0001",
+            }
+        )
+    with pytest.raises(ValidationError):
+        UserUpdateRequest.model_validate(
+            {
+                "expected_version": 1,
+                "password": "x",
+                "idempotency_key": "update-0001",
+            }
+        )
+    projected = build_machine_name(
+        display_name="زارا State Life Employee",
+        cnic=CNIC,
+        shift_worker=True,
+        byte_limit=24,
+    )
+    assert len(projected.encode("utf-8")) <= 24
+    assert projected.endswith(f"-S-{CNIC}")
+
+
+def test_attendance_ingestion_is_idempotent_sanitized_and_ords_is_ephemeral(db: Session):
+    connector = connector_fixture(db)
+    incoming = event(event_uid="e" * 64, raw_name=f"Ayesha-{CNIC}")
+    incoming.raw_event["nested"] = {
+        "cnic": CNIC,
+        "wifi_password": "must-not-persist",
+        "rows": [{"raw_name": f"Ayesha-{CNIC}"}],
+    }
+    accepted, duplicates = ingest_attendance(
+        db, connector=connector, events=[incoming, incoming]
+    )
+    assert accepted == [incoming.event_uid]
+    assert duplicates == [incoming.event_uid]
+    row = db.scalar(select(AttendanceEvent))
+    assert row.raw_event["raw_name"] == "[REDACTED]"
+    assert row.raw_event["nested"] == {
+        "cnic": "[REDACTED]",
+        "wifi_password": "[REDACTED]",
+        "rows": [{"raw_name": "[REDACTED]"}],
+    }
+    outbox = db.scalar(select(OrdsOutbox))
+    assert outbox and not hasattr(outbox, "payload")
+    payload = oracle_payload(connector, connector.zkt_device, row, CNIC)
+    assert payload["cnic"] == CNIC
+    assert payload["capturetype"] == "LIVE"
+
+
+def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent():
     assert event_uid_is_valid("a" * 64)
     assert not event_uid_is_valid("a" * 31 + "?" + "b" * 32)
     with pytest.raises(ValidationError):
@@ -78,314 +878,99 @@ def test_attendance_rejects_corrupt_event_uids():
                 ],
             }
         )
+    assert ords_delivery_succeeded(409, {"message": "resource already exists"})
+    assert ords_delivery_succeeded(201, {"success": True})
+    assert not ords_delivery_succeeded(400, {"success": False})
 
 
-def test_heartbeat_tracks_flapping_and_transition_history(db: Session):
+def test_raw_machine_name_is_encrypted_at_rest(db: Session):
     connector = connector_fixture(db)
-    payload = HeartbeatPayload(
-        firmware_version="zone-lite-2.0.0",
-        zkt={
-            "online": False,
-            "connection_state": "FLAPPING",
-            "serial": "ADZV211860253",
-            "ip_address": "192.168.110.137",
-            "model": "MB20/ID",
-            "platform": "ZLM60_TFT",
-            "consecutive_failures": 3,
-            "flap_count_15m": 4,
-            "user_record_size": 72,
-        },
-    )
-    result = update_heartbeat(
-        db, connector=connector, boot_id="boot-1", sequence=1, payload=payload
-    )
-    db.commit()
-
-    assert result["state"] == "FLAPPING"
-    assert result["zkt"]["capabilities"]["observed_user_record_bytes"] == 72
-    transition = db.scalar(select(DeviceConnectionEvent))
-    assert transition and transition.to_state == "FLAPPING"
-    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
-    assert alert and alert.severity == "WARNING"
+    user = snapshot_user(db, connector, name=f"Ayesha-{CNIC}")
+    assert user.machine_name_encrypted
+    assert CNIC not in user.machine_name_encrypted
+    assert decrypt_text(user.machine_name_encrypted) == f"Ayesha-{CNIC}"
 
 
-def test_heartbeat_resolves_stale_esp_offline_alert(db: Session):
+def test_no_registration_routes_remain():
+    paths = {route.path for route in app.routes}
+    assert "/api/v1/connectors" not in paths
+    assert "/device/v1/activate" not in paths
+    assert "/device/v2/onboard" in paths
+    assert "/api/v2/devices/{connector_id}/users" in paths
+
+
+def test_command_cancellation_is_local_before_dispatch_and_a_handshake_after(db: Session):
     connector = connector_fixture(db)
-    alert = DeviceAlert(
-        connector_id=connector.id,
-        code="ESP_OFFLINE",
-        severity="HIGH",
-        state="OPEN",
-        message="ESP heartbeat is stale.",
-    )
-    db.add(alert)
-    db.commit()
-
-    update_heartbeat(
+    make_writable(connector)
+    queued = create_command(
         db,
         connector=connector,
-        boot_id="boot-recovered",
-        sequence=1,
-        payload=HeartbeatPayload(
-            firmware_version="zone-lite-2.0.2",
-            zkt={"online": True, "connection_state": "RECOVERING"},
-        ),
-    )
-    db.commit()
-
-    assert alert.state == "RESOLVED"
-    assert alert.resolved_at is not None
-
-
-def test_heartbeat_tracks_reconcile_and_restart_schedule(db: Session):
-    connector = connector_fixture(db)
-    payload = HeartbeatPayload(
-        firmware_version="zone-lite-2.0.1",
-        zkt={
-            "online": True,
-            "connection_state": "ONLINE",
-            "backoff_until": "2026-07-10T15:01:00Z",
-            "stability_since": "2026-07-10T15:02:00Z",
-            "last_reconcile_at": "2026-07-10T15:03:00Z",
-            "next_restart_at": "2026-07-10T17:00:00Z",
-        },
-    )
-    update_heartbeat(db, connector=connector, boot_id="boot-1", sequence=1, payload=payload)
-    db.commit()
-
-    zkt = connector.zkt_device
-    assert zkt.backoff_until.replace(tzinfo=timezone.utc) == datetime(
-        2026, 7, 10, 15, 1, tzinfo=timezone.utc
-    )
-    assert zkt.stability_since.replace(tzinfo=timezone.utc) == datetime(
-        2026, 7, 10, 15, 2, tzinfo=timezone.utc
-    )
-    assert zkt.last_reconcile_at.replace(tzinfo=timezone.utc) == datetime(
-        2026, 7, 10, 15, 3, tzinfo=timezone.utc
-    )
-    assert zkt.next_restart_at.replace(tzinfo=timezone.utc) == datetime(
-        2026, 7, 10, 17, 0, tzinfo=timezone.utc
-    )
-
-    # Current-state nulls clear, while an omitted last successful reconcile is
-    # intentionally retained across connector reboots.
-    update_heartbeat(
-        db,
-        connector=connector,
-        boot_id="boot-2",
-        sequence=2,
-        payload=HeartbeatPayload(
-            firmware_version="zone-lite-2.0.1",
-            zkt={
-                "online": True,
-                "connection_state": "RECOVERING",
-                "backoff_until": None,
-                "stability_since": None,
-                "next_restart_at": None,
-            },
-        ),
-    )
-    db.commit()
-
-    assert zkt.backoff_until is None
-    assert zkt.stability_since is None
-    assert zkt.next_restart_at is None
-    assert zkt.last_reconcile_at.replace(tzinfo=timezone.utc) == datetime(
-        2026, 7, 10, 15, 3, tzinfo=timezone.utc
-    )
-
-
-def test_snapshot_admin_lease_and_durable_command_result(db: Session):
-    connector = connector_fixture(db)
-    connector.zkt_device.capability_profile = {
-        "read_users": True,
-        "read_attendance": True,
-        "user_write": True,
-        "admin_lease": True,
-        "protocol_restart": True,
-        "name_bytes": 24,
-    }
-    connector.zkt_device.certification_state = "CERTIFIED"
-    snapshot = UserSnapshotRequest(
-        snapshot_id="snapshot-1",
-        complete=True,
-        observed_at=datetime.now(timezone.utc),
-        users=[
-            UserSnapshotRow(
-                uid="7",
-                user_id="1007",
-                name="Ayesha-S-3520212345671",
-                privilege=0,
-                card=1234,
-            )
-        ],
-    )
-    assert replace_user_snapshot(db, connector=connector, snapshot=snapshot) == 1
-    user = db.scalar(select(DeviceUser))
-    assert user and user.display_name == "Ayesha" and user.shift_worker
-
-    lease, command = create_admin_lease(
-        db,
-        connector=connector,
-        user=user,
-        idempotency_key="lease-test-0001",
+        command_type="REFRESH_USERS",
+        payload={},
+        expected_state={},
+        desired_state={},
+        idempotency_key="cancel-local-0001",
         actor="StateHealthAdmin",
     )
-    apply_command_update(
+    dispatched = create_command(
         db,
         connector=connector,
-        command_id=command.command_id,
-        status="SUCCEEDED",
-        result={"verified_privilege": 14, "expires_epoch": 1_900_000_000},
-        error_code=None,
-        error_message=None,
+        command_type="REFRESH_USERS",
+        payload={},
+        expected_state={},
+        desired_state={},
+        idempotency_key="cancel-handshake-0001",
+        actor="StateHealthAdmin",
     )
-    db.commit()
-    assert lease.state == "ACTIVE"
-    expires_at = lease.expires_at
-    if expires_at.tzinfo is None:  # SQLite drops timezone metadata; PostgreSQL does not.
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    assert int(expires_at.timestamp()) == 1_900_000_000
-
-
-def test_user_snapshot_handles_user_id_swaps_atomically(db: Session):
-    connector = connector_fixture(db)
-    observed_at = datetime.now(timezone.utc)
-    first = UserSnapshotRequest(
-        snapshot_id="snapshot-before-swap",
-        complete=True,
-        observed_at=observed_at,
-        users=[
-            UserSnapshotRow(uid="1", user_id="1001", name="First", card=1),
-            UserSnapshotRow(uid="2", user_id="1002", name="Second", card=2),
-        ],
-    )
-    replace_user_snapshot(db, connector=connector, snapshot=first)
-    db.commit()
-
-    swapped = UserSnapshotRequest(
-        snapshot_id="snapshot-after-swap",
-        complete=True,
-        observed_at=observed_at,
-        users=[
-            UserSnapshotRow(uid="1", user_id="1002", name="First", card=1),
-            UserSnapshotRow(uid="2", user_id="1001", name="Second", card=2),
-        ],
-    )
-    assert replace_user_snapshot(db, connector=connector, snapshot=swapped) == 2
-    db.commit()
-
-    rows = {row.uid: row for row in db.scalars(select(DeviceUser)).all()}
-    assert rows["1"].user_id == "1002"
-    assert rows["2"].user_id == "1001"
-
-
-def test_user_snapshot_handles_reused_user_id(db: Session):
-    connector = connector_fixture(db)
-    observed_at = datetime.now(timezone.utc)
-    replace_user_snapshot(
+    dispatched.status = "DISPATCHED"
+    dispatched.attempt_count = 1
+    raw_session, admin = create_admin_session(
         db,
-        connector=connector,
-        snapshot=UserSnapshotRequest(
-            snapshot_id="snapshot-old-uid",
-            complete=True,
-            observed_at=observed_at,
-            users=[UserSnapshotRow(uid="1", user_id="1001", name="Old User")],
-        ),
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
     )
     db.commit()
 
-    assert replace_user_snapshot(
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    headers = {"X-CSRF-Token": admin.csrf_token}
+
+    local_response = client.post(
+        f"/api/v2/commands/{queued.command_id}/cancel", json={}, headers=headers
+    )
+    assert local_response.status_code == 200
+    assert local_response.json()["status"] == "CANCELLED"
+
+    handshake_response = client.post(
+        f"/api/v2/commands/{dispatched.command_id}/cancel", json={}, headers=headers
+    )
+    assert handshake_response.status_code == 200
+    assert handshake_response.json()["status"] == "CANCEL_REQUESTED"
+    cancel_envelope = serialize_command(dispatched)
+    assert cancel_envelope["type"] == "command_cancel"
+    assert cancel_envelope["command_id"] == dispatched.command_id
+
+
+def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
+    raw_session, _admin = create_admin_session(
         db,
-        connector=connector,
-        snapshot=UserSnapshotRequest(
-            snapshot_id="snapshot-reused-id",
-            complete=True,
-            observed_at=observed_at,
-            users=[UserSnapshotRow(uid="9", user_id="1001", name="New User")],
-        ),
-    ) == 1
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
     db.commit()
 
-    rows = {row.uid: row for row in db.scalars(select(DeviceUser)).all()}
-    assert rows["9"].user_id == "1001" and rows["9"].present
-    assert rows["1"].user_id.startswith("__retired__") and not rows["1"].present
+    def override_db():
+        yield db
 
-
-def test_user_snapshot_rejects_duplicates_before_mutating(db: Session):
-    connector = connector_fixture(db)
-    snapshot = UserSnapshotRequest(
-        snapshot_id="snapshot-duplicate",
-        complete=True,
-        observed_at=datetime.now(timezone.utc),
-        users=[
-            UserSnapshotRow(uid="1", user_id="1001", name="One"),
-            UserSnapshotRow(uid="2", user_id="1001", name="Two"),
-        ],
-    )
-    with pytest.raises(ValueError, match="Duplicate device user ID"):
-        replace_user_snapshot(db, connector=connector, snapshot=snapshot)
-    assert db.scalar(select(DeviceUser)) is None
-
-
-def test_attendance_ingestion_is_idempotent(db: Session):
-    connector = connector_fixture(db)
-    event = AttendanceEventIn(
-        event_uid="e" * 64,
-        uid="7",
-        user_id="1007",
-        raw_name="Ayesha-3520212345671",
-        device_event_time=datetime.now(timezone.utc),
-        captured_at=datetime.now(timezone.utc),
-        source="LIVE",
-        punch=0,
-        status=0,
-        clock_quality="OK",
-    )
-    accepted, duplicates = ingest_attendance(db, connector=connector, events=[event, event])
-    db.commit()
-    assert accepted == [event.event_uid]
-    assert duplicates == [event.event_uid]
-    assert db.scalar(select(AttendanceEvent)).ords_status == "PENDING"
-
-
-def test_reconcile_attendance_is_normalized_for_ords(db: Session):
-    connector = connector_fixture(db)
-    replace_user_snapshot(
-        db,
-        connector=connector,
-        snapshot=UserSnapshotRequest(
-            snapshot_id="snapshot-ords-normalization",
-            complete=True,
-            observed_at=datetime.now(timezone.utc),
-            users=[
-                UserSnapshotRow(
-                    uid="7",
-                    user_id="1007",
-                    name="Ayesha-3520212345671",
-                )
-            ],
-        ),
-    )
-    event = AttendanceEventIn(
-        event_uid="f" * 64,
-        uid="7",
-        user_id="1007",
-        raw_name="Ayesha-3520212345671",
-        device_event_time=datetime.now(timezone.utc),
-        captured_at=datetime.now(timezone.utc),
-        source="RECONCILE_15M",
-        clock_quality="OK",
-    )
-    ingest_attendance(db, connector=connector, events=[event])
-    db.commit()
-
-    payload = db.scalar(select(OrdsOutbox)).payload
-    assert payload["capturetype"] == "DUMP_RECONNECT"
-    assert payload["trust_status"] == "BACKFILL_ACCEPTED_CLOCK_OK"
-
-
-def test_ords_live_conflict_is_an_idempotent_acknowledgement():
-    assert ords_delivery_succeeded(409, {"message": "resource already exists"}) is True
-    assert ords_delivery_succeeded(201, {"success": True}) is True
-    assert ords_delivery_succeeded(400, {"success": False}) is False
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.get("/api/v1/attendance?cnic=not-a-cnic")
+    assert response.status_code == 422
+    assert "13 digits" in response.json()["detail"]

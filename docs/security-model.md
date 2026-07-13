@@ -1,0 +1,89 @@
+# ADD and Zone Lite security model
+
+## Protected assets
+
+- Employee name, CNIC, shift status, attendance linkage, and tombstones.
+- Dashboard administrator session and password verifier.
+- Fleet root, connector bootstrap secrets, rotating device tokens, Wi-Fi/ORDS/ZKT credentials.
+- Commands that alter users, grant privilege, restart a terminal, or delete an identity.
+- Audit integrity and the guarantee that user deletion does not delete attendance.
+
+## Trust boundaries
+
+The browser is untrusted input and receives masked identity data only. ADD is the authorization and
+audit boundary. Zone Lite is the only principal allowed to speak the ZKT protocol. The branch LAN,
+public internet, and terminal are treated as unreliable. PostgreSQL, Redis, the runner environment,
+and fleet-root storage remain server-side and are never exposed to the frontend image.
+
+## Authentication and authorization
+
+- One named administrator signs in with an Argon2id password verifier in the protected environment.
+- Sessions use HttpOnly, Secure, SameSite cookies with idle and absolute expiry. Mutations require a
+  matching CSRF token; login is rate limited.
+- User mutations, restart, delete, and administrator-lease operations require a recent password
+  step-up. The API performs authorization and creates an audit entry before dispatch.
+- ESP onboarding uses a per-MAC HKDF secret. Timestamp skew and nonce uniqueness prevent replay.
+- Connector HTTP/WebSocket traffic uses a rotating token and HMAC request binding. Old/new token
+  overlap is ten minutes, then the old credential expires.
+- A connector can act only for its own ID and certified terminal. Duplicate serial claims quarantine
+  every claimant.
+
+## Encryption and minimization
+
+- Backend PII and command expected/desired/payload state use Fernet encryption at rest.
+- CNIC lookup uses a separate keyed digest; responses expose masked CNIC only.
+- Audit and log payloads use recursive key-based redaction. ORDS payload is generated only at send
+  time and is not retained as plaintext in the outbox.
+- Zone Lite uses ESP-IDF encrypted NVS. XTS material is derived through a per-device HMAC key stored
+  in read/write-protected ESP32-S3 eFuse BLOCK_KEY0.
+- Persistent command inbox, lease deadline, identity tombstones, connector token, and site secrets
+  are encrypted. Temporary provisioning CSV/key/NVS material is created in an OS temporary directory
+  and removed after flash readback verification.
+- PostgreSQL and Redis have no host ports. Public exposure is limited to 8095/8096 behind TLS.
+
+## Command safety
+
+Every mutating command has a UUID, idempotency key, target connector/serial/user, creation and expiry
+time, row version, encrypted precondition, encrypted desired state, and state transitions. The ESP
+persists the command before execution. Duplicate delivery returns the persisted result; it does not
+execute twice.
+
+Fresh terminal reads occur immediately before and after every user write. Partial snapshots,
+uncertified record size, serial change, stale version, unexpected name/privilege, offline/flapping
+state, or ambiguous command replay fail closed. Transient protocol failure produces a durable retry
+rather than tight reconnect. Cancellation is a handshake: queued work can cancel; already running
+work reports that it is running and must finish verification.
+
+Delete has an additional invariant: the attendance count must be identical before and after ZKT
+`CMD_DELETE_USER`. The backend database has no attendance-delete operation in the user command path.
+
+## eFuse ceremony
+
+Burning an eFuse is irreversible and is not authorized by a general request to flash firmware. The
+operator must:
+
+1. read and record the detected Wi-Fi MAC and current `espefuse` summary;
+2. confirm BLOCK_KEY0 is empty/writeable and KEY_PURPOSE_0 is `USER`;
+3. obtain explicit approval naming that exact MAC;
+4. invoke the provisioner with `--confirm-efuse-burn-for <exact-mac>`;
+5. verify KEY_PURPOSE_0 becomes `HMAC_UP` and provisioning readback hashes match.
+
+An existing unreadable HMAC block is never assumed to belong to this fleet. The explicit
+`--trust-existing-derived-hmac` option is allowed only when prior Zone Lite provisioning evidence
+proves that the same protected fleet root derived it.
+
+## Secret handling
+
+Production values live in the runner's protected env file or encrypted Actions secret. CI creates
+random disposable values at runtime. Gitleaks scans the committed worktree; a repository-contract
+guard rejects retired products and unexpected workflow surfaces. Logs, Actions output, release
+metadata, and documentation must never contain plaintext credentials or unmasked CNIC.
+
+Compromise response:
+
+- Administrator password: replace its Argon2id hash and invalidate sessions.
+- Connector token: increment onboarding generation/re-onboard; bounded overlap expires the old one.
+- One ESP bootstrap secret: securely reprovision that MAC.
+- Fleet root: treat as fleet-wide rotation requiring staged reprovisioning; do not silently change it.
+- PII Fernet key: follow an explicit dual-key data migration; changing it directly makes existing
+  encrypted rows unreadable.

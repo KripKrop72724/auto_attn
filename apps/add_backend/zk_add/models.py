@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -14,11 +15,12 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from zk_add.db import Base
-from zk_common.time_utils import utc_now
+from zk_add.time_utils import utc_now
 
 
 def utc_column() -> Mapped[datetime]:
@@ -59,7 +61,8 @@ class Connector(Base):
     current_activity: Mapped[str | None] = mapped_column(String(80))
     last_error_code: Mapped[str | None] = mapped_column(String(120), index=True)
     last_error_message: Mapped[str | None] = mapped_column(Text)
-    activation_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    onboarding_generation: Mapped[int] = mapped_column(Integer, default=0)
+    last_onboarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
@@ -78,7 +81,19 @@ class ConnectorCredential(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     issued_at: Mapped[datetime] = utc_column()
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OnboardingNonce(Base):
+    __tablename__ = "add_onboarding_nonces"
+    __table_args__ = (UniqueConstraint("hardware_id", "nonce", name="uq_add_onboard_nonce"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hardware_id: Mapped[str] = mapped_column(String(120), index=True)
+    nonce: Mapped[str] = mapped_column(String(120))
+    request_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
 
 
 class ConnectorNonce(Base):
@@ -96,7 +111,6 @@ class ZKTDevice(Base):
     __tablename__ = "add_zkt_devices"
     __table_args__ = (
         UniqueConstraint("connector_id", name="uq_add_zkt_connector"),
-        UniqueConstraint("serial", name="uq_add_zkt_serial"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -112,6 +126,10 @@ class ZKTDevice(Base):
     transport: Mapped[str] = mapped_column(String(16), default="TCP")
     capability_profile: Mapped[dict] = mapped_column(JSON, default=dict)
     certification_state: Mapped[str] = mapped_column(String(40), default="READ_ONLY", index=True)
+    certification_fingerprint: Mapped[str | None] = mapped_column(String(255), index=True)
+    certification_observations: Mapped[int] = mapped_column(Integer, default=0)
+    snapshot_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    writes_disabled_reason: Mapped[str | None] = mapped_column(String(160), index=True)
     online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     connection_state: Mapped[str] = mapped_column(String(40), default="UNKNOWN", index=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
@@ -156,15 +174,44 @@ class ConnectorSession(Base):
 class DeviceUser(Base):
     __tablename__ = "add_device_users"
     __table_args__ = (
-        UniqueConstraint("zkt_device_id", "uid", name="uq_add_user_device_uid"),
-        UniqueConstraint("zkt_device_id", "user_id", name="uq_add_user_device_user_id"),
+        Index(
+            "uq_add_user_device_uid_active",
+            "zkt_device_id",
+            "uid",
+            unique=True,
+            postgresql_where=text("lifecycle_state = 'ACTIVE'"),
+            sqlite_where=text("lifecycle_state = 'ACTIVE'"),
+        ),
+        Index(
+            "uq_add_user_device_user_id_active",
+            "zkt_device_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("lifecycle_state = 'ACTIVE'"),
+            sqlite_where=text("lifecycle_state = 'ACTIVE'"),
+        ),
+        Index(
+            "uq_add_user_device_cnic_active",
+            "zkt_device_id",
+            "cnic_lookup_hash",
+            unique=True,
+            postgresql_where=text(
+                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_key: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
     zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
     uid: Mapped[str] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
-    raw_name: Mapped[str] = mapped_column(String(255))
+    machine_name_encrypted: Mapped[str | None] = mapped_column(Text)
     display_name: Mapped[str] = mapped_column(String(255), index=True)
     cnic_encrypted: Mapped[str | None] = mapped_column(Text)
     cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -173,6 +220,14 @@ class DeviceUser(Base):
     privilege: Mapped[int] = mapped_column(Integer, default=0, index=True)
     card: Mapped[int | None] = mapped_column(BigInteger)
     present: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
+    source: Mapped[str] = mapped_column(String(40), default="DEVICE_SNAPSHOT", index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    deleted_by: Mapped[str | None] = mapped_column(String(120))
+    create_audit_id: Mapped[int | None] = mapped_column(ForeignKey("add_audit_events.id"))
+    update_audit_id: Mapped[int | None] = mapped_column(ForeignKey("add_audit_events.id"))
+    delete_audit_id: Mapped[int | None] = mapped_column(ForeignKey("add_audit_events.id"))
+    current_command_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_commands.id"))
     row_version: Mapped[int] = mapped_column(Integer, default=1)
     snapshot_id: Mapped[str | None] = mapped_column(String(100), index=True)
     observed_at: Mapped[datetime] = utc_column()
@@ -187,10 +242,10 @@ class AttendanceEvent(Base):
     event_uid: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
     zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
+    device_user_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_users.id"), index=True)
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     uid: Mapped[str | None] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
-    raw_name: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(255), index=True)
     cnic_encrypted: Mapped[str | None] = mapped_column(Text)
     cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -223,9 +278,10 @@ class DeviceCommand(Base):
     command_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
     command_type: Mapped[str] = mapped_column(String(80), index=True)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    expected_state: Mapped[dict] = mapped_column(JSON, default=dict)
-    desired_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload_encrypted: Mapped[str] = mapped_column(Text)
+    expected_state_encrypted: Mapped[str] = mapped_column(Text)
+    desired_state_encrypted: Mapped[str] = mapped_column(Text)
+    payload_summary: Mapped[dict] = mapped_column(JSON, default=dict)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
     actor: Mapped[str] = mapped_column(String(120))
@@ -376,7 +432,6 @@ class OrdsOutbox(Base):
     attendance_event_id: Mapped[int | None] = mapped_column(ForeignKey("add_attendance_events.id"), unique=True, index=True)
     delivery_type: Mapped[str] = mapped_column(String(30), default="LIVE", index=True)
     status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
     payload_hash: Mapped[str | None] = mapped_column(String(64))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
@@ -386,3 +441,26 @@ class OrdsOutbox(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
+
+
+class IdentityTombstone(Base):
+    __tablename__ = "add_identity_tombstones"
+    __table_args__ = (
+        UniqueConstraint(
+            "zkt_device_id", "user_id", "device_user_id", name="uq_add_identity_tombstone"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
+    device_user_id: Mapped[int] = mapped_column(ForeignKey("add_device_users.id"), index=True)
+    device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
+    uid: Mapped[str] = mapped_column(String(40), index=True)
+    user_id: Mapped[str] = mapped_column(String(100), index=True)
+    display_name_encrypted: Mapped[str] = mapped_column(Text)
+    cnic_encrypted: Mapped[str | None] = mapped_column(Text)
+    cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    cnic_last4: Mapped[str | None] = mapped_column(String(4))
+    shift_worker: Mapped[bool] = mapped_column(Boolean, default=False)
+    privilege: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = utc_column()

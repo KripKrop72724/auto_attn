@@ -24,6 +24,10 @@ class AddSettings(BaseSettings):
 
     pii_fernet_key: str | None = None
     pii_lookup_key: str | None = None
+    fleet_root_secret: str | None = None
+    onboarding_signature_skew_seconds: int = 300
+    onboarding_token_overlap_seconds: int = 10 * 60
+    public_device_ws_url: str = "wss://autoattn.slichealth.com/device/v2/stream"
 
     heartbeat_interval_seconds: int = 15
     offline_after_seconds: int = 45
@@ -39,13 +43,8 @@ class AddSettings(BaseSettings):
     ords_password: str | None = None
     ords_timeout_seconds: int = 20
 
-    bootstrap_connector_id: str | None = None
-    bootstrap_connector_token: str | None = None
-    bootstrap_hardware_id: str | None = None
-    bootstrap_zone_id: str = "ZONE-SLICTOWER-3FL"
-    bootstrap_zone_name: str = "ZONE-SLICTOWER-3FL"
-    bootstrap_device_id: str = "1"
-    bootstrap_expected_serial: str | None = None
+    user_command_retry_seconds: int = 30 * 60
+    command_redispatch_seconds: int = 20
 
     @property
     def sqlite_path(self) -> Path:
@@ -70,6 +69,16 @@ class AddSettings(BaseSettings):
             missing.append("ADD_PII_LOOKUP_KEY")
         if missing:
             raise RuntimeError(f"Missing required ADD secrets: {', '.join(missing)}")
+
+    @property
+    def effective_fleet_root_secret(self) -> str:
+        # Existing production can migrate without a flag day. New deployments
+        # must set ADD_FLEET_ROOT_SECRET explicitly; the lookup key fallback is
+        # retained only to bind the already-flashed connector during rollout.
+        value = self.fleet_root_secret or self.pii_lookup_key
+        if not value:
+            raise RuntimeError("ADD_FLEET_ROOT_SECRET is required for ESP onboarding.")
+        return value
 
 
 settings = AddSettings()

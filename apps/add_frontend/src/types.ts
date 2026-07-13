@@ -1,4 +1,11 @@
-export type DeviceState = 'ONLINE' | 'OFFLINE' | 'DEGRADED' | 'ONBOARDING' | string
+export type DeviceState =
+  | 'ONLINE'
+  | 'OFFLINE'
+  | 'DEGRADED'
+  | 'FLAPPING'
+  | 'ONBOARDING'
+  | 'QUARANTINED_DUPLICATE_SERIAL'
+  | string
 
 export interface ZktDevice {
   id: number
@@ -19,7 +26,10 @@ export interface ZktDevice {
   backoff_until: string | null
   probe_latency_ms: number | null
   certification_state: string
+  certification_observations: number
   capabilities: Record<string, boolean | number | string>
+  snapshot_complete: boolean
+  writes_disabled_reason: string | null
   user_count: number | null
   attendance_count: number | null
   device_time: string | null
@@ -39,6 +49,8 @@ export interface Device {
   state: DeviceState
   connected: boolean
   firmware_version: string | null
+  onboarding_generation: number
+  last_onboarded_at: string | null
   last_seen_at: string | null
   current_activity: string | null
   last_error_code: string | null
@@ -52,24 +64,31 @@ export interface Overview {
   online?: number
   offline?: number
   degraded?: number
+  flapping?: number
   onboarding?: number
+  quarantined_duplicate_serial?: number
   open_alerts: number
   active_leases: number
 }
 
 export interface DeviceUser {
   id: number
+  user_key: string
   uid: string
   user_id: string
-  raw_name: string
   display_name: string
   cnic_masked: string | null
   cnic_available: boolean
+  identity_complete: boolean
   shift_worker: boolean
-  privilege: number
+  privilege: 0 | 14
   present: boolean
+  lifecycle_state: string
   row_version: number
   observed_at: string
+  machine_name_preview: string | null
+  current_command_state: string | null
+  read_only: boolean
 }
 
 export interface AttendanceEvent {
@@ -133,6 +152,11 @@ export interface Command {
   status: string
   created_at: string
   expires_at: string | null
+  dispatched_at?: string | null
+  acknowledged_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  result?: Record<string, unknown>
   error_code?: string | null
   error_message?: string | null
 }
@@ -146,4 +170,9 @@ export interface ConnectionEvent {
   consecutive_successes: number
   flap_count_15m: number
   observed_at: string
+}
+
+export interface UserCommandResponse {
+  user: DeviceUser
+  command: Command
 }

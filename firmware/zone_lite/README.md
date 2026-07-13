@@ -1,103 +1,116 @@
-# Zone Lite ESP32 Firmware
+# Zone Lite ESP32-S3 firmware
 
-Firmware for an ESP32-S3 Zone Lite gateway.
+Zone Lite is the sole ZKT connector for ADD. It maintains live attendance capture, durable ADD/ORDS
+delivery, device time/health telemetry, safe user commands, automatic onboarding, temporary admin
+revocation, intermittent-terminal recovery, and three daily maintenance restarts.
 
-Current milestone:
+## Production behavior
 
-- Connects to Wi-Fi.
-- Scans the DHCP subnet for the first host accepting ZKT TCP port `4370`.
-- Confirms the host by running ZKT `CMD_CONNECT` and Comm Key auth.
-- Reads basic identity/time/count information from the selected device.
-- Repeats discovery so DHCP IP changes are handled without reflashing.
-- Optionally recovers a stuck ZKT device through OS telnet reboot.
-- Uses a two-minute stability gate, bounded anti-flap backoff, and a 15-minute
-  light reconcile so intermittently offline legacy terminals are not hammered.
-- Optionally performs authenticated preventive ZKT protocol restarts at 02:00,
-  12:00, and 22:00 Pakistan time, with a bounded recovery fallback.
-- Keeps live punches in a priority durable ADD outbox while historical truth is
-  appended and acknowledged independently.
-- Shows production status on the ESP32-S3 onboard RGB LED.
-- Can POST a full current-month ZKT truth snapshot to ORDS reconcile so Oracle
-  raw rows converge back to the ZKT machine.
+- Opens one serialized ZKT session and always unregisters/exits/closes it on teardown.
+- Restores live attendance before reconcile after an outage.
+- Runs a light count reconcile every 15 minutes and a bounded truth read only when needed.
+- Treats repeated availability transitions as flapping, waits with bounded jitter, and never scans a
+  subnet more than once per 15 minutes.
+- Persists the last reconciled attendance count and six-hour truth timestamp in encrypted NVS, so an
+  intermittent reconnect performs a light count check instead of repeatedly dumping full history.
+- Keeps ADD and ORDS flash outboxes independent; an outage at one destination does not block the
+  other or the live ZKT socket.
+- Persists commands before execution and verifies fresh terminal pre/postconditions.
+- Supports 72-byte certified user records; 28-byte/partial/unknown profiles remain read-only.
+- Persists ten-minute administrator deadlines and revokes locally without ADD connectivity.
+- Restarts the ZKT at 02:00, 12:00, and 22:00 Pakistan time, once per persisted slot, unless a lease
+  is active. Protocol restart is preferred; configured telnet is a cooldown-protected fallback.
 
-Create local secrets before building:
+## Secure configuration
 
-```bash
-cp main/zone_lite_config.example.h main/zone_lite_config.h
-```
+Production configuration is stored in encrypted NVS, not a compiled header. The provisioner:
 
-`main/zone_lite_config.h` is ignored by git.
+1. reads the ESP Wi-Fi MAC;
+2. derives a per-MAC onboarding secret from `ADD_FLEET_ROOT_SECRET` using HKDF;
+3. derives a separate HMAC key domain for ESP-IDF encrypted NVS;
+4. protects that HMAC key in read/write-protected eFuse BLOCK_KEY0;
+5. generates an encrypted 24 KiB NVS partition in an OS temporary directory;
+6. flashes firmware and NVS in one transaction; and
+7. reads NVS back and verifies its SHA-256 before deleting temporary material.
 
-ZKT recovery:
+The build never checks for or includes a local `zone_lite_config.h`. A non-provisioned image has
+blank network and credential defaults and cannot join Wi-Fi, reach ORDS, or onboard with ADD.
 
-Some ZKT devices can enter a state where TCP `4370` accepts connections but the
-ZKT application service no longer responds to protocol commands. For that stuck
-state, recovery must be done through the device OS telnet service.
-
-Enable `ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED` only after confirming the device
-telnet account. The firmware logs into telnet, confirms a shell with `id`, sends
-`sync`, sends `ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND`, waits
-`ZONE_LITE_ZKT_REBOOT_WAIT_MS`, and then resumes normal discovery and capture.
-The recovery path is cooldown protected to avoid reboot loops.
-
-Scheduled preventive restarts:
-
-Enable `ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED` only after the same telnet account is
-confirmed if recovery fallback is enabled. By default, restart windows begin at
-02:00, 12:00, and 22:00 Pakistan time
-(`ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES=300`). An authenticated ZKT
-protocol restart is always attempted first. Telnet is used only as a bounded
-fallback when no live protocol session can complete the restart and recovery is
-explicitly enabled. Each completed slot is persisted in NVS, active temporary
-admin leases block restarts, and failed attempts are retried no faster than
-`ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS` within the configured window.
-
-LED status:
-
-The ESP32-S3 DevKitC-1 onboard RGB LED defaults to GPIO `48`. The LED is
-operator-facing and always shows the highest-priority current state or latched
-fault.
-
-- White pulse: booting or initializing local storage.
-- Blue blink: Wi-Fi connecting or reconnecting.
-- Cyan pulse/solid: discovering ZKT, then ZKT authenticated.
-- Purple pulse: startup dump, reconcile, or ORDS drain in progress.
-- Green solid: healthy live capture registered.
-- Green flash: live punch captured and queued.
-- Amber heartbeat: durable outbox backlog remains.
-- Orange blink: ORDS/Oracle send failure.
-- Yellow blink: ZKT protocol/auth failure before recovery.
-- Amber/yellow warning blink: Oracle raw rows were repaired from ZKT truth.
-- Red fast blink: controlled ZKT restart in progress for recovery or scheduled
-  maintenance.
-- Red solid: fatal local failure.
-- Magenta blink: identity row blocked locally.
-
-Recoverable fault indications latch for two minutes by default, after which the
-LED returns to the highest-priority current state. Fatal local failures remain
-latched.
-
-Build:
+Copy `tools/provisioning.example.json` to a path outside the repository and fill it there. Never add
+the resulting file to git. Export the same protected fleet root used by ADD, activate ESP-IDF 5.5.3,
+then run:
 
 ```bash
-. ~/esp/esp-idf/export.sh
-idf.py -DIDF_TARGET=esp32s3 -DPROJECT_VER=2.0.2 build
+. /path/to/esp-idf/export.sh
+export ADD_FLEET_ROOT_SECRET='read-from-protected-secret-store'
+python tools/provision_zone_lite.py \
+  --port /dev/cu.usbmodemXXXX \
+  --config /protected/path/zone.json \
+  --idf-path "$IDF_PATH"
 ```
 
-Flash:
+On an empty key block the command intentionally stops and prints the detected MAC. Burning the HMAC
+eFuse is irreversible and requires separate explicit authorization for that exact MAC:
 
 ```bash
-idf.py -p /dev/cu.usbmodem1234561 flash
+python tools/provision_zone_lite.py \
+  --port /dev/cu.usbmodemXXXX \
+  --config /protected/path/zone.json \
+  --idf-path "$IDF_PATH" \
+  --confirm-efuse-burn-for 00:00:00:00:00:00
 ```
 
-If flashing reports `No serial data received`, put the ESP32-S3 in ROM
-download mode manually:
+Replace the example MAC only with the value read from that physical ESP after approval. For a device
+previously provisioned by this fleet, `--trust-existing-derived-hmac` is permitted only when the
+fleet record proves the eFuse was derived from the same root. Unknown/non-HMAC key blocks fail closed.
 
-1. Hold `BOOT`.
-2. Tap/release `RESET` or `EN`.
-3. Keep holding `BOOT` for about two seconds.
-4. Release `BOOT`.
-5. Run the flash command again.
+`--skip-firmware-flash` updates only encrypted NVS while still performing readback verification. It
+does not skip eFuse safety checks.
 
-Some DevKitC-1 boards also work by holding `BOOT` during the flash command and
-releasing it once esptool connects.
+## Build-only validation
+
+An unprovisioned CI image builds from placeholder defaults and cannot onboard:
+
+```bash
+. /path/to/esp-idf/export.sh
+rm -rf build
+idf.py -B build -D SDKCONFIG=/tmp/zone-lite-sdkconfig build
+```
+
+The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partition table, full CA
+bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
+site secrets are never Actions artifacts.
+
+## Recovery safeguards
+
+Some older ZKT devices accept TCP `4370` while their application service is stuck. Recovery is
+allowed only after configured protocol failures and a 30-minute cooldown. The telnet path confirms
+the expected banner/login, executes the configured restart, waits 90 seconds, and resumes normal
+stability gating. It is not used for ordinary intermittent availability.
+
+Preferred IP `0.0.0.0` enables bounded DHCP-subnet discovery. Once authenticated, the last good IP
+is used directly. Serial pinning prevents attaching to a different ZKT that happens to answer first.
+
+## LED states
+
+The onboard RGB LED defaults to GPIO 48. Recoverable faults latch for two minutes; fatal local
+storage/security errors remain latched.
+
+- white pulse — boot/storage initialization;
+- blue blink — Wi-Fi connection;
+- cyan pulse/solid — discovery/ZKT authenticated;
+- purple pulse — startup snapshot, reconcile, or outbox drain;
+- green solid/flash — live registration/punch accepted;
+- amber heartbeat — durable backlog;
+- orange blink — ORDS delivery failure;
+- yellow blink — ZKT protocol/auth failure or bounded retry;
+- red fast blink — controlled terminal restart;
+- red solid — fatal local failure;
+- magenta blink — blocked/ambiguous identity row.
+
+## Hardware release gate
+
+Do not call a flash production-ready from a successful build alone. Complete
+[`docs/hardware-acceptance.md`](../../docs/hardware-acceptance.md), including duplicate-serial
+quarantine, user create/edit/delete with unchanged attendance count, offline lease expiry,
+flapping/quiet-period proof, queued attendance replay, restart idempotency, and a 24-hour soak.

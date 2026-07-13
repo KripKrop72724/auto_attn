@@ -1,22 +1,23 @@
 #pragma once
 
-// Copy this file to zone_lite_config.h for local flashing.
-// zone_lite_config.h is intentionally ignored by git because it contains secrets.
+// Non-secret compile-time behavior defaults for the generic production image.
+// Per-device identity, network, ZKT, ORDS, recovery credentials, and ADD
+// onboarding material must come only from the encrypted NVS provisioner.
 
-#define ZONE_LITE_WIFI_SSID "your-wifi-name"
-#define ZONE_LITE_WIFI_PASSWORD "your-wifi-password"
+#define ZONE_LITE_WIFI_SSID ""
+#define ZONE_LITE_WIFI_PASSWORD ""
 
 #define ZONE_LITE_ZKT_PORT 4370
 #define ZONE_LITE_ZKT_COMM_KEY 0
 #define ZONE_LITE_ZKT_PREFERRED_IP "0.0.0.0"
 #define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
-#define ZONE_LITE_ZONE_DEVICE_ID "1"
-#define ZONE_LITE_ZONE_ID "SLIC-TOWER-11-FLOOR"
-#define ZONE_LITE_ZONE_NAME "SLIC-TOWER-11-FLOOR"
+#define ZONE_LITE_ZONE_DEVICE_ID ""
+#define ZONE_LITE_ZONE_ID ""
+#define ZONE_LITE_ZONE_NAME ""
 
-#define ZONE_LITE_ORDS_BASE_URL "https://example.invalid/ords/slic_hrm/raw_attn_capture_event"
-#define ZONE_LITE_ORDS_USERNAME "slic_zone_agent"
-#define ZONE_LITE_ORDS_PASSWORD "replace-me"
+#define ZONE_LITE_ORDS_BASE_URL ""
+#define ZONE_LITE_ORDS_USERNAME ""
+#define ZONE_LITE_ORDS_PASSWORD ""
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #define ZONE_LITE_ORDS_TIMEOUT_MS 15000
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
@@ -29,11 +30,14 @@
 // When NULL, firmware uses the ESP-IDF built-in certificate bundle.
 #define ZONE_LITE_ORDS_CA_CERT_PEM NULL
 
-// ADD uses an outbound-only TLS WebSocket. Provision each connector with its own token.
+// ADD uses an outbound-only TLS WebSocket. Encrypted NVS carries the per-MAC
+// bootstrap secret and receives a rotated connector token during onboarding.
 #define ZONE_LITE_ADD_ENABLED 0
-#define ZONE_LITE_ADD_WS_URL "wss://autoattn.example.com/device/v1/stream?connector_id=replace-me"
-#define ZONE_LITE_ADD_CONNECTOR_ID "replace-me"
-#define ZONE_LITE_ADD_DEVICE_TOKEN "replace-me"
+#define ZONE_LITE_ADD_ONBOARD_URL "https://autoattn.slichealth.com/device/v2/onboard"
+#define ZONE_LITE_ADD_WS_URL ""
+#define ZONE_LITE_ADD_CONNECTOR_ID ""
+#define ZONE_LITE_ADD_DEVICE_TOKEN ""
+#define ZONE_LITE_ADD_BOOTSTRAP_SECRET ""
 #define ZONE_LITE_ADD_HEARTBEAT_SECONDS 15
 #define ZONE_LITE_ADD_RECONNECT_MS 30000
 
@@ -58,7 +62,7 @@
 // Preventive maintenance restarts. When enabled, the ESP32 attempts an
 // authenticated protocol restart in each configured local-time window, with a
 // bounded recovery-channel fallback only when explicitly configured.
-#define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 0
+#define ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED 1
 #define ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES 300
 #define ZONE_LITE_DAILY_ZKT_REBOOT_WINDOW_MINUTES 30
 #define ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS (5 * 60 * 1000)
@@ -81,7 +85,7 @@
 #define ZONE_LITE_ZKT_RECOVERY_COOLDOWN_MS (30 * 60 * 1000)
 #define ZONE_LITE_ZKT_REBOOT_WAIT_MS 90000
 #define ZONE_LITE_ZKT_TELNET_PORT 23
-#define ZONE_LITE_ZKT_TELNET_USERNAME "root"
-#define ZONE_LITE_ZKT_TELNET_PASSWORD "replace-me"
+#define ZONE_LITE_ZKT_TELNET_USERNAME ""
+#define ZONE_LITE_ZKT_TELNET_PASSWORD ""
 #define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER "Linux"
 #define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND "reboot"

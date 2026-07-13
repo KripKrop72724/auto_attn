@@ -29,15 +29,24 @@ def parse_machine_name(value: str | None) -> ParsedIdentity:
 
 
 def build_machine_name(
-    *, display_name: str, current_raw_name: str, byte_limit: int
+    *,
+    display_name: str,
+    cnic: str | None = None,
+    shift_worker: bool = False,
+    byte_limit: int = 24,
+    current_raw_name: str | None = None,
 ) -> str:
     parsed = parse_machine_name(current_raw_name)
+    supplied_cnic = cnic
+    cnic = supplied_cnic or parsed.cnic
+    if supplied_cnic is None and parsed.cnic:
+        shift_worker = parsed.shift_worker
     cleaned = " ".join(display_name.strip().split())
     if not cleaned:
         raise ValueError("Display name is required.")
     suffix = ""
-    if parsed.cnic:
-        suffix = f"-S-{parsed.cnic}" if parsed.shift_worker else f"-{parsed.cnic}"
+    if cnic:
+        suffix = f"-S-{cnic}" if shift_worker else f"-{cnic}"
     available = byte_limit - len(suffix.encode("utf-8"))
     if available < 1:
         raise ValueError("This model cannot preserve the existing CNIC in its name field.")
@@ -54,4 +63,3 @@ def build_machine_name(
     if len(result.encode("utf-8")) > byte_limit:
         raise ValueError("Device name exceeds the model byte limit.")
     return result
-

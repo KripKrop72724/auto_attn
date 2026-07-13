@@ -11,11 +11,7 @@
 #include "freertos/task.h"
 #include "led_strip.h"
 
-#if __has_include("zone_lite_config.h")
-#include "zone_lite_config.h"
-#else
 #include "zone_lite_config.example.h"
-#endif
 
 #ifndef ZONE_LITE_LED_ENABLED
 #define ZONE_LITE_LED_ENABLED 1

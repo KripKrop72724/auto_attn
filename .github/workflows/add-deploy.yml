@@ -6,6 +6,11 @@ on:
     branches: [main]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      deploy_sha:
+        description: Exact tested commit SHA to deploy (defaults to the current main SHA)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -23,17 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Mark production deployment pending
+      - name: Mark the exact production commit pending
         env:
           GH_TOKEN: ${{ github.token }}
-          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DEPLOY_SHA: ${{ inputs.deploy_sha || github.event.workflow_run.head_sha || github.sha }}
           TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           payload="$(jq -nc \
             --arg state pending \
             --arg context 'ADD production deployment' \
-            --arg description 'Waiting for the self-hosted production runner' \
+            --arg description 'Waiting for the production Windows runner' \
             --arg target_url "$TARGET_URL" \
             '{state: $state, context: $context, description: $description, target_url: $target_url}')"
           curl --fail --silent --show-error \
@@ -49,87 +54,109 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     needs: announce
-    # WIN-80SOHNEH66P is the repository's production server runner.
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         shell: powershell
+    env:
+      DEPLOY_SHA: ${{ inputs.deploy_sha || github.event.workflow_run.head_sha || github.sha }}
+      ADD_DEPLOY_FLEET_ROOT_SECRET: ${{ secrets.ADD_FLEET_ROOT_SECRET }}
+      ADD_DEPLOY_ADMIN_PASSWORD_HASH: ${{ secrets.ADD_ADMIN_PASSWORD_HASH }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ inputs.deploy_sha || github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Load deployment secrets
+      - name: Verify checkout is the tested commit
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($actual -ne $env:DEPLOY_SHA) {
+            throw "Checkout mismatch: expected $env:DEPLOY_SHA, got $actual"
+          }
+
+      - name: Load deployment secrets without logging values
         env:
           CONFIGURED_ENV_FILE: ${{ vars.ADD_ENV_FILE }}
           CONFIGURED_ENV_CONTENT: ${{ secrets.ADD_ENV_FILE_CONTENT }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:CONFIGURED_ENV_FILE) {
-            $sourceFile = $env:CONFIGURED_ENV_FILE
-          } elseif (Test-Path -LiteralPath (Join-Path $HOME '.config\auto-attn\add.env') -PathType Leaf) {
-            $sourceFile = Join-Path $HOME '.config\auto-attn\add.env'
-          } else {
-            $sourceFile = $null
+          $programDataFile = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\config\add.env'
+          $homeFile = Join-Path $HOME '.config\auto-attn\add.env'
+          $sourceFile = $null
+          foreach ($candidate in @($env:CONFIGURED_ENV_FILE, $programDataFile, $homeFile)) {
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              $sourceFile = $candidate
+              break
+            }
           }
           if ($sourceFile) {
-            if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
-              throw "Protected ADD environment file is missing: $sourceFile"
-            }
             Copy-Item -LiteralPath $sourceFile -Destination '.env.add' -Force
           } elseif ($env:CONFIGURED_ENV_CONTENT) {
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            [System.IO.File]::WriteAllText((Join-Path $PWD '.env.add'), $env:CONFIGURED_ENV_CONTENT, $utf8NoBom)
+            $utf8NoBom = New-Object Security.UTF8Encoding($false)
+            [IO.File]::WriteAllText((Join-Path $PWD '.env.add'), $env:CONFIGURED_ENV_CONTENT, $utf8NoBom)
           } else {
-            throw 'Neither ADD_ENV_FILE nor ADD_ENV_FILE_CONTENT is configured.'
+            throw 'Configure ADD_ENV_FILE, the protected ProgramData file, or ADD_ENV_FILE_CONTENT.'
           }
 
-      - name: Deploy ports 8095 and 8096
-        run: .\deploy\add\deploy.ps1
+      - name: Transactionally deploy ports 8095 and 8096
+        run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
 
-      - name: Verify ADD services
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & curl.exe --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8096/health/ready
-          if ($LASTEXITCODE -ne 0) { throw 'ADD backend readiness check failed' }
-          & curl.exe --fail --silent --show-error --retry 12 --retry-delay 5 http://127.0.0.1:8095/health/live
-          if ($LASTEXITCODE -ne 0) { throw 'ADD frontend liveness check failed' }
-
-      - name: Show diagnostics on failure
+      - name: Show bounded diagnostics on failure
         if: failure()
         run: |
           if (Test-Path -LiteralPath '.env.add') {
+            docker compose --env-file .env.add -f docker-compose.add.yml ps
             docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250
-          } else {
-            Write-Host 'No workspace environment file was created; deployment stopped before Compose.'
           }
 
       - name: Remove workspace secret copy
         if: always()
         run: Remove-Item -LiteralPath '.env.add' -Force -ErrorAction SilentlyContinue
 
+  verify-public:
+    if: needs.deploy.result == 'success'
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify public TLS, UI, API, and proxy routing
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
+            https://autoattn.slichealth.com/health/live
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
+            https://autoattn.slichealth.com/health/ready
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
+            https://attendancedevices.slichealth.com/health/ui
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
+            https://attendancedevices.slichealth.com/ | grep -q 'Attendance Device Dashboard'
+
   report:
     if: always() && needs.announce.result == 'success'
-    needs: [announce, deploy]
+    needs: [announce, deploy, verify-public]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Publish production deployment result
         env:
           GH_TOKEN: ${{ github.token }}
-          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DEPLOY_SHA: ${{ inputs.deploy_sha || github.event.workflow_run.head_sha || github.sha }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          VERIFY_RESULT: ${{ needs.verify-public.result }}
           TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ "$DEPLOY_RESULT" = success ]; then
+          if [ "$DEPLOY_RESULT" = success ] && [ "$VERIFY_RESULT" = success ]; then
             state=success
-            description='Production services are healthy on ports 8095 and 8096'
+            description='ADD is healthy locally and on both public domains'
           else
             state=failure
-            description="Production deployment failed: $DEPLOY_RESULT"
+            description="Deployment=$DEPLOY_RESULT public-verification=$VERIFY_RESULT"
           fi
           payload="$(jq -nc \
             --arg state "$state" \

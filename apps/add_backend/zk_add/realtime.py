@@ -9,7 +9,7 @@ from typing import AsyncIterator
 
 from fastapi import WebSocket
 
-from zk_common.time_utils import utc_now
+from zk_add.time_utils import utc_now
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,9 @@ class ConnectorHub:
         self._lock = asyncio.Lock()
 
     async def connect(self, connector_id: str, websocket: WebSocket) -> None:
-        await websocket.accept(subprotocol="add-device-v1")
+        offered = websocket.headers.get("sec-websocket-protocol", "")
+        protocol = "add-device-v2" if "add-device-v2" in offered else "add-device-v1"
+        await websocket.accept(subprotocol=protocol)
         async with self._lock:
             previous = self._connections.get(connector_id)
             self._connections[connector_id] = websocket
@@ -110,4 +112,3 @@ def sse_encode(event: LiveEvent) -> str:
         return ": keepalive\n\n"
     data = json.dumps(event.data, separators=(",", ":"), default=str)
     return f"id: {event.event_id}\nevent: {event.event_type}\ndata: {data}\n\n"
-

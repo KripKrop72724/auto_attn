@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from zk_add.models import AuditEvent
-from zk_common.time_utils import utc_now
+from zk_add.time_utils import utc_now
 
 
 def append_audit(
@@ -60,4 +60,3 @@ def append_audit(
     )
     session.add(row)
     return row
-

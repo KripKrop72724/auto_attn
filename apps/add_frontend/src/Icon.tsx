@@ -1,6 +1,6 @@
 import type { ReactElement, SVGProps } from 'react'
 
-type Name = 'grid' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check'
+type Name = 'grid' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check' | 'trash' | 'userPlus' | 'menu' | 'info' | 'pause'
 
 const paths: Record<Name, ReactElement> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
@@ -21,6 +21,11 @@ const paths: Record<Name, ReactElement> = {
   plus: <path d="M12 5v14M5 12h14"/>,
   edit: <><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4z"/></>,
   check: <path d="m5 12 4 4L19 6"/>,
+  trash: <><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6"/><path d="M10 11v5M14 11v5"/></>,
+  userPlus: <><path d="M15 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8" cy="7" r="4"/><path d="M19 8v6M16 11h6"/></>,
+  menu: <path d="M4 7h16M4 12h16M4 17h16"/>,
+  info: <><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></>,
+  pause: <path d="M9 5v14M15 5v14"/>,
 }
 
 export function Icon({ name, ...props }: SVGProps<SVGSVGElement> & { name: Name }) {

@@ -3,22 +3,7 @@ name: ADD CI
 on:
   push:
     branches: [main]
-    paths:
-      - "apps/add_backend/**"
-      - "apps/add_frontend/**"
-      - "firmware/zone_lite/**"
-      - "docker-compose.add.yml"
-      - "pyproject.toml"
-      - "tests/unit/test_add_backend.py"
-      - ".github/workflows/add-*.yml"
   pull_request:
-    paths:
-      - "apps/add_backend/**"
-      - "apps/add_frontend/**"
-      - "firmware/zone_lite/**"
-      - "docker-compose.add.yml"
-      - "pyproject.toml"
-      - "tests/unit/test_add_backend.py"
   workflow_dispatch:
 
 permissions:
@@ -29,55 +14,192 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  backend:
+  repository-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Enforce ADD and Zone Lite consolidation
+        run: python3 scripts/check_repository_contract.py
+      - name: Parse the transactional Windows deployment script
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'deploy/add/deploy.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
+            throw "deploy.ps1 contains parser errors:$([Environment]::NewLine)$messages"
+          }
+      - name: Scan the committed worktree for secrets
+        run: >-
+          docker run --rm
+          -v "$PWD:/repo:ro"
+          zricethezav/gitleaks:v8.24.3
+          dir /repo --no-banner --redact --exit-code 1
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: attendance_devices
+          POSTGRES_USER: add_service
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U add_service -d attendance_devices"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ADD_DATABASE_URL: postgresql+psycopg://add_service@127.0.0.1:5432/attendance_devices
+      ADD_REDIS_URL: redis://127.0.0.1:6379/0
+      ADD_ADMIN_COOKIE_SECURE: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
-      - run: python -m ruff check apps/add_backend tests/unit/test_add_backend.py
-      - run: python -m pytest -q tests/unit/test_add_backend.py
-        env:
-          ADD_PII_FERNET_KEY: 8Fc5uXV7nq_f54kj7ny7QpOqOM9S7AdHfWvk9v7VgjQ=
-          ADD_PII_LOOKUP_KEY: ci-only-lookup-key
+      - name: Install backend and quality tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" build
+      - name: Generate isolated test keys
+        run: |
+          python scripts/generate_ci_env.py /tmp/add-ci.env --github-env "$GITHUB_ENV"
+          rm -f /tmp/add-ci.env
+      - name: Lint
+        run: python -m ruff check apps/add_backend tests scripts firmware/zone_lite/tools/provision_zone_lite.py
+      - name: Test backend and firmware contracts
+        run: python -m pytest -q tests/unit tests/firmware
+      - name: Validate a fresh PostgreSQL migration and schema drift
+        run: |
+          alembic -c apps/add_backend/alembic.ini upgrade head
+          alembic -c apps/add_backend/alembic.ini current
+          alembic -c apps/add_backend/alembic.ini check
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, inspect
+
+          engine = create_engine(os.environ["ADD_DATABASE_URL"])
+          inspector = inspect(engine)
+          assert "raw_name" not in {c["name"] for c in inspector.get_columns("add_device_users")}
+          assert "payload" not in {c["name"] for c in inspector.get_columns("add_device_commands")}
+          assert "device_user_id" in {c["name"] for c in inspector.get_columns("add_attendance_events")}
+          assert "add_onboarding_nonces" in inspector.get_table_names()
+          assert "add_identity_tombstones" in inspector.get_table_names()
+          PY
+      - name: Build Python distribution
+        run: python -m build
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: apps/add_frontend
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: corepack enable && corepack prepare pnpm@11.7.0 --activate
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run build
+      - name: Install exact frontend dependencies
+        run: corepack enable && corepack prepare pnpm@11.7.0 --activate && pnpm install --frozen-lockfile
+      - name: Run dashboard interaction tests
+        run: pnpm test
+      - name: Build production dashboard
+        run: pnpm run build
 
   firmware:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - name: Build ESP32-S3 firmware with ESP-IDF 5.5.3
+        with:
+          persist-credentials: false
+      - name: Assert secure firmware build defaults
+        run: |
+          grep -qx 'CONFIG_NVS_ENCRYPTION=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y' firmware/zone_lite/sdkconfig.defaults
+      - name: Build ESP32-S3 production firmware with ESP-IDF 5.5.3
         run: >-
           docker run --rm
           -v "$GITHUB_WORKSPACE:/project"
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
-          idf.py build
+          bash -lc 'rm -rf build-ci && idf.py -B build-ci -D SDKCONFIG=/tmp/zone-lite-ci-sdkconfig build'
+      - name: Upload non-provisioned firmware build
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-esp32s3-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            firmware/zone_lite/build-ci/bootloader/bootloader.bin
+            firmware/zone_lite/build-ci/partition_table/partition-table.bin
+            firmware/zone_lite/build-ci/ota_data_initial.bin
+            firmware/zone_lite/build-ci/zone_lite.bin
+            firmware/zone_lite/build-ci/flasher_args.json
 
   containers:
+    needs: [repository-contract, backend, frontend, firmware]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare non-secret container build environment
-        run: install -m 600 .env.add.example .env.add
-      - name: Validate Compose model
-        run: docker compose --env-file .env.add.example -f docker-compose.add.yml config --quiet
-      - name: Build ADD containers
-        run: docker compose --env-file .env.add.example -f docker-compose.add.yml build
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install environment generator dependencies
+        run: python -m pip install --disable-pip-version-check argon2-cffi cryptography
+      - name: Create disposable Compose environment
+        run: python scripts/generate_ci_env.py .env.add
+      - name: Validate Compose model and public bindings
+        run: |
+          docker compose --env-file .env.add -f docker-compose.add.yml config --quiet
+          docker compose --env-file .env.add -f docker-compose.add.yml config --format json |
+            python3 scripts/check_compose_config.py
+      - name: Build and smoke-test the complete stack
+        run: |
+          set -euo pipefail
+          cleanup() {
+            result=$?
+            if [ "$result" -ne 0 ]; then
+              docker compose --env-file .env.add -f docker-compose.add.yml ps || true
+              docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250 || true
+            fi
+            docker compose --env-file .env.add -f docker-compose.add.yml down -v --remove-orphans || true
+            rm -f .env.add
+            exit "$result"
+          }
+          trap cleanup EXIT
+          docker compose --env-file .env.add -f docker-compose.add.yml up -d --build --wait --wait-timeout 240
+          curl --fail --silent --show-error http://127.0.0.1:8096/health/ready
+          curl --fail --silent --show-error http://127.0.0.1:8095/health/ui
+          curl --fail --silent --show-error http://127.0.0.1:8095/ | grep -q 'Attendance Device Dashboard'
+          docker compose --env-file .env.add -f docker-compose.add.yml exec -T add-api alembic -c apps/add_backend/alembic.ini current

@@ -2,25 +2,39 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import hashlib
+import json
 import re
 
 import httpx
 from sqlalchemy import select
 
 from zk_add.db import session_scope
+from zk_add.crypto import decrypt_cnic
 from zk_add.models import (
     AttendanceEvent,
     Connector,
+    ConnectorCredential,
     ConnectorNonce,
+    OnboardingNonce,
     DeviceCommand,
     DeviceLog,
     DeviceTelemetry,
     OrdsOutbox,
+    ZKTDevice,
 )
 from zk_add.realtime import browser_events, connector_hub
-from zk_add.service import queue_due_revokes, serialize_command, upsert_alert
+from zk_add.service import (
+    ACTIVE_COMMAND_STATES,
+    MUTATING_COMMANDS,
+    apply_user_command_terminal_state,
+    oracle_payload,
+    queue_due_revokes,
+    serialize_command,
+    upsert_alert,
+)
 from zk_add.settings import settings
-from zk_common.time_utils import utc_now
+from zk_add.time_utils import utc_now
 
 
 EVENT_UID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -80,17 +94,54 @@ async def maintenance_tick() -> None:
                     )
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         for command in session.scalars(
-            select(DeviceCommand).where(
-                DeviceCommand.status.in_(["QUEUED", "DISPATCHED"])
-            ).order_by(DeviceCommand.created_at.asc())
+            select(DeviceCommand)
+            .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
+            .order_by(DeviceCommand.created_at.asc())
         ):
             if command.expires_at and command.expires_at <= now:
                 command.status = "EXPIRED"
                 command.completed_at = now
+                apply_user_command_terminal_state(session, command=command, status="EXPIRED")
                 continue
             connector = session.get(Connector, command.connector_id)
-            if connector:
-                dispatch.append((connector.connector_id, serialize_command(command)))
+            if connector is None:
+                continue
+            if command.status == "CANCEL_REQUESTED":
+                retry_due = not command.dispatched_at or (
+                    command.dispatched_at
+                    + timedelta(seconds=settings.command_redispatch_seconds)
+                    <= now
+                )
+                if connector.connected and retry_due:
+                    dispatch.append((connector.connector_id, serialize_command(command)))
+                continue
+            if not connector.connected:
+                command.status = "WAITING_FOR_DEVICE"
+                continue
+            zkt = connector.zkt_device
+            if (
+                command.command_type in MUTATING_COMMANDS
+                and connector.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+            ):
+                command.status = "WAITING_FOR_ZKT"
+                command.error_code = "QUARANTINED_DUPLICATE_SERIAL"
+                command.error_message = "All writes are blocked while this serial has multiple claimants."
+                continue
+            if command.command_type in MUTATING_COMMANDS and zkt and (
+                not zkt.online
+                or zkt.connection_state in {"OFFLINE", "FLAPPING", "RETRY_WAIT", "DISCOVERING"}
+            ):
+                command.status = "WAITING_FOR_ZKT"
+                continue
+            if command.dispatched_at and (
+                command.dispatched_at
+                + timedelta(seconds=settings.command_redispatch_seconds)
+                > now
+            ):
+                continue
+            if command.attempt_count > 0:
+                command.status = "RETRYING"
+            dispatch.append((connector.connector_id, serialize_command(command)))
         for command in queue_due_revokes(session):
             connector = session.get(Connector, command.connector_id)
             if connector:
@@ -101,8 +152,18 @@ async def maintenance_tick() -> None:
                 command = session.scalar(
                     select(DeviceCommand).where(DeviceCommand.command_id == update["command_id"])
                 )
-                if command and command.status == "QUEUED":
-                    command.status = "DISPATCHED"
+                if command and command.status in {
+                    "QUEUED",
+                    "WAITING_FOR_DEVICE",
+                    "WAITING_FOR_ZKT",
+                    "RETRYING",
+                    "DISPATCHED",
+                    "ACKNOWLEDGED",
+                    "RUNNING",
+                    "CANCEL_REQUESTED",
+                }:
+                    if command.status != "CANCEL_REQUESTED":
+                        command.status = "DISPATCHED"
                     command.dispatched_at = utc_now()
                     command.attempt_count += 1
     for update in connector_updates:
@@ -140,19 +201,34 @@ async def deliver_ords_once() -> None:
             ).order_by(OrdsOutbox.id.asc()).limit(100)
         ).all()
         for row in candidates:
-            event_uid = (row.payload or {}).get("event_uid")
+            event = (
+                session.get(AttendanceEvent, row.attendance_event_id)
+                if row.attendance_event_id
+                else None
+            )
+            event_uid = event.event_uid if event else None
             if not event_uid_is_valid(event_uid):
                 row.status = "QUARANTINED_INVALID_EVENT_UID"
                 row.last_error = "Rejected before ORDS delivery: event_uid is not a 64-character lowercase hex digest."
-                event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
                 if event:
                     event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
                 continue
+            connector = session.get(Connector, event.connector_id)
+            zkt = session.get(ZKTDevice, event.zkt_device_id)
+            cnic = decrypt_cnic(event.cnic_encrypted)
+            if connector is None or zkt is None or not cnic:
+                row.status = "BLOCKED_IDENTITY"
+                event.ords_status = "BLOCKED_IDENTITY"
+                continue
+            candidate_payload = oracle_payload(connector, zkt, event, cnic)
             row.status = "IN_FLIGHT"
             row.attempt_count += 1
             row.last_attempt_at = now
+            row.payload_hash = hashlib.sha256(
+                json.dumps(candidate_payload, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
             claimed_id = row.id
-            payload = row.payload
+            payload = candidate_payload
             break
     if claimed_id is None or payload is None:
         return
@@ -208,3 +284,14 @@ def retention_tick() -> None:
         session.query(ConnectorNonce).filter(
             ConnectorNonce.created_at < now - timedelta(minutes=10)
         ).delete(synchronize_session=False)
+        session.query(OnboardingNonce).filter(
+            OnboardingNonce.created_at < now - timedelta(minutes=10)
+        ).delete(synchronize_session=False)
+        session.query(ConnectorCredential).filter(
+            ConnectorCredential.active == True,  # noqa: E712
+            ConnectorCredential.valid_until != None,  # noqa: E711
+            ConnectorCredential.valid_until <= now,
+        ).update(
+            {ConnectorCredential.active: False, ConnectorCredential.revoked_at: now},
+            synchronize_session=False,
+        )

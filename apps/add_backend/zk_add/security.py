@@ -11,13 +11,13 @@ from datetime import timedelta
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from fastapi import Header, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
 from zk_add.models import AdminSession, Connector, ConnectorCredential, ConnectorNonce
 from zk_add.settings import settings
-from zk_common.security import body_sha256, sign_request, timestamp_within_skew, token_hash
-from zk_common.time_utils import parse_datetime, utc_now
+from zk_add.protocol import body_sha256, sign_request, timestamp_within_skew, token_hash
+from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
 ADMIN_COOKIE = "add_admin"
@@ -111,9 +111,9 @@ def admin_context(request: Request, session: Session) -> AdminContext:
             AdminSession.token_hash == token_hash(raw), AdminSession.revoked_at == None  # noqa: E711
         )
     )
-    if row is None or row.absolute_expires_at <= now:
+    if row is None or ensure_utc(row.absolute_expires_at) <= now:
         raise HTTPException(status_code=401, detail="Session expired.")
-    if row.last_seen_at + timedelta(seconds=settings.admin_session_idle_seconds) <= now:
+    if ensure_utc(row.last_seen_at) + timedelta(seconds=settings.admin_session_idle_seconds) <= now:
         row.revoked_at = now
         raise HTTPException(status_code=401, detail="Session expired.")
     row.last_seen_at = now
@@ -160,6 +160,10 @@ async def authenticate_connector_request(
             ConnectorCredential.connector_id == connector.id,
             ConnectorCredential.active == True,  # noqa: E712
             ConnectorCredential.revoked_at == None,  # noqa: E711
+            or_(
+                ConnectorCredential.valid_until == None,  # noqa: E711
+                ConnectorCredential.valid_until > utc_now(),
+            ),
             ConnectorCredential.token_hash == connector_token_hash(token),
         )
     )
@@ -187,6 +191,11 @@ async def authenticate_connector_request(
     )
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Invalid connector signature.")
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:connector_key)"),
+            {"connector_key": connector.id},
+        )
     if session.scalar(
         select(ConnectorNonce).where(
             ConnectorNonce.connector_id == connector.id, ConnectorNonce.nonce == nonce
@@ -215,6 +224,10 @@ def authenticate_websocket_token(session: Session, connector_id: str, token: str
             ConnectorCredential.connector_id == connector.id,
             ConnectorCredential.active == True,  # noqa: E712
             ConnectorCredential.revoked_at == None,  # noqa: E711
+            or_(
+                ConnectorCredential.valid_until == None,  # noqa: E711
+                ConnectorCredential.valid_until > utc_now(),
+            ),
             ConnectorCredential.token_hash == connector_token_hash(token),
         )
     )

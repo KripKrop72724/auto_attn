@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -15,19 +15,21 @@ class StepUpRequest(BaseModel):
     password: str
 
 
-class ConnectorCreateRequest(BaseModel):
-    hardware_id: str = Field(min_length=3, max_length=120)
+class OnboardRequest(BaseModel):
+    hardware_id: str = Field(min_length=17, max_length=17)
     zone_id: str = Field(min_length=1, max_length=100)
     zone_name: str = Field(min_length=1, max_length=255)
     device_id: str = Field(min_length=1, max_length=120)
-    display_name: str = Field(min_length=1, max_length=255)
+    firmware_version: str = Field(min_length=1, max_length=80)
     expected_serial: str | None = Field(default=None, max_length=120)
 
-
-class ConnectorActivateRequest(BaseModel):
-    connector_id: str
-    hardware_id: str
-    activation_code: str
+    @field_validator("hardware_id")
+    @classmethod
+    def validate_mac(cls, value: str) -> str:
+        compact = "".join(character for character in value.lower() if character in "0123456789abcdef")
+        if len(compact) != 12:
+            raise ValueError("hardware_id must be a 6-byte Wi-Fi MAC address")
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
 
 
 class Envelope(BaseModel):
@@ -114,11 +116,64 @@ class LogBatchRequest(BaseModel):
     logs: list[DeviceLogIn]
 
 
+class UserCreateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=255)
+    cnic: str = Field(min_length=13, max_length=15)
+    shift_worker: bool = False
+    user_id_override: str | None = Field(default=None, min_length=1, max_length=24)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("cnic")
+    @classmethod
+    def validate_cnic(cls, value: str) -> str:
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("CNIC must contain exactly 13 digits")
+        return digits
+
+    @field_validator("user_id_override")
+    @classmethod
+    def validate_user_id(cls, value: str | None) -> str | None:
+        if value is not None and not value.isdigit():
+            raise ValueError("Employee/user ID override must be numeric")
+        return value
+
+
 class UserUpdateRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=255)
+    cnic: str | None = Field(default=None, min_length=13, max_length=15)
+    shift_worker: bool | None = None
     privilege: Literal[0, 14] | None = None
     expected_version: int = Field(ge=1)
     idempotency_key: str = Field(min_length=8, max_length=120)
+    password: str = Field(min_length=1, max_length=512)
+
+    @field_validator("cnic")
+    @classmethod
+    def validate_optional_cnic(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("CNIC must contain exactly 13 digits")
+        return digits
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if all(
+            value is None
+            for value in (self.display_name, self.cnic, self.shift_worker, self.privilege)
+        ):
+            raise ValueError("At least one user field must be changed")
+        return self
+
+
+class UserDeleteRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    typed_confirmation: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class AdminLeaseRequest(BaseModel):
@@ -135,7 +190,17 @@ class RestartRequest(BaseModel):
 
 class CommandUpdate(BaseModel):
     command_id: str
-    status: Literal["ACKNOWLEDGED", "RUNNING", "SUCCEEDED", "FAILED"]
+    status: Literal[
+        "ACKNOWLEDGED",
+        "WAITING_FOR_DEVICE",
+        "WAITING_FOR_ZKT",
+        "RETRYING",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+    ]
     result: dict[str, Any] = Field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None

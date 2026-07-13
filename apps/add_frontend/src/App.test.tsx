@@ -1,0 +1,225 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import App, {
+  buildMachinePreview,
+  CommandProgress,
+  confirmationMatches,
+  StatusBadge,
+  validateUserDraft,
+} from './App'
+import type { Device, DeviceUser } from './types'
+
+const maskedCnic = '*****-*******-1'
+const fullCnic = '3520212345671'
+
+const device: Device = {
+  connector_id: 'connector-one',
+  hardware_id: 'e0:72:a1:d6:f3:28',
+  zone_id: 'ZONE-SLICTOWER-3FL',
+  zone_name: 'ZONE-SLICTOWER-3FL',
+  device_id: '1',
+  display_name: 'SLICTOWER · 3rd Floor',
+  state: 'ONLINE',
+  connected: true,
+  firmware_version: '2.1.0',
+  onboarding_generation: 2,
+  last_onboarded_at: '2026-07-13T12:00:00Z',
+  last_seen_at: '2026-07-13T12:01:00Z',
+  current_activity: 'Live capture',
+  last_error_code: null,
+  zkt: {
+    id: 1,
+    serial: 'ADZV211860253',
+    expected_serial: 'ADZV211860253',
+    ip_address: '192.168.110.137',
+    model: 'MB20/ID',
+    platform: 'ZLM60_TFT',
+    online: true,
+    connection_state: 'ONLINE',
+    consecutive_failures: 0,
+    consecutive_successes: 4,
+    flap_count_15m: 0,
+    last_transition_at: null,
+    last_online_at: null,
+    offline_since: null,
+    stability_since: null,
+    backoff_until: null,
+    probe_latency_ms: 12,
+    certification_state: 'CERTIFIED',
+    certification_observations: 2,
+    capabilities: { user_write: true, create_user: true, delete_user: true },
+    snapshot_complete: true,
+    writes_disabled_reason: null,
+    user_count: 1,
+    attendance_count: 42,
+    device_time: '2026-07-13T12:01:00Z',
+    device_time_sampled_at: '2026-07-13T12:01:00Z',
+    drift_seconds: 0,
+    last_reconcile_at: '2026-07-13T12:00:00Z',
+    next_restart_at: '2026-07-13T22:00:00Z',
+  },
+}
+
+const user: DeviceUser = {
+  id: 1,
+  user_key: 'test-user-key',
+  uid: '7',
+  user_id: '1007',
+  display_name: 'Ayesha Fatima',
+  cnic_masked: maskedCnic,
+  cnic_available: true,
+  identity_complete: true,
+  shift_worker: false,
+  privilege: 0,
+  present: true,
+  lifecycle_state: 'ACTIVE',
+  row_version: 3,
+  observed_at: '2026-07-13T12:00:00Z',
+  machine_name_preview: 'Ayesha-*****-*******-1',
+  current_command_state: null,
+  read_only: false,
+}
+
+class EventSourceStub {
+  onmessage: ((event: MessageEvent) => void) | null = null
+  constructor(_url: string, _options?: EventSourceInit) {}
+  addEventListener() {}
+  close() {}
+}
+
+const response = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+describe('State Life ADD interface', () => {
+  beforeEach(() => {
+    vi.stubGlobal('EventSource', EventSourceStub)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input)
+        if (path.includes('/api/v1/auth/session')) {
+          return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
+        }
+        if (path.includes('/api/v1/overview')) {
+          return response({ total: 1, online: 1, open_alerts: 0, active_leases: 0 })
+        }
+        if (path.includes('/logs?')) return response({ rows: [] })
+        if (path.includes('/connectivity?')) return response({ rows: [] })
+        if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
+        if (path.includes('/api/v1/devices') && !path.includes('/users')) {
+          return response({ rows: [device] })
+        }
+        if (path.includes('/api/v2/devices/connector-one/users')) {
+          return response({ rows: [user], next_cursor: null, device })
+        }
+        return response({ rows: [] })
+      }),
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it('uses secure automatic onboarding language and exposes no registration control', async () => {
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: /attendance device command center/i })).toBeTruthy()
+    expect(screen.getByAltText('State Life Insurance Corporation')).toBeTruthy()
+    expect(screen.queryByText(/register connector/i)).toBeNull()
+    expect(screen.getByText(/secure auto-onboarding enabled/i)).toBeTruthy()
+  })
+
+  it('renders only masked CNIC in the selected-terminal users workspace', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await screen.findByRole('option', { name: /SLICTOWER · 3rd Floor · ADZV211860253/i })
+    fireEvent.change(screen.getByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    expect(await screen.findByText(maskedCnic)).toBeTruthy()
+    expect(document.body.textContent).not.toContain(fullCnic)
+    expect(screen.getByRole('button', { name: /edit ayesha fatima/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /delete ayesha fatima/i })).toBeTruthy()
+  })
+
+  it('communicates every state with text, icon, and border pattern', () => {
+    const { container, rerender } = render(<StatusBadge state="ONLINE" />)
+    expect(container.querySelector('[data-pattern="confirmed"]')).toBeTruthy()
+    expect(container.querySelector('svg')).toBeTruthy()
+    expect(screen.getByText('ONLINE')).toBeTruthy()
+    rerender(<StatusBadge state="WAITING_FOR_ZKT" />)
+    expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
+    expect(screen.getByText('WAITING FOR ZKT')).toBeTruthy()
+  })
+
+  it('shows durable command progress without relying on hue', () => {
+    const { container } = render(
+      <CommandProgress
+        command={{
+          command_id: 'command-one',
+          type: 'UPDATE_USER',
+          status: 'WAITING_FOR_ZKT',
+          created_at: '2026-07-13T12:00:00Z',
+          expires_at: '2026-07-13T12:30:00Z',
+        }}
+        onCancel={async () => undefined}
+      />,
+    )
+    expect(screen.getByRole('heading', { name: 'WAITING FOR ZKT' })).toBeTruthy()
+    expect(screen.getByText(/durably tracked/i)).toBeTruthy()
+    expect(container.querySelector('.pattern-waiting')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /cancel before execution/i })).toBeTruthy()
+  })
+
+  it('supports semantic keyboard tabs, Escape close, and focus restoration', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    const inspect = await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
+    inspect.focus()
+    fireEvent.click(inspect)
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    const overview = screen.getByRole('tab', { name: 'overview' })
+    expect(overview.getAttribute('aria-controls')).toBe('device-tabpanel')
+    fireEvent.keyDown(overview, { key: 'ArrowRight' })
+    const logs = screen.getByRole('tab', { name: 'Live logs' })
+    expect(logs.getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe('device-tab-logs')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(document.activeElement).toBe(inspect)
+  })
+})
+
+describe('user-operation safety rules', () => {
+  it('builds a valid UTF-8 24-byte machine-name projection', () => {
+    const preview = buildMachinePreview('زارا State Life Employee', fullCnic, true)
+    expect(new TextEncoder().encode(preview).length).toBeLessThanOrEqual(24)
+    expect(preview.endsWith(`-S-${fullCnic}`)).toBe(true)
+  })
+
+  it('validates CNIC, numeric override, password, and typed deletion confirmation', () => {
+    expect(
+      validateUserDraft({
+        displayName: 'Ayesha',
+        cnic: '123',
+        password: 'secret',
+      }),
+    ).toMatch(/13 digits/)
+    expect(
+      validateUserDraft({
+        displayName: 'Ayesha',
+        cnic: fullCnic,
+        password: 'secret',
+        userIdOverride: 'employee-seven',
+      }),
+    ).toMatch(/numeric/)
+    expect(confirmationMatches('Ayesha Fatima', user)).toBe(true)
+    expect(confirmationMatches('1007', user)).toBe(true)
+    expect(confirmationMatches('Ayesha', user)).toBe(false)
+  })
+})
