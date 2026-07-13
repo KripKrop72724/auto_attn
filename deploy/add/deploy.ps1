@@ -53,6 +53,38 @@ function Invoke-DockerProbe {
     return (($result | ForEach-Object { "$_" }) -join "`n").Trim()
 }
 
+function Write-DockerFailureDiagnostics {
+    param([Parameter(Mandatory = $true)][hashtable] $Environment)
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        # Emit only bounded container state and application logs while failed
+        # containers still exist. Never render Compose config or environment.
+        $ErrorActionPreference = "Continue"
+        Write-Warning "Capturing bounded pre-rollback container diagnostics."
+        $psArguments = $compose + @("ps", "-a")
+        $logArguments = $compose + @("logs", "--no-color", "--tail", "250", "add-api")
+        $diagnostics = @(& docker @psArguments 2>&1) + @(& docker @logArguments 2>&1)
+        $material = (($diagnostics | ForEach-Object { "$_" }) -join "`n")
+        foreach ($name in @(
+            "ADD_POSTGRES_PASSWORD", "ADD_ADMIN_PASSWORD_HASH", "ADD_PII_FERNET_KEY",
+            "ADD_PII_LOOKUP_KEY", "ADD_FLEET_ROOT_SECRET", "ADD_ORDS_PASSWORD"
+        )) {
+            if ($Environment.ContainsKey($name) -and $Environment[$name]) {
+                $material = $material.Replace([string]$Environment[$name], "***")
+            }
+        }
+        $material = [regex]::Replace(
+            $material,
+            '(?i)(postgres(?:ql)?(?:\+psycopg)?://[^:\s/]+:)[^@\s]+(@)',
+            '$1***$2'
+        )
+        Write-Host $material
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Get-EnvironmentMap {
     param([Parameter(Mandatory = $true)][string] $Path)
     $map = @{}
@@ -271,8 +303,17 @@ try {
     Invoke-Docker -Arguments @("info") | Out-Null
     Invoke-Docker -Arguments ($compose + @("config", "--quiet"))
 
-    $preApiImage = Get-ImageId -Image $apiImage
-    $preWebImage = Get-ImageId -Image $webImage
+    # Image tags are rollback candidates only after a completed release wrote
+    # immutable metadata. A failed first build can leave production-named tags
+    # behind, but those images have never passed health checks.
+    $previousRelease = Get-ChildItem -LiteralPath $releaseRoot -Filter "*.json" -File |
+        Sort-Object LastWriteTimeUtc |
+        Select-Object -Last 1
+    $preApiImage = if ($previousRelease) { Get-ImageId -Image $apiImage } else { $null }
+    $preWebImage = if ($previousRelease) { Get-ImageId -Image $webImage } else { $null }
+    if ($previousRelease -and (-not $preApiImage -or -not $preWebImage)) {
+        throw "A completed release marker exists, but its rollback image set is incomplete."
+    }
     $rollbackApiTag = "state-life/add-api:rollback-$stamp"
     $rollbackWebTag = "state-life/add-web:rollback-$stamp"
     if ($preApiImage) { Invoke-Docker -Arguments @("tag", $preApiImage, $rollbackApiTag) }
@@ -327,6 +368,7 @@ try {
         Write-Host "ADD commit $actualSha is healthy on 0.0.0.0:8095 and 0.0.0.0:8096."
     } catch {
         $deploymentError = $_.Exception.Message
+        Write-DockerFailureDiagnostics -Environment $environment
         Write-Warning "Deployment failed; beginning bounded rollback."
         try {
             Remove-Item -LiteralPath $pendingEnvironment -Force -ErrorAction SilentlyContinue
@@ -372,7 +414,9 @@ try {
             }
             if (-not $preApiImage -or -not $preWebImage) {
                 Invoke-Docker -Arguments ($compose + @("down", "--remove-orphans"))
-                throw "No complete previous application image set exists; first deployment was stopped."
+                [void](Invoke-DockerProbe -Arguments @("image", "rm", $apiImage))
+                [void](Invoke-DockerProbe -Arguments @("image", "rm", $webImage))
+                throw "Deployment failed; the first release was stopped cleanly: $deploymentError"
             }
             Invoke-Docker -Arguments @("tag", $rollbackApiTag, $apiImage)
             Invoke-Docker -Arguments @("tag", $rollbackWebTag, $webImage)
@@ -381,7 +425,8 @@ try {
             Wait-Endpoint -Uri "http://127.0.0.1:8095/"
             throw "Deployment failed and the previous release was restored: $deploymentError"
         } catch {
-            if ($_.Exception.Message -like "Deployment failed and the previous release was restored:*") {
+            if ($_.Exception.Message -like "Deployment failed and the previous release was restored:*" -or
+                $_.Exception.Message -like "Deployment failed; the first release was stopped cleanly:*") {
                 throw
             }
             throw "Deployment failed ($deploymentError); rollback also failed: $($_.Exception.Message)"

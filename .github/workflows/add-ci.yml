@@ -54,6 +54,12 @@ jobs:
           if ($deploySource -match [regex]::Escape("'*S-1-5-20:(OI)(CI)M'")) {
             throw 'The restricted deployment principal must be able to maintain its protected state ACL.'
           }
+          if ($deploySource -notmatch 'function Write-DockerFailureDiagnostics') {
+            throw 'Failed containers must be logged before transactional rollback removes them.'
+          }
+          if ($deploySource -notmatch 'A failed first build can leave production-named tags') {
+            throw 'Rollback images must be gated by completed-release metadata.'
+          }
       - name: Scan the committed worktree for secrets
         run: >-
           docker run --rm
