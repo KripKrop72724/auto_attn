@@ -4,13 +4,20 @@ from datetime import datetime, timezone
 
 import pytest
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from zk_add.db import Base
 from zk_add.models import AttendanceEvent, DeviceAlert, DeviceConnectionEvent, DeviceUser, OrdsOutbox
-from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
+from zk_add.schemas import (
+    AttendanceBatchRequest,
+    AttendanceEventIn,
+    HeartbeatPayload,
+    UserSnapshotRequest,
+    UserSnapshotRow,
+)
 from zk_add.service import (
     apply_command_update,
     create_admin_lease,
@@ -20,7 +27,7 @@ from zk_add.service import (
     update_heartbeat,
 )
 from zk_add.settings import settings
-from zk_add.worker import ords_delivery_succeeded
+from zk_add.worker import event_uid_is_valid, ords_delivery_succeeded
 
 
 @pytest.fixture()
@@ -53,6 +60,26 @@ def connector_fixture(db: Session):
     return connector
 
 
+def test_attendance_rejects_corrupt_event_uids():
+    assert event_uid_is_valid("a" * 64)
+    assert not event_uid_is_valid("a" * 31 + "?" + "b" * 32)
+    with pytest.raises(ValidationError):
+        AttendanceBatchRequest.model_validate(
+            {
+                "batch_id": "corrupt-batch",
+                "events": [
+                    {
+                        "event_uid": "a" * 31 + "?" + "b" * 32,
+                        "user_id": "1",
+                        "device_event_time": "2026-07-13T13:00:00Z",
+                        "captured_at": "2026-07-13T13:00:01Z",
+                        "source": "LIVE",
+                    }
+                ],
+            }
+        )
+
+
 def test_heartbeat_tracks_flapping_and_transition_history(db: Session):
     connector = connector_fixture(db)
     payload = HeartbeatPayload(
@@ -80,6 +107,34 @@ def test_heartbeat_tracks_flapping_and_transition_history(db: Session):
     assert transition and transition.to_state == "FLAPPING"
     alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
     assert alert and alert.severity == "WARNING"
+
+
+def test_heartbeat_resolves_stale_esp_offline_alert(db: Session):
+    connector = connector_fixture(db)
+    alert = DeviceAlert(
+        connector_id=connector.id,
+        code="ESP_OFFLINE",
+        severity="HIGH",
+        state="OPEN",
+        message="ESP heartbeat is stale.",
+    )
+    db.add(alert)
+    db.commit()
+
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="boot-recovered",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.0.2",
+            zkt={"online": True, "connection_state": "RECOVERING"},
+        ),
+    )
+    db.commit()
+
+    assert alert.state == "RESOLVED"
+    assert alert.resolved_at is not None
 
 
 def test_heartbeat_tracks_reconcile_and_restart_schedule(db: Session):
