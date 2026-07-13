@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from zk_add.db import Base
-from zk_add.models import AttendanceEvent, DeviceAlert, DeviceConnectionEvent, DeviceUser
+from zk_add.models import AttendanceEvent, DeviceAlert, DeviceConnectionEvent, DeviceUser, OrdsOutbox
 from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
 from zk_add.service import (
     apply_command_update,
@@ -20,6 +20,7 @@ from zk_add.service import (
     update_heartbeat,
 )
 from zk_add.settings import settings
+from zk_add.worker import ords_delivery_succeeded
 
 
 @pytest.fixture()
@@ -192,6 +193,86 @@ def test_snapshot_admin_lease_and_durable_command_result(db: Session):
     assert int(expires_at.timestamp()) == 1_900_000_000
 
 
+def test_user_snapshot_handles_user_id_swaps_atomically(db: Session):
+    connector = connector_fixture(db)
+    observed_at = datetime.now(timezone.utc)
+    first = UserSnapshotRequest(
+        snapshot_id="snapshot-before-swap",
+        complete=True,
+        observed_at=observed_at,
+        users=[
+            UserSnapshotRow(uid="1", user_id="1001", name="First", card=1),
+            UserSnapshotRow(uid="2", user_id="1002", name="Second", card=2),
+        ],
+    )
+    replace_user_snapshot(db, connector=connector, snapshot=first)
+    db.commit()
+
+    swapped = UserSnapshotRequest(
+        snapshot_id="snapshot-after-swap",
+        complete=True,
+        observed_at=observed_at,
+        users=[
+            UserSnapshotRow(uid="1", user_id="1002", name="First", card=1),
+            UserSnapshotRow(uid="2", user_id="1001", name="Second", card=2),
+        ],
+    )
+    assert replace_user_snapshot(db, connector=connector, snapshot=swapped) == 2
+    db.commit()
+
+    rows = {row.uid: row for row in db.scalars(select(DeviceUser)).all()}
+    assert rows["1"].user_id == "1002"
+    assert rows["2"].user_id == "1001"
+
+
+def test_user_snapshot_handles_reused_user_id(db: Session):
+    connector = connector_fixture(db)
+    observed_at = datetime.now(timezone.utc)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="snapshot-old-uid",
+            complete=True,
+            observed_at=observed_at,
+            users=[UserSnapshotRow(uid="1", user_id="1001", name="Old User")],
+        ),
+    )
+    db.commit()
+
+    assert replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="snapshot-reused-id",
+            complete=True,
+            observed_at=observed_at,
+            users=[UserSnapshotRow(uid="9", user_id="1001", name="New User")],
+        ),
+    ) == 1
+    db.commit()
+
+    rows = {row.uid: row for row in db.scalars(select(DeviceUser)).all()}
+    assert rows["9"].user_id == "1001" and rows["9"].present
+    assert rows["1"].user_id.startswith("__retired__") and not rows["1"].present
+
+
+def test_user_snapshot_rejects_duplicates_before_mutating(db: Session):
+    connector = connector_fixture(db)
+    snapshot = UserSnapshotRequest(
+        snapshot_id="snapshot-duplicate",
+        complete=True,
+        observed_at=datetime.now(timezone.utc),
+        users=[
+            UserSnapshotRow(uid="1", user_id="1001", name="One"),
+            UserSnapshotRow(uid="2", user_id="1001", name="Two"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Duplicate device user ID"):
+        replace_user_snapshot(db, connector=connector, snapshot=snapshot)
+    assert db.scalar(select(DeviceUser)) is None
+
+
 def test_attendance_ingestion_is_idempotent(db: Session):
     connector = connector_fixture(db)
     event = AttendanceEventIn(
@@ -211,3 +292,45 @@ def test_attendance_ingestion_is_idempotent(db: Session):
     assert accepted == [event.event_uid]
     assert duplicates == [event.event_uid]
     assert db.scalar(select(AttendanceEvent)).ords_status == "PENDING"
+
+
+def test_reconcile_attendance_is_normalized_for_ords(db: Session):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="snapshot-ords-normalization",
+            complete=True,
+            observed_at=datetime.now(timezone.utc),
+            users=[
+                UserSnapshotRow(
+                    uid="7",
+                    user_id="1007",
+                    name="Ayesha-3520212345671",
+                )
+            ],
+        ),
+    )
+    event = AttendanceEventIn(
+        event_uid="f" * 64,
+        uid="7",
+        user_id="1007",
+        raw_name="Ayesha-3520212345671",
+        device_event_time=datetime.now(timezone.utc),
+        captured_at=datetime.now(timezone.utc),
+        source="RECONCILE_15M",
+        clock_quality="OK",
+    )
+    ingest_attendance(db, connector=connector, events=[event])
+    db.commit()
+
+    payload = db.scalar(select(OrdsOutbox)).payload
+    assert payload["capturetype"] == "DUMP_RECONNECT"
+    assert payload["trust_status"] == "BACKFILL_ACCEPTED_CLOCK_OK"
+
+
+def test_ords_live_conflict_is_an_idempotent_acknowledgement():
+    assert ords_delivery_succeeded(409, {"message": "resource already exists"}) is True
+    assert ords_delivery_succeeded(201, {"success": True}) is True
+    assert ords_delivery_succeeded(400, {"success": False}) is False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -78,14 +79,19 @@ from zk_add.service import (
     ingest_attendance,
     ingest_logs,
     replace_user_snapshot,
+    resolve_alert,
     seed_bootstrap_connector,
     serialize_command,
     serialize_connector,
     update_heartbeat,
+    upsert_alert,
 )
 from zk_add.settings import settings
 from zk_add.worker import maintenance_loop
 from zk_common.time_utils import utc_now
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_db():
@@ -976,7 +982,26 @@ async def device_stream(websocket: WebSocket):
             if envelope.connector_id != connector_id:
                 await websocket.close(code=4403)
                 break
-            await handle_envelope(connector_pk, envelope, websocket)
+            try:
+                await handle_envelope(connector_pk, envelope, websocket)
+            except WebSocketDisconnect:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Rejected connector envelope connector_id=%s type=%s message_id=%s",
+                    connector_id,
+                    envelope.type,
+                    envelope.message_id,
+                )
+                record_envelope_rejection(connector_pk, envelope, exc)
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "code": "MESSAGE_REJECTED",
+                        "message_id": envelope.message_id,
+                        "message_type": envelope.type,
+                    }
+                )
     except WebSocketDisconnect:
         pass
     finally:
@@ -987,6 +1012,47 @@ async def device_stream(websocket: WebSocket):
                 connector.connected = False
                 connector.last_disconnect_at = utc_now()
         await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+
+
+def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
+    error_type = type(error).__name__[:80]
+    safe_detail = None
+    if isinstance(error, ValueError):
+        detail = str(error)
+        if detail.startswith(("Duplicate UID ", "Duplicate device user ID ", "Connector has no ")):
+            safe_detail = detail[:300]
+    message = safe_detail or f"{envelope.type} message was rejected ({error_type})."
+    with session_scope() as db:
+        connector = db.get(Connector, connector_pk)
+        if connector is None:
+            return
+        connector.lifecycle_state = "DEGRADED"
+        connector.last_error_code = "DEVICE_MESSAGE_REJECTED"
+        connector.last_error_message = message
+        ingest_logs(
+            db,
+            connector=connector,
+            logs=[
+                DeviceLogIn(
+                    boot_id=envelope.boot_id,
+                    sequence=envelope.seq,
+                    level="ERROR",
+                    subsystem="add_backend",
+                    code="DEVICE_MESSAGE_REJECTED",
+                    message=message,
+                    context={"message_type": envelope.type, "error_type": error_type},
+                    device_time=envelope.sent_at,
+                )
+            ],
+        )
+        upsert_alert(
+            db,
+            connector,
+            code="DEVICE_MESSAGE_REJECTED",
+            severity="HIGH",
+            message=message,
+            details={"message_type": envelope.type, "error_type": error_type},
+        )
 
 
 async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
@@ -1039,6 +1105,10 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
         elif envelope.type == "user_snapshot":
             snapshot = UserSnapshotRequest.model_validate(envelope.payload)
             count = replace_user_snapshot(db, connector=connector, snapshot=snapshot)
+            resolve_alert(db, connector, code="DEVICE_MESSAGE_REJECTED")
+            if connector.last_error_code == "DEVICE_MESSAGE_REJECTED":
+                connector.last_error_code = None
+                connector.last_error_message = None
             event_payload = {"connector_id": connector.connector_id, "count": count}
         elif envelope.type == "attendance_batch":
             batch = AttendanceBatchRequest.model_validate(envelope.payload)

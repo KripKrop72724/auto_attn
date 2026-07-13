@@ -42,6 +42,13 @@ MUTATING_COMMANDS = {
     "RESTART_ZKT",
     "APPLY_CONFIG",
 }
+ORACLE_ALLOWED_CAPTURE_TYPES = {
+    "LIVE",
+    "LIVE_POLL",
+    "DUMP_RECONNECT",
+    "DUMP_STARTUP",
+    "MANUAL_REPROCESS",
+}
 
 
 def ensure_site(session: Session, zone_id: str, zone_name: str) -> Site:
@@ -363,15 +370,47 @@ def replace_user_snapshot(
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
+
+    incoming_by_uid = {}
+    incoming_user_ids: set[str] = set()
+    for incoming in snapshot.users:
+        if incoming.uid in incoming_by_uid:
+            raise ValueError(f"Duplicate UID {incoming.uid} in user snapshot.")
+        if incoming.user_id in incoming_user_ids:
+            raise ValueError(f"Duplicate device user ID {incoming.user_id} in user snapshot.")
+        incoming_by_uid[incoming.uid] = incoming
+        incoming_user_ids.add(incoming.user_id)
+
+    existing_rows = list(
+        session.scalars(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)).all()
+    )
+    rows_by_uid = {row.uid: row for row in existing_rows}
+    uid_claiming_user_id = {
+        incoming.user_id: incoming.uid for incoming in snapshot.users
+    }
+
+    # The ZKT terminal can reuse an employee ID after deleting/re-enrolling a
+    # user, and two existing UIDs can swap employee IDs in a single snapshot.
+    # Stage every changing/conflicting unique value before applying the final
+    # snapshot so PostgreSQL never observes a transient uniqueness violation.
+    staged = False
+    for row in existing_rows:
+        incoming = incoming_by_uid.get(row.uid)
+        changes_user_id = incoming is not None and incoming.user_id != row.user_id
+        claimed_by_other_uid = uid_claiming_user_id.get(row.user_id) not in {None, row.uid}
+        if changes_user_id or claimed_by_other_uid:
+            row.user_id = f"__retired__{row.id}__{row.user_id}"[:100]
+            staged = True
+    if staged:
+        session.flush()
+
     seen: set[str] = set()
+    observed_at = ensure_utc(snapshot.observed_at)
+    updated_at = utc_now()
     for incoming in snapshot.users:
         seen.add(incoming.uid)
         parsed = parse_machine_name(incoming.name)
-        row = session.scalar(
-            select(DeviceUser).where(
-                DeviceUser.zkt_device_id == zkt.id, DeviceUser.uid == incoming.uid
-            )
-        )
+        row = rows_by_uid.get(incoming.uid)
         if row is None:
             row = DeviceUser(
                 zkt_device_id=zkt.id,
@@ -382,19 +421,10 @@ def replace_user_snapshot(
                 row_version=1,
             )
             session.add(row)
+            rows_by_uid[incoming.uid] = row
         else:
-            if row.user_id != incoming.user_id:
-                duplicate = session.scalar(
-                    select(DeviceUser).where(
-                        DeviceUser.zkt_device_id == zkt.id,
-                        DeviceUser.user_id == incoming.user_id,
-                        DeviceUser.id != row.id,
-                    )
-                )
-                if duplicate:
-                    raise ValueError(f"Duplicate device user ID {incoming.user_id} in snapshot.")
-                row.user_id = incoming.user_id
             row.row_version = (row.row_version or 0) + 1
+        row.user_id = incoming.user_id
         row.raw_name = incoming.name
         row.display_name = parsed.display_name
         row.cnic_encrypted = encrypt_cnic(parsed.cnic)
@@ -405,16 +435,14 @@ def replace_user_snapshot(
         row.card = incoming.card
         row.present = True
         row.snapshot_id = snapshot.snapshot_id
-        row.observed_at = ensure_utc(snapshot.observed_at)
-        row.updated_at = utc_now()
+        row.observed_at = observed_at
+        row.updated_at = updated_at
     if snapshot.complete:
-        for row in session.scalars(
-            select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id, DeviceUser.present == True)  # noqa: E712
-        ):
+        for row in existing_rows:
             if row.uid not in seen:
                 row.present = False
                 row.row_version += 1
-                row.updated_at = utc_now()
+                row.updated_at = updated_at
     zkt.user_count = len(snapshot.users)
     zkt.updated_at = utc_now()
     return len(snapshot.users)
@@ -489,6 +517,19 @@ def ingest_attendance(
 
 
 def oracle_payload(connector: Connector, zkt: ZKTDevice, row: AttendanceEvent, cnic: str) -> dict:
+    capture_type = row.source
+    if capture_type == "RECONCILE_15M":
+        capture_type = "DUMP_RECONNECT"
+    elif capture_type not in ORACLE_ALLOWED_CAPTURE_TYPES:
+        capture_type = "MANUAL_REPROCESS"
+    if row.clock_quality == "OK":
+        trust_status = (
+            "TRUSTED_LIVE"
+            if capture_type in {"LIVE", "LIVE_POLL"}
+            else "BACKFILL_ACCEPTED_CLOCK_OK"
+        )
+    else:
+        trust_status = "SUSPECT_DEVICE_TIME"
     return {
         "event_uid": row.event_uid,
         "zone_id": connector.zone_id,
@@ -502,8 +543,8 @@ def oracle_payload(connector: Connector, zkt: ZKTDevice, row: AttendanceEvent, c
         "status": row.status,
         "punch": row.punch,
         "raw_punch": "T" if row.raw_punch else "F",
-        "capturetype": row.source,
-        "trust_status": "TRUSTED_LIVE" if row.clock_quality == "OK" else "SUSPECT_DEVICE_TIME",
+        "capturetype": capture_type,
+        "trust_status": trust_status,
         "clockdiff": row.clock_drift_seconds,
     }
 

@@ -11,6 +11,7 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
@@ -53,6 +54,8 @@
 #define ADD_MAX_INBOUND_BYTES 8192
 #define ADD_ACK_TIMEOUT_MS 15000
 #define ADD_OUTBOX_RETRY_MS 5000
+#define ADD_TRANSPORT_RECOVERY_MS 45000
+#define ADD_TRANSPORT_RESTART_GUARD_MS 45000
 #define ADD_OUTBOX_LINE_BYTES 4096
 #define ADD_OUTBOX_MAX_BYTES (4 * 1024 * 1024)
 #define ADD_OUTBOX_PATH "/storage/add_pending.jsonl"
@@ -76,6 +79,92 @@ static bool s_connected_edge;
 static bool s_ack_matched;
 static char s_waiting_ack[80];
 static uint32_t s_outbox_depth;
+static int64_t s_disconnected_since_ms;
+static int64_t s_last_transport_restart_ms;
+
+static int64_t monotonic_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static char *allocate_outbox_line_buffer(void)
+{
+    char *line = heap_caps_malloc(
+        ADD_OUTBOX_LINE_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!line) {
+        line = malloc(ADD_OUTBOX_LINE_BYTES);
+    }
+    return line;
+}
+
+static size_t valid_utf8_sequence_length(const unsigned char *value, size_t remaining)
+{
+    if (remaining == 0) return 0;
+    unsigned char first = value[0];
+    if (first <= 0x7f) return 1;
+    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
+        value[1] >= 0x80 && value[1] <= 0xbf) {
+        return 2;
+    }
+    if (remaining >= 3 && value[2] >= 0x80 && value[2] <= 0xbf) {
+        if (first == 0xe0 && value[1] >= 0xa0 && value[1] <= 0xbf) return 3;
+        if (first >= 0xe1 && first <= 0xec && value[1] >= 0x80 && value[1] <= 0xbf) return 3;
+        if (first == 0xed && value[1] >= 0x80 && value[1] <= 0x9f) return 3;
+        if (first >= 0xee && first <= 0xef && value[1] >= 0x80 && value[1] <= 0xbf) return 3;
+    }
+    if (remaining >= 4 && value[2] >= 0x80 && value[2] <= 0xbf &&
+        value[3] >= 0x80 && value[3] <= 0xbf) {
+        if (first == 0xf0 && value[1] >= 0x90 && value[1] <= 0xbf) return 4;
+        if (first >= 0xf1 && first <= 0xf3 && value[1] >= 0x80 && value[1] <= 0xbf) return 4;
+        if (first == 0xf4 && value[1] >= 0x80 && value[1] <= 0x8f) return 4;
+    }
+    return 0;
+}
+
+static char *sanitize_utf8_alloc(const char *value, uint32_t *invalid_bytes)
+{
+    if (!value) value = "";
+    size_t input_len = strlen(value);
+    char *safe = malloc(input_len + 1);
+    if (!safe) return NULL;
+    const unsigned char *input = (const unsigned char *)value;
+    size_t read_at = 0;
+    size_t write_at = 0;
+    *invalid_bytes = 0;
+    while (read_at < input_len) {
+        size_t sequence = valid_utf8_sequence_length(input + read_at, input_len - read_at);
+        if (sequence == 0) {
+            safe[write_at++] = '?';
+            read_at++;
+            (*invalid_bytes)++;
+            continue;
+        }
+        memcpy(safe + write_at, input + read_at, sequence);
+        write_at += sequence;
+        read_at += sequence;
+    }
+    safe[write_at] = '\0';
+    return safe;
+}
+
+static void mark_transport_disconnected(void)
+{
+    bool wake_waiter = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        wake_waiter = s_connected || s_waiting_ack[0] != '\0';
+        s_connected = false;
+        s_waiting_ack[0] = '\0';
+        s_ack_matched = false;
+        if (s_disconnected_since_ms == 0) {
+            s_disconnected_since_ms = monotonic_ms();
+        }
+        xSemaphoreGive(s_lock);
+    }
+    if (wake_waiter && s_ack_sem) {
+        xSemaphoreGive(s_ack_sem);
+    }
+}
 
 static void iso_utc(time_t value, char out[32])
 {
@@ -97,7 +186,8 @@ static void json_add_epoch(cJSON *object, const char *name, int64_t epoch)
 
 static bool send_root_locked(cJSON *root)
 {
-    if (!s_client || !s_connected || !root) {
+    if (!s_client || !s_connected || !root || !esp_websocket_client_is_connected(s_client)) {
+        mark_transport_disconnected();
         return false;
     }
     char *text = cJSON_PrintUnformatted(root);
@@ -111,6 +201,9 @@ static bool send_root_locked(cJSON *root)
         pdMS_TO_TICKS(ADD_SEND_TIMEOUT_MS));
     bool ok = sent == (int)strlen(text);
     free(text);
+    if (!ok) {
+        mark_transport_disconnected();
+    }
     return ok;
 }
 
@@ -123,10 +216,23 @@ static bool send_payload(
     if (!ZONE_LITE_ADD_ENABLED || !type || !payload_json) {
         return false;
     }
-    cJSON *payload = cJSON_Parse(payload_json);
+    uint32_t sanitized_bytes = 0;
+    char *safe_payload_json = sanitize_utf8_alloc(payload_json, &sanitized_bytes);
+    if (!safe_payload_json) {
+        return false;
+    }
+    cJSON *payload = cJSON_Parse(safe_payload_json);
+    free(safe_payload_json);
     if (!payload || !cJSON_IsObject(payload)) {
         cJSON_Delete(payload);
         return false;
+    }
+    if (sanitized_bytes > 0) {
+        ESP_LOGW(
+            TAG,
+            "Sanitized %u invalid UTF-8 byte(s) before ADD send type=%s",
+            (unsigned)sanitized_bytes,
+            type);
     }
     if (xSemaphoreTake(s_send_lock, pdMS_TO_TICKS(ADD_SEND_TIMEOUT_MS)) != pdTRUE) {
         cJSON_Delete(payload);
@@ -220,6 +326,26 @@ static void parse_inbound(const char *data, size_t len)
         cJSON_Delete(root);
         return;
     }
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "error") == 0) {
+        cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
+        cJSON *message_type = cJSON_GetObjectItemCaseSensitive(root, "message_type");
+        cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
+        ESP_LOGW(
+            TAG,
+            "ADD rejected outbound message code=%s type=%s",
+            cJSON_IsString(code) ? code->valuestring : "UNKNOWN",
+            cJSON_IsString(message_type) ? message_type->valuestring : "UNKNOWN");
+        if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
+                s_waiting_ack[0] = '\0';
+                s_ack_matched = false;
+                xSemaphoreGive(s_ack_sem);
+            }
+            xSemaphoreGive(s_lock);
+        }
+        cJSON_Delete(root);
+        return;
+    }
     cJSON *command_id = cJSON_GetObjectItemCaseSensitive(root, "command_id");
     cJSON *command_type = cJSON_GetObjectItemCaseSensitive(root, "command_type");
     cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
@@ -271,34 +397,38 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             s_connected = true;
             s_connected_edge = true;
+            s_disconnected_since_ms = 0;
             xSemaphoreGive(s_lock);
         }
         ESP_LOGI(TAG, "ADD live control channel connected");
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
-        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            s_connected = false;
-            s_waiting_ack[0] = '\0';
-            s_ack_matched = false;
-            xSemaphoreGive(s_lock);
-        }
-        xSemaphoreGive(s_ack_sem);
+        mark_transport_disconnected();
         ESP_LOGW(TAG, "ADD live control channel disconnected; client will reconnect");
         break;
     case WEBSOCKET_EVENT_DATA:
-        if (event && event->op_code == 0x1 && event->payload_offset == 0 &&
+        if (event && event->op_code == 0x8) {
+            uint16_t close_code = 0;
+            if (event->data_len >= 2) {
+                const uint8_t *bytes = (const uint8_t *)event->data_ptr;
+                close_code = ((uint16_t)bytes[0] << 8) | bytes[1];
+            }
+            int reason_len = event->data_len > 2 ? event->data_len - 2 : 0;
+            if (reason_len > 120) reason_len = 120;
+            ESP_LOGW(
+                TAG,
+                "ADD WebSocket close frame code=%u reason=%.*s",
+                close_code,
+                reason_len,
+                event->data_len > 2 ? event->data_ptr + 2 : "");
+            mark_transport_disconnected();
+        } else if (event && event->op_code == 0x1 && event->payload_offset == 0 &&
             event->data_len == event->payload_len) {
             parse_inbound(event->data_ptr, event->data_len);
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
-        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            s_connected = false;
-            s_waiting_ack[0] = '\0';
-            s_ack_matched = false;
-            xSemaphoreGive(s_lock);
-        }
-        xSemaphoreGive(s_ack_sem);
+        mark_transport_disconnected();
         ESP_LOGW(TAG, "ADD WebSocket transport error");
         break;
     default:
@@ -310,7 +440,7 @@ static void heartbeat_task(void *arg)
 {
     (void)arg;
     while (true) {
-        if (s_connected) {
+        if (add_connector_is_connected()) {
             add_zkt_telemetry_t zkt;
             char activity[sizeof(s_activity)];
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -360,6 +490,25 @@ static void heartbeat_task(void *arg)
                 (void)add_connector_send_payload("heartbeat", json);
                 free(json);
             }
+        } else if (s_client) {
+            int64_t now_ms = monotonic_ms();
+            int64_t disconnected_since = 0;
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (s_disconnected_since_ms == 0) s_disconnected_since_ms = now_ms;
+                disconnected_since = s_disconnected_since_ms;
+                xSemaphoreGive(s_lock);
+            }
+            if (disconnected_since > 0 &&
+                now_ms - disconnected_since >= ADD_TRANSPORT_RECOVERY_MS &&
+                now_ms - s_last_transport_restart_ms >= ADD_TRANSPORT_RESTART_GUARD_MS) {
+                s_last_transport_restart_ms = now_ms;
+                ESP_LOGW(TAG, "ADD transport remained offline; restarting WebSocket client");
+                (void)esp_websocket_client_stop(s_client);
+                vTaskDelay(pdMS_TO_TICKS(250));
+                if (esp_websocket_client_start(s_client) != ESP_OK) {
+                    ESP_LOGE(TAG, "ADD WebSocket client restart failed");
+                }
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ADD_HEARTBEAT_SECONDS * 1000));
     }
@@ -369,11 +518,17 @@ static uint32_t count_outbox_rows(void)
 {
     FILE *file = fopen(ADD_OUTBOX_PATH, "r");
     if (!file) return 0;
+    char *line = allocate_outbox_line_buffer();
+    if (!line) {
+        fclose(file);
+        ESP_LOGE(TAG, "Could not allocate ADD outbox scan buffer");
+        return 0;
+    }
     uint32_t count = 0;
-    char line[ADD_OUTBOX_LINE_BYTES];
-    while (fgets(line, sizeof(line), file)) {
+    while (fgets(line, ADD_OUTBOX_LINE_BYTES, file)) {
         if (line[0] != '\0') count++;
     }
+    free(line);
     fclose(file);
     return count;
 }
@@ -405,10 +560,17 @@ static bool remove_first_outbox_row_locked(void)
         fclose(in);
         return false;
     }
-    char line[ADD_OUTBOX_LINE_BYTES];
+    char *line = allocate_outbox_line_buffer();
+    if (!line) {
+        fclose(in);
+        fclose(out);
+        (void)remove(ADD_OUTBOX_TMP_PATH);
+        ESP_LOGE(TAG, "Could not allocate ADD outbox compaction buffer");
+        return false;
+    }
     bool skipped = false;
     bool ok = true;
-    while (fgets(line, sizeof(line), in)) {
+    while (fgets(line, ADD_OUTBOX_LINE_BYTES, in)) {
         if (!skipped) {
             skipped = true;
             continue;
@@ -422,6 +584,7 @@ static bool remove_first_outbox_row_locked(void)
     if (fflush(out) != 0 || fsync(fileno(out)) != 0) ok = false;
     fclose(in);
     fclose(out);
+    free(line);
     if (!ok || !skipped) {
         (void)remove(ADD_OUTBOX_TMP_PATH);
         return false;
@@ -481,14 +644,19 @@ bool add_connector_enqueue_attendance(const char *payload_json)
 static void outbox_task(void *arg)
 {
     (void)arg;
-    char line[ADD_OUTBOX_LINE_BYTES];
+    char *line = allocate_outbox_line_buffer();
+    if (!line) {
+        ESP_LOGE(TAG, "Could not allocate ADD outbox worker buffer");
+        vTaskDelete(NULL);
+        return;
+    }
     while (true) {
         bool have_row = false;
         if (add_connector_is_connected() && add_connector_outbox_depth() > 0 &&
             xSemaphoreTake(s_outbox_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
             FILE *file = fopen(ADD_OUTBOX_PATH, "r");
             if (file) {
-                have_row = fgets(line, sizeof(line), file) != NULL;
+                have_row = fgets(line, ADD_OUTBOX_LINE_BYTES, file) != NULL;
                 fclose(file);
             }
             xSemaphoreGive(s_outbox_lock);
@@ -604,6 +772,10 @@ bool add_connector_is_connected(void)
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         connected = s_connected;
         xSemaphoreGive(s_lock);
+    }
+    if (connected && (!s_client || !esp_websocket_client_is_connected(s_client))) {
+        mark_transport_disconnected();
+        connected = false;
     }
     return connected;
 }

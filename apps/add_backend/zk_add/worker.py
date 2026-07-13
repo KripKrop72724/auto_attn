@@ -22,6 +22,17 @@ from zk_add.settings import settings
 from zk_common.time_utils import utc_now
 
 
+def ords_delivery_succeeded(status: int | None, body: object) -> bool:
+    """Classify the documented idempotent responses from the live endpoint."""
+    if status == 409:
+        return True
+    return (
+        status in {200, 201}
+        and isinstance(body, dict)
+        and body.get("success") is True
+    )
+
+
 async def maintenance_loop(stop: asyncio.Event) -> None:
     retention_counter = 0
     while not stop.is_set():
@@ -112,7 +123,7 @@ async def deliver_ords_once() -> None:
             payload = row.payload
     if claimed_id is None or payload is None:
         return
-    url = settings.ords_base_url.rstrip("/") + "/raw-captures/live"
+    url = settings.ords_base_url.rstrip("/") + "/raw-captures"
     status = None
     body = None
     error = None
@@ -135,17 +146,11 @@ async def deliver_ords_once() -> None:
         if row is None:
             return
         event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
-        if status in {200, 201} and isinstance(body, dict) and body.get("success") is True:
+        if ords_delivery_succeeded(status, body):
             row.status = "ACKED"
             row.acknowledged_at = utc_now()
             row.last_http_status = status
             row.last_error = None
-            if event:
-                event.ords_status = "ACKED"
-        elif status == 409 and isinstance(body, dict) and body.get("duplicate_existing_count", 0) >= 1:
-            row.status = "ACKED"
-            row.acknowledged_at = utc_now()
-            row.last_http_status = status
             if event:
                 event.ords_status = "ACKED"
         else:

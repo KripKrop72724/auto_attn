@@ -1532,6 +1532,61 @@ static void iso_system_now(char out[32])
     strftime(out, 32, "%Y-%m-%dT%H:%M:%SZ", &value);
 }
 
+static size_t valid_utf8_sequence_length(const unsigned char *value, size_t remaining)
+{
+    if (remaining == 0) return 0;
+    unsigned char first = value[0];
+    if (first <= 0x7f) return 1;
+    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
+        value[1] >= 0x80 && value[1] <= 0xbf) {
+        return 2;
+    }
+    if (remaining >= 3 && value[2] >= 0x80 && value[2] <= 0xbf) {
+        if (first == 0xe0 && value[1] >= 0xa0 && value[1] <= 0xbf) return 3;
+        if (first >= 0xe1 && first <= 0xec && value[1] >= 0x80 && value[1] <= 0xbf) return 3;
+        if (first == 0xed && value[1] >= 0x80 && value[1] <= 0x9f) return 3;
+        if (first >= 0xee && first <= 0xef && value[1] >= 0x80 && value[1] <= 0xbf) return 3;
+    }
+    if (remaining >= 4 && value[2] >= 0x80 && value[2] <= 0xbf &&
+        value[3] >= 0x80 && value[3] <= 0xbf) {
+        if (first == 0xf0 && value[1] >= 0x90 && value[1] <= 0xbf) return 4;
+        if (first >= 0xf1 && first <= 0xf3 && value[1] >= 0x80 && value[1] <= 0xbf) return 4;
+        if (first == 0xf4 && value[1] >= 0x80 && value[1] <= 0x8f) return 4;
+    }
+    return 0;
+}
+
+static bool json_add_utf8_string(cJSON *object, const char *key, const char *value)
+{
+    if (!value) value = "";
+    size_t input_len = strlen(value);
+    char *safe = malloc(input_len + 1);
+    if (!safe) {
+        cJSON_AddStringToObject(object, key, "");
+        return true;
+    }
+    const unsigned char *input = (const unsigned char *)value;
+    size_t read_at = 0;
+    size_t write_at = 0;
+    bool changed = false;
+    while (read_at < input_len) {
+        size_t sequence = valid_utf8_sequence_length(input + read_at, input_len - read_at);
+        if (sequence == 0) {
+            safe[write_at++] = '?';
+            read_at++;
+            changed = true;
+            continue;
+        }
+        memcpy(safe + write_at, input + read_at, sequence);
+        write_at += sequence;
+        read_at += sequence;
+    }
+    safe[write_at] = '\0';
+    cJSON_AddStringToObject(object, key, safe);
+    free(safe);
+    return changed;
+}
+
 static bool add_send_user_snapshot(const user_table_t *users)
 {
     cJSON *payload = cJSON_CreateObject();
@@ -1549,12 +1604,13 @@ static bool add_send_user_snapshot(const user_table_t *users)
     cJSON_AddBoolToObject(payload, "complete", true);
     cJSON_AddStringToObject(payload, "observed_at", observed);
     cJSON *rows = cJSON_AddArrayToObject(payload, "users");
+    size_t sanitized_fields = 0;
     for (size_t i = 0; i < users->count; i++) {
         const zkt_user_t *user = &users->rows[i];
         cJSON *row = cJSON_CreateObject();
-        cJSON_AddStringToObject(row, "uid", user->uid);
-        cJSON_AddStringToObject(row, "user_id", user->user_id);
-        cJSON_AddStringToObject(row, "name", user->name);
+        sanitized_fields += json_add_utf8_string(row, "uid", user->uid) ? 1 : 0;
+        sanitized_fields += json_add_utf8_string(row, "user_id", user->user_id) ? 1 : 0;
+        sanitized_fields += json_add_utf8_string(row, "name", user->name) ? 1 : 0;
         cJSON_AddNumberToObject(row, "privilege", user->privilege);
         cJSON_AddNumberToObject(row, "card", user->card);
         cJSON_AddItemToArray(rows, row);
@@ -1562,6 +1618,13 @@ static bool add_send_user_snapshot(const user_table_t *users)
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     bool ok = json && add_connector_send_payload("user_snapshot", json);
+    ESP_LOGI(
+        TAG,
+        "ADD user snapshot users=%u bytes=%u sanitized_fields=%u sent=%s",
+        (unsigned)users->count,
+        json ? (unsigned)strlen(json) : 0,
+        (unsigned)sanitized_fields,
+        ok ? "true" : "false");
     free(json);
     return ok;
 }
@@ -1816,20 +1879,43 @@ static void storage_init(void)
     ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_count);
 }
 
+static const char *oracle_capture_type(const char *capturetype)
+{
+    if (capturetype == NULL) return "MANUAL_REPROCESS";
+    if (strcmp(capturetype, "LIVE") == 0 || strcmp(capturetype, "LIVE_POLL") == 0 ||
+        strcmp(capturetype, "DUMP_RECONNECT") == 0 || strcmp(capturetype, "DUMP_STARTUP") == 0 ||
+        strcmp(capturetype, "MANUAL_REPROCESS") == 0) {
+        return capturetype;
+    }
+    if (strcmp(capturetype, "RECONCILE_15M") == 0) {
+        return "DUMP_RECONNECT";
+    }
+    return "MANUAL_REPROCESS";
+}
+
+static const char *oracle_trust_status(const char *capturetype)
+{
+    const char *normalized = oracle_capture_type(capturetype);
+    return strcmp(normalized, "LIVE") == 0 || strcmp(normalized, "LIVE_POLL") == 0
+        ? "TRUSTED_LIVE"
+        : "BACKFILL_ACCEPTED_CLOCK_OK";
+}
+
 static char *event_to_json(const attendance_event_t *event, const char *capturetype)
 {
+    const char *normalized_capturetype = oracle_capture_type(capturetype);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "event_uid", event->event_uid);
     cJSON_AddStringToObject(root, "zone_id", ZONE_LITE_ZONE_ID);
     cJSON_AddStringToObject(root, "device_id", ZONE_LITE_ZONE_DEVICE_ID);
-    cJSON_AddStringToObject(root, "device_serial", g_device_serial[0] ? g_device_serial : "unknown");
-    cJSON_AddStringToObject(root, "user_id", event->user_id);
-    cJSON_AddStringToObject(root, "employee_name", event->employee_name);
+    json_add_utf8_string(root, "device_serial", g_device_serial[0] ? g_device_serial : "unknown");
+    json_add_utf8_string(root, "user_id", event->user_id);
+    json_add_utf8_string(root, "employee_name", event->employee_name);
     cJSON_AddStringToObject(root, "cnic", event->cnic);
     cJSON_AddStringToObject(root, "timestamp", event->timestamp);
     cJSON_AddStringToObject(root, "clockdiff", "0.0");
-    cJSON_AddStringToObject(root, "capturetype", capturetype);
-    cJSON_AddStringToObject(root, "trust_status", "TRUSTED_LIVE");
+    cJSON_AddStringToObject(root, "capturetype", normalized_capturetype);
+    cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized_capturetype));
     cJSON_AddStringToObject(root, "raw_punch", event->raw_punch ? "T" : "F");
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -1850,13 +1936,13 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
     cJSON *events = cJSON_AddArrayToObject(payload, "events");
     cJSON *row = cJSON_CreateObject();
     cJSON_AddStringToObject(row, "event_uid", event->event_uid);
-    cJSON_AddStringToObject(row, "user_id", event->user_id);
+    json_add_utf8_string(row, "user_id", event->user_id);
     char raw_name[128];
     if (event->cnic[0]) {
         snprintf(raw_name, sizeof(raw_name), "%s%s-%s", event->employee_name, event->raw_punch ? "-S" : "", event->cnic);
-        cJSON_AddStringToObject(row, "raw_name", raw_name);
+        json_add_utf8_string(row, "raw_name", raw_name);
     } else if (event->employee_name[0]) {
-        cJSON_AddStringToObject(row, "raw_name", event->employee_name);
+        json_add_utf8_string(row, "raw_name", event->employee_name);
     }
     cJSON_AddStringToObject(row, "device_event_time", event->timestamp);
     char captured[32];
@@ -2573,30 +2659,108 @@ static bool oracle_duplicate_body(const char *body)
     cJSON *root = cJSON_Parse(body);
     if (!root) return false;
     cJSON *duplicate = cJSON_GetObjectItemCaseSensitive(root, "duplicate");
+    cJSON *duplicate_count = cJSON_GetObjectItemCaseSensitive(root, "duplicate_existing_count");
     cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
     bool ok = cJSON_IsTrue(duplicate) ||
+              (cJSON_IsNumber(duplicate_count) && duplicate_count->valuedouble >= 1) ||
               (cJSON_IsString(status) && strcasecmp(status->valuestring, "duplicate") == 0);
     cJSON_Delete(root);
     return ok;
 }
 
-static bool oracle_send_live(const char *event_json)
+static char *oracle_normalize_event_json(const char *event_json)
 {
+    cJSON *root = cJSON_Parse(event_json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    cJSON *capturetype = cJSON_GetObjectItemCaseSensitive(root, "capturetype");
+    const char *source = cJSON_IsString(capturetype) ? capturetype->valuestring : NULL;
+    const char *normalized = oracle_capture_type(source);
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "capturetype");
+    cJSON_AddStringToObject(root, "capturetype", normalized);
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "trust_status");
+    cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized));
+    char *result = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return result;
+}
+
+static void oracle_log_rejection_details(const char *operation, int status, const char *body)
+{
+    int received = -1;
+    int invalid = -1;
+    int conflicts = -1;
+    const char *detail = "";
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    if (root) {
+        cJSON *received_item = cJSON_GetObjectItemCaseSensitive(root, "received_count");
+        cJSON *invalid_item = cJSON_GetObjectItemCaseSensitive(root, "invalid_count");
+        cJSON *conflicts_item = cJSON_GetObjectItemCaseSensitive(root, "conflicts");
+        cJSON *message_item = cJSON_GetObjectItemCaseSensitive(root, "message");
+        cJSON *error_item = cJSON_GetObjectItemCaseSensitive(root, "error");
+        if (cJSON_IsNumber(received_item)) received = received_item->valueint;
+        if (cJSON_IsNumber(invalid_item)) invalid = invalid_item->valueint;
+        if (cJSON_IsArray(conflicts_item)) conflicts = cJSON_GetArraySize(conflicts_item);
+        if (cJSON_IsString(message_item)) detail = message_item->valuestring;
+        else if (cJSON_IsString(error_item)) detail = error_item->valuestring;
+    }
+    ESP_LOGW(
+        TAG,
+        "ORDS %s rejection status=%d received=%d invalid=%d conflicts=%d detail=%.*s",
+        operation,
+        status,
+        received,
+        invalid,
+        conflicts,
+        160,
+        detail);
+    cJSON_Delete(root);
+}
+
+typedef enum {
+    ORACLE_DELIVERY_RETRYABLE = 0,
+    ORACLE_DELIVERY_ACKED,
+    ORACLE_DELIVERY_PERMANENT_REJECTION,
+} oracle_delivery_result_t;
+
+static oracle_delivery_result_t oracle_send_live(const char *event_json)
+{
+    char *normalized_event = oracle_normalize_event_json(event_json);
+    if (!normalized_event) {
+        ESP_LOGE(TAG, "Could not normalize persisted ORDS event JSON");
+        led_status_fault(LED_STATUS_FATAL);
+        return ORACLE_DELIVERY_RETRYABLE;
+    }
     char url[256];
     snprintf(url, sizeof(url), "%s/raw-captures", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
-    int status = http_post_json(url, event_json, &body);
-    bool ok = (status == 409 && oracle_duplicate_body(body)) ||
+    int status = http_post_json(url, normalized_event, &body);
+    free(normalized_event);
+    // The ORDS single-event endpoint uses HTTP 409 as its idempotent
+    // duplicate acknowledgement.  Its 409 response is not guaranteed to use
+    // the bulk endpoint's duplicate_existing_count response shape, so a
+    // successfully completed 409 request must be removed from the outbox.
+    bool ok = status == 409 ||
               ((status == 200 || status == 201) && oracle_success_body(body));
     ESP_LOGI(TAG, "ORDS live status=%d ok=%s", status, ok ? "true" : "false");
     if (ok) {
         ords_mark_success();
+        free(body);
+        return ORACLE_DELIVERY_ACKED;
     } else {
+        oracle_log_rejection_details("live", status, body);
+        if (status == 400 || status == 422) {
+            led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+            free(body);
+            return ORACLE_DELIVERY_PERMANENT_REJECTION;
+        }
         ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }
     free(body);
-    return ok;
+    return ORACLE_DELIVERY_RETRYABLE;
 }
 
 static char *build_bulk_payload(char **events, size_t count, const char *batch_uid)
@@ -2666,6 +2830,21 @@ static bool oracle_send_bulk(char **events, size_t count)
     if (count == 0) {
         return true;
     }
+    char **normalized_events = calloc(count, sizeof(char *));
+    if (!normalized_events) {
+        led_status_fault(LED_STATUS_FATAL);
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        normalized_events[i] = oracle_normalize_event_json(events[i]);
+        if (!normalized_events[i]) {
+            for (size_t j = 0; j < count; j++) free(normalized_events[j]);
+            free(normalized_events);
+            ESP_LOGE(TAG, "Could not normalize ORDS bulk event index=%u", (unsigned)i);
+            led_status_fault(LED_STATUS_FATAL);
+            return false;
+        }
+    }
     char batch_uid[64];
     snprintf(
         batch_uid,
@@ -2674,7 +2853,9 @@ static bool oracle_send_bulk(char **events, size_t count)
         (unsigned long)epoch_now(),
         (unsigned long)(esp_timer_get_time() / 1000),
         (unsigned long)esp_random());
-    char *payload = build_bulk_payload(events, count, batch_uid);
+    char *payload = build_bulk_payload(normalized_events, count, batch_uid);
+    for (size_t i = 0; i < count; i++) free(normalized_events[i]);
+    free(normalized_events);
     if (payload == NULL) {
         return false;
     }
@@ -2688,6 +2869,7 @@ static bool oracle_send_bulk(char **events, size_t count)
     if (ok) {
         ords_mark_success();
     } else {
+        oracle_log_rejection_details("bulk", status, body);
         ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }
@@ -3015,11 +3197,30 @@ static void oracle_drain_pending_locked(bool live_first)
             continue;
         }
         if (live_first && bulk_count == 0) {
-            if (oracle_send_live(line)) {
+            oracle_delivery_result_t delivery = oracle_send_live(line);
+            if (delivery == ORACLE_DELIVERY_ACKED) {
                 append_acked_uid_from_json_to_file(line, acked_file);
                 made_progress = true;
                 live_first = false;
                 continue;
+            }
+            if (delivery == ORACLE_DELIVERY_PERMANENT_REJECTION) {
+                if (append_line(BLOCKED_PATH, line)) {
+                    char event_uid[65] = "unknown";
+                    (void)extract_event_uid(line, event_uid);
+                    ESP_LOGE(
+                        TAG,
+                        "Preserved permanently rejected ORDS event in blocked outbox uid=%s",
+                        event_uid);
+                    (void)add_connector_log(
+                        "ERROR",
+                        "ords",
+                        "ORDS_EVENT_QUARANTINED",
+                        "Oracle permanently rejected a queued attendance event; it remains preserved for review while later events continue.");
+                    made_progress = true;
+                    continue;
+                }
+                ESP_LOGE(TAG, "Could not preserve permanently rejected ORDS event");
             }
             failed = true;
             fprintf(out, "%s\n", line);
@@ -3649,12 +3850,15 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
                 led_status_set(LED_STATUS_SYNCING);
                 size_t added = 0;
+                const char *reconcile_capturetype = last_synced_attendance_count < 0
+                    ? "DUMP_STARTUP"
+                    : "DUMP_RECONNECT";
                 if (reconcile_attendance_dump(
                         sock,
                         &ctx,
                         users,
                         refreshed_records,
-                        "RECONCILE_15M",
+                        reconcile_capturetype,
                         device_now.tm_year + 1900,
                         device_now.tm_mon + 1,
                         &added)) {
