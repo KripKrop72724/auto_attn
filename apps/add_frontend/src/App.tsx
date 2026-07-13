@@ -818,11 +818,35 @@ function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: Re
     <>
       <PageHeader eyebrow="OPERATIONS QUEUE" title="Alerts and exceptions" description="Device conditions prioritized with labels, icons, and border patterns." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
       <section className="alert-list">
-        {rows.map((row) => <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p></div>{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</article>)}
+        {rows.map((row) => {
+          const diagnostics = formatAlertDiagnostics(row.details)
+          return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div>{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</article>
+        })}
         {!rows.length && <div className="panel empty-state"><Icon name="shield" /><h2>No recorded device exceptions.</h2><p>The queue will update from live ESP telemetry.</p></div>}
       </section>
     </>
   )
+}
+
+export function formatAlertDiagnostics(details: Record<string, unknown>): string {
+  const facts: string[] = []
+  const category = details.failure_category
+  if (typeof category === 'string' && /^[A-Z0-9_]{1,80}$/.test(category)) {
+    facts.push(`Category ${category}`)
+  }
+  const httpStatus = details.http_status
+  if (typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
+    facts.push(`HTTP ${httpStatus}`)
+  }
+  const attemptCount = details.attempt_count
+  if (typeof attemptCount === 'number' && Number.isInteger(attemptCount) && attemptCount >= 0) {
+    facts.push(`Attempt ${attemptCount}`)
+  }
+  const affectedUsers = details.affected_users
+  if (typeof affectedUsers === 'number' && Number.isInteger(affectedUsers) && affectedUsers >= 0) {
+    facts.push(`${affectedUsers} affected users`)
+  }
+  return facts.join(' · ')
 }
 
 function DeviceDrawer({

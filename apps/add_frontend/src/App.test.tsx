@@ -4,6 +4,7 @@ import App, {
   buildMachinePreview,
   CommandProgress,
   confirmationMatches,
+  formatAlertDiagnostics,
   StatusBadge,
   validateUserDraft,
 } from './App'
@@ -87,6 +88,24 @@ const conflictedUser: DeviceUser = {
   identity_conflict_code: 'DUPLICATE_CNIC',
 }
 
+const deliveryAlert = {
+  id: 9,
+  code: 'ORDS_DELIVERY_FAILED',
+  severity: 'WARNING',
+  state: 'OPEN',
+  message: 'Oracle attendance delivery is retrying; preserved events remain queued.',
+  details: {
+    failure_category: 'HTTP_503',
+    http_status: 503,
+    attempt_count: 4,
+    response_body: `must-not-render-${fullCnic}`,
+  },
+  first_seen_at: '2026-07-13T12:00:00Z',
+  last_seen_at: '2026-07-13T12:05:00Z',
+  acknowledged_at: null,
+  resolved_at: null,
+}
+
 class EventSourceStub {
   onmessage: ((event: MessageEvent) => void) | null = null
   constructor(_url: string, _options?: EventSourceInit) {}
@@ -127,6 +146,7 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
+    if (path.includes('/alerts')) return response({ rows: [deliveryAlert] })
     if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
     if (path.includes('/api/v1/devices') && !path.includes('/users')) {
       return response({ rows: [device] })
@@ -199,6 +219,16 @@ describe('State Life ADD interface', () => {
     rerender(<StatusBadge state="WAITING_FOR_ZKT" />)
     expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
     expect(screen.getByText('WAITING FOR ZKT')).toBeTruthy()
+  })
+
+  it('renders only allowlisted alert diagnostics', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
+    expect(await screen.findByText(/Category HTTP_503 · HTTP 503 · Attempt 4/i)).toBeTruthy()
+    expect(document.body.textContent).not.toContain('must-not-render')
+    expect(document.body.textContent).not.toContain(fullCnic)
+    expect(formatAlertDiagnostics({ failure_category: 'unsafe detail!', secret: 'x' })).toBe('')
   })
 
   it('shows durable command progress without relying on hue', () => {
