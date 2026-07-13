@@ -145,6 +145,7 @@
 #define BLOCKED_PATH STORAGE_BASE "/blocked_identity.jsonl"
 #define BLOCKED_RECOVERY_TMP_PATH STORAGE_BASE "/blocked_recovery.tmp"
 #define BLOCKED_RECOVERY_BACKUP_PATH STORAGE_BASE "/blocked_recovery.bak"
+#define CORRUPT_ORDS_PATH STORAGE_BASE "/corrupt_ords.jsonl"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
 #define MAX_USERS 2048
@@ -2815,6 +2816,7 @@ typedef enum {
     ORACLE_DELIVERY_RETRYABLE = 0,
     ORACLE_DELIVERY_ACKED,
     ORACLE_DELIVERY_PERMANENT_REJECTION,
+    ORACLE_DELIVERY_CORRUPT_LOCAL_ROW,
 } oracle_delivery_result_t;
 
 static oracle_delivery_result_t oracle_send_live(const char *event_json)
@@ -2822,8 +2824,8 @@ static oracle_delivery_result_t oracle_send_live(const char *event_json)
     char *normalized_event = oracle_normalize_event_json(event_json);
     if (!normalized_event) {
         ESP_LOGE(TAG, "Could not normalize persisted ORDS event JSON");
-        led_status_fault(LED_STATUS_FATAL);
-        return ORACLE_DELIVERY_RETRYABLE;
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+        return ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
     }
     char url[256];
     snprintf(url, sizeof(url), "%s/raw-captures", ZONE_LITE_ORDS_BASE_URL);
@@ -3316,6 +3318,21 @@ static void oracle_drain_pending_locked(bool live_first)
                 }
                 free(blocked_json);
                 ESP_LOGE(TAG, "Could not preserve permanently rejected ORDS event");
+            }
+            if (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
+                if (append_line(CORRUPT_ORDS_PATH, line)) {
+                    ESP_LOGE(
+                        TAG,
+                        "Preserved malformed local ORDS row for forensic recovery and continued draining");
+                    (void)add_connector_log(
+                        "ERROR",
+                        "ords",
+                        "ORDS_LOCAL_ROW_QUARANTINED",
+                        "A malformed legacy ORDS outbox row was preserved separately so newer attendance can continue.");
+                    made_progress = true;
+                    continue;
+                }
+                ESP_LOGE(TAG, "Could not preserve malformed local ORDS row");
             }
             failed = true;
             fprintf(out, "%s\n", line);
