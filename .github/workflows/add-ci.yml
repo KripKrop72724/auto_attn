@@ -37,6 +37,10 @@ jobs:
             $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
             throw "deploy.ps1 contains parser errors:$([Environment]::NewLine)$messages"
           }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          if ($utf8NoBom.GetPreamble().Length -ne 0) {
+            throw 'Deployment UTF-8 encoder unexpectedly emits a BOM.'
+          }
       - name: Scan the committed worktree for secrets
         run: >-
           docker run --rm

@@ -97,7 +97,7 @@ jobs:
           if ($sourceFile) {
             Copy-Item -LiteralPath $sourceFile -Destination '.env.add' -Force
           } elseif ($env:CONFIGURED_ENV_CONTENT) {
-            $utf8NoBom = New-Object Security.UTF8Encoding($false)
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
             [IO.File]::WriteAllText((Join-Path $PWD '.env.add'), $env:CONFIGURED_ENV_CONTENT, $utf8NoBom)
           } else {
             throw 'Configure ADD_ENV_FILE, the protected ProgramData file, or ADD_ENV_FILE_CONTENT.'
