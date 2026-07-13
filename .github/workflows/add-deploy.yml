@@ -122,20 +122,43 @@ jobs:
   verify-public:
     if: needs.deploy.result == 'success'
     needs: deploy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
     steps:
-      - name: Verify public TLS, UI, API, and proxy routing
+      - name: Verify public TLS, UI, API, and proxy routing with bounded retries
         run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
-            https://autoattn.slichealth.com/health/live
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
-            https://autoattn.slichealth.com/health/ready
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
-            https://attendancedevices.slichealth.com/health/ui
-          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors \
-            https://attendancedevices.slichealth.com/ | grep -q 'Attendance Device Dashboard'
+          $ErrorActionPreference = 'Stop'
+          $targets = @(
+            @{ Uri = 'https://autoattn.slichealth.com/health/live'; Contains = '"ok":true' },
+            @{ Uri = 'https://autoattn.slichealth.com/health/ready'; Contains = '"database":true' },
+            @{ Uri = 'https://attendancedevices.slichealth.com/health/ui'; Contains = '"ok":true' },
+            @{ Uri = 'https://attendancedevices.slichealth.com/'; Contains = 'Attendance Device Dashboard' }
+          )
+          foreach ($target in $targets) {
+            $failure = $null
+            for ($attempt = 1; $attempt -le 12; $attempt++) {
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri $target.Uri -TimeoutSec 15
+                if ([int]$response.StatusCode -ne 200) {
+                  throw "Unexpected HTTP status $($response.StatusCode)"
+                }
+                if ($response.Content -notmatch [regex]::Escape($target.Contains)) {
+                  throw 'Expected response marker is missing.'
+                }
+                $failure = $null
+                break
+              } catch {
+                $failure = $_.Exception.Message
+                if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
+              }
+            }
+            if ($failure) {
+              throw "Public verification failed for $($target.Uri): $failure"
+            }
+          }
 
   report:
     if: always() && needs.announce.result == 'success'
