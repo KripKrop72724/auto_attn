@@ -143,6 +143,8 @@
 #define PENDING_TMP_PATH STORAGE_BASE "/pending.tmp"
 #define PENDING_BACKUP_PATH STORAGE_BASE "/pending.bak"
 #define BLOCKED_PATH STORAGE_BASE "/blocked_identity.jsonl"
+#define BLOCKED_RECOVERY_TMP_PATH STORAGE_BASE "/blocked_recovery.tmp"
+#define BLOCKED_RECOVERY_BACKUP_PATH STORAGE_BASE "/blocked_recovery.bak"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
 #define MAX_USERS 2048
@@ -1848,6 +1850,80 @@ static void restore_pending_backup_if_needed(void)
     }
 }
 
+static bool json_event_has_valid_identity_and_no_block_reason(const char *event_json)
+{
+    cJSON *root = cJSON_Parse(event_json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+    cJSON *cnic = cJSON_GetObjectItemCaseSensitive(root, "cnic");
+    cJSON *user_id = cJSON_GetObjectItemCaseSensitive(root, "user_id");
+    cJSON *blocked_reason = cJSON_GetObjectItemCaseSensitive(root, "blocked_reason");
+    bool valid = cJSON_IsString(cnic) && strlen(cnic->valuestring) == 13 &&
+                 cJSON_IsString(user_id) && user_id->valuestring[0] != '\0' &&
+                 blocked_reason == NULL;
+    for (size_t i = 0; valid && i < 13; i++) {
+        valid = isdigit((unsigned char)cnic->valuestring[i]) != 0;
+    }
+    cJSON_Delete(root);
+    return valid;
+}
+
+static void recover_valid_unclassified_blocked_events(void)
+{
+    FILE *in = fopen(BLOCKED_PATH, "r");
+    if (!in) return;
+    FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
+    FILE *pending = fopen(PENDING_PATH, "a");
+    if (!kept || !pending) {
+        if (kept) fclose(kept);
+        if (pending) fclose(pending);
+        fclose(in);
+        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
+        ESP_LOGE(TAG, "Could not open attendance outboxes for blocked-event recovery");
+        return;
+    }
+
+    bool ok = true;
+    size_t recovered = 0;
+    char line[MAX_EVENT_JSON];
+    while (fgets(line, sizeof(line), in) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+        FILE *destination = json_event_has_valid_identity_and_no_block_reason(line) ? pending : kept;
+        if (fprintf(destination, "%s\n", line) < 0) {
+            ok = false;
+            break;
+        }
+        if (destination == pending) recovered++;
+    }
+    if (ferror(in)) ok = false;
+    if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
+    if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
+    fclose(in);
+    fclose(kept);
+    fclose(pending);
+
+    if (!ok) {
+        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
+        ESP_LOGE(TAG, "Blocked-event recovery was interrupted; original rows remain preserved");
+        return;
+    }
+    (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
+    if (rename(BLOCKED_PATH, BLOCKED_RECOVERY_BACKUP_PATH) != 0 ||
+        rename(BLOCKED_RECOVERY_TMP_PATH, BLOCKED_PATH) != 0) {
+        (void)rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH);
+        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
+        ESP_LOGE(TAG, "Could not commit blocked-event recovery; backup remains preserved");
+        return;
+    }
+    (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
+    if (recovered > 0) {
+        ESP_LOGW(TAG, "Recovered %u valid event(s) from the legacy blocked outbox", (unsigned)recovered);
+    }
+}
+
 static void storage_init(void)
 {
     g_seen_hashes = heap_caps_calloc(SEEN_HASH_CAPACITY, sizeof(uint64_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1872,6 +1948,7 @@ static void storage_init(void)
         ESP_ERROR_CHECK(spiffs_ret);
     }
     restore_pending_backup_if_needed();
+    recover_valid_unclassified_blocked_events();
     load_seen_from_file(PENDING_PATH);
     load_seen_from_file(BLOCKED_PATH);
     load_seen_from_file(ACKED_PATH);
@@ -2677,11 +2754,26 @@ static char *oracle_normalize_event_json(const char *event_json)
     }
     cJSON *capturetype = cJSON_GetObjectItemCaseSensitive(root, "capturetype");
     const char *source = cJSON_IsString(capturetype) ? capturetype->valuestring : NULL;
-    const char *normalized = oracle_capture_type(source);
+    char normalized[32];
+    strlcpy(normalized, oracle_capture_type(source), sizeof(normalized));
     cJSON_DeleteItemFromObjectCaseSensitive(root, "capturetype");
     cJSON_AddStringToObject(root, "capturetype", normalized);
     cJSON_DeleteItemFromObjectCaseSensitive(root, "trust_status");
     cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized));
+    char *result = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return result;
+}
+
+static char *oracle_mark_permanent_rejection(const char *event_json)
+{
+    cJSON *root = cJSON_Parse(event_json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "blocked_reason");
+    cJSON_AddStringToObject(root, "blocked_reason", "ORDS_PERMANENT_REJECTION");
     char *result = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return result;
@@ -3205,7 +3297,8 @@ static void oracle_drain_pending_locked(bool live_first)
                 continue;
             }
             if (delivery == ORACLE_DELIVERY_PERMANENT_REJECTION) {
-                if (append_line(BLOCKED_PATH, line)) {
+                char *blocked_json = oracle_mark_permanent_rejection(line);
+                if (blocked_json && append_line(BLOCKED_PATH, blocked_json)) {
                     char event_uid[65] = "unknown";
                     (void)extract_event_uid(line, event_uid);
                     ESP_LOGE(
@@ -3217,9 +3310,11 @@ static void oracle_drain_pending_locked(bool live_first)
                         "ords",
                         "ORDS_EVENT_QUARANTINED",
                         "Oracle permanently rejected a queued attendance event; it remains preserved for review while later events continue.");
+                    free(blocked_json);
                     made_progress = true;
                     continue;
                 }
+                free(blocked_json);
                 ESP_LOGE(TAG, "Could not preserve permanently rejected ORDS event");
             }
             failed = true;
