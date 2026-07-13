@@ -151,7 +151,7 @@
 #define MAX_USERS 2048
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
-#define ADD_RECONCILE_BATCH_EVENTS 6
+#define ADD_RECONCILE_BATCH_EVENTS 10
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -170,6 +170,7 @@
 #ifndef ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS
 #define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
 #endif
+#define ADD_RECONCILE_MAX_BATCHES ((ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS / ADD_RECONCILE_BATCH_EVENTS) + 2)
 #ifndef ZONE_LITE_ORDS_CA_CERT_PEM
 #define ZONE_LITE_ORDS_CA_CERT_PEM NULL
 #endif
@@ -2040,18 +2041,36 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
     return row;
 }
 
-static bool add_enqueue_attendance_events(cJSON *events, const char *batch_id)
+static char *add_serialize_attendance_events(cJSON *events, const char *batch_id)
 {
-    if (!events) return false;
+    if (!events) return NULL;
     cJSON *payload = cJSON_CreateObject();
     if (!payload) {
         cJSON_Delete(events);
-        return false;
+        return NULL;
     }
     cJSON_AddStringToObject(payload, "batch_id", batch_id);
     cJSON_AddItemToObject(payload, "events", events);
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
+    if (!json) return NULL;
+
+    // Reconcile can retain hundreds of batches until the ZKT dump and the
+    // primary attendance-file transaction are complete.  Keep that bounded
+    // backlog in PSRAM so live capture retains ample internal heap.
+    size_t json_size = strlen(json) + 1;
+    char *psram_json = heap_caps_malloc(json_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (psram_json) {
+        memcpy(psram_json, json, json_size);
+        free(json);
+        return psram_json;
+    }
+    return json;
+}
+
+static bool add_enqueue_attendance_events(cJSON *events, const char *batch_id)
+{
+    char *json = add_serialize_attendance_events(events, batch_id);
     bool ok = json && add_connector_enqueue_attendance(json);
     free(json);
     return ok;
@@ -2240,6 +2259,8 @@ static bool reconcile_attendance_dump(
     cJSON *add_batch_events = NULL;
     size_t add_batch_count = 0;
     char add_batch_id[80] = {0};
+    char **add_batches = NULL;
+    size_t add_batch_total = 0;
     char **truth_events = NULL;
     size_t truth_count = 0;
     size_t truth_capacity = truth_enabled ? ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS : 0;
@@ -2273,6 +2294,20 @@ static bool reconcile_attendance_dump(
             led_status_fault(LED_STATUS_FATAL);
             truth_enabled = false;
         }
+    }
+    add_batches = heap_caps_calloc(
+        ADD_RECONCILE_MAX_BATCHES,
+        sizeof(char *),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (add_batches == NULL) {
+        add_batches = calloc(ADD_RECONCILE_MAX_BATCHES, sizeof(char *));
+    }
+    if (add_batches == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Could not allocate ADD reconcile batch list capacity=%u",
+            (unsigned)ADD_RECONCILE_MAX_BATCHES);
+        add_delivery_failed = true;
     }
     while (remain >= record_size) {
         char user_id[32] = "";
@@ -2355,8 +2390,12 @@ static bool reconcile_attendance_dump(
                     cJSON_AddItemToArray(add_batch_events, add_row);
                     add_batch_count++;
                     if (add_batch_count >= ADD_RECONCILE_BATCH_EVENTS) {
-                        if (!add_enqueue_attendance_events(add_batch_events, add_batch_id)) {
+                        char *batch_json = add_serialize_attendance_events(add_batch_events, add_batch_id);
+                        if (!batch_json || add_batch_total >= ADD_RECONCILE_MAX_BATCHES) {
+                            free(batch_json);
                             add_delivery_failed = true;
+                        } else {
+                            add_batches[add_batch_total++] = batch_json;
                         }
                         add_batch_events = NULL;
                         add_batch_count = 0;
@@ -2375,8 +2414,12 @@ static bool reconcile_attendance_dump(
         }
     }
     if (add_batch_events) {
-        if (!add_enqueue_attendance_events(add_batch_events, add_batch_id)) {
+        char *batch_json = add_serialize_attendance_events(add_batch_events, add_batch_id);
+        if (!batch_json || !add_batches || add_batch_total >= ADD_RECONCILE_MAX_BATCHES) {
+            free(batch_json);
             add_delivery_failed = true;
+        } else {
+            add_batches[add_batch_total++] = batch_json;
         }
         add_batch_events = NULL;
     }
@@ -2392,6 +2435,16 @@ static bool reconcile_attendance_dump(
     }
     xSemaphoreGive(g_storage_lock);
     free(data);
+    if (add_batch_total > 0 &&
+        !add_connector_enqueue_attendance_bulk((const char *const *)add_batches, add_batch_total)) {
+        add_delivery_failed = true;
+    }
+    if (add_batches != NULL) {
+        for (size_t i = 0; i < add_batch_total; i++) {
+            free(add_batches[i]);
+        }
+        free(add_batches);
+    }
     if (truth_enabled) {
         if (truth_overflow) {
             ESP_LOGE(TAG, "Skipping ORDS truth reconcile because current-month truth exceeded capacity=%u", (unsigned)truth_capacity);
@@ -2419,12 +2472,12 @@ static bool reconcile_attendance_dump(
     if (add_delivery_failed) {
         ESP_LOGW(
             TAG,
-            "ADD truth batching reached its durable queue limit; live punches remain prioritized and the six-hour truth cycle will repair history");
+            "ADD truth batching could not persist the complete cycle; live punches remain prioritized and the six-hour truth cycle will repair history");
         add_connector_log(
             "ERROR",
             "reconcile",
             "ADD_TRUTH_QUEUE_SATURATED",
-            "Dashboard truth backlog reached its bounded durable queue; live punches remain prioritized and history will be repaired by the next truth cycle");
+            "Dashboard truth cycle could not be fully persisted; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
     ESP_LOGI(
         TAG,
