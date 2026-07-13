@@ -661,7 +661,9 @@ def attendance(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    statement = select(AttendanceEvent)
+    statement = select(AttendanceEvent).where(
+        AttendanceEvent.ords_status != "QUARANTINED_INVALID_EVENT_UID"
+    )
     if device_id:
         connector = connector_or_404(db, device_id)
         statement = statement.where(AttendanceEvent.connector_id == connector.id)
