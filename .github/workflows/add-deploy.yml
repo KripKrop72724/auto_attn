@@ -181,9 +181,12 @@ jobs:
           }
           $containerTokens = @()
           foreach ($line in $containerOutput) {
-            $text = "$line".Trim()
-            if ($text -match '^(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)$') {
-              $containerTokens += $Matches[1]
+            $match = [regex]::Match(
+              "$line",
+              '(?<![A-Za-z0-9_])(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)(?![A-Za-z0-9_])'
+            )
+            if ($match.Success) {
+              $containerTokens += $match.Groups[1].Value
             }
           }
           $containerResult = if ($containerTokens.Count -gt 0) {
@@ -196,6 +199,7 @@ jobs:
           Write-Host "ORDS TCP 443 probe=$tcpResult"
           Write-Host "ORDS host probe=$hostResult"
           Write-Host "ORDS container probe=$containerResult"
+          Write-Host "ORDS container command completed=$($containerExit -eq 0)"
           Write-Host "Runner default proxy used=$defaultProxyUsed"
           Write-Host "Runner proxy environment present=$proxyEnvironmentPresent"
           if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {

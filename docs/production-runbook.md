@@ -137,6 +137,19 @@ must not roll back an otherwise healthy ADD release. A degraded route remains vi
 `ORDS_DELIVERY_FAILED`; queued attendance is retained and retried with bounded backoff while network
 routing is repaired.
 
+Interpret deployment probe results in this order:
+
+- `DNS probe=OK` with `TCP 443 probe=ERROR_TIMEOUT` and both proxy booleans `False` means the
+  production host or its upstream firewall/ACL is blocking outbound TCP 443. Permit the Windows host
+  and Docker NAT network to reach `eclaim2.slichealth.com:443`, then rerun the deployment probe. Do not
+  rotate ORDS credentials for this condition.
+- A successful host probe with a failed container probe points to Docker NAT or container-specific
+  egress policy.
+- HTTP `401`/`403` means transport is working and authentication should be checked without logging
+  credentials or response bodies.
+- HTTP `400`/`413`/`422` applies to individual payloads; ADD quarantines those rows and continues with
+  newer attendance.
+
 ## Alert response
 
 | Alert/state | Immediate action | Do not do |
