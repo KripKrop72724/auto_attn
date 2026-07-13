@@ -17,17 +17,40 @@ function Invoke-Docker {
         [Parameter(Mandatory = $true)][string[]] $Arguments,
         [switch] $Capture
     )
-    if ($Capture) {
-        $result = & docker @Arguments 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    $previousPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 promotes redirected native stderr to a
+        # NativeCommandError. The process exit code is authoritative here.
+        $ErrorActionPreference = "Continue"
+        if ($Capture) {
+            $result = & docker @Arguments 2>&1
+        } else {
+            & docker @Arguments
         }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "docker $($Arguments -join ' ') failed with exit code $exitCode"
+    }
+    if ($Capture) {
         return (($result | ForEach-Object { "$_" }) -join "`n").Trim()
     }
-    & docker @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+}
+
+function Invoke-DockerProbe {
+    param([Parameter(Mandatory = $true)][string[]] $Arguments)
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        $result = & docker @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
     }
+    if ($exitCode -ne 0) { return $null }
+    return (($result | ForEach-Object { "$_" }) -join "`n").Trim()
 }
 
 function Get-EnvironmentMap {
@@ -67,23 +90,19 @@ function Require-EnvironmentValue {
 
 function Get-ImageId {
     param([Parameter(Mandatory = $true)][string] $Image)
-    $result = & docker image inspect $Image --format '{{.Id}}' 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return (($result | Select-Object -Last 1) -as [string]).Trim()
+    return Invoke-DockerProbe -Arguments @("image", "inspect", $Image, "--format", "{{.Id}}")
 }
 
 function Get-PostgresContainer {
-    $result = & docker @compose ps -q postgres 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return (($result | Select-Object -Last 1) -as [string]).Trim()
+    return Invoke-DockerProbe -Arguments ($compose + @("ps", "-q", "postgres"))
 }
 
 function Get-DatabaseRevision {
     param([string] $DatabaseUser, [string] $DatabaseName)
-    $result = & docker @compose exec -T postgres psql -tA -U $DatabaseUser -d $DatabaseName `
-        -c 'SELECT version_num FROM alembic_version LIMIT 1' 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return (($result | Select-Object -Last 1) -as [string]).Trim()
+    return Invoke-DockerProbe -Arguments ($compose + @(
+        "exec", "-T", "postgres", "psql", "-tA", "-U", $DatabaseUser,
+        "-d", $DatabaseName, "-c", "SELECT version_num FROM alembic_version LIMIT 1"
+    ))
 }
 
 function Wait-Endpoint {

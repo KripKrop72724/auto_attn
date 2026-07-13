@@ -41,6 +41,10 @@ jobs:
           if ($utf8NoBom.GetPreamble().Length -ne 0) {
             throw 'Deployment UTF-8 encoder unexpectedly emits a BOM.'
           }
+          $deploySource = Get-Content -LiteralPath 'deploy/add/deploy.ps1' -Raw
+          if ($deploySource -match '(?m)&\s+docker[^\r\n]*2>\$null') {
+            throw 'Direct Docker stderr suppression is unsafe under Windows PowerShell 5.1.'
+          }
       - name: Scan the committed worktree for secrets
         run: >-
           docker run --rm
