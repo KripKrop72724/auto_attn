@@ -124,13 +124,36 @@ function Wait-Endpoint {
 
 function Protect-StateDirectory {
     param([Parameter(Mandatory = $true)][string] $Path)
+
+    $alreadyExists = Test-Path -LiteralPath $Path -PathType Container
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    if ($alreadyExists) {
+        # The runner deliberately has deployment-data access but may not have
+        # WRITE_DAC on a directory created by an administrator. Reapplying the
+        # ACL on every release can therefore leave a valid directory unusable.
+        # Existing directories are checked for effective write access below.
+        return
+    }
+
     & icacls.exe $Path /inheritance:r `
         /grant:r '*S-1-5-18:(OI)(CI)F' `
         '*S-1-5-32-544:(OI)(CI)F' `
-        '*S-1-5-20:(OI)(CI)M' /T /C | Out-Null
+        '*S-1-5-20:(OI)(CI)F' /T | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Could not protect deployment state directory $Path."
+    }
+}
+
+function Assert-StateDirectoryWritable {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $probe = Join-Path $Path ".add-write-probe-$PID-$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText($probe, "")
+    } catch {
+        throw "The runner cannot write deployment state directory $Path. Repair its ACL for NETWORK SERVICE before retrying."
+    } finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -222,134 +245,148 @@ $configRoot = Join-Path $stateRoot "config"
 $releaseRoot = Join-Path $stateRoot "releases"
 Protect-StateDirectory -Path $stateRoot
 foreach ($directory in @($backupRoot, $configRoot, $releaseRoot)) {
-    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    Protect-StateDirectory -Path $directory
+    Assert-StateDirectoryWritable -Path $directory
 }
 
 $protectedEnvironment = Join-Path $configRoot "add.env"
+$legacyPendingEnvironment = "$protectedEnvironment.new"
+if (Test-Path -LiteralPath $legacyPendingEnvironment -PathType Leaf) {
+    try {
+        Remove-Item -LiteralPath $legacyPendingEnvironment -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "A legacy pending environment could not be removed; it remains inside the protected config directory."
+    }
+}
 $previousEnvironmentBackup = $null
 if (Test-Path -LiteralPath $protectedEnvironment -PathType Leaf) {
     $previousEnvironmentBackup = Join-Path $backupRoot "add-env-$stamp.bak"
     Copy-Item -LiteralPath $protectedEnvironment -Destination $previousEnvironmentBackup -Force
 }
-$pendingEnvironment = "$protectedEnvironment.new"
-Copy-Item -LiteralPath ".env.add" -Destination $pendingEnvironment -Force
-
-Invoke-Docker -Arguments @("info") | Out-Null
-Invoke-Docker -Arguments ($compose + @("config", "--quiet"))
-
-$preApiImage = Get-ImageId -Image $apiImage
-$preWebImage = Get-ImageId -Image $webImage
-$rollbackApiTag = "state-life/add-api:rollback-$stamp"
-$rollbackWebTag = "state-life/add-web:rollback-$stamp"
-if ($preApiImage) { Invoke-Docker -Arguments @("tag", $preApiImage, $rollbackApiTag) }
-if ($preWebImage) { Invoke-Docker -Arguments @("tag", $preWebImage, $rollbackWebTag) }
-
-# Bring only durable dependencies online first, then take a binary-safe logical backup.
-Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"))
-$postgresContainer = Get-PostgresContainer
-if (-not $postgresContainer) { throw "PostgreSQL container was not created." }
-$preRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
-$databaseBackup = Join-Path $backupRoot "attendance-devices-$stamp.dump"
-$containerBackup = "/tmp/attendance-devices-$stamp.dump"
-Invoke-Docker -Arguments ($compose + @(
-    "exec", "-T", "postgres", "pg_dump", "-Fc", "-U", $dbUser,
-    "-d", $dbName, "-f", $containerBackup
-))
-Invoke-Docker -Arguments @("cp", "${postgresContainer}:$containerBackup", $databaseBackup)
-Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $containerBackup))
-if (-not (Test-Path -LiteralPath $databaseBackup) -or (Get-Item $databaseBackup).Length -lt 100) {
-    throw "The pre-deployment PostgreSQL backup is missing or invalid."
-}
+$pendingEnvironment = Join-Path $configRoot "add-env-$stamp.new"
 
 try {
-    Invoke-Docker -Arguments ($compose + @("build", "--pull"))
-    $applicationStarted = $true
-    Invoke-Docker -Arguments ($compose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "240"))
-    Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
-    Wait-Endpoint -Uri "http://127.0.0.1:8095/health/ui"
-    $postRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
-    if (-not $postRevision) { throw "Alembic schema revision is unavailable after deployment." }
+    Copy-Item -LiteralPath ".env.add" -Destination $pendingEnvironment
 
-    Move-Item -LiteralPath $pendingEnvironment -Destination $protectedEnvironment -Force
-    $environmentPromoted = $true
+    Invoke-Docker -Arguments @("info") | Out-Null
+    Invoke-Docker -Arguments ($compose + @("config", "--quiet"))
 
-    $metadata = [ordered]@{
-        deployed_at_utc = [DateTime]::UtcNow.ToString("o")
-        commit_sha = $actualSha
-        pre_revision = $preRevision
-        post_revision = $postRevision
-        database_backup = $databaseBackup
-        previous_api_image = $preApiImage
-        previous_web_image = $preWebImage
-        environment_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $protectedEnvironment).Hash
+    $preApiImage = Get-ImageId -Image $apiImage
+    $preWebImage = Get-ImageId -Image $webImage
+    $rollbackApiTag = "state-life/add-api:rollback-$stamp"
+    $rollbackWebTag = "state-life/add-web:rollback-$stamp"
+    if ($preApiImage) { Invoke-Docker -Arguments @("tag", $preApiImage, $rollbackApiTag) }
+    if ($preWebImage) { Invoke-Docker -Arguments @("tag", $preWebImage, $rollbackWebTag) }
+
+    # Bring only durable dependencies online first, then take a binary-safe logical backup.
+    Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"))
+    $postgresContainer = Get-PostgresContainer
+    if (-not $postgresContainer) { throw "PostgreSQL container was not created." }
+    $preRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
+    $databaseBackup = Join-Path $backupRoot "attendance-devices-$stamp.dump"
+    $containerBackup = "/tmp/attendance-devices-$stamp.dump"
+    Invoke-Docker -Arguments ($compose + @(
+        "exec", "-T", "postgres", "pg_dump", "-Fc", "-U", $dbUser,
+        "-d", $dbName, "-f", $containerBackup
+    ))
+    Invoke-Docker -Arguments @("cp", "${postgresContainer}:$containerBackup", $databaseBackup)
+    Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $containerBackup))
+    if (-not (Test-Path -LiteralPath $databaseBackup) -or (Get-Item $databaseBackup).Length -lt 100) {
+        throw "The pre-deployment PostgreSQL backup is missing or invalid."
     }
-    $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $releaseRoot "$stamp.json") -Encoding UTF8
-    Invoke-Docker -Arguments ($compose + @("ps"))
 
-    $cutoff = [DateTime]::UtcNow.AddDays(-14)
-    Get-ChildItem -LiteralPath $backupRoot -File | Where-Object {
-        $_.LastWriteTimeUtc -lt $cutoff
-    } | Remove-Item -Force
-    Write-Host "ADD commit $actualSha is healthy on 0.0.0.0:8095 and 0.0.0.0:8096."
-} catch {
-    $deploymentError = $_.Exception.Message
-    Write-Warning "Deployment failed; beginning bounded rollback."
     try {
-        Remove-Item -LiteralPath $pendingEnvironment -Force -ErrorAction SilentlyContinue
-        if ($environmentPromoted) {
-            if ($previousEnvironmentBackup) {
-                Copy-Item -LiteralPath $previousEnvironmentBackup -Destination $protectedEnvironment -Force
-            } else {
-                Remove-Item -LiteralPath $protectedEnvironment -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if (Test-Path -LiteralPath $protectedEnvironment -PathType Leaf) {
-            Copy-Item -LiteralPath $protectedEnvironment -Destination ".env.add" -Force
-            $rollbackEnvironment = Get-EnvironmentMap -Path ".env.add"
-            $dbUser = if ($rollbackEnvironment.ContainsKey("ADD_POSTGRES_USER")) {
-                $rollbackEnvironment["ADD_POSTGRES_USER"]
-            } else { "add_service" }
-            $dbName = if ($rollbackEnvironment.ContainsKey("ADD_POSTGRES_DB")) {
-                $rollbackEnvironment["ADD_POSTGRES_DB"]
-            } else { "attendance_devices" }
-        }
-        Invoke-Docker -Arguments ($compose + @("stop", "add-api", "add-web"))
-        $postFailureRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
-        $schemaMayHaveChanged = $applicationStarted -and (
-            -not $preRevision -or -not $postFailureRevision -or $postFailureRevision -ne $preRevision
-        )
-        if ($schemaMayHaveChanged) {
-            $postgresContainer = Get-PostgresContainer
-            if (-not $postgresContainer) { throw "Cannot restore PostgreSQL: container is unavailable." }
-            $rollbackDump = "/tmp/rollback-$stamp.dump"
-            Invoke-Docker -Arguments @("cp", $databaseBackup, "${postgresContainer}:$rollbackDump")
-            $terminateSql = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbName' AND pid <> pg_backend_pid();"
-            Invoke-Docker -Arguments ($compose + @(
-                "exec", "-T", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
-                "-U", $dbUser, "-d", "postgres", "-c", $terminateSql
-            ))
-            Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "dropdb", "-U", $dbUser, "--if-exists", $dbName))
-            Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "createdb", "-U", $dbUser, "-O", $dbUser, $dbName))
-            Invoke-Docker -Arguments ($compose + @(
-                "exec", "-T", "postgres", "pg_restore", "--exit-on-error",
-                "-U", $dbUser, "-d", $dbName, $rollbackDump
-            ))
-            Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $rollbackDump))
-        }
-        if (-not $preApiImage -or -not $preWebImage) {
-            Invoke-Docker -Arguments ($compose + @("down", "--remove-orphans"))
-            throw "No complete previous application image set exists; first deployment was stopped."
-        }
-        Invoke-Docker -Arguments @("tag", $rollbackApiTag, $apiImage)
-        Invoke-Docker -Arguments @("tag", $rollbackWebTag, $webImage)
-        Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans"))
+        Invoke-Docker -Arguments ($compose + @("build", "--pull"))
+        $applicationStarted = $true
+        Invoke-Docker -Arguments ($compose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "240"))
         Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
-        Wait-Endpoint -Uri "http://127.0.0.1:8095/"
-        throw "Deployment failed and the previous release was restored: $deploymentError"
-    } catch {
-        if ($_.Exception.Message -like "Deployment failed and the previous release was restored:*") {
-            throw
+        Wait-Endpoint -Uri "http://127.0.0.1:8095/health/ui"
+        $postRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
+        if (-not $postRevision) { throw "Alembic schema revision is unavailable after deployment." }
+
+        Move-Item -LiteralPath $pendingEnvironment -Destination $protectedEnvironment -Force
+        $environmentPromoted = $true
+
+        $metadata = [ordered]@{
+            deployed_at_utc = [DateTime]::UtcNow.ToString("o")
+            commit_sha = $actualSha
+            pre_revision = $preRevision
+            post_revision = $postRevision
+            database_backup = $databaseBackup
+            previous_api_image = $preApiImage
+            previous_web_image = $preWebImage
+            environment_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $protectedEnvironment).Hash
         }
-        throw "Deployment failed ($deploymentError); rollback also failed: $($_.Exception.Message)"
+        $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $releaseRoot "$stamp.json") -Encoding UTF8
+        Invoke-Docker -Arguments ($compose + @("ps"))
+
+        $cutoff = [DateTime]::UtcNow.AddDays(-14)
+        Get-ChildItem -LiteralPath $backupRoot -File | Where-Object {
+            $_.LastWriteTimeUtc -lt $cutoff
+        } | Remove-Item -Force
+        Write-Host "ADD commit $actualSha is healthy on 0.0.0.0:8095 and 0.0.0.0:8096."
+    } catch {
+        $deploymentError = $_.Exception.Message
+        Write-Warning "Deployment failed; beginning bounded rollback."
+        try {
+            Remove-Item -LiteralPath $pendingEnvironment -Force -ErrorAction SilentlyContinue
+            if ($environmentPromoted) {
+                if ($previousEnvironmentBackup) {
+                    Copy-Item -LiteralPath $previousEnvironmentBackup -Destination $protectedEnvironment -Force
+                } else {
+                    Remove-Item -LiteralPath $protectedEnvironment -Force -ErrorAction SilentlyContinue
+                }
+            }
+            if (Test-Path -LiteralPath $protectedEnvironment -PathType Leaf) {
+                Copy-Item -LiteralPath $protectedEnvironment -Destination ".env.add" -Force
+                $rollbackEnvironment = Get-EnvironmentMap -Path ".env.add"
+                $dbUser = if ($rollbackEnvironment.ContainsKey("ADD_POSTGRES_USER")) {
+                    $rollbackEnvironment["ADD_POSTGRES_USER"]
+                } else { "add_service" }
+                $dbName = if ($rollbackEnvironment.ContainsKey("ADD_POSTGRES_DB")) {
+                    $rollbackEnvironment["ADD_POSTGRES_DB"]
+                } else { "attendance_devices" }
+            }
+            Invoke-Docker -Arguments ($compose + @("stop", "add-api", "add-web"))
+            $postFailureRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
+            $schemaMayHaveChanged = $applicationStarted -and (
+                -not $preRevision -or -not $postFailureRevision -or $postFailureRevision -ne $preRevision
+            )
+            if ($schemaMayHaveChanged) {
+                $postgresContainer = Get-PostgresContainer
+                if (-not $postgresContainer) { throw "Cannot restore PostgreSQL: container is unavailable." }
+                $rollbackDump = "/tmp/rollback-$stamp.dump"
+                Invoke-Docker -Arguments @("cp", $databaseBackup, "${postgresContainer}:$rollbackDump")
+                $terminateSql = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbName' AND pid <> pg_backend_pid();"
+                Invoke-Docker -Arguments ($compose + @(
+                    "exec", "-T", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
+                    "-U", $dbUser, "-d", "postgres", "-c", $terminateSql
+                ))
+                Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "dropdb", "-U", $dbUser, "--if-exists", $dbName))
+                Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "createdb", "-U", $dbUser, "-O", $dbUser, $dbName))
+                Invoke-Docker -Arguments ($compose + @(
+                    "exec", "-T", "postgres", "pg_restore", "--exit-on-error",
+                    "-U", $dbUser, "-d", $dbName, $rollbackDump
+                ))
+                Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $rollbackDump))
+            }
+            if (-not $preApiImage -or -not $preWebImage) {
+                Invoke-Docker -Arguments ($compose + @("down", "--remove-orphans"))
+                throw "No complete previous application image set exists; first deployment was stopped."
+            }
+            Invoke-Docker -Arguments @("tag", $rollbackApiTag, $apiImage)
+            Invoke-Docker -Arguments @("tag", $rollbackWebTag, $webImage)
+            Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans"))
+            Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
+            Wait-Endpoint -Uri "http://127.0.0.1:8095/"
+            throw "Deployment failed and the previous release was restored: $deploymentError"
+        } catch {
+            if ($_.Exception.Message -like "Deployment failed and the previous release was restored:*") {
+                throw
+            }
+            throw "Deployment failed ($deploymentError); rollback also failed: $($_.Exception.Message)"
+        }
     }
+} finally {
+    Remove-Item -LiteralPath $pendingEnvironment -Force -ErrorAction SilentlyContinue
 }

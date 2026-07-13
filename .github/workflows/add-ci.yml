@@ -45,6 +45,15 @@ jobs:
           if ($deploySource -match '(?m)&\s+docker[^\r\n]*2>\$null') {
             throw 'Direct Docker stderr suppression is unsafe under Windows PowerShell 5.1.'
           }
+          if ($deploySource -notmatch 'function Assert-StateDirectoryWritable') {
+            throw 'Deployment state directories must be write-tested before storing secrets or backups.'
+          }
+          if ($deploySource -notmatch [regex]::Escape('$pendingEnvironment = Join-Path $configRoot "add-env-$stamp.new"')) {
+            throw 'The pending protected environment must use a release-unique filename.'
+          }
+          if ($deploySource -match [regex]::Escape("'*S-1-5-20:(OI)(CI)M'")) {
+            throw 'The restricted deployment principal must be able to maintain its protected state ACL.'
+          }
       - name: Scan the committed worktree for secrets
         run: >-
           docker run --rm
