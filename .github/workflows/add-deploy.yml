@@ -159,17 +159,28 @@ jobs:
           }
 
           $probe = @'
-          import httpx
+          import urllib.error
+          import urllib.request
+
           target = "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures"
+          request = urllib.request.Request(target, method="OPTIONS")
           try:
-              response = httpx.options(target, timeout=12)
-              print(f"HTTP_{response.status_code}")
+              with urllib.request.urlopen(request, timeout=12) as response:
+                  print(f"HTTP_{response.status}")
+          except urllib.error.HTTPError as exc:
+              print(f"HTTP_{exc.code}")
           except Exception as exc:
-              print(f"ERROR_{type(exc).__name__}")
+              reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+              print(f"ERROR_{type(reason).__name__}")
           '@
+          # Windows PowerShell 5.1 can split or requote multiline native-command
+          # arguments. Encode the script so python -c receives one deterministic
+          # ASCII argument without exposing credentials or response data.
+          $probeEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
+          $probeLauncher = "import base64;exec(base64.b64decode('$probeEncoded'))"
           $arguments = @(
             'compose', '--env-file', '.env.add', '-f', 'docker-compose.add.yml',
-            'exec', '-T', 'add-api', 'python', '-c', $probe
+            'exec', '-T', 'add-api', 'python', '-c', $probeLauncher
           )
           $previousPreference = $ErrorActionPreference
           try {
