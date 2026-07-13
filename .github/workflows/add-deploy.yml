@@ -128,31 +128,37 @@ jobs:
       run:
         shell: powershell
     steps:
-      - name: Verify public TLS, UI, API, and proxy routing with bounded retries
+      - name: Verify production-origin TLS, UI, API, and proxy routing
         run: |
           $ErrorActionPreference = 'Stop'
           $targets = @(
-            @{ Uri = 'https://autoattn.slichealth.com/health/live'; Contains = '"ok":true' },
-            @{ Uri = 'https://autoattn.slichealth.com/health/ready'; Contains = '"database":true' },
-            @{ Uri = 'https://attendancedevices.slichealth.com/health/ui'; Contains = '"ok":true' },
-            @{ Uri = 'https://attendancedevices.slichealth.com/'; Contains = 'Attendance Device Dashboard' }
+            @{ Host = 'autoattn.slichealth.com'; Uri = 'https://autoattn.slichealth.com/health/live'; Contains = '"ok":true' },
+            @{ Host = 'autoattn.slichealth.com'; Uri = 'https://autoattn.slichealth.com/health/ready'; Contains = '"database":true' },
+            @{ Host = 'attendancedevices.slichealth.com'; Uri = 'https://attendancedevices.slichealth.com/health/ui'; Contains = '"ok":true' },
+            @{ Host = 'attendancedevices.slichealth.com'; Uri = 'https://attendancedevices.slichealth.com/'; Contains = 'Attendance Device Dashboard' }
           )
           foreach ($target in $targets) {
             $failure = $null
-            for ($attempt = 1; $attempt -le 12; $attempt++) {
+            for ($attempt = 1; $attempt -le 4; $attempt++) {
               try {
-                $response = Invoke-WebRequest -UseBasicParsing -Uri $target.Uri -TimeoutSec 15
-                if ([int]$response.StatusCode -ne 200) {
-                  throw "Unexpected HTTP status $($response.StatusCode)"
+                # The public edge does not support NAT hairpinning from the
+                # production server. Connect to the local TLS origin while
+                # retaining the real hostname for SNI and certificate checks.
+                $resolution = "$($target.Host):443:127.0.0.1"
+                $response = @(& curl.exe --fail --silent --show-error `
+                  --connect-timeout 5 --max-time 15 --resolve $resolution $target.Uri 2>&1)
+                if ($LASTEXITCODE -ne 0) {
+                  throw (($response | ForEach-Object { "$_" }) -join "`n")
                 }
-                if ($response.Content -notmatch [regex]::Escape($target.Contains)) {
+                $content = ($response | ForEach-Object { "$_" }) -join "`n"
+                if ($content -notmatch [regex]::Escape($target.Contains)) {
                   throw 'Expected response marker is missing.'
                 }
                 $failure = $null
                 break
               } catch {
                 $failure = $_.Exception.Message
-                if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
+                if ($attempt -lt 4) { Start-Sleep -Seconds 5 }
               }
             }
             if ($failure) {
