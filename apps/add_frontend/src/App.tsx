@@ -485,9 +485,14 @@ function UserOperationDialog({
   const [confirmation, setConfirmation] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const conflictRequiresCnic = Boolean(
+    state.mode === 'edit' && user?.identity_conflict_code,
+  )
   const preview = cnic
     ? buildMachinePreview(displayName, cnic, shiftWorker)
-    : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
+    : conflictRequiresCnic
+      ? 'Enter the corrected CNIC to generate a safe terminal preview.'
+      : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -495,6 +500,12 @@ function UserOperationDialog({
     if (state.mode === 'create') {
       const validation = validateUserDraft({ displayName, cnic, password, userIdOverride })
       if (validation) return setError(validation)
+    } else if (state.mode === 'edit' && !displayName.trim()) {
+      return setError('Full name is required.')
+    } else if (state.mode === 'edit' && conflictRequiresCnic && !cnic) {
+      return setError('A replacement CNIC is required to resolve this identity conflict.')
+    } else if (state.mode === 'edit' && cnic && !/^\d{13}$/.test(cnic)) {
+      return setError('CNIC must contain exactly 13 digits.')
     } else if (!password) {
       return setError('Password confirmation is required.')
     } else if (state.mode === 'delete' && !confirmationMatches(confirmation, state.user)) {
@@ -583,12 +594,12 @@ function UserOperationDialog({
           <>
             <div className="form-grid">
               <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} /></label>
-              <label>{state.mode === 'edit' ? 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
+              <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={conflictRequiresCnic} /></label>
               {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, 24))} /></label>}
               {state.mode === 'edit' && <label>Permanent role<select value={privilege} onChange={(event) => setPrivilege(Number(event.target.value) as 0 | 14)}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select></label>}
             </div>
             <label className="check-field"><input type="checkbox" checked={shiftWorker} onChange={(event) => setShiftWorker(event.target.checked)} /><span><strong>Shift worker</strong><small>Adds the -S- identity marker used for raw-punch handling.</small></span></label>
-            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : 'Stored CNIC remains write-only.'}</small></div>
+            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : conflictRequiresCnic ? 'Correction is required before this update can be queued.' : 'Stored CNIC remains write-only.'}</small></div>
           </>
         )}
         {state.mode === 'delete' && (
@@ -717,7 +728,7 @@ function UsersView({
           <section className="panel">
             <div className="toolbar user-toolbar">
               <label className="search-field"><span className="sr-only">Search users</span><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name, user ID, or exact CNIC" /></label>
-              <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing</option></select></label>
+              <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing or conflicted</option><option value="CONFLICT">CNIC conflict</option></select></label>
               <label><span className="sr-only">Role</span><select value={role} onChange={(event) => setRole(event.target.value)}><option value="ALL">All roles</option><option value="0">Regular users</option><option value="14">Administrators</option></select></label>
               <button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh users</button>
             </div>
@@ -725,8 +736,8 @@ function UsersView({
               <div className="user-table-head"><span>Identity</span><span>Terminal record</span><span>Role & shift</span><span>Last sync</span><span>Actions</span></div>
               {loading && <div className="empty-state compact"><Icon name="refresh" /><p>Reading the selected terminal user view…</p></div>}
               {!loading && rows.map((user) => (
-                <article key={user.user_key} className={`user-row ${user.identity_complete ? '' : 'identity-missing'}`}>
-                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
+                <article key={user.user_key} className={`user-row ${user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`}>
+                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? `${user.cnic_masked || 'Masked CNIC'} · Duplicate CNIC · correction required` : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
                   <div><strong>User {user.user_id}</strong><small>UID {user.uid} · v{user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
                   <div><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} /><small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small></div>
                   <div><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>

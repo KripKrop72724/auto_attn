@@ -79,6 +79,14 @@ function Write-DockerFailureDiagnostics {
             '(?i)(postgres(?:ql)?(?:\+psycopg)?://[^:\s/]+:)[^@\s]+(@)',
             '$1***$2'
         )
+        # Keyed lookup values, event fingerprints, and image digests are not
+        # useful in a public deployment log. Redact every standalone SHA-256
+        # shaped value before the repository enters its guarded public window.
+        $material = [regex]::Replace(
+            $material,
+            '(?i)\b[a-f0-9]{64}\b',
+            '<redacted-hash>'
+        )
         Write-Host $material
     } finally {
         $ErrorActionPreference = $previousPreference

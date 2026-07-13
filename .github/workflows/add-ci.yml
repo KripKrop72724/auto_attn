@@ -57,6 +57,13 @@ jobs:
           if ($deploySource -notmatch 'function Write-DockerFailureDiagnostics') {
             throw 'Failed containers must be logged before transactional rollback removes them.'
           }
+          if ($deploySource -notmatch [regex]::Escape("'(?i)\b[a-f0-9]{64}\b'")) {
+            throw 'Failure diagnostics must redact keyed lookup hashes and SHA-256 material.'
+          }
+          $deployWorkflowSource = Get-Content -LiteralPath '.github/workflows/add-deploy.yml' -Raw
+          if ($deployWorkflowSource -match '(?m)^\s*docker compose[^\r\n]*\slogs(?:\s|$)') {
+            throw 'The deploy workflow must not bypass deploy.ps1 log redaction.'
+          }
           if ($deploySource -notmatch 'A failed first build can leave production-named tags') {
             throw 'Rollback images must be gated by completed-release metadata.'
           }
@@ -132,6 +139,15 @@ jobs:
           assert "add_onboarding_nonces" in inspector.get_table_names()
           assert "add_identity_tombstones" in inspector.get_table_names()
           PY
+      - name: Prove legacy duplicate CNIC migration preserves users and punches
+        run: |
+          python scripts/verify_duplicate_cnic_migration.py reset
+          alembic -c apps/add_backend/alembic.ini upgrade 20260710_0001
+          python scripts/verify_duplicate_cnic_migration.py prepare
+          alembic -c apps/add_backend/alembic.ini upgrade head
+          python scripts/verify_duplicate_cnic_migration.py verify
+          alembic -c apps/add_backend/alembic.ini current
+          alembic -c apps/add_backend/alembic.ini check
       - name: Build Python distribution
         run: python -m build
 

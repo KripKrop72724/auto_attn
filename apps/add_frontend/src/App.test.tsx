@@ -69,6 +69,7 @@ const user: DeviceUser = {
   cnic_masked: maskedCnic,
   cnic_available: true,
   identity_complete: true,
+  identity_conflict_code: null,
   shift_worker: false,
   privilege: 0,
   present: true,
@@ -78,6 +79,12 @@ const user: DeviceUser = {
   machine_name_preview: 'Ayesha-*****-*******-1',
   current_command_state: null,
   read_only: false,
+}
+
+const conflictedUser: DeviceUser = {
+  ...user,
+  identity_complete: false,
+  identity_conflict_code: 'DUPLICATE_CNIC',
 }
 
 class EventSourceStub {
@@ -93,31 +100,31 @@ const response = (body: unknown, status = 200) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
+const fetchStub = (users: DeviceUser[] = [user]) =>
+  vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path.includes('/api/v1/auth/session')) {
+      return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
+    }
+    if (path.includes('/api/v1/overview')) {
+      return response({ total: 1, online: 1, open_alerts: 0, active_leases: 0 })
+    }
+    if (path.includes('/logs?')) return response({ rows: [] })
+    if (path.includes('/connectivity?')) return response({ rows: [] })
+    if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
+    if (path.includes('/api/v1/devices') && !path.includes('/users')) {
+      return response({ rows: [device] })
+    }
+    if (path.includes('/api/v2/devices/connector-one/users')) {
+      return response({ rows: users, next_cursor: null, device })
+    }
+    return response({ rows: [] })
+  })
+
 describe('State Life ADD interface', () => {
   beforeEach(() => {
     vi.stubGlobal('EventSource', EventSourceStub)
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: RequestInfo | URL) => {
-        const path = String(input)
-        if (path.includes('/api/v1/auth/session')) {
-          return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
-        }
-        if (path.includes('/api/v1/overview')) {
-          return response({ total: 1, online: 1, open_alerts: 0, active_leases: 0 })
-        }
-        if (path.includes('/logs?')) return response({ rows: [] })
-        if (path.includes('/connectivity?')) return response({ rows: [] })
-        if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
-        if (path.includes('/api/v1/devices') && !path.includes('/users')) {
-          return response({ rows: [device] })
-        }
-        if (path.includes('/api/v2/devices/connector-one/users')) {
-          return response({ rows: [user], next_cursor: null, device })
-        }
-        return response({ rows: [] })
-      }),
-    )
+    vi.stubGlobal('fetch', fetchStub())
   })
 
   afterEach(() => {
@@ -145,6 +152,24 @@ describe('State Life ADD interface', () => {
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(screen.getByRole('button', { name: /edit ayesha fatima/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /delete ayesha fatima/i })).toBeTruthy()
+  })
+
+  it('marks duplicate CNIC identities with text and a non-color-only pattern', async () => {
+    vi.stubGlobal('fetch', fetchStub([conflictedUser]))
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    const warning = await screen.findByText(/duplicate cnic · correction required/i)
+    expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
+    expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
+    expect(document.body.textContent).not.toContain(fullCnic)
+    fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
+    expect(
+      screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),
+    ).toBeTruthy()
   })
 
   it('communicates every state with text, icon, and border pattern', () => {

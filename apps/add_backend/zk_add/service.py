@@ -69,6 +69,7 @@ ORACLE_ALLOWED_CAPTURE_TYPES = {
     "DUMP_STARTUP",
     "MANUAL_REPROCESS",
 }
+IDENTITY_CONFLICT_DUPLICATE_CNIC = "DUPLICATE_CNIC"
 
 
 def ensure_site(session: Session, zone_id: str, zone_name: str) -> Site:
@@ -472,6 +473,7 @@ def replace_user_snapshot(
             row.lifecycle_state = "STAGING"
     session.flush()
     seen: set[str] = set()
+    identity_changed: list[DeviceUser] = []
     observed_at = ensure_utc(snapshot.observed_at)
     updated_at = utc_now()
     for incoming in snapshot.users:
@@ -515,12 +517,28 @@ def replace_user_snapshot(
             row.display_name = parsed.display_name
         if parsed.cnic:
             previous_hash = row.cnic_lookup_hash
+            next_hash = cnic_lookup(parsed.cnic)
+            # Exclude every participant from the partial unique index before
+            # assigning a colliding hash. This also handles older terminals
+            # that legitimately report the same CNIC on multiple user IDs.
+            conflicting_rows = [
+                candidate
+                for candidate in rows_by_uid.values()
+                if candidate is not row
+                and candidate.lifecycle_state in {"ACTIVE", "STAGING"}
+                and candidate.cnic_lookup_hash == next_hash
+            ]
+            if conflicting_rows:
+                row.identity_conflict_code = IDENTITY_CONFLICT_DUPLICATE_CNIC
+                for conflicting_row in conflicting_rows:
+                    conflicting_row.identity_conflict_code = IDENTITY_CONFLICT_DUPLICATE_CNIC
+                session.flush()
             row.cnic_encrypted = encrypt_cnic(parsed.cnic)
-            row.cnic_lookup_hash = cnic_lookup(parsed.cnic)
+            row.cnic_lookup_hash = next_hash
             row.cnic_last4 = parsed.cnic[-4:]
             row.shift_worker = parsed.shift_worker
-            if previous_hash != row.cnic_lookup_hash:
-                enrich_undelivered_attendance(session, zkt=zkt, user=row)
+            if previous_hash != next_hash:
+                identity_changed.append(row)
         row.privilege = incoming.privilege
         row.card = incoming.card
         row.present = True
@@ -566,8 +584,85 @@ def replace_user_snapshot(
             message="The connector reported a partial user snapshot; terminal writes are disabled.",
             details={"snapshot_id": snapshot.snapshot_id, "rows_received": len(snapshot.users)},
         )
+    resolved_conflicts = reconcile_device_user_identity_conflicts(
+        session, connector=connector, zkt=zkt
+    )
+    enrichable = {
+        row.id: row
+        for row in [*identity_changed, *resolved_conflicts]
+        if row.id is not None
+        and row.lifecycle_state == "ACTIVE"
+        and row.identity_conflict_code is None
+    }
+    for row in enrichable.values():
+        enrich_undelivered_attendance(session, zkt=zkt, user=row)
     zkt.updated_at = utc_now()
     return len(snapshot.users)
+
+
+def reconcile_device_user_identity_conflicts(
+    session: Session, *, connector: Connector, zkt: ZKTDevice
+) -> list[DeviceUser]:
+    """Quarantine duplicate active CNICs without deleting identity or punch data."""
+
+    with session.no_autoflush:
+        rows = list(
+            session.scalars(
+                select(DeviceUser).where(
+                    DeviceUser.zkt_device_id == zkt.id,
+                    DeviceUser.lifecycle_state == "ACTIVE",
+                )
+            ).all()
+        )
+    groups: dict[str, list[DeviceUser]] = {}
+    for row in rows:
+        if row.cnic_lookup_hash:
+            groups.setdefault(row.cnic_lookup_hash, []).append(row)
+
+    duplicate_rows = {
+        row.id: row
+        for group in groups.values()
+        if len(group) > 1
+        for row in group
+        if row.id is not None
+    }
+    previously_conflicted = {
+        row.id
+        for row in rows
+        if row.id is not None
+        and row.identity_conflict_code == IDENTITY_CONFLICT_DUPLICATE_CNIC
+    }
+
+    # Phase one excludes every duplicate from the partial unique index. Only
+    # after that flush is it safe to clear conflicts that became singletons.
+    for row in duplicate_rows.values():
+        row.identity_conflict_code = IDENTITY_CONFLICT_DUPLICATE_CNIC
+    session.flush()
+    for row in rows:
+        if (
+            row.id not in duplicate_rows
+            and row.identity_conflict_code == IDENTITY_CONFLICT_DUPLICATE_CNIC
+        ):
+            row.identity_conflict_code = None
+    session.flush()
+
+    if duplicate_rows:
+        upsert_alert(
+            session,
+            connector,
+            code="DUPLICATE_USER_CNIC",
+            severity="HIGH",
+            message="Multiple active terminal users share a CNIC; correction is required.",
+            details={"affected_users": len(duplicate_rows)},
+        )
+    else:
+        resolve_alert(session, connector, code="DUPLICATE_USER_CNIC")
+
+    return [
+        row
+        for row in rows
+        if row.id in previously_conflicted and row.identity_conflict_code is None
+    ]
 
 
 def persist_identity_tombstone(
@@ -589,9 +684,11 @@ def persist_identity_tombstone(
         uid=user.uid,
         user_id=user.user_id,
         display_name_encrypted=encrypt_text(user.display_name) or "",
-        cnic_encrypted=user.cnic_encrypted,
-        cnic_lookup_hash=user.cnic_lookup_hash,
-        cnic_last4=user.cnic_last4,
+        cnic_encrypted=(user.cnic_encrypted if user.identity_conflict_code is None else None),
+        cnic_lookup_hash=(
+            user.cnic_lookup_hash if user.identity_conflict_code is None else None
+        ),
+        cnic_last4=user.cnic_last4 if user.identity_conflict_code is None else None,
         shift_worker=user.shift_worker,
         privilege=user.privilege,
     )
@@ -664,11 +761,20 @@ def ingest_attendance(
                 )
                 .order_by(IdentityTombstone.id.desc())
             )
-        cnic = decrypt_cnic(user.cnic_encrypted) if user else parsed.cnic
+        usable_user_identity = bool(user and user.identity_conflict_code is None)
+        cnic = (
+            decrypt_cnic(user.cnic_encrypted)
+            if usable_user_identity and user
+            else (parsed.cnic if user is None else None)
+        )
         display_name = user.display_name if user else parsed.display_name or incoming.raw_name
-        cnic_encrypted = user.cnic_encrypted if user else encrypt_cnic(cnic)
-        cnic_hash = user.cnic_lookup_hash if user else cnic_lookup(cnic)
-        cnic_last4 = user.cnic_last4 if user else (cnic[-4:] if cnic else None)
+        cnic_encrypted = user.cnic_encrypted if usable_user_identity and user else encrypt_cnic(cnic)
+        cnic_hash = user.cnic_lookup_hash if usable_user_identity and user else cnic_lookup(cnic)
+        cnic_last4 = (
+            user.cnic_last4
+            if usable_user_identity and user
+            else (cnic[-4:] if cnic else None)
+        )
         shift_worker = user.shift_worker if user else parsed.shift_worker
         if not cnic and tombstone is not None:
             cnic_encrypted = tombstone.cnic_encrypted
@@ -1155,6 +1261,8 @@ def update_device_user_command(
         raise ValueError("User changed since it was loaded. Refresh and retry.")
     ensure_no_active_user_operation(session, zkt=zkt, user=user)
     current_cnic = decrypt_cnic(user.cnic_encrypted)
+    if user.identity_conflict_code and cnic is None:
+        raise ValueError("A replacement CNIC is required to resolve this identity conflict.")
     next_cnic = normalize_cnic(cnic) if cnic is not None else current_cnic
     if next_cnic is None:
         raise ValueError("CNIC cannot be cleared.")
@@ -1573,6 +1681,7 @@ def apply_user_command_terminal_state(
         if command.command_type == "CREATE_USER" and user.lifecycle_state == "PENDING":
             user.lifecycle_state = "CREATE_FAILED"
         return
+    zkt = session.get(ZKTDevice, user.zkt_device_id)
     if command.command_type == "CREATE_USER":
         user.present = True
         user.lifecycle_state = "ACTIVE"
@@ -1587,15 +1696,25 @@ def apply_user_command_terminal_state(
         user.privilege = int(desired["privilege"])
         user.machine_name_encrypted = encrypt_text(desired["machine_name"])
         user.row_version += 1
-        zkt = session.get(ZKTDevice, user.zkt_device_id)
-        if zkt:
-            enrich_undelivered_attendance(session, zkt=zkt, user=user)
     elif command.command_type == "DELETE_USER":
         user.present = False
         user.lifecycle_state = "DELETED"
         user.deleted_at = utc_now()
         user.deleted_by = command.actor
         user.row_version += 1
+    if zkt and command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"}:
+        resolved_conflicts = reconcile_device_user_identity_conflicts(
+            session, connector=zkt.connector, zkt=zkt
+        )
+        candidates = [*resolved_conflicts]
+        if command.command_type in {"CREATE_USER", "UPDATE_USER"}:
+            candidates.append(user)
+        for candidate in {row.id: row for row in candidates if row.id is not None}.values():
+            if (
+                candidate.lifecycle_state == "ACTIVE"
+                and candidate.identity_conflict_code is None
+            ):
+                enrich_undelivered_attendance(session, zkt=zkt, user=candidate)
 
 
 def create_admin_lease(

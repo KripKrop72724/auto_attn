@@ -268,6 +268,7 @@ input::placeholder { color: #777777; }
 .user-table-head { min-height: 46px; padding: 0 20px; border-bottom: 1px solid var(--line); color: var(--muted); background: #fafafa; font-size: 12px; font-weight: 750; text-transform: uppercase; }
 .user-row { min-height: 96px; padding: 13px 20px; border-bottom: 1px solid #e8e8e8; }
 .user-row.identity-missing { border-left: 5px dashed #737373; }
+.user-row.identity-conflict { border-left: 6px double #525252; background-image: repeating-linear-gradient(135deg, transparent, transparent 10px, rgba(0,0,0,.025) 10px, rgba(0,0,0,.025) 20px); }
 .user-row > div { min-width: 0; }
 .user-row strong, .user-row small, .user-row code { display: block; }
 .user-row strong { margin-bottom: 5px; font-size: 14px; }

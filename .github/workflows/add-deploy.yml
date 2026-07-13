@@ -106,12 +106,13 @@ jobs:
       - name: Transactionally deploy ports 8095 and 8096
         run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
 
-      - name: Show bounded diagnostics on failure
+      - name: Show bounded container state on failure
         if: failure()
         run: |
           if (Test-Path -LiteralPath '.env.add') {
-            docker compose --env-file .env.add -f docker-compose.add.yml ps
-            docker compose --env-file .env.add -f docker-compose.add.yml logs --tail=250
+            # deploy.ps1 already emits the only bounded, secret-redacted log
+            # sample before rollback. Never bypass that sanitizer here.
+            docker compose --env-file .env.add -f docker-compose.add.yml ps -a
           }
 
       - name: Remove workspace secret copy

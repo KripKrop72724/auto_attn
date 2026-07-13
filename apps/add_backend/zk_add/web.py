@@ -526,9 +526,19 @@ def list_device_users_v2(
     if privilege is not None:
         statement = statement.where(DeviceUser.privilege == privilege)
     if identity == "COMPLETE":
-        statement = statement.where(DeviceUser.cnic_lookup_hash != None)  # noqa: E711
+        statement = statement.where(
+            DeviceUser.cnic_lookup_hash != None,  # noqa: E711
+            DeviceUser.identity_conflict_code == None,  # noqa: E711
+        )
     elif identity == "MISSING":
-        statement = statement.where(DeviceUser.cnic_lookup_hash == None)  # noqa: E711
+        statement = statement.where(
+            or_(
+                DeviceUser.cnic_lookup_hash == None,  # noqa: E711
+                DeviceUser.identity_conflict_code != None,  # noqa: E711
+            )
+        )
+    elif identity == "CONFLICT":
+        statement = statement.where(DeviceUser.identity_conflict_code != None)  # noqa: E711
     rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
     return {
         "rows": [serialize_user(row, zkt=zkt) for row in rows[:limit]],
@@ -1403,7 +1413,10 @@ def serialize_user(row: DeviceUser, *, zkt: ZKTDevice | None = None) -> dict:
         "display_name": row.display_name,
         "cnic_masked": mask_cnic(cnic),
         "cnic_available": bool(cnic),
-        "identity_complete": bool(cnic and row.display_name),
+        "identity_complete": bool(
+            cnic and row.display_name and row.identity_conflict_code is None
+        ),
+        "identity_conflict_code": row.identity_conflict_code,
         "shift_worker": row.shift_worker,
         "privilege": row.privilege,
         "present": row.present,

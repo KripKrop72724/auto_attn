@@ -80,6 +80,7 @@ export interface DeviceUser {
   cnic_masked: string | null
   cnic_available: boolean
   identity_complete: boolean
+  identity_conflict_code: string | null
   shift_worker: boolean
   privilege: 0 | 14
   present: boolean

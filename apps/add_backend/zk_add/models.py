@@ -196,10 +196,12 @@ class DeviceUser(Base):
             "cnic_lookup_hash",
             unique=True,
             postgresql_where=text(
-                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
+                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL "
+                "AND identity_conflict_code IS NULL"
             ),
             sqlite_where=text(
-                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
+                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL "
+                "AND identity_conflict_code IS NULL"
             ),
         ),
     )
@@ -216,6 +218,7 @@ class DeviceUser(Base):
     cnic_encrypted: Mapped[str | None] = mapped_column(Text)
     cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     cnic_last4: Mapped[str | None] = mapped_column(String(4))
+    identity_conflict_code: Mapped[str | None] = mapped_column(String(50), index=True)
     shift_worker: Mapped[bool] = mapped_column(Boolean, default=False)
     privilege: Mapped[int] = mapped_column(Integer, default=0, index=True)
     card: Mapped[int | None] = mapped_column(BigInteger)

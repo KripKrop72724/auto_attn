@@ -116,6 +116,7 @@ def upgrade() -> None:
     _add("add_device_users", sa.Column("update_audit_id", sa.Integer()))
     _add("add_device_users", sa.Column("delete_audit_id", sa.Integer()))
     _add("add_device_users", sa.Column("current_command_id", sa.Integer()))
+    _add("add_device_users", sa.Column("identity_conflict_code", sa.String(50)))
     fernet = _fernet()
     if "raw_name" in user_columns:
         rows = bind.execute(
@@ -172,16 +173,66 @@ def upgrade() -> None:
             unique=True,
             postgresql_where=text("lifecycle_state = 'ACTIVE'"),
         )
-    if "uq_add_user_device_cnic_active" not in indexes:
-        op.create_index(
-            "uq_add_user_device_cnic_active",
-            "add_device_users",
-            ["zkt_device_id", "cnic_lookup_hash"],
-            unique=True,
-            postgresql_where=text(
-                "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
-            ),
+    # Legacy terminals can contain multiple active records carrying the same
+    # CNIC. Preserve every user and punch, quarantine the ambiguous identities,
+    # and allow operators to correct them from ADD. The partial unique index
+    # then protects only identities that are known to be unambiguous.
+    if "uq_add_user_device_cnic_active" in _indexes("add_device_users"):
+        op.drop_index("uq_add_user_device_cnic_active", table_name="add_device_users")
+    bind.execute(
+        text(
+            "UPDATE add_device_users SET identity_conflict_code = NULL "
+            "WHERE lifecycle_state = 'ACTIVE'"
         )
+    )
+    bind.execute(
+        text(
+            "WITH duplicate_cnic AS ("
+            " SELECT zkt_device_id, cnic_lookup_hash"
+            " FROM add_device_users"
+            " WHERE lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL"
+            " GROUP BY zkt_device_id, cnic_lookup_hash HAVING COUNT(*) > 1"
+            ") UPDATE add_device_users AS users"
+            " SET identity_conflict_code = 'DUPLICATE_CNIC'"
+            " FROM duplicate_cnic AS duplicates"
+            " WHERE users.zkt_device_id = duplicates.zkt_device_id"
+            " AND users.cnic_lookup_hash = duplicates.cnic_lookup_hash"
+            " AND users.lifecycle_state = 'ACTIVE'"
+        )
+    )
+    bind.execute(
+        text(
+            "INSERT INTO add_device_alerts ("
+            " connector_id, code, severity, state, message, details, first_seen_at, last_seen_at"
+            ") SELECT devices.connector_id, 'DUPLICATE_USER_CNIC', 'HIGH', 'OPEN',"
+            " 'Multiple active terminal users share a CNIC; correction is required.',"
+            " json_build_object('affected_users', COUNT(*)), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+            " FROM add_device_users AS users"
+            " JOIN add_zkt_devices AS devices ON devices.id = users.zkt_device_id"
+            " WHERE users.identity_conflict_code = 'DUPLICATE_CNIC'"
+            " AND NOT EXISTS ("
+            "  SELECT 1 FROM add_device_alerts AS alerts"
+            "  WHERE alerts.connector_id = devices.connector_id"
+            "  AND alerts.code = 'DUPLICATE_USER_CNIC' AND alerts.state = 'OPEN'"
+            " ) GROUP BY devices.connector_id"
+        )
+    )
+    if "ix_add_device_users_identity_conflict_code" not in _indexes("add_device_users"):
+        op.create_index(
+            "ix_add_device_users_identity_conflict_code",
+            "add_device_users",
+            ["identity_conflict_code"],
+        )
+    op.create_index(
+        "uq_add_user_device_cnic_active",
+        "add_device_users",
+        ["zkt_device_id", "cnic_lookup_hash"],
+        unique=True,
+        postgresql_where=text(
+            "lifecycle_state = 'ACTIVE' AND cnic_lookup_hash IS NOT NULL "
+            "AND identity_conflict_code IS NULL"
+        ),
+    )
     if "raw_name" in _columns("add_device_users"):
         op.drop_column("add_device_users", "raw_name")
 

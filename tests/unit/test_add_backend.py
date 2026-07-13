@@ -422,6 +422,118 @@ def test_partial_snapshot_never_deletes_unseen_users_and_disables_writes(db: Ses
     assert db.scalar(select(DeviceAlert).where(DeviceAlert.code == "USER_SNAPSHOT_TRUNCATED"))
 
 
+def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="duplicate-cnic",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"One-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Two-{CNIC}"),
+            ],
+        ),
+    )
+    db.flush()
+    users = db.scalars(
+        select(DeviceUser).where(DeviceUser.lifecycle_state == "ACTIVE").order_by(DeviceUser.uid)
+    ).all()
+    assert len(users) == 2
+    assert {row.identity_conflict_code for row in users} == {"DUPLICATE_CNIC"}
+    assert {decrypt_cnic(row.cnic_encrypted) for row in users} == {CNIC}
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "DUPLICATE_USER_CNIC"))
+    assert alert and alert.state == "OPEN" and alert.details == {"affected_users": 2}
+
+    raw_session, _admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    complete = client.get(f"/api/v2/devices/{connector.connector_id}/users?identity=COMPLETE")
+    conflicted = client.get(f"/api/v2/devices/{connector.connector_id}/users?identity=CONFLICT")
+    missing = client.get(f"/api/v2/devices/{connector.connector_id}/users?identity=MISSING")
+    assert complete.status_code == conflicted.status_code == missing.status_code == 200
+    assert complete.json()["rows"] == []
+    assert len(conflicted.json()["rows"]) == len(missing.json()["rows"]) == 2
+    assert {row["identity_conflict_code"] for row in conflicted.json()["rows"]} == {
+        "DUPLICATE_CNIC"
+    }
+    assert all(not row["identity_complete"] for row in conflicted.json()["rows"])
+    assert CNIC not in json.dumps(conflicted.json())
+
+    punch = event(event_uid="d" * 64, user_id="1001", raw_name=f"One-{CNIC}")
+    ingest_attendance(db, connector=connector, events=[punch])
+    attendance = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid))
+    assert attendance and attendance.ords_status == "BLOCKED_IDENTITY"
+    assert attendance.cnic_encrypted is None
+    assert db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    ) is None
+
+    make_writable(connector)
+    with pytest.raises(ValueError, match="replacement CNIC"):
+        update_device_user_command(
+            db,
+            connector=connector,
+            user=users[1],
+            display_name=None,
+            cnic=None,
+            shift_worker=None,
+            privilege=None,
+            expected_version=users[1].row_version,
+            idempotency_key="conflict-missing-replacement",
+            actor="StateHealthAdmin",
+        )
+    replacement_cnic = "6110112345671"
+    update = update_device_user_command(
+        db,
+        connector=connector,
+        user=users[1],
+        display_name=None,
+        cnic=replacement_cnic,
+        shift_worker=None,
+        privilege=None,
+        expected_version=users[1].row_version,
+        idempotency_key="conflict-replacement",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=update.command_id,
+        status="SUCCEEDED",
+        result={"verified_uid": users[1].uid, "verified_user_id": users[1].user_id},
+        error_code=None,
+        error_message=None,
+    )
+    db.flush()
+    users = db.scalars(
+        select(DeviceUser).where(DeviceUser.lifecycle_state == "ACTIVE").order_by(DeviceUser.uid)
+    ).all()
+    assert [row.identity_conflict_code for row in users] == [None, None]
+    assert {decrypt_cnic(row.cnic_encrypted) for row in users} == {CNIC, replacement_cnic}
+    assert alert.state == "RESOLVED"
+    assert attendance.ords_status == "PENDING"
+    assert decrypt_cnic(attendance.cnic_encrypted) == CNIC
+    assert db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    )
+
+
 def test_partial_snapshot_rejects_ambiguous_identity_replacement(db: Session):
     connector = connector_fixture(db)
     snapshot_user(db, connector, uid="1", user_id="1001", name="Original")
