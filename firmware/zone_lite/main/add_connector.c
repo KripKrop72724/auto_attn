@@ -662,8 +662,8 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
         (void)remove(outbox->cursor_path);
         return true;
     }
-    if (!force && outbox->offset < ADD_OUTBOX_COMPACT_MIN_BYTES &&
-        outbox->offset < st.st_size / 2) {
+    if (!force && (outbox->offset < ADD_OUTBOX_COMPACT_MIN_BYTES ||
+        outbox->offset < st.st_size / 2)) {
         return true;
     }
     if (outbox->depth == 0 || outbox->offset >= st.st_size) {
@@ -859,13 +859,20 @@ bool add_connector_enqueue_attendance(const char *payload_json)
     cJSON_AddItemToObject(record, "payload", payload);
     char *line = cJSON_PrintUnformatted(record);
     cJSON_Delete(record);
-    if (!line || strlen(line) + 2 >= ADD_OUTBOX_LINE_BYTES) {
+    size_t line_len = line ? strlen(line) : 0;
+    if (!line || line_len + 2 >= ADD_OUTBOX_LINE_BYTES) {
+        ESP_LOGE(
+            TAG,
+            "Refusing oversized ADD attendance batch bytes=%lu limit=%u",
+            (unsigned long)line_len,
+            (unsigned)ADD_OUTBOX_LINE_BYTES);
         free(line);
         return false;
     }
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
-    if (outbox->lock && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
+    if (outbox->lock && xSemaphoreTake(outbox->lock, lock_timeout) == pdTRUE) {
         struct stat st = {0};
         off_t current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
         if (current + (off_t)strlen(line) + 1 > outbox->max_bytes && outbox->offset > 0) {
@@ -883,6 +890,8 @@ bool add_connector_enqueue_attendance(const char *payload_json)
             ESP_LOGE(TAG, "ADD %s attendance outbox is full; preserving existing rows", outbox->label);
         }
         xSemaphoreGive(outbox->lock);
+    } else {
+        ESP_LOGE(TAG, "Timed out waiting for ADD %s outbox lock", outbox->label);
     }
     free(line);
     return ok;
