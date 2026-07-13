@@ -10,8 +10,12 @@ Current milestone:
 - Reads basic identity/time/count information from the selected device.
 - Repeats discovery so DHCP IP changes are handled without reflashing.
 - Optionally recovers a stuck ZKT device through OS telnet reboot.
-- Optionally performs one daily preventive ZKT telnet reboot during a 03:00
-  local maintenance window.
+- Uses a two-minute stability gate, bounded anti-flap backoff, and a 15-minute
+  light reconcile so intermittently offline legacy terminals are not hammered.
+- Optionally performs authenticated preventive ZKT protocol restarts at 02:00,
+  12:00, and 22:00 Pakistan time, with a bounded recovery fallback.
+- Keeps live punches in a priority durable ADD outbox while historical truth is
+  appended and acknowledged independently.
 - Shows production status on the ESP32-S3 onboard RGB LED.
 - Can POST a full current-month ZKT truth snapshot to ORDS reconcile so Oracle
   raw rows converge back to the ZKT machine.
@@ -36,17 +40,17 @@ telnet account. The firmware logs into telnet, confirms a shell with `id`, sends
 `ZONE_LITE_ZKT_REBOOT_WAIT_MS`, and then resumes normal discovery and capture.
 The recovery path is cooldown protected to avoid reboot loops.
 
-Daily preventive reboot:
+Scheduled preventive restarts:
 
 Enable `ZONE_LITE_DAILY_ZKT_REBOOT_ENABLED` only after the same telnet account is
-confirmed. By default the maintenance window is 03:00-03:30 Pakistan time
-(`ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES=300`). When a live ZKT session is
-active, the firmware first performs a final `LIVE_POLL` dump and ORDS drain
-attempt, then sends the telnet reboot command. If no live session is active, it
-uses the preferred or last successfully authenticated ZKT IP. A successful daily
-reboot is recorded in RAM for the current local day; failed attempts are retried
-no faster than `ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS` while the window is
-still open.
+confirmed if recovery fallback is enabled. By default, restart windows begin at
+02:00, 12:00, and 22:00 Pakistan time
+(`ZONE_LITE_DAILY_ZKT_REBOOT_UTC_OFFSET_MINUTES=300`). An authenticated ZKT
+protocol restart is always attempted first. Telnet is used only as a bounded
+fallback when no live protocol session can complete the restart and recovery is
+explicitly enabled. Each completed slot is persisted in NVS, active temporary
+admin leases block restarts, and failed attempts are retried no faster than
+`ZONE_LITE_DAILY_ZKT_REBOOT_RETRY_DELAY_MS` within the configured window.
 
 LED status:
 
@@ -64,10 +68,14 @@ fault.
 - Orange blink: ORDS/Oracle send failure.
 - Yellow blink: ZKT protocol/auth failure before recovery.
 - Amber/yellow warning blink: Oracle raw rows were repaired from ZKT truth.
-- Red fast blink: telnet reboot in progress for recovery or scheduled
+- Red fast blink: controlled ZKT restart in progress for recovery or scheduled
   maintenance.
 - Red solid: fatal local failure.
 - Magenta blink: identity row blocked locally.
+
+Recoverable fault indications latch for two minutes by default, after which the
+LED returns to the highest-priority current state. Fatal local failures remain
+latched.
 
 Build:
 
