@@ -69,13 +69,20 @@ class UserSnapshotRequest(BaseModel):
 
 
 class AttendanceEventIn(BaseModel):
-    event_uid: str
+    event_uid: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     uid: str | None = None
-    user_id: str
+    user_id: str = Field(min_length=1, max_length=100)
     raw_name: str | None = None
     device_event_time: datetime
     captured_at: datetime
-    source: str
+    source: Literal[
+        "LIVE",
+        "LIVE_POLL",
+        "DUMP_STARTUP",
+        "DUMP_RECONNECT",
+        "MANUAL_REPROCESS",
+        "RECONCILE_15M",
+    ]
     status: str | int | None = None
     punch: str | int | None = None
     raw_punch: bool = False
@@ -87,9 +94,9 @@ class AttendanceEventIn(BaseModel):
 
 
 class AttendanceBatchRequest(BaseModel):
-    batch_id: str
+    batch_id: str = Field(min_length=1, max_length=120)
     payload_digest: str | None = None
-    events: list[AttendanceEventIn]
+    events: list[AttendanceEventIn] = Field(min_length=1, max_length=100)
 
 
 class DeviceLogIn(BaseModel):
@@ -136,4 +143,3 @@ class CommandUpdate(BaseModel):
 
 class AlertAcknowledgeRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
-
