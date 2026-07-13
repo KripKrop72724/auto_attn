@@ -42,6 +42,8 @@ def reset() -> None:
 def prepare() -> None:
     engine = database_engine()
     now = utc_now()
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX IF EXISTS uq_add_open_alert_connector_code"))
     with Session(engine) as session:
         connector = Connector(
             connector_id="legacy-duplicate-cnic",
@@ -53,6 +55,24 @@ def prepare() -> None:
         )
         session.add(connector)
         session.flush()
+        session.add_all(
+            [
+                DeviceAlert(
+                    connector_id=connector.id,
+                    code="ORDS_DELIVERY_FAILED",
+                    severity="WARNING",
+                    state="OPEN",
+                    message="Legacy retry alert one",
+                ),
+                DeviceAlert(
+                    connector_id=connector.id,
+                    code="ORDS_DELIVERY_FAILED",
+                    severity="WARNING",
+                    state="OPEN",
+                    message="Legacy retry alert two",
+                ),
+            ]
+        )
         zkt = ZKTDevice(connector_id=connector.id, serial="MIGRATION-SERIAL")
         session.add(zkt)
         session.flush()
@@ -141,10 +161,16 @@ def verify() -> None:
         alerts = session.scalars(
             select(DeviceAlert).where(DeviceAlert.code == "DUPLICATE_USER_CNIC")
         ).all()
+        retry_alerts = session.scalars(
+            select(DeviceAlert).where(DeviceAlert.code == "ORDS_DELIVERY_FAILED")
+        ).all()
         assert len(users) == 2
         assert len(attendance) == 1
         assert len(ords_rows) == 1
         assert len(alerts) == 1
+        assert len(retry_alerts) == 2
+        assert sum(row.state == "OPEN" for row in retry_alerts) == 1
+        assert sum(row.state == "RESOLVED" for row in retry_alerts) == 1
         assert alerts[0].state == "OPEN"
         assert alerts[0].details == {"affected_users": 2}
         assert [row.cnic_encrypted for row in users] == [
@@ -163,8 +189,19 @@ def verify() -> None:
                 "WHERE schemaname='public' AND indexname='uq_add_user_device_cnic_active'"
             )
         )
+        alert_definition = connection.scalar(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname='public' "
+                "AND indexname='uq_add_open_alert_connector_code'"
+            )
+        )
     assert definition is not None
     assert "identity_conflict_code IS NULL" in definition
+    assert alert_definition is not None
+    assert "WHERE" in alert_definition
+    assert "state" in alert_definition
+    assert "OPEN" in alert_definition
 
 
 def main() -> None:

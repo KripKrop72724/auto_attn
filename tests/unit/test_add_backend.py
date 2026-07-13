@@ -59,6 +59,7 @@ from zk_add.service import (
     serialize_command,
     update_device_user_command,
     update_heartbeat,
+    upsert_alert,
 )
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
@@ -1040,13 +1041,29 @@ def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent
 def test_ords_delivery_quarantines_poison_rows_and_redacts_failures(db: Session):
     connector = connector_fixture(db)
     snapshot_user(db, connector)
+    pending_alert = upsert_alert(
+        db,
+        connector,
+        code="SAME_TRANSACTION_DEDUP_TEST",
+        severity="WARNING",
+        message="First observation",
+    )
+    repeated_alert = upsert_alert(
+        db,
+        connector,
+        code="SAME_TRANSACTION_DEDUP_TEST",
+        severity="WARNING",
+        message="Second observation",
+    )
+    assert repeated_alert is pending_alert
     first = event(event_uid="1" * 64)
     second = event(event_uid="2" * 64)
     third = event(event_uid="3" * 64)
-    ingest_attendance(db, connector=connector, events=[first, second, third])
+    fourth = event(event_uid="4" * 64)
+    ingest_attendance(db, connector=connector, events=[first, second, third, fourth])
     db.flush()
     outboxes = db.scalars(select(OrdsOutbox).order_by(OrdsOutbox.id.asc())).all()
-    assert len(outboxes) == 3
+    assert len(outboxes) == 4
     for outbox in outboxes:
         outbox.status = "IN_FLIGHT"
         outbox.attempt_count = 1
@@ -1077,15 +1094,28 @@ def test_ords_delivery_quarantines_poison_rows_and_redacts_failures(db: Session)
     assert outboxes[1].status == "FAILED_RETRYABLE"
     assert outboxes[1].last_error == "HTTP_503"
     assert CNIC not in outboxes[1].last_error
-    assert db.scalar(
-        select(DeviceAlert).where(DeviceAlert.code == "ORDS_DELIVERY_FAILED")
+    apply_ords_delivery_result(
+        db,
+        claimed_id=outboxes[3].id,
+        status=503,
+        body={"success": False, "message": f"Retry another {CNIC}"},
+        transport_error=None,
+        response_parsed=True,
     )
+    retry_alerts = db.scalars(
+        select(DeviceAlert).where(DeviceAlert.code == "ORDS_DELIVERY_FAILED")
+    ).all()
+    assert len(retry_alerts) == 1
 
-    outboxes[2].status = "BLOCKED_IDENTITY"
+    blocked_event = db.get(AttendanceEvent, outboxes[2].attendance_event_id)
+    assert blocked_event
+    blocked_event.ords_status = "BLOCKED_IDENTITY"
+    db.delete(outboxes[2])
+    db.flush()
 
     metrics = ords_delivery_metrics(db)
-    assert metrics["backlog"] == 2
-    assert metrics["retrying"] == 1
+    assert metrics["backlog"] == 3
+    assert metrics["retrying"] == 2
     assert metrics["blocked_identity"] == 1
     assert metrics["quarantined"] == 1
     assert ords_failure_is_permanent(400)

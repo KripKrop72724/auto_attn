@@ -125,7 +125,10 @@ counts. Delivery is claimed in small bounded batches with limited concurrency. P
 `413`, and `422` responses are preserved as quarantined events so one poison row cannot block later
 attendance; transport, authorization, endpoint, throttling, and server failures remain durably
 retryable. ADD stores only a redacted failure category and HTTP status in its alert details, never an
-ORDS response body or CNIC.
+ORDS response body or CNIC. Identity-blocked counts come from the immutable attendance ledger because
+those rows intentionally do not enter the ORDS outbox until identity is repaired. The database permits
+only one open alert per connector and condition code; repeated observations update that alert rather
+than flooding the operations queue.
 
 ## Alert response
 

@@ -44,7 +44,6 @@ ORDS_DELIVERY_BATCH_SIZE = 8
 ORDS_DELIVERY_CONCURRENCY = 4
 ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
 ORDS_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
-ORDS_UNDELIVERED_STATUSES = ORDS_ACTIVE_STATUSES | {"BLOCKED_IDENTITY"}
 ORDS_SAFE_TRANSPORT_ERRORS = {
     "ConnectError",
     "ConnectTimeout",
@@ -99,24 +98,41 @@ def ords_delivery_metrics(session: Session) -> dict:
         select(OrdsOutbox.status, func.count(OrdsOutbox.id)).group_by(OrdsOutbox.status)
     ).all()
     counts = {status.lower(): int(count) for status, count in rows}
-    backlog = sum(
-        count for status, count in counts.items() if status.upper() in ORDS_UNDELIVERED_STATUSES
+    active_outbox = sum(
+        count for status, count in counts.items() if status.upper() in ORDS_ACTIVE_STATUSES
+    )
+    blocked_identity = int(
+        session.scalar(
+            select(func.count(AttendanceEvent.id)).where(
+                AttendanceEvent.ords_status == "BLOCKED_IDENTITY"
+            )
+        )
+        or 0
     )
     quarantined = sum(
         count for status, count in counts.items() if status.upper().startswith("QUARANTINED")
     )
-    oldest_backlog_at = session.scalar(
+    oldest_outbox_at = session.scalar(
         select(func.min(OrdsOutbox.created_at)).where(
-            OrdsOutbox.status.in_(ORDS_UNDELIVERED_STATUSES)
+            OrdsOutbox.status.in_(ORDS_ACTIVE_STATUSES)
         )
+    )
+    oldest_blocked_at = session.scalar(
+        select(func.min(AttendanceEvent.received_at)).where(
+            AttendanceEvent.ords_status == "BLOCKED_IDENTITY"
+        )
+    )
+    oldest_backlog_at = min(
+        (value for value in (oldest_outbox_at, oldest_blocked_at) if value is not None),
+        default=None,
     )
     last_attempt_at = session.scalar(select(func.max(OrdsOutbox.last_attempt_at)))
     return {
-        "backlog": backlog,
+        "backlog": active_outbox + blocked_identity,
         "pending": counts.get("pending", 0),
         "retrying": counts.get("failed_retryable", 0),
         "in_flight": counts.get("in_flight", 0),
-        "blocked_identity": counts.get("blocked_identity", 0),
+        "blocked_identity": blocked_identity,
         "quarantined": quarantined,
         "acknowledged": counts.get("acked", 0),
         "oldest_backlog_at": oldest_backlog_at,

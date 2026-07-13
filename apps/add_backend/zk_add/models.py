@@ -365,6 +365,16 @@ class DeviceLog(Base):
 
 class DeviceAlert(Base):
     __tablename__ = "add_device_alerts"
+    __table_args__ = (
+        Index(
+            "uq_add_open_alert_connector_code",
+            "connector_id",
+            "code",
+            unique=True,
+            postgresql_where=text("state = 'OPEN'"),
+            sqlite_where=text("state = 'OPEN'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)

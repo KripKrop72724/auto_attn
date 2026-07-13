@@ -1504,13 +1504,25 @@ def upsert_alert(
     message: str,
     details: dict | None = None,
 ) -> DeviceAlert:
-    row = session.scalar(
-        select(DeviceAlert).where(
-            DeviceAlert.connector_id == connector.id,
-            DeviceAlert.code == code,
-            DeviceAlert.state == "OPEN",
-        )
+    row = next(
+        (
+            candidate
+            for candidate in session.new
+            if isinstance(candidate, DeviceAlert)
+            and candidate.connector_id == connector.id
+            and candidate.code == code
+            and candidate.state == "OPEN"
+        ),
+        None,
     )
+    if row is None:
+        row = session.scalar(
+            select(DeviceAlert).where(
+                DeviceAlert.connector_id == connector.id,
+                DeviceAlert.code == code,
+                DeviceAlert.state == "OPEN",
+            )
+        )
     if row is None:
         row = DeviceAlert(
             connector_id=connector.id,
