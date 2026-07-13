@@ -221,6 +221,10 @@ def update_heartbeat(
     connector.firmware_version = payload.firmware_version or connector.firmware_version
     connector.config_version = payload.config_version
     connector.current_activity = payload.current_activity
+    # A valid heartbeat is the authoritative recovery signal for the ESP
+    # transport.  The maintenance loop opens this alert when heartbeats go
+    # stale, so resolve it immediately when the connector reports again.
+    resolve_alert(session, connector, code="ESP_OFFLINE")
     zkt = connector.zkt_device
     zkt_payload = payload.zkt
     if zkt:
