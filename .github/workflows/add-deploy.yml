@@ -107,6 +107,7 @@ jobs:
         run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
 
       - name: Record credential-free Oracle egress diagnostics
+        continue-on-error: true
         run: |
           $ErrorActionPreference = 'Stop'
           $target = 'https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures'
@@ -116,12 +117,45 @@ jobs:
           $proxyEnvironmentPresent = -not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -or `
             -not [string]::IsNullOrWhiteSpace($env:HTTP_PROXY)
 
+          $dnsResult = 'ERROR_UNKNOWN'
+          try {
+            $addresses = [System.Net.Dns]::GetHostAddresses($targetUri.Host)
+            $dnsResult = if ($addresses.Count -gt 0) { 'OK' } else { 'ERROR_NO_ADDRESSES' }
+          } catch {
+            $dnsResult = "ERROR_$($_.Exception.GetType().Name)"
+          }
+
+          $tcpResult = 'ERROR_UNKNOWN'
+          $tcpClient = New-Object System.Net.Sockets.TcpClient
+          try {
+            $connectTask = $tcpClient.ConnectAsync($targetUri.Host, 443)
+            if (-not $connectTask.Wait(12000)) {
+              $tcpResult = 'ERROR_TIMEOUT'
+            } elseif ($connectTask.IsFaulted) {
+              $tcpResult = 'ERROR_CONNECT_FAILED'
+            } else {
+              $tcpResult = 'OK'
+            }
+          } catch {
+            $tcpResult = "ERROR_$($_.Exception.GetType().Name)"
+          } finally {
+            $tcpClient.Dispose()
+          }
+
           $hostResult = 'ERROR_UNKNOWN'
           try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
             $response = Invoke-WebRequest -UseBasicParsing -Method Options -Uri $target -TimeoutSec 12
             $hostResult = "HTTP_$($response.StatusCode)"
           } catch {
-            $hostResult = "ERROR_$($_.Exception.GetType().Name)"
+            $exception = $_.Exception
+            if ($exception.Response -and $exception.Response.StatusCode) {
+              $hostResult = "HTTP_$([int]$exception.Response.StatusCode)"
+            } elseif ($exception -is [System.Net.WebException]) {
+              $hostResult = "ERROR_WEB_$($exception.Status.ToString().ToUpperInvariant())"
+            } else {
+              $hostResult = "ERROR_$($exception.GetType().Name)"
+            }
           }
 
           $probe = @'
@@ -132,7 +166,6 @@ jobs:
               print(f"HTTP_{response.status_code}")
           except Exception as exc:
               print(f"ERROR_{type(exc).__name__}")
-              raise SystemExit(2)
           '@
           $arguments = @(
             'compose', '--env-file', '.env.add', '-f', 'docker-compose.add.yml',
@@ -146,11 +179,21 @@ jobs:
           } finally {
             $ErrorActionPreference = $previousPreference
           }
-          $containerResult = (($containerOutput | ForEach-Object { "$_" }) -join '').Trim()
-          if ($containerResult -notmatch '^(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)$') {
-            $containerResult = 'ERROR_UNEXPECTED_PROBE_OUTPUT'
+          $containerTokens = @()
+          foreach ($line in $containerOutput) {
+            $text = "$line".Trim()
+            if ($text -match '^(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)$') {
+              $containerTokens += $Matches[1]
+            }
+          }
+          $containerResult = if ($containerTokens.Count -gt 0) {
+            $containerTokens[-1]
+          } else {
+            'ERROR_UNEXPECTED_PROBE_OUTPUT'
           }
 
+          Write-Host "ORDS DNS probe=$dnsResult"
+          Write-Host "ORDS TCP 443 probe=$tcpResult"
           Write-Host "ORDS host probe=$hostResult"
           Write-Host "ORDS container probe=$containerResult"
           Write-Host "Runner default proxy used=$defaultProxyUsed"
@@ -158,6 +201,10 @@ jobs:
           if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {
             Write-Warning 'ORDS egress is degraded; attendance remains preserved in the bounded retry queue.'
           }
+          # A connectivity observation is operational evidence, not a release failure. The
+          # outbox is durable and the dashboard carries the degraded-route alert.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Show bounded container state on failure
         if: failure()
