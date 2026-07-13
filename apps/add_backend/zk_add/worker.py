@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import re
 
 import httpx
 from sqlalchemy import select
@@ -20,6 +21,13 @@ from zk_add.realtime import browser_events, connector_hub
 from zk_add.service import queue_due_revokes, serialize_command, upsert_alert
 from zk_add.settings import settings
 from zk_common.time_utils import utc_now
+
+
+EVENT_UID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def event_uid_is_valid(value: object) -> bool:
+    return isinstance(value, str) and EVENT_UID_PATTERN.fullmatch(value) is not None
 
 
 def ords_delivery_succeeded(status: int | None, body: object) -> bool:
@@ -109,18 +117,43 @@ async def deliver_ords_once() -> None:
     payload = None
     with session_scope() as session:
         now = utc_now()
-        row = session.scalar(
+        # A process interruption after claiming a row must not strand it in
+        # IN_FLIGHT forever.  No normal request remains active this long.
+        stale_before = now - timedelta(seconds=max(60, int(settings.ords_timeout_seconds * 3)))
+        for stale in session.scalars(
+            select(OrdsOutbox).where(
+                OrdsOutbox.status == "IN_FLIGHT",
+                OrdsOutbox.last_attempt_at < stale_before,
+            ).limit(100)
+        ).all():
+            stale.status = "FAILED_RETRYABLE"
+            stale.next_attempt_at = now
+            stale.last_error = "Recovered a stale in-flight delivery after backend interruption."
+            event = session.get(AttendanceEvent, stale.attendance_event_id) if stale.attendance_event_id else None
+            if event:
+                event.ords_status = "FAILED_RETRYABLE"
+
+        candidates = session.scalars(
             select(OrdsOutbox).where(
                 OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE"]),
                 (OrdsOutbox.next_attempt_at == None) | (OrdsOutbox.next_attempt_at <= now),  # noqa: E711
-            ).order_by(OrdsOutbox.id.asc()).limit(1)
-        )
-        if row:
+            ).order_by(OrdsOutbox.id.asc()).limit(100)
+        ).all()
+        for row in candidates:
+            event_uid = (row.payload or {}).get("event_uid")
+            if not event_uid_is_valid(event_uid):
+                row.status = "QUARANTINED_INVALID_EVENT_UID"
+                row.last_error = "Rejected before ORDS delivery: event_uid is not a 64-character lowercase hex digest."
+                event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+                if event:
+                    event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+                continue
             row.status = "IN_FLIGHT"
             row.attempt_count += 1
             row.last_attempt_at = now
             claimed_id = row.id
             payload = row.payload
+            break
     if claimed_id is None or payload is None:
         return
     url = settings.ords_base_url.rstrip("/") + "/raw-captures"
