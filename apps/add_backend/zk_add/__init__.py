@@ -1,3 +1,3 @@
 """Attendance Device Dashboard control plane."""
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"

@@ -1,9 +1,10 @@
 """Exercise the production duplicate-CNIC migration against PostgreSQL.
 
 The baseline migration creates current metadata, so ``prepare`` removes the new
-conflict column/index after inserting representative legacy rows. Alembic can
-then prove that the consolidation migration preserves users and attendance while
-quarantining ambiguous CNIC identities.
+conflict and resolution structures after inserting representative legacy rows.
+Alembic can then prove that later migrations preserve users and attendance while
+quarantining ambiguous CNIC identities and adding non-destructive resolution
+provenance.
 """
 
 from __future__ import annotations
@@ -136,6 +137,10 @@ def prepare() -> None:
         session.commit()
 
     with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE add_attendance_events DROP COLUMN identity_resolution_id")
+        )
+        connection.execute(text("DROP TABLE add_identity_conflict_resolutions"))
         connection.execute(text("DROP INDEX IF EXISTS uq_add_user_device_cnic_active"))
         connection.execute(
             text("DROP INDEX IF EXISTS ix_add_device_users_identity_conflict_code")
@@ -150,6 +155,11 @@ def verify() -> None:
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns("add_device_users")}
     assert "identity_conflict_code" in columns
+    attendance_columns = {
+        column["name"] for column in inspector.get_columns("add_attendance_events")
+    }
+    assert "identity_resolution_id" in attendance_columns
+    assert "add_identity_conflict_resolutions" in inspector.get_table_names()
     with Session(engine) as session:
         users = session.scalars(
             select(DeviceUser)
@@ -179,6 +189,7 @@ def verify() -> None:
         ]
         assert {row.identity_conflict_code for row in users} == {"DUPLICATE_CNIC"}
         assert attendance[0].device_user_id == users[0].id
+        assert attendance[0].identity_resolution_id is None
         assert attendance[0].ords_status == "FAILED_RETRYABLE"
         assert ords_rows[0].last_error == "LEGACY_ERROR_REDACTED"
 

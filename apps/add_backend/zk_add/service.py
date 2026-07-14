@@ -20,6 +20,10 @@ from zk_add.crypto import (
     normalize_cnic,
 )
 from zk_add.identity import build_machine_name, parse_machine_name
+from zk_add.identity_conflicts import (
+    valid_identity_resolutions,
+    valid_resolution_for_user,
+)
 from zk_add.models import (
     AttendanceEvent,
     Connector,
@@ -31,6 +35,7 @@ from zk_add.models import (
     DeviceLog,
     DeviceTelemetry,
     DeviceUser,
+    IdentityConflictResolution,
     IdentityTombstone,
     OrdsOutbox,
     Site,
@@ -619,10 +624,28 @@ def reconcile_device_user_identity_conflicts(
         if row.cnic_lookup_hash:
             groups.setdefault(row.cnic_lookup_hash, []).append(row)
 
+    valid_resolutions = valid_identity_resolutions(
+        session,
+        zkt=zkt,
+        groups=groups,
+        mark_stale=True,
+    )
+
     duplicate_rows = {
         row.id: row
         for group in groups.values()
         if len(group) > 1
+        for row in group
+        if row.id is not None
+    }
+    unresolved_groups = {
+        lookup: group
+        for lookup, group in groups.items()
+        if len(group) > 1 and lookup not in valid_resolutions
+    }
+    unresolved_rows = {
+        row.id: row
+        for group in unresolved_groups.values()
         for row in group
         if row.id is not None
     }
@@ -646,17 +669,19 @@ def reconcile_device_user_identity_conflicts(
             row.identity_conflict_code = None
     session.flush()
 
-    if duplicate_rows:
-        duplicate_group_count = sum(len(group) > 1 for group in groups.values())
+    if unresolved_rows:
         upsert_alert(
             session,
             connector,
             code="DUPLICATE_USER_CNIC",
             severity="HIGH",
-            message="Multiple active terminal users share a CNIC; correction is required.",
+            message=(
+                "Multiple active terminal users share a CNIC without a verified "
+                "same-employee resolution."
+            ),
             details={
-                "affected_users": len(duplicate_rows),
-                "duplicate_groups": duplicate_group_count,
+                "affected_users": len(unresolved_rows),
+                "duplicate_groups": len(unresolved_groups),
             },
         )
     else:
@@ -681,6 +706,11 @@ def persist_identity_tombstone(
     )
     if existing is not None:
         return existing
+    conflict_is_resolved = bool(
+        user.identity_conflict_code
+        and valid_resolution_for_user(session, zkt=zkt, user=user)
+    )
+    identity_is_usable = user.identity_conflict_code is None or conflict_is_resolved
     row = IdentityTombstone(
         zkt_device_id=zkt.id,
         device_user_id=user.id,
@@ -688,11 +718,9 @@ def persist_identity_tombstone(
         uid=user.uid,
         user_id=user.user_id,
         display_name_encrypted=encrypt_text(user.display_name) or "",
-        cnic_encrypted=(user.cnic_encrypted if user.identity_conflict_code is None else None),
-        cnic_lookup_hash=(
-            user.cnic_lookup_hash if user.identity_conflict_code is None else None
-        ),
-        cnic_last4=user.cnic_last4 if user.identity_conflict_code is None else None,
+        cnic_encrypted=(user.cnic_encrypted if identity_is_usable else None),
+        cnic_lookup_hash=(user.cnic_lookup_hash if identity_is_usable else None),
+        cnic_last4=user.cnic_last4 if identity_is_usable else None,
         shift_worker=user.shift_worker,
         privilege=user.privilege,
     )
@@ -752,6 +780,7 @@ def ingest_attendance(
         raise ValueError("Connector has no assigned ZKT device.")
     accepted: list[str] = []
     duplicates: list[str] = []
+    identity_resolution_cache: dict[str, IdentityConflictResolution | None] = {}
     for incoming in events:
         existing = session.scalar(
             select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid)
@@ -777,7 +806,17 @@ def ingest_attendance(
                 )
                 .order_by(IdentityTombstone.id.desc())
             )
-        usable_user_identity = bool(user and user.identity_conflict_code is None)
+        identity_resolution = None
+        if user and user.identity_conflict_code and user.cnic_lookup_hash:
+            lookup = user.cnic_lookup_hash
+            if lookup not in identity_resolution_cache:
+                identity_resolution_cache[lookup] = valid_resolution_for_user(
+                    session, zkt=zkt, user=user
+                )
+            identity_resolution = identity_resolution_cache[lookup]
+        usable_user_identity = bool(
+            user and (user.identity_conflict_code is None or identity_resolution is not None)
+        )
         cnic = (
             decrypt_cnic(user.cnic_encrypted)
             if usable_user_identity and user
@@ -804,6 +843,9 @@ def ingest_attendance(
             connector_id=connector.id,
             zkt_device_id=zkt.id,
             device_user_id=user.id if user else (tombstone.device_user_id if tombstone else None),
+            identity_resolution_id=(
+                identity_resolution.id if identity_resolution is not None else None
+            ),
             device_serial=zkt.serial,
             uid=incoming.uid,
             user_id=incoming.user_id,
@@ -1337,7 +1379,12 @@ def update_device_user_command(
         raise ValueError("User changed since it was loaded. Refresh and retry.")
     ensure_no_active_user_operation(session, zkt=zkt, user=user)
     current_cnic = decrypt_cnic(user.cnic_encrypted)
-    if user.identity_conflict_code and cnic is None:
+    identity_resolution = (
+        valid_resolution_for_user(session, zkt=zkt, user=user)
+        if user.identity_conflict_code
+        else None
+    )
+    if user.identity_conflict_code and identity_resolution is None and cnic is None:
         raise ValueError("A replacement CNIC is required to resolve this identity conflict.")
     next_cnic = normalize_cnic(cnic) if cnic is not None else current_cnic
     if next_cnic is None:
@@ -1349,7 +1396,15 @@ def update_device_user_command(
         lookup=next_lookup,
         exclude_user_id=user.id,
     )
-    if claims:
+    approved_member_ids = set(
+        identity_resolution.member_device_user_ids if identity_resolution is not None else []
+    )
+    claims_are_approved_aliases = bool(
+        identity_resolution is not None
+        and next_lookup == user.cnic_lookup_hash
+        and all(claim.id in approved_member_ids for claim in claims)
+    )
+    if claims and not claims_are_approved_aliases:
         raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker

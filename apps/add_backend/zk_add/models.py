@@ -238,6 +238,48 @@ class DeviceUser(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class IdentityConflictResolution(Base):
+    """Audited approval for one exact-CNIC terminal group.
+
+    The terminal records remain independent.  This row only records that an
+    administrator verified that the current, exact set of records belongs to
+    one employee.  A deterministic group token makes the approval stale as
+    soon as the ZKT membership changes.
+    """
+
+    __tablename__ = "add_identity_conflict_resolutions"
+    __table_args__ = (
+        Index(
+            "uq_add_active_identity_resolution",
+            "zkt_device_id",
+            "cnic_lookup_hash",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+            sqlite_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resolution_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
+    cnic_lookup_hash: Mapped[str] = mapped_column(String(64), index=True)
+    group_token: Mapped[str] = mapped_column(String(64), index=True)
+    member_device_user_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    resolution_type: Mapped[str] = mapped_column(String(80), index=True)
+    classification: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    created_by: Mapped[str] = mapped_column(String(120), index=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(120), index=True)
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class AttendanceEvent(Base):
     __tablename__ = "add_attendance_events"
 
@@ -246,6 +288,9 @@ class AttendanceEvent(Base):
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
     zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
     device_user_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_users.id"), index=True)
+    identity_resolution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_identity_conflict_resolutions.id"), index=True
+    )
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     uid: Mapped[str | None] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)

@@ -176,6 +176,33 @@ class UserDeleteRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class IdentityConflictMemberConfirmation(BaseModel):
+    user_key: str = Field(min_length=1, max_length=36)
+    expected_version: int = Field(ge=1)
+
+
+class IdentityConflictResolveRequest(BaseModel):
+    group_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    members: list[IdentityConflictMemberConfirmation] = Field(min_length=2, max_length=20)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: Literal["SAME EMPLOYEE"]
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @model_validator(mode="after")
+    def unique_members(self):
+        keys = [member.user_key for member in self.members]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Each conflict member must be confirmed exactly once")
+        return self
+
+
+class IdentityConflictRevokeRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: Literal["REVOKE RESOLUTION"]
+    password: str = Field(min_length=1, max_length=512)
+
+
 class AdminLeaseRequest(BaseModel):
     uid: str
     idempotency_key: str = Field(min_length=8, max_length=120)

@@ -15,6 +15,10 @@ from sqlalchemy.pool import StaticPool
 from zk_add.crypto import decrypt_cnic, decrypt_json, decrypt_text
 from zk_add.db import Base
 from zk_add.identity import build_machine_name
+from zk_add.identity_conflicts import (
+    build_identity_conflict_report,
+    create_same_employee_resolution,
+)
 from zk_add.models import (
     AttendanceEvent,
     AuditEvent,
@@ -23,6 +27,7 @@ from zk_add.models import (
     DeviceAlert,
     DeviceConnectionEvent,
     DeviceUser,
+    IdentityConflictResolution,
     IdentityTombstone,
     OnboardingNonce,
     OrdsOutbox,
@@ -490,6 +495,9 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
         "missing_cnic": 0,
         "duplicate_groups": 1,
         "duplicate_users": 2,
+        "resolved_duplicate_groups": 0,
+        "unresolved_duplicate_groups": 1,
+        "unresolved_duplicate_users": 2,
     }
     assert {
         tuple(member["user_id"] for member in row["identity_conflict_members"])
@@ -572,6 +580,250 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
     )
+
+
+def test_same_employee_resolution_is_audited_reversible_and_never_mutates_punches(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    assert connector.zkt_device is not None
+    connector.zkt_device.attendance_count = 49_537
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="same-employee-duplicates",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"Same Name-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Same Name-{CNIC}"),
+            ],
+        ),
+    )
+    old_punches = [
+        event(event_uid="7" * 64, user_id="1001", raw_name=f"Same Name-{CNIC}"),
+        event(event_uid="8" * 64, user_id="1002", raw_name=f"Same Name-{CNIC}"),
+    ]
+    ingest_attendance(db, connector=connector, events=old_punches)
+    db.flush()
+    immutable_before = [
+        (
+            row.event_uid,
+            row.device_user_id,
+            row.user_id,
+            row.device_event_time,
+            row.cnic_encrypted,
+            row.ords_status,
+            row.identity_resolution_id,
+        )
+        for row in db.scalars(
+            select(AttendanceEvent)
+            .where(AttendanceEvent.event_uid.in_([p.event_uid for p in old_punches]))
+            .order_by(AttendanceEvent.event_uid)
+        ).all()
+    ]
+    assert {row[5] for row in immutable_before} == {"BLOCKED_IDENTITY"}
+
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    report_response = client.get(
+        f"/api/v2/devices/{connector.connector_id}/identity-conflicts"
+    )
+    assert report_response.status_code == 200
+    report = report_response.json()
+    assert report["raw_duplicate_groups"] == report["unresolved_groups"] == 1
+    assert report["resolved_groups"] == 0
+    assert report["evidence_scope"] == {
+        "snapshot_source": "CURRENT_COMPLETE_ZKT_SNAPSHOT",
+        "terminal_attendance_count": 49_537,
+        "add_attendance_count": 2,
+        "attendance_coverage_percent": 0.0,
+        "attendance_is_immutable": True,
+        "terminal_users_are_unchanged": True,
+    }
+    assert report["groups"][0]["classification"] == "EXACT_NAME_MATCH"
+    assert CNIC not in report_response.text
+
+    group = report["groups"][0]
+    resolve_response = client.post(
+        f"/api/v2/devices/{connector.connector_id}/identity-conflicts/resolve",
+        headers={"X-CSRF-Token": admin.csrf_token},
+        json={
+            "group_token": group["group_token"],
+            "members": [
+                {
+                    "user_key": member["user_key"],
+                    "expected_version": member["row_version"],
+                }
+                for member in group["members"]
+            ],
+            "reason": f"Exact terminal names for CNIC {CNIC} match; retain both terminal IDs.",
+            "typed_confirmation": "SAME EMPLOYEE",
+            "password": "correct-password",
+            "idempotency_key": "resolve-01",
+        },
+    )
+    assert resolve_response.status_code == 201, resolve_response.text
+    assert CNIC not in resolve_response.text
+    assert "[CNIC-REDACTED]" in resolve_response.text
+    resolution_id = resolve_response.json()["resolution"]["resolution_id"]
+    resolution = db.scalar(
+        select(IdentityConflictResolution).where(
+            IdentityConflictResolution.resolution_id == resolution_id
+        )
+    )
+    assert resolution and resolution.status == "ACTIVE"
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "DUPLICATE_USER_CNIC"))
+    assert alert and alert.state == "RESOLVED"
+
+    immutable_after = [
+        (
+            row.event_uid,
+            row.device_user_id,
+            row.user_id,
+            row.device_event_time,
+            row.cnic_encrypted,
+            row.ords_status,
+            row.identity_resolution_id,
+        )
+        for row in db.scalars(
+            select(AttendanceEvent)
+            .where(AttendanceEvent.event_uid.in_([p.event_uid for p in old_punches]))
+            .order_by(AttendanceEvent.event_uid)
+        ).all()
+    ]
+    assert immutable_after == immutable_before
+
+    make_writable(connector)
+    resolved_user = db.scalar(
+        select(DeviceUser).where(DeviceUser.user_id == "1001")
+    )
+    assert resolved_user is not None
+    edit = update_device_user_command(
+        db,
+        connector=connector,
+        user=resolved_user,
+        display_name="Same Name Updated",
+        cnic=None,
+        shift_worker=None,
+        privilege=None,
+        expected_version=resolved_user.row_version,
+        idempotency_key="edit-approved-alias-without-cnic-replacement",
+        actor="StateHealthAdmin",
+    )
+    assert edit.command_type == "UPDATE_USER"
+
+    resolved_punch = event(
+        event_uid="9" * 64,
+        user_id="1002",
+        raw_name=f"Same Name-{CNIC}",
+    )
+    ingest_attendance(db, connector=connector, events=[resolved_punch])
+    db.flush()
+    resolved_event = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == resolved_punch.event_uid)
+    )
+    assert resolved_event and resolved_event.ords_status == "PENDING"
+    assert resolved_event.identity_resolution_id == resolution.id
+    assert decrypt_cnic(resolved_event.cnic_encrypted) == CNIC
+    assert db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == resolved_event.id)
+    )
+
+    revoke_response = client.post(
+        f"/api/v2/devices/{connector.connector_id}/identity-conflicts/{resolution_id}/revoke",
+        headers={"X-CSRF-Token": admin.csrf_token},
+        json={
+            "reason": "Exercise the protected rollback path before production use.",
+            "typed_confirmation": "REVOKE RESOLUTION",
+            "password": "correct-password",
+        },
+    )
+    assert revoke_response.status_code == 200, revoke_response.text
+    assert resolution.status == "REVOKED"
+    revoked_punch = event(
+        event_uid="a" * 64,
+        user_id="1001",
+        raw_name=f"Same Name-{CNIC}",
+    )
+    ingest_attendance(db, connector=connector, events=[revoked_punch])
+    revoked_event = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == revoked_punch.event_uid)
+    )
+    assert revoked_event and revoked_event.ords_status == "BLOCKED_IDENTITY"
+    assert revoked_event.identity_resolution_id is None
+
+
+def test_same_employee_resolution_becomes_stale_when_terminal_membership_changes(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="two-members",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"Same Name-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Same Name-{CNIC}"),
+            ],
+        ),
+    )
+    report = build_identity_conflict_report(db, zkt=connector.zkt_device)
+    group = report["groups"][0]
+    resolution = create_same_employee_resolution(
+        db,
+        zkt=connector.zkt_device,
+        group_token=group["group_token"],
+        members=[
+            (member["user_key"], member["row_version"]) for member in group["members"]
+        ],
+        reason="Exact current membership was independently reviewed.",
+        idempotency_key="stale-membership-resolution",
+        actor="StateHealthAdmin",
+    )
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="three-members",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"Same Name-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Same Name-{CNIC}"),
+                UserSnapshotRow(uid="3", user_id="1003", name=f"Same Name-{CNIC}"),
+            ],
+        ),
+    )
+    db.flush()
+    assert resolution.status == "STALE"
+    assert db.scalar(select(func.count(DeviceUser.id))) == 3
+    alert = db.scalar(
+        select(DeviceAlert)
+        .where(DeviceAlert.code == "DUPLICATE_USER_CNIC", DeviceAlert.state == "OPEN")
+        .order_by(DeviceAlert.id.desc())
+    )
+    assert alert and alert.details == {"affected_users": 3, "duplicate_groups": 1}
+    punch = event(event_uid="b" * 64, user_id="1003", raw_name=f"Same Name-{CNIC}")
+    ingest_attendance(db, connector=connector, events=[punch])
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid))
+    assert row and row.ords_status == "BLOCKED_IDENTITY"
 
 
 def test_partial_snapshot_rejects_ambiguous_identity_replacement(db: Session):

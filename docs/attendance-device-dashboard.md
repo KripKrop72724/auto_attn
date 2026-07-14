@@ -72,6 +72,16 @@ all thirteen normalized digits; it never compares masks. When a complete termina
 an exact duplicate, ADD shows the number of affected groups and the matching ZKT user IDs. Create and
 update requests remain available for other unique CNICs, while reuse of the conflicting CNIC is
 blocked with the exact terminal record that currently claims it.
+
+Some older terminals contain multiple user records for the same employee. ADD handles that case
+without merging or deleting terminal data. The Identity Review view shows the exact group, masked
+CNIC, names, UID/user IDs, current ADD punch evidence, and the fraction of terminal history actually
+present in ADD. After independent verification, a password step-up and typed confirmation create an
+audited `SAME_EMPLOYEE_MULTIPLE_TERMINAL_RECORDS` resolution. The user rows, templates, UID/user IDs,
+and existing attendance remain byte-for-byte untouched; future punches retain their originating
+terminal record and carry the resolution ID as provenance. A resolution can be revoked, and it
+automatically becomes stale if a later complete ZKT snapshot changes group membership. Mixed-name
+groups stay quarantined until HR confirms a same-employee relationship or corrects the wrong CNIC.
 Every mutation has an idempotency key, expected row version, expected terminal identity, encrypted
 desired state, expiry, and immutable audit record.
 
