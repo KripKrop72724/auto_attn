@@ -37,8 +37,10 @@ The build never checks for or includes a local `zone_lite_config.h`. A non-provi
 blank network and credential defaults and cannot join Wi-Fi, reach ORDS, or onboard with ADD.
 
 Copy `tools/provisioning.example.json` to a path outside the repository and fill it there. Never add
-the resulting file to git. Export the same protected fleet root used by ADD, activate ESP-IDF 5.5.3,
-then run:
+the resulting file to git. Export the exact protected fleet root injected into production ADD,
+activate ESP-IDF 5.5.3, then run. The provisioner deliberately does not fall back to
+`ADD_PII_LOOKUP_KEY`: a successful flash with the wrong root produces an ESP that can join Wi-Fi but
+whose signed onboarding is rejected by ADD.
 
 ```bash
 . /path/to/esp-idf/export.sh
@@ -66,6 +68,30 @@ fleet record proves the eFuse was derived from the same root. Unknown/non-HMAC k
 
 `--skip-firmware-flash` updates only encrypted NVS while still performing readback verification. It
 does not skip eFuse safety checks.
+
+### Exceptional split-root recovery
+
+If a device's locked eFuse was demonstrably derived from a known wrong root, do not change the
+production ADD root and do not attempt another eFuse burn. Recover it by using the production root
+for the ADD bootstrap secret and the original root only to recreate HMAC-protected NVS. This mode is
+valid only for an existing `HMAC_UP` block and requires both the existing-key trust flag and exact-MAC
+confirmation:
+
+```bash
+export ADD_FLEET_ROOT_SECRET='read-exact-production-root-from-protected-store'
+export ZONE_LITE_NVS_HMAC_ROOT_SECRET='read-proven-original-nvs-root-from-protected-store'
+python tools/provision_zone_lite.py \
+  --port /dev/cu.usbmodemXXXX \
+  --config /protected/path/zone.json \
+  --idf-path "$IDF_PATH" \
+  --skip-build \
+  --skip-firmware-flash \
+  --trust-existing-derived-hmac \
+  --confirm-split-root-recovery-for 00:00:00:00:00:00
+```
+
+The exact MAC must be read from the attached ESP. Split-root mode refuses an empty eFuse, so it can
+never be used to provision a new device. Remove both secret environment variables after recovery.
 
 ## Build-only validation
 

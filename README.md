@@ -98,6 +98,7 @@ equivalent to that approval.
 Use these runbooks before operating production:
 
 - [Architecture and behavior](docs/attendance-device-dashboard.md)
+- [Zone Lite secure automatic onboarding](docs/zone-lite-secure-auto-onboarding.md)
 - [Security model](docs/security-model.md)
 - [Production deployment and rollback](docs/production-runbook.md)
 - [ESP/ZKT hardware acceptance](docs/hardware-acceptance.md)

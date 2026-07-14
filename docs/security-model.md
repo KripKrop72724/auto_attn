@@ -72,6 +72,12 @@ An existing unreadable HMAC block is never assumed to belong to this fleet. The 
 `--trust-existing-derived-hmac` option is allowed only when prior Zone Lite provisioning evidence
 proves that the same protected fleet root derived it.
 
+Normal provisioning requires `ADD_FLEET_ROOT_SECRET` explicitly and never falls back to the PII
+lookup key. Exceptional recovery may separate the production onboarding root from a proven original
+NVS HMAC root only for an already-locked exact MAC. It requires
+`--trust-existing-derived-hmac` plus `--confirm-split-root-recovery-for <exact-mac>`, refuses empty
+eFuses, rewrites only encrypted NVS, and does not alter the production fleet root.
+
 ## Secret handling
 
 Production values live in the runner's protected env file or encrypted Actions secret. CI creates

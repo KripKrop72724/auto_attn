@@ -9,7 +9,8 @@ connector. Use a controlled test employee identity; never experiment on an emplo
 - The ESP32-S3 USB serial port is stable and its Wi-Fi MAC is recorded.
 - ZKT serial/model/firmware, user count, attendance count, device time, and current IP are recorded.
 - A fresh terminal backup/export exists according to local operations policy.
-- The production `.env.add` fleet root matches the fleet root used by the provisioner.
+- The provisioner's explicit `ADD_FLEET_ROOT_SECRET` is verified against the protected production
+  source. Never infer it from a local `.env.add` file and never substitute `ADD_PII_LOOKUP_KEY`.
 - Explicit approval has been obtained before any irreversible eFuse burn for the exact MAC.
 
 ## Provision and boot proof
@@ -24,6 +25,10 @@ connector. Use a controlled test employee identity; never experiment on an emplo
 5. Capture serial boot logs until Wi-Fi, signed onboarding, TLS WebSocket, ZKT authentication, live
    event registration, and heartbeat succeed.
 6. Confirm the connector appears automatically in ADD; there must be no registration action.
+
+If Wi-Fi succeeds but no connector row appears, verify root provenance before changing network or
+ADD records. A known locked-eFuse root mismatch must use the documented exact-MAC split-root
+recovery; never rotate production to the wrong root and never burn a second key.
 
 ## Read-only baseline
 
