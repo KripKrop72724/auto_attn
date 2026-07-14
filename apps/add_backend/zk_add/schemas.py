@@ -61,6 +61,18 @@ class UserSnapshotRow(BaseModel):
     name: str
     privilege: int = 0
     card: int | None = None
+    terminal_identity_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    terminal_state_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class UserSnapshotRequest(BaseModel):

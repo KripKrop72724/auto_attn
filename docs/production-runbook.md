@@ -109,6 +109,12 @@ Never run Alembic downgrade for the protected-data contract revision; restore it
 
 After every release, verify:
 
+- the expected Zone Lite firmware version is reported after any required physical flash;
+- a complete user refresh has populated raw-record fingerprints before editing a legacy user whose
+  displayed user ID contains replacement question marks;
+- the target UID, terminal user count, and terminal attendance count are unchanged before retrying
+  a failed legacy-record edit.
+
 ```text
 http://127.0.0.1:8095/health/ui
 http://127.0.0.1:8096/health/ready

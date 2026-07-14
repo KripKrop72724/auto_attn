@@ -181,6 +181,26 @@ def test_command_inbox_is_encrypted_bounded_recoverable_and_cancellable():
     assert "add_connector_command_retry" in runtime
 
 
+def test_malformed_legacy_user_ids_use_keyed_raw_record_preconditions():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert "set_terminal_user_fingerprints" in runtime
+    assert "mbedtls_md_hmac" in runtime
+    assert "runtime->bootstrap_secret" in runtime
+    assert '"ZONE-LITE-ZKT-USER-IDENTITY-V1"' in runtime
+    assert '"ZONE-LITE-ZKT-USER-STATE-V1"' in runtime
+    assert '"terminal_identity_fingerprint"' in runtime
+    assert '"terminal_state_fingerprint"' in runtime
+    assert "has_expected_terminal_identity_fingerprint" in header
+    assert "has_expected_terminal_state_fingerprint" in header
+    assert '"terminal_identity_fingerprint"' in connector
+    assert '"terminal_state_fingerprint"' in connector
+    assert "user_matches_expected_state" in runtime
+    assert "verified_terminal_identity_fingerprint" in runtime
+    assert "verified_terminal_state_fingerprint" in runtime
+
+
 def test_delete_persists_identity_before_zkt_mutation():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     branch = source[source.index('strcmp(command.command_type, "DELETE_USER") == 0') :]

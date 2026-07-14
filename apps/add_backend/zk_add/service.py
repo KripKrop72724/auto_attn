@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -506,6 +507,8 @@ def replace_user_snapshot(
                 uid=incoming.uid,
                 user_id=incoming.user_id,
                 machine_name_encrypted=encrypt_text(incoming.name),
+                terminal_identity_fingerprint=incoming.terminal_identity_fingerprint,
+                terminal_state_fingerprint=incoming.terminal_state_fingerprint,
                 display_name=parsed.display_name,
                 row_version=1,
                 lifecycle_state="ACTIVE",
@@ -518,6 +521,8 @@ def replace_user_snapshot(
             row.row_version = (row.row_version or 0) + 1
         row.user_id = incoming.user_id
         row.machine_name_encrypted = encrypt_text(incoming.name)
+        row.terminal_identity_fingerprint = incoming.terminal_identity_fingerprint
+        row.terminal_state_fingerprint = incoming.terminal_state_fingerprint
         if row.source != "ADD_MANAGED" or not row.display_name:
             row.display_name = parsed.display_name
         if parsed.cnic:
@@ -1175,6 +1180,41 @@ def duplicate_cnic_message(claims: list[DeviceUser]) -> str:
     )
 
 
+def terminal_fingerprint_preconditions(user: DeviceUser) -> dict[str, str]:
+    """Return opaque raw-record checks when the connector supplied them.
+
+    Old ZKT models can contain non-UTF-8 bytes in a user ID. Their JSON-safe
+    representation is intentionally lossy, so using that representation as a
+    terminal precondition would reject the correct UID. New Zone Lite firmware
+    supplies keyed fingerprints over the exact raw identifier and state bytes.
+    """
+
+    identity = user.terminal_identity_fingerprint
+    state = user.terminal_state_fingerprint
+    if ("?" in user.user_id or "\ufffd" in user.user_id) and not (identity and state):
+        raise ValueError(
+            "This legacy terminal user ID contains malformed bytes. Refresh users with "
+            "the current Zone Lite firmware before editing this record."
+        )
+    result: dict[str, str] = {}
+    if identity:
+        result["terminal_identity_fingerprint"] = identity
+    if state:
+        result["terminal_state_fingerprint"] = state
+    return result
+
+
+def apply_verified_terminal_fingerprints(user: DeviceUser, result: dict) -> None:
+    mappings = {
+        "verified_terminal_identity_fingerprint": "terminal_identity_fingerprint",
+        "verified_terminal_state_fingerprint": "terminal_state_fingerprint",
+    }
+    for result_key, attribute in mappings.items():
+        value = result.get(result_key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+            setattr(user, attribute, value)
+
+
 def allocate_device_identifiers(
     session: Session, *, zkt: ZKTDevice, user_id_override: str | None
 ) -> tuple[str, str]:
@@ -1409,6 +1449,7 @@ def update_device_user_command(
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker
     next_privilege = user.privilege if privilege is None else privilege
+    fingerprint_preconditions = terminal_fingerprint_preconditions(user)
     machine_name = build_machine_name(
         display_name=next_display,
         cnic=next_cnic,
@@ -1465,6 +1506,7 @@ def update_device_user_command(
             "row_version": user.row_version,
             "name": current_machine_name,
             "privilege": user.privilege,
+            **fingerprint_preconditions,
         },
         desired_state=desired,
         idempotency_key=idempotency_key,
@@ -1508,6 +1550,7 @@ def delete_device_user_command(
     if user.privilege == 14:
         raise ValueError("Demote this permanent administrator before deletion.")
     ensure_no_active_user_operation(session, zkt=zkt, user=user)
+    fingerprint_preconditions = terminal_fingerprint_preconditions(user)
     persist_identity_tombstone(session, zkt=zkt, user=user)
     cnic = decrypt_cnic(user.cnic_encrypted)
     current_machine_name = decrypt_text(user.machine_name_encrypted) or ""
@@ -1551,6 +1594,7 @@ def delete_device_user_command(
             "name": current_machine_name,
             "privilege": user.privilege,
             "attendance_count": zkt.attendance_count,
+            **fingerprint_preconditions,
         },
         desired_state={"user_key": user.user_key, "present": False},
         idempotency_key=idempotency_key,
@@ -1795,6 +1839,10 @@ def apply_command_update(
                         details={"lease_id": lease.lease_id},
                     )
             lease.updated_at = now
+    if lease is not None and status == "SUCCEEDED":
+        lease_user = session.get(DeviceUser, lease.device_user_id)
+        if lease_user is not None:
+            apply_verified_terminal_fingerprints(lease_user, result)
     append_audit(
         session,
         actor=f"connector:{connector.connector_id}",
@@ -1845,6 +1893,8 @@ def apply_user_command_terminal_state(
         user.deleted_at = utc_now()
         user.deleted_by = command.actor
         user.row_version += 1
+    if command.command_type in {"CREATE_USER", "UPDATE_USER"}:
+        apply_verified_terminal_fingerprints(user, command.result or {})
     if zkt and command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"}:
         resolved_conflicts = reconcile_device_user_identity_conflicts(
             session, connector=zkt.connector, zkt=zkt
@@ -1871,6 +1921,7 @@ def create_admin_lease(
     if user.privilege != 0 or not user.present:
         raise ValueError("Only a present regular user can receive a temporary admin lease.")
     zkt = require_writable_user_profile(connector, "admin_lease")
+    fingerprint_preconditions = terminal_fingerprint_preconditions(user)
     active = session.scalar(
         select(TemporaryAdminLease).where(
             TemporaryAdminLease.zkt_device_id == zkt.id,
@@ -1900,6 +1951,7 @@ def create_admin_lease(
             "user_id": user.user_id,
             "privilege": 0,
             "row_version": user.row_version,
+            **fingerprint_preconditions,
         },
         desired_state={"privilege": 14},
         idempotency_key=idempotency_key,
@@ -1950,6 +2002,7 @@ def queue_due_revokes(session: Session) -> list[DeviceCommand]:
                     "uid": user.uid,
                     "user_id": user.user_id,
                     "privilege": 14,
+                    **terminal_fingerprint_preconditions(user),
                 },
                 desired_state={"privilege": 0},
                 idempotency_key=f"revoke:{lease.lease_id}:{lease.revoke_command_id or 0}",

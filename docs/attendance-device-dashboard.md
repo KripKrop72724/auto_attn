@@ -54,6 +54,11 @@ completeness. ADD certifies a write profile only after stable observations:
 The certification fingerprint changes when terminal identity/profile changes. A change clears
 write certification until fresh stable observations arrive.
 
+Per-user command preconditions are independent of the certification fingerprint. Zone Lite 2.1.2
+adds keyed raw-record fingerprints so records from older terminals remain safely editable even when
+their user-ID bytes cannot be represented losslessly in JSON. Until a refreshed snapshot supplies
+those fingerprints, ADD refuses to queue a mutation for a visibly sanitized legacy ID.
+
 ## User lifecycle
 
 Users are always scoped to the selected terminal and have a stable ADD UUID independent of mutable
