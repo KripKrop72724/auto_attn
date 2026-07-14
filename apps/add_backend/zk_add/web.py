@@ -28,6 +28,12 @@ from sqlalchemy.orm import Session
 from zk_add import APP_VERSION
 from zk_add.audit import append_audit
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
+from zk_add.identity_conflicts import (
+    build_identity_conflict_report,
+    create_same_employee_resolution,
+    revoke_identity_resolution,
+    valid_identity_resolutions,
+)
 from zk_add.db import SessionLocal, init_db, session_scope
 from zk_add.models import (
     AdminSession,
@@ -39,6 +45,7 @@ from zk_add.models import (
     DeviceConnectionEvent,
     DeviceLog,
     DeviceUser,
+    IdentityConflictResolution,
     IdentityTombstone,
     OnboardingNonce,
     TemporaryAdminLease,
@@ -52,6 +59,8 @@ from zk_add.schemas import (
     CommandUpdate,
     Envelope,
     HeartbeatPayload,
+    IdentityConflictResolveRequest,
+    IdentityConflictRevokeRequest,
     LoginRequest,
     OnboardRequest,
     DeviceLogIn,
@@ -87,6 +96,7 @@ from zk_add.service import (
     ingest_attendance,
     ingest_logs,
     replace_user_snapshot,
+    reconcile_device_user_identity_conflicts,
     resolve_alert,
     onboard_connector,
     serialize_command,
@@ -484,7 +494,17 @@ def list_users(
         statement = statement.where(DeviceUser.privilege == privilege)
     rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
-    return {"rows": [serialize_user(row) for row in rows[:limit]], "next_cursor": next_cursor}
+    resolutions = valid_identity_resolutions(db, zkt=connector.zkt_device)
+    return {
+        "rows": [
+            serialize_user(
+                row,
+                identity_resolution=resolutions.get(row.cnic_lookup_hash or ""),
+            )
+            for row in rows[:limit]
+        ],
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/api/v2/devices/{connector_id}/users")
@@ -527,34 +547,127 @@ def list_device_users_v2(
         statement = statement.where(DeviceUser.cnic_lookup_hash == cnic_lookup(normalized))
     if privilege is not None:
         statement = statement.where(DeviceUser.privilege == privilege)
+    rows = list(db.scalars(statement.order_by(DeviceUser.id.asc())).all())
+    integrity, conflict_members, resolutions_by_user = device_user_identity_integrity(
+        db, zkt=zkt
+    )
     if identity == "COMPLETE":
-        statement = statement.where(
-            DeviceUser.cnic_lookup_hash != None,  # noqa: E711
-            DeviceUser.identity_conflict_code == None,  # noqa: E711
-        )
+        rows = [
+            row
+            for row in rows
+            if row.cnic_lookup_hash
+            and (row.identity_conflict_code is None or row.id in resolutions_by_user)
+        ]
     elif identity == "MISSING":
-        statement = statement.where(
-            or_(
-                DeviceUser.cnic_lookup_hash == None,  # noqa: E711
-                DeviceUser.identity_conflict_code != None,  # noqa: E711
-            )
-        )
+        rows = [
+            row
+            for row in rows
+            if not row.cnic_lookup_hash
+            or (row.identity_conflict_code is not None and row.id not in resolutions_by_user)
+        ]
     elif identity == "CONFLICT":
-        statement = statement.where(DeviceUser.identity_conflict_code != None)  # noqa: E711
-    rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
-    integrity, conflict_members = device_user_identity_integrity(db, zkt=zkt)
+        rows = [
+            row
+            for row in rows
+            if row.identity_conflict_code is not None and row.id not in resolutions_by_user
+        ]
+    elif identity == "RESOLVED_ALIAS":
+        rows = [row for row in rows if row.id in resolutions_by_user]
+    next_cursor = rows[limit - 1].id if len(rows) > limit else None
     return {
         "rows": [
             serialize_user(
                 row,
                 zkt=zkt,
                 identity_conflict_members=conflict_members.get(row.id, []),
+                identity_resolution=resolutions_by_user.get(row.id),
             )
             for row in rows[:limit]
         ],
-        "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
+        "next_cursor": next_cursor,
         "device": serialize_connector(connector),
         "identity_integrity": integrity,
+    }
+
+
+@app.get("/api/v2/devices/{connector_id}/identity-conflicts")
+def identity_conflict_report(
+    connector_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    if connector.zkt_device is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    return build_identity_conflict_report(db, zkt=connector.zkt_device)
+
+
+@app.post("/api/v2/devices/{connector_id}/identity-conflicts/resolve", status_code=201)
+def resolve_identity_conflict(
+    connector_id: str,
+    body: IdentityConflictResolveRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    try:
+        resolution = create_same_employee_resolution(
+            db,
+            zkt=zkt,
+            group_token=body.group_token,
+            members=[(member.user_key, member.expected_version) for member in body.members],
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+            ip_address=client_ip(request),
+        )
+        reconcile_device_user_identity_conflicts(db, connector=connector, zkt=zkt)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {
+        "resolution": serialize_identity_resolution(resolution),
+        "report": build_identity_conflict_report(db, zkt=zkt),
+    }
+
+
+@app.post(
+    "/api/v2/devices/{connector_id}/identity-conflicts/{resolution_id}/revoke"
+)
+def revoke_resolved_identity_conflict(
+    connector_id: str,
+    resolution_id: str,
+    body: IdentityConflictRevokeRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    try:
+        resolution = revoke_identity_resolution(
+            db,
+            zkt=zkt,
+            resolution_id=resolution_id,
+            reason=body.reason,
+            actor=context.username,
+            ip_address=client_ip(request),
+        )
+        reconcile_device_user_identity_conflicts(db, connector=connector, zkt=zkt)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {
+        "resolution": serialize_identity_resolution(resolution),
+        "report": build_identity_conflict_report(db, zkt=zkt),
     }
 
 
@@ -1413,7 +1526,11 @@ def command_response(row: DeviceCommand) -> dict:
 
 def device_user_identity_integrity(
     db: Session, *, zkt: ZKTDevice
-) -> tuple[dict, dict[int, list[dict[str, str]]]]:
+) -> tuple[
+    dict,
+    dict[int, list[dict[str, str]]],
+    dict[int, IdentityConflictResolution],
+]:
     """Build exact-match evidence without returning CNICs or lookup hashes."""
 
     active = list(
@@ -1430,18 +1547,28 @@ def device_user_identity_integrity(
         if user.cnic_lookup_hash:
             groups.setdefault(user.cnic_lookup_hash, []).append(user)
     duplicate_groups = [group for group in groups.values() if len(group) > 1]
+    valid_resolutions = valid_identity_resolutions(db, zkt=zkt, groups=groups)
     conflict_members: dict[int, list[dict[str, str]]] = {}
+    resolutions_by_user: dict[int, IdentityConflictResolution] = {}
     for group in duplicate_groups:
         ordered = sorted(group, key=lambda user: (user.user_id, user.uid))
+        resolution = valid_resolutions.get(ordered[0].cnic_lookup_hash or "")
         for user in ordered:
             if user.id is None:
                 continue
+            if resolution is not None:
+                resolutions_by_user[user.id] = resolution
             conflict_members[user.id] = [
                 {"user_id": member.user_id, "uid": member.uid}
                 for member in ordered
                 if member.id != user.id
             ]
     with_cnic = sum(bool(user.cnic_lookup_hash) for user in active)
+    unresolved_groups = [
+        group
+        for group in duplicate_groups
+        if (group[0].cnic_lookup_hash or "") not in valid_resolutions
+    ]
     return (
         {
             "source": (
@@ -1454,8 +1581,12 @@ def device_user_identity_integrity(
             "missing_cnic": len(active) - with_cnic,
             "duplicate_groups": len(duplicate_groups),
             "duplicate_users": sum(len(group) for group in duplicate_groups),
+            "resolved_duplicate_groups": len(duplicate_groups) - len(unresolved_groups),
+            "unresolved_duplicate_groups": len(unresolved_groups),
+            "unresolved_duplicate_users": sum(len(group) for group in unresolved_groups),
         },
         conflict_members,
+        resolutions_by_user,
     )
 
 
@@ -1464,6 +1595,7 @@ def serialize_user(
     *,
     zkt: ZKTDevice | None = None,
     identity_conflict_members: list[dict[str, str]] | None = None,
+    identity_resolution: IdentityConflictResolution | None = None,
 ) -> dict:
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
@@ -1478,10 +1610,16 @@ def serialize_user(
         "cnic_masked": mask_cnic(cnic),
         "cnic_available": bool(cnic),
         "identity_complete": bool(
-            cnic and row.display_name and row.identity_conflict_code is None
+            cnic
+            and row.display_name
+            and (row.identity_conflict_code is None or identity_resolution is not None)
         ),
         "identity_conflict_code": row.identity_conflict_code,
         "identity_conflict_members": identity_conflict_members or [],
+        "identity_conflict_resolved": identity_resolution is not None,
+        "identity_resolution_id": (
+            identity_resolution.resolution_id if identity_resolution is not None else None
+        ),
         "shift_worker": row.shift_worker,
         "privilege": row.privilege,
         "present": row.present,
@@ -1491,6 +1629,21 @@ def serialize_user(
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
         "read_only": bool(zkt and zkt.certification_state != "CERTIFIED"),
+    }
+
+
+def serialize_identity_resolution(row: IdentityConflictResolution) -> dict:
+    return {
+        "resolution_id": row.resolution_id,
+        "resolution_type": row.resolution_type,
+        "classification": row.classification,
+        "status": row.status,
+        "reason": row.reason,
+        "created_by": row.created_by,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "revoked_by": row.revoked_by,
+        "revoked_at": row.revoked_at,
     }
 
 
@@ -1512,6 +1665,7 @@ def serialize_attendance(row: AttendanceEvent) -> dict:
         "clock_quality": row.clock_quality,
         "clock_drift_seconds": row.clock_drift_seconds,
         "ords_status": row.ords_status,
+        "identity_resolution_id": row.identity_resolution_id,
     }
 
 

@@ -18,6 +18,8 @@ import type {
   Device,
   DeviceLog,
   DeviceUser,
+  IdentityConflictGroup,
+  IdentityConflictReport,
   IdentityIntegrity,
   Overview,
   UserCommandResponse,
@@ -32,6 +34,10 @@ type UserDialogState =
   | { mode: 'delete'; user: DeviceUser }
   | { mode: 'lease'; user: DeviceUser }
   | null
+type IdentityResolutionDialogState = {
+  mode: 'resolve' | 'revoke'
+  group: IdentityConflictGroup
+} | null
 
 const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
 const drawerTabs: DrawerTab[] = ['overview', 'logs', 'control']
@@ -77,6 +83,11 @@ export function identityConflictText(user: DeviceUser) {
   const matches = user.identity_conflict_members
     .map((member) => `${member.user_id} (UID ${member.uid})`)
     .join(', ')
+  if (user.identity_conflict_resolved) {
+    return matches
+      ? `${user.cnic_masked || 'Masked CNIC'} · Verified same employee across user ${matches}`
+      : `${user.cnic_masked || 'Masked CNIC'} · Verified same-employee terminal alias`
+  }
   return matches
     ? `${user.cnic_masked || 'Masked CNIC'} · Exact CNIC also encoded on user ${matches} · correction required`
     : `${user.cnic_masked || 'Masked CNIC'} · Exact duplicate reported by terminal · correction required`
@@ -498,7 +509,7 @@ function UserOperationDialog({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const conflictRequiresCnic = Boolean(
-    state.mode === 'edit' && user?.identity_conflict_code,
+    state.mode === 'edit' && user?.identity_conflict_code && !user.identity_conflict_resolved,
   )
   const preview = cnic
     ? buildMachinePreview(displayName, cnic, shiftWorker)
@@ -635,6 +646,108 @@ function UserOperationDialog({
   )
 }
 
+function IdentityResolutionDialog({
+  state,
+  device,
+  onClose,
+  onComplete,
+  toast,
+}: {
+  state: Exclude<IdentityResolutionDialogState, null>
+  device: Device
+  onClose: () => void
+  onComplete: (report: IdentityConflictReport) => void
+  toast: ReturnType<typeof useToast>
+}) {
+  const resolving = state.mode === 'resolve'
+  const expectedConfirmation = resolving ? 'SAME EMPLOYEE' : 'REVOKE RESOLUTION'
+  const [reason, setReason] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    if (reason.trim().length < 10) return setError('Record a reason of at least 10 characters.')
+    if (confirmation !== expectedConfirmation) {
+      return setError(`Type ${expectedConfirmation} exactly to continue.`)
+    }
+    if (!password) return setError('Password confirmation is required.')
+    setBusy(true)
+    try {
+      const path = resolving
+        ? `/api/v2/devices/${device.connector_id}/identity-conflicts/resolve`
+        : `/api/v2/devices/${device.connector_id}/identity-conflicts/${state.group.resolution_id}/revoke`
+      const body = resolving
+        ? {
+            group_token: state.group.group_token,
+            members: state.group.members.map((member) => ({
+              user_key: member.user_key,
+              expected_version: member.row_version,
+            })),
+            reason: reason.trim(),
+            typed_confirmation: expectedConfirmation,
+            password,
+            idempotency_key: idempotency('identity-resolution'),
+          }
+        : {
+            reason: reason.trim(),
+            typed_confirmation: expectedConfirmation,
+            password,
+          }
+      const response = await api<{ report: IdentityConflictReport }>(path, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      onComplete(response.report)
+      toast.notice(
+        resolving
+          ? 'Same-employee alias approved. No terminal user or attendance row was changed.'
+          : 'Identity resolution revoked. New punches return to identity quarantine.',
+      )
+      onClose()
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : 'Resolution could not be saved.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog
+      titleId="identity-resolution-title"
+      title={resolving ? 'Verify same employee' : 'Revoke identity resolution'}
+      description={
+        resolving
+          ? 'Approve only after the member records are confirmed to belong to one legal identity.'
+          : 'Re-enable quarantine if the prior same-employee decision was incorrect.'
+      }
+      onClose={onClose}
+    >
+      <form className="dialog-body" onSubmit={submit}>
+        <div className={resolving ? 'info-copy pattern-waiting' : 'destructive-copy pattern-blocked'}>
+          <Icon name={resolving ? 'shield' : 'alert'} />
+          <div>
+            <h3>{state.group.cnic_masked || 'Masked CNIC group'}</h3>
+            <p>{state.group.members.map((member) => `${member.display_name} · User ${member.user_id}`).join(' | ')}</p>
+            <p>No ZKT user, fingerprint template, UID, or attendance event is merged, deleted, or rewritten.</p>
+          </div>
+        </div>
+        <label>Audit reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
+        <label>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
+        <label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
+        <footer className="dialog-actions">
+          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className={`button ${resolving ? 'primary' : 'destructive'}`} disabled={busy}>{busy ? 'Saving…' : resolving ? 'Approve same employee' : 'Revoke resolution'}</button>
+        </footer>
+      </form>
+    </Dialog>
+  )
+}
+
 function UsersView({
   devices,
   selectedDeviceId,
@@ -659,30 +772,39 @@ function UsersView({
   const [dialog, setDialog] = useState<UserDialogState>(null)
   const [command, setCommand] = useState<Command | null>(null)
   const [integrity, setIntegrity] = useState<IdentityIntegrity | null>(null)
+  const [conflictReport, setConflictReport] = useState<IdentityConflictReport | null>(null)
+  const [resolutionDialog, setResolutionDialog] = useState<IdentityResolutionDialogState>(null)
 
   const load = useCallback(async () => {
     if (!selected) {
       setRows([])
       setIntegrity(null)
+      setConflictReport(null)
       return
     }
     setLoading(true)
     try {
       const compact = query.replace(/\D/g, '')
       const cnicSearch = compact.length === 13 && compact === query.replace(/[\s-]/g, '')
-      const result = await api<{
-        rows: DeviceUser[]
-        identity_integrity: IdentityIntegrity
-      }>(
-        `/api/v2/devices/${selected.connector_id}/users${queryString({
-          q: cnicSearch ? undefined : query,
-          cnic: cnicSearch ? compact : undefined,
-          identity: identity === 'ALL' ? undefined : identity,
-          privilege: role === 'ALL' ? undefined : role,
-        })}`,
-      )
+      const [result, conflicts] = await Promise.all([
+        api<{
+          rows: DeviceUser[]
+          identity_integrity: IdentityIntegrity
+        }>(
+          `/api/v2/devices/${selected.connector_id}/users${queryString({
+            q: cnicSearch ? undefined : query,
+            cnic: cnicSearch ? compact : undefined,
+            identity: identity === 'ALL' ? undefined : identity,
+            privilege: role === 'ALL' ? undefined : role,
+          })}`,
+        ),
+        api<IdentityConflictReport>(
+          `/api/v2/devices/${selected.connector_id}/identity-conflicts`,
+        ),
+      ])
       setRows(result.rows)
       setIntegrity(result.identity_integrity || null)
+      setConflictReport(conflicts)
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : 'Unable to load users.')
     } finally {
@@ -745,25 +867,73 @@ function UsersView({
       ) : (
         <>
           {!writable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{selected.zkt?.writes_disabled_reason || 'The terminal is not yet write-certified or its complete snapshot is pending.'}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ_ONLY'} /></div>}
-          {integrity && integrity.duplicate_users > 0 && (
+          {integrity && integrity.unresolved_duplicate_users > 0 && (
             <div className="capability-banner pattern-blocked" role="status">
               <Icon name="alert" />
               <div>
                 <strong>Exact CNIC conflicts are present in the terminal data.</strong>
                 <span>
                   The latest {integrity.source === 'CURRENT_COMPLETE_ZKT_SNAPSHOT' ? 'complete ' : ''}
-                  ZKT snapshot reports {integrity.duplicate_users} users across {integrity.duplicate_groups}{' '}
-                  exact-CNIC groups. Matching terminal user IDs are shown below; unsafe reuse remains blocked.
+                  ZKT snapshot reports {integrity.unresolved_duplicate_users} unresolved users across{' '}
+                  {integrity.unresolved_duplicate_groups} exact-CNIC groups. Matching terminal user IDs are
+                  quarantined until corrected or explicitly verified as the same employee.
                 </span>
               </div>
               <StatusBadge state="CORRECTION REQUIRED" />
             </div>
           )}
           {command && <CommandProgress command={command} onCancel={cancel} />}
+          {conflictReport && conflictReport.raw_duplicate_groups > 0 && (
+            <section className="panel conflict-workbench" aria-label="Identity conflict review">
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">REVERSIBLE IDENTITY REVIEW</p>
+                  <h2>Exact-CNIC terminal groups</h2>
+                  <p>
+                    {conflictReport.resolved_groups} verified · {conflictReport.unresolved_groups} awaiting review.
+                    ADD has {conflictReport.evidence_scope.add_attendance_count.toLocaleString()} of the terminal’s{' '}
+                    {conflictReport.evidence_scope.terminal_attendance_count.toLocaleString()} punches
+                    {conflictReport.evidence_scope.attendance_coverage_percent == null
+                      ? ''
+                      : ` (${conflictReport.evidence_scope.attendance_coverage_percent}% evidence coverage)`}.
+                  </p>
+                </div>
+                <StatusBadge state={conflictReport.unresolved_groups ? 'REVIEW REQUIRED' : 'RESOLVED'} />
+              </div>
+              <div className="conflict-groups">
+                {conflictReport.groups.map((group) => (
+                  <article key={group.group_token} className={`conflict-group pattern-${group.status === 'UNRESOLVED' ? 'blocked' : 'confirmed'}`}>
+                    <div className="conflict-group-heading">
+                      <div><strong>{group.cnic_masked || 'Masked CNIC'}</strong><small>{group.classification.replaceAll('_', ' ')}</small></div>
+                      <StatusBadge state={group.status} />
+                    </div>
+                    <div className="conflict-members">
+                      {group.members.map((member) => (
+                        <div key={member.user_key}>
+                          <span><strong>{member.display_name}</strong><small>User {member.user_id} · UID {member.uid}</small></span>
+                          <span><strong>{member.punch_evidence.captured_count.toLocaleString()} captured</strong><small>{member.punch_evidence.last_captured_at ? `Last ${dateTime(member.punch_evidence.last_captured_at)}` : 'No punches in ADD evidence window'}</small></span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="conflict-group-actions">
+                      <small>{group.status === 'UNRESOLVED' ? group.recommended_action.replaceAll('_', ' ') : group.resolution_reason}</small>
+                      <button
+                        className={`button ${group.status === 'UNRESOLVED' ? 'secondary' : 'text-button'}`}
+                        onClick={() => setResolutionDialog({ mode: group.status === 'UNRESOLVED' ? 'resolve' : 'revoke', group })}
+                      >
+                        <Icon name={group.status === 'UNRESOLVED' ? 'shield' : 'alert'} />
+                        {group.status === 'UNRESOLVED' ? 'Review same-employee alias' : 'Revoke resolution'}
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
           <section className="panel">
             <div className="toolbar user-toolbar">
               <label className="search-field"><span className="sr-only">Search users</span><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name, user ID, or exact CNIC" /></label>
-              <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing or conflicted</option><option value="CONFLICT">CNIC conflict</option></select></label>
+              <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing or unresolved</option><option value="CONFLICT">CNIC conflict</option><option value="RESOLVED_ALIAS">Verified aliases</option></select></label>
               <label><span className="sr-only">Role</span><select value={role} onChange={(event) => setRole(event.target.value)}><option value="ALL">All roles</option><option value="0">Regular users</option><option value="14">Administrators</option></select></label>
               <button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh users</button>
             </div>
@@ -771,7 +941,7 @@ function UsersView({
               <div className="user-table-head"><span>Identity</span><span>Terminal record</span><span>Role & shift</span><span>Last sync</span><span>Actions</span></div>
               {loading && <div className="empty-state compact"><Icon name="refresh" /><p>Reading the selected terminal user view…</p></div>}
               {!loading && rows.map((user) => (
-                <article key={user.user_key} className={`user-row ${user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`}>
+                <article key={user.user_key} className={`user-row ${user.identity_conflict_resolved ? 'identity-resolved' : user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`}>
                   <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
                   <div><strong>User {user.user_id}</strong><small>UID {user.uid} · v{user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
                   <div><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} /><small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small></div>
@@ -789,6 +959,7 @@ function UsersView({
         </>
       )}
       {dialog && selected && <UserOperationDialog state={dialog} device={selected} onClose={() => setDialog(null)} onCommand={setCommand} toast={toast} />}
+      {resolutionDialog && selected && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void load() }} toast={toast} />}
     </>
   )
 }

@@ -116,6 +116,7 @@ input, select, textarea {
   font-size: 14px;
 }
 input::placeholder { color: #777777; }
+textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .login-card small { display: block; margin-top: 18px; color: var(--muted); text-align: center; }
 
 .button, .icon-button, .text-button {
@@ -261,6 +262,22 @@ input::placeholder { color: #777777; }
 .command-progress h3 { margin: 0 0 3px; font-size: 17px; }
 .command-progress p { margin: 0; color: var(--muted); font-size: 14px; }
 .command-progress .eyebrow { margin-bottom: 3px; font-size: 12px; }
+.conflict-workbench { margin-bottom: 18px; }
+.section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px; border-bottom: 1px solid var(--line); }
+.section-heading h2 { margin-bottom: 7px; font-size: 21px; }
+.section-heading p:not(.eyebrow) { max-width: 900px; margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+.conflict-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 16px; background: #fafafa; }
+.conflict-group { min-width: 0; padding: 16px; background: #ffffff; }
+.conflict-group-heading, .conflict-group-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.conflict-group-heading > div, .conflict-group-heading strong, .conflict-group-heading small { display: block; }
+.conflict-group-heading strong { margin-bottom: 4px; font-size: 15px; }
+.conflict-group-heading small, .conflict-group-actions small { color: var(--muted); }
+.conflict-members { display: grid; margin: 14px 0; border-top: 1px solid var(--line); }
+.conflict-members > div { min-height: 62px; display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid #eeeeee; }
+.conflict-members span, .conflict-members strong, .conflict-members small { display: block; min-width: 0; }
+.conflict-members strong { overflow: hidden; margin-bottom: 3px; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.conflict-members small { color: var(--muted); }
+.conflict-group-actions small { max-width: 55%; overflow-wrap: anywhere; font-size: 11px; }
 .user-toolbar { flex-wrap: wrap; }
 .user-toolbar .search-field { min-width: 320px; }
 .user-table { min-height: 180px; }
@@ -269,6 +286,7 @@ input::placeholder { color: #777777; }
 .user-row { min-height: 96px; padding: 13px 20px; border-bottom: 1px solid #e8e8e8; }
 .user-row.identity-missing { border-left: 5px dashed #737373; }
 .user-row.identity-conflict { border-left: 6px double #525252; background-image: repeating-linear-gradient(135deg, transparent, transparent 10px, rgba(0,0,0,.025) 10px, rgba(0,0,0,.025) 20px); }
+.user-row.identity-resolved { border-left: 5px solid var(--blue); background: rgba(0,148,218,.025); }
 .user-row > div { min-width: 0; }
 .user-row strong, .user-row small, .user-row code { display: block; }
 .user-row strong { margin-bottom: 5px; font-size: 14px; }
@@ -371,6 +389,7 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
   .page-content { padding-bottom: 110px; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .filter-grid { grid-template-columns: repeat(3, 1fr); }
+  .conflict-groups { grid-template-columns: 1fr; }
   .user-table-head { display: none; }
   .user-row { grid-template-columns: 1.2fr 1fr 1fr; }
   .user-row > div:nth-child(4) { grid-column: 2; }
@@ -406,6 +425,9 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
   .device-card-actions > span { display: none; }
   .selection-panel { grid-template-columns: 1fr; }
   .selected-device-summary { justify-content: flex-start; }
+  .section-heading, .conflict-group-heading, .conflict-group-actions { align-items: flex-start; flex-direction: column; }
+  .conflict-group-actions small { max-width: none; }
+  .conflict-group-actions .button, .conflict-group-actions .text-button { width: 100%; }
   .toolbar { align-items: stretch; flex-direction: column; }
   .toolbar select { width: 100%; }
   .user-toolbar .search-field { min-width: 0; }

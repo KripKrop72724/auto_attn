@@ -33,6 +33,8 @@ hash in the protected server environment; plaintext credentials are never commit
 - Fleet overview with live ESP/ZKT state, serial-style logs, alerts, device clock, drift, sync state,
   next restart, and operator-triggered restart.
 - Device-scoped user search, creation, name/CNIC/shift editing, deletion, and role display.
+- Reversible, password-confirmed same-employee resolution for legacy duplicate-CNIC terminal records;
+  no terminal user, fingerprint template, or historical punch is merged or rewritten.
 - Ten-minute administrator leases with password step-up and ESP-enforced automatic revocation.
 - Deleting a user removes only the ZKT identity. Attendance rows remain immutable and are checked
   before the command can report success.

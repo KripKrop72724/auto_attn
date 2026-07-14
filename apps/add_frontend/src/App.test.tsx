@@ -73,6 +73,8 @@ const user: DeviceUser = {
   identity_complete: true,
   identity_conflict_code: null,
   identity_conflict_members: [],
+  identity_conflict_resolved: false,
+  identity_resolution_id: null,
   shift_worker: false,
   privilege: 0,
   present: true,
@@ -154,6 +156,56 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
     if (path.includes('/api/v1/devices') && !path.includes('/users')) {
       return response({ rows: [device] })
     }
+    if (path.includes('/api/v2/devices/connector-one/identity-conflicts')) {
+      const hasConflict = users.some((row) => row.identity_conflict_code)
+      return response({
+        evidence_scope: {
+          snapshot_source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT',
+          terminal_attendance_count: 42,
+          add_attendance_count: 4,
+          attendance_coverage_percent: 9.52,
+          attendance_is_immutable: true,
+          terminal_users_are_unchanged: true,
+        },
+        raw_duplicate_groups: hasConflict ? 1 : 0,
+        resolved_groups: 0,
+        unresolved_groups: hasConflict ? 1 : 0,
+        groups: hasConflict
+          ? [{
+              group_token: 'a'.repeat(64),
+              cnic_masked: maskedCnic,
+              classification: 'POSSIBLE_NAME_VARIANT',
+              status: 'UNRESOLVED',
+              resolution_id: null,
+              resolution_created_at: null,
+              resolution_reason: null,
+              recommended_action: 'HR_IDENTITY_REVIEW',
+              members: [
+                {
+                  user_key: conflictedUser.user_key,
+                  uid: conflictedUser.uid,
+                  user_id: conflictedUser.user_id,
+                  display_name: conflictedUser.display_name,
+                  row_version: conflictedUser.row_version,
+                  privilege: conflictedUser.privilege,
+                  observed_at: conflictedUser.observed_at,
+                  punch_evidence: { captured_count: 4, first_captured_at: null, last_captured_at: null, blocked_identity_count: 1 },
+                },
+                {
+                  user_key: 'other-user-key',
+                  uid: '8',
+                  user_id: '1008',
+                  display_name: 'Ayesha F.',
+                  row_version: 2,
+                  privilege: 0,
+                  observed_at: conflictedUser.observed_at,
+                  punch_evidence: { captured_count: 0, first_captured_at: null, last_captured_at: null, blocked_identity_count: 0 },
+                },
+              ],
+            }]
+          : [],
+      })
+    }
     if (path.includes('/api/v2/devices/connector-one/users')) {
       const hasConflict = users.some((row) => row.identity_conflict_code)
       return response({
@@ -167,6 +219,9 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
           missing_cnic: 0,
           duplicate_groups: hasConflict ? 1 : 0,
           duplicate_users: hasConflict ? 2 : 0,
+          resolved_duplicate_groups: 0,
+          unresolved_duplicate_groups: hasConflict ? 1 : 0,
+          unresolved_duplicate_users: hasConflict ? 2 : 0,
         },
       })
     }
@@ -219,10 +274,16 @@ describe('State Life ADD interface', () => {
     })
     const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
     expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
-    expect(screen.getByText(/2 users across 1 exact-cnic groups/i)).toBeTruthy()
+    expect(screen.getByText(/2 unresolved users across 1 exact-cnic groups/i)).toBeTruthy()
     expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(identityConflictText(conflictedUser)).toContain('1008 (UID 8)')
+    fireEvent.click(screen.getByRole('button', { name: /review same-employee alias/i }))
+    expect(screen.getByRole('heading', { name: /verify same employee/i })).toBeTruthy()
+    expect(screen.getByText(/no zkt user, fingerprint template, uid, or attendance event is merged/i)).toBeTruthy()
+    expect(screen.getByLabelText(/type “same employee”/i)).toBeTruthy()
+    expect(screen.getByLabelText(/confirm administrator password/i)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /close dialog/i }))
     fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
     expect(
       screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),

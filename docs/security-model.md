@@ -35,6 +35,9 @@ and fleet-root storage remain server-side and are never exposed to the frontend 
   only the final four digits and non-PII terminal user IDs as duplicate-match evidence.
 - Audit and log payloads use recursive key-based redaction. ORDS payload is generated only at send
   time and is not retained as plaintext in the outbox.
+- Duplicate-CNIC alias approval stores only the keyed CNIC lookup, internal row IDs, deterministic
+  membership token, classification, and audit reason. It never copies plaintext CNIC into the
+  resolution record and never rewrites historical attendance.
 - Zone Lite uses ESP-IDF encrypted NVS. XTS material is derived through a per-device HMAC key stored
   in read/write-protected ESP32-S3 eFuse BLOCK_KEY0.
 - Persistent command inbox, lease deadline, identity tombstones, connector token, and site secrets
@@ -57,6 +60,11 @@ work reports that it is running and must finish verification.
 
 Delete has an additional invariant: the attendance count must be identical before and after ZKT
 `CMD_DELETE_USER`. The backend database has no attendance-delete operation in the user command path.
+
+Duplicate-CNIC resolution is deliberately an ADD-only metadata operation. It issues no ESP/ZKT
+command. Every approval is bound to the complete snapshot's exact member IDs and row versions,
+requires password step-up plus `SAME EMPLOYEE`, and becomes stale on membership change. Revocation
+blocks new ambiguous punches again; previously captured terminal facts are never removed.
 
 ## eFuse ceremony
 

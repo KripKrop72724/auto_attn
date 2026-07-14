@@ -93,6 +93,8 @@ export interface DeviceUser {
   identity_complete: boolean
   identity_conflict_code: string | null
   identity_conflict_members: Array<{ user_id: string; uid: string }>
+  identity_conflict_resolved: boolean
+  identity_resolution_id: string | null
   shift_worker: boolean
   privilege: 0 | 14
   present: boolean
@@ -111,6 +113,54 @@ export interface IdentityIntegrity {
   missing_cnic: number
   duplicate_groups: number
   duplicate_users: number
+  resolved_duplicate_groups: number
+  unresolved_duplicate_groups: number
+  unresolved_duplicate_users: number
+}
+
+export interface IdentityConflictPunchEvidence {
+  captured_count: number
+  first_captured_at: string | null
+  last_captured_at: string | null
+  blocked_identity_count: number
+}
+
+export interface IdentityConflictMember {
+  user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  row_version: number
+  privilege: number
+  observed_at: string
+  punch_evidence: IdentityConflictPunchEvidence
+}
+
+export interface IdentityConflictGroup {
+  group_token: string
+  cnic_masked: string | null
+  classification: 'EXACT_NAME_MATCH' | 'POSSIBLE_NAME_VARIANT' | 'MIXED_NAMES_HIGH_RISK'
+  status: 'UNRESOLVED' | 'RESOLVED_SAME_EMPLOYEE'
+  resolution_id: string | null
+  resolution_created_at: string | null
+  resolution_reason: string | null
+  recommended_action: 'CONFIRM_SAME_EMPLOYEE' | 'HR_IDENTITY_REVIEW'
+  members: IdentityConflictMember[]
+}
+
+export interface IdentityConflictReport {
+  evidence_scope: {
+    snapshot_source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT' | 'PARTIAL_ZKT_SNAPSHOT'
+    terminal_attendance_count: number
+    add_attendance_count: number
+    attendance_coverage_percent: number | null
+    attendance_is_immutable: boolean
+    terminal_users_are_unchanged: boolean
+  }
+  raw_duplicate_groups: number
+  resolved_groups: number
+  unresolved_groups: number
+  groups: IdentityConflictGroup[]
 }
 
 export interface AttendanceEvent {
@@ -130,6 +180,7 @@ export interface AttendanceEvent {
   clock_quality: string
   clock_drift_seconds: number | null
   ords_status: string
+  identity_resolution_id: number | null
 }
 
 export interface DeviceLog {
