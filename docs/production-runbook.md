@@ -157,6 +157,7 @@ Interpret deployment probe results in this order:
 | ESP offline | Check branch power/internet; retain queued commands | Do not repeatedly restart ZKT |
 | ZKT flapping/retry wait | Observe next retry and last good time; check LAN/power | Do not probe port 4370 manually in a loop |
 | Duplicate serial quarantine | Find duplicate physical/config mapping; keep both read-only | Do not override write block |
+| Duplicate user CNIC | Use the exact-match member user IDs in Users, verify each terminal name, and correct the wrong identity | Do not infer equality from a masked suffix or bypass exact-CNIC protection |
 | Partial/truncated snapshot | Wait for stable complete snapshot; inspect logs/memory | Do not create/edit/delete users |
 | Admin revoke overdue | Keep command active; restore terminal reachability; verify privilege 0 | Do not grant a second lease |
 | ORDS backlog | Check public ORDS/TLS/auth; preserve flash queue | Do not erase connector storage |

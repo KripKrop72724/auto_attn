@@ -5,12 +5,13 @@ import App, {
   CommandProgress,
   confirmationMatches,
   formatAlertDiagnostics,
+  identityConflictText,
   StatusBadge,
   validateUserDraft,
 } from './App'
 import type { Device, DeviceUser } from './types'
 
-const maskedCnic = '*****-*******-1'
+const maskedCnic = '*****-****567-1'
 const fullCnic = '3520212345671'
 
 const device: Device = {
@@ -71,13 +72,14 @@ const user: DeviceUser = {
   cnic_available: true,
   identity_complete: true,
   identity_conflict_code: null,
+  identity_conflict_members: [],
   shift_worker: false,
   privilege: 0,
   present: true,
   lifecycle_state: 'ACTIVE',
   row_version: 3,
   observed_at: '2026-07-13T12:00:00Z',
-  machine_name_preview: 'Ayesha-*****-*******-1',
+  machine_name_preview: 'Ayesha-*****-****567-1',
   current_command_state: null,
   read_only: false,
 }
@@ -86,6 +88,7 @@ const conflictedUser: DeviceUser = {
   ...user,
   identity_complete: false,
   identity_conflict_code: 'DUPLICATE_CNIC',
+  identity_conflict_members: [{ user_id: '1008', uid: '8' }],
 }
 
 const deliveryAlert = {
@@ -152,7 +155,20 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
       return response({ rows: [device] })
     }
     if (path.includes('/api/v2/devices/connector-one/users')) {
-      return response({ rows: users, next_cursor: null, device })
+      const hasConflict = users.some((row) => row.identity_conflict_code)
+      return response({
+        rows: users,
+        next_cursor: null,
+        device,
+        identity_integrity: {
+          source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT',
+          total_users: hasConflict ? 2 : users.length,
+          with_cnic: hasConflict ? 2 : users.length,
+          missing_cnic: 0,
+          duplicate_groups: hasConflict ? 1 : 0,
+          duplicate_users: hasConflict ? 2 : 0,
+        },
+      })
     }
     return response({ rows: [] })
   })
@@ -201,10 +217,12 @@ describe('State Life ADD interface', () => {
     fireEvent.change(await screen.findByLabelText('Selected terminal'), {
       target: { value: device.connector_id },
     })
-    const warning = await screen.findByText(/duplicate cnic · correction required/i)
+    const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
     expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
+    expect(screen.getByText(/2 users across 1 exact-cnic groups/i)).toBeTruthy()
     expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
+    expect(identityConflictText(conflictedUser)).toContain('1008 (UID 8)')
     fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
     expect(
       screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),

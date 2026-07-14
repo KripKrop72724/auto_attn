@@ -18,6 +18,7 @@ import type {
   Device,
   DeviceLog,
   DeviceUser,
+  IdentityIntegrity,
   Overview,
   UserCommandResponse,
 } from './types'
@@ -70,6 +71,15 @@ const utf8Prefix = (value: string, maxBytes: number) => {
     output += character
   }
   return output
+}
+
+export function identityConflictText(user: DeviceUser) {
+  const matches = user.identity_conflict_members
+    .map((member) => `${member.user_id} (UID ${member.uid})`)
+    .join(', ')
+  return matches
+    ? `${user.cnic_masked || 'Masked CNIC'} · Exact CNIC also encoded on user ${matches} · correction required`
+    : `${user.cnic_masked || 'Masked CNIC'} · Exact duplicate reported by terminal · correction required`
 }
 
 export function buildMachinePreview(
@@ -648,14 +658,22 @@ function UsersView({
   const [role, setRole] = useState('ALL')
   const [dialog, setDialog] = useState<UserDialogState>(null)
   const [command, setCommand] = useState<Command | null>(null)
+  const [integrity, setIntegrity] = useState<IdentityIntegrity | null>(null)
 
   const load = useCallback(async () => {
-    if (!selected) return setRows([])
+    if (!selected) {
+      setRows([])
+      setIntegrity(null)
+      return
+    }
     setLoading(true)
     try {
       const compact = query.replace(/\D/g, '')
       const cnicSearch = compact.length === 13 && compact === query.replace(/[\s-]/g, '')
-      const result = await api<{ rows: DeviceUser[] }>(
+      const result = await api<{
+        rows: DeviceUser[]
+        identity_integrity: IdentityIntegrity
+      }>(
         `/api/v2/devices/${selected.connector_id}/users${queryString({
           q: cnicSearch ? undefined : query,
           cnic: cnicSearch ? compact : undefined,
@@ -664,6 +682,7 @@ function UsersView({
         })}`,
       )
       setRows(result.rows)
+      setIntegrity(result.identity_integrity || null)
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : 'Unable to load users.')
     } finally {
@@ -726,6 +745,20 @@ function UsersView({
       ) : (
         <>
           {!writable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{selected.zkt?.writes_disabled_reason || 'The terminal is not yet write-certified or its complete snapshot is pending.'}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ_ONLY'} /></div>}
+          {integrity && integrity.duplicate_users > 0 && (
+            <div className="capability-banner pattern-blocked" role="status">
+              <Icon name="alert" />
+              <div>
+                <strong>Exact CNIC conflicts are present in the terminal data.</strong>
+                <span>
+                  The latest {integrity.source === 'CURRENT_COMPLETE_ZKT_SNAPSHOT' ? 'complete ' : ''}
+                  ZKT snapshot reports {integrity.duplicate_users} users across {integrity.duplicate_groups}{' '}
+                  exact-CNIC groups. Matching terminal user IDs are shown below; unsafe reuse remains blocked.
+                </span>
+              </div>
+              <StatusBadge state="CORRECTION REQUIRED" />
+            </div>
+          )}
           {command && <CommandProgress command={command} onCancel={cancel} />}
           <section className="panel">
             <div className="toolbar user-toolbar">
@@ -739,7 +772,7 @@ function UsersView({
               {loading && <div className="empty-state compact"><Icon name="refresh" /><p>Reading the selected terminal user view…</p></div>}
               {!loading && rows.map((user) => (
                 <article key={user.user_key} className={`user-row ${user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`}>
-                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? `${user.cnic_masked || 'Masked CNIC'} · Duplicate CNIC · correction required` : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
+                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
                   <div><strong>User {user.user_id}</strong><small>UID {user.uid} · v{user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
                   <div><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} /><small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small></div>
                   <div><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>

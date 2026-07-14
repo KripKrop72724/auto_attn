@@ -92,6 +92,7 @@ export interface DeviceUser {
   cnic_available: boolean
   identity_complete: boolean
   identity_conflict_code: string | null
+  identity_conflict_members: Array<{ user_id: string; uid: string }>
   shift_worker: boolean
   privilege: 0 | 14
   present: boolean
@@ -101,6 +102,15 @@ export interface DeviceUser {
   machine_name_preview: string | null
   current_command_state: string | null
   read_only: boolean
+}
+
+export interface IdentityIntegrity {
+  source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT' | 'PARTIAL_ZKT_SNAPSHOT'
+  total_users: number
+  with_cnic: number
+  missing_cnic: number
+  duplicate_groups: number
+  duplicate_users: number
 }
 
 export interface AttendanceEvent {

@@ -67,6 +67,11 @@ ZKT UID/user-ID fields. The dashboard supports:
 
 The exact byte-limited ZKT name preview is shown before a write. CNIC is accepted as thirteen digits,
 stored encrypted, indexed with a keyed lookup hash, returned only masked, and never placed in logs.
+The mask exposes only the final four digits. Duplicate detection always compares the keyed digest of
+all thirteen normalized digits; it never compares masks. When a complete terminal snapshot contains
+an exact duplicate, ADD shows the number of affected groups and the matching ZKT user IDs. Create and
+update requests remain available for other unique CNICs, while reuse of the conflicting CNIC is
+blocked with the exact terminal record that currently claims it.
 Every mutation has an idempotency key, expected row version, expected terminal identity, encrypted
 desired state, expiry, and immutable audit record.
 
