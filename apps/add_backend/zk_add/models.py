@@ -214,6 +214,8 @@ class DeviceUser(Base):
     uid: Mapped[str] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
     machine_name_encrypted: Mapped[str | None] = mapped_column(Text)
+    terminal_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    terminal_state_fingerprint: Mapped[str | None] = mapped_column(String(64))
     display_name: Mapped[str] = mapped_column(String(255), index=True)
     cnic_encrypted: Mapped[str | None] = mapped_column(Text)
     cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64), index=True)

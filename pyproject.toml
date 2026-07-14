@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "state-life-attendance-device-dashboard"
-version = "2.2.0"
+version = "2.2.1"
 description = "State Life ADD control plane for securely managed Zone Lite ESP32 connectors."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

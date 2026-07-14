@@ -157,6 +157,8 @@ def snapshot_user(
     user_id: str = "1007",
     name: str = f"Ayesha-{CNIC}",
     privilege: int = 0,
+    terminal_identity_fingerprint: str | None = None,
+    terminal_state_fingerprint: str | None = None,
 ) -> DeviceUser:
     replace_user_snapshot(
         db,
@@ -171,6 +173,8 @@ def snapshot_user(
                     user_id=user_id,
                     name=name,
                     privilege=privilege,
+                    terminal_identity_fingerprint=terminal_identity_fingerprint,
+                    terminal_state_fingerprint=terminal_state_fingerprint,
                 )
             ],
         ),
@@ -884,6 +888,89 @@ def test_unique_full_cnic_is_accepted_even_when_mask_and_other_conflicts_match(
             select(DeviceUser).where(DeviceUser.lifecycle_state == "ACTIVE")
         )
     }
+
+
+def test_malformed_legacy_user_id_uses_exact_terminal_fingerprints_for_safe_edit(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    legacy = snapshot_user(
+        db,
+        connector,
+        uid="287",
+        user_id="??",
+        name="Jjkjjk",
+    )
+    with pytest.raises(ValueError, match="malformed bytes"):
+        update_device_user_command(
+            db,
+            connector=connector,
+            user=legacy,
+            display_name="JunaidK",
+            cnic="3450210835219",
+            shift_worker=False,
+            privilege=0,
+            expected_version=legacy.row_version,
+            idempotency_key="legacy-edit-before-fingerprint",
+            actor="StateHealthAdmin",
+        )
+
+    identity_before = "a" * 64
+    state_before = "b" * 64
+    legacy = snapshot_user(
+        db,
+        connector,
+        uid="287",
+        user_id="??",
+        name="Jjkjjk",
+        terminal_identity_fingerprint=identity_before,
+        terminal_state_fingerprint=state_before,
+    )
+    assert legacy.terminal_identity_fingerprint == identity_before
+    assert legacy.terminal_state_fingerprint == state_before
+
+    update = update_device_user_command(
+        db,
+        connector=connector,
+        user=legacy,
+        display_name="JunaidK",
+        cnic="3450210835219",
+        shift_worker=False,
+        privilege=0,
+        expected_version=legacy.row_version,
+        idempotency_key="legacy-edit-with-fingerprint",
+        actor="StateHealthAdmin",
+    )
+    wire = serialize_command(update)
+    assert wire["payload"]["uid"] == "287"
+    assert wire["payload"]["user_id"] == "??"
+    assert wire["expected_state"]["terminal_identity_fingerprint"] == identity_before
+    assert wire["expected_state"]["terminal_state_fingerprint"] == state_before
+    assert wire["expected_state"]["name"] == "Jjkjjk"
+
+    identity_after = "c" * 64
+    state_after = "d" * 64
+    attendance_before = db.scalar(select(func.count(AttendanceEvent.id)))
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=update.command_id,
+        status="SUCCEEDED",
+        result={
+            "verified_privilege": 0,
+            "verified_terminal_identity_fingerprint": identity_after,
+            "verified_terminal_state_fingerprint": state_after,
+        },
+        error_code=None,
+        error_message=None,
+    )
+    assert legacy.display_name == "JunaidK"
+    assert decrypt_cnic(legacy.cnic_encrypted) == "3450210835219"
+    assert decrypt_text(legacy.machine_name_encrypted) == "JunaidK-3450210835219"
+    assert legacy.terminal_identity_fingerprint == identity_after
+    assert legacy.terminal_state_fingerprint == state_after
+    assert db.scalar(select(func.count(AttendanceEvent.id))) == attendance_before
 
 
 def test_user_create_update_delete_is_idempotent_encrypted_and_immutable(db: Session):

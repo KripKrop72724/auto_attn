@@ -600,6 +600,30 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
         command->has_expected_name = true;
     }
     value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(
+                      expected,
+                      "terminal_identity_fingerprint")
+                : NULL;
+    if (cJSON_IsString(value) && strlen(value->valuestring) == 64) {
+        strlcpy(
+            command->expected_terminal_identity_fingerprint,
+            value->valuestring,
+            sizeof(command->expected_terminal_identity_fingerprint));
+        command->has_expected_terminal_identity_fingerprint = true;
+    }
+    value = cJSON_IsObject(expected)
+                ? cJSON_GetObjectItemCaseSensitive(
+                      expected,
+                      "terminal_state_fingerprint")
+                : NULL;
+    if (cJSON_IsString(value) && strlen(value->valuestring) == 64) {
+        strlcpy(
+            command->expected_terminal_state_fingerprint,
+            value->valuestring,
+            sizeof(command->expected_terminal_state_fingerprint));
+        command->has_expected_terminal_state_fingerprint = true;
+    }
+    value = cJSON_IsObject(expected)
                 ? cJSON_GetObjectItemCaseSensitive(expected, "privilege")
                 : NULL;
     if (cJSON_IsNumber(value)) {
@@ -940,7 +964,7 @@ static void heartbeat_task(void *arg)
             wifi_ap_record_t ap = {0};
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
-            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.1.1");
+            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.1.2");
             cJSON_AddNumberToObject(payload, "config_version", 3);
             cJSON_AddNumberToObject(payload, "uptime_seconds", (double)(esp_timer_get_time() / 1000000));
             cJSON_AddNumberToObject(payload, "rssi", rssi);
@@ -1571,7 +1595,7 @@ static bool perform_onboarding(void)
     cJSON_AddStringToObject(root, "zone_id", runtime->zone_id);
     cJSON_AddStringToObject(root, "zone_name", runtime->zone_name);
     cJSON_AddStringToObject(root, "device_id", runtime->zone_device_id);
-    cJSON_AddStringToObject(root, "firmware_version", "zone-lite-2.1.1");
+    cJSON_AddStringToObject(root, "firmware_version", "zone-lite-2.1.2");
     if (runtime->zkt_expected_serial[0]) {
         cJSON_AddStringToObject(root, "expected_serial", runtime->zkt_expected_serial);
     }

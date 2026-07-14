@@ -58,6 +58,13 @@ state, or ambiguous command replay fail closed. Transient protocol failure produ
 rather than tight reconnect. Cancellation is a handshake: queued work can cancel; already running
 work reports that it is running and must finish verification.
 
+Some legacy ZKT records contain non-UTF-8 bytes in their user-ID or name fields. Zone Lite never
+weakens the precondition to accommodate them. Firmware 2.1.2 publishes keyed HMAC fingerprints for
+the exact raw terminal identifier and mutable state bytes. ADD binds a mutation to those opaque
+fingerprints, and the ESP compares them against a fresh read before writing. The identifier
+fingerprint is checked again after reread. The bootstrap secret never leaves encrypted NVS, and the
+fingerprints expose neither the malformed bytes nor CNIC/name contents.
+
 Delete has an additional invariant: the attendance count must be identical before and after ZKT
 `CMD_DELETE_USER`. The backend database has no attendance-delete operation in the user command path.
 

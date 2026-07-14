@@ -14,6 +14,8 @@ typedef struct {
     char lease_id[48];
     char expected_serial[80];
     char expected_name[64];
+    char expected_terminal_identity_fingerprint[65];
+    char expected_terminal_state_fingerprint[65];
     char tombstone_display_name[256];
     char tombstone_cnic[16];
     int privilege;
@@ -27,6 +29,8 @@ typedef struct {
     bool has_privilege;
     bool has_expected_name;
     bool has_expected_privilege;
+    bool has_expected_terminal_identity_fingerprint;
+    bool has_expected_terminal_state_fingerprint;
     bool has_expected_version;
     bool has_expected_attendance_count;
     bool has_tombstone;

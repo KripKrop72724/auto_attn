@@ -33,6 +33,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
+#include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -303,6 +304,8 @@ typedef struct {
     uint32_t card;
     char group_id[8];
     uint8_t record_size;
+    char terminal_identity_fingerprint[65];
+    char terminal_state_fingerprint[65];
 } zkt_user_t;
 
 typedef struct {
@@ -1405,6 +1408,150 @@ static void copy_zk_string(char *out, size_t out_len, const uint8_t *data, size_
     trim_spaces(out);
 }
 
+static bool append_fingerprint_field(
+    uint8_t *material,
+    size_t capacity,
+    size_t *length,
+    uint8_t tag,
+    const uint8_t *value,
+    size_t value_length)
+{
+    if (!material || !length || !value || value_length > 255 ||
+        *length + 2 + value_length > capacity) {
+        return false;
+    }
+    material[(*length)++] = tag;
+    material[(*length)++] = (uint8_t)value_length;
+    memcpy(material + *length, value, value_length);
+    *length += value_length;
+    return true;
+}
+
+static void bytes_to_hex(const uint8_t *value, size_t length, char *out, size_t out_size)
+{
+    if (!value || !out || out_size < (length * 2) + 1) return;
+    for (size_t index = 0; index < length; index++) {
+        snprintf(out + index * 2, 3, "%02x", value[index]);
+    }
+    out[length * 2] = '\0';
+}
+
+static bool keyed_terminal_fingerprint(
+    const char *domain,
+    const uint8_t *material,
+    size_t material_length,
+    char out[65])
+{
+    const zone_config_t *runtime = zone_config_get();
+    if (!runtime || !runtime->bootstrap_secret[0] || !domain || !material || !out) {
+        if (out) out[0] = '\0';
+        return false;
+    }
+    uint8_t input[192];
+    size_t domain_length = strlen(domain);
+    if (domain_length + 1 + material_length > sizeof(input)) {
+        out[0] = '\0';
+        return false;
+    }
+    memcpy(input, domain, domain_length);
+    input[domain_length] = 0;
+    memcpy(input + domain_length + 1, material, material_length);
+    uint8_t digest[32];
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    int result = mbedtls_md_hmac(
+        md,
+        (const unsigned char *)runtime->bootstrap_secret,
+        strlen(runtime->bootstrap_secret),
+        input,
+        domain_length + 1 + material_length,
+        digest);
+    if (result != 0) {
+        out[0] = '\0';
+        return false;
+    }
+    bytes_to_hex(digest, sizeof(digest), out, 65);
+    return true;
+}
+
+static void set_terminal_user_fingerprints(
+    zkt_user_t *user,
+    const uint8_t *record,
+    uint8_t record_size)
+{
+    if (!user || !record) return;
+    uint8_t identity[96];
+    size_t identity_length = 0;
+    const uint8_t *user_id = record_size == 72 ? record + 48 : record + 24;
+    size_t user_id_length = record_size == 72
+        ? strnlen((const char *)user_id, 24)
+        : 4;
+    const uint8_t *card = record_size == 72 ? record + 35 : record + 16;
+    if (!append_fingerprint_field(
+            identity,
+            sizeof(identity),
+            &identity_length,
+            1,
+            &record_size,
+            1) ||
+        !append_fingerprint_field(
+            identity,
+            sizeof(identity),
+            &identity_length,
+            2,
+            record,
+            2) ||
+        !append_fingerprint_field(
+            identity,
+            sizeof(identity),
+            &identity_length,
+            3,
+            user_id,
+            user_id_length) ||
+        !append_fingerprint_field(
+            identity,
+            sizeof(identity),
+            &identity_length,
+            4,
+            card,
+            4)) {
+        return;
+    }
+    (void)keyed_terminal_fingerprint(
+        "ZONE-LITE-ZKT-USER-IDENTITY-V1",
+        identity,
+        identity_length,
+        user->terminal_identity_fingerprint);
+
+    uint8_t state[160];
+    memcpy(state, identity, identity_length);
+    size_t state_length = identity_length;
+    const uint8_t *name = record_size == 72 ? record + 11 : record + 8;
+    size_t name_limit = record_size == 72 ? 24 : 8;
+    size_t name_length = strnlen((const char *)name, name_limit);
+    if (!append_fingerprint_field(
+            state,
+            sizeof(state),
+            &state_length,
+            5,
+            record + 2,
+            1) ||
+        !append_fingerprint_field(
+            state,
+            sizeof(state),
+            &state_length,
+            6,
+            name,
+            name_length)) {
+        user->terminal_state_fingerprint[0] = '\0';
+        return;
+    }
+    (void)keyed_terminal_fingerprint(
+        "ZONE-LITE-ZKT-USER-STATE-V1",
+        state,
+        state_length,
+        user->terminal_state_fingerprint);
+}
+
 static uint32_t choose_zk_record_size(
     uint32_t total_size,
     uint32_t reported_count,
@@ -1492,6 +1639,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
             snprintf(u->group_id, sizeof(u->group_id), "%u", p[21]);
             snprintf(u->user_id, sizeof(u->user_id), "%lu", (unsigned long)read_le32(p + 24));
             u->record_size = 28;
+            set_terminal_user_fingerprints(u, p, 28);
             parse_machine_identity(u);
             p += 28;
             remain -= 28;
@@ -1505,6 +1653,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
             copy_zk_string(u->group_id, sizeof(u->group_id), p + 40, 7);
             copy_zk_string(u->user_id, sizeof(u->user_id), p + 48, 24);
             u->record_size = 72;
+            set_terminal_user_fingerprints(u, p, 72);
             parse_machine_identity(u);
             p += 72;
             remain -= 72;
@@ -1620,7 +1769,15 @@ static bool user_matches_command(const zkt_user_t *user, const add_command_t *co
 {
     if (!user || !command) return false;
     if (command->uid[0] && strcmp(user->uid, command->uid) != 0) return false;
-    if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) return false;
+    if (command->has_expected_terminal_identity_fingerprint) {
+        if (strcmp(
+                user->terminal_identity_fingerprint,
+                command->expected_terminal_identity_fingerprint) != 0) {
+            return false;
+        }
+    } else if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) {
+        return false;
+    }
     if (command->has_name && strcmp(user->name, command->name) != 0) return false;
     if (command->has_privilege && user->privilege != command->privilege) return false;
     return true;
@@ -1630,7 +1787,20 @@ static bool user_matches_expected_state(const zkt_user_t *user, const add_comman
 {
     if (!user || !command) return false;
     if (command->uid[0] && strcmp(user->uid, command->uid) != 0) return false;
-    if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) return false;
+    if (command->has_expected_terminal_state_fingerprint) {
+        return strcmp(
+                   user->terminal_state_fingerprint,
+                   command->expected_terminal_state_fingerprint) == 0;
+    }
+    if (command->has_expected_terminal_identity_fingerprint) {
+        if (strcmp(
+                user->terminal_identity_fingerprint,
+                command->expected_terminal_identity_fingerprint) != 0) {
+            return false;
+        }
+    } else if (command->user_id[0] && strcmp(user->user_id, command->user_id) != 0) {
+        return false;
+    }
     if (command->has_expected_name && strcmp(user->name, command->expected_name) != 0) {
         return false;
     }
@@ -1750,6 +1920,18 @@ static bool add_send_user_snapshot(const user_table_t *users)
         sanitized_fields += json_add_utf8_string(row, "uid", user->uid) ? 1 : 0;
         sanitized_fields += json_add_utf8_string(row, "user_id", user->user_id) ? 1 : 0;
         sanitized_fields += json_add_utf8_string(row, "name", user->name) ? 1 : 0;
+        if (user->terminal_identity_fingerprint[0]) {
+            cJSON_AddStringToObject(
+                row,
+                "terminal_identity_fingerprint",
+                user->terminal_identity_fingerprint);
+        }
+        if (user->terminal_state_fingerprint[0]) {
+            cJSON_AddStringToObject(
+                row,
+                "terminal_state_fingerprint",
+                user->terminal_state_fingerprint);
+        }
         cJSON_AddNumberToObject(row, "privilege", user->privilege);
         cJSON_AddNumberToObject(row, "card", user->card);
         cJSON_AddItemToArray(rows, row);
@@ -4025,7 +4207,7 @@ static bool process_add_commands(
         bool ok = false;
         const char *error_code = "COMMAND_UNSUPPORTED";
         const char *error_message = "The requested command is not supported by this firmware.";
-        char result[192] = "{}";
+        char result[512] = "{}";
         if (strcmp(command.command_type, "REFRESH_USERS") == 0) {
             int32_t records = 0;
             if (zk_get_counts(sock, ctx, user_count, &records) &&
@@ -4099,10 +4281,14 @@ static bool process_add_commands(
                     snprintf(
                         result,
                         sizeof(result),
-                        "{\"verified_uid\":\"%s\",\"verified_user_id\":\"%s\",\"user_count\":%ld}",
+                        "{\"verified_uid\":\"%s\",\"verified_user_id\":\"%s\",\"user_count\":%ld,"
+                        "\"verified_terminal_identity_fingerprint\":\"%s\","
+                        "\"verified_terminal_state_fingerprint\":\"%s\"}",
                         command.uid,
                         command.user_id,
-                        (long)after_users);
+                        (long)after_users,
+                        verified->terminal_identity_fingerprint,
+                        verified->terminal_state_fingerprint);
                 }
             } else if (strcmp(command.command_type, "DELETE_USER") == 0) {
                 zkt_user_t *user = find_mutable_user_by_uid(users, command.uid);
@@ -4152,8 +4338,12 @@ static bool process_add_commands(
                     snprintf(
                         result,
                         sizeof(result),
-                        "{\"duplicate\":true,\"verified_privilege\":%d}",
-                        user->privilege);
+                        "{\"duplicate\":true,\"verified_privilege\":%d,"
+                        "\"verified_terminal_identity_fingerprint\":\"%s\","
+                        "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                        user->privilege,
+                        user->terminal_identity_fingerprint,
+                        user->terminal_state_fingerprint);
                 } else if (
                     strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
                     user->privilege == 14) {
@@ -4172,15 +4362,26 @@ static bool process_add_commands(
                         snprintf(
                             result,
                             sizeof(result),
-                            "{\"duplicate\":true,\"verified_privilege\":14,\"expires_epoch\":%lld}",
-                            (long long)deadline);
+                            "{\"duplicate\":true,\"verified_privilege\":14,\"expires_epoch\":%lld,"
+                            "\"verified_terminal_identity_fingerprint\":\"%s\","
+                            "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                            (long long)deadline,
+                            user->terminal_identity_fingerprint,
+                            user->terminal_state_fingerprint);
                     }
                 } else if (
                     strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0 &&
                     user->privilege == 0) {
                     temp_admin_clear();
                     ok = true;
-                    snprintf(result, sizeof(result), "{\"duplicate\":true,\"verified_privilege\":0}");
+                    snprintf(
+                        result,
+                        sizeof(result),
+                        "{\"duplicate\":true,\"verified_privilege\":0,"
+                        "\"verified_terminal_identity_fingerprint\":\"%s\","
+                        "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                        user->terminal_identity_fingerprint,
+                        user->terminal_state_fingerprint);
                 } else if (
                     strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
                     command.lease_expires_epoch > 0 &&
@@ -4221,7 +4422,8 @@ static bool process_add_commands(
                             error_message = "Administrator elevation could not be verified by reread.";
                         } else {
                             zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
-                            if (!verified || verified->privilege != 14) {
+                            if (!verified || !user_matches_command(verified, &command) ||
+                                verified->privilege != 14) {
                                 ok = false;
                                 error_code = "ZKT_USER_POSTCONDITION_FAILED";
                                 error_message = "Administrator elevation did not persist after reread.";
@@ -4242,7 +4444,15 @@ static bool process_add_commands(
                                 }
                                 nvs_save_runtime_state();
                                 if (ok) {
-                                    snprintf(result, sizeof(result), "{\"verified_privilege\":14,\"expires_epoch\":%lld}", (long long)g_temp_admin_expires_epoch);
+                                    snprintf(
+                                        result,
+                                        sizeof(result),
+                                        "{\"verified_privilege\":14,\"expires_epoch\":%lld,"
+                                        "\"verified_terminal_identity_fingerprint\":\"%s\","
+                                        "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                                        (long long)g_temp_admin_expires_epoch,
+                                        verified->terminal_identity_fingerprint,
+                                        verified->terminal_state_fingerprint);
                                 }
                             }
                         }
@@ -4257,13 +4467,21 @@ static bool process_add_commands(
                         error_message = "Administrator revocation could not be verified by reread.";
                     } else {
                         zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
-                        if (!verified || verified->privilege != 0) {
+                        if (!verified || !user_matches_command(verified, &command) ||
+                            verified->privilege != 0) {
                             ok = false;
                             error_code = "ZKT_USER_POSTCONDITION_FAILED";
                             error_message = "Administrator revocation did not persist after reread.";
                         } else {
                             temp_admin_clear();
-                            snprintf(result, sizeof(result), "{\"verified_privilege\":0}");
+                            snprintf(
+                                result,
+                                sizeof(result),
+                                "{\"verified_privilege\":0,"
+                                "\"verified_terminal_identity_fingerprint\":\"%s\","
+                                "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                                verified->terminal_identity_fingerprint,
+                                verified->terminal_state_fingerprint);
                         }
                     }
                 } else {
@@ -4276,13 +4494,22 @@ static bool process_add_commands(
                         error_message = "The terminal write ACK could not be verified by reread.";
                     } else {
                         zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
-                        if (!verified || verified->privilege != privilege ||
+                        if (!verified || !user_matches_command(verified, &command) ||
+                            verified->privilege != privilege ||
                             (name && strcmp(verified->name, name) != 0)) {
                             ok = false;
                             error_code = "ZKT_USER_POSTCONDITION_FAILED";
                             error_message = "The terminal reread did not match the requested user values.";
                         } else {
-                            snprintf(result, sizeof(result), "{\"verified_privilege\":%d}", privilege);
+                            snprintf(
+                                result,
+                                sizeof(result),
+                                "{\"verified_privilege\":%d,"
+                                "\"verified_terminal_identity_fingerprint\":\"%s\","
+                                "\"verified_terminal_state_fingerprint\":\"%s\"}",
+                                privilege,
+                                verified->terminal_identity_fingerprint,
+                                verified->terminal_state_fingerprint);
                         }
                     }
                 }

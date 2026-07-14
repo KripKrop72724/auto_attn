@@ -138,6 +138,18 @@ def prepare() -> None:
 
     with engine.begin() as connection:
         connection.execute(
+            text(
+                "ALTER TABLE add_device_users "
+                "DROP COLUMN terminal_state_fingerprint"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE add_device_users "
+                "DROP COLUMN terminal_identity_fingerprint"
+            )
+        )
+        connection.execute(
             text("ALTER TABLE add_attendance_events DROP COLUMN identity_resolution_id")
         )
         connection.execute(text("DROP TABLE add_identity_conflict_resolutions"))
@@ -155,6 +167,8 @@ def verify() -> None:
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns("add_device_users")}
     assert "identity_conflict_code" in columns
+    assert "terminal_identity_fingerprint" in columns
+    assert "terminal_state_fingerprint" in columns
     attendance_columns = {
         column["name"] for column in inspector.get_columns("add_attendance_events")
     }
@@ -188,6 +202,8 @@ def verify() -> None:
             "encrypted-cnic-two",
         ]
         assert {row.identity_conflict_code for row in users} == {"DUPLICATE_CNIC"}
+        assert all(row.terminal_identity_fingerprint is None for row in users)
+        assert all(row.terminal_state_fingerprint is None for row in users)
         assert attendance[0].device_user_id == users[0].id
         assert attendance[0].identity_resolution_id is None
         assert attendance[0].ords_status == "FAILED_RETRYABLE"
