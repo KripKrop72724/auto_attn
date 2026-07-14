@@ -9,6 +9,7 @@ after the read-back hash has been verified.
 from __future__ import annotations
 
 import argparse
+import hmac
 import csv
 import hashlib
 import json
@@ -86,11 +87,58 @@ def load_config(path: Path) -> dict:
     values = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(values, dict):
         raise ValueError("Provisioning JSON must contain an object")
-    fleet_root = os.environ.get("ADD_FLEET_ROOT_SECRET") or os.environ.get("ADD_PII_LOOKUP_KEY")
+    fleet_root = os.environ.get("ADD_FLEET_ROOT_SECRET")
     if not fleet_root:
-        raise ValueError("Set ADD_FLEET_ROOT_SECRET before provisioning")
+        raise ValueError(
+            "Set ADD_FLEET_ROOT_SECRET explicitly before provisioning; "
+            "ADD_PII_LOOKUP_KEY is never a safe provisioning fallback"
+        )
     values["fleet_root"] = fleet_root
+    values["nvs_hmac_root"] = (
+        os.environ.get("ZONE_LITE_NVS_HMAC_ROOT_SECRET") or fleet_root
+    )
     return values
+
+
+def validate_root_selection(
+    *,
+    mac: str,
+    fleet_root: str,
+    nvs_hmac_root: str,
+    recovery_confirmation: str | None,
+    trust_existing: bool,
+) -> bool:
+    """Require an exact-MAC ceremony before using separate onboarding/NVS roots.
+
+    Normal provisioning derives both domains from ADD_FLEET_ROOT_SECRET. A split
+    is supported only to recover a device whose unreadable HMAC eFuse was
+    previously derived from the wrong-but-known root. It must never become the
+    accidental default for a new eFuse burn.
+    """
+    roots_match = hmac.compare_digest(
+        hashlib.sha256(fleet_root.encode("utf-8")).digest(),
+        hashlib.sha256(nvs_hmac_root.encode("utf-8")).digest(),
+    )
+    if roots_match:
+        if recovery_confirmation:
+            raise RuntimeError(
+                "--confirm-split-root-recovery-for was supplied but the roots match"
+            )
+        return False
+    if not trust_existing:
+        raise RuntimeError(
+            "Split-root recovery is allowed only with --trust-existing-derived-hmac"
+        )
+    try:
+        confirmed_mac = normalize_mac(recovery_confirmation or "")
+    except ValueError:
+        confirmed_mac = ""
+    if confirmed_mac != mac:
+        raise RuntimeError(
+            "Split-root recovery requires explicit approval for this exact ESP. "
+            f"Re-run with --confirm-split-root-recovery-for {mac}."
+        )
+    return True
 
 
 def read_mac(esptool: str, port: str) -> str:
@@ -213,6 +261,7 @@ def ensure_nvs_hmac_key(
     summary_path: Path,
     confirmation: str | None,
     trust_existing: bool,
+    split_root_recovery: bool,
 ) -> None:
     summary = efuse_summary(espefuse, port, summary_path)
     block = summary.get("BLOCK_KEY0", {})
@@ -220,6 +269,11 @@ def ensure_nvs_hmac_key(
     raw = str(block.get("raw_value", ""))
     is_empty = raw in {"", "0x" + ("0" * 64)} and bool(block.get("writeable", False))
     if is_empty and purpose == "USER":
+        if split_root_recovery:
+            raise RuntimeError(
+                "Split-root recovery is forbidden for an empty eFuse; provision new devices "
+                "with one explicit ADD_FLEET_ROOT_SECRET"
+            )
         try:
             confirmed_mac = normalize_mac(confirmation or "")
         except ValueError:
@@ -291,6 +345,7 @@ def main() -> None:
     parser.add_argument("--skip-firmware-flash", action="store_true")
     parser.add_argument("--confirm-efuse-burn-for")
     parser.add_argument("--trust-existing-derived-hmac", action="store_true")
+    parser.add_argument("--confirm-split-root-recovery-for")
     args = parser.parse_args()
     if not args.idf_path:
         raise SystemExit("Pass --idf-path or export IDF_PATH")
@@ -299,8 +354,16 @@ def main() -> None:
     config = load_config(args.config)
     mac = read_mac(args.esptool, args.port)
     fleet_root = config.pop("fleet_root")
+    nvs_hmac_root = config.pop("nvs_hmac_root")
+    split_root_recovery = validate_root_selection(
+        mac=mac,
+        fleet_root=fleet_root,
+        nvs_hmac_root=nvs_hmac_root,
+        recovery_confirmation=args.confirm_split_root_recovery_for,
+        trust_existing=args.trust_existing_derived_hmac,
+    )
     bootstrap_secret = derive_bootstrap_secret(mac, fleet_root)
-    nvs_hmac_key = derive_nvs_hmac_key(mac, fleet_root)
+    nvs_hmac_key = derive_nvs_hmac_key(mac, nvs_hmac_root)
     generator = find_nvs_generator(args.idf_path)
 
     if not args.skip_build:
@@ -353,6 +416,7 @@ def main() -> None:
             summary_path=summary_path,
             confirmation=args.confirm_efuse_burn_for,
             trust_existing=args.trust_existing_derived_hmac,
+            split_root_recovery=split_root_recovery,
         )
         if args.skip_firmware_flash:
             run(

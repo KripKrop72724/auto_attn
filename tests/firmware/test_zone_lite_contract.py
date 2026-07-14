@@ -34,6 +34,75 @@ def test_per_device_hkdf_vectors_are_stable_and_domain_separated():
     )
 
 
+def test_provisioner_requires_explicit_fleet_root(monkeypatch, tmp_path: Path):
+    provisioner = load_provisioner()
+    config = tmp_path / "zone.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("ADD_FLEET_ROOT_SECRET", raising=False)
+    monkeypatch.setenv("ADD_PII_LOOKUP_KEY", "must-never-be-a-provisioning-root")
+
+    with pytest.raises(ValueError, match="never a safe provisioning fallback"):
+        provisioner.load_config(config)
+
+
+def test_split_root_recovery_requires_trust_and_exact_mac(monkeypatch, tmp_path: Path):
+    provisioner = load_provisioner()
+    config = tmp_path / "zone.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ADD_FLEET_ROOT_SECRET", "production-fleet-root")
+    monkeypatch.setenv("ZONE_LITE_NVS_HMAC_ROOT_SECRET", "known-original-nvs-root")
+    loaded = provisioner.load_config(config)
+    mac = "e0:72:a1:d6:3c:7c"
+
+    with pytest.raises(RuntimeError, match="trust-existing-derived-hmac"):
+        provisioner.validate_root_selection(
+            mac=mac,
+            fleet_root=loaded["fleet_root"],
+            nvs_hmac_root=loaded["nvs_hmac_root"],
+            recovery_confirmation=mac,
+            trust_existing=False,
+        )
+    with pytest.raises(RuntimeError, match="exact ESP"):
+        provisioner.validate_root_selection(
+            mac=mac,
+            fleet_root=loaded["fleet_root"],
+            nvs_hmac_root=loaded["nvs_hmac_root"],
+            recovery_confirmation="e0:72:a1:d6:f3:28",
+            trust_existing=True,
+        )
+    assert provisioner.validate_root_selection(
+        mac=mac,
+        fleet_root=loaded["fleet_root"],
+        nvs_hmac_root=loaded["nvs_hmac_root"],
+        recovery_confirmation=mac,
+        trust_existing=True,
+    )
+
+
+def test_split_root_recovery_can_never_burn_an_empty_efuse(monkeypatch, tmp_path: Path):
+    provisioner = load_provisioner()
+    monkeypatch.setattr(
+        provisioner,
+        "efuse_summary",
+        lambda *_args, **_kwargs: {
+            "BLOCK_KEY0": {"raw_value": "0x" + ("0" * 64), "writeable": True},
+            "KEY_PURPOSE_0": {"value": "USER"},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="forbidden for an empty eFuse"):
+        provisioner.ensure_nvs_hmac_key(
+            espefuse="espefuse.py",
+            port="test-port",
+            mac="e0:72:a1:d6:3c:7c",
+            key_path=tmp_path / "unused-key.bin",
+            summary_path=tmp_path / "summary.json",
+            confirmation=None,
+            trust_existing=True,
+            split_root_recovery=True,
+        )
+
+
 def test_secure_nvs_and_generic_image_are_mandatory_defaults():
     defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
     assert "CONFIG_NVS_ENCRYPTION=y" in defaults
@@ -42,6 +111,8 @@ def test_secure_nvs_and_generic_image_are_mandatory_defaults():
     provisioner = (FIRMWARE / "tools" / "provision_zone_lite.py").read_text(encoding="utf-8")
     assert "--confirm-efuse-burn-for" in provisioner
     assert "--trust-existing-derived-hmac" in provisioner
+    assert "--confirm-split-root-recovery-for" in provisioner
+    assert 'or os.environ.get("ADD_PII_LOOKUP_KEY")' not in provisioner
     assert "TemporaryDirectory" in provisioner
     assert "validate_secure_build_config(project)" in provisioner
     sources = "\n".join(
