@@ -647,13 +647,17 @@ def reconcile_device_user_identity_conflicts(
     session.flush()
 
     if duplicate_rows:
+        duplicate_group_count = sum(len(group) > 1 for group in groups.values())
         upsert_alert(
             session,
             connector,
             code="DUPLICATE_USER_CNIC",
             severity="HIGH",
             message="Multiple active terminal users share a CNIC; correction is required.",
-            details={"affected_users": len(duplicate_rows)},
+            details={
+                "affected_users": len(duplicate_rows),
+                "duplicate_groups": duplicate_group_count,
+            },
         )
     else:
         resolve_alert(session, connector, code="DUPLICATE_USER_CNIC")
@@ -1067,6 +1071,68 @@ def ensure_no_active_user_operation(
         raise ValueError("An enrollment administrator lease is active for this user/device.")
 
 
+def lock_zkt_user_registry(session: Session, *, zkt: ZKTDevice) -> None:
+    """Serialize identity reservations for one terminal inside the transaction.
+
+    PostgreSQL honors ``FOR UPDATE`` while SQLite safely ignores it in unit
+    tests.  This closes the race where two concurrent ADD requests could both
+    pass the CNIC/UID checks before either pending user became visible.
+    """
+
+    session.scalar(
+        select(ZKTDevice.id).where(ZKTDevice.id == zkt.id).with_for_update()
+    )
+
+
+def find_terminal_cnic_claims(
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+    lookup: str | None,
+    exclude_user_id: int | None = None,
+) -> list[DeviceUser]:
+    if lookup is None:
+        return []
+    statement = select(DeviceUser).where(
+        DeviceUser.zkt_device_id == zkt.id,
+        DeviceUser.cnic_lookup_hash == lookup,
+        DeviceUser.lifecycle_state.in_(["ACTIVE", "PENDING"]),
+    )
+    if exclude_user_id is not None:
+        statement = statement.where(DeviceUser.id != exclude_user_id)
+    return list(
+        session.scalars(
+            statement.order_by(DeviceUser.lifecycle_state.asc(), DeviceUser.user_id.asc())
+        ).all()
+    )
+
+
+def duplicate_cnic_message(claims: list[DeviceUser]) -> str:
+    """Return an actionable, non-PII explanation of an exact CNIC match."""
+
+    active = [row for row in claims if row.lifecycle_state == "ACTIVE"]
+    pending = [row for row in claims if row.lifecycle_state == "PENDING"]
+
+    def user_ids(rows: list[DeviceUser]) -> str:
+        shown = ", ".join(row.user_id for row in rows[:5])
+        remaining = len(rows) - 5
+        return f"{shown} (+{remaining} more)" if remaining > 0 else shown
+
+    if active:
+        noun = "record" if len(active) == 1 else "records"
+        message = (
+            "The terminal currently encodes this exact CNIC on active user "
+            f"{noun} {user_ids(active)}."
+        )
+        if pending:
+            message += f" It is also reserved by pending user {user_ids(pending)}."
+        return message + " Correct the listed terminal record before reusing the CNIC."
+    return (
+        f"This exact CNIC is reserved by pending terminal user {user_ids(pending)}. "
+        "Wait for that operation to finish or cancel it before retrying."
+    )
+
+
 def allocate_device_identifiers(
     session: Session, *, zkt: ZKTDevice, user_id_override: str | None
 ) -> tuple[str, str]:
@@ -1148,19 +1214,15 @@ def create_device_user_command(
             raise ValueError("The idempotent create command no longer references a user.")
         return user, existing
     zkt = require_writable_user_profile(connector, "create_user")
+    lock_zkt_user_registry(session, zkt=zkt)
     ensure_no_active_user_operation(session, zkt=zkt)
     normalized_cnic = normalize_cnic(cnic)
     if normalized_cnic is None:
         raise ValueError("CNIC must contain exactly 13 digits.")
     lookup = cnic_lookup(normalized_cnic)
-    if session.scalar(
-        select(DeviceUser).where(
-            DeviceUser.zkt_device_id == zkt.id,
-            DeviceUser.cnic_lookup_hash == lookup,
-            DeviceUser.lifecycle_state.in_(["ACTIVE", "PENDING"]),
-        )
-    ):
-        raise ValueError("That CNIC already belongs to a user on this terminal.")
+    claims = find_terminal_cnic_claims(session, zkt=zkt, lookup=lookup)
+    if claims:
+        raise ValueError(duplicate_cnic_message(claims))
     uid, user_id = allocate_device_identifiers(
         session, zkt=zkt, user_id_override=user_id_override
     )
@@ -1267,6 +1329,8 @@ def update_device_user_command(
             raise ValueError("That idempotency key belongs to another user.")
         return existing_command
     zkt = require_writable_user_profile(connector, "user_write")
+    lock_zkt_user_registry(session, zkt=zkt)
+    session.refresh(user)
     if user.lifecycle_state != "ACTIVE" or not user.present:
         raise ValueError("Device user is not active.")
     if user.row_version != expected_version:
@@ -1279,16 +1343,14 @@ def update_device_user_command(
     if next_cnic is None:
         raise ValueError("CNIC cannot be cleared.")
     next_lookup = cnic_lookup(next_cnic)
-    duplicate = session.scalar(
-        select(DeviceUser).where(
-            DeviceUser.zkt_device_id == zkt.id,
-            DeviceUser.cnic_lookup_hash == next_lookup,
-            DeviceUser.lifecycle_state == "ACTIVE",
-            DeviceUser.id != user.id,
-        )
+    claims = find_terminal_cnic_claims(
+        session,
+        zkt=zkt,
+        lookup=next_lookup,
+        exclude_user_id=user.id,
     )
-    if duplicate:
-        raise ValueError("That CNIC already belongs to another active user.")
+    if claims:
+        raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker
     next_privilege = user.privilege if privilege is None else privilege
@@ -1380,6 +1442,8 @@ def delete_device_user_command(
             raise ValueError("That idempotency key belongs to another user.")
         return existing_command
     zkt = require_writable_user_profile(connector, "delete_user")
+    lock_zkt_user_registry(session, zkt=zkt)
+    session.refresh(user)
     if user.lifecycle_state != "ACTIVE" or not user.present:
         raise ValueError("Device user is not active.")
     if user.row_version != expected_version:

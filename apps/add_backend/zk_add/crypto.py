@@ -46,7 +46,14 @@ def cnic_lookup(value: str | None) -> str | None:
 
 def mask_cnic(value: str | None) -> str | None:
     normalized = normalize_cnic(value)
-    return None if normalized is None else f"*****-*******-{normalized[-1]}"
+    if normalized is None:
+        return None
+    # An authenticated operator needs enough information to distinguish two
+    # terminal identities without receiving the full CNIC.  Showing only the
+    # check digit produced ten visually identical values and made unrelated
+    # users look duplicated.  Keep nine digits hidden and expose the final
+    # four in the familiar 5-7-1 CNIC layout.
+    return f"*****-****{normalized[-4:-1]}-{normalized[-1]}"
 
 
 def encrypt_text(value: str | None) -> str | None:

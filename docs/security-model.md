@@ -31,7 +31,8 @@ and fleet-root storage remain server-side and are never exposed to the frontend 
 ## Encryption and minimization
 
 - Backend PII and command expected/desired/payload state use Fernet encryption at rest.
-- CNIC lookup uses a separate keyed digest; responses expose masked CNIC only.
+- CNIC lookup uses a separate keyed digest over all thirteen normalized digits; responses expose
+  only the final four digits and non-PII terminal user IDs as duplicate-match evidence.
 - Audit and log payloads use recursive key-based redaction. ORDS payload is generated only at send
   time and is not retained as plaintext in the outbox.
 - Zone Lite uses ESP-IDF encrypted NVS. XTS material is derived through a per-device HMAC key stored

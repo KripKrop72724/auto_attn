@@ -455,7 +455,10 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert {row.identity_conflict_code for row in users} == {"DUPLICATE_CNIC"}
     assert {decrypt_cnic(row.cnic_encrypted) for row in users} == {CNIC}
     alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "DUPLICATE_USER_CNIC"))
-    assert alert and alert.state == "OPEN" and alert.details == {"affected_users": 2}
+    assert alert and alert.state == "OPEN" and alert.details == {
+        "affected_users": 2,
+        "duplicate_groups": 1,
+    }
 
     raw_session, _admin = create_admin_session(
         db,
@@ -480,6 +483,21 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert {row["identity_conflict_code"] for row in conflicted.json()["rows"]} == {
         "DUPLICATE_CNIC"
     }
+    assert conflicted.json()["identity_integrity"] == {
+        "source": "CURRENT_COMPLETE_ZKT_SNAPSHOT",
+        "total_users": 2,
+        "with_cnic": 2,
+        "missing_cnic": 0,
+        "duplicate_groups": 1,
+        "duplicate_users": 2,
+    }
+    assert {
+        tuple(member["user_id"] for member in row["identity_conflict_members"])
+        for row in conflicted.json()["rows"]
+    } == {("1001",), ("1002",)}
+    assert {row["cnic_masked"] for row in conflicted.json()["rows"]} == {
+        "*****-****567-1"
+    }
     assert all(not row["identity_complete"] for row in conflicted.json()["rows"])
     assert CNIC not in json.dumps(conflicted.json())
 
@@ -493,6 +511,20 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     ) is None
 
     make_writable(connector)
+    with pytest.raises(
+        ValueError,
+        match=r"exact CNIC on active user records 1001, 1002",
+    ):
+        create_device_user_command(
+            db,
+            connector=connector,
+            display_name="A third identity",
+            cnic=CNIC,
+            shift_worker=False,
+            user_id_override="1003",
+            idempotency_key="conflict-create-rejected",
+            actor="StateHealthAdmin",
+        )
     with pytest.raises(ValueError, match="replacement CNIC"):
         update_device_user_command(
             db,
@@ -558,6 +590,48 @@ def test_partial_snapshot_rejects_ambiguous_identity_replacement(db: Session):
         )
     original = db.scalar(select(DeviceUser).where(DeviceUser.uid == "1"))
     assert original.present and original.lifecycle_state == "ACTIVE"
+
+
+def test_unique_full_cnic_is_accepted_even_when_mask_and_other_conflicts_match(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="existing-conflicts",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"One-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Two-{CNIC}"),
+            ],
+        ),
+    )
+    make_writable(connector)
+    # Both values render with the same four-digit mask (***567-1), but the
+    # reservation check is an HMAC of all 13 normalized digits.
+    distinct_cnic_with_same_visible_suffix = "6110112345671"
+    user, command = create_device_user_command(
+        db,
+        connector=connector,
+        display_name="Unique full CNIC",
+        cnic=distinct_cnic_with_same_visible_suffix,
+        shift_worker=False,
+        user_id_override="1003",
+        idempotency_key="unique-despite-same-mask",
+        actor="StateHealthAdmin",
+    )
+    assert user.lifecycle_state == "PENDING"
+    assert command.command_type == "CREATE_USER"
+    assert decrypt_cnic(user.cnic_encrypted) == distinct_cnic_with_same_visible_suffix
+    assert user.cnic_lookup_hash not in {
+        row.cnic_lookup_hash
+        for row in db.scalars(
+            select(DeviceUser).where(DeviceUser.lifecycle_state == "ACTIVE")
+        )
+    }
 
 
 def test_user_create_update_delete_is_idempotent_encrypted_and_immutable(db: Session):

@@ -542,10 +542,19 @@ def list_device_users_v2(
     elif identity == "CONFLICT":
         statement = statement.where(DeviceUser.identity_conflict_code != None)  # noqa: E711
     rows = db.scalars(statement.order_by(DeviceUser.id.asc()).limit(limit + 1)).all()
+    integrity, conflict_members = device_user_identity_integrity(db, zkt=zkt)
     return {
-        "rows": [serialize_user(row, zkt=zkt) for row in rows[:limit]],
+        "rows": [
+            serialize_user(
+                row,
+                zkt=zkt,
+                identity_conflict_members=conflict_members.get(row.id, []),
+            )
+            for row in rows[:limit]
+        ],
         "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
         "device": serialize_connector(connector),
+        "identity_integrity": integrity,
     }
 
 
@@ -1402,7 +1411,60 @@ def command_response(row: DeviceCommand) -> dict:
     }
 
 
-def serialize_user(row: DeviceUser, *, zkt: ZKTDevice | None = None) -> dict:
+def device_user_identity_integrity(
+    db: Session, *, zkt: ZKTDevice
+) -> tuple[dict, dict[int, list[dict[str, str]]]]:
+    """Build exact-match evidence without returning CNICs or lookup hashes."""
+
+    active = list(
+        db.scalars(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.lifecycle_state == "ACTIVE",
+                DeviceUser.present == True,  # noqa: E712
+            )
+        ).all()
+    )
+    groups: dict[str, list[DeviceUser]] = {}
+    for user in active:
+        if user.cnic_lookup_hash:
+            groups.setdefault(user.cnic_lookup_hash, []).append(user)
+    duplicate_groups = [group for group in groups.values() if len(group) > 1]
+    conflict_members: dict[int, list[dict[str, str]]] = {}
+    for group in duplicate_groups:
+        ordered = sorted(group, key=lambda user: (user.user_id, user.uid))
+        for user in ordered:
+            if user.id is None:
+                continue
+            conflict_members[user.id] = [
+                {"user_id": member.user_id, "uid": member.uid}
+                for member in ordered
+                if member.id != user.id
+            ]
+    with_cnic = sum(bool(user.cnic_lookup_hash) for user in active)
+    return (
+        {
+            "source": (
+                "CURRENT_COMPLETE_ZKT_SNAPSHOT"
+                if zkt.snapshot_complete
+                else "PARTIAL_ZKT_SNAPSHOT"
+            ),
+            "total_users": len(active),
+            "with_cnic": with_cnic,
+            "missing_cnic": len(active) - with_cnic,
+            "duplicate_groups": len(duplicate_groups),
+            "duplicate_users": sum(len(group) for group in duplicate_groups),
+        },
+        conflict_members,
+    )
+
+
+def serialize_user(
+    row: DeviceUser,
+    *,
+    zkt: ZKTDevice | None = None,
+    identity_conflict_members: list[dict[str, str]] | None = None,
+) -> dict:
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
     if cnic and machine_name:
@@ -1419,6 +1481,7 @@ def serialize_user(row: DeviceUser, *, zkt: ZKTDevice | None = None) -> dict:
             cnic and row.display_name and row.identity_conflict_code is None
         ),
         "identity_conflict_code": row.identity_conflict_code,
+        "identity_conflict_members": identity_conflict_members or [],
         "shift_worker": row.shift_worker,
         "privilege": row.privilege,
         "present": row.present,
