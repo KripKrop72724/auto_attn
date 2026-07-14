@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 FIRMWARE = ROOT / "firmware" / "zone_lite"
@@ -41,6 +43,7 @@ def test_secure_nvs_and_generic_image_are_mandatory_defaults():
     assert "--confirm-efuse-burn-for" in provisioner
     assert "--trust-existing-derived-hmac" in provisioner
     assert "TemporaryDirectory" in provisioner
+    assert "validate_secure_build_config(project)" in provisioner
     sources = "\n".join(
         (FIRMWARE / "main" / name).read_text(encoding="utf-8")
         for name in ("zone_lite.c", "zone_config.c", "add_connector.c", "led_status.c")
@@ -55,6 +58,34 @@ def test_secure_nvs_and_generic_image_are_mandatory_defaults():
     runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     assert "if (!zone_config_get()->provisioned)" in runtime
     assert runtime.index("if (!zone_config_get()->provisioned)") < runtime.index("wifi_init_sta();")
+    assert "nvs_flash_erase()" not in runtime
+
+
+def test_provisioner_rejects_stale_insecure_effective_sdkconfig(tmp_path: Path):
+    provisioner = load_provisioner()
+    (tmp_path / "build" / "config").mkdir(parents=True)
+    (tmp_path / "sdkconfig").write_text(
+        "# CONFIG_NVS_ENCRYPTION is not set\n", encoding="utf-8"
+    )
+    (tmp_path / "build" / "config" / "sdkconfig.h").write_text(
+        "/* insecure stale build */\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="without HMAC-backed NVS encryption"):
+        provisioner.validate_secure_build_config(tmp_path)
+
+
+def test_provisioner_accepts_matching_secure_effective_sdkconfig(tmp_path: Path):
+    provisioner = load_provisioner()
+    (tmp_path / "build" / "config").mkdir(parents=True)
+    (tmp_path / "sdkconfig").write_text(
+        "\n".join(provisioner.SECURE_SDKCONFIG_VALUES) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "build" / "config" / "sdkconfig.h").write_text(
+        "\n".join(provisioner.SECURE_BUILD_DEFINES) + "\n", encoding="utf-8"
+    )
+
+    provisioner.validate_secure_build_config(tmp_path)
 
 
 def test_user_protocol_never_contains_attendance_clear_command():

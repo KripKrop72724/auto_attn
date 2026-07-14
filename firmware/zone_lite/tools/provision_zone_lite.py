@@ -30,6 +30,16 @@ NVS_HMAC_SALT = b"state-life-zone-lite-nvs-hmac-v1"
 MAC_PATTERN = re.compile(r"MAC:\s*([0-9a-f:]{17})", re.IGNORECASE)
 NVS_PARTITION_SIZE = 0x6000
 NVS_PARTITION_OFFSET = "0x9000"
+SECURE_SDKCONFIG_VALUES = (
+    "CONFIG_NVS_ENCRYPTION=y",
+    "CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y",
+    "CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0",
+)
+SECURE_BUILD_DEFINES = (
+    "#define CONFIG_NVS_ENCRYPTION 1",
+    "#define CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC 1",
+    "#define CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID 0",
+)
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> str:
@@ -151,6 +161,31 @@ def find_nvs_generator(idf_path: Path) -> Path:
     return candidate
 
 
+def validate_secure_build_config(project: Path) -> None:
+    """Refuse provisioning unless the effective image uses HMAC-backed NVS.
+
+    sdkconfig.defaults is intentionally not sufficient evidence: an ignored,
+    previously generated sdkconfig can override those defaults. Checking both
+    the resolved sdkconfig and the generated build header ties this gate to the
+    image that is about to be flashed.
+    """
+    sdkconfig_path = project / "sdkconfig"
+    build_header_path = project / "build" / "config" / "sdkconfig.h"
+    if not sdkconfig_path.is_file() or not build_header_path.is_file():
+        raise RuntimeError(
+            "Secure build configuration is missing; run a clean idf.py build before provisioning"
+        )
+    sdkconfig = sdkconfig_path.read_text(encoding="utf-8")
+    build_header = build_header_path.read_text(encoding="utf-8")
+    missing_values = [value for value in SECURE_SDKCONFIG_VALUES if value not in sdkconfig]
+    missing_defines = [value for value in SECURE_BUILD_DEFINES if value not in build_header]
+    if missing_values or missing_defines:
+        raise RuntimeError(
+            "Refusing to provision an image without HMAC-backed NVS encryption; "
+            "remove the stale generated sdkconfig, rebuild from sdkconfig.defaults, and retry"
+        )
+
+
 def efuse_summary(espefuse: str, port: str, destination: Path) -> dict:
     run(
         [
@@ -270,6 +305,7 @@ def main() -> None:
 
     if not args.skip_build:
         run(["idf.py", "build"], cwd=project)
+    validate_secure_build_config(project)
     with tempfile.TemporaryDirectory(prefix="zone-lite-provision-") as directory:
         temporary = Path(directory)
         csv_path = temporary / "provision.csv"

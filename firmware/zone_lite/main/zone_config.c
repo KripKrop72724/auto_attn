@@ -7,6 +7,16 @@
 
 #include "zone_lite_config.example.h"
 
+#if !defined(CONFIG_NVS_ENCRYPTION)
+#error "Zone Lite requires CONFIG_NVS_ENCRYPTION"
+#endif
+#if !defined(CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC)
+#error "Zone Lite requires HMAC-backed NVS key protection"
+#endif
+#if !defined(CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID) || CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID != 0
+#error "Zone Lite provisioning expects the HMAC key in eFuse key block 0"
+#endif
+
 #ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
 #define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
 #endif
@@ -114,7 +124,10 @@ esp_err_t zone_config_init(void)
         ESP_LOGE(TAG, "No encrypted per-device provisioning namespace; firmware remains inert");
         return ESP_OK;
     }
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not open encrypted provisioning namespace: %s", esp_err_to_name(err));
+        return err;
+    }
     uint8_t provisioned = 0;
     (void)nvs_get_u8(handle, "provisioned", &provisioned);
     s_config.provisioned = provisioned == 1;

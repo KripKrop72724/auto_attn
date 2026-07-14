@@ -4766,11 +4766,14 @@ void app_main(void)
     led_status_init();
     led_status_set(LED_STATUS_BOOTING);
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Encrypted NVS initialization failed (%s); preserving provisioning data and staying inert",
+            esp_err_to_name(ret));
+        led_status_fault(LED_STATUS_FATAL);
+        return;
     }
-    ESP_ERROR_CHECK(ret);
     ESP_ERROR_CHECK(zone_config_init());
     if (!zone_config_get()->provisioned) {
         ESP_LOGE(TAG, "Encrypted per-device provisioning is required; network startup is blocked");
