@@ -15,6 +15,14 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
   intermittent reconnect performs a light count check instead of repeatedly dumping full history.
 - Keeps ADD and ORDS flash outboxes independent; an outage at one destination does not block the
   other or the live ZKT socket.
+- Arbitrates ORDS outbox work before a full ZKT dump, then releases the multi-megabyte terminal
+  buffer before building or sending downstream truth payloads.
+- Reads large MB40 buffers in native `0xffc0`-byte chunks with a 90-second authenticated I/O
+  deadline and sends `CMD_FREE_DATA` on every post-prepare exit path.
+- Stores at most 5,000 current-month reconcile events in PSRAM, serializes ORDS rows one at a time,
+  and durably commits ADD truth in groups of 32 batches.
+- Reports a reconcile successful only after ORDS truth and durable ADD enqueue both succeed; the
+  serial completion marker is `complete=true`.
 - Persists commands before execution and verifies fresh terminal pre/postconditions.
 - Supports 72-byte certified user records; 28-byte/partial/unknown profiles remain read-only.
 - Persists ten-minute administrator deadlines and revokes locally without ADD connectivity.
@@ -107,6 +115,10 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
+The current production version is `2.1.10`. ADD onboarding and heartbeat version fields are generated
+from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
+8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
+
 ## Recovery safeguards
 
 Some older ZKT devices accept TCP `4370` while their application service is stuck. Recovery is
@@ -140,3 +152,5 @@ Do not call a flash production-ready from a successful build alone. Complete
 [`docs/hardware-acceptance.md`](../../docs/hardware-acceptance.md), including duplicate-serial
 quarantine, user create/edit/delete with unchanged attendance count, offline lease expiry,
 flapping/quiet-period proof, queued attendance replay, restart idempotency, and a 24-hour soak.
+For this release, also retain the evidence listed in
+[`docs/zone-lite-2.1.10-release.md`](../../docs/zone-lite-2.1.10-release.md).

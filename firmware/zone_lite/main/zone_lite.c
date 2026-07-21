@@ -152,6 +152,7 @@
 #define SEEN_HASH_CAPACITY 262144
 #define MAX_EVENT_JSON 1024
 #define ADD_RECONCILE_BATCH_EVENTS 10
+#define ADD_RECONCILE_COMMIT_BATCHES 32
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -170,7 +171,6 @@
 #ifndef ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS
 #define ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS 5000
 #endif
-#define ADD_RECONCILE_MAX_BATCHES ((ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS / ADD_RECONCILE_BATCH_EVENTS) + 2)
 #ifndef ZONE_LITE_ORDS_CA_CERT_PEM
 #define ZONE_LITE_ORDS_CA_CERT_PEM NULL
 #endif
@@ -252,7 +252,13 @@
 #define ZONE_LITE_ZKT_TELNET_EXPECT_BANNER (zone_config_get()->zkt_telnet_banner)
 #undef ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND
 #define ZONE_LITE_ZKT_TELNET_REBOOT_COMMAND (zone_config_get()->zkt_telnet_command)
-#define ZKT_IO_TIMEOUT_SEC 8
+// Large MB40 attendance buffers can remain in CMD_PREPARE_DATA while flash is
+// being read for more than a minute. Connection attempts retain their own
+// short deadline; authenticated command/data reads get this wider bound.
+#define ZKT_IO_TIMEOUT_SEC 90
+// Use the ZKT TCP protocol's native maximum. It is proven on this MB40 and
+// halves the number of flash-backed requests needed for a multi-megabyte dump.
+#define ZKT_BUFFER_CHUNK_BYTES 0xffc0
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
 #define ZKT_KEEPALIVE_COUNT 3
@@ -264,6 +270,8 @@
 static const char *TAG = "zone_lite";
 static EventGroupHandle_t wifi_event_group;
 static SemaphoreHandle_t g_storage_lock;
+static SemaphoreHandle_t g_ords_http_lock;
+static SemaphoreHandle_t g_ords_outbox_gate;
 static int wifi_retry_count;
 
 typedef struct {
@@ -349,7 +357,12 @@ static bool g_temp_admin_active;
 static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
 
-static bool oracle_send_reconcile(char **events, size_t count, int year, int month);
+static bool oracle_send_reconcile(
+    const attendance_event_t *events,
+    size_t event_count,
+    int year,
+    int month,
+    size_t *truth_count_out);
 
 static int64_t uptime_ms(void)
 {
@@ -1029,12 +1042,15 @@ static bool zk_read_buffer(int sock, zk_context_t *ctx, uint16_t command, uint32
     uint8_t *buffer = malloc(size);
     if (buffer == NULL) {
         ESP_LOGE(TAG, "Could not allocate %lu byte ZKT buffer", (unsigned long)size);
+        (void)zk_send_command(sock, ctx, CMD_FREE_DATA, NULL, 0, rx, 8192, &response);
         free(rx);
         return false;
     }
 
     uint32_t offset = 0;
-    const uint32_t max_chunk = 0xffc0;
+    // The MB40 can intermittently spend more than a minute preparing a
+    // flash-backed chunk; the authenticated socket deadline accounts for it.
+    const uint32_t max_chunk = ZKT_BUFFER_CHUNK_BYTES;
     while (offset < size) {
         uint32_t want = size - offset > max_chunk ? max_chunk : size - offset;
         uint8_t chunk_payload[8];
@@ -1042,7 +1058,9 @@ static bool zk_read_buffer(int sock, zk_context_t *ctx, uint16_t command, uint32
         write_le32(chunk_payload + 4, want);
         uint8_t *chunk_rx = malloc(want + 64);
         if (chunk_rx == NULL) {
+            (void)zk_send_command(sock, ctx, CMD_FREE_DATA, NULL, 0, rx, 8192, &response);
             free(buffer);
+            free(rx);
             return false;
         }
         zk_response_t chunk_response = {0};
@@ -1071,6 +1089,10 @@ static bool zk_read_buffer(int sock, zk_context_t *ctx, uint16_t command, uint32
                 (unsigned)chunk_response.data_len,
                 (unsigned long)want);
             free(chunk_rx);
+            // A prepared ZKT read is terminal-side state. Always release it
+            // before abandoning a partial transfer so subsequent sessions do
+            // not inherit an exhausted or wedged device buffer.
+            (void)zk_send_command(sock, ctx, CMD_FREE_DATA, NULL, 0, rx, 8192, &response);
             free(buffer);
             free(rx);
             return false;
@@ -2399,6 +2421,91 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
     return add_enqueue_attendance_events(events, event->event_uid);
 }
 
+static void free_reconcile_payloads(char **payloads, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        free(payloads[i]);
+        payloads[i] = NULL;
+    }
+}
+
+static bool flush_add_reconcile_payloads(char **payloads, size_t *count)
+{
+    if (*count == 0) {
+        return true;
+    }
+    size_t queued = *count;
+    bool ok = add_connector_enqueue_attendance_bulk((const char *const *)payloads, queued);
+    free_reconcile_payloads(payloads, queued);
+    *count = 0;
+    return ok;
+}
+
+static bool add_enqueue_reconcile_events(
+    const attendance_event_t *events,
+    size_t event_count,
+    const char *capturetype)
+{
+    char *payloads[ADD_RECONCILE_COMMIT_BATCHES] = {0};
+    size_t payload_count = 0;
+    size_t total_batches = 0;
+    size_t batch_count = 0;
+    char batch_id[80] = {0};
+    cJSON *batch_events = NULL;
+
+    for (size_t i = 0; i < event_count; i++) {
+        if (batch_events == NULL) {
+            batch_events = cJSON_CreateArray();
+            snprintf(batch_id, sizeof(batch_id), "truth-%s", events[i].event_uid);
+        }
+        cJSON *row = add_attendance_json_row(&events[i], capturetype);
+        if (batch_events == NULL || row == NULL) {
+            cJSON_Delete(row);
+            cJSON_Delete(batch_events);
+            free_reconcile_payloads(payloads, payload_count);
+            ESP_LOGE(TAG, "Could not serialize a bounded ADD reconcile batch");
+            return false;
+        }
+        cJSON_AddItemToArray(batch_events, row);
+        batch_count++;
+        if (batch_count < ADD_RECONCILE_BATCH_EVENTS && i + 1 < event_count) {
+            continue;
+        }
+
+        char *batch_json = add_serialize_attendance_events(batch_events, batch_id);
+        batch_events = NULL;
+        batch_count = 0;
+        batch_id[0] = '\0';
+        if (batch_json == NULL) {
+            free_reconcile_payloads(payloads, payload_count);
+            ESP_LOGE(TAG, "Could not serialize a bounded ADD reconcile payload");
+            return false;
+        }
+        payloads[payload_count++] = batch_json;
+        total_batches++;
+        if (payload_count == ADD_RECONCILE_COMMIT_BATCHES &&
+            !flush_add_reconcile_payloads(payloads, &payload_count)) {
+            ESP_LOGE(TAG, "Could not durably append an ADD reconcile payload chunk");
+            return false;
+        }
+        if ((total_batches % ADD_RECONCILE_COMMIT_BATCHES) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    if (!flush_add_reconcile_payloads(payloads, &payload_count)) {
+        ESP_LOGE(TAG, "Could not durably append the final ADD reconcile payload chunk");
+        return false;
+    }
+    ESP_LOGI(
+        TAG,
+        "ADD reconcile enqueue complete events=%u batches=%u commit_chunk=%u",
+        (unsigned)event_count,
+        (unsigned)total_batches,
+        (unsigned)ADD_RECONCILE_COMMIT_BATCHES);
+    return true;
+}
+
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype,
@@ -2522,6 +2629,16 @@ static bool reconcile_attendance_dump(
     if (records <= 0) {
         return true;
     }
+    // Do not download a multi-megabyte ZKT dump while the background ORDS
+    // worker owns the durable outbox for a network rewrite. Waiting here keeps
+    // the expensive device read outside that contention window.
+    if (g_ords_outbox_gate == NULL ||
+        xSemaphoreTake(
+            g_ords_outbox_gate,
+            pdMS_TO_TICKS(ZONE_LITE_ORDS_TIMEOUT_MS * 5)) != pdTRUE) {
+        ESP_LOGW(TAG, "Timed out waiting for ORDS outbox before full reconcile");
+        return false;
+    }
     int32_t refreshed_users = 0;
     int32_t refreshed_records = 0;
     if (zk_get_counts(sock, ctx, &refreshed_users, &refreshed_records) && refreshed_records > 0) {
@@ -2536,6 +2653,7 @@ static bool reconcile_attendance_dump(
     if (!zk_read_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &data, &len) || len < 4) {
         ESP_LOGW(TAG, "Could not read attendance dump");
         free(data);
+        xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
     uint32_t total_size = read_le32(data);
@@ -2548,6 +2666,7 @@ static bool reconcile_attendance_dump(
     if (record_size == 0) {
         ESP_LOGW(TAG, "Unsupported ZKT attendance table size total=%lu records=%ld", (unsigned long)total_size, (long)records);
         free(data);
+        xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
     uint32_t parsed_records = total_size / record_size;
@@ -2570,17 +2689,27 @@ static bool reconcile_attendance_dump(
     size_t filtered = 0;
     size_t skipped = 0;
     bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED && filter_year > 0 && filter_month > 0;
-    bool truth_overflow = false;
-    bool truth_build_failed = false;
-    bool add_delivery_failed = false;
-    cJSON *add_batch_events = NULL;
-    size_t add_batch_count = 0;
-    char add_batch_id[80] = {0};
-    char **add_batches = NULL;
-    size_t add_batch_total = 0;
-    char **truth_events = NULL;
+    bool reconcile_overflow = false;
+    size_t reconcile_event_count = 0;
     size_t truth_count = 0;
-    size_t truth_capacity = truth_enabled ? ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS : 0;
+    size_t reconcile_capacity = ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
+    attendance_event_t *reconcile_events = heap_caps_calloc(
+        reconcile_capacity,
+        sizeof(attendance_event_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (reconcile_events == NULL) {
+        reconcile_events = calloc(reconcile_capacity, sizeof(attendance_event_t));
+    }
+    if (reconcile_events == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Could not allocate bounded reconcile event store capacity=%u",
+            (unsigned)reconcile_capacity);
+        free(data);
+        xSemaphoreGive(g_ords_outbox_gate);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        return false;
+    }
     ESP_LOGI(
         TAG,
         "Reconciling %ld attendance records packet_size=%lu month_filter=%04d-%02d",
@@ -2590,7 +2719,9 @@ static bool reconcile_attendance_dump(
         filter_month);
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGW(TAG, "Skipping reconcile because attendance storage is busy");
+        free(reconcile_events);
         free(data);
+        xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
     FILE *pending_file = fopen(PENDING_PATH, "a");
@@ -2600,31 +2731,6 @@ static bool reconcile_attendance_dump(
     FILE *blocked_file = fopen(BLOCKED_PATH, "a");
     if (blocked_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
-    }
-    if (truth_enabled) {
-        truth_events = heap_caps_calloc(truth_capacity, sizeof(char *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (truth_events == NULL) {
-            truth_events = calloc(truth_capacity, sizeof(char *));
-        }
-        if (truth_events == NULL) {
-            ESP_LOGE(TAG, "Could not allocate ORDS truth reconcile event list capacity=%u", (unsigned)truth_capacity);
-            led_status_fault(LED_STATUS_FATAL);
-            truth_enabled = false;
-        }
-    }
-    add_batches = heap_caps_calloc(
-        ADD_RECONCILE_MAX_BATCHES,
-        sizeof(char *),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (add_batches == NULL) {
-        add_batches = calloc(ADD_RECONCILE_MAX_BATCHES, sizeof(char *));
-    }
-    if (add_batches == NULL) {
-        ESP_LOGE(
-            TAG,
-            "Could not allocate ADD reconcile batch list capacity=%u",
-            (unsigned)ADD_RECONCILE_MAX_BATCHES);
-        add_delivery_failed = true;
     }
     while (remain >= record_size) {
         char user_id[32] = "";
@@ -2665,17 +2771,13 @@ static bool reconcile_attendance_dump(
         }
         attendance_event_t event;
         if (build_attendance_event(&event, users, user_id, uid, timestamp, status, punch)) {
-            if (truth_enabled && event.cnic[0] != '\0') {
-                if (truth_count < truth_capacity) {
-                    char *truth_json = event_to_json(&event, "MANUAL_REPROCESS");
-                    if (truth_json != NULL) {
-                        truth_events[truth_count++] = truth_json;
-                    } else {
-                        truth_build_failed = true;
-                    }
-                } else {
-                    truth_overflow = true;
+            if (reconcile_event_count < reconcile_capacity) {
+                reconcile_events[reconcile_event_count++] = event;
+                if (event.cnic[0] != '\0') {
+                    truth_count++;
                 }
+            } else {
+                reconcile_overflow = true;
             }
             enqueue_result_t result = enqueue_event_to_files(
                 &event, capturetype, pending_file, blocked_file, false);
@@ -2688,38 +2790,6 @@ static bool reconcile_attendance_dump(
             } else {
                 duplicates++;
             }
-            // ADD receives a batched truth stream independently of the ORDS
-            // dedup state.  This lets a reboot repair dashboard history even
-            // when the same event was already accepted by ORDS.
-            if (!add_delivery_failed) {
-                if (!add_batch_events) {
-                    add_batch_events = cJSON_CreateArray();
-                    snprintf(add_batch_id, sizeof(add_batch_id), "truth-%s", event.event_uid);
-                }
-                cJSON *add_row = add_attendance_json_row(&event, capturetype);
-                if (!add_batch_events || !add_row) {
-                    cJSON_Delete(add_row);
-                    cJSON_Delete(add_batch_events);
-                    add_batch_events = NULL;
-                    add_batch_count = 0;
-                    add_delivery_failed = true;
-                } else {
-                    cJSON_AddItemToArray(add_batch_events, add_row);
-                    add_batch_count++;
-                    if (add_batch_count >= ADD_RECONCILE_BATCH_EVENTS) {
-                        char *batch_json = add_serialize_attendance_events(add_batch_events, add_batch_id);
-                        if (!batch_json || add_batch_total >= ADD_RECONCILE_MAX_BATCHES) {
-                            free(batch_json);
-                            add_delivery_failed = true;
-                        } else {
-                            add_batches[add_batch_total++] = batch_json;
-                        }
-                        add_batch_events = NULL;
-                        add_batch_count = 0;
-                        add_batch_id[0] = '\0';
-                    }
-                }
-            }
         } else {
             skipped++;
         }
@@ -2729,16 +2799,6 @@ static bool reconcile_attendance_dump(
         if ((processed % 50) == 0) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
-    }
-    if (add_batch_events) {
-        char *batch_json = add_serialize_attendance_events(add_batch_events, add_batch_id);
-        if (!batch_json || !add_batches || add_batch_total >= ADD_RECONCILE_MAX_BATCHES) {
-            free(batch_json);
-            add_delivery_failed = true;
-        } else {
-            add_batches[add_batch_total++] = batch_json;
-        }
-        add_batch_events = NULL;
     }
     if (pending_file != NULL) {
         (void)fflush(pending_file);
@@ -2752,41 +2812,42 @@ static bool reconcile_attendance_dump(
     }
     xSemaphoreGive(g_storage_lock);
     free(data);
-    if (add_batch_total > 0 &&
-        !add_connector_enqueue_attendance_bulk((const char *const *)add_batches, add_batch_total)) {
-        add_delivery_failed = true;
-    }
-    if (add_batches != NULL) {
-        for (size_t i = 0; i < add_batch_total; i++) {
-            free(add_batches[i]);
+    xSemaphoreGive(g_ords_outbox_gate);
+    ESP_LOGI(
+        TAG,
+        "Released ZKT dump before downstream reconcile serialization events=%u truth=%u",
+        (unsigned)reconcile_event_count,
+        (unsigned)truth_count);
+
+    bool truth_delivery_ok = true;
+    bool add_delivery_ok = true;
+    if (reconcile_overflow) {
+        ESP_LOGE(
+            TAG,
+            "Current-month reconcile exceeded bounded event capacity=%u",
+            (unsigned)reconcile_capacity);
+        truth_delivery_ok = false;
+        add_delivery_ok = false;
+    } else {
+        if (truth_enabled) {
+            truth_delivery_ok = oracle_send_reconcile(
+                reconcile_events,
+                reconcile_event_count,
+                filter_year,
+                filter_month,
+                &truth_count);
         }
-        free(add_batches);
+        // ADD receives the same compact truth stream independently of ORDS
+        // dedup state. Payloads are serialized and committed in bounded chunks
+        // only after the multi-megabyte ZKT dump has been released.
+        add_delivery_ok = add_enqueue_reconcile_events(
+            reconcile_events,
+            reconcile_event_count,
+            capturetype);
     }
-    if (truth_enabled) {
-        if (truth_overflow) {
-            ESP_LOGE(TAG, "Skipping ORDS truth reconcile because current-month truth exceeded capacity=%u", (unsigned)truth_capacity);
-            led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
-        } else if (truth_build_failed) {
-            ESP_LOGE(TAG, "Skipping ORDS truth reconcile because one or more truth events could not be serialized");
-            led_status_fault(LED_STATUS_FATAL);
-        } else if (blocked > 0 || skipped > 0) {
-            ESP_LOGW(
-                TAG,
-                "Skipping ORDS truth reconcile because current-month dump has blocked=%u skipped=%u identity gaps",
-                (unsigned)blocked,
-                (unsigned)skipped);
-            led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
-        } else {
-            (void)oracle_send_reconcile(truth_events, truth_count, filter_year, filter_month);
-        }
-    }
-    if (truth_events != NULL) {
-        for (size_t i = 0; i < truth_count; i++) {
-            free(truth_events[i]);
-        }
-        free(truth_events);
-    }
-    if (add_delivery_failed) {
+    free(reconcile_events);
+
+    if (!add_delivery_ok) {
         ESP_LOGW(
             TAG,
             "ADD truth batching could not persist the complete cycle; live punches remain prioritized and the six-hour truth cycle will repair history");
@@ -2796,9 +2857,13 @@ static bool reconcile_attendance_dump(
             "ADD_TRUTH_QUEUE_SATURATED",
             "Dashboard truth cycle could not be fully persisted; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
+    bool reconcile_complete = !reconcile_overflow && truth_delivery_ok && add_delivery_ok;
+    if (!reconcile_complete) {
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+    }
     ESP_LOGI(
         TAG,
-        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u truth=%u",
+        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u truth=%u complete=%s",
         capturetype,
         (unsigned)processed,
         (unsigned)added,
@@ -2807,9 +2872,10 @@ static bool reconcile_attendance_dump(
         (unsigned)duplicates,
         (unsigned)filtered,
         (unsigned)skipped,
-        (unsigned)truth_count);
+        (unsigned)truth_count,
+        reconcile_complete ? "true" : "false");
     if (added_out) *added_out = added;
-    return true;
+    return reconcile_complete;
 }
 
 static bool system_time_is_valid(void)
@@ -3138,7 +3204,7 @@ static int http_post_json_with_tls_source(
     return status;
 }
 
-static int http_post_json(const char *url, const char *json, char **response_body)
+static int http_post_json_unlocked(const char *url, const char *json, char **response_body)
 {
     if (response_body != NULL) {
         *response_body = NULL;
@@ -3164,6 +3230,23 @@ static int http_post_json(const char *url, const char *json, char **response_bod
     }
 
     return http_post_json_with_tls_source(url, json, response_body, NULL, "ESP-IDF certificate bundle");
+}
+
+static int http_post_json(const char *url, const char *json, char **response_body)
+{
+    if (response_body != NULL) {
+        *response_body = NULL;
+    }
+    if (g_ords_http_lock == NULL ||
+        xSemaphoreTake(
+            g_ords_http_lock,
+            pdMS_TO_TICKS(ZONE_LITE_ORDS_TIMEOUT_MS + 10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Timed out waiting for exclusive ORDS HTTPS transport");
+        return -1;
+    }
+    int status = http_post_json_unlocked(url, json, response_body);
+    xSemaphoreGive(g_ords_http_lock);
+    return status;
 }
 
 static bool oracle_success_body(const char *body)
@@ -3458,8 +3541,14 @@ static char *json_escape_alloc(const char *value)
     return escaped;
 }
 
-static char *build_reconcile_payload(char **events, size_t count, int year, int month)
+static char *build_reconcile_payload(
+    const attendance_event_t *events,
+    size_t event_count,
+    int year,
+    int month,
+    size_t *included_out)
 {
+    if (included_out) *included_out = 0;
     int last_day = days_in_month(year, month);
     if (last_day == 0) {
         return NULL;
@@ -3499,14 +3588,24 @@ static char *build_reconcile_payload(char **events, size_t count, int year, int 
     const char *suffix = "]}";
     size_t payload_len = (size_t)header_len + strlen(suffix);
     size_t included = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (events[i] == NULL || events[i][0] == '\0') {
+    // Size the authoritative payload with one transient JSON row at a time.
+    // Keeping thousands of row strings alongside the ZKT dump caused the
+    // original production memory exhaustion.
+    for (size_t i = 0; i < event_count; i++) {
+        if (events[i].cnic[0] == '\0') {
             continue;
         }
-        payload_len += strlen(events[i]);
-        if (included > 0) {
-            payload_len++;
+        char *event_json = event_to_json(&events[i], "MANUAL_REPROCESS");
+        if (event_json == NULL) {
+            return NULL;
         }
+        size_t event_len = strlen(event_json);
+        free(event_json);
+        size_t separator = included > 0 ? 1 : 0;
+        if (event_len > SIZE_MAX - payload_len - separator) {
+            return NULL;
+        }
+        payload_len += event_len + separator;
         included++;
     }
 
@@ -3521,23 +3620,37 @@ static char *build_reconcile_payload(char **events, size_t count, int year, int 
     char *write_at = payload;
     memcpy(write_at, header, (size_t)header_len);
     write_at += header_len;
-    included = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (events[i] == NULL || events[i][0] == '\0') {
+    size_t written = 0;
+    for (size_t i = 0; i < event_count; i++) {
+        if (events[i].cnic[0] == '\0') {
             continue;
         }
-        if (included > 0) {
+        char *event_json = event_to_json(&events[i], "MANUAL_REPROCESS");
+        if (event_json == NULL) {
+            free(payload);
+            return NULL;
+        }
+        if (written > 0) {
             *write_at++ = ',';
         }
-        size_t len = strlen(events[i]);
-        memcpy(write_at, events[i], len);
+        size_t len = strlen(event_json);
+        memcpy(write_at, event_json, len);
         write_at += len;
-        included++;
+        free(event_json);
+        written++;
+        if ((written % 100) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
     size_t suffix_len = strlen(suffix);
     memcpy(write_at, suffix, suffix_len);
     write_at += suffix_len;
     *write_at = '\0';
+    if (written != included) {
+        free(payload);
+        return NULL;
+    }
+    if (included_out) *included_out = included;
     return payload;
 }
 
@@ -3571,8 +3684,14 @@ static bool oracle_reconcile_body_ok(const char *body, int *deleted, int *correc
     return ok;
 }
 
-static bool oracle_send_reconcile(char **events, size_t count, int year, int month)
+static bool oracle_send_reconcile(
+    const attendance_event_t *events,
+    size_t event_count,
+    int year,
+    int month,
+    size_t *truth_count_out)
 {
+    if (truth_count_out) *truth_count_out = 0;
     if (!ZONE_LITE_ORDS_RECONCILE_ENABLED) {
         return true;
     }
@@ -3580,18 +3699,20 @@ static bool oracle_send_reconcile(char **events, size_t count, int year, int mon
         ESP_LOGI(TAG, "Skipping ORDS truth reconcile until current ORDS backoff expires");
         return false;
     }
-    if (count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
-        ESP_LOGE(TAG, "Truth reconcile has %u events, above safety limit %u", (unsigned)count, (unsigned)ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS);
-        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+    if (event_count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
+        ESP_LOGE(TAG, "Truth reconcile has %u events, above safety limit %u", (unsigned)event_count, (unsigned)ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
 
-    char *payload = build_reconcile_payload(events, count, year, month);
+    size_t truth_count = 0;
+    char *payload = build_reconcile_payload(events, event_count, year, month, &truth_count);
     if (payload == NULL) {
-        ESP_LOGE(TAG, "Could not build ORDS truth reconcile payload count=%u", (unsigned)count);
-        led_status_fault(LED_STATUS_FATAL);
+        ESP_LOGE(TAG, "Could not build bounded ORDS truth reconcile payload events=%u", (unsigned)event_count);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
+    if (truth_count_out) *truth_count_out = truth_count;
 
     char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures/reconcile", ZONE_LITE_ORDS_BASE_URL);
@@ -3613,7 +3734,7 @@ static bool oracle_send_reconcile(char **events, size_t count, int year, int mon
     ESP_LOGI(
         TAG,
         "ORDS truth reconcile count=%u month=%04d-%02d status=%d ok=%s deleted=%d corrected=%d invalid=%d",
-        (unsigned)count,
+        (unsigned)truth_count,
         year,
         month,
         status,
@@ -3871,9 +3992,15 @@ static void oracle_drain_pending_locked(bool live_first)
 
 static void oracle_drain_pending(bool live_first)
 {
-    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return;
+    if (!g_ords_outbox_gate ||
+        xSemaphoreTake(g_ords_outbox_gate, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        xSemaphoreGive(g_ords_outbox_gate);
+        return;
+    }
     oracle_drain_pending_locked(live_first);
     xSemaphoreGive(g_storage_lock);
+    xSemaphoreGive(g_ords_outbox_gate);
 }
 
 static void ords_uploader_task(void *arg)
@@ -5009,8 +5136,10 @@ void app_main(void)
     }
     nvs_load_runtime_state();
     g_storage_lock = xSemaphoreCreateMutex();
-    if (!g_storage_lock) {
-        ESP_LOGE(TAG, "Could not create durable storage lock");
+    g_ords_http_lock = xSemaphoreCreateMutex();
+    g_ords_outbox_gate = xSemaphoreCreateMutex();
+    if (!g_storage_lock || !g_ords_http_lock || !g_ords_outbox_gate) {
+        ESP_LOGE(TAG, "Could not create durable storage or ORDS coordination locks");
         led_status_fault(LED_STATUS_FATAL);
         return;
     }

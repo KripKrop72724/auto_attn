@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -140,6 +141,19 @@ static int64_t s_last_transport_restart_ms;
 static int64_t monotonic_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static const char *firmware_version(void)
+{
+    static char value[96];
+    if (value[0] == '\0') {
+        const esp_app_desc_t *description = esp_app_get_description();
+        const char *version = description && description->version[0]
+            ? description->version
+            : "unknown";
+        snprintf(value, sizeof(value), "zone-lite-%s", version);
+    }
+    return value;
 }
 
 static char *allocate_outbox_line_buffer(void)
@@ -964,7 +978,7 @@ static void heartbeat_task(void *arg)
             wifi_ap_record_t ap = {0};
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
-            cJSON_AddStringToObject(payload, "firmware_version", "zone-lite-2.1.2");
+            cJSON_AddStringToObject(payload, "firmware_version", firmware_version());
             cJSON_AddNumberToObject(payload, "config_version", 3);
             cJSON_AddNumberToObject(payload, "uptime_seconds", (double)(esp_timer_get_time() / 1000000));
             cJSON_AddNumberToObject(payload, "rssi", rssi);
@@ -1595,7 +1609,7 @@ static bool perform_onboarding(void)
     cJSON_AddStringToObject(root, "zone_id", runtime->zone_id);
     cJSON_AddStringToObject(root, "zone_name", runtime->zone_name);
     cJSON_AddStringToObject(root, "device_id", runtime->zone_device_id);
-    cJSON_AddStringToObject(root, "firmware_version", "zone-lite-2.1.2");
+    cJSON_AddStringToObject(root, "firmware_version", firmware_version());
     if (runtime->zkt_expected_serial[0]) {
         cJSON_AddStringToObject(root, "expected_serial", runtime->zkt_expected_serial);
     }

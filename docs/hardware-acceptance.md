@@ -99,6 +99,11 @@ under this bounded load stays read-only and requires model-specific review.
 - Verify deterministic IDs yield exactly one ADD row and one ORDS result per physical punch.
 - Power-cycle ESP with queued events and prove flash replay/acknowledgement.
 - Force a count mismatch and prove live capture resumes before bounded truth reconcile.
+- For Zone Lite 2.1.10 or later, retain the full-reconcile serial markers: terminal byte count fully
+  read, parsed record count equal to the refreshed terminal count, ORDS truth `status=200 ok=true`,
+  ADD reconcile enqueue complete, `blocked=0`, `skipped=0`, and final `complete=true`.
+- Reboot after ADD has drained and require `ADD outboxes restored live=0 reconcile=0`; if new punches
+  arrive during the proof, account for the count delta rather than suppressing the next reconcile.
 - Trigger an ADD restart command and verify one protocol restart, state transition, recovery, and no
   attendance deletion.
 - Exercise each scheduled slot in a time-controlled test or injected clock build; require one restart
@@ -109,6 +114,9 @@ under this bounded load stays read-only and requires model-specific review.
 Retain commit SHA, firmware version/hash, ESP MAC, eFuse purpose result, ZKT serial/profile,
 provisioning readback result, ADD connector ID, command IDs, pre/post counts, screenshots with masked
 PII, bounded serial logs, outage timeline, and 24-hour observation metrics.
+
+The firmware version shown in ADD must exactly match the ESP-IDF boot descriptor. A build that boots
+one version but reports another through heartbeat/onboarding does not pass.
 
 Pass only when every destructive-path invariant, local revoke, intermittent recovery, public domain,
 and attendance durability check succeeds. Remove the synthetic user after preserving its punches and
