@@ -33,14 +33,24 @@ Create these protected environments and require an authorized reviewer:
 
 | Environment | Required configuration |
 | --- | --- |
-| `firmware-signing` | Secret `ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64`; variable `ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_ID` |
+| `firmware-signing` | Authorized reviewers; access to the dedicated ADD Windows signing runner. Private keys are not GitHub secrets. |
 | `firmware-production` | Variable `ADD_FIRMWARE_STORE_HOST_PATH`, pointing to a protected host directory mounted read-only at `/firmware` |
 | `firmware-hil-peshawar` | Secret `OTA_HIL_RUNNER_COMMAND` on a runner labeled `self-hosted`, `zone-lite-hil`, `peshawar` |
 | `firmware-hil-islamabad` | Secret `OTA_HIL_RUNNER_COMMAND` on a runner labeled `self-hosted`, `zone-lite-hil`, `islamabad` |
 
-The signing private key must exist only as a protected environment secret. Do not commit it, put it in an artifact, place it on an ADD host, or print it in logs. Back it up offline using the organization key-custody process.
+The three signing private keys are generated on the trusted ADD Windows runner and encrypted with Windows DPAPI `CurrentUser`. Their ciphertext, entropy, public keys, and manifest live under `%ProgramData%\StateLife\AttendanceDeviceDashboard\firmware-signing`, with inheritance disabled and access restricted to the runner identity, `SYSTEM`, and local administrators. Private PEM material must never enter ADD's database, containers, HTTP APIs, GitHub secrets, logs, or artifacts.
 
 ADD needs only the manifest verification public key in `ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64`. The production host path is configured through `ADD_FIRMWARE_STORE_HOST_PATH`; Docker mounts it read-only.
+
+## Signing-key custody
+
+The authoritative key vault is created by the `Zone Lite signing key bootstrap` workflow after exact typed confirmation and protected-environment approval. It creates three independent RSA-3072 keys: key 1 is `ACTIVE`; keys 2 and 3 are `RESERVE`. The factory bootloader is signed by all three so their public digests are installed during first boot. Normal application and manifest releases are signed only by the active key.
+
+DPAPI binds decryption to the dedicated Windows runner account. Preserve the ADD host's system-state backup, that account profile, DPAPI master keys, and the firmware-signing directory together. A file-only copy of the `.dpapi` blobs is not a usable disaster-recovery backup. Restore and test the protected runner identity in an isolated recovery exercise before bootstrapping additional zones.
+
+The bootstrap workflow returns a one-day artifact containing only signed binaries, public keys, hashes, and the exact target MAC. The normal release workflow builds unsigned firmware on a hosted runner, then sends only that unsigned application to the ADD runner. The ADD runner decrypts the active key into a restricted temporary file, signs the application and release manifest, overwrites and deletes the temporary plaintext, and publishes only the signed package.
+
+Changing the runner service account makes the existing DPAPI vault unreadable. Do not regenerate keys if a vault exists but cannot be opened; stop and restore the original account/profile. Silent regeneration would permanently split the fleet trust root.
 
 ## One-time physical bootstrap
 

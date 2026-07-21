@@ -105,6 +105,7 @@ def main() -> int:
         ".github/workflows/add-ci.yml",
         ".github/workflows/add-deploy.yml",
         ".github/workflows/firmware-hil.yml",
+        ".github/workflows/firmware-key-bootstrap.yml",
         ".github/workflows/firmware-release.yml",
     }
     if workflow_files != expected_workflows:

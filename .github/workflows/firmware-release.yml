@@ -38,6 +38,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: provenance
         name: Require exact main SHA and successful HIL evidence
         shell: bash
@@ -55,76 +56,60 @@ jobs:
           test "$(jq -r .head_sha <<<"$run_json")" = "$sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-  build-sign:
+  build:
     needs: provenance
     runs-on: ubuntu-latest
-    environment: firmware-signing
     container: espressif/idf:v5.5.3
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.provenance.outputs.sha }}
           fetch-depth: 1
-      - name: Build the exact candidate
+          persist-credentials: false
+      - name: Build the exact unsigned candidate
         working-directory: firmware/zone_lite
         shell: bash
         run: |
           set -euo pipefail
           test "$(sed -n 's/^project(zone_lite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
-          idf.py build
-      - name: Sign application and release manifest
-        shell: bash
-        env:
-          ACTIVE_KEY_B64: ${{ secrets.ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64 }}
-          ACTIVE_KEY_ID: ${{ vars.ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_ID }}
-        run: |
-          set -euo pipefail
-          umask 077
-          test -n "$ACTIVE_KEY_B64"
-          test -n "$ACTIVE_KEY_ID"
-          mkdir -p release
-          printf '%s' "$ACTIVE_KEY_B64" | base64 -d > /tmp/zone-lite-signing-key.pem
-          espsecure.py sign_data --version 2 \
-            --keyfile /tmp/zone-lite-signing-key.pem \
-            --output release/zone-lite-${{ inputs.version }}.bin \
-            firmware/zone_lite/build/zone_lite.bin
-          python3 - <<'PY'
-          import hashlib, json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
+          idf.py -B build-release -D SDKCONFIG=/tmp/zone-lite-release-sdkconfig build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-release-unsigned-${{ needs.provenance.outputs.sha }}
+          path: firmware/zone_lite/build-release/zone_lite.bin
+          if-no-files-found: error
+          retention-days: 1
 
-          version = "${{ inputs.version }}"
-          image = Path(f"release/zone-lite-{version}.bin")
-          size = image.stat().st_size
-          slot_size = 0x280000
-          reserve = 128 * 1024
-          if size > slot_size - reserve:
-              raise SystemExit(f"signed image {size} exceeds guarded slot limit {slot_size - reserve}")
-          manifest = {
-              "schema_version": 1,
-              "version": version,
-              "build_sha": "${{ needs.provenance.outputs.sha }}",
-              "hardware": "esp32-s3-zone-lite",
-              "esp_idf_version": "5.5.3",
-              "image_file": image.name,
-              "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
-              "image_size": size,
-              "partition_layout": "zone-lite-ota-v1",
-              "secure_boot": "v2",
-              "signing_key_id": os.environ["ACTIVE_KEY_ID"],
-              "created_at": datetime.now(timezone.utc).isoformat(),
-          }
-          Path("release/manifest.json").write_text(
-              json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
-          PY
-          openssl dgst -sha256 -sign /tmp/zone-lite-signing-key.pem \
-            -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:-1 \
-            -out release/manifest.sig release/manifest.json
-          openssl pkey -in /tmp/zone-lite-signing-key.pem -pubout -out release/manifest-public-key.pem
-          rm -f /tmp/zone-lite-signing-key.pem
-          sha256sum release/* > release/SHA256SUMS
+  sign:
+    needs: [provenance, build]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-release-unsigned-${{ needs.provenance.outputs.sha }}
+          path: unsigned
+      - name: Sign with the ADD-hosted DPAPI vault
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          $unsigned = Join-Path $PWD 'unsigned\firmware\zone_lite\build-release'
+          $output = Join-Path $PWD 'release'
+          ./deploy/add/sign-firmware-release.ps1 `
+            -VaultDirectory $vault `
+            -UnsignedDirectory $unsigned `
+            -OutputDirectory $output `
+            -Version '${{ inputs.version }}' `
+            -GitSha '${{ needs.provenance.outputs.sha }}'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-${{ inputs.version }}
@@ -133,7 +118,7 @@ jobs:
           retention-days: 90
 
   publish-add:
-    needs: [provenance, build-sign]
+    needs: [provenance, sign]
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-production
     steps:
@@ -141,6 +126,7 @@ jobs:
         with:
           ref: ${{ needs.provenance.outputs.sha }}
           fetch-depth: 1
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: zone-lite-${{ inputs.version }}
@@ -158,7 +144,7 @@ jobs:
 
   disaster-recovery-copy:
     if: ${{ inputs.publish_disaster_recovery_copy }}
-    needs: [provenance, build-sign, publish-add]
+    needs: [provenance, sign, publish-add]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

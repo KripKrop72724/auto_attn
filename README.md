@@ -125,6 +125,7 @@ Use these runbooks before operating production:
 - [Zone Lite 2.2.0 release record](docs/zone-lite-2.2.0-release.md)
 - [Zone Lite remote firmware updates](docs/zone-lite-remote-firmware-updates.md)
 - [Zone Lite OTA operator and AI-agent runbook](docs/zone-lite-ota-agent-runbook.md)
+- [Zone Lite signing-key custody](docs/zone-lite-signing-key-custody.md)
 - [Zone Lite 2.1.11 identity release record](docs/zone-lite-2.1.11-release.md)
 
 Never commit `.env.add`, provisioning JSON, generated NVS images, terminal
