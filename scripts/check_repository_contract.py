@@ -107,6 +107,7 @@ def main() -> int:
         ".github/workflows/firmware-hil.yml",
         ".github/workflows/firmware-key-bootstrap.yml",
         ".github/workflows/firmware-release.yml",
+        ".github/workflows/zone-lite-device-provisioning.yml",
     }
     if workflow_files != expected_workflows:
         problems.append(f"workflow set is not consolidated: {sorted(workflow_files)}")
