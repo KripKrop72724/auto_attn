@@ -177,15 +177,7 @@ try {
         Invoke-DockerText @('cp', (Join-Path $work '.'), "${container}:/work") | Out-Null
         Invoke-DockerText @(
             'exec', $container, '/bin/bash', '-lc',
-            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-1.pem --output /work/bootloader-signed-1.bin /work/bootloader.bin'
-        ) | Out-Null
-        Invoke-DockerText @(
-            'exec', $container, '/bin/bash', '-lc',
-            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-2.pem --append-signatures --output /work/bootloader-signed-2.bin /work/bootloader-signed-1.bin'
-        ) | Out-Null
-        Invoke-DockerText @(
-            'exec', $container, '/bin/bash', '-lc',
-            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-3.pem --append-signatures --output /work/bootloader-signed.bin /work/bootloader-signed-2.bin'
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-1.pem /work/key-2.pem /work/key-3.pem --output /work/bootloader-signed.bin /work/bootloader.bin'
         ) | Out-Null
         Invoke-DockerText @(
             'exec', $container, '/bin/bash', '-lc',
