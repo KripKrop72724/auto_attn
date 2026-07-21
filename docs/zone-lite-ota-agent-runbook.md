@@ -5,6 +5,9 @@ This checklist is authoritative for remote firmware operations. Stop rather than
 ## Non-negotiable rules
 
 - Never expose, print, download for inspection, or commit a firmware private key.
+- Never copy a DPAPI-protected fleet key into ADD's database, containers, API, GitHub secrets, or an artifact.
+- Never regenerate the signing vault because DPAPI decryption failed; restore the original runner identity and profile.
+- Never change the dedicated firmware-signing runner account without a tested DPAPI migration and recovery plan.
 - Never OTA a bootloader, partition table, NVS, SPIFFS, or storage image.
 - Never enable the OTA feature flag before physical Peshawar acceptance.
 - Never create a national or multi-zone campaign.
@@ -23,6 +26,8 @@ This checklist is authoritative for remote firmware operations. Stop rather than
 - Confirm the HIL evidence includes both physical power-loss tests.
 - Confirm the version in `firmware/zone_lite/CMakeLists.txt` matches the requested release.
 - Confirm the signing environment reviewer recognizes the SHA and version.
+- Confirm the ADD signing-vault manifest has exactly one `ACTIVE` key and two `RESERVE` keys.
+- Confirm the workflow artifact contains no `.pem` private key, `.dpapi` blob, entropy file, or private-key archive.
 - Confirm the firmware store has free space and its backup is healthy.
 
 If any item is unknown, stop without publishing.
