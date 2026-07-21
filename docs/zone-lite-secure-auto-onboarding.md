@@ -145,3 +145,50 @@ the required observations; an unknown record profile remains read-only by design
 - Never trust an existing unreadable HMAC block without a matching provisioning record.
 - Never use split-root recovery without proof of the original NVS root and exact-MAC confirmation.
 - Never replace signed automatic onboarding with an unauthenticated registration endpoint.
+
+## Existing-eFuse attestation and remote package handoff
+
+An ADD onboarding record proves the connector bootstrap secret, but it does not prove which root
+was burned into an older device's unreadable `HMAC_UP` eFuse. Before reprovisioning any legacy ESP,
+load a RAM-only diagnostic that calculates HMAC-SHA256 over a fresh 32-byte public challenge using
+`BLOCK_KEY0`. This diagnostic must be built with `CONFIG_APP_BUILD_TYPE_RAM=y` and loaded with
+`esptool.py --no-stub load_ram`; it must never write flash or eFuse.
+
+Run the `Zone Lite device provisioning` workflow with operation `attest-hmac`, the exact physical
+MAC, the same challenge, and confirmation `ATTEST EXISTING HMAC`. The protected ADD runner emits
+only candidate digests for the current fleet root, the historical PII-root fallback, and an optional
+explicit recovery root. Match the ESP digest exactly before selecting a root. No match means stop:
+do not flash NVS, do not enable Secure Boot, and do not attempt another eFuse burn.
+
+For a proven match, generate a one-time X25519 recipient key on the physically attached workstation:
+
+```bash
+python firmware/zone_lite/tools/provisioning_envelope.py keygen \
+  --private-key /protected/temporary/request.key
+```
+
+Create a request JSON containing `request_id`, `target_mac`, `recipient_public_key_b64`, the site
+Wi-Fi/ZKT/zone settings, the expected ZKT serial, and `nvs_root_source`. The root source must be the
+attested value: `fleet`, `legacy_pii`, or `explicit_recovery`. Store the base64-encoded JSON only in
+the short-lived Actions secret `ZONE_LITE_PROVISIONING_INPUT_B64`, dispatch operation
+`build-package` with confirmation `BUILD ENCRYPTED NVS`, then delete the secret immediately.
+
+The ADD runner reads fleet and ORDS credentials only from the running production ADD container,
+derives device-bound material in an ephemeral ESP-IDF container, and uploads only
+`provision.bin.enc` plus a credential-free manifest for one day. Plaintext NVS, fleet roots, ORDS
+credentials, Wi-Fi credentials, Comm Keys, bootstrap secrets, and XTS/HMAC keys are never Actions
+artifacts. Decrypt locally with the one-time private key and exact request/MAC expectations:
+
+```bash
+python firmware/zone_lite/tools/provisioning_envelope.py decrypt \
+  --package /protected/temporary/package \
+  --private-key /protected/temporary/request.key \
+  --output /protected/temporary/provision.bin \
+  --expected-request-id REQUEST_ID \
+  --expected-mac 00:00:00:00:00:00
+```
+
+Flash only after the envelope, plaintext NVS SHA-256, exact MAC, eFuse root attestation, signed
+firmware signatures, and full-device backup have all been verified. Read back NVS and compare its
+SHA-256, then securely remove the plaintext NVS and one-time private key. The encrypted Actions
+artifact is transport only; it is never a fleet record or a reusable backup.
