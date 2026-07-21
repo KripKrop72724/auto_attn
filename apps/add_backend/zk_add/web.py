@@ -693,7 +693,14 @@ async def refresh_users(
         )
         db.commit()
         await dispatch_command(connector, command)
-        return command_response(command)
+        return {
+            **command_response(command),
+            "identity_snapshot": {
+                "revision": connector.zkt_device.identity_snapshot_revision,
+                "observed_at": connector.zkt_device.identity_snapshot_observed_at,
+                "stable": connector.zkt_device.identity_snapshot_stable,
+            } if connector.zkt_device else None,
+        }
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

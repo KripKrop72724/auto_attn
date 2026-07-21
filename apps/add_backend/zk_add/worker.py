@@ -306,7 +306,11 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int]]:
             connector = session.get(Connector, event.connector_id)
             zkt = session.get(ZKTDevice, event.zkt_device_id)
             cnic = decrypt_cnic(event.cnic_encrypted)
-            if connector is None or zkt is None or not cnic:
+            identity_unverified = (
+                settings.identity_snapshot_gate_enabled
+                and event.identity_resolution_status != "RESOLVED"
+            )
+            if connector is None or zkt is None or not cnic or identity_unverified:
                 row.status = "BLOCKED_IDENTITY"
                 event.ords_status = "BLOCKED_IDENTITY"
                 continue

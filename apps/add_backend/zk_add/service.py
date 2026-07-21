@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from zk_add.models import (
     DeviceLog,
     DeviceTelemetry,
     DeviceUser,
+    DeviceUserSnapshot,
     IdentityConflictResolution,
     IdentityTombstone,
     OrdsOutbox,
@@ -76,6 +78,21 @@ ORACLE_ALLOWED_CAPTURE_TYPES = {
     "MANUAL_REPROCESS",
 }
 IDENTITY_CONFLICT_DUPLICATE_CNIC = "DUPLICATE_CNIC"
+
+
+def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
+    """Hash every terminal field that can change attendance identity or authorization."""
+    digest = hashlib.sha256()
+    for row in snapshot.users:
+        for value in (
+            row.uid,
+            row.user_id,
+            row.terminal_identity_fingerprint or "",
+            row.terminal_state_fingerprint or "",
+        ):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def ensure_site(session: Session, zone_id: str, zone_name: str) -> Site:
@@ -441,6 +458,32 @@ def replace_user_snapshot(
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
 
+    computed_state_hash = user_snapshot_state_hash(snapshot)
+    if snapshot.state_hash and snapshot.state_hash != computed_state_hash:
+        raise ValueError("User snapshot state hash does not match its terminal rows.")
+    previous_state_hash = zkt.identity_snapshot_state_hash
+    stable_complete = snapshot.complete and snapshot.stable
+    latest_recorded_revision = session.scalar(
+        select(func.max(DeviceUserSnapshot.revision)).where(
+            DeviceUserSnapshot.zkt_device_id == zkt.id
+        )
+    )
+    next_revision = max(zkt.identity_snapshot_revision or 0, latest_recorded_revision or 0) + 1
+    snapshot_record = DeviceUserSnapshot(
+        zkt_device_id=zkt.id,
+        snapshot_id=snapshot.snapshot_id,
+        revision=next_revision,
+        state_hash=computed_state_hash,
+        complete=snapshot.complete,
+        stable=snapshot.stable,
+        reason=snapshot.reason,
+        user_count=len(snapshot.users),
+        started_at=ensure_utc(snapshot.started_at) if snapshot.started_at else None,
+        observed_at=ensure_utc(snapshot.observed_at),
+    )
+    session.add(snapshot_record)
+    session.flush()
+
     incoming_by_uid = {}
     incoming_user_ids: set[str] = set()
     for incoming in snapshot.users:
@@ -486,6 +529,8 @@ def replace_user_snapshot(
         seen.add(incoming.uid)
         parsed = parse_machine_name(incoming.name)
         row = rows_by_uid.get(incoming.uid)
+        previous_cnic_hash = row.cnic_lookup_hash if row is not None else None
+        previous_state_fingerprint = row.terminal_state_fingerprint if row is not None else None
         if row is None:
             conflicting = session.scalar(
                 select(DeviceUser).where(
@@ -523,10 +568,8 @@ def replace_user_snapshot(
         row.machine_name_encrypted = encrypt_text(incoming.name)
         row.terminal_identity_fingerprint = incoming.terminal_identity_fingerprint
         row.terminal_state_fingerprint = incoming.terminal_state_fingerprint
-        if row.source != "ADD_MANAGED" or not row.display_name:
-            row.display_name = parsed.display_name
+        row.display_name = parsed.display_name
         if parsed.cnic:
-            previous_hash = row.cnic_lookup_hash
             next_hash = cnic_lookup(parsed.cnic)
             # Exclude every participant from the partial unique index before
             # assigning a colliding hash. This also handles older terminals
@@ -547,8 +590,16 @@ def replace_user_snapshot(
             row.cnic_lookup_hash = next_hash
             row.cnic_last4 = parsed.cnic[-4:]
             row.shift_worker = parsed.shift_worker
-            if previous_hash != next_hash:
-                identity_changed.append(row)
+        else:
+            row.cnic_encrypted = None
+            row.cnic_lookup_hash = None
+            row.cnic_last4 = None
+            row.shift_worker = False
+        if (
+            previous_cnic_hash != row.cnic_lookup_hash
+            or previous_state_fingerprint != incoming.terminal_state_fingerprint
+        ):
+            identity_changed.append(row)
         row.privilege = incoming.privilege
         row.card = incoming.card
         row.present = True
@@ -556,9 +607,10 @@ def replace_user_snapshot(
         row.deleted_at = None
         row.deleted_by = None
         row.snapshot_id = snapshot.snapshot_id
+        row.snapshot_revision = next_revision
         row.observed_at = observed_at
         row.updated_at = updated_at
-    if snapshot.complete:
+    if stable_complete:
         for row in existing_rows:
             if row.uid not in seen:
                 persist_identity_tombstone(session, zkt=zkt, user=row)
@@ -570,6 +622,14 @@ def replace_user_snapshot(
                 row.updated_at = updated_at
         zkt.user_count = len(snapshot.users)
         zkt.snapshot_complete = True
+        zkt.identity_snapshot_revision = next_revision
+        zkt.identity_snapshot_id = snapshot_record.id
+        zkt.identity_snapshot_state_hash = computed_state_hash
+        zkt.identity_snapshot_observed_at = observed_at
+        zkt.identity_snapshot_received_at = updated_at
+        zkt.identity_snapshot_stable = True
+        if previous_state_hash and previous_state_hash != computed_state_hash:
+            zkt.last_identity_change_at = updated_at
         if zkt.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED":
             zkt.writes_disabled_reason = None
     else:
@@ -577,6 +637,7 @@ def replace_user_snapshot(
             if row.uid not in seen and row.lifecycle_state == "STAGING":
                 row.lifecycle_state = "ACTIVE"
         zkt.snapshot_complete = False
+        zkt.identity_snapshot_stable = False
         zkt.writes_disabled_reason = "USER_SNAPSHOT_TRUNCATED"
         zkt.certification_state = "READ_ONLY"
         zkt.capability_profile = {
@@ -597,15 +658,30 @@ def replace_user_snapshot(
     resolved_conflicts = reconcile_device_user_identity_conflicts(
         session, connector=connector, zkt=zkt
     )
-    enrichable = {
+    affected = {
         row.id: row
         for row in [*identity_changed, *resolved_conflicts]
         if row.id is not None
         and row.lifecycle_state == "ACTIVE"
-        and row.identity_conflict_code is None
     }
-    for row in enrichable.values():
-        enrich_undelivered_attendance(session, zkt=zkt, user=row)
+    for row in session.scalars(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.lifecycle_state == "ACTIVE",
+            DeviceUser.identity_conflict_code.is_not(None),
+        )
+    ).all():
+        if row.id is not None:
+            affected[row.id] = row
+    for row in affected.values():
+        if row.cnic_lookup_hash and row.identity_conflict_code is None:
+            enrich_undelivered_attendance(
+                session, zkt=zkt, user=row, snapshot=snapshot_record
+            )
+        else:
+            block_undelivered_attendance(
+                session, zkt=zkt, user=row, snapshot=snapshot_record
+            )
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 
@@ -734,7 +810,11 @@ def persist_identity_tombstone(
 
 
 def enrich_undelivered_attendance(
-    session: Session, *, zkt: ZKTDevice, user: DeviceUser
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+    user: DeviceUser,
+    snapshot: DeviceUserSnapshot | None = None,
 ) -> int:
     cnic = decrypt_cnic(user.cnic_encrypted)
     if not cnic:
@@ -756,7 +836,37 @@ def enrich_undelivered_attendance(
     for row in rows:
         if row.ords_status not in eligible_statuses:
             continue
+        identity_reused = bool(
+            (row.device_user_id is not None and row.device_user_id != user.id)
+            or (
+                row.device_user_id is None
+                and row.uid
+                and user.uid
+                and row.uid != user.uid
+            )
+            or (
+                row.identity_terminal_fingerprint
+                and user.terminal_identity_fingerprint
+                and row.identity_terminal_fingerprint != user.terminal_identity_fingerprint
+            )
+        )
+        if identity_reused:
+            row.ords_status = "QUARANTINED_IDENTITY_REUSE"
+            row.identity_resolution_status = "QUARANTINED_REUSE"
+            outbox = session.scalar(
+                select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+            )
+            if outbox is not None:
+                outbox.status = "QUARANTINED_IDENTITY_REUSE"
+                outbox.next_attempt_at = None
+            continue
         row.device_user_id = user.id
+        row.identity_snapshot_id = snapshot.id if snapshot else zkt.identity_snapshot_id
+        row.identity_terminal_fingerprint = user.terminal_identity_fingerprint
+        row.identity_resolution_status = "RESOLVED"
+        row.identity_resolved_at = utc_now()
+        row.identity_repaired_at = utc_now()
+        row.identity_repair_reason = "VERIFIED_TERMINAL_SNAPSHOT"
         row.display_name = user.display_name
         row.cnic_encrypted = user.cnic_encrypted
         row.cnic_lookup_hash = user.cnic_lookup_hash
@@ -773,6 +883,47 @@ def enrich_undelivered_attendance(
             outbox.next_attempt_at = None
             outbox.last_http_status = None
             outbox.last_error = None
+        changed += 1
+    return changed
+
+
+def block_undelivered_attendance(
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+    user: DeviceUser,
+    snapshot: DeviceUserSnapshot | None = None,
+) -> int:
+    eligible_statuses = {"BLOCKED_IDENTITY", "PENDING", "FAILED_RETRYABLE", "RETRYING"}
+    rows = session.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == user.user_id,
+            AttendanceEvent.ords_status.in_(eligible_statuses),
+        )
+    ).all()
+    changed = 0
+    for row in rows:
+        if row.device_user_id not in {None, user.id}:
+            row.ords_status = "QUARANTINED_IDENTITY_REUSE"
+            row.identity_resolution_status = "QUARANTINED_REUSE"
+        else:
+            row.device_user_id = user.id
+            row.identity_snapshot_id = snapshot.id if snapshot else zkt.identity_snapshot_id
+            row.identity_terminal_fingerprint = user.terminal_identity_fingerprint
+            row.cnic_encrypted = None
+            row.cnic_lookup_hash = None
+            row.cnic_last4 = None
+            row.ords_status = "BLOCKED_IDENTITY"
+            row.identity_resolution_status = (
+                "BLOCKED_CONFLICT" if user.identity_conflict_code else "BLOCKED_MALFORMED_IDENTITY"
+            )
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        )
+        if outbox is not None:
+            outbox.status = row.ords_status
+            outbox.next_attempt_at = None
         changed += 1
     return changed
 
@@ -822,11 +973,23 @@ def ingest_attendance(
         usable_user_identity = bool(
             user and (user.identity_conflict_code is None or identity_resolution is not None)
         )
+        snapshot_verified = bool(
+            zkt.identity_snapshot_stable
+            and zkt.identity_snapshot_id
+            and zkt.identity_snapshot_observed_at
+            and ensure_utc(zkt.identity_snapshot_observed_at)
+            >= ensure_utc(incoming.captured_at)
+            - timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
+        )
+        if settings.identity_snapshot_gate_enabled and not snapshot_verified:
+            usable_user_identity = False
         cnic = (
             decrypt_cnic(user.cnic_encrypted)
             if usable_user_identity and user
             else (parsed.cnic if user is None else None)
         )
+        if settings.identity_snapshot_gate_enabled and not snapshot_verified:
+            cnic = None
         display_name = user.display_name if user else parsed.display_name or incoming.raw_name
         cnic_encrypted = user.cnic_encrypted if usable_user_identity and user else encrypt_cnic(cnic)
         cnic_hash = user.cnic_lookup_hash if usable_user_identity and user else cnic_lookup(cnic)
@@ -851,6 +1014,20 @@ def ingest_attendance(
             identity_resolution_id=(
                 identity_resolution.id if identity_resolution is not None else None
             ),
+            identity_snapshot_id=zkt.identity_snapshot_id if snapshot_verified else None,
+            identity_terminal_fingerprint=(
+                user.terminal_identity_fingerprint if usable_user_identity and user else None
+            ),
+            identity_resolution_status=(
+                "RESOLVED"
+                if cnic
+                else (
+                    "WAITING_FOR_SNAPSHOT"
+                    if settings.identity_snapshot_gate_enabled and not snapshot_verified
+                    else "BLOCKED_IDENTITY"
+                )
+            ),
+            identity_resolved_at=utc_now() if cnic else None,
             device_serial=zkt.serial,
             uid=incoming.uid,
             user_id=incoming.user_id,
@@ -1646,6 +1823,12 @@ def serialize_connector(connector: Connector) -> dict:
             "certification_observations": zkt.certification_observations,
             "capabilities": zkt.capability_profile,
             "snapshot_complete": zkt.snapshot_complete,
+            "identity_snapshot_revision": zkt.identity_snapshot_revision,
+            "identity_snapshot_state_hash": zkt.identity_snapshot_state_hash,
+            "identity_snapshot_observed_at": zkt.identity_snapshot_observed_at,
+            "identity_snapshot_received_at": zkt.identity_snapshot_received_at,
+            "identity_snapshot_stable": zkt.identity_snapshot_stable,
+            "last_identity_change_at": zkt.last_identity_change_at,
             "writes_disabled_reason": zkt.writes_disabled_reason,
             "user_count": zkt.user_count,
             "attendance_count": zkt.attendance_count,

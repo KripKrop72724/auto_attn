@@ -78,6 +78,12 @@ class UserSnapshotRow(BaseModel):
 class UserSnapshotRequest(BaseModel):
     snapshot_id: str
     complete: bool = True
+    stable: bool = True
+    state_hash: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    reason: str = Field(default="PERIODIC", min_length=1, max_length=80)
+    started_at: datetime | None = None
     observed_at: datetime
     users: list[UserSnapshotRow]
 

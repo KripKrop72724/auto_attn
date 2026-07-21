@@ -129,6 +129,17 @@ class ZKTDevice(Base):
     certification_fingerprint: Mapped[str | None] = mapped_column(String(255), index=True)
     certification_observations: Mapped[int] = mapped_column(Integer, default=0)
     snapshot_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    identity_snapshot_revision: Mapped[int] = mapped_column(Integer, default=0)
+    identity_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_device_user_snapshots.id"), index=True
+    )
+    identity_snapshot_state_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    identity_snapshot_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    identity_snapshot_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    identity_snapshot_stable: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_identity_change_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     writes_disabled_reason: Mapped[str | None] = mapped_column(String(160), index=True)
     online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     connection_state: Mapped[str] = mapped_column(String(40), default="UNKNOWN", index=True)
@@ -235,9 +246,30 @@ class DeviceUser(Base):
     current_command_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_commands.id"))
     row_version: Mapped[int] = mapped_column(Integer, default=1)
     snapshot_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    snapshot_revision: Mapped[int | None] = mapped_column(Integer, index=True)
     observed_at: Mapped[datetime] = utc_column()
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
+
+
+class DeviceUserSnapshot(Base):
+    __tablename__ = "add_device_user_snapshots"
+    __table_args__ = (
+        UniqueConstraint("zkt_device_id", "revision", name="uq_add_user_snapshot_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
+    snapshot_id: Mapped[str] = mapped_column(String(100), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    complete: Mapped[bool] = mapped_column(Boolean, default=True)
+    stable: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    reason: Mapped[str] = mapped_column(String(80), default="PERIODIC")
+    user_count: Mapped[int] = mapped_column(Integer)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    received_at: Mapped[datetime] = utc_column()
 
 
 class IdentityConflictResolution(Base):
@@ -293,6 +325,16 @@ class AttendanceEvent(Base):
     identity_resolution_id: Mapped[int | None] = mapped_column(
         ForeignKey("add_identity_conflict_resolutions.id"), index=True
     )
+    identity_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_device_user_snapshots.id"), index=True
+    )
+    identity_terminal_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    identity_resolution_status: Mapped[str] = mapped_column(
+        String(50), default="WAITING_FOR_SNAPSHOT", index=True
+    )
+    identity_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    identity_repaired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    identity_repair_reason: Mapped[str | None] = mapped_column(String(120))
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     uid: Mapped[str | None] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)

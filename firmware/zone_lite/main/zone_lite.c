@@ -153,6 +153,7 @@
 #define MAX_EVENT_JSON 1024
 #define ADD_RECONCILE_BATCH_EVENTS 10
 #define ADD_RECONCILE_COMMIT_BATCHES 32
+#define ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (30 * 1000)
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -1918,6 +1919,74 @@ static bool json_add_utf8_string(cJSON *object, const char *key, const char *val
     return changed;
 }
 
+static bool user_table_state_hash(const user_table_t *users, char out[65])
+{
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    if (!md || mbedtls_md_setup(&ctx, md, 0) != 0 || mbedtls_md_starts(&ctx) != 0) {
+        mbedtls_md_free(&ctx);
+        out[0] = '\0';
+        return false;
+    }
+    static const unsigned char separator = 0;
+    for (size_t i = 0; i < users->count; i++) {
+        const zkt_user_t *user = &users->rows[i];
+        const char *fields[] = {
+            user->uid,
+            user->user_id,
+            user->terminal_identity_fingerprint,
+            user->terminal_state_fingerprint,
+        };
+        for (size_t field = 0; field < sizeof(fields) / sizeof(fields[0]); field++) {
+            const unsigned char *value = (const unsigned char *)fields[field];
+            if (mbedtls_md_update(&ctx, value, strlen(fields[field])) != 0 ||
+                mbedtls_md_update(&ctx, &separator, 1) != 0) {
+                mbedtls_md_free(&ctx);
+                out[0] = '\0';
+                return false;
+            }
+        }
+    }
+    unsigned char digest[32];
+    bool ok = mbedtls_md_finish(&ctx, digest) == 0;
+    mbedtls_md_free(&ctx);
+    if (!ok) {
+        out[0] = '\0';
+        return false;
+    }
+    bytes_to_hex(digest, sizeof(digest), out, 65);
+    return true;
+}
+
+static bool zk_refresh_users_stable(
+    int sock,
+    zk_context_t *ctx,
+    user_table_t *users,
+    int32_t user_count,
+    char state_hash[65])
+{
+    char first_hash[65] = {0};
+    char second_hash[65] = {0};
+    if (!zk_refresh_users_preserving_current(sock, ctx, users, user_count) ||
+        !user_table_state_hash(users, first_hash) ||
+        !zk_refresh_users_preserving_current(sock, ctx, users, user_count) ||
+        !user_table_state_hash(users, second_hash)) {
+        return false;
+    }
+    if (strcmp(first_hash, second_hash) != 0) {
+        ESP_LOGW(TAG, "ZKT user table changed between verification reads; withholding identity");
+        add_connector_log(
+            "WARN",
+            "identity",
+            "USER_SNAPSHOT_UNSTABLE",
+            "Two consecutive terminal user reads differed; attendance identity remains pending.");
+        return false;
+    }
+    strlcpy(state_hash, second_hash, 65);
+    return true;
+}
+
 static bool add_send_user_snapshot(const user_table_t *users)
 {
     cJSON *payload = cJSON_CreateObject();
@@ -1933,7 +2002,13 @@ static bool add_send_user_snapshot(const user_table_t *users)
     iso_system_now(observed);
     cJSON_AddStringToObject(payload, "snapshot_id", snapshot_id);
     cJSON_AddBoolToObject(payload, "complete", users->complete);
+    cJSON_AddBoolToObject(payload, "stable", true);
+    cJSON_AddStringToObject(payload, "reason", "VERIFIED_TERMINAL_READ");
     cJSON_AddStringToObject(payload, "observed_at", observed);
+    char state_hash[65] = {0};
+    if (user_table_state_hash(users, state_hash)) {
+        cJSON_AddStringToObject(payload, "state_hash", state_hash);
+    }
     cJSON *rows = cJSON_AddArrayToObject(payload, "users");
     size_t sanitized_fields = 0;
     for (size_t i = 0; i < users->count; i++) {
@@ -2263,6 +2338,91 @@ static void recover_valid_unclassified_blocked_events(void)
     if (recovered > 0) {
         ESP_LOGW(TAG, "Recovered %u valid event(s) from the legacy blocked outbox", (unsigned)recovered);
     }
+}
+
+static void recover_blocked_events_from_snapshot(const user_table_t *users)
+{
+    if (!users || !g_storage_lock ||
+        xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return;
+    }
+    FILE *in = fopen(BLOCKED_PATH, "r");
+    if (!in) {
+        xSemaphoreGive(g_storage_lock);
+        return;
+    }
+    FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
+    FILE *pending = fopen(PENDING_PATH, "a");
+    if (!kept || !pending) {
+        if (kept) fclose(kept);
+        if (pending) fclose(pending);
+        fclose(in);
+        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
+        xSemaphoreGive(g_storage_lock);
+        return;
+    }
+
+    bool ok = true;
+    size_t recovered = 0;
+    char line[MAX_EVENT_JSON];
+    while (fgets(line, sizeof(line), in) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+        char *output = NULL;
+        cJSON *root = cJSON_Parse(line);
+        cJSON *blocked_reason = root
+            ? cJSON_GetObjectItemCaseSensitive(root, "blocked_reason")
+            : NULL;
+        cJSON *user_id = root
+            ? cJSON_GetObjectItemCaseSensitive(root, "user_id")
+            : NULL;
+        const zkt_user_t *user =
+            cJSON_IsString(user_id) && blocked_reason == NULL
+                ? find_user_by_user_id(users, user_id->valuestring)
+                : NULL;
+        if (user && strlen(user->cnic) == 13) {
+            cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
+            cJSON_AddStringToObject(root, "cnic", user->cnic);
+            output = cJSON_PrintUnformatted(root);
+        }
+        FILE *destination = output ? pending : kept;
+        const char *serialized = output ? output : line;
+        if (fprintf(destination, "%s\n", serialized) < 0) ok = false;
+        if (output) recovered++;
+        free(output);
+        cJSON_Delete(root);
+        if (!ok) break;
+    }
+    if (ferror(in)) ok = false;
+    if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
+    if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
+    fclose(in);
+    fclose(kept);
+    fclose(pending);
+    if (ok) {
+        (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
+        if (rename(BLOCKED_PATH, BLOCKED_RECOVERY_BACKUP_PATH) != 0 ||
+            rename(BLOCKED_RECOVERY_TMP_PATH, BLOCKED_PATH) != 0) {
+            (void)rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH);
+            ok = false;
+        }
+    }
+    if (ok) {
+        (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
+        if (recovered > 0) {
+            led_status_set_backlog(true);
+            ESP_LOGW(TAG, "Repaired %u blocked identity event(s) from verified terminal truth", (unsigned)recovered);
+            add_connector_log(
+                "INFO",
+                "identity",
+                "BLOCKED_IDENTITY_REPAIRED",
+                "Blocked attendance was re-enriched from a stable terminal snapshot and returned to the ORDS queue.");
+        }
+    } else {
+        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
+        ESP_LOGE(TAG, "Blocked identity repair was interrupted; preserved the original outbox");
+    }
+    xSemaphoreGive(g_storage_lock);
 }
 
 static void storage_init(void)
@@ -4337,11 +4497,13 @@ static bool process_add_commands(
         char result[512] = "{}";
         if (strcmp(command.command_type, "REFRESH_USERS") == 0) {
             int32_t records = 0;
+            char verified_hash[65] = {0};
             if (zk_get_counts(sock, ctx, user_count, &records) &&
-                zk_refresh_users_preserving_current(sock, ctx, users, *user_count)) {
+                zk_refresh_users_stable(sock, ctx, users, *user_count, verified_hash)) {
                 g_add_zkt.user_count = *user_count;
                 g_add_zkt.attendance_count = records;
                 add_connector_set_zkt(&g_add_zkt);
+                recover_blocked_events_from_snapshot(users);
                 ok = add_send_user_snapshot(users);
                 if (!ok) {
                     error_code = "ADD_SNAPSHOT_SEND_FAILED";
@@ -4640,7 +4802,10 @@ static bool process_add_commands(
                         }
                     }
                 }
-                if (ok) (void)add_send_user_snapshot(users);
+                if (ok) {
+                    recover_blocked_events_from_snapshot(users);
+                    (void)add_send_user_snapshot(users);
+                }
                 }
             }
         } else if (strcmp(command.command_type, "RESTART_ZKT") == 0) {
@@ -4750,7 +4915,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
         ESP_LOGE(TAG, "Could not allocate ZKT user table");
         zk_disconnect(sock, &ctx); close(sock); return uptime_ms() - session_started_ms;
     }
-    if (!zk_load_users(sock, &ctx, users, user_count)) {
+    char initial_user_state_hash[65] = {0};
+    if (!zk_refresh_users_stable(sock, &ctx, users, user_count, initial_user_state_hash)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
     g_add_zkt.user_record_size = users->record_size;
@@ -4793,11 +4959,34 @@ static int64_t gateway_run(uint32_t host_order_ip)
             }
             zk_header_t *header = (zk_header_t *)packet;
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
+                if (!zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
+                int32_t verified_users = 0;
+                int32_t verified_records = 0;
+                char verified_hash[65] = {0};
+                add_connector_set_activity("VERIFYING_IDENTITY");
+                if (!zk_get_counts(sock, &ctx, &verified_users, &verified_records) ||
+                    !zk_refresh_users_stable(
+                        sock, &ctx, users, verified_users, verified_hash)) {
+                    add_connector_log(
+                        "WARN",
+                        "identity",
+                        "LIVE_IDENTITY_VERIFICATION_FAILED",
+                        "A live punch was retained in terminal history because post-punch user verification failed; reconciliation will recover it.");
+                    free(packet);
+                    break;
+                }
+                user_count = verified_users;
+                g_add_zkt.user_count = verified_users;
+                g_add_zkt.attendance_count = verified_records;
+                add_connector_set_zkt(&g_add_zkt);
+                recover_blocked_events_from_snapshot(users);
+                (void)add_send_user_snapshot(users);
                 live_events_since_sync += process_live_packet(
                     packet + sizeof(zk_header_t),
                     top.length - sizeof(zk_header_t),
                     users);
-                if (!zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
+                last_user_integrity = uptime_ms();
+                add_connector_set_activity("LIVE_CAPTURE");
             }
             free(packet);
         } else if (rc < 0) {
@@ -4820,6 +5009,25 @@ static int64_t gateway_run(uint32_t host_order_ip)
         }
         (void)temp_admin_revoke_if_due(sock, &ctx, users);
 
+        if (now_ms - last_user_integrity >= ZONE_LITE_USER_INTEGRITY_INTERVAL_MS) {
+            int32_t verified_users = 0;
+            int32_t verified_records = 0;
+            char verified_hash[65] = {0};
+            add_connector_set_activity("VERIFYING_IDENTITY");
+            if (!zk_get_counts(sock, &ctx, &verified_users, &verified_records) ||
+                !zk_refresh_users_stable(sock, &ctx, users, verified_users, verified_hash)) {
+                break;
+            }
+            user_count = verified_users;
+            g_add_zkt.user_count = verified_users;
+            g_add_zkt.attendance_count = verified_records;
+            add_connector_set_zkt(&g_add_zkt);
+            recover_blocked_events_from_snapshot(users);
+            (void)add_send_user_snapshot(users);
+            last_user_integrity = now_ms;
+            add_connector_set_activity("LIVE_CAPTURE");
+        }
+
         if (now_ms - last_time_sample >= 60000) {
             last_time_sample = now_ms;
             g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
@@ -4839,11 +5047,13 @@ static int64_t gateway_run(uint32_t host_order_ip)
             int32_t refreshed_records = 0;
             add_connector_set_activity("RECONCILING");
             if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) break;
-            bool integrity_due = now_ms - last_user_integrity >= (6 * 60 * 60 * 1000LL);
-            if (refreshed_users != user_count || integrity_due) {
-                if (!zk_refresh_users_preserving_current(sock, &ctx, users, refreshed_users)) break;
+            if (refreshed_users != user_count) {
+                char verified_hash[65] = {0};
+                if (!zk_refresh_users_stable(
+                        sock, &ctx, users, refreshed_users, verified_hash)) break;
                 user_count = refreshed_users;
                 last_user_integrity = now_ms;
+                recover_blocked_events_from_snapshot(users);
                 (void)add_send_user_snapshot(users);
             }
             int64_t record_delta = g_last_synced_attendance_count >= 0

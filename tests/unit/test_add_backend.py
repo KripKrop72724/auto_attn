@@ -1547,6 +1547,83 @@ def test_raw_machine_name_is_encrypted_at_rest(db: Session):
     assert decrypt_text(user.machine_name_encrypted) == f"Ayesha-{CNIC}"
 
 
+def test_stable_snapshot_clears_removed_cnic_and_repairs_only_verified_pending_rows(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    user = snapshot_user(db, connector, name=f"Asadisb-{CNIC}")
+    punch = event(event_uid="d" * 64, user_id=user.user_id)
+    ingest_attendance(db, connector=connector, events=[punch])
+    db.flush()
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid)
+    )
+    assert attendance and decrypt_cnic(attendance.cnic_encrypted) == CNIC
+
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="asad-cnic-removed",
+            observed_at=utc_now(),
+            users=[UserSnapshotRow(uid=user.uid, user_id=user.user_id, name="Asadisb")],
+        ),
+    )
+    db.flush()
+    assert user.cnic_encrypted is None
+    assert attendance.cnic_encrypted is None
+    assert attendance.ords_status == "BLOCKED_IDENTITY"
+    assert attendance.identity_resolution_status == "BLOCKED_MALFORMED_IDENTITY"
+
+    replacement = "6110112009989"
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="asad-cnic-restored",
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=user.uid,
+                    user_id=user.user_id,
+                    name=f"Asadisb-{replacement}",
+                )
+            ],
+        ),
+    )
+    db.flush()
+    assert decrypt_cnic(attendance.cnic_encrypted) == replacement
+    assert attendance.ords_status == "PENDING"
+    assert attendance.identity_resolution_status == "RESOLVED"
+    assert attendance.identity_repair_reason == "VERIFIED_TERMINAL_SNAPSHOT"
+
+
+def test_snapshot_revision_detects_same_count_valid_to_valid_identity_change(db: Session):
+    connector = connector_fixture(db)
+    user = snapshot_user(db, connector, name=f"Drbilalmeh-{CNIC}")
+    first_revision = connector.zkt_device.identity_snapshot_revision
+    replacement = "1560703548395"
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="same-count-valid-change",
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=user.uid,
+                    user_id=user.user_id,
+                    name=f"Drbilalmeh-{replacement}",
+                )
+            ],
+        ),
+    )
+    assert connector.zkt_device.user_count == 1
+    assert connector.zkt_device.identity_snapshot_revision == first_revision + 1
+    assert connector.zkt_device.identity_snapshot_stable is True
+    assert decrypt_cnic(user.cnic_encrypted) == replacement
+
+
 def test_no_registration_routes_remain():
     paths = {route.path for route in app.routes}
     assert "/api/v1/connectors" not in paths
