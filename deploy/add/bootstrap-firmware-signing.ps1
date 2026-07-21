@@ -69,30 +69,49 @@ $vaultManifest = Join-Path $VaultDirectory 'vault-manifest.json'
 if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
     $staging = Join-Path $env:TEMP ('zone-lite-vault-staging-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $staging | Out-Null
+    $container = 'zone-lite-keygen-' + [guid]::NewGuid().ToString('N')
     try {
-        $keys = @()
         foreach ($number in 1..3) {
             $pem = Invoke-DockerText @('run', '--rm', 'espressif/idf:v5.5.3', 'openssl', 'genrsa', '3072')
             $plain = [Text.Encoding]::ASCII.GetBytes($pem)
-            $protected = Protect-Key $plain
-            [IO.File]::WriteAllBytes((Join-Path $staging "key-$number.dpapi"), $protected.Ciphertext)
-            [IO.File]::WriteAllBytes((Join-Path $staging "key-$number.entropy"), $protected.Entropy)
-
-            $tempKey = Join-Path $staging "key-$number.pem"
-            [IO.File]::WriteAllBytes($tempKey, $plain)
             try {
-                $public = Invoke-DockerText @(
-                    'run', '--rm', '-v', "${staging}:/keys", 'espressif/idf:v5.5.3',
-                    'openssl', 'pkey', '-in', "/keys/key-$number.pem", '-pubout'
-                )
-                $publicPath = Join-Path $staging "key-$number-public.pem"
-                [IO.File]::WriteAllText($publicPath, $public, (New-Object Text.UTF8Encoding($false)))
-                $keyId = (Get-FileHash -LiteralPath $publicPath -Algorithm SHA256).Hash.ToLowerInvariant()
-                $keys += @{ number = $number; key_id = $keyId; state = $(if ($number -eq 1) { 'ACTIVE' } else { 'RESERVE' }) }
+                $protected = Protect-Key $plain
+                [IO.File]::WriteAllBytes((Join-Path $staging "key-$number.dpapi"), $protected.Ciphertext)
+                [IO.File]::WriteAllBytes((Join-Path $staging "key-$number.entropy"), $protected.Entropy)
+                [IO.File]::WriteAllBytes((Join-Path $staging "key-$number.pem"), $plain)
             }
             finally {
-                Clear-PlaintextFile $tempKey
                 [Array]::Clear($plain, 0, $plain.Length)
+            }
+        }
+
+        Invoke-DockerText @(
+            'create', '--name', $container, 'espressif/idf:v5.5.3',
+            'bash', '-lc', 'sleep 900'
+        ) | Out-Null
+        Invoke-DockerText @('start', $container) | Out-Null
+        Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/keys') | Out-Null
+        Invoke-DockerText @('cp', (Join-Path $staging '.'), "${container}:/keys") | Out-Null
+        foreach ($number in 1..3) {
+            Invoke-DockerText @(
+                'exec', $container, 'openssl', 'pkey',
+                '-in', "/keys/key-$number.pem",
+                '-pubout', '-out', "/keys/key-$number-public.pem"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', "${container}:/keys/key-$number-public.pem",
+                (Join-Path $staging "key-$number-public.pem")
+            ) | Out-Null
+        }
+
+        $keys = @()
+        foreach ($number in 1..3) {
+            $publicPath = Join-Path $staging "key-$number-public.pem"
+            $keyId = (Get-FileHash -LiteralPath $publicPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $keys += @{
+                number = $number
+                key_id = $keyId
+                state = $(if ($number -eq 1) { 'ACTIVE' } else { 'RESERVE' })
             }
         }
         $manifest = @{
@@ -103,6 +122,7 @@ if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
             created_at = [DateTime]::UtcNow.ToString('o')
             keys = $keys
         } | ConvertTo-Json -Depth 5
+
         foreach ($number in 1..3) {
             foreach ($suffix in @('dpapi', 'entropy')) {
                 $source = Join-Path $staging "key-$number.$suffix"
@@ -120,10 +140,13 @@ if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
         [IO.File]::WriteAllText($vaultManifest, $manifest, (New-Object Text.UTF8Encoding($false)))
     }
     finally {
+        & docker rm -f $container 2>$null | Out-Null
+        foreach ($number in 1..3) {
+            Clear-PlaintextFile (Join-Path $staging "key-$number.pem")
+        }
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
     }
 }
-
 foreach ($number in 1..3) {
     foreach ($suffix in @('dpapi', 'entropy')) {
         if (-not (Test-Path -LiteralPath (Join-Path $VaultDirectory "key-$number.$suffix") -PathType Leaf)) {
@@ -142,34 +165,56 @@ try {
     foreach ($number in 1..3) {
         [IO.File]::WriteAllBytes((Join-Path $work "key-$number.pem"), (Unprotect-Key $number))
     }
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'sign_data', '--version', '2', '--keyfile', '/work/key-1.pem',
-        '--output', '/work/bootloader-signed-1.bin', '/work/bootloader.bin'
-    ) | Out-Null
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'sign_data', '--version', '2', '--keyfile', '/work/key-2.pem',
-        '--append-signatures', '--output', '/work/bootloader-signed-2.bin', '/work/bootloader-signed-1.bin'
-    ) | Out-Null
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'sign_data', '--version', '2', '--keyfile', '/work/key-3.pem',
-        '--append-signatures', '--output', '/work/bootloader-signed.bin', '/work/bootloader-signed-2.bin'
-    ) | Out-Null
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'sign_data', '--version', '2', '--keyfile', '/work/key-1.pem',
-        '--output', '/work/zone-lite-signed.bin', '/work/zone_lite.bin'
-    ) | Out-Null
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'signature-info-v2', '/work/bootloader-signed.bin'
-    ) | Out-Null
-    Invoke-DockerText @(
-        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
-        'espsecure.py', 'signature-info-v2', '/work/zone-lite-signed.bin'
-    ) | Out-Null
+
+    $container = 'zone-lite-sign-' + [guid]::NewGuid().ToString('N')
+    try {
+        Invoke-DockerText @(
+            'create', '--name', $container, 'espressif/idf:v5.5.3',
+            'bash', '-lc', 'sleep 900'
+        ) | Out-Null
+        Invoke-DockerText @('start', $container) | Out-Null
+        Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/work') | Out-Null
+        Invoke-DockerText @('cp', (Join-Path $work '.'), "${container}:/work") | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
+            '--keyfile', '/work/key-1.pem', '--output', '/work/bootloader-signed-1.bin',
+            '/work/bootloader.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
+            '--keyfile', '/work/key-2.pem', '--append-signatures',
+            '--output', '/work/bootloader-signed-2.bin', '/work/bootloader-signed-1.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
+            '--keyfile', '/work/key-3.pem', '--append-signatures',
+            '--output', '/work/bootloader-signed.bin', '/work/bootloader-signed-2.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
+            '--keyfile', '/work/key-1.pem', '--output', '/work/zone-lite-signed.bin',
+            '/work/zone_lite.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'signature-info-v2',
+            '/work/bootloader-signed.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'exec', $container, 'espsecure.py', 'signature-info-v2',
+            '/work/zone-lite-signed.bin'
+        ) | Out-Null
+        Invoke-DockerText @(
+            'cp', "${container}:/work/bootloader-signed.bin",
+            (Join-Path $work 'bootloader-signed.bin')
+        ) | Out-Null
+        Invoke-DockerText @(
+            'cp', "${container}:/work/zone-lite-signed.bin",
+            (Join-Path $work 'zone-lite-signed.bin')
+        ) | Out-Null
+    }
+    finally {
+        & docker rm -f $container 2>$null | Out-Null
+    }
 
     Copy-Item -LiteralPath (Join-Path $work 'bootloader-signed.bin') -Destination (Join-Path $output 'bootloader-signed.bin')
     Copy-Item -LiteralPath (Join-Path $work 'zone-lite-signed.bin') -Destination (Join-Path $output 'zone-lite-signed.bin')
