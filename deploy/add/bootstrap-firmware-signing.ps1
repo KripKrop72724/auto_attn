@@ -67,7 +67,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not restrict firmware-vault ACLs' }
 
 $vaultManifest = Join-Path $VaultDirectory 'vault-manifest.json'
 if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
-    $staging = Join-Path $VaultDirectory ('.new-' + [guid]::NewGuid().ToString('N'))
+    $staging = Join-Path $env:TEMP ('zone-lite-vault-staging-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $staging | Out-Null
     try {
         $keys = @()
@@ -103,10 +103,21 @@ if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
             created_at = [DateTime]::UtcNow.ToString('o')
             keys = $keys
         } | ConvertTo-Json -Depth 5
-        [IO.File]::WriteAllText((Join-Path $staging 'vault-manifest.json'), $manifest, (New-Object Text.UTF8Encoding($false)))
-        foreach ($item in Get-ChildItem -LiteralPath $staging) {
-            Move-Item -LiteralPath $item.FullName -Destination (Join-Path $VaultDirectory $item.Name)
+        foreach ($number in 1..3) {
+            foreach ($suffix in @('dpapi', 'entropy')) {
+                $source = Join-Path $staging "key-$number.$suffix"
+                $destination = Join-Path $VaultDirectory "key-$number.$suffix"
+                [IO.File]::WriteAllBytes($destination, [IO.File]::ReadAllBytes($source))
+            }
+            $publicSource = Join-Path $staging "key-$number-public.pem"
+            $publicDestination = Join-Path $VaultDirectory "key-$number-public.pem"
+            [IO.File]::WriteAllText(
+                $publicDestination,
+                [IO.File]::ReadAllText($publicSource),
+                (New-Object Text.UTF8Encoding($false))
+            )
         }
+        [IO.File]::WriteAllText($vaultManifest, $manifest, (New-Object Text.UTF8Encoding($false)))
     }
     finally {
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
