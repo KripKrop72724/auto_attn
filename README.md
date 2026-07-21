@@ -53,6 +53,18 @@ hash in the protected server environment; plaintext credentials are never commit
 - State Life branding based only on `#0094DA`, white, and neutral shades, including supplied logo,
   favicons, maskable icons, and install manifest.
 
+## Current Zone Lite release
+
+The current firmware is **Zone Lite 2.1.10**. It adds production-hardened full reconciliation for
+large MB40 attendance tables: native 64 KiB buffered reads with a slow-flash deadline, guaranteed
+terminal buffer release on every failure path, bounded PSRAM truth storage, serialized ORDS HTTPS,
+durable chunked ADD truth enqueue, and an 8 KiB main-task stack for large persistent dedup indexes.
+Heartbeat and onboarding versions are derived from the built application descriptor so ADD always
+reports the actual image version.
+
+See [the Zone Lite 2.1.10 release record](docs/zone-lite-2.1.10-release.md) for upgrade notes,
+validation evidence, and the required `complete=true` acceptance markers.
+
 ## Repository layout
 
 ```text
@@ -105,6 +117,7 @@ Use these runbooks before operating production:
 - [Production deployment and rollback](docs/production-runbook.md)
 - [ESP/ZKT hardware acceptance](docs/hardware-acceptance.md)
 - [Zone Lite build and provisioning](firmware/zone_lite/README.md)
+- [Zone Lite 2.1.10 release record](docs/zone-lite-2.1.10-release.md)
 
 Never commit `.env.add`, provisioning JSON, generated NVS images, terminal
 credentials, ORDS credentials, Wi-Fi credentials, or fleet-root material.

@@ -116,8 +116,11 @@ Provisioning is complete only after all applicable checks pass:
 5. ZKT discovery authenticates with the configured Comm Key.
 6. Terminal model, IP, serial, user count, and attendance count appear correctly in ADD.
 7. The initial stability gate reaches `ONLINE`; certified profiles become `CERTIFIED`.
-8. Startup reconciliation completes without clearing attendance.
+8. Startup reconciliation completes without clearing attendance. For firmware 2.1.10 and later,
+   require a complete buffered dump, ORDS `status=200 ok=true`, ADD reconcile enqueue completion,
+   and a final `complete=true` marker.
 9. ADD and ORDS outboxes are independently durable and either drain or raise actionable alerts.
+10. ADD heartbeat reports the same firmware version as the ESP-IDF boot application descriptor.
 
 At a flashing desk where the destination SSID is absent, Wi-Fi retries are expected. Record site
 validation as pending; do not claim that automatic ADD onboarding was verified until it succeeds on

@@ -55,9 +55,10 @@ The certification fingerprint changes when terminal identity/profile changes. A 
 write certification until fresh stable observations arrive.
 
 Per-user command preconditions are independent of the certification fingerprint. Zone Lite 2.1.2
-adds keyed raw-record fingerprints so records from older terminals remain safely editable even when
-their user-ID bytes cannot be represented losslessly in JSON. Until a refreshed snapshot supplies
-those fingerprints, ADD refuses to queue a mutation for a visibly sanitized legacy ID.
+and later publish keyed raw-record fingerprints so records from older terminals remain safely
+editable even when their user-ID bytes cannot be represented losslessly in JSON. Until a refreshed
+snapshot supplies those fingerprints, ADD refuses to queue a mutation for a visibly sanitized
+legacy ID.
 
 ## User lifecycle
 
@@ -150,6 +151,18 @@ deadline requests a bounded table read. Live capture remains higher priority and
 large truth operation. The encrypted-NVS count and truth checkpoint survives reconnects and ESP
 restarts, so an intermittent older terminal does not repeatedly trigger a full-history read. Event
 IDs are deterministic, making backend/ORDS retries idempotent.
+
+Zone Lite 2.1.10 coordinates a full truth cycle in four bounded phases:
+
+1. acquire the ORDS outbox gate before requesting the expensive terminal dump;
+2. read the ZKT prepared buffer with the native TCP chunk size and always issue `CMD_FREE_DATA`;
+3. reduce the current month into a bounded PSRAM event array and release the dump before TLS work;
+4. serialize ORDS HTTPS exclusively, then persist ADD truth in bounded commit groups.
+
+ORDS and ADD remain independent delivery destinations, but a cycle is marked complete only when the
+ORDS truth request succeeds and every ADD batch is durably appended. The decisive serial line ends
+with `complete=true`; a partial ZKT read, truth failure, or ADD persistence failure remains incomplete
+and is retried by the normal recovery/truth cadence.
 
 Malformed historical rows are isolated rather than blocking newer punches. Flash queues are
 bounded, checksummed, replayed after restart, and removed only after application-level acknowledgement.

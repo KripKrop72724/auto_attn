@@ -13,6 +13,7 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Device credentials and site configuration are encrypted with XTS keys
 # derived from a per-device HMAC key in read/write-protected eFuse block 0.

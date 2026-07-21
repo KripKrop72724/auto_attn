@@ -232,3 +232,101 @@ def test_reconcile_and_restart_cadence_are_production_defaults():
     assert "ZONE_LITE_LED_FAULT_LATCH_MS (2 * 60 * 1000)" in (
         FIRMWARE / "main" / "led_status.c"
     ).read_text(encoding="utf-8")
+
+
+def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+    assert "attendance_event_t *reconcile_events = heap_caps_calloc" in reconcile
+    assert "char **truth_events" not in reconcile
+    assert "ADD_RECONCILE_MAX_BATCHES" not in source
+    assert "#define ADD_RECONCILE_COMMIT_BATCHES 32" in source
+    assert reconcile.index("free(data);") < reconcile.index("oracle_send_reconcile(")
+    assert reconcile.index("oracle_send_reconcile(") < reconcile.index(
+        "add_enqueue_reconcile_events("
+    )
+    assert 'reconcile_complete ? "true" : "false"' in reconcile
+    assert "return reconcile_complete;" in reconcile
+
+
+def test_recoverable_truth_memory_pressure_never_latches_fatal_led():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    payload = source[
+        source.index("static char *build_reconcile_payload(") :
+        source.index("static bool oracle_reconcile_body_ok(")
+    ]
+    sender = source[
+        source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
+        source.index("static void append_acked_uid_from_json_to_file(")
+    ]
+    assert "one transient JSON row at a time" in payload
+    assert 'event_to_json(&events[i], "MANUAL_REPROCESS")' in payload
+    assert "LED_STATUS_FATAL" not in sender
+    assert "LED_STATUS_TRUTH_REPAIR" in sender
+
+
+def test_ords_truth_and_outbox_https_requests_are_serialized():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    wrapper = source[
+        source.index("static int http_post_json(const char *url") :
+        source.index("static bool oracle_success_body(")
+    ]
+    assert "static SemaphoreHandle_t g_ords_http_lock;" in source
+    assert "xSemaphoreTake(" in wrapper
+    assert "g_ords_http_lock" in wrapper
+    assert "http_post_json_unlocked(url, json, response_body)" in wrapper
+    assert "xSemaphoreGive(g_ords_http_lock);" in wrapper
+    assert "g_ords_http_lock = xSemaphoreCreateMutex();" in source
+
+
+def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+    assert "static SemaphoreHandle_t g_ords_outbox_gate;" in source
+    gate_at = reconcile.index("xSemaphoreTake(\n            g_ords_outbox_gate")
+    dump_at = reconcile.index("zk_read_buffer(sock, ctx, CMD_ATTLOG_RRQ")
+    assert gate_at < dump_at
+    assert "xSemaphoreGive(g_ords_outbox_gate);" in reconcile
+    assert "g_ords_outbox_gate = xSemaphoreCreateMutex();" in source
+
+
+def test_large_zkt_buffer_reads_allow_slow_prepare_data_delivery():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert "#define ZKT_IO_TIMEOUT_SEC 90" in source
+    assert "#define ZKT_BUFFER_CHUNK_BYTES 0xffc0" in source
+    assert "const uint32_t max_chunk = ZKT_BUFFER_CHUNK_BYTES;" in source
+    assert "CMD_PREPARE_DATA" in source
+    reader = source[
+        source.index("static bool zk_read_buffer(") :
+        source.index("static void zk_disconnect(")
+    ]
+    assert reader.count("CMD_FREE_DATA") >= 4
+
+
+def test_main_task_stack_is_sized_for_persistent_dedup_rebuilds():
+    defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
+    effective = (FIRMWARE / "sdkconfig").read_text(encoding="utf-8")
+    assert "CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192" in defaults
+    assert "CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192" in effective
+
+
+def test_add_reports_the_built_application_version():
+    source = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    component = (FIRMWARE / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert '#include "esp_app_desc.h"' in source
+    assert "esp_app_format" in component
+    assert "esp_app_get_description()" in source
+    assert 'snprintf(value, sizeof(value), "zone-lite-%s", version);' in source
+    assert source.count(
+        'cJSON_AddStringToObject(payload, "firmware_version", firmware_version());'
+    ) == 1
+    assert source.count(
+        'cJSON_AddStringToObject(root, "firmware_version", firmware_version());'
+    ) == 1
+    assert '"zone-lite-2.1.' not in source
