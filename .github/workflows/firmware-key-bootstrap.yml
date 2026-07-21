@@ -66,8 +66,14 @@ jobs:
       - name: Generate or reuse ADD-hosted key vault and sign bootstrap image
         run: |
           $ErrorActionPreference = 'Stop'
-          # upload-artifact stores these files relative to their common build-bootstrap root.
-          $unsigned = Join-Path $PWD 'unsigned'
+          $artifact = Join-Path $PWD 'unsigned'
+          $unsigned = Join-Path $PWD 'unsigned-package'
+          New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $artifact 'bootloader\bootloader.bin') -Destination (Join-Path $unsigned 'bootloader.bin')
+          Copy-Item -LiteralPath (Join-Path $artifact 'partition_table\partition-table.bin') -Destination (Join-Path $unsigned 'partition-table.bin')
+          foreach ($name in @('ota_data_initial.bin', 'zone_lite.bin', 'flasher_args.json')) {
+            Copy-Item -LiteralPath (Join-Path $artifact $name) -Destination (Join-Path $unsigned $name)
+          }
           $output = Join-Path $PWD 'signed-bootstrap'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
           ./deploy/add/bootstrap-firmware-signing.ps1 `
