@@ -36,4 +36,6 @@ def test_release_workflow_requires_hil_and_protected_environments() -> None:
     assert "hil_run_id" in text
     assert "firmware-signing" in text
     assert "firmware-production" in text
-    assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" in text
+    assert "[self-hosted, Windows, X64]" in text
+    assert "deploy/add/sign-firmware-release.ps1" in text
+    assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in text
