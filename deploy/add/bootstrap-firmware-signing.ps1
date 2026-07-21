@@ -185,11 +185,11 @@ try {
         ) | Out-Null
         Invoke-DockerText @(
             'exec', $container, '/bin/bash', '-lc',
-            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature-info-v2 /work/bootloader-signed.bin'
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature_info_v2 /work/bootloader-signed.bin'
         ) | Out-Null
         Invoke-DockerText @(
             'exec', $container, '/bin/bash', '-lc',
-            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature-info-v2 /work/zone-lite-signed.bin'
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature_info_v2 /work/zone-lite-signed.bin'
         ) | Out-Null
         Invoke-DockerText @(
             'cp', "${container}:/work/bootloader-signed.bin",
