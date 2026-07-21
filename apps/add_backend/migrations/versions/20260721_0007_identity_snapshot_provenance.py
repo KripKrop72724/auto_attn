@@ -138,9 +138,9 @@ def upgrade() -> None:
             ["id"],
         )
     for name, columns in (
-        ("ix_add_attendance_identity_snapshot_id", ["identity_snapshot_id"]),
-        ("ix_add_attendance_identity_terminal_fingerprint", ["identity_terminal_fingerprint"]),
-        ("ix_add_attendance_identity_resolution_status", ["identity_resolution_status"]),
+        ("ix_add_attendance_events_identity_snapshot_id", ["identity_snapshot_id"]),
+        ("ix_add_attendance_events_identity_terminal_fingerprint", ["identity_terminal_fingerprint"]),
+        ("ix_add_attendance_events_identity_resolution_status", ["identity_resolution_status"]),
     ):
         _add_index("add_attendance_events", name, columns)
 

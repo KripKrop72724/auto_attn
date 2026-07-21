@@ -131,7 +131,12 @@ class ZKTDevice(Base):
     snapshot_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     identity_snapshot_revision: Mapped[int] = mapped_column(Integer, default=0)
     identity_snapshot_id: Mapped[int | None] = mapped_column(
-        ForeignKey("add_device_user_snapshots.id"), index=True
+        ForeignKey(
+            "add_device_user_snapshots.id",
+            name="fk_add_zkt_identity_snapshot",
+            use_alter=True,
+        ),
+        index=True,
     )
     identity_snapshot_state_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     identity_snapshot_observed_at: Mapped[datetime | None] = mapped_column(
