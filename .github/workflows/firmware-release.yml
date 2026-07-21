@@ -1,0 +1,180 @@
+name: Zone Lite signed firmware release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green main commit to build
+        required: true
+        type: string
+      version:
+        description: SemVer firmware version, without a v prefix
+        required: true
+        type: string
+      hil_run_id:
+        description: Successful Zone Lite OTA hardware-gate run ID for this commit
+        required: true
+        type: string
+      publish_disaster_recovery_copy:
+        description: Also create an immutable GitHub release copy
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: zone-lite-firmware-release
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.provenance.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: provenance
+        name: Require exact main SHA and successful HIL evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin main
+          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          git merge-base --is-ancestor "$sha" origin/main
+          run_json="$(gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.hil_run_id }}")"
+          test "$(jq -r .name <<<"$run_json")" = "Zone Lite OTA hardware gate"
+          test "$(jq -r .conclusion <<<"$run_json")" = "success"
+          test "$(jq -r .head_sha <<<"$run_json")" = "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build-sign:
+    needs: provenance
+    runs-on: ubuntu-latest
+    environment: firmware-signing
+    container: espressif/idf:v5.5.3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+      - name: Build the exact candidate
+        working-directory: firmware/zone_lite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sed -n 's/^project(zone_lite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
+          idf.py build
+      - name: Sign application and release manifest
+        shell: bash
+        env:
+          ACTIVE_KEY_B64: ${{ secrets.ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64 }}
+          ACTIVE_KEY_ID: ${{ vars.ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$ACTIVE_KEY_B64"
+          test -n "$ACTIVE_KEY_ID"
+          mkdir -p release
+          printf '%s' "$ACTIVE_KEY_B64" | base64 -d > /tmp/zone-lite-signing-key.pem
+          espsecure.py sign_data --version 2 \
+            --keyfile /tmp/zone-lite-signing-key.pem \
+            --output release/zone-lite-${{ inputs.version }}.bin \
+            firmware/zone_lite/build/zone_lite.bin
+          python3 - <<'PY'
+          import hashlib, json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          version = "${{ inputs.version }}"
+          image = Path(f"release/zone-lite-{version}.bin")
+          size = image.stat().st_size
+          slot_size = 0x280000
+          reserve = 128 * 1024
+          if size > slot_size - reserve:
+              raise SystemExit(f"signed image {size} exceeds guarded slot limit {slot_size - reserve}")
+          manifest = {
+              "schema_version": 1,
+              "version": version,
+              "build_sha": "${{ needs.provenance.outputs.sha }}",
+              "hardware": "esp32-s3-zone-lite",
+              "esp_idf_version": "5.5.3",
+              "image_file": image.name,
+              "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+              "image_size": size,
+              "partition_layout": "zone-lite-ota-v1",
+              "secure_boot": "v2",
+              "signing_key_id": os.environ["ACTIVE_KEY_ID"],
+              "created_at": datetime.now(timezone.utc).isoformat(),
+          }
+          Path("release/manifest.json").write_text(
+              json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          openssl dgst -sha256 -sign /tmp/zone-lite-signing-key.pem \
+            -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:-1 \
+            -out release/manifest.sig release/manifest.json
+          openssl pkey -in /tmp/zone-lite-signing-key.pem -pubout -out release/manifest-public-key.pem
+          rm -f /tmp/zone-lite-signing-key.pem
+          sha256sum release/* > release/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-add:
+    needs: [provenance, build-sign]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: firmware-release
+      - name: Atomically publish to the ADD firmware store
+        shell: powershell
+        env:
+          ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+        run: |
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw "ADD_FIRMWARE_STORE_HOST_PATH is not configured" }
+          ./deploy/add/publish-firmware.ps1 `
+            -SourceDirectory firmware-release `
+            -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+            -Version "${{ inputs.version }}"
+
+  disaster-recovery-copy:
+    if: ${{ inputs.publish_disaster_recovery_copy }}
+    needs: [provenance, build-sign, publish-add]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: release
+      - name: Publish immutable disaster-recovery copy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="zone-lite-v${{ inputs.version }}"
+          ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1
+          gh release create "$tag" release/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ needs.provenance.outputs.sha }}" \
+            --title "Zone Lite ${{ inputs.version }}" \
+            --notes "Signed production firmware. Promotion requires an approved per-zone campaign in ADD."

@@ -55,7 +55,7 @@ hash in the protected server environment; plaintext credentials are never commit
 
 ## Current Zone Lite release
 
-The current firmware is **Zone Lite 2.1.11**. It adds stable, versioned terminal identity snapshots,
+The current firmware candidate is **Zone Lite 2.2.0**. It adds stable, versioned terminal identity snapshots,
 post-punch identity verification, 30-second external-edit detection, and verified blocked-event repair
 without changing event UIDs, attendance history, or the independent ADD and ORDS outboxes. It retains
 the production-hardened full reconciliation introduced in 2.1.10 for
@@ -65,7 +65,9 @@ durable chunked ADD truth enqueue, and an 8 KiB main-task stack for large persis
 Heartbeat and onboarding versions are derived from the built application descriptor so ADD always
 reports the actual image version.
 
-See [the Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md) for upgrade notes,
+See [the Zone Lite 2.2.0 release record](docs/zone-lite-2.2.0-release.md) and
+[the remote firmware update runbook](docs/zone-lite-remote-firmware-updates.md) for bootstrap, release,
+campaign, rollback, and recovery procedures. See [the Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md) for identity-snapshot upgrade notes,
 validation evidence, and the required `complete=true` acceptance markers.
 
 ## Repository layout
@@ -120,7 +122,10 @@ Use these runbooks before operating production:
 - [Production deployment and rollback](docs/production-runbook.md)
 - [ESP/ZKT hardware acceptance](docs/hardware-acceptance.md)
 - [Zone Lite build and provisioning](firmware/zone_lite/README.md)
-- [Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md)
+- [Zone Lite 2.2.0 release record](docs/zone-lite-2.2.0-release.md)
+- [Zone Lite remote firmware updates](docs/zone-lite-remote-firmware-updates.md)
+- [Zone Lite OTA operator and AI-agent runbook](docs/zone-lite-ota-agent-runbook.md)
+- [Zone Lite 2.1.11 identity release record](docs/zone-lite-2.1.11-release.md)
 
 Never commit `.env.add`, provisioning JSON, generated NVS images, terminal
 credentials, ORDS credentials, Wi-Fi credentials, or fleet-root material.

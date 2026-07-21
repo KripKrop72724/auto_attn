@@ -55,6 +55,10 @@ export interface Device {
   state: DeviceState
   connected: boolean
   firmware_version: string | null
+  ota_capable?: boolean
+  ota_state?: 'LEGACY_MANUAL_UPDATE' | 'OTA_READY' | 'UPDATING' | 'ROLLBACK_REQUIRED' | 'OTA_BLOCKED'
+  ota_partition_layout?: string | null
+  ota_running_partition?: string | null
   onboarding_generation: number
   last_onboarded_at: string | null
   last_seen_at: string | null

@@ -48,6 +48,10 @@ class AddSettings(BaseSettings):
 
     user_command_retry_seconds: int = 30 * 60
     command_redispatch_seconds: int = 20
+    firmware_ota_enabled: bool = False
+    firmware_store_path: str = "/firmware"
+    firmware_download_grant_seconds: int = 15 * 60
+    firmware_signing_public_key_pem_b64: str | None = None
 
     @property
     def sqlite_path(self) -> Path:

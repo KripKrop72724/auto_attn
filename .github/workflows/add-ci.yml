@@ -183,6 +183,12 @@ jobs:
           grep -qx 'CONFIG_NVS_ENCRYPTION=y' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_SECURE_BOOT=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_SECURE_BOOT_V2_ENABLED=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n' firmware/zone_lite/sdkconfig.defaults
+          grep -q 'ota_0.*0x2A0000.*0x280000' firmware/zone_lite/partitions.csv
+          grep -q 'ota_1.*0x520000.*0x280000' firmware/zone_lite/partitions.csv
       - name: Build ESP32-S3 production firmware with ESP-IDF 5.5.3
         run: >-
           docker run --rm
