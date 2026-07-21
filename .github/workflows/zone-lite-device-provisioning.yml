@@ -116,11 +116,11 @@ jobs:
             $api = @(& docker ps --filter 'ancestor=state-life/add-api:production' --format '{{.ID}}')
             if ($api.Count -ne 1) { throw "Expected one production ADD API container, found $($api.Count)" }
             $extract = @'
-            import base64, json, os
-            names = ["ADD_FLEET_ROOT_SECRET", "ADD_PII_LOOKUP_KEY", "ZONE_LITE_NVS_HMAC_ROOT_SECRET", "ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME", "ADD_ORDS_PASSWORD"]
-            values = {name: os.environ.get(name) for name in names}
-            print(base64.b64encode(json.dumps(values).encode("utf-8")).decode("ascii"))
-            '@
+          import base64, json, os
+          names = ["ADD_FLEET_ROOT_SECRET", "ADD_PII_LOOKUP_KEY", "ZONE_LITE_NVS_HMAC_ROOT_SECRET", "ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME", "ADD_ORDS_PASSWORD"]
+          values = {name: os.environ.get(name) for name in names}
+          print(base64.b64encode(json.dumps(values).encode("utf-8")).decode("ascii"))
+          '@
             $extractEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($extract))
             $extractLauncher = "import base64;exec(base64.b64decode('$extractEncoded'))"
             $protectedB64 = (@(& docker exec $api[0] python -c $extractLauncher) | Select-Object -Last 1).Trim()
@@ -170,4 +170,3 @@ jobs:
           path: provisioning-output/
           if-no-files-found: error
           retention-days: 1
-
