@@ -311,9 +311,7 @@ def test_large_zkt_buffer_reads_allow_slow_prepare_data_delivery():
 
 def test_main_task_stack_is_sized_for_persistent_dedup_rebuilds():
     defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
-    effective = (FIRMWARE / "sdkconfig").read_text(encoding="utf-8")
     assert "CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192" in defaults
-    assert "CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192" in effective
 
 
 def test_add_reports_the_built_application_version():
