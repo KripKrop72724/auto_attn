@@ -20,6 +20,7 @@ def test_secure_boot_and_rollback_are_build_contracts() -> None:
     assert "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" in text
     assert "CONFIG_SECURE_BOOT_V2_ENABLED=y" in text
     assert "CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n" in text
+    assert "CONFIG_PARTITION_TABLE_OFFSET=0x10000" in text
 
 
 def test_ota_manager_uses_safe_application_ota_and_first_boot_confirmation() -> None:
