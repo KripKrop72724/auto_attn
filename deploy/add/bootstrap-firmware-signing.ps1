@@ -11,7 +11,7 @@ Add-Type -AssemblyName System.Security
 function Invoke-DockerText {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
     $output = @(& docker @Arguments)
-    if ($LASTEXITCODE -ne 0) { throw "Docker command failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "Docker operation $($Arguments[0]) failed with exit code $LASTEXITCODE" }
     return ($output -join "`n") + "`n"
 }
 
@@ -87,7 +87,7 @@ if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
 
         Invoke-DockerText @(
             'create', '--name', $container, 'espressif/idf:v5.5.3',
-            'bash', '-lc', 'sleep 900'
+            'tail', '-f', '/dev/null'
         ) | Out-Null
         Invoke-DockerText @('start', $container) | Out-Null
         Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/keys') | Out-Null
@@ -170,7 +170,7 @@ try {
     try {
         Invoke-DockerText @(
             'create', '--name', $container, 'espressif/idf:v5.5.3',
-            'bash', '-lc', 'sleep 900'
+            'tail', '-f', '/dev/null'
         ) | Out-Null
         Invoke-DockerText @('start', $container) | Out-Null
         Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/work') | Out-Null
