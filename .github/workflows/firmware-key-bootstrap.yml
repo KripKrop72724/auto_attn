@@ -83,7 +83,7 @@ jobs:
             -DeviceMac '${{ inputs.device_mac }}'
       - uses: actions/upload-artifact@v4
         with:
-          name: zone-lite-signed-bootstrap-${{ inputs.device_mac }}-${{ github.sha }}
+          name: zone-lite-signed-bootstrap-${{ github.sha }}
           retention-days: 1
           if-no-files-found: error
           path: signed-bootstrap/
