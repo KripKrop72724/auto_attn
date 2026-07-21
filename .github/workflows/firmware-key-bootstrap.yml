@@ -1,0 +1,82 @@
+name: Zone Lite signing key bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_mac:
+        description: Exact physical ESP32-S3 MAC address
+        required: true
+        type: string
+      confirmation:
+        description: Type CREATE ADD FIRMWARE VAULT
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-firmware-signing-vault
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build exact unsigned Secure Boot candidate
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project/firmware/zone_lite
+          espressif/idf:v5.5.3
+          bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-bootstrap-unsigned-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            firmware/zone_lite/build-bootstrap/bootloader/bootloader.bin
+            firmware/zone_lite/build-bootstrap/partition_table/partition-table.bin
+            firmware/zone_lite/build-bootstrap/ota_data_initial.bin
+            firmware/zone_lite/build-bootstrap/zone_lite.bin
+            firmware/zone_lite/build-bootstrap/flasher_args.json
+
+  generate-and-sign:
+    needs: build
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-bootstrap-unsigned-${{ github.sha }}
+          path: unsigned
+      - name: Generate or reuse ADD-hosted key vault and sign bootstrap image
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unsigned = Join-Path $PWD 'unsigned\firmware\zone_lite\build-bootstrap'
+          $output = Join-Path $PWD 'signed-bootstrap'
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          ./deploy/add/bootstrap-firmware-signing.ps1 `
+            -VaultDirectory $vault `
+            -UnsignedDirectory $unsigned `
+            -OutputDirectory $output `
+            -DeviceMac '${{ inputs.device_mac }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-signed-bootstrap-${{ inputs.device_mac }}-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: error
+          path: signed-bootstrap/
