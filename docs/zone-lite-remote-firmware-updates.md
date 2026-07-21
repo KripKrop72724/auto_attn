@@ -40,7 +40,7 @@ Create these protected environments and require an authorized reviewer:
 
 The signing private key must exist only as a protected environment secret. Do not commit it, put it in an artifact, place it on an ADD host, or print it in logs. Back it up offline using the organization key-custody process.
 
-ADD needs only the manifest verification public key in `ADD_FIRMWARE_MANIFEST_PUBLIC_KEY_B64`. The production host path is configured through `ADD_FIRMWARE_STORE_HOST_PATH`; Docker mounts it read-only.
+ADD needs only the manifest verification public key in `ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64`. The production host path is configured through `ADD_FIRMWARE_STORE_HOST_PATH`; Docker mounts it read-only.
 
 ## One-time physical bootstrap
 
