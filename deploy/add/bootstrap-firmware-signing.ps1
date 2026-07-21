@@ -11,7 +11,7 @@ Add-Type -AssemblyName System.Security
 function Invoke-DockerText {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
     $output = @(& docker @Arguments)
-    if ($LASTEXITCODE -ne 0) { throw "Docker operation $($Arguments[0]) failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "Docker operation $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
     return ($output -join "`n") + "`n"
 }
 
@@ -90,11 +90,11 @@ if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
             'tail', '-f', '/dev/null'
         ) | Out-Null
         Invoke-DockerText @('start', $container) | Out-Null
-        Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/keys') | Out-Null
+        Invoke-DockerText @('exec', $container, '/bin/mkdir', '-p', '/keys') | Out-Null
         Invoke-DockerText @('cp', (Join-Path $staging '.'), "${container}:/keys") | Out-Null
         foreach ($number in 1..3) {
             Invoke-DockerText @(
-                'exec', $container, 'openssl', 'pkey',
+                'exec', $container, '/usr/bin/openssl', 'pkey',
                 '-in', "/keys/key-$number.pem",
                 '-pubout', '-out', "/keys/key-$number-public.pem"
             ) | Out-Null
@@ -173,35 +173,31 @@ try {
             'tail', '-f', '/dev/null'
         ) | Out-Null
         Invoke-DockerText @('start', $container) | Out-Null
-        Invoke-DockerText @('exec', $container, 'mkdir', '-p', '/work') | Out-Null
+        Invoke-DockerText @('exec', $container, '/bin/mkdir', '-p', '/work') | Out-Null
         Invoke-DockerText @('cp', (Join-Path $work '.'), "${container}:/work") | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
-            '--keyfile', '/work/key-1.pem', '--output', '/work/bootloader-signed-1.bin',
-            '/work/bootloader.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-1.pem --output /work/bootloader-signed-1.bin /work/bootloader.bin'
         ) | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
-            '--keyfile', '/work/key-2.pem', '--append-signatures',
-            '--output', '/work/bootloader-signed-2.bin', '/work/bootloader-signed-1.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-2.pem --append-signatures --output /work/bootloader-signed-2.bin /work/bootloader-signed-1.bin'
         ) | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
-            '--keyfile', '/work/key-3.pem', '--append-signatures',
-            '--output', '/work/bootloader-signed.bin', '/work/bootloader-signed-2.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-3.pem --append-signatures --output /work/bootloader-signed.bin /work/bootloader-signed-2.bin'
         ) | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'sign_data', '--version', '2',
-            '--keyfile', '/work/key-1.pem', '--output', '/work/zone-lite-signed.bin',
-            '/work/zone_lite.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py sign_data --version 2 --keyfile /work/key-1.pem --output /work/zone-lite-signed.bin /work/zone_lite.bin'
         ) | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'signature-info-v2',
-            '/work/bootloader-signed.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature-info-v2 /work/bootloader-signed.bin'
         ) | Out-Null
         Invoke-DockerText @(
-            'exec', $container, 'espsecure.py', 'signature-info-v2',
-            '/work/zone-lite-signed.bin'
+            'exec', $container, '/bin/bash', '-lc',
+            '. /opt/esp/idf/export.sh >/dev/null 2>&1 && espsecure.py signature-info-v2 /work/zone-lite-signed.bin'
         ) | Out-Null
         Invoke-DockerText @(
             'cp', "${container}:/work/bootloader-signed.bin",
