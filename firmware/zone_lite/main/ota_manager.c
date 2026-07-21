@@ -191,10 +191,15 @@ static bool post_json(const char *path, cJSON *root)
 {
     char *body = cJSON_PrintUnformatted(root);
     if (!body) return false;
-    char response_data[OTA_HTTP_RESPONSE_BYTES] = {0};
-    ota_response_t response = {.data = response_data, .capacity = sizeof(response_data)};
+    char *response_data = calloc(1, OTA_HTTP_RESPONSE_BYTES);
+    if (!response_data) {
+        free(body);
+        return false;
+    }
+    ota_response_t response = {.data = response_data, .capacity = OTA_HTTP_RESPONSE_BYTES};
     int status = 0;
     bool ok = signed_request("POST", path, body, &response, &status) && status >= 200 && status < 300;
+    free(response_data);
     free(body);
     return ok;
 }
@@ -231,12 +236,22 @@ static bool report_capability(void)
 
 static bool fetch_assignment(void)
 {
-    char response_data[OTA_HTTP_RESPONSE_BYTES] = {0};
-    ota_response_t response = {.data = response_data, .capacity = sizeof(response_data)};
+    char *response_data = calloc(1, OTA_HTTP_RESPONSE_BYTES);
+    if (!response_data) return false;
+    ota_response_t response = {.data = response_data, .capacity = OTA_HTTP_RESPONSE_BYTES};
     int status = 0;
-    if (!signed_request("GET", "/device/v2/firmware/assignment", NULL, &response, &status)) return false;
-    if (status == 204) return false;
-    if (status != 200) return false;
+    if (!signed_request("GET", "/device/v2/firmware/assignment", NULL, &response, &status)) {
+        free(response_data);
+        return false;
+    }
+    if (status == 204) {
+        free(response_data);
+        return false;
+    }
+    if (status != 200) {
+        free(response_data);
+        return false;
+    }
     cJSON *root = cJSON_Parse(response.data);
     cJSON *deployment = root ? cJSON_GetObjectItemCaseSensitive(root, "deployment_id") : NULL;
     cJSON *release = root ? cJSON_GetObjectItemCaseSensitive(root, "release_id") : NULL;
@@ -263,6 +278,7 @@ static bool fetch_assignment(void)
         (void)save_journal();
     }
     cJSON_Delete(root);
+    free(response_data);
     return valid;
 }
 
