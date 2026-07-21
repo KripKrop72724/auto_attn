@@ -31,6 +31,13 @@ def test_ota_manager_uses_safe_application_ota_and_first_boot_confirmation() -> 
     assert "esp_ota_mark_app_invalid_rollback_and_reboot" in text
 
 
+def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
+    text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text
+    assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 2
+    assert text.count("free(response_data)") >= 4
+
+
 def test_release_workflow_requires_hil_and_protected_environments() -> None:
     text = (ROOT / ".github" / "workflows" / "firmware-release.yml").read_text(encoding="utf-8")
     assert "hil_run_id" in text
