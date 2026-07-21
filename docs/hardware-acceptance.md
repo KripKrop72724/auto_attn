@@ -95,6 +95,12 @@ under this bounded load stays read-only and requires model-specific review.
 
 ## Attendance and restart proof
 
+Before attendance sign-off for Zone Lite 2.1.11, change one terminal name without changing the user
+count, first from a missing CNIC to a valid CNIC and then from one valid CNIC to another. Require two
+matching user-table reads, a new ADD snapshot revision, automatic repair of eligible unacknowledged
+events, and ORDS acknowledgement within 60 seconds. Confirm that ACKED events remain unchanged and
+that a UID/fingerprint mismatch is quarantined rather than reassigned.
+
 - Produce controlled punches during steady state, ADD outage, ORDS outage, ZKT flap, and recovery.
 - Verify deterministic IDs yield exactly one ADD row and one ORDS result per physical punch.
 - Power-cycle ESP with queued events and prove flash replay/acknowledgement.

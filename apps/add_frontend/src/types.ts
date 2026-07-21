@@ -29,6 +29,12 @@ export interface ZktDevice {
   certification_observations: number
   capabilities: Record<string, boolean | number | string>
   snapshot_complete: boolean
+  identity_snapshot_revision?: number
+  identity_snapshot_state_hash?: string | null
+  identity_snapshot_observed_at?: string | null
+  identity_snapshot_received_at?: string | null
+  identity_snapshot_stable?: boolean
+  last_identity_change_at?: string | null
   writes_disabled_reason: string | null
   user_count: number | null
   attendance_count: number | null
@@ -181,6 +187,9 @@ export interface AttendanceEvent {
   clock_drift_seconds: number | null
   ords_status: string
   identity_resolution_id: number | null
+  identity_resolution_status?: string
+  identity_snapshot_id?: number | null
+  identity_repaired_at?: string | null
 }
 
 export interface DeviceLog {

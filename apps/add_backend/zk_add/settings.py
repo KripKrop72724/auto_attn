@@ -33,7 +33,10 @@ class AddSettings(BaseSettings):
     offline_after_seconds: int = 45
     connector_command_poll_seconds: int = 3
     reconcile_interval_seconds: int = 15 * 60
-    user_integrity_interval_seconds: int = 6 * 60 * 60
+    user_integrity_interval_seconds: int = 30
+    identity_snapshot_gate_enabled: bool = False
+    identity_snapshot_capture_tolerance_seconds: int = 5
+    identity_repair_sla_seconds: int = 60
     log_retention_days: int = 14
     telemetry_retention_days: int = 30
     session_retention_days: int = 90
