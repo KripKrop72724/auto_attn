@@ -1,8 +1,6 @@
 name: Zone Lite signing key bootstrap
 
 on:
-  push:
-    branches: [fix/add-signing-without-bind-mounts]
   workflow_dispatch:
     inputs:
       device_mac:
@@ -23,7 +21,7 @@ concurrency:
 
 jobs:
   build:
-    if: ${{ github.event_name == 'push' || inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
+    if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -82,10 +80,10 @@ jobs:
             -VaultDirectory $vault `
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
-            -DeviceMac '${{ github.event_name == 'push' && 'e0:72:a1:d7:05:c4' || inputs.device_mac }}'
+            -DeviceMac '${{ inputs.device_mac }}'
       - uses: actions/upload-artifact@v4
         with:
-          name: zone-lite-signed-bootstrap-${{ github.event_name == 'push' && 'e0:72:a1:d7:05:c4' || inputs.device_mac }}-${{ github.sha }}
+          name: zone-lite-signed-bootstrap-${{ inputs.device_mac }}-${{ github.sha }}
           retention-days: 1
           if-no-files-found: error
           path: signed-bootstrap/
