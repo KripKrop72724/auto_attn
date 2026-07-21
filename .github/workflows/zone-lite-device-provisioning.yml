@@ -1,0 +1,173 @@
+name: Zone Lite device provisioning
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Protected operation to perform
+        required: true
+        type: choice
+        options: [attest-hmac, build-package]
+      target_mac:
+        description: Exact physical ESP32-S3 Wi-Fi MAC
+        required: true
+        type: string
+      request_id:
+        description: Unique non-secret provisioning request ID
+        required: true
+        type: string
+      challenge_hex:
+        description: 32-byte public challenge for attest-hmac
+        required: false
+        type: string
+      confirmation:
+        description: Type ATTEST EXISTING HMAC or BUILD ENCRYPTED NVS
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-device-provisioning
+  cancel-in-progress: false
+
+jobs:
+  attest-hmac:
+    if: ${{ inputs.operation == 'attest-hmac' && inputs.confirmation == 'ATTEST EXISTING HMAC' }}
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Derive non-secret candidate attestations inside production ADD
+        env:
+          TARGET_MAC: ${{ inputs.target_mac }}
+          CHALLENGE_HEX: ${{ inputs.challenge_hex }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:TARGET_MAC -notmatch '^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$') { throw 'Invalid target MAC' }
+          if ($env:CHALLENGE_HEX -notmatch '^[0-9a-fA-F]{64}$') { throw 'Challenge must be exactly 32 bytes' }
+          $containers = @(& docker ps --filter 'ancestor=state-life/add-api:production' --format '{{.ID}}')
+          if ($containers.Count -ne 1) { throw "Expected one production ADD API container, found $($containers.Count)" }
+          $script = @'
+          import hashlib, hmac, os, sys
+
+          salt = b"state-life-zone-lite-nvs-hmac-v1"
+          mac = sys.argv[1].lower()
+          challenge = bytes.fromhex(sys.argv[2])
+          info = f"zone-lite-nvs:{mac}".encode("ascii")
+
+          def hkdf(root):
+              prk = hmac.new(salt, root.encode("utf-8"), hashlib.sha256).digest()
+              return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+          candidates = {
+              "fleet": os.environ.get("ADD_FLEET_ROOT_SECRET"),
+              "legacy_pii": os.environ.get("ADD_PII_LOOKUP_KEY"),
+              "explicit_recovery": os.environ.get("ZONE_LITE_NVS_HMAC_ROOT_SECRET"),
+          }
+          if not candidates["fleet"]:
+              raise SystemExit("Production ADD has no explicit fleet root")
+          for label, root in candidates.items():
+              if root:
+                  print(f"{label}={hmac.new(hkdf(root), challenge, hashlib.sha256).hexdigest()}")
+          '@
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
+          $launcher = "import base64;exec(base64.b64decode('$encoded'))"
+          & docker exec $containers[0] python -c $launcher $env:TARGET_MAC.ToLowerInvariant() $env:CHALLENGE_HEX.ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0) { throw 'ADD-side HMAC attestation failed' }
+
+  build-package:
+    if: ${{ inputs.operation == 'build-package' && inputs.confirmation == 'BUILD ENCRYPTED NVS' }}
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    env:
+      REQUEST_B64: ${{ secrets.ZONE_LITE_PROVISIONING_INPUT_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build device-bound package within the ADD trust boundary
+        env:
+          TARGET_MAC: ${{ inputs.target_mac }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:REQUEST_B64) { throw 'ZONE_LITE_PROVISIONING_INPUT_B64 is not configured' }
+          $work = Join-Path $env:TEMP ('zone-lite-provision-' + [guid]::NewGuid().ToString('N'))
+          $requestPath = Join-Path $work 'request.json'
+          $output = Join-Path $PWD 'provisioning-output'
+          $container = 'zone-lite-provision-' + [guid]::NewGuid().ToString('N')
+          New-Item -ItemType Directory -Path $work, $output -Force | Out-Null
+          try {
+            [IO.File]::WriteAllBytes($requestPath, [Convert]::FromBase64String($env:REQUEST_B64))
+            $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+            if ($request.request_id -ne $env:REQUEST_ID) { throw 'Request ID does not match protected request' }
+            if ($request.target_mac.ToLowerInvariant() -ne $env:TARGET_MAC.ToLowerInvariant()) { throw 'MAC does not match protected request' }
+            if ($request.nvs_root_source -notin @('fleet', 'legacy_pii', 'explicit_recovery')) { throw 'Invalid NVS root source' }
+
+            $api = @(& docker ps --filter 'ancestor=state-life/add-api:production' --format '{{.ID}}')
+            if ($api.Count -ne 1) { throw "Expected one production ADD API container, found $($api.Count)" }
+            $extract = @'
+            import base64, json, os
+            names = ["ADD_FLEET_ROOT_SECRET", "ADD_PII_LOOKUP_KEY", "ZONE_LITE_NVS_HMAC_ROOT_SECRET", "ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME", "ADD_ORDS_PASSWORD"]
+            values = {name: os.environ.get(name) for name in names}
+            print(base64.b64encode(json.dumps(values).encode("utf-8")).decode("ascii"))
+            '@
+            $extractEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($extract))
+            $extractLauncher = "import base64;exec(base64.b64decode('$extractEncoded'))"
+            $protectedB64 = (@(& docker exec $api[0] python -c $extractLauncher) | Select-Object -Last 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $protectedB64) { throw 'Could not read protected ADD settings' }
+            $protected = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($protectedB64)) | ConvertFrom-Json
+            foreach ($name in @('ADD_FLEET_ROOT_SECRET', 'ADD_ORDS_BASE_URL', 'ADD_ORDS_USERNAME', 'ADD_ORDS_PASSWORD')) {
+              $value = $protected.$name
+              if (-not $value) { throw "Protected ADD setting is missing: $name" }
+              [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+            }
+            if ($request.nvs_root_source -eq 'legacy_pii') {
+              if (-not $protected.ADD_PII_LOOKUP_KEY) { throw 'Legacy PII recovery root is unavailable' }
+              $env:ZONE_LITE_NVS_HMAC_ROOT_SECRET = $protected.ADD_PII_LOOKUP_KEY
+            } elseif ($request.nvs_root_source -eq 'explicit_recovery') {
+              if (-not $protected.ZONE_LITE_NVS_HMAC_ROOT_SECRET) { throw 'Explicit recovery root is unavailable' }
+              $env:ZONE_LITE_NVS_HMAC_ROOT_SECRET = $protected.ZONE_LITE_NVS_HMAC_ROOT_SECRET
+            } else {
+              Remove-Item Env:ZONE_LITE_NVS_HMAC_ROOT_SECRET -ErrorAction SilentlyContinue
+            }
+
+            & docker create --name $container `
+              --env ADD_FLEET_ROOT_SECRET --env ZONE_LITE_NVS_HMAC_ROOT_SECRET `
+              --env ADD_ORDS_BASE_URL --env ADD_ORDS_USERNAME --env ADD_ORDS_PASSWORD `
+              espressif/idf:v5.5.3 tail -f /dev/null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create provisioning container' }
+            & docker start $container | Out-Null
+            & docker exec $container mkdir -p /project /request /output
+            & docker cp (Join-Path $PWD '.') "${container}:/project"
+            & docker cp $requestPath "${container}:/request/request.json"
+            & docker exec $container bash -lc '. /opt/esp/idf/export.sh >/dev/null 2>&1 && cd /project/firmware/zone_lite && python tools/build_provisioning_package.py --request /request/request.json --output /output --idf-path /opt/esp/idf'
+            if ($LASTEXITCODE -ne 0) { throw 'Encrypted NVS package generation failed' }
+            & docker cp "${container}:/output/." $output
+            if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve encrypted package' }
+            $files = @(Get-ChildItem -LiteralPath $output -File | Select-Object -ExpandProperty Name)
+            if (($files | Sort-Object) -join ',' -ne 'manifest.json,provision.bin.enc') { throw 'Unexpected provisioning artifact contents' }
+          }
+          finally {
+            & docker rm -f $container 2>$null | Out-Null
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($name in @('ADD_FLEET_ROOT_SECRET', 'ZONE_LITE_NVS_HMAC_ROOT_SECRET', 'ADD_ORDS_BASE_URL', 'ADD_ORDS_USERNAME', 'ADD_ORDS_PASSWORD', 'REQUEST_B64')) {
+              Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-provisioning-${{ inputs.request_id }}
+          path: provisioning-output/
+          if-no-files-found: error
+          retention-days: 1
+
