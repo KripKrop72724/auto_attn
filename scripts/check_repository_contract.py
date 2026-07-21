@@ -101,7 +101,12 @@ def main() -> int:
         problems.append(f"firmware products must be exactly zone_lite, got {sorted(firmware_products)}")
 
     workflow_files = {name for name in files if name.startswith(".github/workflows/")}
-    expected_workflows = {".github/workflows/add-ci.yml", ".github/workflows/add-deploy.yml"}
+    expected_workflows = {
+        ".github/workflows/add-ci.yml",
+        ".github/workflows/add-deploy.yml",
+        ".github/workflows/firmware-hil.yml",
+        ".github/workflows/firmware-release.yml",
+    }
     if workflow_files != expected_workflows:
         problems.append(f"workflow set is not consolidated: {sorted(workflow_files)}")
 

@@ -1,4 +1,5 @@
 #include "add_connector.h"
+#include "ota_manager.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -984,6 +985,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
             cJSON_AddNumberToObject(payload, "outbox_depth", add_connector_outbox_depth());
+            ota_manager_append_telemetry(payload);
             cJSON_AddStringToObject(payload, "current_activity", activity);
             cJSON_AddStringToObject(payload, "led_state", zkt.online ? "HEALTHY" : zkt.connection_state);
             cJSON *zkt_json = cJSON_AddObjectToObject(payload, "zkt");

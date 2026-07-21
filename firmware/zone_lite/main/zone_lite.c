@@ -42,6 +42,7 @@
 
 #include "led_status.h"
 #include "add_connector.h"
+#include "ota_manager.h"
 #include "zone_config.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
@@ -5354,6 +5355,7 @@ void app_main(void)
         return;
     }
     add_connector_init();
+    ota_manager_init();
     zkt_publish_state("BOOTING", "ESP32 firmware boot", false);
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);
     storage_init();
@@ -5365,6 +5367,7 @@ void app_main(void)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
+    ota_manager_start();
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");
         led_status_fault(LED_STATUS_FATAL);

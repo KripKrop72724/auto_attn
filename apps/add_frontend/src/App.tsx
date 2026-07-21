@@ -447,7 +447,7 @@ function FleetView({
               </button>
               <div className="device-card-actions">
                 <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
-                <span>FW {device.firmware_version || 'unknown'} · {device.zkt?.certification_state || 'uncertified'}</span>
+                <span>FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
               </div>
             </article>
           ))}

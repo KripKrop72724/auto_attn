@@ -30,16 +30,22 @@ HKDF_SALT = b"state-life-zone-lite-onboarding-v1"
 NVS_HMAC_SALT = b"state-life-zone-lite-nvs-hmac-v1"
 MAC_PATTERN = re.compile(r"MAC:\s*([0-9a-f:]{17})", re.IGNORECASE)
 NVS_PARTITION_SIZE = 0x6000
-NVS_PARTITION_OFFSET = "0x9000"
+NVS_PARTITION_OFFSET = "0x11000"
 SECURE_SDKCONFIG_VALUES = (
     "CONFIG_NVS_ENCRYPTION=y",
     "CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y",
     "CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0",
+    "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y",
+    "CONFIG_SECURE_BOOT=y",
+    "CONFIG_SECURE_BOOT_V2_ENABLED=y",
 )
 SECURE_BUILD_DEFINES = (
     "#define CONFIG_NVS_ENCRYPTION 1",
     "#define CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC 1",
     "#define CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID 0",
+    "#define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1",
+    "#define CONFIG_SECURE_BOOT 1",
+    "#define CONFIG_SECURE_BOOT_V2_ENABLED 1",
 )
 
 
@@ -311,7 +317,14 @@ def ensure_nvs_hmac_key(
         )
 
 
-def firmware_flash_arguments(project: Path, esptool: str, port: str, nvs_binary: Path) -> list[str]:
+def firmware_flash_arguments(
+    project: Path,
+    esptool: str,
+    port: str,
+    nvs_binary: Path,
+    signed_bootloader: Path,
+    signed_app: Path,
+) -> list[str]:
     build = project / "build"
     values = json.loads((build / "flasher_args.json").read_text(encoding="utf-8"))
     extra = values["extra_esptool_args"]
@@ -329,7 +342,12 @@ def firmware_flash_arguments(project: Path, esptool: str, port: str, nvs_binary:
         *[str(item) for item in values.get("write_flash_args", [])],
     ]
     for offset, filename in values["flash_files"].items():
-        command.extend([offset, str(build / filename)])
+        source = build / filename
+        if str(filename).endswith("bootloader.bin"):
+            source = signed_bootloader
+        elif str(filename).endswith("zone_lite.bin"):
+            source = signed_app
+        command.extend([offset, str(source)])
     command.extend([NVS_PARTITION_OFFSET, str(nvs_binary)])
     return command
 
@@ -344,11 +362,23 @@ def main() -> None:
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-firmware-flash", action="store_true")
     parser.add_argument("--confirm-efuse-burn-for")
+    parser.add_argument("--confirm-secure-boot-for")
+    parser.add_argument("--signed-bootloader", type=Path)
+    parser.add_argument("--signed-app", type=Path)
     parser.add_argument("--trust-existing-derived-hmac", action="store_true")
     parser.add_argument("--confirm-split-root-recovery-for")
     args = parser.parse_args()
     if not args.idf_path:
         raise SystemExit("Pass --idf-path or export IDF_PATH")
+    if not args.skip_firmware_flash:
+        if normalize_mac(args.confirm_secure_boot_for or "") != read_mac(args.esptool, args.port):
+            raise SystemExit(
+                "Secure Boot is irreversible. Re-run with --confirm-secure-boot-for set to the exact detected MAC."
+            )
+        if not args.signed_bootloader or not args.signed_bootloader.is_file():
+            raise SystemExit("Pass the independently verified three-key signed bootloader with --signed-bootloader.")
+        if not args.signed_app or not args.signed_app.is_file():
+            raise SystemExit("Pass the independently verified signed Zone Lite image with --signed-app.")
 
     project = Path(__file__).resolve().parents[1]
     config = load_config(args.config)
@@ -432,7 +462,16 @@ def main() -> None:
                 ]
             )
         else:
-            run(firmware_flash_arguments(project, args.esptool, args.port, binary_path))
+            run(
+                firmware_flash_arguments(
+                    project,
+                    args.esptool,
+                    args.port,
+                    binary_path,
+                    args.signed_bootloader,
+                    args.signed_app,
+                )
+            )
         run(
             [
                 args.esptool,

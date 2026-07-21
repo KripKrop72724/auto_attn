@@ -46,6 +46,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ${ADD_FIRMWARE_STORE_HOST_PATH:-./.firmware-store}
+        target: /firmware
+        read_only: true
     env_file: .env.add
     environment:
       ADD_DATABASE_URL: postgresql+psycopg://${ADD_POSTGRES_USER:-add_service}:${ADD_POSTGRES_PASSWORD}@postgres:5432/${ADD_POSTGRES_DB:-attendance_devices}

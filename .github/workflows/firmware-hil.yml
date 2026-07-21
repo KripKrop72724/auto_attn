@@ -1,0 +1,68 @@
+name: Zone Lite OTA hardware gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main commit containing the firmware candidate
+        required: true
+        type: string
+      rig:
+        description: Physical OTA rig to use
+        required: true
+        default: peshawar
+        type: choice
+        options:
+          - peshawar
+          - islamabad
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-hil-${{ inputs.rig }}
+  cancel-in-progress: false
+
+jobs:
+  verify-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require an exact commit on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git cat-file -e "${{ inputs.commit_sha }}^{commit}"
+          git merge-base --is-ancestor "${{ inputs.commit_sha }}" origin/main
+
+  hardware-gate:
+    needs: verify-main
+    runs-on: [self-hosted, zone-lite-hil, "${{ inputs.rig }}"]
+    environment: firmware-hil-${{ inputs.rig }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 1
+      - name: Run the configured physical rig suite
+        shell: bash
+        env:
+          OTA_HIL_RUNNER_COMMAND: ${{ secrets.OTA_HIL_RUNNER_COMMAND }}
+        run: |
+          set -euo pipefail
+          test -n "$OTA_HIL_RUNNER_COMMAND"
+          python3 firmware/zone_lite/tools/run_ota_hil_gate.py \
+            --command "$OTA_HIL_RUNNER_COMMAND" \
+            --evidence ota-hil-evidence.json
+      - name: Upload immutable HIL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-hil-${{ inputs.rig }}-${{ inputs.commit_sha }}
+          path: ota-hil-evidence.json
+          if-no-files-found: error
+          retention-days: 90

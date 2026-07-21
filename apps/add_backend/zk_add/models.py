@@ -51,6 +51,14 @@ class Connector(Base):
     device_id: Mapped[str] = mapped_column(String(120), index=True)
     display_name: Mapped[str] = mapped_column(String(255))
     firmware_version: Mapped[str | None] = mapped_column(String(80))
+    ota_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ota_secure_boot: Mapped[bool] = mapped_column(Boolean, default=False)
+    ota_rollback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    ota_partition_layout: Mapped[str | None] = mapped_column(String(80))
+    ota_state: Mapped[str] = mapped_column(String(40), default="LEGACY_MANUAL_UPDATE", index=True)
+    ota_running_partition: Mapped[str | None] = mapped_column(String(40))
+    ota_image_sha256: Mapped[str | None] = mapped_column(String(64))
+    ota_signing_key_id: Mapped[str | None] = mapped_column(String(80))
     config_version: Mapped[int] = mapped_column(Integer, default=1)
     lifecycle_state: Mapped[str] = mapped_column(String(40), default="ONBOARDING", index=True)
     connected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
@@ -571,3 +579,7 @@ class IdentityTombstone(Base):
     shift_worker: Mapped[bool] = mapped_column(Boolean, default=False)
     privilege: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = utc_column()
+
+# Import additive OTA tables after Connector is defined so Alembic and schema
+# drift checks always see the complete production metadata.
+from zk_add import ota as _ota_models  # noqa: E402,F401

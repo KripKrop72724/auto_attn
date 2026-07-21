@@ -1720,3 +1720,277 @@ def serialize_lease(row: TemporaryAdminLease | None) -> dict | None:
         "revoked_at": row.revoked_at,
         "last_error": row.last_error,
     }
+
+# Firmware OTA routes are intentionally additive. Legacy connectors never call
+# these endpoints and remain supported by the existing device protocol.
+from pathlib import Path as _Path  # noqa: E402
+from typing import Literal as _Literal  # noqa: E402
+
+from fastapi.responses import StreamingResponse as _StreamingResponse  # noqa: E402
+from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
+from sqlalchemy import select as _select  # noqa: E402
+
+from zk_add.audit import append_audit as _append_audit  # noqa: E402
+from zk_add.ota import (  # noqa: E402
+    FirmwareCampaign as _FirmwareCampaign,
+    FirmwareDeployment as _FirmwareDeployment,
+    FirmwareRelease as _FirmwareRelease,
+    assignment_for_connector as _assignment_for_connector,
+    campaign_rows as _campaign_rows,
+    create_campaign as _create_firmware_campaign,
+    parse_single_range as _parse_single_range,
+    record_progress as _record_firmware_progress,
+    release_rows as _release_rows,
+    resolve_download as _resolve_firmware_download,
+)
+from zk_add.time_utils import utc_now as _ota_utc_now  # noqa: E402
+
+
+class _FirmwareCapabilityIn(_BaseModel):
+    capable: bool
+    secure_boot: bool
+    rollback_enabled: bool
+    partition_layout: str = _Field(max_length=80)
+    running_version: str = _Field(max_length=80)
+    running_partition: str = _Field(max_length=40)
+    image_sha256: str | None = _Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    signing_key_id: str | None = _Field(default=None, max_length=80)
+
+
+class _FirmwareProgressIn(_BaseModel):
+    state: _Literal[
+        "OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING",
+        "RECONCILING", "SUCCEEDED", "FAILED", "ROLLED_BACK", "CANCELLED",
+        "SUPERSEDED", "RELEASE_REVOKED",
+    ]
+    bytes_written: int = _Field(default=0, ge=0)
+    running_version: str | None = _Field(default=None, max_length=80)
+    error_code: str | None = _Field(default=None, max_length=120)
+    error_message: str | None = _Field(default=None, max_length=500)
+
+
+class _FirmwareCampaignIn(_BaseModel):
+    release_id: str = _Field(min_length=1, max_length=100)
+    zone_id: str = _Field(min_length=1, max_length=100)
+    reason: str = _Field(min_length=10, max_length=500)
+    typed_confirmation: str = _Field(min_length=1, max_length=80)
+    password: str = _Field(min_length=1, max_length=512)
+
+
+class _FirmwareControlIn(_BaseModel):
+    reason: str = _Field(min_length=10, max_length=500)
+    password: str = _Field(min_length=1, max_length=512)
+
+
+async def _require_ota_connector(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    connector_id: str | None = Header(default=None, alias="X-ADD-Connector-Id"),
+    timestamp: str | None = Header(default=None, alias="X-ADD-Timestamp"),
+    nonce: str | None = Header(default=None, alias="X-ADD-Nonce"),
+    body_hash: str | None = Header(default=None, alias="X-ADD-Body-SHA256"),
+    signature: str | None = Header(default=None, alias="X-ADD-Signature"),
+    db: Session = Depends(get_db),
+) -> tuple[Session, Connector]:
+    connector = await authenticate_connector_request(
+        request,
+        db,
+        authorization=authorization,
+        connector_id=connector_id,
+        timestamp=timestamp,
+        nonce=nonce,
+        supplied_body_hash=body_hash,
+        signature=signature,
+    )
+    return db, connector
+
+
+@app.post("/device/v2/firmware/capability")
+async def report_firmware_capability(
+    body: _FirmwareCapabilityIn,
+    auth: tuple[Session, Connector] = Depends(_require_ota_connector),
+):
+    db, connector = auth
+    eligible = bool(
+        body.capable
+        and body.secure_boot
+        and body.rollback_enabled
+        and body.partition_layout == "zone-lite-ota-v1"
+        and body.running_version >= "2.2.0"
+    )
+    connector.ota_capable = eligible
+    connector.ota_secure_boot = body.secure_boot
+    connector.ota_rollback_enabled = body.rollback_enabled
+    connector.ota_partition_layout = body.partition_layout
+    connector.ota_running_partition = body.running_partition
+    connector.ota_image_sha256 = body.image_sha256
+    connector.ota_signing_key_id = body.signing_key_id or "fleet-key-0"
+    connector.ota_state = "OTA_READY" if eligible else "OTA_BLOCKED"
+    connector.firmware_version = body.running_version
+    db.commit()
+    return {"accepted": eligible, "ota_state": connector.ota_state}
+
+
+@app.get("/device/v2/firmware/assignment")
+async def firmware_assignment(
+    request: Request,
+    auth: tuple[Session, Connector] = Depends(_require_ota_connector),
+):
+    db, connector = auth
+    assignment = _assignment_for_connector(
+        db, connector=connector, public_base=str(request.base_url).rstrip("/")
+    )
+    db.commit()
+    if assignment is None:
+        return Response(status_code=204)
+    return assignment
+
+
+@app.post("/device/v2/firmware/deployments/{deployment_id}/progress")
+async def firmware_progress(
+    deployment_id: str,
+    body: _FirmwareProgressIn,
+    auth: tuple[Session, Connector] = Depends(_require_ota_connector),
+):
+    db, connector = auth
+    try:
+        deployment = _record_firmware_progress(
+            db,
+            connector=connector,
+            deployment_public_id=deployment_id,
+            state=body.state,
+            bytes_written=body.bytes_written,
+            error_code=body.error_code,
+            error_message=body.error_message,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    db.commit()
+    return {"deployment_id": deployment.deployment_id, "state": deployment.status, "confirm": body.state == "BOOTED_PENDING"}
+
+
+def _firmware_chunks(path: _Path, start: int, end: int):
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = end - start + 1
+        while remaining:
+            chunk = handle.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+@app.head("/device/v2/firmware/download/{token}")
+@app.get("/device/v2/firmware/download/{token}")
+def download_firmware(token: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        release, image = _resolve_firmware_download(db, token)
+        requested = _parse_single_range(request.headers.get("range"), release.image_size)
+    except ValueError as error:
+        raise HTTPException(status_code=416 if "range" in str(error).lower() else 404, detail=str(error)) from error
+    db.commit()
+    start, end = requested or (0, release.image_size - 1)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-transform, immutable",
+        "ETag": f'"{release.image_sha256}"',
+        "Content-Length": str(end - start + 1),
+        "Content-Disposition": f'attachment; filename="zone-lite-{release.version}.bin"',
+    }
+    status_code = 206 if requested else 200
+    if requested:
+        headers["Content-Range"] = f"bytes {start}-{end}/{release.image_size}"
+    if request.method == "HEAD":
+        return Response(status_code=status_code, headers=headers, media_type="application/octet-stream")
+    return _StreamingResponse(
+        _firmware_chunks(image, start, end), status_code=status_code,
+        headers=headers, media_type="application/octet-stream"
+    )
+
+
+@app.get("/api/v1/firmware/releases")
+def list_firmware_releases(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _ = auth
+    return {"rows": _release_rows(db), "enabled": settings.firmware_ota_enabled}
+
+
+@app.get("/api/v1/firmware/campaigns")
+def list_firmware_campaigns(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _ = auth
+    return {"rows": _campaign_rows(db), "enabled": settings.firmware_ota_enabled}
+
+
+@app.post("/api/v1/firmware/campaigns", status_code=201)
+def start_firmware_campaign(
+    body: _FirmwareCampaignIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    if not settings.firmware_ota_enabled:
+        raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
+    require_step_up(body.password, db, context)
+    try:
+        campaign = _create_firmware_campaign(
+            db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
+            typed_confirmation=body.typed_confirmation, actor=context.username
+        )
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
+                  target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id, "release_id": body.release_id})
+    db.commit()
+    return {"campaign_id": campaign.campaign_id, "status": campaign.status,
+            "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count}
+
+
+@app.post("/api/v1/firmware/campaigns/{campaign_id}/{action}")
+def control_firmware_campaign(
+    campaign_id: str,
+    action: _Literal["pause", "resume", "cancel"],
+    body: _FirmwareControlIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    campaign = db.scalar(_select(_FirmwareCampaign).where(_FirmwareCampaign.campaign_id == campaign_id))
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Firmware campaign not found.")
+    campaign.status = {"pause": "PAUSED", "resume": "ACTIVE", "cancel": "CANCELLED"}[action]
+    campaign.pause_reason = body.reason if action != "resume" else None
+    if action == "cancel":
+        for deployment in db.scalars(_select(_FirmwareDeployment).where(
+            _FirmwareDeployment.campaign_id == campaign.id,
+            _FirmwareDeployment.status.in_(["PENDING", "OFFERED", "DOWNLOADING"]))):
+            deployment.status = "CANCELLED"
+    _append_audit(db, actor=context.username, action=f"FIRMWARE_CAMPAIGN_{action.upper()}",
+                  target_type="firmware_campaign", target_id=campaign_id,
+                  outcome=campaign.status, after={"reason": body.reason})
+    db.commit()
+    return {"campaign_id": campaign_id, "status": campaign.status}
+
+
+@app.post("/api/v1/firmware/releases/{release_id}/revoke")
+def revoke_firmware_release(
+    release_id: str,
+    body: _FirmwareControlIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    release = db.scalar(_select(_FirmwareRelease).where(_FirmwareRelease.release_id == release_id))
+    if release is None:
+        raise HTTPException(status_code=404, detail="Firmware release not found.")
+    release.state = "REVOKED"
+    release.revoked_at = _ota_utc_now()
+    release.revoked_by = context.username
+    for campaign in db.scalars(_select(_FirmwareCampaign).where(
+        _FirmwareCampaign.release_id == release.id,
+        _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
+        campaign.status = "PAUSED"
+        campaign.pause_reason = f"Release revoked: {body.reason}"
+    _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
+                  target_type="firmware_release", target_id=release_id,
+                  outcome="REVOKED", after={"reason": body.reason})
+    db.commit()
+    return {"release_id": release_id, "state": release.state}
