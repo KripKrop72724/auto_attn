@@ -1,4 +1,4 @@
-name: Temporary device 2 OTA stack signed candidate
+name: Temporary Peshawar-02 OTA stack signed candidate
 
 on:
   push:
@@ -42,10 +42,10 @@ jobs:
             -VaultDirectory (Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing') `
             -UnsignedDirectory $unsigned `
             -OutputDirectory (Join-Path $PWD 'signed-bootstrap') `
-            -DeviceMac 'e0:72:a1:d5:08:a0'
+            -DeviceMac 'e0:72:a1:d7:05:c4'
       - uses: actions/upload-artifact@v4
         with:
-          name: temporary-signed-device2-${{ github.sha }}
+          name: temporary-signed-peshawar02-${{ github.sha }}
           retention-days: 1
           if-no-files-found: error
           path: signed-bootstrap/
