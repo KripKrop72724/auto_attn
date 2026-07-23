@@ -536,6 +536,20 @@ def replace_user_snapshot(
         row = rows_by_uid.get(incoming.uid)
         previous_cnic_hash = row.cnic_lookup_hash if row is not None else None
         previous_state_fingerprint = row.terminal_state_fingerprint if row is not None else None
+        terminal_state_changed = bool(
+            row is not None
+            and (
+                row.user_id != incoming.user_id
+                or (decrypt_text(row.machine_name_encrypted) or "") != incoming.name
+                or row.terminal_identity_fingerprint
+                != incoming.terminal_identity_fingerprint
+                or row.terminal_state_fingerprint != incoming.terminal_state_fingerprint
+                or row.privilege != incoming.privilege
+                or row.card != incoming.card
+                or not row.present
+                or row.lifecycle_state != "ACTIVE"
+            )
+        )
         if row is None:
             conflicting = session.scalar(
                 select(DeviceUser).where(
@@ -567,7 +581,7 @@ def replace_user_snapshot(
             session.add(row)
             session.flush()
             rows_by_uid[incoming.uid] = row
-        else:
+        elif terminal_state_changed:
             row.row_version = (row.row_version or 0) + 1
         row.user_id = incoming.user_id
         row.machine_name_encrypted = encrypt_text(incoming.name)
