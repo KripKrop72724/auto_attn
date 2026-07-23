@@ -1754,6 +1754,90 @@ def test_snapshot_revision_detects_same_count_valid_to_valid_identity_change(db:
     assert decrypt_cnic(user.cnic_encrypted) == replacement
 
 
+def test_identical_terminal_reread_does_not_invalidate_selected_user_version(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    identity_fingerprint = "a" * 64
+    state_fingerprint = "b" * 64
+    user = snapshot_user(
+        db,
+        connector,
+        name=f"Stable User-{CNIC}",
+        terminal_identity_fingerprint=identity_fingerprint,
+        terminal_state_fingerprint=state_fingerprint,
+    )
+    selected_version = user.row_version
+
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="harmless-reread",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=user.uid,
+                    user_id=user.user_id,
+                    name=f"Stable User-{CNIC}",
+                    privilege=0,
+                    terminal_identity_fingerprint=identity_fingerprint,
+                    terminal_state_fingerprint=state_fingerprint,
+                )
+            ],
+        ),
+    )
+    assert user.row_version == selected_version
+
+    job = create_user_deletion_job(
+        db,
+        connector=connector,
+        targets=[(user.user_key, selected_version)],
+        reason="Remove a confirmed obsolete terminal account",
+        typed_confirmation="DELETE 1 USERS FROM 1",
+        idempotency_key="stable-selection-after-reread",
+        actor="StateHealthAdmin",
+    )
+    assert job.status == "QUEUED"
+
+
+def test_real_terminal_user_change_invalidates_selected_version(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name=f"Original User-{CNIC}")
+    selected_version = user.row_version
+
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="actual-terminal-change",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=user.uid,
+                    user_id=user.user_id,
+                    name=f"Renamed User-{CNIC}",
+                )
+            ],
+        ),
+    )
+    assert user.row_version == selected_version + 1
+    with pytest.raises(ValueError, match="changed since it was selected"):
+        create_user_deletion_job(
+            db,
+            connector=connector,
+            targets=[(user.user_key, selected_version)],
+            reason="Remove a confirmed obsolete terminal account",
+            typed_confirmation="DELETE 1 USERS FROM 1",
+            idempotency_key="stale-selection-after-change",
+            actor="StateHealthAdmin",
+        )
+
+
 def test_no_registration_routes_remain():
     paths = {route.path for route in app.routes}
     assert "/api/v1/connectors" not in paths
