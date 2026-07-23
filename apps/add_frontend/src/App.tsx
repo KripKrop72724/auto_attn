@@ -126,8 +126,11 @@ export const confirmationMatches = (value: string, user: DeviceUser) =>
 export const bulkDeletionConfirmation = (count: number, deviceId: string) =>
   `DELETE ${count} USERS FROM ${deviceId}`
 
-const statusPattern = (state: string) => {
-  const normalized = state.toUpperCase()
+const normalizedStatus = (state: unknown) =>
+  typeof state === 'string' && state.trim() ? state.trim() : 'UNKNOWN'
+
+const statusPattern = (state: unknown) => {
+  const normalized = normalizedStatus(state).toUpperCase()
   if (
     ['ONLINE', 'SUCCEEDED', 'ACKED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED'].includes(
       normalized,
@@ -149,8 +152,15 @@ const statusPattern = (state: string) => {
   return 'notice'
 }
 
-export function StatusBadge({ state, live = false }: { state: string; live?: boolean }) {
-  const pattern = statusPattern(state)
+export function StatusBadge({
+  state,
+  live = false,
+}: {
+  state?: string | null
+  live?: boolean
+}) {
+  const status = normalizedStatus(state)
+  const pattern = statusPattern(status)
   const icon =
     pattern === 'confirmed'
       ? 'check'
@@ -162,7 +172,7 @@ export function StatusBadge({ state, live = false }: { state: string; live?: boo
   return (
     <span className={`status-badge pattern-${pattern}`} data-pattern={pattern}>
       <Icon name={icon} />
-      <span>{state.replaceAll('_', ' ')}</span>
+      <span>{status.replaceAll('_', ' ')}</span>
       {live && <i aria-hidden="true" />}
     </span>
   )
@@ -475,13 +485,15 @@ export function CommandProgress({
   command: Command
   onCancel: (command: Command) => Promise<void>
 }) {
-  const canCancel = !['RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(command.status)
+  const status = normalizedStatus(command.status)
+  const commandType = normalizedStatus(command.type)
+  const canCancel = !['RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(status)
   return (
-    <section className={`command-progress pattern-${statusPattern(command.status)}`} aria-live="polite">
-      <span className="command-symbol"><Icon name={command.status === 'SUCCEEDED' ? 'check' : command.status === 'FAILED' ? 'alert' : 'refresh'} /></span>
+    <section className={`command-progress pattern-${statusPattern(status)}`} aria-live="polite">
+      <span className="command-symbol"><Icon name={status === 'SUCCEEDED' ? 'check' : status === 'FAILED' ? 'alert' : 'refresh'} /></span>
       <div>
-        <p className="eyebrow">{command.type.replaceAll('_', ' ')}</p>
-        <h3>{command.status.replaceAll('_', ' ')}</h3>
+        <p className="eyebrow">{commandType.replaceAll('_', ' ')}</p>
+        <h3>{status.replaceAll('_', ' ')}</h3>
         <p>{command.error_message || command.error_code || `Command ${command.command_id.slice(0, 8)} is durably tracked.`}</p>
       </div>
       {canCancel && <button className="button secondary" onClick={() => void onCancel(command)}>Cancel before execution</button>}

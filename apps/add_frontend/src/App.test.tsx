@@ -310,6 +310,29 @@ describe('State Life ADD interface', () => {
     expect(screen.getByText('WAITING FOR ZKT')).toBeTruthy()
   })
 
+  it('renders an unknown status instead of crashing on a partial API response', () => {
+    const { container } = render(<StatusBadge state={undefined} />)
+    expect(screen.getByText('UNKNOWN')).toBeTruthy()
+    expect(container.querySelector('[data-pattern="notice"]')).toBeTruthy()
+  })
+
+  it('keeps command progress visible when a legacy command envelope has no status', () => {
+    render(
+      <CommandProgress
+        command={{
+          command_id: 'restart-command',
+          type: 'command',
+          status: undefined,
+          created_at: '2026-07-23T12:00:00Z',
+          expires_at: null,
+        } as unknown as Parameters<typeof CommandProgress>[0]['command']}
+        onCancel={async () => undefined}
+      />,
+    )
+    expect(screen.getByRole('heading', { name: 'UNKNOWN' })).toBeTruthy()
+    expect(screen.getByText(/durably tracked/i)).toBeTruthy()
+  })
+
   it('renders only allowlisted alert diagnostics', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })

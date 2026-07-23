@@ -457,7 +457,7 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         )
     return {
         **serialize_connector(connector),
-        "active_command": serialize_command(active_command) if active_command else None,
+        "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
 
