@@ -1921,3 +1921,45 @@ def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
     response = client.get("/api/v1/attendance?cnic=not-a-cnic")
     assert response.status_code == 422
     assert "13 digits" in response.json()["detail"]
+
+
+def test_device_detail_exposes_admin_command_status_not_device_wire_envelope(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    command = create_command(
+        db,
+        connector=connector,
+        command_type="RESTART_ZKT",
+        payload={"reason": "Regression test", "mode": "protocol"},
+        expected_state={"serial": SERIAL},
+        desired_state={"restart": True},
+        idempotency_key="restart-device-detail-contract",
+        actor="StateHealthAdmin",
+        expires_in_seconds=120,
+    )
+    raw_session, _admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.get(f"/api/v1/devices/{connector.connector_id}")
+
+    assert response.status_code == 200
+    active = response.json()["active_command"]
+    assert active["command_id"] == command.command_id
+    assert active["type"] == "RESTART_ZKT"
+    assert active["status"] == command.status
+    assert active["status"]
+    assert "payload" not in active
+    assert "expected_state" not in active
+    assert "desired_state" not in active
