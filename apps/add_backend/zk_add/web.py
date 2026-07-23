@@ -49,6 +49,7 @@ from zk_add.models import (
     IdentityTombstone,
     OnboardingNonce,
     TemporaryAdminLease,
+    UserDeletionJob,
     ZKTDevice,
 )
 from zk_add.realtime import browser_events, connector_hub, sse_encode
@@ -56,6 +57,8 @@ from zk_add.schemas import (
     AdminLeaseRequest,
     AlertAcknowledgeRequest,
     AttendanceBatchRequest,
+    BulkUserDeleteCancelRequest,
+    BulkUserDeleteRequest,
     CommandUpdate,
     Envelope,
     HeartbeatPayload,
@@ -88,9 +91,11 @@ from zk_add.service import (
     ACTIVE_COMMAND_STATES,
     apply_command_update,
     apply_user_command_terminal_state,
+    cancel_user_deletion_job,
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_user_deletion_job,
     delete_device_user_command,
     fleet_counts,
     ingest_attendance,
@@ -101,6 +106,7 @@ from zk_add.service import (
     onboard_connector,
     serialize_command,
     serialize_connector,
+    serialize_user_deletion_job,
     terminal_fingerprint_preconditions,
     update_heartbeat,
     update_device_user_command,
@@ -809,6 +815,76 @@ async def delete_user_v2(
     db.commit()
     await dispatch_command(connector, command)
     return {"user": serialize_user(user, zkt=zkt), "command": command_response(command)}
+
+
+@app.post("/api/v2/devices/{connector_id}/user-deletion-jobs", status_code=202)
+def create_user_deletion_job_v2(
+    connector_id: str,
+    body: BulkUserDeleteRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        job = create_user_deletion_job(
+            db,
+            connector=connector,
+            targets=[
+                (target.user_key, target.expected_version) for target in body.targets
+            ],
+            reason=body.reason,
+            typed_confirmation=body.typed_confirmation,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {"job": serialize_user_deletion_job(db, job)}
+
+
+@app.get("/api/v2/devices/{connector_id}/user-deletion-jobs/latest")
+def latest_user_deletion_job_v2(
+    connector_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    job = db.scalar(
+        select(UserDeletionJob)
+        .where(UserDeletionJob.connector_id == connector.id)
+        .order_by(UserDeletionJob.created_at.desc())
+    )
+    return {"job": serialize_user_deletion_job(db, job) if job else None}
+
+
+@app.get("/api/v2/user-deletion-jobs/{job_id}")
+def get_user_deletion_job_v2(
+    job_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    job = db.scalar(select(UserDeletionJob).where(UserDeletionJob.job_id == job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail="User deletion job not found.")
+    return {"job": serialize_user_deletion_job(db, job)}
+
+
+@app.post("/api/v2/user-deletion-jobs/{job_id}/cancel", status_code=202)
+def cancel_user_deletion_job_v2(
+    job_id: str,
+    body: BulkUserDeleteCancelRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    job = db.scalar(select(UserDeletionJob).where(UserDeletionJob.job_id == job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail="User deletion job not found.")
+    cancel_user_deletion_job(db, job=job, actor=context.username)
+    db.commit()
+    return {"job": serialize_user_deletion_job(db, job)}
 
 
 @app.post("/api/v1/devices/{connector_id}/admin-leases", status_code=202)

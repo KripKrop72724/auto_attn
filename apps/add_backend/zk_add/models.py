@@ -412,6 +412,67 @@ class DeviceCommandEvent(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
+class UserDeletionJob(Base):
+    __tablename__ = "add_user_deletion_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_id",
+            "idempotency_key",
+            name="uq_add_user_deletion_job_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
+    requested_count: Mapped[int] = mapped_column(Integer)
+    succeeded_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    canceled_count: Mapped[int] = mapped_column(Integer, default=0)
+    expired_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = utc_column()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class UserDeletionItem(Base):
+    __tablename__ = "add_user_deletion_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "user_key", name="uq_add_user_deletion_item_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_user_deletion_jobs.id"), index=True)
+    device_user_id: Mapped[int] = mapped_column(ForeignKey("add_device_users.id"), index=True)
+    user_key: Mapped[str] = mapped_column(String(36))
+    uid: Mapped[str] = mapped_column(String(40))
+    user_id: Mapped[str] = mapped_column(String(100))
+    display_name_encrypted: Mapped[str] = mapped_column(Text)
+    expected_row_version: Mapped[int] = mapped_column(Integer)
+    expected_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    expected_state_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    current_command_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_device_commands.id"), index=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = utc_column()
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
 class TemporaryAdminLease(Base):
     __tablename__ = "add_temporary_admin_leases"
 

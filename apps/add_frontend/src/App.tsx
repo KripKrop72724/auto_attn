@@ -23,6 +23,7 @@ import type {
   IdentityIntegrity,
   Overview,
   UserCommandResponse,
+  UserDeletionJob,
 } from './types'
 
 type View = 'fleet' | 'users' | 'attendance' | 'alerts'
@@ -122,6 +123,9 @@ export function validateUserDraft(values: {
 export const confirmationMatches = (value: string, user: DeviceUser) =>
   value === user.display_name || value === user.user_id
 
+export const bulkDeletionConfirmation = (count: number, deviceId: string) =>
+  `DELETE ${count} USERS FROM ${deviceId}`
+
 const statusPattern = (state: string) => {
   const normalized = state.toUpperCase()
   if (
@@ -131,7 +135,7 @@ const statusPattern = (state: string) => {
   )
     return 'confirmed'
   if (
-    ['OFFLINE', 'FAILED', 'CRITICAL', 'EXPIRED', 'QUARANTINED', 'BLOCKED_IDENTITY'].some(
+    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'EXPIRED', 'QUARANTINED', 'BLOCKED_IDENTITY'].some(
       (item) => normalized.includes(item),
     )
   )
@@ -748,6 +752,145 @@ function IdentityResolutionDialog({
   )
 }
 
+function BulkDeletionDialog({
+  users,
+  device,
+  onClose,
+  onCreated,
+}: {
+  users: DeviceUser[]
+  device: Device
+  onClose: () => void
+  onCreated: (job: UserDeletionJob) => void
+}) {
+  const expectedConfirmation = bulkDeletionConfirmation(users.length, device.device_id)
+  const [reason, setReason] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    if (reason.trim().length < 10) return setError('Record a reason of at least 10 characters.')
+    if (confirmation !== expectedConfirmation) {
+      return setError(`Type ${expectedConfirmation} exactly to continue.`)
+    }
+    if (!password) return setError('Password confirmation is required.')
+    setBusy(true)
+    try {
+      const response = await api<{ job: UserDeletionJob }>(
+        `/api/v2/devices/${device.connector_id}/user-deletion-jobs`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            targets: users.map((user) => ({
+              user_key: user.user_key,
+              expected_version: user.row_version,
+            })),
+            reason: reason.trim(),
+            typed_confirmation: confirmation,
+            password,
+            idempotency_key: idempotency('bulk-delete-users'),
+          }),
+        },
+      )
+      onCreated(response.job)
+      onClose()
+    } catch (reasonValue) {
+      setError(
+        reasonValue instanceof Error
+          ? reasonValue.message
+          : 'The bulk deletion job could not be created.',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Dialog
+      titleId="bulk-user-deletion-title"
+      title={`Delete ${users.length} terminal users`}
+      description="ADD will process one user at a time and stop advancing if terminal verification is unsafe."
+      onClose={onClose}
+      className="bulk-deletion-dialog"
+    >
+      <form className="dialog-body" onSubmit={submit}>
+        <div className="destructive-copy pattern-blocked">
+          <Icon name="trash" />
+          <div>
+            <h3>{device.display_name}</h3>
+            <p>{users.map((user) => `${user.display_name} (${user.user_id})`).join(' · ')}</p>
+            <p>User records are removed from the ZKT. Attendance and ADD identity history remain preserved.</p>
+          </div>
+        </div>
+        <label>Audit reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
+        <label>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
+        <label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
+        <footer className="dialog-actions">
+          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className="button destructive" disabled={busy}>{busy ? 'Creating durable job…' : `Delete ${users.length} users safely`}</button>
+        </footer>
+      </form>
+    </Dialog>
+  )
+}
+
+function BulkDeletionProgress({
+  job,
+  onCancel,
+}: {
+  job: UserDeletionJob
+  onCancel: (password: string) => Promise<void>
+}) {
+  const active = ['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(job.status)
+  const [cancelOpen, setCancelOpen] = useState(false)
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  return (
+    <section className={`command-progress bulk-deletion-progress pattern-${statusPattern(job.status)}`} aria-live="polite">
+      <span className="command-symbol"><Icon name={job.status === 'SUCCEEDED' ? 'check' : ['PARTIAL', 'FAILED', 'EXPIRED'].includes(job.status) ? 'alert' : 'refresh'} /></span>
+      <div>
+        <p className="eyebrow">DURABLE BULK USER DELETION</p>
+        <h3>{job.status.replaceAll('_', ' ')}</h3>
+        <p>
+          {job.counts.succeeded} verified deleted · {job.counts.pending} pending ·{' '}
+          {job.counts.failed} failed · {job.counts.canceled} canceled · {job.counts.expired} expired
+        </p>
+        {job.items.find((item) => item.error_message)?.error_message && (
+          <small>{job.items.find((item) => item.error_message)?.error_message}</small>
+        )}
+      </div>
+      {active && job.status !== 'CANCEL_REQUESTED' && (
+        <div className="bulk-cancel">
+          {!cancelOpen ? (
+            <button className="button secondary" onClick={() => setCancelOpen(true)}>Cancel untouched users</button>
+          ) : (
+            <>
+              <input aria-label="Administrator password to cancel" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Administrator password" />
+              <button
+                className="button destructive"
+                disabled={busy || !password}
+                onClick={async () => {
+                  setBusy(true)
+                  try {
+                    await onCancel(password)
+                  } finally {
+                    setBusy(false)
+                  }
+                }}
+              >
+                {busy ? 'Canceling…' : 'Confirm cancel'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function UsersView({
   devices,
   selectedDeviceId,
@@ -774,6 +917,9 @@ function UsersView({
   const [integrity, setIntegrity] = useState<IdentityIntegrity | null>(null)
   const [conflictReport, setConflictReport] = useState<IdentityConflictReport | null>(null)
   const [resolutionDialog, setResolutionDialog] = useState<IdentityResolutionDialogState>(null)
+  const [selectedUserKeys, setSelectedUserKeys] = useState<Set<string>>(new Set())
+  const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
+  const [deletionJob, setDeletionJob] = useState<UserDeletionJob | null>(null)
 
   const load = useCallback(async () => {
     if (!selected) {
@@ -786,7 +932,7 @@ function UsersView({
     try {
       const compact = query.replace(/\D/g, '')
       const cnicSearch = compact.length === 13 && compact === query.replace(/[\s-]/g, '')
-      const [result, conflicts] = await Promise.all([
+      const [result, conflicts, latestJob] = await Promise.all([
         api<{
           rows: DeviceUser[]
           identity_integrity: IdentityIntegrity
@@ -801,10 +947,18 @@ function UsersView({
         api<IdentityConflictReport>(
           `/api/v2/devices/${selected.connector_id}/identity-conflicts`,
         ),
+        api<{ job: UserDeletionJob | null }>(
+          `/api/v2/devices/${selected.connector_id}/user-deletion-jobs/latest`,
+        ),
       ])
       setRows(result.rows)
+      setSelectedUserKeys((current) => {
+        const available = new Set(result.rows.map((user) => user.user_key))
+        return new Set([...current].filter((key) => available.has(key)))
+      })
       setIntegrity(result.identity_integrity || null)
       setConflictReport(conflicts)
+      setDeletionJob(latestJob.job)
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : 'Unable to load users.')
     } finally {
@@ -816,6 +970,38 @@ function UsersView({
     const timeout = window.setTimeout(() => void load(), 250)
     return () => window.clearTimeout(timeout)
   }, [load, revision])
+
+  useEffect(() => {
+    setSelectedUserKeys(new Set())
+    setBulkDialogOpen(false)
+  }, [selectedDeviceId])
+
+  useEffect(() => {
+    if (!deletionJob || !['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(deletionJob.status)) {
+      return
+    }
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await api<{ job: UserDeletionJob }>(
+          `/api/v2/user-deletion-jobs/${deletionJob.job_id}`,
+        )
+        const finished = !['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(response.job.status)
+        setDeletionJob(response.job)
+        if (finished) {
+          setSelectedUserKeys(new Set())
+          await Promise.all([load(), refreshFleet()])
+          if (response.job.status === 'SUCCEEDED') {
+            toast.notice('Every selected user was deleted and verified; attendance was preserved.')
+          } else {
+            toast.error(`Bulk deletion ended as ${response.job.status}. Review the per-user result.`)
+          }
+        }
+      } catch (reason) {
+        toast.error(reason instanceof Error ? reason.message : 'Unable to refresh deletion progress.')
+      }
+    }, 1600)
+    return () => window.clearTimeout(timeout)
+  }, [deletionJob, load, refreshFleet, toast.error, toast.notice])
 
   useEffect(() => {
     if (!command || terminalCommandStates.has(command.status)) return
@@ -849,6 +1035,39 @@ function UsersView({
       selected.zkt.snapshot_complete &&
       selected.zkt.capabilities.user_write,
   )
+  const deleteWritable = Boolean(writable && selected?.zkt?.capabilities.delete_user)
+  const eligibleRows = rows.filter(
+    (user) =>
+      user.privilege !== 14 &&
+      !user.read_only &&
+      !user.current_command_state,
+  )
+  const selectedUsers = eligibleRows.filter((user) => selectedUserKeys.has(user.user_key))
+  const activeDeletionJob = Boolean(
+    deletionJob && ['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(deletionJob.status),
+  )
+  const toggleUser = (userKey: string, checked: boolean) => {
+    setSelectedUserKeys((current) => {
+      const next = new Set(current)
+      if (checked) next.add(userKey)
+      else next.delete(userKey)
+      return next
+    })
+  }
+  const cancelDeletionJob = async (password: string) => {
+    if (!deletionJob) return
+    try {
+      const response = await api<{ job: UserDeletionJob }>(
+        `/api/v2/user-deletion-jobs/${deletionJob.job_id}/cancel`,
+        { method: 'POST', body: JSON.stringify({ password }) },
+      )
+      setDeletionJob(response.job)
+      toast.notice('Cancellation recorded. Any running user will finish verification; untouched users will be skipped.')
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Unable to cancel deletion job.')
+      throw reason
+    }
+  }
 
   return (
     <>
@@ -883,6 +1102,7 @@ function UsersView({
             </div>
           )}
           {command && <CommandProgress command={command} onCancel={cancel} />}
+          {deletionJob && <BulkDeletionProgress job={deletionJob} onCancel={cancelDeletionJob} />}
           {conflictReport && conflictReport.raw_duplicate_groups > 0 && (
             <section className="panel conflict-workbench" aria-label="Identity conflict review">
               <div className="section-heading">
@@ -936,13 +1156,45 @@ function UsersView({
               <label><span className="sr-only">Identity completeness</span><select value={identity} onChange={(event) => setIdentity(event.target.value)}><option value="ALL">All identities</option><option value="COMPLETE">CNIC complete</option><option value="MISSING">CNIC missing or unresolved</option><option value="CONFLICT">CNIC conflict</option><option value="RESOLVED_ALIAS">Verified aliases</option></select></label>
               <label><span className="sr-only">Role</span><select value={role} onChange={(event) => setRole(event.target.value)}><option value="ALL">All roles</option><option value="0">Regular users</option><option value="14">Administrators</option></select></label>
               <button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh users</button>
+              <label className="check-field bulk-select-all">
+                <input
+                  type="checkbox"
+                  checked={eligibleRows.length > 0 && selectedUsers.length === eligibleRows.length}
+                  disabled={!deleteWritable || activeDeletionJob || !eligibleRows.length}
+                  onChange={(event) =>
+                    setSelectedUserKeys(
+                      event.target.checked
+                        ? new Set(eligibleRows.map((user) => user.user_key))
+                        : new Set(),
+                    )
+                  }
+                />
+                <span><strong>Select eligible</strong><small>{selectedUsers.length} selected</small></span>
+              </label>
+              <button
+                className="button destructive"
+                disabled={!deleteWritable || activeDeletionJob || !selectedUsers.length}
+                onClick={() => setBulkDialogOpen(true)}
+              >
+                <Icon name="trash" /> Delete selected ({selectedUsers.length})
+              </button>
             </div>
             <div className="user-table" aria-busy={loading}>
               <div className="user-table-head"><span>Identity</span><span>Terminal record</span><span>Role & shift</span><span>Last sync</span><span>Actions</span></div>
               {loading && <div className="empty-state compact"><Icon name="refresh" /><p>Reading the selected terminal user view…</p></div>}
               {!loading && rows.map((user) => (
                 <article key={user.user_key} className={`user-row ${user.identity_conflict_resolved ? 'identity-resolved' : user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`}>
-                  <div className="user-person"><span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span></div>
+                  <div className="user-person">
+                    <input
+                      className="user-select"
+                      type="checkbox"
+                      aria-label={`Select ${user.display_name} for bulk deletion`}
+                      checked={selectedUserKeys.has(user.user_key)}
+                      disabled={!deleteWritable || activeDeletionJob || user.privilege === 14 || user.read_only || Boolean(user.current_command_state)}
+                      onChange={(event) => toggleUser(user.user_key, event.target.checked)}
+                    />
+                    <span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span>
+                  </div>
                   <div><strong>User {user.user_id}</strong><small>UID {user.uid} · v{user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
                   <div><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} /><small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small></div>
                   <div><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>
@@ -959,6 +1211,17 @@ function UsersView({
         </>
       )}
       {dialog && selected && <UserOperationDialog state={dialog} device={selected} onClose={() => setDialog(null)} onCommand={setCommand} toast={toast} />}
+      {bulkDialogOpen && selected && selectedUsers.length > 0 && (
+        <BulkDeletionDialog
+          users={selectedUsers}
+          device={selected}
+          onClose={() => setBulkDialogOpen(false)}
+          onCreated={(job) => {
+            setDeletionJob(job)
+            toast.notice('Durable bulk deletion job created. ADD will verify one user at a time.')
+          }}
+        />
+      )}
       {resolutionDialog && selected && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void load() }} toast={toast} />}
     </>
   )
