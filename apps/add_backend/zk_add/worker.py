@@ -28,6 +28,7 @@ from zk_add.realtime import browser_events, connector_hub
 from zk_add.service import (
     ACTIVE_COMMAND_STATES,
     MUTATING_COMMANDS,
+    advance_user_deletion_jobs,
     apply_user_command_terminal_state,
     oracle_payload,
     queue_due_revokes,
@@ -178,6 +179,7 @@ async def maintenance_tick() -> None:
                         message="ESP heartbeat is stale.",
                     )
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
+        advance_user_deletion_jobs(session)
         for command in session.scalars(
             select(DeviceCommand)
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))

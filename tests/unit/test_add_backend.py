@@ -25,6 +25,7 @@ from zk_add.models import (
     Connector,
     ConnectorCredential,
     DeviceAlert,
+    DeviceCommand,
     DeviceConnectionEvent,
     DeviceUser,
     IdentityConflictResolution,
@@ -32,6 +33,7 @@ from zk_add.models import (
     OnboardingNonce,
     OrdsOutbox,
     TemporaryAdminLease,
+    UserDeletionItem,
 )
 from zk_add.onboarding import derive_bootstrap_secret, verify_onboarding_signature
 from zk_add.protocol import body_sha256, sign_request, signature_material
@@ -52,16 +54,20 @@ from zk_add.security import (
     require_step_up,
 )
 from zk_add.service import (
+    advance_user_deletion_jobs,
     apply_command_update,
+    cancel_user_deletion_job,
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_user_deletion_job,
     delete_device_user_command,
     ingest_attendance,
     onboard_connector,
     oracle_payload,
     replace_user_snapshot,
     serialize_command,
+    serialize_user_deletion_job,
     update_device_user_command,
     update_heartbeat,
     upsert_alert,
@@ -1156,6 +1162,130 @@ def test_delete_postcondition_failure_keeps_user_active(db: Session):
     )
     assert result.status == "FAILED"
     assert result.error_code == "DELETE_POSTCONDITION_FAILED"
+    assert user.present and user.lifecycle_state == "ACTIVE"
+
+
+def test_bulk_user_deletion_job_is_idempotent_sequential_and_preserves_attendance(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    connector.zkt_device.attendance_count = 73
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="bulk-delete-source",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="11", user_id="1011", name=f"First-{CNIC}"),
+                UserSnapshotRow(uid="12", user_id="1012", name="Second-6110112345671"),
+            ],
+        ),
+    )
+    users = list(
+        db.scalars(
+            select(DeviceUser)
+            .where(DeviceUser.zkt_device_id == connector.zkt_device.id)
+            .order_by(DeviceUser.uid)
+        ).all()
+    )
+    targets = [(user.user_key, user.row_version) for user in users]
+    job = create_user_deletion_job(
+        db,
+        connector=connector,
+        targets=targets,
+        reason="Approved duplicate terminal cleanup",
+        typed_confirmation="DELETE 2 USERS FROM 1",
+        idempotency_key="bulk-delete-users-0001",
+        actor="StateHealthAdmin",
+    )
+    replay = create_user_deletion_job(
+        db,
+        connector=connector,
+        targets=targets,
+        reason="Approved duplicate terminal cleanup",
+        typed_confirmation="DELETE 2 USERS FROM 1",
+        idempotency_key="bulk-delete-users-0001",
+        actor="StateHealthAdmin",
+    )
+    assert replay.id == job.id
+
+    advance_user_deletion_jobs(db)
+    items = list(
+        db.scalars(
+            select(UserDeletionItem)
+            .where(UserDeletionItem.job_id == job.id)
+            .order_by(UserDeletionItem.id)
+        ).all()
+    )
+    assert [item.status for item in items] == ["RUNNING", "PENDING"]
+    first_command = items[0].current_command_id
+    assert first_command is not None
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=db.get(DeviceCommand, first_command).command_id,
+        status="SUCCEEDED",
+        result={
+            "user_absent": True,
+            "attendance_count_before": 73,
+            "attendance_count_after": 73,
+        },
+        error_code=None,
+        error_message=None,
+    )
+    advance_user_deletion_jobs(db)
+    assert [item.status for item in items] == ["SUCCEEDED", "RUNNING"]
+    second_command = items[1].current_command_id
+    assert second_command is not None and second_command != first_command
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=db.get(DeviceCommand, second_command).command_id,
+        status="SUCCEEDED",
+        result={
+            "user_absent": True,
+            "attendance_count_before": 73,
+            "attendance_count_after": 73,
+        },
+        error_code=None,
+        error_message=None,
+    )
+    advance_user_deletion_jobs(db)
+    summary = serialize_user_deletion_job(db, job)
+    assert job.status == "SUCCEEDED"
+    assert summary["counts"] == {
+        "requested": 2,
+        "succeeded": 2,
+        "failed": 0,
+        "canceled": 0,
+        "expired": 0,
+        "pending": 0,
+    }
+    assert connector.zkt_device.attendance_count == 73
+    assert all(not user.present and user.lifecycle_state == "DELETED" for user in users)
+
+
+def test_bulk_user_deletion_cancels_only_untouched_items(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    job = create_user_deletion_job(
+        db,
+        connector=connector,
+        targets=[(user.user_key, user.row_version)],
+        reason="Operator withdrew the cleanup request",
+        typed_confirmation="DELETE 1 USERS FROM 1",
+        idempotency_key="bulk-delete-users-cancel",
+        actor="StateHealthAdmin",
+    )
+    cancel_user_deletion_job(db, job=job, actor="StateHealthAdmin")
+    advance_user_deletion_jobs(db)
+    item = db.scalar(select(UserDeletionItem).where(UserDeletionItem.job_id == job.id))
+    assert job.status == "CANCELED"
+    assert item.status == "CANCELED"
     assert user.present and user.lifecycle_state == "ACTIVE"
 
 

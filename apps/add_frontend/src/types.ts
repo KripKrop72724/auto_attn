@@ -116,6 +116,37 @@ export interface DeviceUser {
   read_only: boolean
 }
 
+export interface UserDeletionJobItem {
+  user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  status: string
+  error_code: string | null
+  error_message: string | null
+  result: Record<string, unknown>
+}
+
+export interface UserDeletionJob {
+  job_id: string
+  connector_id: string
+  status: string
+  reason: string
+  counts: {
+    requested: number
+    succeeded: number
+    failed: number
+    canceled: number
+    expired: number
+    pending: number
+  }
+  created_at: string
+  expires_at: string
+  started_at: string | null
+  completed_at: string | null
+  items: UserDeletionJobItem[]
+}
+
 export interface IdentityIntegrity {
   source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT' | 'PARTIAL_ZKT_SNAPSHOT'
   total_users: number

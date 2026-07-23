@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,8 @@ from zk_add.models import (
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
+    UserDeletionItem,
+    UserDeletionJob,
     ZKTDevice,
 )
 from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest
@@ -78,6 +81,8 @@ ORACLE_ALLOWED_CAPTURE_TYPES = {
     "MANUAL_REPROCESS",
 }
 IDENTITY_CONFLICT_DUPLICATE_CNIC = "DUPLICATE_CNIC"
+ACTIVE_USER_DELETION_JOB_STATES = {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
+TERMINAL_USER_DELETION_ITEM_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"}
 
 
 def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
@@ -1174,6 +1179,7 @@ def create_command(
     idempotency_key: str,
     actor: str,
     expires_in_seconds: int | None = 300,
+    owning_user_deletion_job_id: int | None = None,
 ) -> DeviceCommand:
     existing = session.scalar(
         select(DeviceCommand).where(
@@ -1189,6 +1195,16 @@ def create_command(
     ):
         raise ValueError("This connector is quarantined because its ZKT serial is duplicated.")
     if command_type in MUTATING_COMMANDS:
+        active_job = session.scalar(
+            select(UserDeletionJob).where(
+                UserDeletionJob.connector_id == connector.id,
+                UserDeletionJob.status.in_(ACTIVE_USER_DELETION_JOB_STATES),
+            )
+        )
+        if active_job and active_job.id != owning_user_deletion_job_id:
+            raise ValueError(
+                f"Device already has active user deletion job {active_job.job_id}."
+            )
         active = session.scalar(
             select(DeviceCommand).where(
                 DeviceCommand.connector_id == connector.id,
@@ -1703,6 +1719,8 @@ def delete_device_user_command(
     typed_confirmation: str,
     idempotency_key: str,
     actor: str,
+    owning_user_deletion_job_id: int | None = None,
+    expires_in_seconds: int | None = None,
 ) -> DeviceCommand:
     replay = find_idempotent_user_command(
         session,
@@ -1776,10 +1794,398 @@ def delete_device_user_command(
         desired_state={"user_key": user.user_key, "present": False},
         idempotency_key=idempotency_key,
         actor=actor,
-        expires_in_seconds=settings.user_command_retry_seconds,
+        expires_in_seconds=(
+            settings.user_command_retry_seconds
+            if expires_in_seconds is None
+            else expires_in_seconds
+        ),
+        owning_user_deletion_job_id=owning_user_deletion_job_id,
     )
     user.current_command_id = command.id
     return command
+
+
+def _bulk_delete_request_digest(*, targets: list[tuple[str, int]], reason: str) -> str:
+    canonical = {
+        "reason": reason.strip(),
+        "targets": [
+            {"user_key": user_key, "expected_version": expected_version}
+            for user_key, expected_version in sorted(targets)
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def create_user_deletion_job(
+    session: Session,
+    *,
+    connector: Connector,
+    targets: list[tuple[str, int]],
+    reason: str,
+    typed_confirmation: str,
+    idempotency_key: str,
+    actor: str,
+) -> UserDeletionJob:
+    digest = _bulk_delete_request_digest(targets=targets, reason=reason)
+    existing = session.scalar(
+        select(UserDeletionJob).where(
+            UserDeletionJob.connector_id == connector.id,
+            UserDeletionJob.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.request_digest != digest:
+            raise ValueError("That idempotency key belongs to a different deletion request.")
+        return existing
+
+    zkt = require_writable_user_profile(connector, "delete_user")
+    lock_zkt_user_registry(session, zkt=zkt)
+    ensure_no_active_user_operation(session, zkt=zkt)
+    expected_confirmation = f"DELETE {len(targets)} USERS FROM {connector.device_id}"
+    if typed_confirmation.strip() != expected_confirmation:
+        raise ValueError(f'Typed confirmation must exactly match "{expected_confirmation}".')
+    if session.scalar(
+        select(UserDeletionJob).where(
+            UserDeletionJob.connector_id == connector.id,
+            UserDeletionJob.status.in_(ACTIVE_USER_DELETION_JOB_STATES),
+        )
+    ):
+        raise ValueError("This device already has an active bulk user deletion job.")
+    if session.scalar(
+        select(DeviceCommand).where(
+            DeviceCommand.connector_id == connector.id,
+            DeviceCommand.command_type.in_(MUTATING_COMMANDS),
+            DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
+        )
+    ):
+        raise ValueError("This device already has an active mutating command.")
+
+    requested = {
+        user_key: expected_version for user_key, expected_version in targets
+    }
+    users = list(
+        session.scalars(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.user_key.in_(requested),
+            )
+        ).all()
+    )
+    if len(users) != len(requested):
+        found = {user.user_key for user in users}
+        missing = sorted(set(requested) - found)
+        raise ValueError(f"Selected terminal users no longer exist: {', '.join(missing[:5])}.")
+    users_by_key = {user.user_key: user for user in users}
+    for user_key, expected_version in targets:
+        user = users_by_key[user_key]
+        if user.lifecycle_state != "ACTIVE" or not user.present:
+            raise ValueError(f"User {user.user_id} is no longer active.")
+        if user.row_version != expected_version:
+            raise ValueError(f"User {user.user_id} changed since it was selected.")
+        if user.privilege == 14:
+            raise ValueError(
+                f"User {user.user_id} is a permanent administrator and cannot be deleted."
+            )
+        if user.current_command_id is not None:
+            raise ValueError(f"User {user.user_id} already has an active command.")
+        terminal_fingerprint_preconditions(user)
+
+    now = utc_now()
+    job = UserDeletionJob(
+        connector_id=connector.id,
+        zkt_device_id=zkt.id,
+        actor=actor,
+        reason=reason.strip(),
+        idempotency_key=idempotency_key,
+        request_digest=digest,
+        status="QUEUED",
+        requested_count=len(targets),
+        expires_at=now + timedelta(hours=24),
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(job)
+    session.flush()
+    for user_key, expected_version in targets:
+        user = users_by_key[user_key]
+        session.add(
+            UserDeletionItem(
+                job_id=job.id,
+                device_user_id=user.id,
+                user_key=user.user_key,
+                uid=user.uid,
+                user_id=user.user_id,
+                display_name_encrypted=encrypt_text(user.display_name) or "",
+                expected_row_version=expected_version,
+                expected_identity_fingerprint=user.terminal_identity_fingerprint,
+                expected_state_fingerprint=user.terminal_state_fingerprint,
+                status="PENDING",
+                result={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    append_audit(
+        session,
+        actor=actor,
+        action="BULK_USER_DELETE_REQUESTED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome="PENDING",
+        after={
+            "job_id": job.job_id,
+            "requested_count": job.requested_count,
+            "reason": job.reason,
+        },
+    )
+    return job
+
+
+def _refresh_user_deletion_job_counts(
+    session: Session, job: UserDeletionJob
+) -> list[UserDeletionItem]:
+    items = list(
+        session.scalars(
+            select(UserDeletionItem)
+            .where(UserDeletionItem.job_id == job.id)
+            .order_by(UserDeletionItem.id.asc())
+        ).all()
+    )
+    job.succeeded_count = sum(item.status == "SUCCEEDED" for item in items)
+    job.failed_count = sum(item.status == "FAILED" for item in items)
+    job.canceled_count = sum(item.status == "CANCELED" for item in items)
+    job.expired_count = sum(item.status == "EXPIRED" for item in items)
+    job.updated_at = utc_now()
+    return items
+
+
+def _finalize_user_deletion_job(
+    session: Session, *, job: UserDeletionJob, connector: Connector
+) -> None:
+    items = _refresh_user_deletion_job_counts(session, job)
+    if any(item.status not in TERMINAL_USER_DELETION_ITEM_STATES for item in items):
+        return
+    if job.completed_at is not None:
+        return
+    if job.succeeded_count == job.requested_count:
+        status = "SUCCEEDED"
+    elif job.succeeded_count:
+        status = "PARTIAL"
+    elif job.failed_count:
+        status = "FAILED"
+    elif job.expired_count:
+        status = "EXPIRED"
+    else:
+        status = "CANCELED"
+    now = utc_now()
+    job.status = status
+    job.completed_at = now
+    job.updated_at = now
+    summary = {
+        "job_id": job.job_id,
+        "requested": job.requested_count,
+        "succeeded": job.succeeded_count,
+        "failed": job.failed_count,
+        "canceled": job.canceled_count,
+        "expired": job.expired_count,
+    }
+    append_audit(
+        session,
+        actor=job.actor,
+        action="BULK_USER_DELETE_COMPLETED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome=status,
+        after=summary,
+    )
+    if status in {"PARTIAL", "FAILED", "EXPIRED"}:
+        upsert_alert(
+            session,
+            connector,
+            code="USER_DELETION_JOB_INCOMPLETE",
+            severity="HIGH",
+            message="A bulk user deletion job did not delete every selected user.",
+            details=summary,
+        )
+
+
+def advance_user_deletion_jobs(session: Session) -> None:
+    now = utc_now()
+    jobs = list(
+        session.scalars(
+            select(UserDeletionJob)
+            .where(UserDeletionJob.status.in_(ACTIVE_USER_DELETION_JOB_STATES))
+            .order_by(UserDeletionJob.created_at.asc())
+        ).all()
+    )
+    for job in jobs:
+        connector = session.get(Connector, job.connector_id)
+        if connector is None:
+            continue
+        items = _refresh_user_deletion_job_counts(session, job)
+
+        for item in items:
+            if item.status != "RUNNING" or item.current_command_id is None:
+                continue
+            command = session.get(DeviceCommand, item.current_command_id)
+            if command is None or command.status in ACTIVE_COMMAND_STATES:
+                continue
+            item.result = command.result or {}
+            item.error_code = command.error_code
+            item.error_message = command.error_message
+            item.completed_at = command.completed_at or now
+            item.updated_at = now
+            if command.status == "SUCCEEDED":
+                item.status = "SUCCEEDED"
+            elif command.status in {"CANCELLED", "CANCELED"}:
+                item.status = "CANCELED"
+            elif command.status == "EXPIRED":
+                item.status = "EXPIRED"
+            else:
+                item.status = "FAILED"
+
+        items = _refresh_user_deletion_job_counts(session, job)
+        if job.expires_at <= now:
+            for item in items:
+                if item.status == "PENDING":
+                    item.status = "EXPIRED"
+                    item.error_code = "JOB_EXPIRED"
+                    item.error_message = "The deletion job exceeded its 24-hour safety window."
+                    item.completed_at = now
+                    item.updated_at = now
+            _finalize_user_deletion_job(session, job=job, connector=connector)
+            continue
+
+        if job.status == "CANCEL_REQUESTED":
+            for item in items:
+                if item.status == "PENDING":
+                    item.status = "CANCELED"
+                    item.error_code = "JOB_CANCELED"
+                    item.error_message = "Canceled before dispatch."
+                    item.completed_at = now
+                    item.updated_at = now
+            _finalize_user_deletion_job(session, job=job, connector=connector)
+            continue
+
+        if any(item.status == "RUNNING" for item in items):
+            continue
+        pending = next((item for item in items if item.status == "PENDING"), None)
+        if pending is None:
+            _finalize_user_deletion_job(session, job=job, connector=connector)
+            continue
+
+        user = session.get(DeviceUser, pending.device_user_id)
+        mismatch = None
+        if user is None or user.user_key != pending.user_key:
+            mismatch = "The selected user record no longer exists."
+        elif user.lifecycle_state != "ACTIVE" or not user.present:
+            mismatch = "The selected user is no longer active."
+        elif user.uid != pending.uid or user.user_id != pending.user_id:
+            mismatch = "The selected terminal identity changed."
+        elif user.privilege == 14:
+            mismatch = "The selected user is now a permanent administrator."
+        elif (
+            pending.expected_identity_fingerprint
+            and user.terminal_identity_fingerprint
+            != pending.expected_identity_fingerprint
+        ):
+            mismatch = "The selected terminal identity fingerprint changed."
+        elif (
+            pending.expected_state_fingerprint
+            and user.terminal_state_fingerprint != pending.expected_state_fingerprint
+        ):
+            mismatch = "The selected terminal state fingerprint changed."
+        if mismatch:
+            pending.status = "FAILED"
+            pending.error_code = "USER_PRECONDITION_CHANGED"
+            pending.error_message = mismatch
+            pending.completed_at = now
+            pending.updated_at = now
+            continue
+
+        try:
+            remaining_seconds = max(1, int((job.expires_at - now).total_seconds()))
+            command = delete_device_user_command(
+                session,
+                connector=connector,
+                user=user,
+                expected_version=user.row_version,
+                typed_confirmation=user.user_id,
+                idempotency_key=f"bulk-delete:{job.job_id}:{pending.id}",
+                actor=job.actor,
+                owning_user_deletion_job_id=job.id,
+                expires_in_seconds=remaining_seconds,
+            )
+        except ValueError as exc:
+            pending.status = "FAILED"
+            pending.error_code = "DELETE_DISPATCH_REJECTED"
+            pending.error_message = str(exc)
+            pending.completed_at = now
+            pending.updated_at = now
+            continue
+        pending.status = "RUNNING"
+        pending.current_command_id = command.id
+        pending.updated_at = now
+        job.status = "RUNNING"
+        job.started_at = job.started_at or now
+        job.updated_at = now
+
+
+def cancel_user_deletion_job(
+    session: Session, *, job: UserDeletionJob, actor: str
+) -> UserDeletionJob:
+    if job.status not in ACTIVE_USER_DELETION_JOB_STATES:
+        return job
+    job.status = "CANCEL_REQUESTED"
+    job.updated_at = utc_now()
+    append_audit(
+        session,
+        actor=actor,
+        action="BULK_USER_DELETE_CANCEL_REQUESTED",
+        target_type="user_deletion_job",
+        target_id=job.job_id,
+        outcome="PENDING",
+    )
+    return job
+
+
+def serialize_user_deletion_job(session: Session, job: UserDeletionJob) -> dict:
+    items = _refresh_user_deletion_job_counts(session, job)
+    return {
+        "job_id": job.job_id,
+        "connector_id": session.get(Connector, job.connector_id).connector_id,
+        "status": job.status,
+        "reason": job.reason,
+        "counts": {
+            "requested": job.requested_count,
+            "succeeded": job.succeeded_count,
+            "failed": job.failed_count,
+            "canceled": job.canceled_count,
+            "expired": job.expired_count,
+            "pending": sum(
+                item.status not in TERMINAL_USER_DELETION_ITEM_STATES for item in items
+            ),
+        },
+        "created_at": job.created_at,
+        "expires_at": job.expires_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+        "items": [
+            {
+                "user_key": item.user_key,
+                "uid": item.uid,
+                "user_id": item.user_id,
+                "display_name": decrypt_text(item.display_name_encrypted) or "",
+                "status": item.status,
+                "error_code": item.error_code,
+                "error_message": item.error_message,
+                "result": item.result or {},
+            }
+            for item in items
+        ],
+    }
 
 
 def serialize_connector(connector: Connector) -> dict:

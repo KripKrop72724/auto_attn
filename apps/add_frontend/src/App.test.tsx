@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, {
   buildMachinePreview,
+  bulkDeletionConfirmation,
   CommandProgress,
   confirmationMatches,
   formatAlertDiagnostics,
@@ -206,6 +207,9 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
           : [],
       })
     }
+    if (path.includes('/api/v2/devices/connector-one/user-deletion-jobs/latest')) {
+      return response({ job: null })
+    }
     if (path.includes('/api/v2/devices/connector-one/users')) {
       const hasConflict = users.some((row) => row.identity_conflict_code)
       return response({
@@ -237,6 +241,12 @@ describe('State Life ADD interface', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+  })
+
+  it('builds an exact device-scoped bulk deletion confirmation', () => {
+    expect(bulkDeletionConfirmation(12, 'ZONE-SWAT-01')).toBe(
+      'DELETE 12 USERS FROM ZONE-SWAT-01',
+    )
   })
 
   it('uses secure automatic onboarding language and exposes no registration control', async () => {

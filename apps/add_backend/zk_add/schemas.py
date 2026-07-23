@@ -194,6 +194,30 @@ class UserDeleteRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class BulkUserDeleteTarget(BaseModel):
+    user_key: str = Field(min_length=1, max_length=36)
+    expected_version: int = Field(ge=1)
+
+
+class BulkUserDeleteRequest(BaseModel):
+    targets: list[BulkUserDeleteTarget] = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @model_validator(mode="after")
+    def unique_targets(self):
+        keys = [target.user_key for target in self.targets]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Each terminal user may be selected only once")
+        return self
+
+
+class BulkUserDeleteCancelRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=512)
+
+
 class IdentityConflictMemberConfirmation(BaseModel):
     user_key: str = Field(min_length=1, max_length=36)
     expected_version: int = Field(ge=1)
