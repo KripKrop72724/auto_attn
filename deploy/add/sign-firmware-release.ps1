@@ -76,14 +76,16 @@ try {
     Copy-Item -LiteralPath $publicPath -Destination (Join-Path $output 'manifest-public-key.pem')
     $imageHash = (Get-FileHash -LiteralPath (Join-Path $output "zone-lite-$Version.bin") -Algorithm SHA256).Hash.ToLowerInvariant()
     $manifest = [ordered]@{
-        build_sha = $GitSha
         created_at = [DateTime]::UtcNow.ToString('o')
         esp_idf_version = '5.5.3'
+        git_sha = $GitSha
         hardware = 'esp32-s3-zone-lite'
-        image_file = "zone-lite-$Version.bin"
+        image_name = "zone-lite-$Version.bin"
         image_sha256 = $imageHash
         image_size = $size
+        minimum_bootstrap_version = '2.2.0'
         partition_layout = 'zone-lite-ota-v1'
+        release_id = "zone-lite-$Version"
         schema_version = 1
         secure_boot = 'v2'
         signing_key_id = $keyId
@@ -92,17 +94,22 @@ try {
     $manifestJson = $manifest | ConvertTo-Json -Compress
     [IO.File]::WriteAllText(
         (Join-Path $output 'manifest.json'),
-        $manifestJson + "`n",
+        $manifestJson,
         (New-Object Text.UTF8Encoding($false))
     )
     Copy-Item -LiteralPath (Join-Path $output 'manifest.json') -Destination (Join-Path $work 'manifest.json')
     Invoke-Docker @(
         'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
         'openssl', 'dgst', '-sha256', '-sign', '/work/active-key.pem',
-        '-sigopt', 'rsa_padding_mode:pss', '-sigopt', 'rsa_pss_saltlen:-1',
+        '-sigopt', 'rsa_padding_mode:pss', '-sigopt', 'rsa_pss_saltlen:32',
         '-out', '/work/manifest.sig', '/work/manifest.json'
     )
-    Copy-Item -LiteralPath (Join-Path $work 'manifest.sig') -Destination (Join-Path $output 'manifest.sig')
+    $signature = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $work 'manifest.sig')))
+    [IO.File]::WriteAllText(
+        (Join-Path $output 'manifest.sig'),
+        $signature + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
     $sumLines = @()
     foreach ($name in @("zone-lite-$Version.bin", 'manifest.json', 'manifest.sig', 'manifest-public-key.pem')) {
         $hash = (Get-FileHash -LiteralPath (Join-Path $output $name) -Algorithm SHA256).Hash.ToLowerInvariant()
