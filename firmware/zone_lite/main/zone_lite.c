@@ -5421,48 +5421,74 @@ static int64_t gateway_run(uint32_t host_order_ip)
             }
             bool reconcile_succeeded = true;
             if (counter_mismatch || truth_due) {
-                char reason[192];
-                snprintf(
-                    reason,
-                    sizeof(reason),
-                    "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s firmware_forced=%s",
-                    (long long)record_delta,
-                    (unsigned)live_events_since_sync,
-                    truth_due ? "true" : "false",
-                    g_force_truth_reconcile ? "true" : "false");
-                ESP_LOGI(TAG, "%s", reason);
-                add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
-                if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
-                led_status_set(LED_STATUS_SYNCING);
-                size_t added = 0;
-                const char *reconcile_capturetype = g_last_synced_attendance_count < 0
-                    ? "DUMP_STARTUP"
-                    : "DUMP_RECONNECT";
-                if (reconcile_attendance_dump(
-                        sock,
-                        &ctx,
-                        users,
-                        refreshed_records,
-                        reconcile_capturetype,
-                        device_now.tm_year + 1900,
-                        device_now.tm_mon + 1,
-                        device_now.tm_mday,
-                        &added)) {
-                    g_force_truth_reconcile = false;
-                    g_last_synced_attendance_count = refreshed_records;
-                    live_events_since_sync = 0;
-                    g_last_full_truth_reconcile_ms = now_ms;
-                    if (epoch_valid) {
-                        g_last_full_truth_reconcile_epoch = current_epoch;
+                uint32_t bulk_depth = 0;
+                bool bulk_depth_available =
+                    add_connector_get_bulk_outbox_depth(&bulk_depth);
+                if (!bulk_depth_available || bulk_depth > 0) {
+                    char deferred[192];
+                    if (bulk_depth_available) {
+                        snprintf(
+                            deferred,
+                            sizeof(deferred),
+                            "Full reconcile deferred while %u durable ADD bulk row(s) drain; live capture remains prioritized",
+                            (unsigned)bulk_depth);
+                    } else {
+                        snprintf(
+                            deferred,
+                            sizeof(deferred),
+                            "Full reconcile deferred because durable ADD bulk depth is temporarily unavailable; live capture remains prioritized");
                     }
-                    nvs_save_runtime_state();
-                } else {
-                    reconcile_succeeded = false;
+                    ESP_LOGI(TAG, "%s", deferred);
                     add_connector_log(
-                        "ERROR",
+                        "INFO",
                         "reconcile",
-                        "FULL_RECONCILE_FAILED",
-                        "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
+                        "FULL_RECONCILE_DEFERRED_OUTBOX",
+                        deferred);
+                    reconcile_succeeded = false;
+                } else {
+                    char reason[192];
+                    snprintf(
+                        reason,
+                        sizeof(reason),
+                        "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s firmware_forced=%s",
+                        (long long)record_delta,
+                        (unsigned)live_events_since_sync,
+                        truth_due ? "true" : "false",
+                        g_force_truth_reconcile ? "true" : "false");
+                    ESP_LOGI(TAG, "%s", reason);
+                    add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
+                    if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
+                    led_status_set(LED_STATUS_SYNCING);
+                    size_t added = 0;
+                    const char *reconcile_capturetype = g_last_synced_attendance_count < 0
+                        ? "DUMP_STARTUP"
+                        : "DUMP_RECONNECT";
+                    if (reconcile_attendance_dump(
+                            sock,
+                            &ctx,
+                            users,
+                            refreshed_records,
+                            reconcile_capturetype,
+                            device_now.tm_year + 1900,
+                            device_now.tm_mon + 1,
+                            device_now.tm_mday,
+                            &added)) {
+                        g_force_truth_reconcile = false;
+                        g_last_synced_attendance_count = refreshed_records;
+                        live_events_since_sync = 0;
+                        g_last_full_truth_reconcile_ms = now_ms;
+                        if (epoch_valid) {
+                            g_last_full_truth_reconcile_epoch = current_epoch;
+                        }
+                        nvs_save_runtime_state();
+                    } else {
+                        reconcile_succeeded = false;
+                        add_connector_log(
+                            "ERROR",
+                            "reconcile",
+                            "FULL_RECONCILE_FAILED",
+                            "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
+                    }
                 }
             } else {
                 char summary[160];
