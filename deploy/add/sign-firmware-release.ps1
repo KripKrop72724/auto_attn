@@ -49,7 +49,16 @@ $sourceImage = Join-Path $unsigned 'zone_lite.bin'
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
-$work = Join-Path $env:TEMP ('zone-lite-release-sign-' + [guid]::NewGuid().ToString('N'))
+$workRoot = if ($env:RUNNER_TEMP) {
+    (Resolve-Path $env:RUNNER_TEMP).Path
+}
+elseif ($env:GITHUB_WORKSPACE) {
+    (Resolve-Path $env:GITHUB_WORKSPACE).Path
+}
+else {
+    $output
+}
+$work = Join-Path $workRoot ('zone-lite-release-sign-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 $tempKey = Join-Path $work 'active-key.pem'
 try {
