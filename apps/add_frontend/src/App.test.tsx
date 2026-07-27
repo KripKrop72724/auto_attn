@@ -10,6 +10,7 @@ import App, {
   StatusBadge,
   validateUserDraft,
 } from './App'
+import { api } from './api'
 import type { Device, DeviceUser } from './types'
 
 const maskedCnic = '*****-****567-1'
@@ -126,7 +127,7 @@ const response = (body: unknown, status = 200) =>
   })
 
 const fetchStub = (users: DeviceUser[] = [user]) =>
-  vi.fn(async (input: RequestInfo | URL) => {
+  vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (path.includes('/api/v1/auth/session')) {
       return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
@@ -152,6 +153,39 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
           last_attempt_at: '2026-07-13T12:05:00Z',
         },
       })
+    }
+    if (path.endsWith('/api/v1/firmware/releases')) {
+      return response({
+        enabled: false,
+        hil_enabled: true,
+        rows: [{
+          release_id: 'release-2-2-4',
+          version: '2.2.4',
+          git_sha: 'f11f9306d7c0f01df19123dda9bea6157a68119d',
+          image_sha256: 'a'.repeat(64),
+          application_sha256: 'b'.repeat(64),
+          image_size: 1_048_576,
+          state: 'HIL_ONLY',
+          partition_layout: 'ota_0/ota_1',
+          signing_key_id: 'zone-lite-production',
+          published_at: '2026-07-27T12:00:00Z',
+          hil_target_mac: device.hardware_id,
+        }],
+      })
+    }
+    if (path.endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST') {
+      return response({
+        campaign_id: 'campaign-one',
+        status: 'ACTIVE',
+        eligible: 1,
+        legacy_skipped: 0,
+      }, 201)
+    }
+    if (path.endsWith('/api/v1/firmware/campaigns')) {
+      return response({ enabled: false, hil_enabled: true, rows: [] })
+    }
+    if (/\/api\/v1\/firmware\/campaigns\/[^/]+\/(pause|resume|cancel)$/.test(path)) {
+      return response({ campaign_id: 'campaign-one', status: 'PAUSED' })
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
@@ -317,6 +351,54 @@ describe('State Life ADD interface', () => {
     const { container } = render(<StatusBadge state={undefined} />)
     expect(screen.getByText('UNKNOWN')).toBeTruthy()
     expect(container.querySelector('[data-pattern="notice"]')).toBeTruthy()
+  })
+
+  it('starts an exact-target HIL firmware campaign with step-up confirmation', async () => {
+    const fetchMock = fetchStub()
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
+    expect(await screen.findByRole('heading', { name: 'Firmware releases and campaigns' })).toBeTruthy()
+    expect(await screen.findByText(device.hardware_id)).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Signed release'), {
+      target: { value: 'release-2-2-4' },
+    })
+    expect((screen.getByLabelText('Zone') as HTMLSelectElement).value).toBe(device.zone_id)
+    expect((screen.getByLabelText('Zone') as HTMLSelectElement).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Audited reason'), {
+      target: { value: 'Pilot SWAT deployment validation' },
+    })
+    fireEvent.change(screen.getByLabelText('Type release version to confirm'), {
+      target: { value: '2.2.4' },
+    })
+    const password = screen.getByLabelText('Administrator password') as HTMLInputElement
+    fireEvent.change(password, { target: { value: 'local-step-up-value' } })
+    fireEvent.click(screen.getByRole('button', { name: /start firmware campaign/i }))
+
+    expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
+    const campaignCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
+    )
+    expect(campaignCall).toBeTruthy()
+    expect(JSON.parse(String(campaignCall?.[1]?.body))).toEqual({
+      release_id: 'release-2-2-4',
+      zone_id: device.zone_id,
+      reason: 'Pilot SWAT deployment validation',
+      typed_confirmation: '2.2.4',
+      password: 'local-step-up-value',
+    })
+    expect(password.value).toBe('')
+  })
+
+  it('returns to the login screen when any request reports an expired session', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ detail: 'Session expired.' }, 401)))
+    await api('/api/v1/protected-test').catch(() => undefined)
+    expect(await screen.findByText(/sign in to the national device operations console/i)).toBeTruthy()
   })
 
   it('keeps command progress visible when a legacy command envelope has no status', () => {

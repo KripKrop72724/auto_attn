@@ -95,6 +95,32 @@ export interface Overview {
   }
 }
 
+export interface FirmwareRelease {
+  release_id: string
+  version: string
+  git_sha: string
+  image_sha256: string
+  application_sha256: string | null
+  image_size: number
+  state: 'AVAILABLE' | 'HIL_ONLY' | 'REVOKED' | string
+  partition_layout: string
+  signing_key_id: string
+  published_at: string
+  hil_target_mac: string | null
+}
+
+export interface FirmwareCampaign {
+  campaign_id: string
+  zone_id: string
+  version: string | null
+  status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'CANCELLED' | string
+  eligible: number
+  legacy_skipped: number
+  counts: Record<string, number>
+  pause_reason: string | null
+  created_at: string
+}
+
 export interface DeviceUser {
   id: number
   user_key: string
