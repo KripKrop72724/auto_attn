@@ -345,7 +345,6 @@ def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
     assert "add_connector_enqueue_oracle_receipts" in header_source
     assert '"FIRMWARE_LIVE"' in zone_source
     assert '"FIRMWARE_BULK"' in zone_source
-    assert '"FIRMWARE_RECONCILE"' in zone_source
     live_receipt = zone_source.index(
         "add_enqueue_json_receipts(\n                        live_event"
     )
@@ -354,29 +353,22 @@ def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
         live_receipt,
     )
     assert live_receipt < live_retire
-    truth_receipt = zone_source.index("add_enqueue_truth_receipts(")
-    truth_complete = zone_source.index(
-        "add_delivery_ok && receipt_delivery_ok",
-        truth_receipt,
-    )
-    assert truth_receipt < truth_complete
 
 
-def test_large_truth_stream_applies_bounded_outbox_backpressure_and_receipt_priority():
+def test_large_truth_stream_delegates_confirmation_to_durable_add_delivery():
     zone_source = (FIRMWARE / "main" / "zone_lite.c").read_text()
     connector_source = (FIRMWARE / "main" / "add_connector.c").read_text()
     reconcile = zone_source[
         zone_source.index("static bool reconcile_attendance_dump(") :
         zone_source.index("static bool system_time_is_valid(")
     ]
-    window = reconcile[
-        reconcile.index("bool window_receipt_ok = true;") :
-        reconcile.index("truth_count += window_truth_count;")
-    ]
 
-    assert window.index("add_enqueue_truth_receipts(") < window.index(
-        "add_enqueue_reconcile_events("
-    )
+    assert "add_enqueue_truth_receipts(" not in reconcile
+    assert '"FIRMWARE_RECONCILE"' not in reconcile
+    assert '"ORACLE_RECONCILE_ACCEPTED"' in reconcile
+    assert "per-event confirmation delegated to durable ADD delivery/check" in reconcile
+    assert "truth_delivery_ok && add_delivery_ok" in reconcile
+    assert "receipt_delivery_ok" not in reconcile
     assert "#define ADD_BULK_CAPACITY_WAIT_MS" in connector_source
     assert "#define ADD_ACK_TIMEOUT_MS 60000" in connector_source
     assert "ADD_BULK_CAPACITY_POLL_MS" in connector_source
