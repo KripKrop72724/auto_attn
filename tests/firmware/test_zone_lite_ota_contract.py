@@ -36,6 +36,16 @@ def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text
     assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 2
     assert text.count("free(response_data)") >= 4
+    assert "#define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096" in text
+    assert ".buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES" in text
+
+
+def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
+    text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    assert "bool capability_reported = false;" in text
+    assert "if (!capability_reported)" in text
+    assert "capability_reported = report_capability();" in text
+    assert "capability_reported && !s_busy && fetch_assignment()" in text
 
 
 def test_release_workflow_requires_hil_and_protected_environments() -> None:

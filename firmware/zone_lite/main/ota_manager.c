@@ -29,6 +29,7 @@
 #define OTA_BOOT_CONFIRM_SECONDS 180
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
+#define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
 
 typedef struct {
     char deployment_id[48];
@@ -166,6 +167,7 @@ static bool signed_request(
         .user_data = response,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
+        .buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http);
     if (!client) return false;
@@ -388,13 +390,23 @@ static bool confirm_or_report_rollback(void)
 static void ota_task(void *argument)
 {
     (void)argument;
-    (void)report_capability();
     if (!confirm_or_report_rollback()) vTaskDelete(NULL);
+    bool capability_reported = false;
     while (true) {
-        if (!s_busy && add_connector_is_connected() && fetch_assignment()) {
-            s_busy = true;
-            (void)perform_update();
-            s_busy = false;
+        if (add_connector_is_connected()) {
+            if (!capability_reported) {
+                capability_reported = report_capability();
+                if (capability_reported) {
+                    ESP_LOGI(TAG, "ADD accepted OTA capability; connector is OTA ready");
+                } else {
+                    ESP_LOGW(TAG, "ADD OTA capability report failed; retrying in %u ms", OTA_POLL_MS);
+                }
+            }
+            if (capability_reported && !s_busy && fetch_assignment()) {
+                s_busy = true;
+                (void)perform_update();
+                s_busy = false;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
     }
