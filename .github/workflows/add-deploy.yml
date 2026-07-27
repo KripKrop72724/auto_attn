@@ -64,6 +64,8 @@ jobs:
       DEPLOY_SHA: ${{ inputs.deploy_sha || github.event.workflow_run.head_sha || github.sha }}
       ADD_DEPLOY_FLEET_ROOT_SECRET: ${{ secrets.ADD_FLEET_ROOT_SECRET }}
       ADD_DEPLOY_ADMIN_PASSWORD_HASH: ${{ secrets.ADD_ADMIN_PASSWORD_HASH }}
+      ADD_DEPLOY_FIRMWARE_HIL_ENABLED: ${{ vars.ADD_FIRMWARE_HIL_ENABLED }}
+      ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC: ${{ vars.ADD_FIRMWARE_HIL_TARGET_MAC }}
     steps:
       - uses: actions/checkout@v4
         with:
