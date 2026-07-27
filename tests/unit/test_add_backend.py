@@ -79,6 +79,8 @@ from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.web import app, get_db
 from zk_add.worker import (
+    ORDS_DELIVERY_BATCH_SIZE,
+    ORDS_DELIVERY_CONCURRENCY,
     apply_ords_delivery_result,
     event_uid_is_valid,
     ords_delivery_metrics,
@@ -92,6 +94,12 @@ from zk_add.worker import (
 MAC = "e0:72:a1:d6:f3:28"
 SERIAL = "ADZV211860253"
 CNIC = "3520212345671"
+
+
+def test_ords_delivery_defaults_drain_retry_backlog_in_bounded_batches():
+    assert ORDS_DELIVERY_BATCH_SIZE == 100
+    assert 1 <= ORDS_DELIVERY_CONCURRENCY <= ORDS_DELIVERY_BATCH_SIZE
+    assert ORDS_DELIVERY_BATCH_SIZE <= 500
 
 
 @pytest.fixture()

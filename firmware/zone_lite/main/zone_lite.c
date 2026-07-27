@@ -3209,19 +3209,20 @@ static bool reconcile_attendance_dump(
                     }
                 }
             }
-            // ADD receives the same compact truth stream independently of
-            // ORDS state. A failed Oracle window does not prevent the
-            // dashboard's durable truth stream from being queued.
-            bool window_add_ok = add_enqueue_reconcile_events(
-                reconcile_events,
-                window_event_count,
-                capturetype);
             bool window_receipt_ok = true;
-            if (truth_enabled && window_truth_ok && window_add_ok) {
+            if (truth_enabled && window_truth_ok) {
                 window_receipt_ok = add_enqueue_truth_receipts(
                     reconcile_events,
                     window_event_count);
             }
+            // Oracle receipts are queued before the larger ADD truth stream.
+            // ADD retains early receipts until their attendance rows arrive,
+            // so a large terminal history cannot leave Oracle confirmation
+            // trapped behind megabytes of idempotent attendance batches.
+            bool window_add_ok = add_enqueue_reconcile_events(
+                reconcile_events,
+                window_event_count,
+                capturetype);
             truth_count += window_truth_count;
             truth_delivery_ok = truth_delivery_ok && window_truth_ok;
             add_delivery_ok = add_delivery_ok && window_add_ok;

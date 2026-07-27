@@ -65,6 +65,9 @@
 #define ADD_OUTBOX_MAX_BYTES (4 * 1024 * 1024)
 #define ADD_LIVE_OUTBOX_MAX_BYTES (512 * 1024)
 #define ADD_OUTBOX_COMPACT_MIN_BYTES (256 * 1024)
+#define ADD_BULK_CAPACITY_WAIT_MS (2 * 60 * 1000)
+#define ADD_BULK_CAPACITY_POLL_MS 250
+#define ADD_OUTBOX_RECORD_OVERHEAD_BYTES 128
 #define ADD_OUTBOX_PATH "/storage/add_pending.jsonl"
 #define ADD_OUTBOX_TMP_PATH "/storage/add_pending.tmp"
 #define ADD_OUTBOX_BACKUP_PATH "/storage/add_pending.bak"
@@ -1428,26 +1431,45 @@ static bool add_connector_enqueue_record(const char *type, const char *payload_j
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
-    if (outbox->lock && xSemaphoreTake(outbox->lock, lock_timeout) == pdTRUE) {
-        struct stat st = {0};
-        off_t current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
-        if (current + (off_t)strlen(line) + 1 > outbox->max_bytes && outbox->offset > 0) {
-            (void)compact_outbox_locked(outbox, true);
-            current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
-        }
-        if (current + (off_t)strlen(line) + 1 <= outbox->max_bytes) {
-            FILE *file = fopen(outbox->path, "a");
-            if (file) {
-                ok = fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 && fsync(fileno(file)) == 0;
-                fclose(file);
-                if (ok) outbox->depth++;
+    int64_t deadline_ms = monotonic_ms() + (live ? 0 : ADD_BULK_CAPACITY_WAIT_MS);
+    bool waiting_logged = false;
+    do {
+        if (outbox->lock && xSemaphoreTake(outbox->lock, lock_timeout) == pdTRUE) {
+            struct stat st = {0};
+            off_t current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
+            if (current + (off_t)strlen(line) + 1 > outbox->max_bytes &&
+                outbox->offset > 0) {
+                (void)compact_outbox_locked(outbox, true);
+                current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
             }
-        } else {
-            ESP_LOGE(TAG, "ADD %s outbox is full; preserving existing rows", outbox->label);
+            if (current + (off_t)strlen(line) + 1 <= outbox->max_bytes) {
+                FILE *file = fopen(outbox->path, "a");
+                if (file) {
+                    ok = fprintf(file, "%s\n", line) > 0 &&
+                        fflush(file) == 0 &&
+                        fsync(fileno(file)) == 0;
+                    fclose(file);
+                    if (ok) outbox->depth++;
+                }
+            }
+            xSemaphoreGive(outbox->lock);
         }
-        xSemaphoreGive(outbox->lock);
-    } else {
-        ESP_LOGE(TAG, "Timed out waiting for ADD %s outbox lock", outbox->label);
+        if (ok || live || monotonic_ms() >= deadline_ms) {
+            break;
+        }
+        if (!waiting_logged) {
+            waiting_logged = true;
+            ESP_LOGW(
+                TAG,
+                "ADD reconcile outbox reached its bounded capacity; applying backpressure while acknowledged rows drain");
+        }
+        vTaskDelay(pdMS_TO_TICKS(ADD_BULK_CAPACITY_POLL_MS));
+    } while (true);
+    if (!ok) {
+        ESP_LOGE(
+            TAG,
+            "Could not durably append ADD %s outbox row within the bounded wait",
+            outbox->label);
     }
     free(line);
     return ok;
@@ -1498,56 +1520,95 @@ bool add_connector_enqueue_oracle_receipts(
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count)
 {
     if (!zone_config_get()->add_enabled || count == 0) return true;
-    if (!payloads || !s_bulk_outbox.lock ||
-        xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out waiting to append ADD reconcile batches");
+    if (!payloads || !s_bulk_outbox.lock) {
+        ESP_LOGE(TAG, "ADD reconcile bulk append is not initialized");
         return false;
     }
 
-    bool ok = true;
-    if (s_bulk_outbox.offset > 0 && !compact_outbox_locked(&s_bulk_outbox, true)) {
-        ok = false;
-    }
-    struct stat st = {0};
-    off_t current = stat(s_bulk_outbox.path, &st) == 0 ? st.st_size : 0;
-    FILE *file = ok ? fopen(s_bulk_outbox.path, "a") : NULL;
-    if (!file) ok = false;
-    uint32_t written = 0;
-    for (size_t i = 0; ok && i < count; i++) {
-        bool live = false;
-        char *line = attendance_outbox_record_line(payloads[i], &live);
-        size_t line_len = line ? strlen(line) : 0;
-        if (!line || live) {
-            ESP_LOGE(TAG, "Rejected an invalid payload from the ADD reconcile bulk append");
-            free(line);
-            ok = false;
-            break;
+    size_t required_bytes = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!payloads[i]) return false;
+        size_t payload_bytes = strlen(payloads[i]);
+        if (payload_bytes + ADD_OUTBOX_RECORD_OVERHEAD_BYTES >= ADD_OUTBOX_LINE_BYTES ||
+            required_bytes > SIZE_MAX - payload_bytes - ADD_OUTBOX_RECORD_OVERHEAD_BYTES) {
+            ESP_LOGE(TAG, "ADD reconcile bulk append contains an oversized payload");
+            return false;
         }
-        if (current + (off_t)line_len + 1 > s_bulk_outbox.max_bytes) {
-            ESP_LOGE(TAG, "ADD reconcile attendance outbox is full; preserving existing rows");
-            free(line);
-            ok = false;
-            break;
+        required_bytes += payload_bytes + ADD_OUTBOX_RECORD_OVERHEAD_BYTES;
+    }
+
+    int64_t deadline_ms = monotonic_ms() + ADD_BULK_CAPACITY_WAIT_MS;
+    bool waiting_logged = false;
+    while (true) {
+        if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+            if (monotonic_ms() >= deadline_ms) {
+                ESP_LOGE(TAG, "Timed out waiting to append ADD reconcile batches");
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(ADD_BULK_CAPACITY_POLL_MS));
+            continue;
         }
-        if (fprintf(file, "%s\n", line) <= 0) {
-            free(line);
-            ok = false;
-            break;
+
+        struct stat st = {0};
+        off_t current = stat(s_bulk_outbox.path, &st) == 0 ? st.st_size : 0;
+        if (current + (off_t)required_bytes > s_bulk_outbox.max_bytes &&
+            s_bulk_outbox.offset > 0) {
+            (void)compact_outbox_locked(&s_bulk_outbox, true);
+            current = stat(s_bulk_outbox.path, &st) == 0 ? st.st_size : 0;
         }
-        current += (off_t)line_len + 1;
-        written++;
-        free(line);
+        if (current + (off_t)required_bytes > s_bulk_outbox.max_bytes) {
+            xSemaphoreGive(s_bulk_outbox.lock);
+            if (monotonic_ms() >= deadline_ms) {
+                ESP_LOGE(
+                    TAG,
+                    "ADD reconcile attendance outbox remained full after bounded backpressure");
+                return false;
+            }
+            if (!waiting_logged) {
+                waiting_logged = true;
+                ESP_LOGW(
+                    TAG,
+                    "ADD reconcile outbox reached its bounded capacity; waiting for acknowledged rows before appending more truth");
+            }
+            vTaskDelay(pdMS_TO_TICKS(ADD_BULK_CAPACITY_POLL_MS));
+            continue;
+        }
+
+        bool ok = true;
+        FILE *file = fopen(s_bulk_outbox.path, "a");
+        if (!file) ok = false;
+        uint32_t written = 0;
+        for (size_t i = 0; ok && i < count; i++) {
+            bool live = false;
+            char *line = attendance_outbox_record_line(payloads[i], &live);
+            if (!line || live) {
+                ESP_LOGE(TAG, "Rejected an invalid payload from the ADD reconcile bulk append");
+                free(line);
+                ok = false;
+                break;
+            }
+            if (fprintf(file, "%s\n", line) <= 0) {
+                free(line);
+                ok = false;
+                break;
+            }
+            written++;
+            free(line);
+        }
+        if (file) {
+            if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
+            fclose(file);
+        }
+        s_bulk_outbox.depth += written;
+        xSemaphoreGive(s_bulk_outbox.lock);
+        if (written > 0) {
+            ESP_LOGI(
+                TAG,
+                "Durably appended %lu ADD reconcile batch(es) with one flash sync",
+                (unsigned long)written);
+        }
+        return ok && written == count;
     }
-    if (file) {
-        if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
-        fclose(file);
-    }
-    s_bulk_outbox.depth += written;
-    xSemaphoreGive(s_bulk_outbox.lock);
-    if (written > 0) {
-        ESP_LOGI(TAG, "Durably appended %lu ADD reconcile batch(es) with one flash sync", (unsigned long)written);
-    }
-    return ok && written == count;
 }
 
 static void outbox_task(void *arg)
