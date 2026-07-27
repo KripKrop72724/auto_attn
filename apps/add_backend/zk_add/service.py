@@ -1141,11 +1141,45 @@ def record_oracle_receipts(
     applied = 0
     awaiting_event = 0
     rejected = 0
+    event_uids = list(batch.event_uids)
+    receipts_by_uid = {
+        row.event_uid: row
+        for row in session.scalars(
+            select(OracleReceipt).where(OracleReceipt.event_uid.in_(event_uids))
+        ).all()
+    }
+    events_by_uid = {
+        row.event_uid: row
+        for row in session.scalars(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid.in_(event_uids))
+        ).all()
+    }
+    owned_event_ids = [
+        row.id for row in events_by_uid.values() if row.connector_id == connector.id
+    ]
+    outboxes_by_event_id = (
+        {
+            row.attendance_event_id: row
+            for row in session.scalars(
+                select(OrdsOutbox).where(
+                    OrdsOutbox.attendance_event_id.in_(owned_event_ids)
+                )
+            ).all()
+        }
+        if owned_event_ids
+        else {}
+    )
+
     for event_uid in batch.event_uids:
-        receipt = session.scalar(
-            select(OracleReceipt).where(OracleReceipt.event_uid == event_uid)
-        )
-        if receipt is not None and receipt.connector_id != connector.id:
+        receipt = receipts_by_uid.get(event_uid)
+        event = events_by_uid.get(event_uid)
+        if (
+            receipt is not None
+            and receipt.connector_id != connector.id
+        ) or (
+            event is not None
+            and event.connector_id != connector.id
+        ):
             rejected += 1
             upsert_alert(
                 session,
@@ -1170,7 +1204,7 @@ def record_oracle_receipts(
                 observation_count=1,
             )
             session.add(receipt)
-            session.flush()
+            receipts_by_uid[event_uid] = receipt
         else:
             receipt.last_received_at = now
             receipt.observation_count += 1
@@ -1182,43 +1216,28 @@ def record_oracle_receipts(
             ):
                 receipt.confirmation_path = batch.confirmation_path
 
-        event = session.scalar(
-            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
-        )
         if event is None:
             awaiting_event += 1
-            continue
-        if event.connector_id != connector.id:
-            rejected += 1
-            upsert_alert(
-                session,
-                connector,
-                code="ORACLE_RECEIPT_CONNECTOR_MISMATCH",
-                severity="HIGH",
-                message=(
-                    "A device-reported Oracle receipt did not match the immutable "
-                    "attendance owner; the receipt was not applied."
-                ),
-                details={"event_uid_prefix": event_uid[:12]},
-            )
             continue
 
         receipt.attendance_event_id = event.id
         event.ords_status = "ACKED_FIRMWARE"
         event.oracle_confirmed_at = receipt.oracle_observed_at
         event.oracle_confirmation_path = receipt.confirmation_path
-        outbox = session.scalar(
-            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)
-        )
+        outbox = outboxes_by_event_id.get(event.id)
         if outbox is None:
             outbox = OrdsOutbox(attendance_event_id=event.id)
             session.add(outbox)
+            outboxes_by_event_id[event.id] = outbox
         outbox.status = "ACKED_FIRMWARE"
         outbox.acknowledged_at = receipt.oracle_observed_at
         outbox.next_attempt_at = None
         outbox.last_error = None
         applied += 1
 
+    # One flush makes the complete receipt batch durable before the websocket
+    # acknowledgement while avoiding the previous per-event flush/query loop.
+    session.flush()
     remaining_failure = session.scalar(
         select(OrdsOutbox.id)
         .join(AttendanceEvent, AttendanceEvent.id == OrdsOutbox.attendance_event_id)

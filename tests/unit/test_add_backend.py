@@ -8,7 +8,7 @@ from cryptography.fernet import Fernet
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event as sqlalchemy_event, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -1662,6 +1662,90 @@ def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Sessio
     assert metrics["backlog"] == 0
     assert metrics["acknowledged"] == 2
     assert metrics["acknowledged_firmware"] == 2
+
+
+def test_oracle_receipt_batch_uses_one_flush_for_one_hundred_events(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    event_uids = [f"{index:064x}" for index in range(1, 101)]
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid=event_uid) for event_uid in event_uids],
+    )
+    assert len(accepted) == 100
+    assert duplicates == []
+    db.flush()
+
+    flush_count = 0
+
+    def count_flush(*_args):
+        nonlocal flush_count
+        flush_count += 1
+
+    sqlalchemy_event.listen(db, "before_flush", count_flush)
+    try:
+        result = record_oracle_receipts(
+            db,
+            connector=connector,
+            batch=OracleReceiptBatchRequest(
+                confirmation_path="FIRMWARE_RECONCILE",
+                oracle_observed_at=utc_now(),
+                event_uids=event_uids,
+            ),
+        )
+    finally:
+        sqlalchemy_event.remove(db, "before_flush", count_flush)
+
+    assert result == (100, 0, 0)
+    assert flush_count == 1
+    assert db.scalar(
+        select(func.count()).select_from(OracleReceipt)
+    ) == 100
+    assert db.scalar(
+        select(func.count())
+        .select_from(AttendanceEvent)
+        .where(AttendanceEvent.ords_status == "ACKED_FIRMWARE")
+    ) == 100
+
+
+def test_oracle_receipt_batch_cannot_poison_another_connectors_event(db: Session):
+    owner = connector_fixture(db)
+    snapshot_user(db, owner)
+    event_uid = "9" * 64
+    ingest_attendance(db, connector=owner, events=[event(event_uid=event_uid)])
+    reporter = connector_fixture(
+        db,
+        hardware_id="e0:72:a1:d6:f3:29",
+        expected_serial="PESHAWAR-OTHER-TERMINAL",
+    )
+    db.flush()
+
+    result = record_oracle_receipts(
+        db,
+        connector=reporter,
+        batch=OracleReceiptBatchRequest(
+            confirmation_path="FIRMWARE_RECONCILE",
+            oracle_observed_at=utc_now(),
+            event_uids=[event_uid],
+        ),
+    )
+
+    assert result == (0, 0, 1)
+    assert db.scalar(
+        select(OracleReceipt).where(OracleReceipt.event_uid == event_uid)
+    ) is None
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+    )
+    assert attendance.ords_status == "PENDING"
+    assert db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == reporter.id,
+            DeviceAlert.code == "ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+            DeviceAlert.state == "OPEN",
+        )
+    )
 
 
 def test_ords_membership_response_is_fail_closed():
