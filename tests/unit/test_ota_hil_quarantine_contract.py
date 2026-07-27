@@ -29,6 +29,11 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
     for required in (
         'git merge-base --is-ancestor "$sha" origin/main',
         "runs-on: [self-hosted, Windows, X64]",
+        "ADD_BASE_URL: http://127.0.0.1:8096",
+        "'(?:^|[,\\s])add_admin=([^;,\\s]+)'",
+        "-Headers $authHeaders",
+        "/api/v1/auth/logout",
+        "'X-CSRF-Token' = [string]$login.csrf_token",
         "$_.state -eq 'HIL_ONLY'",
         "[int]$_.counts.SUCCEEDED -eq 1",
         "[int]$_.legacy_skipped -eq 0",
