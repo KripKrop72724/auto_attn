@@ -35,5 +35,9 @@ if ($actualHash -ne [string]$manifest.image_sha256) {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 Copy-Item -Path (Join-Path $release '*') -Destination $output -Recurse -Force
+$outputMarkerPath = Join-Path $output '.hil-only.json'
+if (Test-Path -LiteralPath $outputMarkerPath -PathType Leaf) {
+    Remove-Item -LiteralPath $outputMarkerPath -Force
+}
 Remove-Item -LiteralPath $markerPath -Force
 Write-Host "Promoted the exact HIL-tested Zone Lite $Version bytes to AVAILABLE"
