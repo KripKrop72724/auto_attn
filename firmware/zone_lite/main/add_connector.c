@@ -1516,13 +1516,44 @@ bool add_connector_enqueue_oracle_receipts(
     char observed_at[32];
     iso_utc(now, observed_at);
     cJSON_AddStringToObject(payload, "oracle_observed_at", observed_at);
+    size_t unique_count = 0;
+    size_t duplicate_count = 0;
     for (size_t i = 0; i < count; i++) {
         if (!attendance_event_uid_is_valid(event_uids[i])) {
             cJSON_Delete(payload);
             cJSON_Delete(uids);
             return false;
         }
-        cJSON_AddItemToArray(uids, cJSON_CreateString(event_uids[i]));
+        bool duplicate = false;
+        for (size_t previous = 0; previous < i; previous++) {
+            if (strcmp(event_uids[previous], event_uids[i]) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            duplicate_count++;
+            continue;
+        }
+        cJSON *uid = cJSON_CreateString(event_uids[i]);
+        if (!uid) {
+            cJSON_Delete(payload);
+            cJSON_Delete(uids);
+            return false;
+        }
+        cJSON_AddItemToArray(uids, uid);
+        unique_count++;
+    }
+    if (unique_count == 0) {
+        cJSON_Delete(payload);
+        cJSON_Delete(uids);
+        return false;
+    }
+    if (duplicate_count > 0) {
+        ESP_LOGI(
+            TAG,
+            "Collapsed %lu duplicate Oracle receipt event UID(s) before durable enqueue",
+            (unsigned long)duplicate_count);
     }
     cJSON_AddItemToObject(payload, "event_uids", uids);
     char *json = cJSON_PrintUnformatted(payload);
