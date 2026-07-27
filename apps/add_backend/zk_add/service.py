@@ -966,32 +966,69 @@ def ingest_attendance(
         raise ValueError("Connector has no assigned ZKT device.")
     accepted: list[str] = []
     duplicates: list[str] = []
-    identity_resolution_cache: dict[str, IdentityConflictResolution | None] = {}
+    event_uids = [incoming.event_uid for incoming in events]
+    existing_uids = set(
+        session.scalars(
+            select(AttendanceEvent.event_uid).where(
+                AttendanceEvent.event_uid.in_(event_uids)
+            )
+        ).all()
+    )
+    seen_uids = set(existing_uids)
+    pending_events: list[AttendanceEventIn] = []
     for incoming in events:
-        existing = session.scalar(
-            select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid)
-        )
-        if existing:
+        if incoming.event_uid in seen_uids:
             duplicates.append(incoming.event_uid)
             continue
-        parsed = parse_machine_name(incoming.raw_name)
-        user = session.scalar(
+        seen_uids.add(incoming.event_uid)
+        pending_events.append(incoming)
+    if not pending_events:
+        return accepted, duplicates
+
+    user_ids = {incoming.user_id for incoming in pending_events}
+    users_by_id = {
+        row.user_id: row
+        for row in session.scalars(
             select(DeviceUser).where(
                 DeviceUser.zkt_device_id == zkt.id,
-                DeviceUser.user_id == incoming.user_id,
+                DeviceUser.user_id.in_(user_ids),
                 DeviceUser.lifecycle_state == "ACTIVE",
             )
-        )
-        tombstone = None
-        if user is None:
-            tombstone = session.scalar(
-                select(IdentityTombstone)
-                .where(
-                    IdentityTombstone.zkt_device_id == zkt.id,
-                    IdentityTombstone.user_id == incoming.user_id,
-                )
-                .order_by(IdentityTombstone.id.desc())
+        ).all()
+    }
+    missing_user_ids = user_ids - users_by_id.keys()
+    tombstones_by_id: dict[str, IdentityTombstone] = {}
+    if missing_user_ids:
+        for row in session.scalars(
+            select(IdentityTombstone)
+            .where(
+                IdentityTombstone.zkt_device_id == zkt.id,
+                IdentityTombstone.user_id.in_(missing_user_ids),
             )
+            .order_by(IdentityTombstone.id.desc())
+        ).all():
+            tombstones_by_id.setdefault(row.user_id, row)
+    receipts_by_uid = {
+        row.event_uid: row
+        for row in session.scalars(
+            select(OracleReceipt).where(
+                OracleReceipt.event_uid.in_(
+                    [incoming.event_uid for incoming in pending_events]
+                )
+            )
+        ).all()
+    }
+
+    identity_resolution_cache: dict[str, IdentityConflictResolution | None] = {}
+    pending_rows: list[
+        tuple[AttendanceEvent, OracleReceipt | None, bool, bool]
+    ] = []
+    for incoming in pending_events:
+        parsed = parse_machine_name(incoming.raw_name)
+        user = users_by_id.get(incoming.user_id)
+        tombstone = (
+            tombstones_by_id.get(incoming.user_id) if user is None else None
+        )
         identity_resolution = None
         if user and user.identity_conflict_code and user.cnic_lookup_hash:
             lookup = user.cnic_lookup_hash
@@ -1036,9 +1073,7 @@ def ingest_attendance(
             cnic = decrypt_cnic(tombstone.cnic_encrypted)
             display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
             shift_worker = tombstone.shift_worker
-        receipt = session.scalar(
-            select(OracleReceipt).where(OracleReceipt.event_uid == incoming.event_uid)
-        )
+        receipt = receipts_by_uid.get(incoming.event_uid)
         receipt_matches_connector = bool(
             receipt is not None and receipt.connector_id == connector.id
         )
@@ -1107,8 +1142,16 @@ def ingest_attendance(
             ),
         )
         session.add(row)
-        session.flush()
+        pending_rows.append((row, receipt, receipt_matches_connector, bool(cnic)))
+        accepted.append(incoming.event_uid)
+
+    # Assign all attendance IDs in one flush. The previous per-event
+    # SELECT/flush loop made a 100-event firmware batch exceed its ACK timeout
+    # and stalled the device's durable outbox.
+    session.flush()
+    for row, receipt, receipt_matches_connector, has_cnic in pending_rows:
         if receipt_matches_connector:
+            assert receipt is not None
             receipt.attendance_event_id = row.id
             session.add(
                 OrdsOutbox(
@@ -1117,9 +1160,11 @@ def ingest_attendance(
                     acknowledged_at=receipt.oracle_observed_at,
                 )
             )
-        elif cnic:
+        elif has_cnic:
             session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
-        accepted.append(incoming.event_uid)
+    # Persist the corresponding Oracle outbox rows in one second flush so the
+    # whole firmware message is durable before its websocket acknowledgement.
+    session.flush()
     return accepted, duplicates
 
 

@@ -1570,6 +1570,51 @@ def test_attendance_ingestion_is_idempotent_sanitized_and_ords_is_ephemeral(db: 
     assert payload["capturetype"] == "LIVE"
 
 
+def test_attendance_batch_uses_bounded_flushes_and_duplicate_retry_uses_none(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    incoming = [
+        event(event_uid=f"{index:064x}")
+        for index in range(1, 101)
+    ]
+    flush_count = 0
+
+    def count_flush(*_args):
+        nonlocal flush_count
+        flush_count += 1
+
+    sqlalchemy_event.listen(db, "before_flush", count_flush)
+    try:
+        accepted, duplicates = ingest_attendance(
+            db,
+            connector=connector,
+            events=incoming,
+        )
+        first_flush_count = flush_count
+        retry_accepted, retry_duplicates = ingest_attendance(
+            db,
+            connector=connector,
+            events=incoming,
+        )
+    finally:
+        sqlalchemy_event.remove(db, "before_flush", count_flush)
+
+    assert len(accepted) == 100
+    assert duplicates == []
+    assert first_flush_count == 2
+    assert retry_accepted == []
+    assert retry_duplicates == [row.event_uid for row in incoming]
+    assert flush_count == first_flush_count
+    assert db.scalar(
+        select(func.count()).select_from(AttendanceEvent)
+    ) == 100
+    assert db.scalar(
+        select(func.count()).select_from(OrdsOutbox)
+    ) == 100
+
+
 def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent():
     assert event_uid_is_valid("a" * 64)
     assert not event_uid_is_valid("a" * 31 + "?" + "b" * 32)
