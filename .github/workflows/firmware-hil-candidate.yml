@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(sed -n 's/^project(zone_lite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
+          test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
           idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig build
       - uses: actions/upload-artifact@v4
         with:
