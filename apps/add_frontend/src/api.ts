@@ -16,6 +16,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.method && init.method !== 'GET' && csrfToken) headers.set('X-CSRF-Token', csrfToken)
   const response = await fetch(path, { ...init, headers, credentials: 'include' })
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('add:session-expired'))
+    }
     let message = `Request failed (${response.status})`
     try {
       const body = await response.json()
