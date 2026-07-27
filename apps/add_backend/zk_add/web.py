@@ -1988,13 +1988,15 @@ def download_firmware(token: str, request: Request, db: Session = Depends(get_db
 @app.get("/api/v1/firmware/releases")
 def list_firmware_releases(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _ = auth
-    return {"rows": _release_rows(db), "enabled": settings.firmware_ota_enabled}
+    return {"rows": _release_rows(db), "enabled": settings.firmware_ota_enabled,
+            "hil_enabled": settings.firmware_hil_enabled}
 
 
 @app.get("/api/v1/firmware/campaigns")
 def list_firmware_campaigns(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _ = auth
-    return {"rows": _campaign_rows(db), "enabled": settings.firmware_ota_enabled}
+    return {"rows": _campaign_rows(db), "enabled": settings.firmware_ota_enabled,
+            "hil_enabled": settings.firmware_hil_enabled}
 
 
 @app.post("/api/v1/firmware/campaigns", status_code=201)
@@ -2003,7 +2005,7 @@ def start_firmware_campaign(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
-    if not settings.firmware_ota_enabled:
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
         raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
     require_step_up(body.password, db, context)
     try:
