@@ -51,7 +51,6 @@ jobs:
   build:
     needs: provenance
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.5.3
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,7 +63,11 @@ jobs:
         run: |
           set -euo pipefail
           test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
-          idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig build
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project/firmware/zone_lite \
+            espressif/idf:v5.5.3 \
+            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig build'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
