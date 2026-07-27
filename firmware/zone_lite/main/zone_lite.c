@@ -2691,34 +2691,6 @@ static bool add_enqueue_reconcile_events(
     return true;
 }
 
-static bool add_enqueue_truth_receipts(
-    const attendance_event_t *events,
-    size_t event_count)
-{
-    const char *event_uids[100] = {0};
-    size_t batch_count = 0;
-    for (size_t i = 0; i < event_count; i++) {
-        if (events[i].cnic[0] == '\0') {
-            continue;
-        }
-        event_uids[batch_count++] = events[i].event_uid;
-        if (batch_count == 100) {
-            if (!add_connector_enqueue_oracle_receipts(
-                    event_uids,
-                    batch_count,
-                    "FIRMWARE_RECONCILE")) {
-                return false;
-            }
-            batch_count = 0;
-        }
-    }
-    return batch_count == 0 ||
-        add_connector_enqueue_oracle_receipts(
-            event_uids,
-            batch_count,
-            "FIRMWARE_RECONCILE");
-}
-
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype,
@@ -2954,12 +2926,22 @@ static bool reconcile_attendance_dump(
             &truth_count);
         bool add_delivery_ok = add_enqueue_reconcile_events(
             NULL, 0, capturetype);
-        bool receipt_delivery_ok = !truth_enabled ||
-            !truth_delivery_ok ||
-            !add_delivery_ok ||
-            add_enqueue_truth_receipts(NULL, 0);
-        bool reconcile_complete = truth_delivery_ok &&
-            add_delivery_ok && receipt_delivery_ok;
+        if (truth_enabled && truth_delivery_ok) {
+            char checkpoint[192];
+            snprintf(
+                checkpoint,
+                sizeof(checkpoint),
+                "Oracle accepted empty truth window %04d-%02d-01..%02d; per-event confirmation delegated to durable ADD delivery/check",
+                filter_year,
+                filter_month,
+                day_end);
+            (void)add_connector_log(
+                "INFO",
+                "reconcile",
+                "ORACLE_RECONCILE_ACCEPTED",
+                checkpoint);
+        }
+        bool reconcile_complete = truth_delivery_ok && add_delivery_ok;
         ESP_LOGI(
             TAG,
             "Empty-terminal authoritative reconcile window=%04d-%02d-01..%02d complete=%s",
@@ -3160,7 +3142,6 @@ static bool reconcile_attendance_dump(
     bool window_overflow = false;
     bool truth_delivery_ok = true;
     bool add_delivery_ok = true;
-    bool receipt_delivery_ok = true;
     while (window_start_day <= day_end) {
         int window_end_day = daily_windows ? window_start_day : day_end;
         bool overflow = false;
@@ -3189,7 +3170,6 @@ static bool reconcile_attendance_dump(
             window_overflow = true;
             truth_delivery_ok = false;
             add_delivery_ok = false;
-            receipt_delivery_ok = false;
         } else {
             size_t window_truth_count = 0;
             bool window_truth_ok = true;
@@ -3209,27 +3189,40 @@ static bool reconcile_attendance_dump(
                     }
                 }
             }
-            bool window_receipt_ok = true;
-            if (truth_enabled && window_truth_ok) {
-                window_receipt_ok = add_enqueue_truth_receipts(
-                    reconcile_events,
-                    window_event_count);
-            }
-            // Oracle receipts are queued before the larger ADD truth stream.
-            // ADD retains early receipts until their attendance rows arrive,
-            // so a large terminal history cannot leave Oracle confirmation
-            // trapped behind megabytes of idempotent attendance batches.
+            // Do not mirror a full terminal history into per-event firmware
+            // receipt rows. A 95k-record terminal produces more receipt bytes
+            // than the bounded 4 MiB ADD outbox can hold, even though Oracle
+            // has already accepted the authoritative truth. The durable ADD
+            // attendance stream below is the recovery contract: ADD delivers
+            // each event idempotently and its worker independently confirms
+            // existing Oracle membership through raw-captures/check.
             bool window_add_ok = add_enqueue_reconcile_events(
                 reconcile_events,
                 window_event_count,
                 capturetype);
+            if (truth_enabled && window_truth_ok) {
+                char checkpoint[192];
+                snprintf(
+                    checkpoint,
+                    sizeof(checkpoint),
+                    "Oracle accepted truth window %04d-%02d-%02d..%02d events=%u; per-event confirmation delegated to durable ADD delivery/check",
+                    filter_year,
+                    filter_month,
+                    window_start_day,
+                    window_end_day,
+                    (unsigned)window_truth_count);
+                (void)add_connector_log(
+                    "INFO",
+                    "reconcile",
+                    "ORACLE_RECONCILE_ACCEPTED",
+                    checkpoint);
+            }
             truth_count += window_truth_count;
             truth_delivery_ok = truth_delivery_ok && window_truth_ok;
             add_delivery_ok = add_delivery_ok && window_add_ok;
-            receipt_delivery_ok = receipt_delivery_ok && window_receipt_ok;
             ESP_LOGI(
                 TAG,
-                "Truth window %04d-%02d-%02d..%02d events=%u truth=%u oracle=%s add=%s receipt=%s",
+                "Truth window %04d-%02d-%02d..%02d events=%u truth=%u oracle=%s add=%s",
                 filter_year,
                 filter_month,
                 window_start_day,
@@ -3237,8 +3230,7 @@ static bool reconcile_attendance_dump(
                 (unsigned)window_event_count,
                 (unsigned)window_truth_count,
                 window_truth_ok ? "true" : "false",
-                window_add_ok ? "true" : "false",
-                window_receipt_ok ? "true" : "false");
+                window_add_ok ? "true" : "false");
         }
         if (!daily_windows) {
             break;
@@ -3263,7 +3255,6 @@ static bool reconcile_attendance_dump(
             (unsigned)identity_mapped_count,
             (unsigned)truth_count);
         truth_delivery_ok = false;
-        receipt_delivery_ok = false;
     }
     if (!add_delivery_ok) {
         ESP_LOGW(
@@ -3275,18 +3266,8 @@ static bool reconcile_attendance_dump(
             "ADD_TRUTH_QUEUE_SATURATED",
             "Dashboard truth cycle could not be fully persisted; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
-    if (!receipt_delivery_ok) {
-        ESP_LOGW(
-            TAG,
-            "Oracle truth succeeded but its ADD receipt could not be persisted; the next truth cycle will retry idempotently");
-        add_connector_log(
-            "ERROR",
-            "reconcile",
-            "ORACLE_RECEIPT_QUEUE_SATURATED",
-            "Oracle accepted terminal truth but its dashboard receipt could not be persisted; the next truth cycle will retry safely");
-    }
     bool reconcile_complete = durable_enqueue_ok && !window_overflow &&
-        truth_delivery_ok && add_delivery_ok && receipt_delivery_ok;
+        truth_delivery_ok && add_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
     }
