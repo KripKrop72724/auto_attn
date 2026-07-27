@@ -67,6 +67,7 @@ jobs:
       ADD_DEPLOY_FIRMWARE_HIL_ENABLED: ${{ vars.ADD_FIRMWARE_HIL_ENABLED }}
       ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC: ${{ vars.ADD_FIRMWARE_HIL_TARGET_MAC }}
       ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+      ADD_DEPLOY_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64: ${{ vars.ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,6 +106,10 @@ jobs:
           } else {
             throw 'Configure ADD_ENV_FILE, the protected ProgramData file, or ADD_ENV_FILE_CONTENT.'
           }
+          if (-not $env:ADD_DEPLOY_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64) {
+            throw 'Configure ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64 in the add-production environment.'
+          }
+          Add-Content -LiteralPath '.env.add' -Value "ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64='$env:ADD_DEPLOY_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64'"
 
       - name: Transactionally deploy ports 8095 and 8096
         run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
