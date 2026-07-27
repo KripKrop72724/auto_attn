@@ -419,6 +419,27 @@ def test_full_reconcile_defers_until_prior_durable_add_backlog_drains():
     assert "g_last_full_truth_reconcile_epoch" not in deferred
 
 
+def test_oracle_receipt_batches_collapse_duplicate_terminal_event_uids():
+    connector_source = (FIRMWARE / "main" / "add_connector.c").read_text(
+        encoding="utf-8"
+    )
+    receipt_enqueue = connector_source[
+        connector_source.index("bool add_connector_enqueue_oracle_receipts(") :
+        connector_source.index(
+            "bool add_connector_enqueue_attendance_bulk(",
+            connector_source.index("bool add_connector_enqueue_oracle_receipts("),
+        )
+    ]
+
+    assert "size_t unique_count = 0;" in receipt_enqueue
+    assert "size_t duplicate_count = 0;" in receipt_enqueue
+    assert "strcmp(event_uids[previous], event_uids[i]) == 0" in receipt_enqueue
+    assert "if (duplicate)" in receipt_enqueue
+    assert "continue;" in receipt_enqueue
+    assert "cJSON_CreateString(event_uids[i])" in receipt_enqueue
+    assert "Collapsed %lu duplicate Oracle receipt event UID(s)" in receipt_enqueue
+
+
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[
