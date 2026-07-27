@@ -31,6 +31,13 @@ def test_ota_manager_uses_safe_application_ota_and_first_boot_confirmation() -> 
     assert "esp_ota_mark_app_invalid_rollback_and_reboot" in text
 
 
+def test_ota_hash_covers_the_exact_signed_binary_bytes() -> None:
+    text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    assert "hash_partition_bytes(target, s_journal.image_size, digest)" in text
+    assert "esp_partition_read(partition, offset, buffer, chunk)" in text
+    assert "esp_partition_get_sha256(target, digest)" not in text
+
+
 def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text

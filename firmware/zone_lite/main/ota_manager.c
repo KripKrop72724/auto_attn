@@ -30,6 +30,7 @@
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
+#define OTA_HASH_READ_BYTES 4096
 
 typedef struct {
     char deployment_id[48];
@@ -62,6 +63,34 @@ static void hex_bytes(const unsigned char *input, size_t length, char *output)
         output[index * 2 + 1] = alphabet[input[index] & 0x0f];
     }
     output[length * 2] = '\0';
+}
+
+static bool hash_partition_bytes(
+    const esp_partition_t *partition,
+    size_t length,
+    unsigned char digest[32])
+{
+    if (!partition || !digest || length == 0 || length > partition->size) return false;
+    unsigned char *buffer = malloc(OTA_HASH_READ_BYTES);
+    if (!buffer) return false;
+
+    mbedtls_sha256_context context;
+    mbedtls_sha256_init(&context);
+    int result = mbedtls_sha256_starts(&context, 0);
+    for (size_t offset = 0; result == 0 && offset < length;) {
+        size_t chunk = length - offset;
+        if (chunk > OTA_HASH_READ_BYTES) chunk = OTA_HASH_READ_BYTES;
+        if (esp_partition_read(partition, offset, buffer, chunk) != ESP_OK) {
+            result = -1;
+            break;
+        }
+        result = mbedtls_sha256_update(&context, buffer, chunk);
+        offset += chunk;
+    }
+    if (result == 0) result = mbedtls_sha256_finish(&context, digest);
+    mbedtls_sha256_free(&context);
+    free(buffer);
+    return result == 0;
 }
 
 static void api_base(char *output, size_t size)
@@ -339,7 +368,7 @@ static bool perform_update(void)
     }
     unsigned char digest[32];
     char digest_hex[65];
-    if (esp_partition_get_sha256(target, digest) != ESP_OK) {
+    if (!hash_partition_bytes(target, s_journal.image_size, digest)) {
         strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
         return false;
     }
