@@ -72,3 +72,9 @@ def test_release_workflow_requires_hil_and_protected_environments() -> None:
 
     assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in candidate
     assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in release
+
+def test_release_signer_uses_a_docker_mountable_ephemeral_workspace() -> None:
+    signer = (ROOT / "deploy" / "add" / "sign-firmware-release.ps1").read_text(encoding="utf-8")
+    assert "$env:RUNNER_TEMP" in signer
+    assert "$env:GITHUB_WORKSPACE" in signer
+    assert "Join-Path $env:TEMP" not in signer
