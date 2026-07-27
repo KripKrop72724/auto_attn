@@ -217,6 +217,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FLEET_ROOT_SECRET)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ADMIN_PASSWORD_HASH)) {
     $environment["ADD_ADMIN_PASSWORD_HASH"] = $env:ADD_DEPLOY_ADMIN_PASSWORD_HASH
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED)) {
+    $environment["ADD_FIRMWARE_OTA_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED
+}
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
     $environment["ADD_FIRMWARE_HIL_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED
 }

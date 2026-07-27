@@ -11,6 +11,21 @@ def test_hil_quarantine_is_disabled_by_default() -> None:
     assert settings.firmware_hil_target_mac is None
 
 
+def test_deployment_can_explicitly_switch_from_hil_to_national_ota() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "add-deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    deploy = (ROOT / "deploy" / "add" / "deploy.ps1").read_text(encoding="utf-8")
+    assert (
+        "ADD_DEPLOY_FIRMWARE_OTA_ENABLED: "
+        "${{ vars.ADD_FIRMWARE_OTA_ENABLED }}" in workflow
+    )
+    assert (
+        '$environment["ADD_FIRMWARE_OTA_ENABLED"] = '
+        "$env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED" in deploy
+    )
+
+
 def test_publication_requires_exact_hil_target_and_promotion_preserves_bytes() -> None:
     publish = (ROOT / "deploy/add/publish-firmware.ps1").read_text(encoding="utf-8")
     promote = (ROOT / "deploy/add/promote-firmware.ps1").read_text(encoding="utf-8")
