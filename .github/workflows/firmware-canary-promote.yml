@@ -70,7 +70,7 @@ jobs:
 
   verify-production-canary:
     needs: provenance
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
     environment: firmware-production
     timeout-minutes: 10
     env:
@@ -85,97 +85,97 @@ jobs:
       MINIMUM_TERMINAL_ATTENDANCE: ${{ inputs.minimum_terminal_attendance }}
     steps:
       - name: Verify exact successful canary and stable live operation
-        shell: bash
+        shell: powershell
         run: |
-          set -euo pipefail
-          test -n "$ADD_ADMIN_PASSWORD"
-          umask 077
-          work="$(mktemp -d)"
-          trap 'rm -rf "$work"' EXIT
-          jq -cn \
-            --arg username "$ADD_ADMIN_USERNAME" \
-            --arg password "$ADD_ADMIN_PASSWORD" \
-            '{username:$username,password:$password}' > "$work/login-request.json"
-          curl --fail-with-body --silent --show-error \
-            --retry 3 --retry-all-errors \
-            --cookie-jar "$work/cookies" \
-            --header 'Content-Type: application/json' \
-            --data-binary "@$work/login-request.json" \
-            "$ADD_BASE_URL/api/v1/auth/login" > "$work/login-response.json"
-          jq -e --arg username "$ADD_ADMIN_USERNAME" \
-            '.ok == true and .username == $username and (.csrf_token | length > 20)' \
-            "$work/login-response.json" >/dev/null
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_ADMIN_PASSWORD) {
+            throw 'ADD_CANARY_ADMIN_PASSWORD is not configured in firmware-production.'
+          }
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+          $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $loginBody = @{
+            username = $env:ADD_ADMIN_USERNAME
+            password = $env:ADD_ADMIN_PASSWORD
+          } | ConvertTo-Json -Compress
+          $login = Invoke-RestMethod `
+            -Method Post `
+            -Uri "$env:ADD_BASE_URL/api/v1/auth/login" `
+            -ContentType 'application/json' `
+            -Body $loginBody `
+            -WebSession $session `
+            -TimeoutSec 30
+          if (-not $login.ok -or $login.username -ne $env:ADD_ADMIN_USERNAME -or
+              [string]::IsNullOrWhiteSpace([string]$login.csrf_token)) {
+            throw 'Production canary verifier could not establish an authenticated ADD session.'
+          }
 
-          curl --fail-with-body --silent --show-error \
-            --retry 3 --retry-all-errors \
-            --cookie "$work/cookies" \
-            "$ADD_BASE_URL/api/v1/firmware/releases" > "$work/releases.json"
-          jq -e \
-            --arg version "$EXPECTED_VERSION" \
-            --arg sha "$EXPECTED_SHA" \
-            --arg mac "$EXPECTED_MAC" \
-            '.rows | any(
-              .version == $version and
-              .git_sha == $sha and
-              .state == "HIL_ONLY" and
-              ((.hil_target_mac // "") | ascii_downcase) == $mac
-            )' "$work/releases.json" >/dev/null
+          $releases = Invoke-RestMethod `
+            -Method Get `
+            -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases" `
+            -WebSession $session `
+            -TimeoutSec 30
+          $matchingReleases = @($releases.rows | Where-Object {
+            $_.version -eq $env:EXPECTED_VERSION -and
+            $_.git_sha -eq $env:EXPECTED_SHA -and
+            $_.state -eq 'HIL_ONLY' -and
+            ([string]$_.hil_target_mac).ToLowerInvariant() -eq $env:EXPECTED_MAC
+          })
+          if ($matchingReleases.Count -ne 1) {
+            throw 'Exact immutable HIL_ONLY release identity was not found.'
+          }
 
-          curl --fail-with-body --silent --show-error \
-            --retry 3 --retry-all-errors \
-            --cookie "$work/cookies" \
-            "$ADD_BASE_URL/api/v1/firmware/campaigns" > "$work/campaigns.json"
-          jq -e \
-            --arg campaign "$EXPECTED_CAMPAIGN" \
-            --arg version "$EXPECTED_VERSION" \
-            --arg zone "$EXPECTED_ZONE" \
-            '.rows | any(
-              .campaign_id == $campaign and
-              .version == $version and
-              .zone_id == $zone and
-              .status == "CANCELLED" and
-              .eligible == 1 and
-              .legacy_skipped == 0 and
-              .counts.SUCCEEDED == 1
-            )' "$work/campaigns.json" >/dev/null
+          $campaigns = Invoke-RestMethod `
+            -Method Get `
+            -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `
+            -WebSession $session `
+            -TimeoutSec 30
+          $matchingCampaigns = @($campaigns.rows | Where-Object {
+            $_.campaign_id -eq $env:EXPECTED_CAMPAIGN -and
+            $_.version -eq $env:EXPECTED_VERSION -and
+            $_.zone_id -eq $env:EXPECTED_ZONE -and
+            $_.status -eq 'CANCELLED' -and
+            [int]$_.eligible -eq 1 -and
+            [int]$_.legacy_skipped -eq 0 -and
+            [int]$_.counts.SUCCEEDED -eq 1
+          })
+          if ($matchingCampaigns.Count -ne 1) {
+            throw 'Exact closed production-canary campaign did not contain one successful deployment.'
+          }
 
-          stable=false
-          for attempt in $(seq 1 20); do
-            curl --fail-with-body --silent --show-error \
-              --retry 2 --retry-all-errors \
-              --cookie "$work/cookies" \
-              --get --data-urlencode "q=$EXPECTED_MAC" \
-              "$ADD_BASE_URL/api/v1/devices" > "$work/devices.json"
-            if jq -e \
-              --arg mac "$EXPECTED_MAC" \
-              --arg zone "$EXPECTED_ZONE" \
-              --arg firmware "zone-lite-$EXPECTED_VERSION" \
-              --argjson minimum "$MINIMUM_TERMINAL_ATTENDANCE" \
-              '.rows as $rows |
-                ($rows | length) == 1 and
-                ($rows[0] |
-                  ((.hardware_id // "") | ascii_downcase) == $mac and
-                  .zone_id == $zone and
-                  .firmware_version == $firmware and
-                  .state == "ONLINE" and
-                  .connected == true and
-                  .ota_capable == true and
-                  .ota_state == "OTA_READY" and
-                  .current_activity == "LIVE_CAPTURE" and
-                  .zkt.online == true and
-                  .zkt.connection_state == "ONLINE" and
-                  .zkt.certification_state == "CERTIFIED" and
-                  .zkt.snapshot_complete == true and
-                  .zkt.attendance_count >= $minimum
-                )' \
-              "$work/devices.json" >/dev/null; then
-              stable=true
-              break
-            fi
-            sleep 15
-          done
-          test "$stable" = true
-          echo "Exact production canary is stable and eligible for immutable-byte promotion."
+          $deviceQuery = [Uri]::EscapeDataString($env:EXPECTED_MAC)
+          $stable = $false
+          for ($attempt = 1; $attempt -le 20; $attempt++) {
+            $devices = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/devices?q=$deviceQuery" `
+              -WebSession $session `
+              -TimeoutSec 30
+            $rows = @($devices.rows)
+            if ($rows.Count -eq 1) {
+              $row = $rows[0]
+              $stable = (
+                ([string]$row.hardware_id).ToLowerInvariant() -eq $env:EXPECTED_MAC -and
+                $row.zone_id -eq $env:EXPECTED_ZONE -and
+                $row.firmware_version -eq "zone-lite-$env:EXPECTED_VERSION" -and
+                $row.state -eq 'ONLINE' -and
+                [bool]$row.connected -and
+                [bool]$row.ota_capable -and
+                $row.ota_state -eq 'OTA_READY' -and
+                $row.current_activity -eq 'LIVE_CAPTURE' -and
+                [bool]$row.zkt.online -and
+                $row.zkt.connection_state -eq 'ONLINE' -and
+                $row.zkt.certification_state -eq 'CERTIFIED' -and
+                [bool]$row.zkt.snapshot_complete -and
+                [int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE
+              )
+            }
+            if ($stable) { break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $stable) {
+            throw 'Production canary did not reach the complete stable live-operation contract.'
+          }
+          Write-Host 'Exact production canary is stable and eligible for immutable-byte promotion.'
 
   promote-add:
     needs: [provenance, verify-production-canary]
