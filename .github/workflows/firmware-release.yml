@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Exact green main commit to build
+        description: Exact green main commit already tested as an immutable HIL candidate
         required: true
         type: string
       version:
@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: provenance
-        name: Require exact main SHA and successful HIL evidence
+        name: Require exact main SHA and successful physical HIL evidence
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,69 +56,8 @@ jobs:
           test "$(jq -r .head_sha <<<"$run_json")" = "$sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-  build:
+  promote-add:
     needs: provenance
-    runs-on: ubuntu-latest
-    container: espressif/idf:v5.5.3
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.provenance.outputs.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Build the exact unsigned candidate
-        working-directory: firmware/zone_lite
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(sed -n 's/^project(zone_lite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
-          idf.py -B build-release -D SDKCONFIG=/tmp/zone-lite-release-sdkconfig build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zone-lite-release-unsigned-${{ needs.provenance.outputs.sha }}
-          path: firmware/zone_lite/build-release/zone_lite.bin
-          if-no-files-found: error
-          retention-days: 1
-
-  sign:
-    needs: [provenance, build]
-    runs-on: [self-hosted, Windows, X64]
-    environment: firmware-signing
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.provenance.outputs.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: zone-lite-release-unsigned-${{ needs.provenance.outputs.sha }}
-          path: unsigned
-      - name: Sign with the ADD-hosted DPAPI vault
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
-          $unsigned = Join-Path $PWD 'unsigned\firmware\zone_lite\build-release'
-          $output = Join-Path $PWD 'release'
-          ./deploy/add/sign-firmware-release.ps1 `
-            -VaultDirectory $vault `
-            -UnsignedDirectory $unsigned `
-            -OutputDirectory $output `
-            -Version '${{ inputs.version }}' `
-            -GitSha '${{ needs.provenance.outputs.sha }}'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zone-lite-${{ inputs.version }}
-          path: release/
-          if-no-files-found: error
-          retention-days: 90
-
-  publish-add:
-    needs: [provenance, sign]
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-production
     steps:
@@ -127,24 +66,27 @@ jobs:
           ref: ${{ needs.provenance.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: zone-lite-${{ inputs.version }}
-          path: firmware-release
-      - name: Atomically publish to the ADD firmware store
+      - name: Promote the exact HIL-tested bytes
         shell: powershell
         env:
           ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
         run: |
           if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw "ADD_FIRMWARE_STORE_HOST_PATH is not configured" }
-          ./deploy/add/publish-firmware.ps1 `
-            -SourceDirectory firmware-release `
+          ./deploy/add/promote-firmware.ps1 `
             -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
-            -Version "${{ inputs.version }}"
+            -Version "${{ inputs.version }}" `
+            -GitSha "${{ needs.provenance.outputs.sha }}" `
+            -OutputDirectory promoted-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: promoted-release/
+          if-no-files-found: error
+          retention-days: 90
 
   disaster-recovery-copy:
     if: ${{ inputs.publish_disaster_recovery_copy }}
-    needs: [provenance, sign, publish-add]
+    needs: [provenance, promote-add]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -163,4 +105,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ needs.provenance.outputs.sha }}" \
             --title "Zone Lite ${{ inputs.version }}" \
-            --notes "Signed production firmware. Promotion requires an approved per-zone campaign in ADD."
+            --notes "Exact immutable bytes promoted after physical HIL acceptance."
