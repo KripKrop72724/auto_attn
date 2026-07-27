@@ -112,6 +112,11 @@ def capability_is_eligible(connector: Connector) -> bool:
                 and connector.ota_partition_layout == OTA_LAYOUT)
 
 
+def _versions_match(running: str | None, target: str) -> bool:
+    normalized_running = (running or "").removeprefix("zone-lite-")
+    return bool(normalized_running and normalized_running == target.removeprefix("zone-lite-"))
+
+
 def _application_sha256(release: FirmwareRelease) -> str | None:
     value = str((release.manifest or {}).get("application_sha256") or "")
     if len(value) != 64 or value != value.lower() or any(
@@ -282,6 +287,20 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
             return None
     application_digest = _application_sha256(release)
     if application_digest is None:
+        return None
+    if (
+        deployment.status in ACTIVE_DEPLOYMENT_STATES
+        and _versions_match(connector.firmware_version, deployment.target_version)
+    ):
+        deployment.status = "SUCCEEDED"
+        deployment.completed_at = utc_now()
+        deployment.updated_at = utc_now()
+        connector.ota_state = "OTA_READY"
+        session.add(FirmwareEvent(
+            deployment_id=deployment.id,
+            state="SUCCEEDED",
+            details={"recovered_from_running_target_version": True},
+        ))
         return None
     if pending_offer:
         deployment.status = "OFFERED"

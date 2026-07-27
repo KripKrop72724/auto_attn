@@ -265,6 +265,21 @@ static bool fetch_assignment(void)
                  cJSON_IsString(sha) && strlen(sha->valuestring) == 64 && cJSON_IsString(url) &&
                  cJSON_IsNumber(size) && size->valuedouble > 0;
     if (valid) {
+        const esp_app_desc_t *running = esp_app_get_description();
+        if (running && strcmp(running->version, version->valuestring) == 0) {
+            memset(&s_journal, 0, sizeof(s_journal));
+            strlcpy(s_journal.deployment_id, deployment->valuestring, sizeof(s_journal.deployment_id));
+            strlcpy(s_journal.release_id, release->valuestring, sizeof(s_journal.release_id));
+            strlcpy(s_journal.target_version, version->valuestring, sizeof(s_journal.target_version));
+            strlcpy(s_journal.state, "RECONCILING", sizeof(s_journal.state));
+            (void)save_journal();
+            if (report_state("SUCCEEDED", NULL)) {
+                clear_journal();
+            }
+            cJSON_Delete(root);
+            free(response_data);
+            return false;
+        }
         bool same = strcmp(s_journal.deployment_id, deployment->valuestring) == 0 &&
                     strcmp(s_journal.image_sha256, sha->valuestring) == 0;
         size_t resume = same ? s_journal.bytes_written : 0;
@@ -375,8 +390,9 @@ static bool confirm_or_report_rollback(void)
                 (void)save_journal();
                 (void)report_state("RECONCILING", NULL);
                 vTaskDelay(pdMS_TO_TICKS(45000));
-                (void)report_state("SUCCEEDED", NULL);
-                clear_journal();
+                if (report_state("SUCCEEDED", NULL)) {
+                    clear_journal();
+                }
                 return true;
             }
             break;
@@ -385,6 +401,26 @@ static bool confirm_or_report_rollback(void)
     }
     (void)esp_ota_mark_app_invalid_rollback_and_reboot();
     return false;
+}
+
+static bool acknowledge_pending_success(void)
+{
+    if (!s_journal.deployment_id[0] || strcmp(s_journal.state, "RECONCILING") != 0) {
+        return true;
+    }
+    const esp_app_desc_t *running = esp_app_get_description();
+    if (!running || strcmp(running->version, s_journal.target_version) != 0) {
+        (void)report_state("ROLLED_BACK", "RUNNING_VERSION_MISMATCH");
+        clear_journal();
+        return true;
+    }
+    if (!report_state("SUCCEEDED", NULL)) {
+        ESP_LOGW(TAG, "ADD did not acknowledge OTA success; retaining journal for retry");
+        return false;
+    }
+    clear_journal();
+    ESP_LOGI(TAG, "ADD acknowledged durable OTA success");
+    return true;
 }
 
 static void ota_task(void *argument)
@@ -402,10 +438,16 @@ static void ota_task(void *argument)
                     ESP_LOGW(TAG, "ADD OTA capability report failed; retrying in %u ms", OTA_POLL_MS);
                 }
             }
-            if (capability_reported && !s_busy && fetch_assignment()) {
-                s_busy = true;
-                (void)perform_update();
-                s_busy = false;
+            if (capability_reported && !s_busy) {
+                if (!acknowledge_pending_success()) {
+                    vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
+                    continue;
+                }
+                if (fetch_assignment()) {
+                    s_busy = true;
+                    (void)perform_update();
+                    s_busy = false;
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));

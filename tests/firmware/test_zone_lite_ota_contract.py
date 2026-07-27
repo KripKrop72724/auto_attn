@@ -51,7 +51,18 @@ def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
     assert "bool capability_reported = false;" in text
     assert "if (!capability_reported)" in text
     assert "capability_reported = report_capability();" in text
-    assert "capability_reported && !s_busy && fetch_assignment()" in text
+    assert "capability_reported && !s_busy" in text
+    assert "capability_reported = report_capability();" in text
+
+
+def test_ota_success_is_durable_and_same_version_is_never_downloaded_again() -> None:
+    text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    assert "acknowledge_pending_success" in text
+    assert 'strcmp(s_journal.state, "RECONCILING") != 0' in text
+    assert 'if (report_state("SUCCEEDED", NULL)) {' in text
+    assert "ADD did not acknowledge OTA success; retaining journal for retry" in text
+    assert 'strcmp(running->version, version->valuestring) == 0' in text
+    assert '(void)perform_update();' in text
 
 
 def test_release_workflow_requires_hil_and_protected_environments() -> None:
