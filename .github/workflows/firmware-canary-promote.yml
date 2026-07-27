@@ -1,0 +1,235 @@
+name: Zone Lite production canary promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green main commit used to build the HIL_ONLY candidate
+        required: true
+        type: string
+      version:
+        description: SemVer firmware version, without a v prefix
+        required: true
+        type: string
+      campaign_id:
+        description: Closed production-canary campaign with one successful deployment
+        required: true
+        type: string
+      zone_id:
+        description: Exact canary zone
+        required: true
+        type: string
+      device_mac:
+        description: Exact canary ESP MAC
+        required: true
+        type: string
+      minimum_terminal_attendance:
+        description: Fail closed if the canary reports fewer preserved terminal punches
+        required: true
+        type: number
+      publish_disaster_recovery_copy:
+        description: Also create an immutable GitHub release copy
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zone-lite-firmware-release
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.provenance.outputs.sha }}
+      mac: ${{ steps.provenance.outputs.mac }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: provenance
+        name: Require exact main SHA and normalized release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${{ inputs.campaign_id }}" =~ ^[0-9a-f]{32}$ ]]
+          [[ "${{ inputs.zone_id }}" =~ ^ZONE-[A-Z0-9-]+$ ]]
+          mac="$(tr '[:upper:]' '[:lower:]' <<<"${{ inputs.device_mac }}")"
+          [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]
+          test "${{ inputs.minimum_terminal_attendance }}" -ge 1
+          git fetch origin main
+          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "mac=$mac" >> "$GITHUB_OUTPUT"
+
+  verify-production-canary:
+    needs: provenance
+    runs-on: ubuntu-latest
+    environment: firmware-production
+    timeout-minutes: 10
+    env:
+      ADD_BASE_URL: https://attendancedevices.slichealth.com
+      ADD_ADMIN_USERNAME: StateHealthAdmin
+      ADD_ADMIN_PASSWORD: ${{ secrets.ADD_CANARY_ADMIN_PASSWORD }}
+      EXPECTED_SHA: ${{ needs.provenance.outputs.sha }}
+      EXPECTED_MAC: ${{ needs.provenance.outputs.mac }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+      EXPECTED_CAMPAIGN: ${{ inputs.campaign_id }}
+      EXPECTED_ZONE: ${{ inputs.zone_id }}
+      MINIMUM_TERMINAL_ATTENDANCE: ${{ inputs.minimum_terminal_attendance }}
+    steps:
+      - name: Verify exact successful canary and stable live operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ADD_ADMIN_PASSWORD"
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          jq -cn \
+            --arg username "$ADD_ADMIN_USERNAME" \
+            --arg password "$ADD_ADMIN_PASSWORD" \
+            '{username:$username,password:$password}' > "$work/login-request.json"
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors \
+            --cookie-jar "$work/cookies" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$work/login-request.json" \
+            "$ADD_BASE_URL/api/v1/auth/login" > "$work/login-response.json"
+          jq -e --arg username "$ADD_ADMIN_USERNAME" \
+            '.ok == true and .username == $username and (.csrf_token | length > 20)' \
+            "$work/login-response.json" >/dev/null
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors \
+            --cookie "$work/cookies" \
+            "$ADD_BASE_URL/api/v1/firmware/releases" > "$work/releases.json"
+          jq -e \
+            --arg version "$EXPECTED_VERSION" \
+            --arg sha "$EXPECTED_SHA" \
+            --arg mac "$EXPECTED_MAC" \
+            '.rows | any(
+              .version == $version and
+              .git_sha == $sha and
+              .state == "HIL_ONLY" and
+              ((.hil_target_mac // "") | ascii_downcase) == $mac
+            )' "$work/releases.json" >/dev/null
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors \
+            --cookie "$work/cookies" \
+            "$ADD_BASE_URL/api/v1/firmware/campaigns" > "$work/campaigns.json"
+          jq -e \
+            --arg campaign "$EXPECTED_CAMPAIGN" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg zone "$EXPECTED_ZONE" \
+            '.rows | any(
+              .campaign_id == $campaign and
+              .version == $version and
+              .zone_id == $zone and
+              .status == "CANCELLED" and
+              .eligible == 1 and
+              .legacy_skipped == 0 and
+              .counts.SUCCEEDED == 1
+            )' "$work/campaigns.json" >/dev/null
+
+          stable=false
+          for attempt in $(seq 1 20); do
+            curl --fail-with-body --silent --show-error \
+              --retry 2 --retry-all-errors \
+              --cookie "$work/cookies" \
+              --get --data-urlencode "q=$EXPECTED_MAC" \
+              "$ADD_BASE_URL/api/v1/devices" > "$work/devices.json"
+            if jq -e \
+              --arg mac "$EXPECTED_MAC" \
+              --arg zone "$EXPECTED_ZONE" \
+              --arg firmware "zone-lite-$EXPECTED_VERSION" \
+              --argjson minimum "$MINIMUM_TERMINAL_ATTENDANCE" \
+              '.rows as $rows |
+                ($rows | length) == 1 and
+                ($rows[0] |
+                  ((.hardware_id // "") | ascii_downcase) == $mac and
+                  .zone_id == $zone and
+                  .firmware_version == $firmware and
+                  .state == "ONLINE" and
+                  .connected == true and
+                  .ota_capable == true and
+                  .ota_state == "OTA_READY" and
+                  .current_activity == "LIVE_CAPTURE" and
+                  .zkt.online == true and
+                  .zkt.connection_state == "ONLINE" and
+                  .zkt.certification_state == "CERTIFIED" and
+                  .zkt.snapshot_complete == true and
+                  .zkt.attendance_count >= $minimum
+                )' \
+              "$work/devices.json" >/dev/null; then
+              stable=true
+              break
+            fi
+            sleep 15
+          done
+          test "$stable" = true
+          echo "Exact production canary is stable and eligible for immutable-byte promotion."
+
+  promote-add:
+    needs: [provenance, verify-production-canary]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Promote the exact canary-tested bytes
+        shell: powershell
+        env:
+          ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+        run: |
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw "ADD_FIRMWARE_STORE_HOST_PATH is not configured" }
+          ./deploy/add/promote-firmware.ps1 `
+            -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+            -Version "${{ inputs.version }}" `
+            -GitSha "${{ needs.provenance.outputs.sha }}" `
+            -OutputDirectory promoted-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: promoted-release/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 90
+
+  disaster-recovery-copy:
+    if: ${{ inputs.publish_disaster_recovery_copy }}
+    needs: [provenance, promote-add]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}
+          path: release
+      - name: Ensure the promoted package is no longer HIL-targeted
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e release/.hil-only.json
+      - name: Publish immutable disaster-recovery copy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="zone-lite-v${{ inputs.version }}"
+          ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1
+          gh release create "$tag" release/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ needs.provenance.outputs.sha }}" \
+            --title "Zone Lite ${{ inputs.version }}" \
+            --notes "Exact immutable bytes promoted after a successful production canary and live health acceptance."

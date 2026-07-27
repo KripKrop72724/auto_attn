@@ -17,7 +17,30 @@ def test_publication_requires_exact_hil_target_and_promotion_preserves_bytes() -
     assert "HIL_ONLY publication requires one exact ESP MAC" in publish
     assert "already exists outside HIL quarantine" in publish
     assert "Firmware image changed after HIL publication" in promote
+    assert "$outputMarkerPath = Join-Path $output '.hil-only.json'" in promote
+    assert "Remove-Item -LiteralPath $outputMarkerPath -Force" in promote
     assert "Remove-Item -LiteralPath $markerPath -Force" in promote
+
+
+def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "firmware-canary-promote.yml"
+    ).read_text(encoding="utf-8")
+    for required in (
+        'git merge-base --is-ancestor "$sha" origin/main',
+        ".state == \"HIL_ONLY\"",
+        ".counts.SUCCEEDED == 1",
+        ".legacy_skipped == 0",
+        ".firmware_version == $firmware",
+        ".ota_state == \"OTA_READY\"",
+        ".current_activity == \"LIVE_CAPTURE\"",
+        ".zkt.connection_state == \"ONLINE\"",
+        ".zkt.certification_state == \"CERTIFIED\"",
+        ".zkt.attendance_count >= $minimum",
+        "deploy/add/promote-firmware.ps1",
+        "test ! -e release/.hil-only.json",
+    ):
+        assert required in workflow
 
 
 def test_release_manifest_contract_matches_add_verifier() -> None:
