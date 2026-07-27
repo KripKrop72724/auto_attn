@@ -74,7 +74,7 @@ jobs:
     environment: firmware-production
     timeout-minutes: 10
     env:
-      ADD_BASE_URL: https://attendancedevices.slichealth.com
+      ADD_BASE_URL: http://127.0.0.1:8096
       ADD_ADMIN_USERNAME: StateHealthAdmin
       ADD_ADMIN_PASSWORD: ${{ secrets.ADD_CANARY_ADMIN_PASSWORD }}
       EXPECTED_SHA: ${{ needs.provenance.outputs.sha }}
@@ -91,91 +91,126 @@ jobs:
           if (-not $env:ADD_ADMIN_PASSWORD) {
             throw 'ADD_CANARY_ADMIN_PASSWORD is not configured in firmware-production.'
           }
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-          $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
           $loginBody = @{
             username = $env:ADD_ADMIN_USERNAME
             password = $env:ADD_ADMIN_PASSWORD
           } | ConvertTo-Json -Compress
-          $login = Invoke-RestMethod `
+          $loginResponse = Invoke-WebRequest `
+            -UseBasicParsing `
             -Method Post `
             -Uri "$env:ADD_BASE_URL/api/v1/auth/login" `
             -ContentType 'application/json' `
             -Body $loginBody `
-            -WebSession $session `
             -TimeoutSec 30
+          $login = $loginResponse.Content | ConvertFrom-Json
           if (-not $login.ok -or $login.username -ne $env:ADD_ADMIN_USERNAME -or
               [string]::IsNullOrWhiteSpace([string]$login.csrf_token)) {
             throw 'Production canary verifier could not establish an authenticated ADD session.'
           }
-
-          $releases = Invoke-RestMethod `
-            -Method Get `
-            -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases" `
-            -WebSession $session `
-            -TimeoutSec 30
-          $matchingReleases = @($releases.rows | Where-Object {
-            $_.version -eq $env:EXPECTED_VERSION -and
-            $_.git_sha -eq $env:EXPECTED_SHA -and
-            $_.state -eq 'HIL_ONLY' -and
-            ([string]$_.hil_target_mac).ToLowerInvariant() -eq $env:EXPECTED_MAC
-          })
-          if ($matchingReleases.Count -ne 1) {
-            throw 'Exact immutable HIL_ONLY release identity was not found.'
+          $setCookie = @($loginResponse.Headers['Set-Cookie']) -join ','
+          $cookieMatch = [regex]::Match(
+            $setCookie,
+            '(?:^|[,\s])add_admin=([^;,\s]+)'
+          )
+          if (-not $cookieMatch.Success) {
+            throw 'Production canary verifier did not receive the ADD administrator cookie.'
           }
-
-          $campaigns = Invoke-RestMethod `
-            -Method Get `
-            -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `
-            -WebSession $session `
-            -TimeoutSec 30
-          $matchingCampaigns = @($campaigns.rows | Where-Object {
-            $_.campaign_id -eq $env:EXPECTED_CAMPAIGN -and
-            $_.version -eq $env:EXPECTED_VERSION -and
-            $_.zone_id -eq $env:EXPECTED_ZONE -and
-            $_.status -eq 'CANCELLED' -and
-            [int]$_.eligible -eq 1 -and
-            [int]$_.legacy_skipped -eq 0 -and
-            [int]$_.counts.SUCCEEDED -eq 1
-          })
-          if ($matchingCampaigns.Count -ne 1) {
-            throw 'Exact closed production-canary campaign did not contain one successful deployment.'
+          $authHeaders = @{
+            Cookie = "add_admin=$($cookieMatch.Groups[1].Value)"
           }
+          $verificationFailed = $false
+          try {
 
-          $deviceQuery = [Uri]::EscapeDataString($env:EXPECTED_MAC)
-          $stable = $false
-          for ($attempt = 1; $attempt -le 20; $attempt++) {
-            $devices = Invoke-RestMethod `
+            $releases = Invoke-RestMethod `
               -Method Get `
-              -Uri "$env:ADD_BASE_URL/api/v1/devices?q=$deviceQuery" `
-              -WebSession $session `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases" `
+              -Headers $authHeaders `
               -TimeoutSec 30
-            $rows = @($devices.rows)
-            if ($rows.Count -eq 1) {
-              $row = $rows[0]
-              $stable = (
-                ([string]$row.hardware_id).ToLowerInvariant() -eq $env:EXPECTED_MAC -and
-                $row.zone_id -eq $env:EXPECTED_ZONE -and
-                $row.firmware_version -eq "zone-lite-$env:EXPECTED_VERSION" -and
-                $row.state -eq 'ONLINE' -and
-                [bool]$row.connected -and
-                [bool]$row.ota_capable -and
-                $row.ota_state -eq 'OTA_READY' -and
-                $row.current_activity -eq 'LIVE_CAPTURE' -and
-                [bool]$row.zkt.online -and
-                $row.zkt.connection_state -eq 'ONLINE' -and
-                $row.zkt.certification_state -eq 'CERTIFIED' -and
-                [bool]$row.zkt.snapshot_complete -and
-                [int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE
-              )
+            $matchingReleases = @($releases.rows | Where-Object {
+              $_.version -eq $env:EXPECTED_VERSION -and
+              $_.git_sha -eq $env:EXPECTED_SHA -and
+              $_.state -eq 'HIL_ONLY' -and
+              ([string]$_.hil_target_mac).ToLowerInvariant() -eq $env:EXPECTED_MAC
+            })
+            if ($matchingReleases.Count -ne 1) {
+              throw 'Exact immutable HIL_ONLY release identity was not found.'
             }
-            if ($stable) { break }
-            Start-Sleep -Seconds 15
+
+            $campaigns = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `
+              -Headers $authHeaders `
+              -TimeoutSec 30
+            $matchingCampaigns = @($campaigns.rows | Where-Object {
+              $_.campaign_id -eq $env:EXPECTED_CAMPAIGN -and
+              $_.version -eq $env:EXPECTED_VERSION -and
+              $_.zone_id -eq $env:EXPECTED_ZONE -and
+              $_.status -eq 'CANCELLED' -and
+              [int]$_.eligible -eq 1 -and
+              [int]$_.legacy_skipped -eq 0 -and
+              [int]$_.counts.SUCCEEDED -eq 1
+            })
+            if ($matchingCampaigns.Count -ne 1) {
+              throw 'Exact closed production-canary campaign did not contain one successful deployment.'
+            }
+
+            $deviceQuery = [Uri]::EscapeDataString($env:EXPECTED_MAC)
+            $stable = $false
+            for ($attempt = 1; $attempt -le 20; $attempt++) {
+              $devices = Invoke-RestMethod `
+                -Method Get `
+                -Uri "$env:ADD_BASE_URL/api/v1/devices?q=$deviceQuery" `
+                -Headers $authHeaders `
+                -TimeoutSec 30
+              $rows = @($devices.rows)
+              if ($rows.Count -eq 1) {
+                $row = $rows[0]
+                $stable = (
+                  ([string]$row.hardware_id).ToLowerInvariant() -eq $env:EXPECTED_MAC -and
+                  $row.zone_id -eq $env:EXPECTED_ZONE -and
+                  $row.firmware_version -eq "zone-lite-$env:EXPECTED_VERSION" -and
+                  $row.state -eq 'ONLINE' -and
+                  [bool]$row.connected -and
+                  [bool]$row.ota_capable -and
+                  $row.ota_state -eq 'OTA_READY' -and
+                  $row.current_activity -eq 'LIVE_CAPTURE' -and
+                  [bool]$row.zkt.online -and
+                  $row.zkt.connection_state -eq 'ONLINE' -and
+                  $row.zkt.certification_state -eq 'CERTIFIED' -and
+                  [bool]$row.zkt.snapshot_complete -and
+                  [int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE
+                )
+              }
+              if ($stable) { break }
+              Start-Sleep -Seconds 15
+            }
+            if (-not $stable) {
+              throw 'Production canary did not reach the complete stable live-operation contract.'
+            }
+            Write-Host 'Exact production canary is stable and eligible for immutable-byte promotion.'
+          } catch {
+            $verificationFailed = $true
+            throw
+          } finally {
+            try {
+              $logoutHeaders = @{
+                Cookie = $authHeaders.Cookie
+                'X-CSRF-Token' = [string]$login.csrf_token
+              }
+              Invoke-RestMethod `
+                -Method Post `
+                -Uri "$env:ADD_BASE_URL/api/v1/auth/logout" `
+                -Headers $logoutHeaders `
+                -ContentType 'application/json' `
+                -Body '{}' `
+                -TimeoutSec 15 | Out-Null
+            } catch {
+              if (-not $verificationFailed) {
+                throw 'Production canary verification succeeded, but the temporary ADD session could not be revoked.'
+              }
+              Write-Warning 'Temporary ADD session revocation also failed after a verification failure.'
+            }
           }
-          if (-not $stable) {
-            throw 'Production canary did not reach the complete stable live-operation contract.'
-          }
-          Write-Host 'Exact production canary is stable and eligible for immutable-byte promotion.'
 
   promote-add:
     needs: [provenance, verify-production-canary]
