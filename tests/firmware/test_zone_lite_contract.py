@@ -378,11 +378,45 @@ def test_large_truth_stream_applies_bounded_outbox_backpressure_and_receipt_prio
         "add_enqueue_reconcile_events("
     )
     assert "#define ADD_BULK_CAPACITY_WAIT_MS" in connector_source
+    assert "#define ADD_ACK_TIMEOUT_MS 60000" in connector_source
     assert "ADD_BULK_CAPACITY_POLL_MS" in connector_source
+    assert "refresh_capacity_deadline_on_progress" in connector_source
+    assert "outbox->depth < *last_depth" in connector_source
+    assert "*deadline_ms = monotonic_ms() + ADD_BULK_CAPACITY_WAIT_MS;" in connector_source
     assert "required_bytes" in connector_source
     assert "s_bulk_outbox.offset > 0" in connector_source
     assert "compact_outbox_locked(&s_bulk_outbox, true)" in connector_source
     assert "waiting for acknowledged rows before appending more truth" in connector_source
+
+
+def test_full_reconcile_defers_until_prior_durable_add_backlog_drains():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    connector_source = (FIRMWARE / "main" / "add_connector.c").read_text()
+    header_source = (FIRMWARE / "main" / "add_connector.h").read_text()
+    gateway_start = source.index("uint32_t bulk_depth = 0;")
+    gateway_reconcile = source[
+        gateway_start :
+        source.index('add_connector_set_activity("LIVE_CAPTURE");', gateway_start)
+    ]
+    deferred_start = gateway_reconcile.index(
+        "if (!bulk_depth_available || bulk_depth > 0)"
+    )
+    deferred_end = gateway_reconcile.index(
+        "} else {",
+        gateway_reconcile.index("reconcile_succeeded = false;", deferred_start),
+    )
+    deferred = gateway_reconcile[
+        deferred_start:deferred_end
+    ]
+
+    assert "add_connector_get_bulk_outbox_depth" in connector_source
+    assert "add_connector_get_bulk_outbox_depth" in header_source
+    assert "add_connector_get_bulk_outbox_depth(&bulk_depth)" in gateway_reconcile
+    assert "!bulk_depth_available || bulk_depth > 0" in gateway_reconcile
+    assert '"FULL_RECONCILE_DEFERRED_OUTBOX"' in deferred
+    assert "reconcile_succeeded = false;" in deferred
+    assert "g_force_truth_reconcile = false" not in deferred
+    assert "g_last_full_truth_reconcile_epoch" not in deferred
 
 
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():

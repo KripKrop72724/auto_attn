@@ -65,6 +65,7 @@ void add_connector_start(void);
 bool add_connector_is_connected(void);
 bool add_connector_consume_connected_edge(void);
 uint32_t add_connector_outbox_depth(void);
+bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out);
 void add_connector_set_activity(const char *activity);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);

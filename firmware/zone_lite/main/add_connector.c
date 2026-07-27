@@ -57,7 +57,7 @@
 #define ADD_COMMAND_QUEUE_DEPTH 32
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES 8192
-#define ADD_ACK_TIMEOUT_MS 15000
+#define ADD_ACK_TIMEOUT_MS 60000
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
 #define ADD_TRANSPORT_RESTART_GUARD_MS 45000
@@ -65,7 +65,7 @@
 #define ADD_OUTBOX_MAX_BYTES (4 * 1024 * 1024)
 #define ADD_LIVE_OUTBOX_MAX_BYTES (512 * 1024)
 #define ADD_OUTBOX_COMPACT_MIN_BYTES (256 * 1024)
-#define ADD_BULK_CAPACITY_WAIT_MS (2 * 60 * 1000)
+#define ADD_BULK_CAPACITY_WAIT_MS (10 * 60 * 1000)
 #define ADD_BULK_CAPACITY_POLL_MS 250
 #define ADD_OUTBOX_RECORD_OVERHEAD_BYTES 128
 #define ADD_OUTBOX_PATH "/storage/add_pending.jsonl"
@@ -1422,6 +1422,17 @@ static char *attendance_outbox_record_line(const char *payload_json, bool *live_
     return outbox_record_line("attendance_batch", payload_json, live_out);
 }
 
+static void refresh_capacity_deadline_on_progress(
+    const add_outbox_t *outbox,
+    uint32_t *last_depth,
+    int64_t *deadline_ms)
+{
+    if (*last_depth != UINT32_MAX && outbox->depth < *last_depth) {
+        *deadline_ms = monotonic_ms() + ADD_BULK_CAPACITY_WAIT_MS;
+    }
+    *last_depth = outbox->depth;
+}
+
 static bool add_connector_enqueue_record(const char *type, const char *payload_json)
 {
     if (!zone_config_get()->add_enabled) return true;
@@ -1432,9 +1443,14 @@ static bool add_connector_enqueue_record(const char *type, const char *payload_j
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
     int64_t deadline_ms = monotonic_ms() + (live ? 0 : ADD_BULK_CAPACITY_WAIT_MS);
+    uint32_t last_depth = UINT32_MAX;
     bool waiting_logged = false;
     do {
         if (outbox->lock && xSemaphoreTake(outbox->lock, lock_timeout) == pdTRUE) {
+            refresh_capacity_deadline_on_progress(
+                outbox,
+                &last_depth,
+                &deadline_ms);
             struct stat st = {0};
             off_t current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
             if (current + (off_t)strlen(line) + 1 > outbox->max_bytes &&
@@ -1538,6 +1554,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
     }
 
     int64_t deadline_ms = monotonic_ms() + ADD_BULK_CAPACITY_WAIT_MS;
+    uint32_t last_depth = UINT32_MAX;
     bool waiting_logged = false;
     while (true) {
         if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
@@ -1549,6 +1566,10 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
             continue;
         }
 
+        refresh_capacity_deadline_on_progress(
+            &s_bulk_outbox,
+            &last_depth,
+            &deadline_ms);
         struct stat st = {0};
         off_t current = stat(s_bulk_outbox.path, &st) == 0 ? st.st_size : 0;
         if (current + (off_t)required_bytes > s_bulk_outbox.max_bytes &&
@@ -1980,6 +2001,17 @@ uint32_t add_connector_outbox_depth(void)
         xSemaphoreGive(s_bulk_outbox.lock);
     }
     return depth;
+}
+
+bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out)
+{
+    if (!depth_out || !s_bulk_outbox.lock ||
+        xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    *depth_out = s_bulk_outbox.depth;
+    xSemaphoreGive(s_bulk_outbox.lock);
+    return true;
 }
 
 void add_connector_set_activity(const char *activity)
