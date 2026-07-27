@@ -132,9 +132,8 @@ const normalizedStatus = (state: unknown) =>
 const statusPattern = (state: unknown) => {
   const normalized = normalizedStatus(state).toUpperCase()
   if (
-    ['ONLINE', 'SUCCEEDED', 'ACKED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED'].includes(
-      normalized,
-    )
+    ['ONLINE', 'SUCCEEDED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED'].includes(normalized) ||
+    normalized.includes('ACKED')
   )
     return 'confirmed'
   if (
@@ -416,7 +415,12 @@ function FleetView({
         <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" />
         <Metric label="Needs review" value={overview.open_alerts} detail={`${attention} devices degraded or offline`} icon="alert" />
         <Metric label="Enrollment access" value={overview.active_leases} detail="Temporary 10-minute leases" icon="shield" />
-        <Metric label="ORDS delivery queue" value={delivery?.backlog ?? 0} detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`} icon="clock" />
+        <Metric
+          label="ORDS delivery queue"
+          value={delivery?.backlog ?? 0}
+          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined · ${delivery?.acknowledged_firmware ?? 0} firmware-confirmed`}
+          icon="clock"
+        />
         <Metric label="National footprint" value={overview.total} detail="Authorized ESP–ZKT pairs" icon="server" />
       </section>
       <section className="panel">
@@ -1269,7 +1273,7 @@ function AttendanceView({ devices, revision }: { devices: Device[]; revision: nu
         <div className="attendance-table">
           <div className="attendance-head"><span>Employee</span><span>Event time</span><span>Terminal</span><span>Capture</span><span>Delivery</span></div>
           {loading && <div className="empty-state compact">Loading attendance ledger…</div>}
-          {!loading && rows.map((row) => <article key={row.event_uid}><div><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id}`}</small></div><div><strong>{dateTime(row.device_event_time)}</strong><small>Received {relativeTime(row.received_at)}</small></div><div><strong>{row.device_serial || 'Unreported serial'}</strong><small>UID {row.uid || '—'} · User {row.user_id}</small></div><div><StatusBadge state={row.source} /><small>Punch {row.punch ?? '—'} · {row.clock_quality}</small></div><div><StatusBadge state={row.ords_status} /><small>{row.clock_drift_seconds == null ? 'No drift sample' : `${Math.round(row.clock_drift_seconds)}s clock drift`}</small></div></article>)}
+          {!loading && rows.map((row) => <article key={row.event_uid}><div><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id}`}</small></div><div><strong>{dateTime(row.device_event_time)}</strong><small>Received {relativeTime(row.received_at)}</small></div><div><strong>{row.device_serial || 'Unreported serial'}</strong><small>UID {row.uid || '—'} · User {row.user_id}</small></div><div><StatusBadge state={row.source} /><small>Punch {row.punch ?? '—'} · {row.clock_quality}</small></div><div><StatusBadge state={row.ords_status} /><small>{row.oracle_confirmed_at ? `Oracle confirmed ${relativeTime(row.oracle_confirmed_at)} via ${(row.oracle_confirmation_path || 'unknown path').replaceAll('_', ' ').toLowerCase()}` : row.clock_drift_seconds == null ? 'No Oracle confirmation yet' : `${Math.round(row.clock_drift_seconds)}s clock drift`}</small></div></article>)}
           {!loading && !rows.length && <div className="empty-state"><Icon name="clock" /><h3>No attendance matches these filters.</h3></div>}
         </div>
       </section>

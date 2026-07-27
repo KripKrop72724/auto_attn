@@ -31,6 +31,7 @@ from zk_add.models import (
     IdentityConflictResolution,
     IdentityTombstone,
     OnboardingNonce,
+    OracleReceipt,
     OrdsOutbox,
     TemporaryAdminLease,
     UserDeletionItem,
@@ -41,6 +42,7 @@ from zk_add.schemas import (
     AttendanceBatchRequest,
     AttendanceEventIn,
     HeartbeatPayload,
+    OracleReceiptBatchRequest,
     UserCreateRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
@@ -66,6 +68,7 @@ from zk_add.service import (
     onboard_connector,
     oracle_payload,
     replace_user_snapshot,
+    record_oracle_receipts,
     serialize_command,
     serialize_user_deletion_job,
     update_device_user_command,
@@ -73,7 +76,7 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.settings import settings
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.web import app, get_db
 from zk_add.worker import (
     apply_ords_delivery_result,
@@ -82,6 +85,7 @@ from zk_add.worker import (
     ords_delivery_succeeded,
     ords_failure_category,
     ords_failure_is_permanent,
+    ords_membership_missing,
 )
 
 
@@ -1579,6 +1583,120 @@ def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent
     assert ords_delivery_succeeded(409, {"message": "resource already exists"})
     assert ords_delivery_succeeded(201, {"success": True})
     assert not ords_delivery_succeeded(400, {"success": False})
+
+
+def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    observed_at = utc_now()
+    before_event = OracleReceiptBatchRequest(
+        confirmation_path="FIRMWARE_RECONCILE",
+        oracle_observed_at=observed_at,
+        event_uids=["7" * 64],
+    )
+    applied, awaiting, rejected = record_oracle_receipts(
+        db,
+        connector=connector,
+        batch=before_event,
+    )
+    assert (applied, awaiting, rejected) == (0, 1, 0)
+    receipt = db.scalar(
+        select(OracleReceipt).where(OracleReceipt.event_uid == "7" * 64)
+    )
+    assert receipt and receipt.attendance_event_id is None
+
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="7" * 64)],
+    )
+    first = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "7" * 64)
+    )
+    first_outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == first.id)
+    )
+    assert first.ords_status == "ACKED_FIRMWARE"
+    assert first.oracle_confirmation_path == "FIRMWARE_RECONCILE"
+    assert ensure_utc(first.oracle_confirmed_at) == observed_at
+    assert first_outbox.status == "ACKED_FIRMWARE"
+    assert receipt.attendance_event_id == first.id
+
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="8" * 64)],
+    )
+    second = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "8" * 64)
+    )
+    assert second.ords_status == "PENDING"
+    applied, awaiting, rejected = record_oracle_receipts(
+        db,
+        connector=connector,
+        batch=OracleReceiptBatchRequest(
+            confirmation_path="FIRMWARE_LIVE",
+            oracle_observed_at=observed_at,
+            event_uids=["8" * 64],
+        ),
+    )
+    assert (applied, awaiting, rejected) == (1, 0, 0)
+    assert second.ords_status == "ACKED_FIRMWARE"
+    assert second.oracle_confirmation_path == "FIRMWARE_LIVE"
+
+    record_oracle_receipts(
+        db,
+        connector=connector,
+        batch=before_event,
+    )
+    assert receipt.observation_count == 2
+    metrics = ords_delivery_metrics(db)
+    assert metrics["backlog"] == 0
+    assert metrics["acknowledged"] == 2
+    assert metrics["acknowledged_firmware"] == 2
+
+
+def test_ords_membership_response_is_fail_closed():
+    requested = {"a" * 64, "b" * 64}
+    assert ords_membership_missing(
+        200,
+        {
+            "success": True,
+            "received_count": 2,
+            "existing_count": 1,
+            "missing_count": 1,
+            "missing_event_uids": ["b" * 64],
+        },
+        requested,
+    ) == {"b" * 64}
+    assert (
+        ords_membership_missing(
+            200,
+            {
+                "success": True,
+                "received_count": 2,
+                "missing_count": 1,
+                "missing_event_uids": ["c" * 64],
+            },
+            requested,
+        )
+        is None
+    )
+    assert (
+        ords_membership_missing(
+            200,
+            {
+                "success": True,
+                "received_count": 2,
+                "existing_count": 2,
+                "missing_count": 1,
+                "missing_event_uids": ["b" * 64],
+            },
+            requested,
+        )
+        is None
+    )
+    assert ords_membership_missing(503, {"success": False}, requested) is None
 
 
 def test_ords_delivery_quarantines_poison_rows_and_redacts_failures(db: Session):

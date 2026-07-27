@@ -287,6 +287,34 @@ def test_ords_truth_and_outbox_https_requests_are_serialized():
     assert "g_ords_http_lock = xSemaphoreCreateMutex();" in source
 
 
+def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
+    zone_source = (FIRMWARE / "main" / "zone_lite.c").read_text()
+    connector_source = (FIRMWARE / "main" / "add_connector.c").read_text()
+    header_source = (FIRMWARE / "main" / "add_connector.h").read_text()
+
+    assert "oracle_receipt_batch" in connector_source
+    assert "oracle_receipt_payload_is_valid" in connector_source
+    assert "add_connector_enqueue_oracle_receipts" in connector_source
+    assert "add_connector_enqueue_oracle_receipts" in header_source
+    assert '"FIRMWARE_LIVE"' in zone_source
+    assert '"FIRMWARE_BULK"' in zone_source
+    assert '"FIRMWARE_RECONCILE"' in zone_source
+    live_receipt = zone_source.index(
+        "add_enqueue_json_receipts(\n                        live_event"
+    )
+    live_retire = zone_source.index(
+        "append_acked_uid_from_json_to_file(line, acked_file)",
+        live_receipt,
+    )
+    assert live_receipt < live_retire
+    truth_receipt = zone_source.index("add_enqueue_truth_receipts(")
+    truth_complete = zone_source.index(
+        "add_delivery_ok && receipt_delivery_ok",
+        truth_receipt,
+    )
+    assert truth_receipt < truth_complete
+
+
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[

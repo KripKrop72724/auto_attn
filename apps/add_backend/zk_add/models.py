@@ -368,6 +368,10 @@ class AttendanceEvent(Base):
     sequence: Mapped[int | None] = mapped_column(BigInteger)
     raw_event: Mapped[dict] = mapped_column(JSON, default=dict)
     ords_status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    oracle_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    oracle_confirmation_path: Mapped[str | None] = mapped_column(String(40), index=True)
 
 
 Index("ix_add_attendance_device_time_id", AttendanceEvent.zkt_device_id, AttendanceEvent.device_event_time, AttendanceEvent.id)
@@ -617,6 +621,22 @@ class OrdsOutbox(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
+
+
+class OracleReceipt(Base):
+    __tablename__ = "add_oracle_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    attendance_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_attendance_events.id"), unique=True, index=True
+    )
+    confirmation_path: Mapped[str] = mapped_column(String(40), index=True)
+    oracle_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    first_received_at: Mapped[datetime] = utc_column()
+    last_received_at: Mapped[datetime] = utc_column()
+    observation_count: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class IdentityTombstone(Base):

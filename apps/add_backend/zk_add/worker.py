@@ -45,6 +45,7 @@ ORDS_DELIVERY_BATCH_SIZE = 8
 ORDS_DELIVERY_CONCURRENCY = 4
 ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
 ORDS_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
+ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK", "ACKED_FIRMWARE"}
 ORDS_SAFE_TRANSPORT_ERRORS = {
     "ConnectError",
     "ConnectTimeout",
@@ -128,6 +129,11 @@ def ords_delivery_metrics(session: Session) -> dict:
         default=None,
     )
     last_attempt_at = session.scalar(select(func.max(OrdsOutbox.last_attempt_at)))
+    acknowledged = sum(
+        count
+        for status, count in counts.items()
+        if status.upper() in ORDS_ACKNOWLEDGED_STATUSES
+    )
     return {
         "backlog": active_outbox + blocked_identity,
         "pending": counts.get("pending", 0),
@@ -135,7 +141,10 @@ def ords_delivery_metrics(session: Session) -> dict:
         "in_flight": counts.get("in_flight", 0),
         "blocked_identity": blocked_identity,
         "quarantined": quarantined,
-        "acknowledged": counts.get("acked", 0),
+        "acknowledged": acknowledged,
+        "acknowledged_add": counts.get("acked", 0),
+        "acknowledged_check": counts.get("acked_check", 0),
+        "acknowledged_firmware": counts.get("acked_firmware", 0),
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
     }
@@ -258,8 +267,8 @@ async def maintenance_tick() -> None:
     await deliver_ords_batch()
 
 
-def claim_ords_batch(limit: int) -> list[tuple[int, dict, int]]:
-    claims: list[tuple[int, dict, int]] = []
+def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
+    claims: list[tuple[int, dict, int, bool]] = []
     with session_scope() as session:
         now = utc_now()
         # A process interruption after claiming a row must not strand it in
@@ -293,6 +302,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int]]:
             .with_for_update(skip_locked=True)
         ).all()
         for row in candidates:
+            was_retry = row.status == "FAILED_RETRYABLE"
             event = (
                 session.get(AttendanceEvent, row.attendance_event_id)
                 if row.attendance_event_id
@@ -325,7 +335,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int]]:
             row.payload_hash = hashlib.sha256(
                 json.dumps(candidate_payload, separators=(",", ":"), sort_keys=True).encode()
             ).hexdigest()
-            claims.append((row.id, candidate_payload, connector.id))
+            claims.append((row.id, candidate_payload, connector.id, was_retry))
             if len(claims) >= limit:
                 break
     return claims
@@ -335,9 +345,9 @@ async def post_ords_claim(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     url: str,
-    claim: tuple[int, dict, int],
+    claim: tuple[int, dict, int, bool],
 ) -> tuple[int, int, int | None, object, str | None, bool]:
-    row_id, payload, connector_id = claim
+    row_id, payload, connector_id, _was_retry = claim
     status: int | None = None
     body: object = None
     transport_error: str | None = None
@@ -357,6 +367,134 @@ async def post_ords_claim(
         transport_error = type(exc).__name__
         response_parsed = False
     return row_id, connector_id, status, body, transport_error, response_parsed
+
+
+async def post_ords_membership_check(
+    client: httpx.AsyncClient,
+    url: str,
+    claims: list[tuple[int, dict, int, bool]],
+) -> tuple[int | None, object, str | None, bool]:
+    status: int | None = None
+    body: object = None
+    transport_error: str | None = None
+    response_parsed = True
+    try:
+        response = await client.post(
+            url,
+            json={"event_uids": [claim[1]["event_uid"] for claim in claims]},
+        )
+        status = response.status_code
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                response_parsed = False
+        else:
+            response_parsed = False
+    except Exception as exc:
+        transport_error = type(exc).__name__
+        response_parsed = False
+    return status, body, transport_error, response_parsed
+
+
+def ords_membership_missing(
+    status: int | None,
+    body: object,
+    requested: set[str],
+) -> set[str] | None:
+    if status != 200 or not isinstance(body, dict) or body.get("success") is not True:
+        return None
+    missing = body.get("missing_event_uids")
+    if not isinstance(missing, list) or any(not event_uid_is_valid(item) for item in missing):
+        return None
+    missing_set = set(missing)
+    if len(missing_set) != len(missing) or not missing_set.issubset(requested):
+        return None
+    if body.get("received_count") != len(requested):
+        return None
+    if body.get("missing_count") != len(missing_set):
+        return None
+    if body.get("existing_count") != len(requested) - len(missing_set):
+        return None
+    return missing_set
+
+
+def apply_ords_confirmation(
+    session: Session,
+    *,
+    claimed_id: int,
+    path: str,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    confirmed_at = utc_now()
+    row.status = "ACKED_CHECK"
+    row.acknowledged_at = confirmed_at
+    row.next_attempt_at = None
+    row.last_error = None
+    row.last_http_status = 200
+    event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+    if event is not None:
+        event.ords_status = "ACKED_CHECK"
+        event.oracle_confirmed_at = confirmed_at
+        event.oracle_confirmation_path = path
+        connector = session.get(Connector, event.connector_id)
+        remaining_failure = session.scalar(
+            select(OrdsOutbox.id)
+            .join(AttendanceEvent, AttendanceEvent.id == OrdsOutbox.attendance_event_id)
+            .where(
+                AttendanceEvent.connector_id == event.connector_id,
+                OrdsOutbox.status.in_(ORDS_ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+        if connector is not None and remaining_failure is None:
+            resolve_alert(session, connector, code="ORDS_DELIVERY_FAILED")
+
+
+def apply_ords_membership_failure(
+    session: Session,
+    *,
+    claimed_id: int,
+    status: int | None,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+    connector = session.get(Connector, event.connector_id) if event else None
+    category = ords_failure_category(
+        status,
+        transport_error=transport_error,
+        response_parsed=response_parsed,
+    )
+    row.status = "FAILED_RETRYABLE"
+    row.last_http_status = status
+    row.last_error = f"CHECK_{category}"
+    row.next_attempt_at = utc_now() + timedelta(
+        seconds=min(600, 2 ** min(row.attempt_count, 9))
+    )
+    if event is not None:
+        event.ords_status = "FAILED_RETRYABLE"
+    if connector is not None:
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity="HIGH" if status in {401, 403} else "WARNING",
+            message=(
+                "Oracle attendance membership verification is retrying; "
+                "preserved events remain queued."
+            ),
+            details={
+                "failure_category": f"CHECK_{category}",
+                "http_status": status,
+                "attempt_count": row.attempt_count,
+            },
+        )
 
 
 def apply_ords_delivery_result(
@@ -380,12 +518,15 @@ def apply_ords_delivery_result(
         response_parsed=response_parsed,
     )
     if ords_delivery_succeeded(status, body):
+        confirmed_at = utc_now()
         row.status = "ACKED"
-        row.acknowledged_at = utc_now()
+        row.acknowledged_at = confirmed_at
         row.next_attempt_at = None
         row.last_error = None
         if event:
             event.ords_status = "ACKED"
+            event.oracle_confirmed_at = confirmed_at
+            event.oracle_confirmation_path = "ADD_DELIVERY"
         if connector is not None:
             remaining_failure = session.scalar(
                 select(OrdsOutbox.id)
@@ -458,7 +599,9 @@ async def deliver_ords_batch(
     claims = claim_ords_batch(max(1, limit))
     if not claims:
         return
-    url = settings.ords_base_url.rstrip("/") + "/raw-captures"
+    base_url = settings.ords_base_url.rstrip("/")
+    url = base_url + "/raw-captures"
+    check_url = base_url + "/raw-captures/check"
     semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
     async with httpx.AsyncClient(
         timeout=settings.ords_timeout_seconds,
@@ -467,10 +610,48 @@ async def deliver_ords_batch(
             "X-API-Password": settings.ords_password,
         },
     ) as client:
+        retry_claims = [claim for claim in claims if claim[3]]
+        send_claims = [claim for claim in claims if not claim[3]]
+        confirmed_claim_ids: list[int] = []
+        membership_failure: tuple[int | None, str | None, bool] | None = None
+        if retry_claims:
+            check_status, check_body, check_error, check_parsed = (
+                await post_ords_membership_check(client, check_url, retry_claims)
+            )
+            requested = {claim[1]["event_uid"] for claim in retry_claims}
+            missing = ords_membership_missing(check_status, check_body, requested)
+            if missing is not None:
+                for claim in retry_claims:
+                    if claim[1]["event_uid"] in missing:
+                        send_claims.append(claim)
+                    else:
+                        confirmed_claim_ids.append(claim[0])
+            elif check_status in {404, 405}:
+                # Backward compatibility while Oracle environments roll out the
+                # membership endpoint.
+                send_claims.extend(retry_claims)
+            else:
+                membership_failure = (check_status, check_error, check_parsed)
         results = await asyncio.gather(
-            *(post_ords_claim(client, semaphore, url, claim) for claim in claims)
+            *(post_ords_claim(client, semaphore, url, claim) for claim in send_claims)
         )
     with session_scope() as session:
+        for claimed_id in confirmed_claim_ids:
+            apply_ords_confirmation(
+                session,
+                claimed_id=claimed_id,
+                path="ORDS_MEMBERSHIP_CHECK",
+            )
+        if membership_failure is not None:
+            failure_status, failure_error, failure_parsed = membership_failure
+            for claimed_id, _payload, _connector_id, _was_retry in retry_claims:
+                apply_ords_membership_failure(
+                    session,
+                    claimed_id=claimed_id,
+                    status=failure_status,
+                    transport_error=failure_error,
+                    response_parsed=failure_parsed,
+                )
         for row_id, _connector_id, status, body, error, parsed in results:
             apply_ords_delivery_result(
                 session,
