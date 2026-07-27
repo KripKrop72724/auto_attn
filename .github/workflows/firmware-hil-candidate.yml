@@ -1,0 +1,137 @@
+name: Zone Lite quarantined HIL candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green main commit to build
+        required: true
+        type: string
+      version:
+        description: SemVer firmware version, without a v prefix
+        required: true
+        type: string
+      device_mac:
+        description: Exact locally attached HIL ESP MAC
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-hil-candidate
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.provenance.outputs.sha }}
+      mac: ${{ steps.provenance.outputs.mac }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: provenance
+        name: Require exact main SHA, version, and ESP MAC
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          mac="$(tr '[:upper:]' '[:lower:]' <<<"${{ inputs.device_mac }}")"
+          [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]
+          git fetch origin main
+          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "mac=$mac" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: provenance
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build the exact unsigned candidate
+        working-directory: firmware/zone_lite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sed -n 's/^project(zone_lite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
+          idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
+          path: firmware/zone_lite/build-hil-release/zone_lite.bin
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: [provenance, build]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
+          path: unsigned
+      - name: Sign the immutable HIL candidate with the ADD vault
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          $unsigned = Join-Path $PWD 'unsigned'
+          $output = Join-Path $PWD 'release'
+          ./deploy/add/sign-firmware-release.ps1 `
+            -VaultDirectory $vault `
+            -UnsignedDirectory $unsigned `
+            -OutputDirectory $output `
+            -Version '${{ inputs.version }}' `
+            -GitSha '${{ needs.provenance.outputs.sha }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}-hil-only
+          path: release/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-hil:
+    needs: [provenance, sign]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-${{ inputs.version }}-hil-only
+          path: firmware-release
+      - name: Atomically publish for one exact HIL ESP
+        shell: powershell
+        env:
+          ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+        run: |
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw "ADD_FIRMWARE_STORE_HOST_PATH is not configured" }
+          ./deploy/add/publish-firmware.ps1 `
+            -SourceDirectory firmware-release `
+            -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+            -Version "${{ inputs.version }}" `
+            -PublicationMode HIL_ONLY `
+            -HilTargetMac '${{ needs.provenance.outputs.mac }}'
