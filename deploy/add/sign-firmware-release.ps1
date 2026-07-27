@@ -27,6 +27,46 @@ function Clear-PlaintextFile {
     Remove-Item -LiteralPath $Path -Force
 }
 
+function Get-EspApplicationSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 56 -or $bytes[0] -ne 0xE9 -or $bytes[23] -ne 1) {
+        throw 'Signed firmware does not contain an ESP application validation hash'
+    }
+    $segmentCount = [int]$bytes[1]
+    $offset = [uint64]24
+    foreach ($index in 0..($segmentCount - 1)) {
+        if ($offset + 8 -gt [uint64]$bytes.Length) {
+            throw 'Signed firmware has a truncated ESP segment header'
+        }
+        $segmentLength = [BitConverter]::ToUInt32($bytes, [int]$offset + 4)
+        $offset += 8 + [uint64]$segmentLength
+        if ($offset -gt [uint64]$bytes.Length) {
+            throw 'Signed firmware has a truncated ESP segment'
+        }
+    }
+    $hashOffset = [uint64]([Math]::Ceiling(([double]$offset + 1) / 16) * 16)
+    if ($hashOffset + 32 -gt [uint64]$bytes.Length) {
+        throw 'Signed firmware is missing its ESP application validation hash'
+    }
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $computed = $sha256.ComputeHash($bytes, 0, [int]$hashOffset)
+    } finally {
+        $sha256.Dispose()
+    }
+    $stored = New-Object byte[] 32
+    [Array]::Copy($bytes, [int]$hashOffset, $stored, 0, 32)
+    $computedHex = ([BitConverter]::ToString($computed)).Replace('-', '').ToLowerInvariant()
+    $storedHex = ([BitConverter]::ToString($stored)).Replace('-', '').ToLowerInvariant()
+    if ($computedHex -ne $storedHex) {
+        throw 'Signed firmware ESP application validation hash is invalid'
+    }
+    return $storedHex
+}
+
 $vault = (Resolve-Path $VaultDirectory).Path
 $unsigned = (Resolve-Path $UnsignedDirectory).Path
 $vaultManifestPath = Join-Path $vault 'vault-manifest.json'
@@ -84,7 +124,9 @@ try {
     Copy-Item -LiteralPath $signedImage -Destination (Join-Path $output "zone-lite-$Version.bin")
     Copy-Item -LiteralPath $publicPath -Destination (Join-Path $output 'manifest-public-key.pem')
     $imageHash = (Get-FileHash -LiteralPath (Join-Path $output "zone-lite-$Version.bin") -Algorithm SHA256).Hash.ToLowerInvariant()
+    $applicationHash = Get-EspApplicationSha256 -Path (Join-Path $output "zone-lite-$Version.bin")
     $manifest = [ordered]@{
+        application_sha256 = $applicationHash
         created_at = [DateTime]::UtcNow.ToString('o')
         esp_idf_version = '5.5.3'
         git_sha = $GitSha
@@ -95,7 +137,7 @@ try {
         minimum_bootstrap_version = '2.2.0'
         partition_layout = 'zone-lite-ota-v1'
         release_id = "zone-lite-$Version"
-        schema_version = 1
+        schema_version = 2
         secure_boot = 'v2'
         signing_key_id = $keyId
         version = $Version

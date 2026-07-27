@@ -23,11 +23,20 @@ def test_publication_requires_exact_hil_target_and_promotion_preserves_bytes() -
 def test_release_manifest_contract_matches_add_verifier() -> None:
     signer = (ROOT / "deploy/add/sign-firmware-release.ps1").read_text(encoding="utf-8")
     ota = (ROOT / "apps/add_backend/zk_add/ota.py").read_text(encoding="utf-8")
-    for field in ("release_id", "git_sha", "image_name", "image_sha256", "image_size"):
+    for field in (
+        "release_id",
+        "git_sha",
+        "image_name",
+        "image_sha256",
+        "application_sha256",
+        "image_size",
+    ):
         assert f"{field} =" in signer
         assert f'manifest["{field}"]' in ota or f'manifest.get("{field}"' in ota
     assert "rsa_pss_saltlen:32" in signer
     assert "[Convert]::ToBase64String" in signer
+    assert '"image_sha256": application_digest' in ota
+    assert '"artifact_sha256": release.image_sha256' in ota
 
 
 def test_hil_assignment_is_fail_closed_to_one_hardware_id() -> None:

@@ -112,6 +112,15 @@ def capability_is_eligible(connector: Connector) -> bool:
                 and connector.ota_partition_layout == OTA_LAYOUT)
 
 
+def _application_sha256(release: FirmwareRelease) -> str | None:
+    value = str((release.manifest or {}).get("application_sha256") or "")
+    if len(value) != 64 or value != value.lower() or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        return None
+    return value
+
+
 def parse_single_range(value: str | None, size: int) -> tuple[int, int] | None:
     if not value:
         return None
@@ -154,6 +163,14 @@ def sync_release_store(session: Session) -> None:
         digest = hashlib.sha256(image.read_bytes()).hexdigest()
         if not hmac.compare_digest(digest, str(manifest["image_sha256"])) or image.stat().st_size != int(manifest["image_size"]):
             raise RuntimeError(f"Firmware release {release_id} failed immutable artifact verification.")
+        application_digest = str(manifest.get("application_sha256") or "")
+        if application_digest and (
+            len(application_digest) != 64 or application_digest != application_digest.lower() or
+            any(character not in "0123456789abcdef" for character in application_digest)
+        ):
+            raise RuntimeError(f"Firmware release {release_id} has an invalid ESP application digest.")
+        if int(manifest.get("schema_version", 1)) >= 2 and not application_digest:
+            raise RuntimeError(f"Firmware release {release_id} is missing its ESP application digest.")
         if manifest.get("partition_layout") != OTA_LAYOUT:
             raise RuntimeError(f"Firmware release {release_id} has an unknown partition layout.")
         marker_path = manifest_path.parent / HIL_MARKER
@@ -199,6 +216,8 @@ def create_campaign(session: Session, *, release_public_id: str, zone_id: str, r
         FirmwareRelease.state.in_(["AVAILABLE", "HIL_ONLY"])))
     if release is None:
         raise ValueError("Firmware release is not available.")
+    if _application_sha256(release) is None:
+        raise ValueError("Firmware release lacks the ESP application digest required by OTA bootstraps.")
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         raise ValueError("National firmware OTA remains disabled.")
     hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
@@ -261,6 +280,9 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
             return None
         if connector.hardware_id.lower() != target:
             return None
+    application_digest = _application_sha256(release)
+    if application_digest is None:
+        return None
     if pending_offer:
         deployment.status = "OFFERED"
         deployment.offered_at = utc_now()
@@ -271,7 +293,8 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         deployment_id=deployment.id, connector_id=connector.id,
         expires_at=utc_now() + timedelta(seconds=settings.firmware_download_grant_seconds)))
     return {"deployment_id": deployment.deployment_id, "release_id": release.release_id,
-        "version": release.version, "image_sha256": release.image_sha256, "image_size": release.image_size,
+        "version": release.version, "image_sha256": application_digest,
+        "artifact_sha256": release.image_sha256, "image_size": release.image_size,
         "partition_layout": release.partition_layout,
         "download_url": f"{public_base}/device/v2/firmware/download/{token}"}
 
@@ -311,6 +334,7 @@ def release_rows(session: Session) -> list[dict[str, Any]]:
     sync_release_store(session)
     return [{"release_id": row.release_id, "version": row.version, "git_sha": row.git_sha,
              "image_sha256": row.image_sha256, "image_size": row.image_size, "state": row.state,
+             "application_sha256": _application_sha256(row),
              "partition_layout": row.partition_layout, "signing_key_id": row.signing_key_id,
              "published_at": row.published_at,
              "hil_target_mac": (row.manifest or {}).get("_hil_target_mac")}
