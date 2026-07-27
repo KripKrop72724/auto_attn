@@ -21,6 +21,7 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 OTA_LAYOUT = "zone-lite-ota-v1"
+HIL_MARKER = ".hil-only.json"
 ACTIVE_DEPLOYMENT_STATES = {
     "OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"
 }
@@ -136,7 +137,7 @@ def _verify_manifest(manifest: dict, signature_b64: str) -> None:
 
 
 def sync_release_store(session: Session) -> None:
-    if not settings.firmware_ota_enabled:
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
         return
     root = Path(settings.firmware_store_path).resolve()
     if not root.is_dir():
@@ -144,7 +145,7 @@ def sync_release_store(session: Session) -> None:
     for manifest_path in root.glob("*/manifest.json"):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         release_id = str(manifest.get("release_id", ""))
-        if not release_id or session.scalar(select(FirmwareRelease).where(FirmwareRelease.release_id == release_id)):
+        if not release_id:
             continue
         signature = manifest_path.with_name("manifest.sig").read_text(encoding="ascii").strip()
         _verify_manifest(manifest, signature)
@@ -155,13 +156,38 @@ def sync_release_store(session: Session) -> None:
             raise RuntimeError(f"Firmware release {release_id} failed immutable artifact verification.")
         if manifest.get("partition_layout") != OTA_LAYOUT:
             raise RuntimeError(f"Firmware release {release_id} has an unknown partition layout.")
+        marker_path = manifest_path.parent / HIL_MARKER
+        hil_target_mac = None
+        desired_state = "AVAILABLE"
+        if marker_path.is_file():
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            hil_target_mac = str(marker.get("target_mac") or "").strip().lower()
+            if not hil_target_mac:
+                raise RuntimeError(f"Firmware release {release_id} has an invalid HIL quarantine marker.")
+            if str(marker.get("git_sha") or "") != str(manifest["git_sha"]):
+                raise RuntimeError(f"Firmware release {release_id} HIL marker has a different source SHA.")
+            if str(marker.get("image_sha256") or "") != digest:
+                raise RuntimeError(f"Firmware release {release_id} HIL marker has a different image hash.")
+            desired_state = "HIL_ONLY"
+        stored_manifest = {
+            **manifest,
+            "_publication_mode": desired_state,
+            "_hil_target_mac": hil_target_mac,
+        }
+        existing = session.scalar(select(FirmwareRelease).where(
+            FirmwareRelease.release_id == release_id))
+        if existing is not None:
+            if existing.state != "REVOKED":
+                existing.state = desired_state
+                existing.manifest = stored_manifest
+            continue
         session.add(FirmwareRelease(
             release_id=release_id, version=str(manifest["version"]), git_sha=str(manifest["git_sha"]),
             image_sha256=digest, image_size=image.stat().st_size, signing_key_id=str(manifest["signing_key_id"]),
             partition_layout=str(manifest["partition_layout"]),
             minimum_bootstrap_version=str(manifest.get("minimum_bootstrap_version", "2.2.0")),
-            storage_name=f"{manifest_path.parent.name}/{image_name}", manifest=manifest,
-            manifest_signature=signature, state="AVAILABLE"))
+            storage_name=f"{manifest_path.parent.name}/{image_name}", manifest=stored_manifest,
+            manifest_signature=signature, state=desired_state))
     session.flush()
 
 
@@ -169,9 +195,19 @@ def create_campaign(session: Session, *, release_public_id: str, zone_id: str, r
                     typed_confirmation: str, actor: str) -> FirmwareCampaign:
     sync_release_store(session)
     release = session.scalar(select(FirmwareRelease).where(
-        FirmwareRelease.release_id == release_public_id, FirmwareRelease.state == "AVAILABLE"))
+        FirmwareRelease.release_id == release_public_id,
+        FirmwareRelease.state.in_(["AVAILABLE", "HIL_ONLY"])))
     if release is None:
         raise ValueError("Firmware release is not available.")
+    if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
+        raise ValueError("National firmware OTA remains disabled.")
+    hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
+    if release.state == "HIL_ONLY":
+        configured_target = (settings.firmware_hil_target_mac or "").strip().lower()
+        if not settings.firmware_hil_enabled or not configured_target:
+            raise ValueError("Firmware HIL quarantine is disabled.")
+        if hil_target_mac != configured_target:
+            raise ValueError("HIL release target does not match the configured ESP MAC.")
     if typed_confirmation != release.version:
         raise ValueError("Typed firmware version does not match the release.")
     if session.scalar(select(FirmwareCampaign).where(
@@ -180,6 +216,10 @@ def create_campaign(session: Session, *, release_public_id: str, zone_id: str, r
     connectors = list(session.scalars(select(Connector).where(
         Connector.zone_id == zone_id, Connector.active == True)).all())  # noqa: E712
     eligible = [row for row in connectors if capability_is_eligible(row)]
+    if release.state == "HIL_ONLY":
+        eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
+        if len(eligible) != 1:
+            raise ValueError("HIL campaign requires exactly one eligible connector with the target MAC.")
     campaign = FirmwareCampaign(campaign_id=secrets.token_hex(16), release_id=release.id, zone_id=zone_id,
         actor=actor, reason=reason, typed_confirmation=typed_confirmation, eligible_count=len(eligible),
         legacy_skipped_count=len(connectors) - len(eligible))
@@ -193,7 +233,7 @@ def create_campaign(session: Session, *, release_public_id: str, zone_id: str, r
 
 
 def assignment_for_connector(session: Session, *, connector: Connector, public_base: str) -> dict[str, Any] | None:
-    if not settings.firmware_ota_enabled or not capability_is_eligible(connector):
+    if not capability_is_eligible(connector):
         return None
     active = session.scalar(select(FirmwareDeployment).join(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == connector.zone_id, FirmwareCampaign.status == "ACTIVE",
@@ -201,19 +241,31 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     if active is not None and active.connector_id != connector.id:
         return None
     deployment = active
+    pending_offer = False
     if deployment is None:
         deployment = session.scalar(select(FirmwareDeployment).join(FirmwareCampaign).where(
             FirmwareCampaign.zone_id == connector.zone_id, FirmwareCampaign.status == "ACTIVE",
             FirmwareDeployment.status == "PENDING").order_by(FirmwareDeployment.id))
         if deployment is None or deployment.connector_id != connector.id:
             return None
+        pending_offer = True
+    release = session.get(FirmwareRelease, deployment.release_id)
+    if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
+        return None
+    if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
+        return None
+    if release.state == "HIL_ONLY":
+        target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
+        configured = (settings.firmware_hil_target_mac or "").strip().lower()
+        if not settings.firmware_hil_enabled or not target or target != configured:
+            return None
+        if connector.hardware_id.lower() != target:
+            return None
+    if pending_offer:
         deployment.status = "OFFERED"
         deployment.offered_at = utc_now()
         deployment.attempt_count += 1
         session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details={}))
-    release = session.get(FirmwareRelease, deployment.release_id)
-    if release is None or release.state != "AVAILABLE":
-        return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
         deployment_id=deployment.id, connector_id=connector.id,
@@ -260,7 +312,8 @@ def release_rows(session: Session) -> list[dict[str, Any]]:
     return [{"release_id": row.release_id, "version": row.version, "git_sha": row.git_sha,
              "image_sha256": row.image_sha256, "image_size": row.image_size, "state": row.state,
              "partition_layout": row.partition_layout, "signing_key_id": row.signing_key_id,
-             "published_at": row.published_at}
+             "published_at": row.published_at,
+             "hil_target_mac": (row.manifest or {}).get("_hil_target_mac")}
             for row in session.scalars(select(FirmwareRelease).order_by(FirmwareRelease.id.desc())).all()]
 
 
@@ -288,8 +341,16 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         raise ValueError("Firmware download grant is invalid or expired.")
     deployment = session.get(FirmwareDeployment, grant.deployment_id)
     release = session.get(FirmwareRelease, deployment.release_id) if deployment else None
-    if release is None or release.state != "AVAILABLE":
+    if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         raise ValueError("Firmware release is unavailable.")
+    if release.state == "HIL_ONLY":
+        target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
+        configured = (settings.firmware_hil_target_mac or "").strip().lower()
+        connector = session.get(Connector, grant.connector_id)
+        if not settings.firmware_hil_enabled or not target or target != configured:
+            raise ValueError("HIL firmware release is unavailable.")
+        if connector is None or connector.hardware_id.lower() != target:
+            raise ValueError("HIL firmware grant target mismatch.")
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()
     if root not in image.parents or not image.is_file():
