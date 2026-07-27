@@ -436,8 +436,13 @@ def test_oracle_receipt_batches_collapse_duplicate_terminal_event_uids():
     assert "strcmp(event_uids[previous], event_uids[i]) == 0" in receipt_enqueue
     assert "if (duplicate)" in receipt_enqueue
     assert "continue;" in receipt_enqueue
-    assert "cJSON_CreateString(event_uids[i])" in receipt_enqueue
     assert "Collapsed %lu duplicate Oracle receipt event UID(s)" in receipt_enqueue
+    assert "cJSON_CreateObject" not in receipt_enqueue
+    assert "cJSON_CreateArray" not in receipt_enqueue
+    assert "cJSON_CreateString" not in receipt_enqueue
+    assert "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT" in receipt_enqueue
+    assert "ADD_OUTBOX_LINE_BYTES - used" in receipt_enqueue
+    assert "add_connector_enqueue_validated_line(" in receipt_enqueue
 
 
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():

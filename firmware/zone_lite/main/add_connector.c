@@ -1318,15 +1318,21 @@ static bool attendance_payload_is_valid(const cJSON *payload)
     return true;
 }
 
+static bool oracle_confirmation_path_is_valid(const char *value)
+{
+    return value &&
+        (strcmp(value, "FIRMWARE_LIVE") == 0 ||
+         strcmp(value, "FIRMWARE_BULK") == 0 ||
+         strcmp(value, "FIRMWARE_RECONCILE") == 0);
+}
+
 static bool oracle_receipt_payload_is_valid(const cJSON *payload)
 {
     const cJSON *path = cJSON_GetObjectItemCaseSensitive(payload, "confirmation_path");
     const cJSON *observed_at = cJSON_GetObjectItemCaseSensitive(payload, "oracle_observed_at");
     const cJSON *event_uids = cJSON_GetObjectItemCaseSensitive(payload, "event_uids");
     bool path_valid = cJSON_IsString(path) &&
-        (strcmp(path->valuestring, "FIRMWARE_LIVE") == 0 ||
-         strcmp(path->valuestring, "FIRMWARE_BULK") == 0 ||
-         strcmp(path->valuestring, "FIRMWARE_RECONCILE") == 0);
+        oracle_confirmation_path_is_valid(path->valuestring);
     int count = cJSON_IsArray(event_uids) ? cJSON_GetArraySize(event_uids) : 0;
     if (!path_valid || !cJSON_IsString(observed_at) ||
         !attendance_timestamp_is_valid(observed_at->valuestring) ||
@@ -1433,11 +1439,8 @@ static void refresh_capacity_deadline_on_progress(
     *last_depth = outbox->depth;
 }
 
-static bool add_connector_enqueue_record(const char *type, const char *payload_json)
+static bool add_connector_enqueue_validated_line(const char *line, bool live)
 {
-    if (!zone_config_get()->add_enabled) return true;
-    bool live = false;
-    char *line = outbox_record_line(type, payload_json, &live);
     if (!line) return false;
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
@@ -1487,6 +1490,16 @@ static bool add_connector_enqueue_record(const char *type, const char *payload_j
             "Could not durably append ADD %s outbox row within the bounded wait",
             outbox->label);
     }
+    return ok;
+}
+
+static bool add_connector_enqueue_record(const char *type, const char *payload_json)
+{
+    if (!zone_config_get()->add_enabled) return true;
+    bool live = false;
+    char *line = outbox_record_line(type, payload_json, &live);
+    if (!line) return false;
+    bool ok = add_connector_enqueue_validated_line(line, live);
     free(line);
     return ok;
 }
@@ -1502,26 +1515,59 @@ bool add_connector_enqueue_oracle_receipts(
     const char *confirmation_path)
 {
     if (!zone_config_get()->add_enabled) return true;
-    if (!event_uids || count < 1 || count > 100 || !confirmation_path) return false;
-    cJSON *payload = cJSON_CreateObject();
-    cJSON *uids = cJSON_CreateArray();
-    if (!payload || !uids) {
-        cJSON_Delete(payload);
-        cJSON_Delete(uids);
+    if (!event_uids || count < 1 || count > 100 ||
+        !oracle_confirmation_path_is_valid(confirmation_path)) {
         return false;
     }
-    cJSON_AddStringToObject(payload, "confirmation_path", confirmation_path);
+
+    // A full terminal dump remains resident in PSRAM while receipts are
+    // staged. Building and then reparsing a 100-node cJSON tree here used
+    // constrained internal heap and could fail late in a large truth cycle.
+    // Construct the already-validated record directly in PSRAM instead. The
+    // outbox worker independently parses and validates it again before send.
+    char *line = heap_caps_malloc(
+        ADD_OUTBOX_LINE_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!line) {
+        line = malloc(ADD_OUTBOX_LINE_BYTES);
+    }
+    if (!line) {
+        ESP_LOGE(TAG, "Could not allocate Oracle receipt outbox record buffer");
+        return false;
+    }
+
     time_t now;
     time(&now);
     char observed_at[32];
     iso_utc(now, observed_at);
-    cJSON_AddStringToObject(payload, "oracle_observed_at", observed_at);
+    if (!attendance_timestamp_is_valid(observed_at)) {
+        ESP_LOGE(TAG, "Refusing Oracle receipt with an invalid observed timestamp");
+        free(line);
+        return false;
+    }
+
+    int prefix_bytes = snprintf(
+        line,
+        ADD_OUTBOX_LINE_BYTES,
+        "{\"type\":\"oracle_receipt_batch\",\"payload\":{"
+        "\"confirmation_path\":\"%s\","
+        "\"oracle_observed_at\":\"%s\","
+        "\"event_uids\":[",
+        confirmation_path,
+        observed_at);
+    if (prefix_bytes < 0 || prefix_bytes >= ADD_OUTBOX_LINE_BYTES) {
+        ESP_LOGE(TAG, "Could not serialize Oracle receipt outbox prefix");
+        free(line);
+        return false;
+    }
+
+    size_t used = (size_t)prefix_bytes;
     size_t unique_count = 0;
     size_t duplicate_count = 0;
     for (size_t i = 0; i < count; i++) {
         if (!attendance_event_uid_is_valid(event_uids[i])) {
-            cJSON_Delete(payload);
-            cJSON_Delete(uids);
+            ESP_LOGE(TAG, "Refusing Oracle receipt with an invalid event UID");
+            free(line);
             return false;
         }
         bool duplicate = false;
@@ -1535,32 +1581,50 @@ bool add_connector_enqueue_oracle_receipts(
             duplicate_count++;
             continue;
         }
-        cJSON *uid = cJSON_CreateString(event_uids[i]);
-        if (!uid) {
-            cJSON_Delete(payload);
-            cJSON_Delete(uids);
+
+        int uid_bytes = snprintf(
+            line + used,
+            ADD_OUTBOX_LINE_BYTES - used,
+            "%s\"%s\"",
+            unique_count > 0 ? "," : "",
+            event_uids[i]);
+        if (uid_bytes < 0 ||
+            (size_t)uid_bytes >= ADD_OUTBOX_LINE_BYTES - used) {
+            ESP_LOGE(TAG, "Oracle receipt outbox record exceeded its bounded line size");
+            free(line);
             return false;
         }
-        cJSON_AddItemToArray(uids, uid);
+        used += (size_t)uid_bytes;
         unique_count++;
     }
     if (unique_count == 0) {
-        cJSON_Delete(payload);
-        cJSON_Delete(uids);
+        free(line);
         return false;
     }
+
+    int suffix_bytes = snprintf(
+        line + used,
+        ADD_OUTBOX_LINE_BYTES - used,
+        "]}}");
+    if (suffix_bytes < 0 ||
+        (size_t)suffix_bytes >= ADD_OUTBOX_LINE_BYTES - used ||
+        used + (size_t)suffix_bytes + 2 >= ADD_OUTBOX_LINE_BYTES) {
+        ESP_LOGE(TAG, "Could not terminate Oracle receipt outbox record");
+        free(line);
+        return false;
+    }
+
     if (duplicate_count > 0) {
         ESP_LOGI(
             TAG,
             "Collapsed %lu duplicate Oracle receipt event UID(s) before durable enqueue",
             (unsigned long)duplicate_count);
     }
-    cJSON_AddItemToObject(payload, "event_uids", uids);
-    char *json = cJSON_PrintUnformatted(payload);
-    cJSON_Delete(payload);
-    bool ok = json &&
-        add_connector_enqueue_record("oracle_receipt_batch", json);
-    free(json);
+
+    bool ok = add_connector_enqueue_validated_line(
+        line,
+        strcmp(confirmation_path, "FIRMWARE_LIVE") == 0);
+    free(line);
     return ok;
 }
 
