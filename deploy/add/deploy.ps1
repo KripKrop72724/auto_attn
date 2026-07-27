@@ -217,6 +217,12 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FLEET_ROOT_SECRET)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ADMIN_PASSWORD_HASH)) {
     $environment["ADD_ADMIN_PASSWORD_HASH"] = $env:ADD_DEPLOY_ADMIN_PASSWORD_HASH
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
+    $environment["ADD_FIRMWARE_HIL_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) {
+    $environment["ADD_FIRMWARE_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC
+}
 # These deployment coordinates are locked product requirements, not operator
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
