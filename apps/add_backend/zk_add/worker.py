@@ -41,8 +41,11 @@ from zk_add.time_utils import utc_now
 
 
 EVENT_UID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-ORDS_DELIVERY_BATCH_SIZE = 8
-ORDS_DELIVERY_CONCURRENCY = 4
+ORDS_DELIVERY_BATCH_SIZE = max(1, min(settings.ords_delivery_batch_size, 500))
+ORDS_DELIVERY_CONCURRENCY = max(
+    1,
+    min(settings.ords_delivery_concurrency, ORDS_DELIVERY_BATCH_SIZE),
+)
 ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
 ORDS_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
 ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK", "ACKED_FIRMWARE"}

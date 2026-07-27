@@ -45,6 +45,8 @@ class AddSettings(BaseSettings):
     ords_username: str | None = None
     ords_password: str | None = None
     ords_timeout_seconds: int = 20
+    ords_delivery_batch_size: int = 100
+    ords_delivery_concurrency: int = 8
 
     user_command_retry_seconds: int = 30 * 60
     command_redispatch_seconds: int = 20

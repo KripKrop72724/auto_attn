@@ -362,6 +362,29 @@ def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
     assert truth_receipt < truth_complete
 
 
+def test_large_truth_stream_applies_bounded_outbox_backpressure_and_receipt_priority():
+    zone_source = (FIRMWARE / "main" / "zone_lite.c").read_text()
+    connector_source = (FIRMWARE / "main" / "add_connector.c").read_text()
+    reconcile = zone_source[
+        zone_source.index("static bool reconcile_attendance_dump(") :
+        zone_source.index("static bool system_time_is_valid(")
+    ]
+    window = reconcile[
+        reconcile.index("bool window_receipt_ok = true;") :
+        reconcile.index("truth_count += window_truth_count;")
+    ]
+
+    assert window.index("add_enqueue_truth_receipts(") < window.index(
+        "add_enqueue_reconcile_events("
+    )
+    assert "#define ADD_BULK_CAPACITY_WAIT_MS" in connector_source
+    assert "ADD_BULK_CAPACITY_POLL_MS" in connector_source
+    assert "required_bytes" in connector_source
+    assert "s_bulk_outbox.offset > 0" in connector_source
+    assert "compact_outbox_locked(&s_bulk_outbox, true)" in connector_source
+    assert "waiting for acknowledged rows before appending more truth" in connector_source
+
+
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[
