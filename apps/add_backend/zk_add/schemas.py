@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -117,6 +118,33 @@ class AttendanceBatchRequest(BaseModel):
     batch_id: str = Field(min_length=1, max_length=120)
     payload_digest: str | None = None
     events: list[AttendanceEventIn] = Field(min_length=1, max_length=100)
+
+
+class OracleReceiptBatchRequest(BaseModel):
+    confirmation_path: Literal[
+        "FIRMWARE_LIVE",
+        "FIRMWARE_BULK",
+        "FIRMWARE_RECONCILE",
+    ]
+    oracle_observed_at: datetime
+    event_uids: list[
+        str
+    ] = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    @field_validator("event_uids")
+    @classmethod
+    def validate_event_uids(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if len(value) != 64 or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(
+                    "Each event_uid must be a 64-character lowercase hex digest"
+                )
+        if len(values) != len(set(values)):
+            raise ValueError("Each event_uid may be confirmed only once per batch")
+        return values
 
 
 class DeviceLogIn(BaseModel):

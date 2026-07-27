@@ -2667,6 +2667,34 @@ static bool add_enqueue_reconcile_events(
     return true;
 }
 
+static bool add_enqueue_truth_receipts(
+    const attendance_event_t *events,
+    size_t event_count)
+{
+    const char *event_uids[100] = {0};
+    size_t batch_count = 0;
+    for (size_t i = 0; i < event_count; i++) {
+        if (events[i].cnic[0] == '\0') {
+            continue;
+        }
+        event_uids[batch_count++] = events[i].event_uid;
+        if (batch_count == 100) {
+            if (!add_connector_enqueue_oracle_receipts(
+                    event_uids,
+                    batch_count,
+                    "FIRMWARE_RECONCILE")) {
+                return false;
+            }
+            batch_count = 0;
+        }
+    }
+    return batch_count == 0 ||
+        add_connector_enqueue_oracle_receipts(
+            event_uids,
+            batch_count,
+            "FIRMWARE_RECONCILE");
+}
+
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype,
@@ -2982,6 +3010,7 @@ static bool reconcile_attendance_dump(
 
     bool truth_delivery_ok = true;
     bool add_delivery_ok = true;
+    bool receipt_delivery_ok = true;
     if (reconcile_overflow) {
         ESP_LOGE(
             TAG,
@@ -3005,6 +3034,11 @@ static bool reconcile_attendance_dump(
             reconcile_events,
             reconcile_event_count,
             capturetype);
+        if (truth_enabled && truth_delivery_ok && add_delivery_ok) {
+            receipt_delivery_ok = add_enqueue_truth_receipts(
+                reconcile_events,
+                reconcile_event_count);
+        }
     }
     free(reconcile_events);
 
@@ -3018,7 +3052,18 @@ static bool reconcile_attendance_dump(
             "ADD_TRUTH_QUEUE_SATURATED",
             "Dashboard truth cycle could not be fully persisted; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
-    bool reconcile_complete = !reconcile_overflow && truth_delivery_ok && add_delivery_ok;
+    if (!receipt_delivery_ok) {
+        ESP_LOGW(
+            TAG,
+            "Oracle truth succeeded but its ADD receipt could not be persisted; the next truth cycle will retry idempotently");
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORACLE_RECEIPT_QUEUE_SATURATED",
+            "Oracle accepted terminal truth but its dashboard receipt could not be persisted; the next truth cycle will retry safely");
+    }
+    bool reconcile_complete = !reconcile_overflow && truth_delivery_ok &&
+        add_delivery_ok && receipt_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
     }
@@ -3974,6 +4019,36 @@ static bool replace_pending_with_backup(void)
     return false;
 }
 
+static bool add_enqueue_json_receipts(
+    char *const *events,
+    size_t count,
+    const char *confirmation_path)
+{
+    if (count == 0) return true;
+    char (*uid_storage)[65] = calloc(count, sizeof(*uid_storage));
+    const char **event_uids = calloc(count, sizeof(*event_uids));
+    if (!uid_storage || !event_uids) {
+        free(uid_storage);
+        free(event_uids);
+        return false;
+    }
+    bool valid = true;
+    for (size_t i = 0; i < count; i++) {
+        if (!extract_event_uid(events[i], uid_storage[i])) {
+            valid = false;
+            break;
+        }
+        event_uids[i] = uid_storage[i];
+    }
+    bool ok = valid && add_connector_enqueue_oracle_receipts(
+        event_uids,
+        count,
+        confirmation_path);
+    free(uid_storage);
+    free(event_uids);
+    return ok;
+}
+
 static void oracle_drain_pending_locked(bool live_first)
 {
     if (!file_has_nonempty_line(PENDING_PATH)) {
@@ -4025,10 +4100,19 @@ static void oracle_drain_pending_locked(bool live_first)
         if (live_first && bulk_count == 0) {
             oracle_delivery_result_t delivery = oracle_send_live(line);
             if (delivery == ORACLE_DELIVERY_ACKED) {
-                append_acked_uid_from_json_to_file(line, acked_file);
-                made_progress = true;
-                live_first = false;
-                continue;
+                char *live_event[] = {line};
+                if (add_enqueue_json_receipts(
+                        live_event,
+                        1,
+                        "FIRMWARE_LIVE")) {
+                    append_acked_uid_from_json_to_file(line, acked_file);
+                    made_progress = true;
+                    live_first = false;
+                    continue;
+                }
+                ESP_LOGE(
+                    TAG,
+                    "Oracle accepted a live event but its ADD receipt could not be persisted; retaining the event for an idempotent retry");
             }
             if (delivery == ORACLE_DELIVERY_PERMANENT_REJECTION) {
                 char *blocked_json = oracle_mark_permanent_rejection(line);
@@ -4079,7 +4163,12 @@ static void oracle_drain_pending_locked(bool live_first)
         }
         bulk_count++;
         if (bulk_count == ZONE_LITE_ORDS_BULK_CHUNK_SIZE) {
-            if (oracle_send_bulk(bulk, bulk_count)) {
+            bool oracle_ok = oracle_send_bulk(bulk, bulk_count);
+            bool receipt_ok = oracle_ok && add_enqueue_json_receipts(
+                bulk,
+                bulk_count,
+                "FIRMWARE_BULK");
+            if (oracle_ok && receipt_ok) {
                 for (size_t i = 0; i < bulk_count; i++) {
                     append_acked_uid_from_json_to_file(bulk[i], acked_file);
                     free(bulk[i]);
@@ -4087,6 +4176,11 @@ static void oracle_drain_pending_locked(bool live_first)
                 }
                 made_progress = true;
             } else {
+                if (oracle_ok) {
+                    ESP_LOGE(
+                        TAG,
+                        "Oracle accepted a bulk chunk but its ADD receipt could not be persisted; retaining the chunk for an idempotent retry");
+                }
                 failed = true;
                 for (size_t i = 0; i < bulk_count; i++) {
                     fprintf(out, "%s\n", bulk[i]);
@@ -4103,12 +4197,22 @@ static void oracle_drain_pending_locked(bool live_first)
     }
 
     if (!failed && bulk_count > 0) {
-        if (oracle_send_bulk(bulk, bulk_count)) {
+        bool oracle_ok = oracle_send_bulk(bulk, bulk_count);
+        bool receipt_ok = oracle_ok && add_enqueue_json_receipts(
+            bulk,
+            bulk_count,
+            "FIRMWARE_BULK");
+        if (oracle_ok && receipt_ok) {
             for (size_t i = 0; i < bulk_count; i++) {
                 append_acked_uid_from_json_to_file(bulk[i], acked_file);
             }
             made_progress = true;
         } else {
+            if (oracle_ok) {
+                ESP_LOGE(
+                    TAG,
+                    "Oracle accepted the final bulk chunk but its ADD receipt could not be persisted; retaining the chunk for an idempotent retry");
+            }
             failed = true;
             for (size_t i = 0; i < bulk_count; i++) {
                 fprintf(out, "%s\n", bulk[i]);

@@ -41,6 +41,7 @@ from zk_add.models import (
     DeviceUserSnapshot,
     IdentityConflictResolution,
     IdentityTombstone,
+    OracleReceipt,
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
@@ -48,7 +49,12 @@ from zk_add.models import (
     UserDeletionJob,
     ZKTDevice,
 )
-from zk_add.schemas import AttendanceEventIn, HeartbeatPayload, UserSnapshotRequest
+from zk_add.schemas import (
+    AttendanceEventIn,
+    HeartbeatPayload,
+    OracleReceiptBatchRequest,
+    UserSnapshotRequest,
+)
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
@@ -83,6 +89,11 @@ ORACLE_ALLOWED_CAPTURE_TYPES = {
 IDENTITY_CONFLICT_DUPLICATE_CNIC = "DUPLICATE_CNIC"
 ACTIVE_USER_DELETION_JOB_STATES = {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
 TERMINAL_USER_DELETION_ITEM_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"}
+ORACLE_CONFIRMATION_PATH_PRIORITY = {
+    "FIRMWARE_LIVE": 1,
+    "FIRMWARE_BULK": 2,
+    "FIRMWARE_RECONCILE": 3,
+}
 
 
 def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
@@ -1025,6 +1036,24 @@ def ingest_attendance(
             cnic = decrypt_cnic(tombstone.cnic_encrypted)
             display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
             shift_worker = tombstone.shift_worker
+        receipt = session.scalar(
+            select(OracleReceipt).where(OracleReceipt.event_uid == incoming.event_uid)
+        )
+        receipt_matches_connector = bool(
+            receipt is not None and receipt.connector_id == connector.id
+        )
+        if receipt is not None and not receipt_matches_connector:
+            upsert_alert(
+                session,
+                connector,
+                code="ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+                severity="HIGH",
+                message=(
+                    "A device reported Oracle acceptance for an event owned by another "
+                    "connector; the receipt was not applied."
+                ),
+                details={"event_uid_prefix": incoming.event_uid[:12]},
+            )
         row = AttendanceEvent(
             event_uid=incoming.event_uid,
             connector_id=connector.id,
@@ -1065,14 +1094,145 @@ def ingest_attendance(
             boot_id=incoming.boot_id,
             sequence=incoming.sequence,
             raw_event=sanitize_raw_event(incoming.raw_event),
-            ords_status="PENDING" if cnic else "BLOCKED_IDENTITY",
+            ords_status=(
+                "ACKED_FIRMWARE"
+                if receipt_matches_connector
+                else ("PENDING" if cnic else "BLOCKED_IDENTITY")
+            ),
+            oracle_confirmed_at=(
+                receipt.oracle_observed_at if receipt_matches_connector else None
+            ),
+            oracle_confirmation_path=(
+                receipt.confirmation_path if receipt_matches_connector else None
+            ),
         )
         session.add(row)
         session.flush()
-        if cnic:
+        if receipt_matches_connector:
+            receipt.attendance_event_id = row.id
+            session.add(
+                OrdsOutbox(
+                    attendance_event_id=row.id,
+                    status="ACKED_FIRMWARE",
+                    acknowledged_at=receipt.oracle_observed_at,
+                )
+            )
+        elif cnic:
             session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
         accepted.append(incoming.event_uid)
     return accepted, duplicates
+
+
+def record_oracle_receipts(
+    session: Session,
+    *,
+    connector: Connector,
+    batch: OracleReceiptBatchRequest,
+) -> tuple[int, int, int]:
+    """Persist device-observed Oracle acknowledgements before replying to firmware.
+
+    Receipts are independent of attendance arrival order.  A receipt that reaches
+    ADD before its attendance batch is retained and applied by ``ingest_attendance``
+    when that immutable event later arrives.
+    """
+
+    observed_at = ensure_utc(batch.oracle_observed_at)
+    now = utc_now()
+    applied = 0
+    awaiting_event = 0
+    rejected = 0
+    for event_uid in batch.event_uids:
+        receipt = session.scalar(
+            select(OracleReceipt).where(OracleReceipt.event_uid == event_uid)
+        )
+        if receipt is not None and receipt.connector_id != connector.id:
+            rejected += 1
+            upsert_alert(
+                session,
+                connector,
+                code="ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+                severity="HIGH",
+                message=(
+                    "A device reported Oracle acceptance for an event owned by another "
+                    "connector; the receipt was not applied."
+                ),
+                details={"event_uid_prefix": event_uid[:12]},
+            )
+            continue
+        if receipt is None:
+            receipt = OracleReceipt(
+                event_uid=event_uid,
+                connector_id=connector.id,
+                confirmation_path=batch.confirmation_path,
+                oracle_observed_at=observed_at,
+                first_received_at=now,
+                last_received_at=now,
+                observation_count=1,
+            )
+            session.add(receipt)
+            session.flush()
+        else:
+            receipt.last_received_at = now
+            receipt.observation_count += 1
+            receipt.oracle_observed_at = max(
+                ensure_utc(receipt.oracle_observed_at), observed_at
+            )
+            if ORACLE_CONFIRMATION_PATH_PRIORITY[batch.confirmation_path] >= (
+                ORACLE_CONFIRMATION_PATH_PRIORITY.get(receipt.confirmation_path, 0)
+            ):
+                receipt.confirmation_path = batch.confirmation_path
+
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        if event is None:
+            awaiting_event += 1
+            continue
+        if event.connector_id != connector.id:
+            rejected += 1
+            upsert_alert(
+                session,
+                connector,
+                code="ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+                severity="HIGH",
+                message=(
+                    "A device-reported Oracle receipt did not match the immutable "
+                    "attendance owner; the receipt was not applied."
+                ),
+                details={"event_uid_prefix": event_uid[:12]},
+            )
+            continue
+
+        receipt.attendance_event_id = event.id
+        event.ords_status = "ACKED_FIRMWARE"
+        event.oracle_confirmed_at = receipt.oracle_observed_at
+        event.oracle_confirmation_path = receipt.confirmation_path
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)
+        )
+        if outbox is None:
+            outbox = OrdsOutbox(attendance_event_id=event.id)
+            session.add(outbox)
+        outbox.status = "ACKED_FIRMWARE"
+        outbox.acknowledged_at = receipt.oracle_observed_at
+        outbox.next_attempt_at = None
+        outbox.last_error = None
+        applied += 1
+
+    remaining_failure = session.scalar(
+        select(OrdsOutbox.id)
+        .join(AttendanceEvent, AttendanceEvent.id == OrdsOutbox.attendance_event_id)
+        .where(
+            AttendanceEvent.connector_id == connector.id,
+            OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"]),
+        )
+        .limit(1)
+    )
+    if remaining_failure is None:
+        resolve_alert(session, connector, code="ORDS_DELIVERY_FAILED")
+    if rejected == 0:
+        resolve_alert(session, connector, code="ORACLE_RECEIPT_CONNECTOR_MISMATCH")
+    return applied, awaiting_event, rejected
 
 
 def sanitize_raw_event(value: dict) -> dict:

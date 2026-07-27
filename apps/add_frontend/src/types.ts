@@ -87,6 +87,9 @@ export interface Overview {
     blocked_identity: number
     quarantined: number
     acknowledged: number
+    acknowledged_add: number
+    acknowledged_check: number
+    acknowledged_firmware: number
     oldest_backlog_at: string | null
     last_attempt_at: string | null
   }
@@ -221,6 +224,8 @@ export interface AttendanceEvent {
   clock_quality: string
   clock_drift_seconds: number | null
   ords_status: string
+  oracle_confirmed_at: string | null
+  oracle_confirmation_path: string | null
   identity_resolution_id: number | null
   identity_resolution_status?: string
   identity_snapshot_id?: number | null

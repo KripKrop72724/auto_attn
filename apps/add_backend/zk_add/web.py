@@ -68,6 +68,7 @@ from zk_add.schemas import (
     OnboardRequest,
     DeviceLogIn,
     LogBatchRequest,
+    OracleReceiptBatchRequest,
     RestartRequest,
     UserCreateRequest,
     UserDeleteRequest,
@@ -101,6 +102,7 @@ from zk_add.service import (
     ingest_attendance,
     ingest_logs,
     replace_user_snapshot,
+    record_oracle_receipts,
     reconcile_device_user_identity_conflicts,
     resolve_alert,
     onboard_connector,
@@ -1556,6 +1558,20 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "accepted": len(accepted),
                 "duplicates": len(duplicates),
             }
+        elif envelope.type == "oracle_receipt_batch":
+            receipt_batch = OracleReceiptBatchRequest.model_validate(envelope.payload)
+            applied, awaiting_event, rejected = record_oracle_receipts(
+                db,
+                connector=connector,
+                batch=receipt_batch,
+            )
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "applied": applied,
+                "awaiting_event": awaiting_event,
+                "rejected": rejected,
+                "confirmation_path": receipt_batch.confirmation_path,
+            }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
     await websocket.send_json({"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq})
@@ -1750,6 +1766,8 @@ def serialize_attendance(row: AttendanceEvent) -> dict:
         "clock_quality": row.clock_quality,
         "clock_drift_seconds": row.clock_drift_seconds,
         "ords_status": row.ords_status,
+        "oracle_confirmed_at": row.oracle_confirmed_at,
+        "oracle_confirmation_path": row.oracle_confirmation_path,
         "identity_resolution_id": row.identity_resolution_id,
     }
 

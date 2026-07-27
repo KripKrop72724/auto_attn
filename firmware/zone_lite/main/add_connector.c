@@ -1315,6 +1315,37 @@ static bool attendance_payload_is_valid(const cJSON *payload)
     return true;
 }
 
+static bool oracle_receipt_payload_is_valid(const cJSON *payload)
+{
+    const cJSON *path = cJSON_GetObjectItemCaseSensitive(payload, "confirmation_path");
+    const cJSON *observed_at = cJSON_GetObjectItemCaseSensitive(payload, "oracle_observed_at");
+    const cJSON *event_uids = cJSON_GetObjectItemCaseSensitive(payload, "event_uids");
+    bool path_valid = cJSON_IsString(path) &&
+        (strcmp(path->valuestring, "FIRMWARE_LIVE") == 0 ||
+         strcmp(path->valuestring, "FIRMWARE_BULK") == 0 ||
+         strcmp(path->valuestring, "FIRMWARE_RECONCILE") == 0);
+    int count = cJSON_IsArray(event_uids) ? cJSON_GetArraySize(event_uids) : 0;
+    if (!path_valid || !cJSON_IsString(observed_at) ||
+        !attendance_timestamp_is_valid(observed_at->valuestring) ||
+        count < 1 || count > 100) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        const cJSON *uid = cJSON_GetArrayItem(event_uids, i);
+        if (!cJSON_IsString(uid) || !attendance_event_uid_is_valid(uid->valuestring)) {
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            const cJSON *previous = cJSON_GetArrayItem(event_uids, j);
+            if (cJSON_IsString(previous) &&
+                strcmp(previous->valuestring, uid->valuestring) == 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static void preserve_corrupt_outbox_row(const char *line)
 {
     FILE *file = fopen(ADD_CORRUPT_OUTBOX_PATH, "a");
@@ -1325,26 +1356,47 @@ static void preserve_corrupt_outbox_row(const char *line)
     fclose(file);
 }
 
-static char *attendance_outbox_record_line(const char *payload_json, bool *live_out)
+static char *outbox_record_line(
+    const char *type,
+    const char *payload_json,
+    bool *live_out)
 {
-    if (!payload_json) return NULL;
+    if (!type || !payload_json) return NULL;
     cJSON *payload = cJSON_Parse(payload_json);
     if (!payload || !cJSON_IsObject(payload)) {
         cJSON_Delete(payload);
         return NULL;
     }
-    if (!attendance_payload_is_valid(payload)) {
-        ESP_LOGE(TAG, "Refusing to enqueue an invalid ADD attendance payload");
+    bool live = false;
+    if (strcmp(type, "attendance_batch") == 0) {
+        if (!attendance_payload_is_valid(payload)) {
+            ESP_LOGE(TAG, "Refusing to enqueue an invalid ADD attendance payload");
+            cJSON_Delete(payload);
+            return NULL;
+        }
+        live = attendance_payload_is_live(payload);
+    } else if (strcmp(type, "oracle_receipt_batch") == 0) {
+        if (!oracle_receipt_payload_is_valid(payload)) {
+            ESP_LOGE(TAG, "Refusing to enqueue an invalid Oracle receipt payload");
+            cJSON_Delete(payload);
+            return NULL;
+        }
+        const cJSON *path = cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "confirmation_path");
+        live = cJSON_IsString(path) &&
+            strcmp(path->valuestring, "FIRMWARE_LIVE") == 0;
+    } else {
+        ESP_LOGE(TAG, "Refusing unsupported ADD outbox message type=%s", type);
         cJSON_Delete(payload);
         return NULL;
     }
-    bool live = attendance_payload_is_live(payload);
     cJSON *record = cJSON_CreateObject();
     if (!record) {
         cJSON_Delete(payload);
         return NULL;
     }
-    cJSON_AddStringToObject(record, "type", "attendance_batch");
+    cJSON_AddStringToObject(record, "type", type);
     cJSON_AddItemToObject(record, "payload", payload);
     char *line = cJSON_PrintUnformatted(record);
     cJSON_Delete(record);
@@ -1352,7 +1404,7 @@ static char *attendance_outbox_record_line(const char *payload_json, bool *live_
     if (!line || line_len + 2 >= ADD_OUTBOX_LINE_BYTES) {
         ESP_LOGE(
             TAG,
-            "Refusing oversized ADD attendance batch bytes=%lu limit=%u",
+            "Refusing oversized ADD outbox message bytes=%lu limit=%u",
             (unsigned long)line_len,
             (unsigned)ADD_OUTBOX_LINE_BYTES);
         free(line);
@@ -1362,11 +1414,16 @@ static char *attendance_outbox_record_line(const char *payload_json, bool *live_
     return line;
 }
 
-bool add_connector_enqueue_attendance(const char *payload_json)
+static char *attendance_outbox_record_line(const char *payload_json, bool *live_out)
+{
+    return outbox_record_line("attendance_batch", payload_json, live_out);
+}
+
+static bool add_connector_enqueue_record(const char *type, const char *payload_json)
 {
     if (!zone_config_get()->add_enabled) return true;
     bool live = false;
-    char *line = attendance_outbox_record_line(payload_json, &live);
+    char *line = outbox_record_line(type, payload_json, &live);
     if (!line) return false;
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
@@ -1386,13 +1443,55 @@ bool add_connector_enqueue_attendance(const char *payload_json)
                 if (ok) outbox->depth++;
             }
         } else {
-            ESP_LOGE(TAG, "ADD %s attendance outbox is full; preserving existing rows", outbox->label);
+            ESP_LOGE(TAG, "ADD %s outbox is full; preserving existing rows", outbox->label);
         }
         xSemaphoreGive(outbox->lock);
     } else {
         ESP_LOGE(TAG, "Timed out waiting for ADD %s outbox lock", outbox->label);
     }
     free(line);
+    return ok;
+}
+
+bool add_connector_enqueue_attendance(const char *payload_json)
+{
+    return add_connector_enqueue_record("attendance_batch", payload_json);
+}
+
+bool add_connector_enqueue_oracle_receipts(
+    const char *const *event_uids,
+    size_t count,
+    const char *confirmation_path)
+{
+    if (!zone_config_get()->add_enabled) return true;
+    if (!event_uids || count < 1 || count > 100 || !confirmation_path) return false;
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *uids = cJSON_CreateArray();
+    if (!payload || !uids) {
+        cJSON_Delete(payload);
+        cJSON_Delete(uids);
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "confirmation_path", confirmation_path);
+    time_t now;
+    time(&now);
+    char observed_at[32];
+    iso_utc(now, observed_at);
+    cJSON_AddStringToObject(payload, "oracle_observed_at", observed_at);
+    for (size_t i = 0; i < count; i++) {
+        if (!attendance_event_uid_is_valid(event_uids[i])) {
+            cJSON_Delete(payload);
+            cJSON_Delete(uids);
+            return false;
+        }
+        cJSON_AddItemToArray(uids, cJSON_CreateString(event_uids[i]));
+    }
+    cJSON_AddItemToObject(payload, "event_uids", uids);
+    char *json = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    bool ok = json &&
+        add_connector_enqueue_record("oracle_receipt_batch", json);
+    free(json);
     return ok;
 }
 
@@ -1483,8 +1582,11 @@ static void outbox_task(void *arg)
         cJSON *record = cJSON_Parse(line);
         cJSON *type = record ? cJSON_GetObjectItemCaseSensitive(record, "type") : NULL;
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
-        bool valid = cJSON_IsString(type) && strcmp(type->valuestring, "attendance_batch") == 0 &&
-                     cJSON_IsObject(payload) && attendance_payload_is_valid(payload);
+        bool valid = cJSON_IsString(type) && cJSON_IsObject(payload) &&
+            ((strcmp(type->valuestring, "attendance_batch") == 0 &&
+              attendance_payload_is_valid(payload)) ||
+             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 &&
+              oracle_receipt_payload_is_valid(payload)));
         char *payload_json = valid ? cJSON_PrintUnformatted(payload) : NULL;
         if (!valid || !payload_json) {
             cJSON_Delete(record);

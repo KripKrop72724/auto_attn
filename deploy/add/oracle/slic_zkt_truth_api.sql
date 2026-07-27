@@ -13,6 +13,7 @@ set define off
 create or replace package slic_zkt_truth_api authid definer as
     procedure post_live(p_body in clob);
     procedure post_bulk(p_body in clob);
+    procedure post_check(p_body in clob);
     procedure post_reconcile(p_body in clob);
 
     function parse_event_timestamp(p_value in varchar2) return timestamp with time zone;
@@ -197,6 +198,31 @@ create or replace package body slic_zkt_truth_api as
         when others then
             return -1;
     end event_array_count;
+
+    procedure send_check_result(
+        p_received_count in number,
+        p_existing_count in number,
+        p_missing_count in number,
+        p_missing_event_uids in clob)
+    is
+        v_json clob;
+    begin
+        select json_object(
+                   'success' value 'true' format json,
+                   'received_count' value nvl(p_received_count, 0),
+                   'existing_count' value nvl(p_existing_count, 0),
+                   'missing_count' value nvl(p_missing_count, 0),
+                   'missing_event_uids' value coalesce(
+                       p_missing_event_uids,
+                       to_clob('[]')) format json
+                   returning clob)
+          into v_json
+          from dual;
+        owa_util.status_line(200, 'OK', false);
+        owa_util.mime_header('application/json', false);
+        owa_util.http_header_close;
+        htp.p(dbms_lob.substr(v_json, 32767, 1));
+    end send_check_result;
 
     procedure handle_event_array(p_body in clob, p_allow_empty in boolean, p_default_capture_type in varchar2) is
         v_received number := 0;
@@ -418,6 +444,104 @@ create or replace package body slic_zkt_truth_api as
     begin
         handle_event_array(p_body, false, 'LIVE_POLL');
     end post_bulk;
+
+    procedure post_check(p_body in clob) is
+        v_received number := 0;
+        v_invalid number := 0;
+        v_request_dupes number := 0;
+        v_missing number := 0;
+        v_missing_event_uids clob;
+    begin
+        require_auth;
+        begin
+            select count(*),
+                   sum(
+                       case
+                           when event_uid is null
+                             or not regexp_like(event_uid, '^[0-9a-f]{64}$', 'c')
+                           then 1
+                           else 0
+                       end)
+              into v_received, v_invalid
+              from json_table(
+                       p_body,
+                       '$.event_uids[*]'
+                       columns event_uid varchar2(150) path '$' null on error
+                   );
+        exception
+            when others then
+                fail_and_stop(400, 'Malformed JSON payload', 0, 1, '["malformed_json"]');
+        end;
+
+        v_invalid := nvl(v_invalid, 0);
+        if v_received < 1 or v_received > 500 then
+            fail_and_stop(
+                400,
+                'Membership check requires between 1 and 500 event_uids',
+                v_received,
+                1,
+                '["invalid_event_uid_count"]');
+        end if;
+
+        select greatest(count(*) - count(distinct event_uid), 0)
+          into v_request_dupes
+          from json_table(
+                   p_body,
+                   '$.event_uids[*]'
+                   columns event_uid varchar2(150) path '$' null on error
+               );
+        if v_invalid > 0 or v_request_dupes > 0 then
+            fail_and_stop(
+                400,
+                'Invalid or duplicate event_uid membership request',
+                v_received,
+                v_invalid + v_request_dupes,
+                '["invalid_event_uid","duplicate_event_uid_in_request"]');
+        end if;
+
+        with incoming as (
+            select j.event_uid
+              from json_table(
+                       p_body,
+                       '$.event_uids[*]'
+                       columns event_uid varchar2(150) path '$' null on error
+                   ) j
+        ),
+        missing as (
+            select i.event_uid
+              from incoming i
+             where not exists (
+                       select 1
+                         from hr_raw_attn_capture_events d
+                        where d.event_uid = i.event_uid
+                   )
+        )
+        select count(*),
+               json_arrayagg(event_uid order by event_uid returning clob)
+          into v_missing, v_missing_event_uids
+          from missing;
+        if v_missing_event_uids is null then
+            v_missing_event_uids := to_clob('[]');
+        end if;
+
+        send_check_result(
+            p_received_count => v_received,
+            p_existing_count => v_received - v_missing,
+            p_missing_count => v_missing,
+            p_missing_event_uids => v_missing_event_uids);
+    exception
+        when e_response_sent then
+            rollback;
+        when others then
+            rollback;
+            send_metrics(
+                p_status => 500,
+                p_success => false,
+                p_message => 'Unhandled membership check error: ' || substr(sqlerrm, 1, 500),
+                p_received_count => v_received,
+                p_invalid_count => v_invalid,
+                p_conflicts_json => '["server_error"]');
+    end post_check;
 
     procedure post_reconcile(p_body in clob) is
         v_api_version number;
@@ -820,6 +944,27 @@ begin
                 p_status => 'PUBLISHED',
                 p_comments => 'ZKT raw attendance capture API with authoritative truth reconcile');
     end;
+
+    begin
+        ords.define_template(
+            p_module_name => l_module_name,
+            p_pattern => 'raw-captures/check');
+    exception
+        when dup_val_on_index then
+            null;
+    end;
+
+    ords.define_handler(
+        p_module_name => l_module_name,
+        p_pattern => 'raw-captures/check',
+        p_method => 'POST',
+        p_source_type => ords.source_type_plsql,
+        p_items_per_page => 0,
+        p_source => q'[
+begin
+    slic_zkt_truth_api.post_check(:body_text);
+end;
+]');
 
     begin
         ords.define_template(
