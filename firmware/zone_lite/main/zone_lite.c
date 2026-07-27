@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -343,6 +344,7 @@ static uint32_t g_last_authenticated_zkt_ip;
 static int32_t g_last_synced_attendance_count = -1;
 static int64_t g_last_full_truth_reconcile_epoch;
 static int64_t g_last_full_truth_reconcile_ms;
+static bool g_force_truth_reconcile;
 static uint32_t g_last_zkt_tcp_candidate_ip;
 static bool g_sntp_started;
 static bool g_time_synced;
@@ -364,7 +366,10 @@ static bool oracle_send_reconcile(
     size_t event_count,
     int year,
     int month,
+    int window_start_day,
+    int window_end_day,
     size_t *truth_count_out);
+static int days_in_month(int year, int month);
 
 static int64_t uptime_ms(void)
 {
@@ -387,6 +392,13 @@ static void nvs_save_runtime_state(void)
     (void)nvs_set_u32(handle, "zkt_ip", g_last_authenticated_zkt_ip);
     (void)nvs_set_i32(handle, "attn_count", g_last_synced_attendance_count);
     (void)nvs_set_i64(handle, "truth_epoch", g_last_full_truth_reconcile_epoch);
+    if (!g_force_truth_reconcile) {
+        const esp_app_desc_t *description = esp_app_get_description();
+        const char *version = description && description->version[0]
+            ? description->version
+            : "unknown";
+        (void)nvs_set_str(handle, "truth_ver", version);
+    }
     (void)nvs_set_i32(handle, "restart_slot", g_daily_zkt_reboot_completed_day);
     (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
     (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
@@ -403,9 +415,21 @@ static void nvs_load_runtime_state(void)
     }
     uint8_t active = 0;
     int32_t restart_slot = -1;
+    char truth_version[32] = "";
+    size_t truth_version_size = sizeof(truth_version);
     (void)nvs_get_u32(handle, "zkt_ip", &g_last_authenticated_zkt_ip);
     (void)nvs_get_i32(handle, "attn_count", &g_last_synced_attendance_count);
     (void)nvs_get_i64(handle, "truth_epoch", &g_last_full_truth_reconcile_epoch);
+    const esp_app_desc_t *description = esp_app_get_description();
+    const char *running_version = description && description->version[0]
+        ? description->version
+        : "unknown";
+    if (nvs_get_str(handle, "truth_ver", truth_version, &truth_version_size) != ESP_OK ||
+        strcmp(truth_version, running_version) != 0) {
+        g_force_truth_reconcile = true;
+        g_last_full_truth_reconcile_epoch = 0;
+        g_last_full_truth_reconcile_ms = 0;
+    }
     if (nvs_get_i32(handle, "restart_slot", &restart_slot) == ESP_OK) {
         g_daily_zkt_reboot_completed_day = (int)restart_slot;
     }
@@ -2795,11 +2819,106 @@ static bool build_attendance_event(
     return out->user_id[0] != '\0';
 }
 
-static bool zk_timestamp_in_month(uint32_t timestamp, int year, int month)
+static bool zk_timestamp_in_window(
+    uint32_t timestamp,
+    int year,
+    int month,
+    int start_day,
+    int end_day)
 {
     struct tm decoded;
     decode_zk_time(timestamp, &decoded);
-    return decoded.tm_year + 1900 == year && decoded.tm_mon + 1 == month;
+    return decoded.tm_year + 1900 == year &&
+        decoded.tm_mon + 1 == month &&
+        decoded.tm_mday >= start_day &&
+        decoded.tm_mday <= end_day;
+}
+
+static bool parse_attendance_record(
+    const uint8_t *record,
+    uint32_t record_size,
+    const user_table_t *users,
+    attendance_event_t *event,
+    uint32_t *timestamp_out)
+{
+    if (!record || !users || !event || !timestamp_out) return false;
+    char user_id[32] = "";
+    uint16_t uid = 0;
+    uint32_t timestamp = 0;
+    uint8_t status = 0;
+    uint8_t punch = 0;
+    if (record_size == 8) {
+        uid = read_le16(record);
+        status = record[2];
+        timestamp = read_le32(record + 3);
+        punch = record[7];
+        const zkt_user_t *user = find_user_by_uid(users, uid);
+        snprintf(user_id, sizeof(user_id), "%s", user ? user->user_id : "");
+    } else if (record_size == 16) {
+        snprintf(user_id, sizeof(user_id), "%lu", (unsigned long)read_le32(record));
+        timestamp = read_le32(record + 4);
+        status = record[8];
+        punch = record[9];
+    } else if (record_size == 40) {
+        uid = read_le16(record);
+        copy_zk_string(user_id, sizeof(user_id), record + 2, 24);
+        status = record[26];
+        timestamp = read_le32(record + 27);
+        punch = record[31];
+    } else {
+        return false;
+    }
+    *timestamp_out = timestamp;
+    return build_attendance_event(
+        event, users, user_id, uid, timestamp, status, punch);
+}
+
+static size_t collect_reconcile_window(
+    const uint8_t *data,
+    size_t len,
+    uint32_t record_size,
+    const user_table_t *users,
+    int year,
+    int month,
+    int start_day,
+    int end_day,
+    attendance_event_t *events,
+    size_t capacity,
+    bool *overflow)
+{
+    if (overflow) *overflow = false;
+    if (!data || len < 4 || !events || capacity == 0) return 0;
+    const uint8_t *record = data + 4;
+    size_t remain = len - 4;
+    size_t count = 0;
+    size_t processed = 0;
+    while (remain >= record_size) {
+        attendance_event_t event;
+        uint32_t timestamp = 0;
+        if (parse_attendance_record(
+                record, record_size, users, &event, &timestamp)) {
+            struct tm decoded;
+            decode_zk_time(timestamp, &decoded);
+            int event_year = decoded.tm_year + 1900;
+            int event_month = decoded.tm_mon + 1;
+            int event_day = decoded.tm_mday;
+            if (event_year == year && event_month == month &&
+                event_day >= start_day && event_day <= end_day) {
+                if (count >= capacity) {
+                    if (overflow) *overflow = true;
+                    return count;
+                }
+                events[count++] = event;
+            }
+        }
+        record += record_size;
+        remain -= record_size;
+        processed++;
+        if ((processed % 100) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    return count;
 }
 
 static bool reconcile_attendance_dump(
@@ -2810,13 +2929,48 @@ static bool reconcile_attendance_dump(
     const char *capturetype,
     int filter_year,
     int filter_month,
+    int filter_day_end,
     size_t *added_out)
 {
     if (added_out) *added_out = 0;
     uint8_t *data = NULL;
     size_t len = 0;
     if (records <= 0) {
-        return true;
+        int last_day = days_in_month(filter_year, filter_month);
+        int day_end = filter_day_end;
+        if (last_day == 0 || day_end < 1) {
+            return false;
+        }
+        if (day_end > last_day) day_end = last_day;
+        size_t truth_count = 0;
+        bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED;
+        bool truth_delivery_ok = !truth_enabled || oracle_send_reconcile(
+            NULL,
+            0,
+            filter_year,
+            filter_month,
+            1,
+            day_end,
+            &truth_count);
+        bool add_delivery_ok = add_enqueue_reconcile_events(
+            NULL, 0, capturetype);
+        bool receipt_delivery_ok = !truth_enabled ||
+            !truth_delivery_ok ||
+            !add_delivery_ok ||
+            add_enqueue_truth_receipts(NULL, 0);
+        bool reconcile_complete = truth_delivery_ok &&
+            add_delivery_ok && receipt_delivery_ok;
+        ESP_LOGI(
+            TAG,
+            "Empty-terminal authoritative reconcile window=%04d-%02d-01..%02d complete=%s",
+            filter_year,
+            filter_month,
+            day_end,
+            reconcile_complete ? "true" : "false");
+        if (!reconcile_complete) {
+            led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        }
+        return reconcile_complete;
     }
     // Do not download a multi-megabyte ZKT dump while the background ORDS
     // worker owns the durable outbox for a network rewrite. Waiting here keeps
@@ -2877,38 +3031,36 @@ static bool reconcile_attendance_dump(
     size_t duplicates = 0;
     size_t filtered = 0;
     size_t skipped = 0;
-    bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED && filter_year > 0 && filter_month > 0;
-    bool reconcile_overflow = false;
-    size_t reconcile_event_count = 0;
-    size_t truth_count = 0;
-    size_t reconcile_capacity = ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
-    attendance_event_t *reconcile_events = heap_caps_calloc(
-        reconcile_capacity,
-        sizeof(attendance_event_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (reconcile_events == NULL) {
-        reconcile_events = calloc(reconcile_capacity, sizeof(attendance_event_t));
-    }
-    if (reconcile_events == NULL) {
+    bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED &&
+        filter_year > 0 && filter_month > 0;
+    int last_day = days_in_month(filter_year, filter_month);
+    int day_end = filter_day_end;
+    if (last_day == 0 || day_end < 1) {
         ESP_LOGE(
             TAG,
-            "Could not allocate bounded reconcile event store capacity=%u",
-            (unsigned)reconcile_capacity);
+            "Invalid reconcile window year=%d month=%d end_day=%d",
+            filter_year,
+            filter_month,
+            filter_day_end);
         free(data);
         xSemaphoreGive(g_ords_outbox_gate);
-        led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
+    if (day_end > last_day) day_end = last_day;
+    size_t reconcile_event_count = 0;
+    size_t identity_mapped_count = 0;
+    size_t reconcile_capacity = ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
+    bool durable_enqueue_ok = true;
     ESP_LOGI(
         TAG,
-        "Reconciling %ld attendance records packet_size=%lu month_filter=%04d-%02d",
+        "Reconciling %ld attendance records packet_size=%lu window=%04d-%02d-01..%02d",
         (long)records,
         (unsigned long)record_size,
         filter_year,
-        filter_month);
+        filter_month,
+        day_end);
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGW(TAG, "Skipping reconcile because attendance storage is busy");
-        free(reconcile_events);
         free(data);
         xSemaphoreGive(g_ords_outbox_gate);
         return false;
@@ -2922,33 +3074,13 @@ static bool reconcile_attendance_dump(
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
     }
     while (remain >= record_size) {
-        char user_id[32] = "";
-        uint16_t uid = 0;
+        attendance_event_t event;
         uint32_t timestamp = 0;
-        uint8_t status = 0;
-        uint8_t punch = 0;
-        if (record_size == 8 && remain >= 8) {
-            uid = read_le16(p);
-            status = p[2];
-            timestamp = read_le32(p + 3);
-            punch = p[7];
-            const zkt_user_t *user = find_user_by_uid(users, uid);
-            snprintf(user_id, sizeof(user_id), "%s", user ? user->user_id : "");
-        } else if (record_size == 16 && remain >= 16) {
-            snprintf(user_id, sizeof(user_id), "%lu", (unsigned long)read_le32(p));
-            timestamp = read_le32(p + 4);
-            status = p[8];
-            punch = p[9];
-        } else if (record_size == 40 && remain >= 40) {
-            uid = read_le16(p);
-            copy_zk_string(user_id, sizeof(user_id), p + 2, 24);
-            status = p[26];
-            timestamp = read_le32(p + 27);
-            punch = p[31];
-        } else {
-            break;
-        }
-        if (filter_year > 0 && filter_month > 0 && !zk_timestamp_in_month(timestamp, filter_year, filter_month)) {
+        bool parsed = parse_attendance_record(
+            p, record_size, users, &event, &timestamp);
+        if (parsed && filter_year > 0 && filter_month > 0 &&
+            !zk_timestamp_in_window(
+                timestamp, filter_year, filter_month, 1, day_end)) {
             filtered++;
             p += record_size;
             remain -= record_size;
@@ -2958,15 +3090,10 @@ static bool reconcile_attendance_dump(
             }
             continue;
         }
-        attendance_event_t event;
-        if (build_attendance_event(&event, users, user_id, uid, timestamp, status, punch)) {
-            if (reconcile_event_count < reconcile_capacity) {
-                reconcile_events[reconcile_event_count++] = event;
-                if (event.cnic[0] != '\0') {
-                    truth_count++;
-                }
-            } else {
-                reconcile_overflow = true;
+        if (parsed) {
+            reconcile_event_count++;
+            if (event.cnic[0] != '\0') {
+                identity_mapped_count++;
             }
             enqueue_result_t result = enqueue_event_to_files(
                 &event, capturetype, pending_file, blocked_file, false);
@@ -2976,6 +3103,8 @@ static bool reconcile_attendance_dump(
             } else if (result == ENQUEUE_BLOCKED) {
                 added++;
                 blocked++;
+            } else if (result == ENQUEUE_STORAGE_ERROR) {
+                durable_enqueue_ok = false;
             } else {
                 duplicates++;
             }
@@ -3000,48 +3129,141 @@ static bool reconcile_attendance_dump(
         fclose(blocked_file);
     }
     xSemaphoreGive(g_storage_lock);
-    free(data);
     xSemaphoreGive(g_ords_outbox_gate);
     ESP_LOGI(
         TAG,
-        "Released ZKT dump before downstream reconcile serialization events=%u truth=%u",
+        "Released durable outbox before bounded downstream windows events=%u identity_mapped=%u",
         (unsigned)reconcile_event_count,
-        (unsigned)truth_count);
+        (unsigned)identity_mapped_count);
 
+    attendance_event_t *reconcile_events = heap_caps_calloc(
+        reconcile_capacity,
+        sizeof(attendance_event_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (reconcile_events == NULL) {
+        reconcile_events = calloc(reconcile_capacity, sizeof(attendance_event_t));
+    }
+    if (reconcile_events == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Could not allocate bounded reconcile window capacity=%u",
+            (unsigned)reconcile_capacity);
+        free(data);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        return false;
+    }
+
+    bool daily_windows = reconcile_event_count > reconcile_capacity;
+    int window_start_day = 1;
+    size_t truth_count = 0;
+    size_t window_count = 0;
+    bool window_overflow = false;
     bool truth_delivery_ok = true;
     bool add_delivery_ok = true;
     bool receipt_delivery_ok = true;
-    if (reconcile_overflow) {
-        ESP_LOGE(
-            TAG,
-            "Current-month reconcile exceeded bounded event capacity=%u",
-            (unsigned)reconcile_capacity);
-        truth_delivery_ok = false;
-        add_delivery_ok = false;
-    } else {
-        if (truth_enabled) {
-            truth_delivery_ok = oracle_send_reconcile(
-                reconcile_events,
-                reconcile_event_count,
+    while (window_start_day <= day_end) {
+        int window_end_day = daily_windows ? window_start_day : day_end;
+        bool overflow = false;
+        size_t window_event_count = collect_reconcile_window(
+            data,
+            len,
+            record_size,
+            users,
+            filter_year,
+            filter_month,
+            window_start_day,
+            window_end_day,
+            reconcile_events,
+            reconcile_capacity,
+            &overflow);
+        window_count++;
+        if (overflow) {
+            ESP_LOGE(
+                TAG,
+                "Truth window %04d-%02d-%02d..%02d exceeded safety capacity=%u; no authoritative request was sent for this window",
                 filter_year,
                 filter_month,
-                &truth_count);
-        }
-        // ADD receives the same compact truth stream independently of ORDS
-        // dedup state. Payloads are serialized and committed in bounded chunks
-        // only after the multi-megabyte ZKT dump has been released.
-        add_delivery_ok = add_enqueue_reconcile_events(
-            reconcile_events,
-            reconcile_event_count,
-            capturetype);
-        if (truth_enabled && truth_delivery_ok && add_delivery_ok) {
-            receipt_delivery_ok = add_enqueue_truth_receipts(
+                window_start_day,
+                window_end_day,
+                (unsigned)reconcile_capacity);
+            window_overflow = true;
+            truth_delivery_ok = false;
+            add_delivery_ok = false;
+            receipt_delivery_ok = false;
+        } else {
+            size_t window_truth_count = 0;
+            bool window_truth_ok = true;
+            if (truth_enabled) {
+                window_truth_ok = oracle_send_reconcile(
+                    reconcile_events,
+                    window_event_count,
+                    filter_year,
+                    filter_month,
+                    window_start_day,
+                    window_end_day,
+                    &window_truth_count);
+            } else {
+                for (size_t i = 0; i < window_event_count; i++) {
+                    if (reconcile_events[i].cnic[0] != '\0') {
+                        window_truth_count++;
+                    }
+                }
+            }
+            // ADD receives the same compact truth stream independently of
+            // ORDS state. A failed Oracle window does not prevent the
+            // dashboard's durable truth stream from being queued.
+            bool window_add_ok = add_enqueue_reconcile_events(
                 reconcile_events,
-                reconcile_event_count);
+                window_event_count,
+                capturetype);
+            bool window_receipt_ok = true;
+            if (truth_enabled && window_truth_ok && window_add_ok) {
+                window_receipt_ok = add_enqueue_truth_receipts(
+                    reconcile_events,
+                    window_event_count);
+            }
+            truth_count += window_truth_count;
+            truth_delivery_ok = truth_delivery_ok && window_truth_ok;
+            add_delivery_ok = add_delivery_ok && window_add_ok;
+            receipt_delivery_ok = receipt_delivery_ok && window_receipt_ok;
+            ESP_LOGI(
+                TAG,
+                "Truth window %04d-%02d-%02d..%02d events=%u truth=%u oracle=%s add=%s receipt=%s",
+                filter_year,
+                filter_month,
+                window_start_day,
+                window_end_day,
+                (unsigned)window_event_count,
+                (unsigned)window_truth_count,
+                window_truth_ok ? "true" : "false",
+                window_add_ok ? "true" : "false",
+                window_receipt_ok ? "true" : "false");
+        }
+        if (!daily_windows) {
+            break;
+        }
+        window_start_day++;
+        if ((window_count % 4) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
+    free(data);
     free(reconcile_events);
 
+    if (!durable_enqueue_ok) {
+        ESP_LOGE(
+            TAG,
+            "One or more terminal events could not be durably appended to the local attendance outbox");
+    }
+    if (truth_count != identity_mapped_count) {
+        ESP_LOGW(
+            TAG,
+            "Bounded truth scan count mismatch first_scan=%u window_scan=%u",
+            (unsigned)identity_mapped_count,
+            (unsigned)truth_count);
+        truth_delivery_ok = false;
+        receipt_delivery_ok = false;
+    }
     if (!add_delivery_ok) {
         ESP_LOGW(
             TAG,
@@ -3062,14 +3284,14 @@ static bool reconcile_attendance_dump(
             "ORACLE_RECEIPT_QUEUE_SATURATED",
             "Oracle accepted terminal truth but its dashboard receipt could not be persisted; the next truth cycle will retry safely");
     }
-    bool reconcile_complete = !reconcile_overflow && truth_delivery_ok &&
-        add_delivery_ok && receipt_delivery_ok;
+    bool reconcile_complete = durable_enqueue_ok && !window_overflow &&
+        truth_delivery_ok && add_delivery_ok && receipt_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
     }
     ESP_LOGI(
         TAG,
-        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u truth=%u complete=%s",
+        "Reconcile %s processed=%u new=%u pending=%u blocked=%u duplicates=%u filtered=%u skipped=%u truth=%u windows=%u daily=%s complete=%s",
         capturetype,
         (unsigned)processed,
         (unsigned)added,
@@ -3079,6 +3301,8 @@ static bool reconcile_attendance_dump(
         (unsigned)filtered,
         (unsigned)skipped,
         (unsigned)truth_count,
+        (unsigned)window_count,
+        daily_windows ? "true" : "false",
         reconcile_complete ? "true" : "false");
     if (added_out) *added_out = added;
     return reconcile_complete;
@@ -3752,11 +3976,14 @@ static char *build_reconcile_payload(
     size_t event_count,
     int year,
     int month,
+    int window_start_day,
+    int window_end_day,
     size_t *included_out)
 {
     if (included_out) *included_out = 0;
     int last_day = days_in_month(year, month);
-    if (last_day == 0) {
+    if (last_day == 0 || window_start_day < 1 ||
+        window_end_day < window_start_day || window_end_day > last_day) {
         return NULL;
     }
     char *zone_id = json_escape_alloc(ZONE_LITE_ZONE_ID);
@@ -3774,16 +4001,17 @@ static char *build_reconcile_payload(
         header,
         sizeof(header),
         "{\"api_version\":1,\"zone_id\":\"%s\",\"device_id\":\"%s\",\"device_serial\":\"%s\","
-        "\"window_start\":\"%04d-%02d-01\",\"window_end\":\"%04d-%02d-%02d\","
+        "\"window_start\":\"%04d-%02d-%02d\",\"window_end\":\"%04d-%02d-%02d\","
         "\"mode\":\"authoritative_replace\",\"events\":[",
         zone_id,
         device_id,
         device_serial,
         year,
         month,
+        window_start_day,
         year,
         month,
-        last_day);
+        window_end_day);
     free(zone_id);
     free(device_id);
     free(device_serial);
@@ -3895,6 +4123,8 @@ static bool oracle_send_reconcile(
     size_t event_count,
     int year,
     int month,
+    int window_start_day,
+    int window_end_day,
     size_t *truth_count_out)
 {
     if (truth_count_out) *truth_count_out = 0;
@@ -3912,7 +4142,14 @@ static bool oracle_send_reconcile(
     }
 
     size_t truth_count = 0;
-    char *payload = build_reconcile_payload(events, event_count, year, month, &truth_count);
+    char *payload = build_reconcile_payload(
+        events,
+        event_count,
+        year,
+        month,
+        window_start_day,
+        window_end_day,
+        &truth_count);
     if (payload == NULL) {
         ESP_LOGE(TAG, "Could not build bounded ORDS truth reconcile payload events=%u", (unsigned)event_count);
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
@@ -3939,10 +4176,12 @@ static bool oracle_send_reconcile(
 
     ESP_LOGI(
         TAG,
-        "ORDS truth reconcile count=%u month=%04d-%02d status=%d ok=%s deleted=%d corrected=%d invalid=%d",
+        "ORDS truth reconcile count=%u window=%04d-%02d-%02d..%02d status=%d ok=%s deleted=%d corrected=%d invalid=%d",
         (unsigned)truth_count,
         year,
         month,
+        window_start_day,
+        window_end_day,
         status,
         ok ? "true" : "false",
         deleted,
@@ -5167,7 +5406,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
             bool counter_mismatch = record_delta < 0 || (uint64_t)record_delta != live_events_since_sync;
             int64_t current_epoch = epoch_now();
             bool epoch_valid = current_epoch > 1700000000;
-            bool truth_due = g_last_synced_attendance_count < 0 ||
+            bool truth_due = g_force_truth_reconcile ||
+                g_last_synced_attendance_count < 0 ||
                 (g_last_full_truth_reconcile_epoch == 0 && g_last_full_truth_reconcile_ms == 0);
             if (!truth_due && epoch_valid && g_last_full_truth_reconcile_epoch > 0) {
                 int64_t elapsed_seconds = current_epoch - g_last_full_truth_reconcile_epoch;
@@ -5184,10 +5424,11 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 snprintf(
                     reason,
                     sizeof(reason),
-                    "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s",
+                    "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s firmware_forced=%s",
                     (long long)record_delta,
                     (unsigned)live_events_since_sync,
-                    truth_due ? "true" : "false");
+                    truth_due ? "true" : "false",
+                    g_force_truth_reconcile ? "true" : "false");
                 ESP_LOGI(TAG, "%s", reason);
                 add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
                 if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
@@ -5204,7 +5445,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         reconcile_capturetype,
                         device_now.tm_year + 1900,
                         device_now.tm_mon + 1,
+                        device_now.tm_mday,
                         &added)) {
+                    g_force_truth_reconcile = false;
                     g_last_synced_attendance_count = refreshed_records;
                     live_events_since_sync = 0;
                     g_last_full_truth_reconcile_ms = now_ms;

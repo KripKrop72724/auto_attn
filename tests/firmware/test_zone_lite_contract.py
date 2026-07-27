@@ -246,10 +246,20 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
         source.index("static bool system_time_is_valid(")
     ]
     assert "attendance_event_t *reconcile_events = heap_caps_calloc" in reconcile
+    assert "collect_reconcile_window(" in reconcile
+    assert "bool daily_windows = reconcile_event_count > reconcile_capacity;" in reconcile
+    assert "while (window_start_day <= day_end)" in reconcile
     assert "char **truth_events" not in reconcile
     assert "ADD_RECONCILE_MAX_BATCHES" not in source
     assert "#define ADD_RECONCILE_COMMIT_BATCHES 32" in source
-    assert reconcile.index("free(data);") < reconcile.index("oracle_send_reconcile(")
+    release_gate = reconcile.index(
+        "xSemaphoreGive(g_ords_outbox_gate);",
+        reconcile.index("xSemaphoreGive(g_storage_lock);"),
+    )
+    collect_window = reconcile.index("collect_reconcile_window(")
+    oracle_send = reconcile.index("oracle_send_reconcile(", collect_window)
+    free_dump = reconcile.rindex("free(data);")
+    assert release_gate < collect_window < oracle_send < free_dump
     assert reconcile.index("oracle_send_reconcile(") < reconcile.index(
         "add_enqueue_reconcile_events("
     )
@@ -271,6 +281,43 @@ def test_recoverable_truth_memory_pressure_never_latches_fatal_led():
     assert 'event_to_json(&events[i], "MANUAL_REPROCESS")' in payload
     assert "LED_STATUS_FATAL" not in sender
     assert "LED_STATUS_TRUTH_REPAIR" in sender
+
+
+def test_truth_reconcile_uses_bounded_authoritative_day_windows():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    collector = source[
+        source.index("static size_t collect_reconcile_window(") :
+        source.index("static bool reconcile_attendance_dump(")
+    ]
+    payload = source[
+        source.index("static char *build_reconcile_payload(") :
+        source.index("static bool oracle_reconcile_body_ok(")
+    ]
+    sender = source[
+        source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
+        source.index("static void append_acked_uid_from_json_to_file(")
+    ]
+    assert "event_day >= start_day && event_day <= end_day" in collector
+    assert "if (count >= capacity)" in collector
+    assert "window_start_day" in payload
+    assert "window_end_day" in payload
+    assert '"window_start\\":\\"%04d-%02d-%02d\\"' in payload
+    assert '"window_end\\":\\"%04d-%02d-%02d\\"' in payload
+    assert "window_start_day" in sender
+    assert "window_end_day" in sender
+
+
+def test_firmware_version_change_forces_immediate_truth_reconcile():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert '#include "esp_app_desc.h"' in source
+    assert 'nvs_get_str(handle, "truth_ver"' in source
+    assert 'strcmp(truth_version, running_version) != 0' in source
+    assert "g_force_truth_reconcile = true;" in source
+    assert "bool truth_due = g_force_truth_reconcile ||" in source
+    success = source.index("g_force_truth_reconcile = false;")
+    save = source.index("nvs_save_runtime_state();", success)
+    assert success < save
+    assert 'nvs_set_str(handle, "truth_ver", version)' in source
 
 
 def test_ords_truth_and_outbox_https_requests_are_serialized():
