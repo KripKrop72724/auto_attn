@@ -115,16 +115,20 @@ jobs:
           if (-not $cookieMatch.Success) {
             throw 'Production canary verifier did not receive the ADD administrator cookie.'
           }
-          $authHeaders = @{
-            Cookie = "add_admin=$($cookieMatch.Groups[1].Value)"
-          }
+          $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $adminCookie = New-Object System.Net.Cookie
+          $adminCookie.Name = 'add_admin'
+          $adminCookie.Value = $cookieMatch.Groups[1].Value
+          $adminCookie.Path = '/'
+          $adminCookie.Secure = $false
+          $session.Cookies.Add([Uri]$env:ADD_BASE_URL, $adminCookie)
           $verificationFailed = $false
           try {
 
             $releases = Invoke-RestMethod `
               -Method Get `
               -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases" `
-              -Headers $authHeaders `
+              -WebSession $session `
               -TimeoutSec 30
             $matchingReleases = @($releases.rows | Where-Object {
               $_.version -eq $env:EXPECTED_VERSION -and
@@ -139,7 +143,7 @@ jobs:
             $campaigns = Invoke-RestMethod `
               -Method Get `
               -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `
-              -Headers $authHeaders `
+              -WebSession $session `
               -TimeoutSec 30
             $matchingCampaigns = @($campaigns.rows | Where-Object {
               $_.campaign_id -eq $env:EXPECTED_CAMPAIGN -and
@@ -160,7 +164,7 @@ jobs:
               $devices = Invoke-RestMethod `
                 -Method Get `
                 -Uri "$env:ADD_BASE_URL/api/v1/devices?q=$deviceQuery" `
-                -Headers $authHeaders `
+                -WebSession $session `
                 -TimeoutSec 30
               $rows = @($devices.rows)
               if ($rows.Count -eq 1) {
@@ -194,13 +198,13 @@ jobs:
           } finally {
             try {
               $logoutHeaders = @{
-                Cookie = $authHeaders.Cookie
                 'X-CSRF-Token' = [string]$login.csrf_token
               }
               Invoke-RestMethod `
                 -Method Post `
                 -Uri "$env:ADD_BASE_URL/api/v1/auth/logout" `
                 -Headers $logoutHeaders `
+                -WebSession $session `
                 -ContentType 'application/json' `
                 -Body '{}' `
                 -TimeoutSec 15 | Out-Null
