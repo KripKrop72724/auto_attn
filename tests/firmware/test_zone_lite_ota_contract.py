@@ -49,10 +49,23 @@ def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
 
 
 def test_release_workflow_requires_hil_and_protected_environments() -> None:
-    text = (ROOT / ".github" / "workflows" / "firmware-release.yml").read_text(encoding="utf-8")
-    assert "hil_run_id" in text
-    assert "firmware-signing" in text
-    assert "firmware-production" in text
-    assert "[self-hosted, Windows, X64]" in text
-    assert "deploy/add/sign-firmware-release.ps1" in text
-    assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in text
+    candidate = (ROOT / ".github" / "workflows" / "firmware-hil-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    release = (ROOT / ".github" / "workflows" / "firmware-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "firmware-signing" in candidate
+    assert "firmware-production" in candidate
+    assert "[self-hosted, Windows, X64]" in candidate
+    assert "deploy/add/sign-firmware-release.ps1" in candidate
+    assert "HIL_ONLY" in candidate
+
+    assert "hil_run_id" in release
+    assert "firmware-production" in release
+    assert "deploy/add/promote-firmware.ps1" in release
+    assert "deploy/add/sign-firmware-release.ps1" not in release
+
+    assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in candidate
+    assert "ZONE_LITE_SECURE_BOOT_ACTIVE_KEY_B64" not in release
