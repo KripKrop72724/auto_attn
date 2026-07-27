@@ -61,6 +61,9 @@ def test_release_workflow_requires_hil_and_protected_environments() -> None:
     assert "[self-hosted, Windows, X64]" in candidate
     assert "deploy/add/sign-firmware-release.ps1" in candidate
     assert "HIL_ONLY" in candidate
+    assert "docker run --rm" in candidate
+    assert "espressif/idf:v5.5.3" in candidate
+    assert "container: espressif/idf:v5.5.3" not in candidate
 
     assert "hil_run_id" in release
     assert "firmware-production" in release
