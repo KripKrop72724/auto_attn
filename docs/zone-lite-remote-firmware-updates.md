@@ -16,10 +16,10 @@ Devices on older firmware remain fully operational and continue sending attendan
 ## Architecture
 
 1. GitHub Actions builds an exact commit from `main` with ESP-IDF 5.5.3.
-2. A physical hardware-in-the-loop run proves attendance continuity, power-loss recovery, rollback, and queue preservation for that exact SHA.
-3. The protected `firmware-signing` environment signs the application and manifest with the active Secure Boot V2 RSA-3072 key.
-4. The protected `firmware-production` environment atomically publishes the immutable package to ADD's read-only firmware store.
-5. An administrator creates a per-zone campaign after password step-up and typed confirmation.
+2. The protected signing and production environments publish an immutable `HIL_ONLY` package quarantined to one exact, locally attached ESP MAC. National OTA remains disabled.
+3. A physical hardware-in-the-loop run proves attendance continuity, download power-loss recovery, first-boot rollback, and queue preservation for that exact SHA and exact signed package.
+4. The protected `firmware-production` environment promotes the same tested bytes by removing the server-side quarantine marker. It never rebuilds, resigns, or replaces the package.
+5. An administrator creates a per-zone production campaign after password step-up and typed confirmation.
 6. ADD offers the release to one eligible ESP at a time in that zone.
 7. The ESP downloads to the inactive OTA slot, checkpoints progress in encrypted NVS, verifies metadata and SHA-256, and switches the boot partition.
 8. The new image must reconnect to ADD and receive first-boot confirmation before it marks itself valid. A crash, reset, or power loss before confirmation causes the bootloader to roll back.
@@ -91,12 +91,13 @@ The rig must deliberately remove power during download and again during first bo
 ## Release procedure
 
 1. Merge the firmware change to `main` only after normal CI is green.
-2. Run `Zone Lite OTA hardware gate` with the exact main SHA and physical rig.
-3. Record the successful HIL workflow run ID.
-4. Run `Zone Lite signed firmware release` with the same SHA, semantic version, and HIL run ID.
-5. Approve the protected signing and production environments only after checking their displayed SHA and HIL run.
-6. Confirm the release appears in ADD and remains unassigned.
-7. Keep `ADD_FIRMWARE_OTA_ENABLED=false` until the Peshawar acceptance checklist is signed off.
+2. Run `Zone Lite quarantined HIL candidate` with the exact main SHA, semantic version, and locally attached ESP MAC.
+3. Confirm ADD shows the release as `HIL_ONLY`, national OTA remains disabled, and only that exact MAC is eligible.
+4. Run `Zone Lite OTA hardware gate` with the exact main SHA and physical rig.
+5. Record the successful HIL workflow run ID.
+6. Run `Zone Lite signed firmware release` with the same SHA, semantic version, and HIL run ID. This promotes the exact tested package without rebuilding it.
+7. Approve the protected production environment only after checking its displayed SHA, version, image hash, and HIL run.
+8. Keep `ADD_FIRMWARE_OTA_ENABLED=false` until the Peshawar acceptance checklist is signed off.
 
 Published versions are immutable. If a defect is found, revoke the release and publish a new version. Never replace a `.bin` or manifest under an existing version.
 
