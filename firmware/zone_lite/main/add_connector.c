@@ -56,7 +56,8 @@
 
 #define ADD_COMMAND_QUEUE_DEPTH 32
 #define ADD_SEND_TIMEOUT_MS 5000
-#define ADD_MAX_INBOUND_BYTES 8192
+#define ADD_MAX_INBOUND_BYTES (64 * 1024)
+#define ADD_IDENTITY_CATALOG_MAX_ROWS 512
 #define ADD_ACK_TIMEOUT_MS 60000
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
@@ -121,6 +122,11 @@ static char s_waiting_ack[80];
 static char s_running_command_id[48];
 static char s_queued_command_ids[ADD_COMMAND_QUEUE_DEPTH][48];
 static size_t s_queued_command_count;
+static char *s_inbound_payload;
+static size_t s_inbound_payload_expected;
+static size_t s_inbound_payload_received;
+static uint32_t s_identity_catalog_generation;
+static size_t s_identity_catalog_rows;
 static add_outbox_t s_bulk_outbox = {
     .path = ADD_OUTBOX_PATH,
     .tmp_path = ADD_OUTBOX_TMP_PATH,
@@ -476,8 +482,13 @@ static char *decrypt_storage_line(const char *line)
     return (char *)plain;
 }
 
-static bool persist_identity_catalog(cJSON *root)
+static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
 {
+    cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+    int row_count = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
+    if (row_count < 0 || row_count > ADD_IDENTITY_CATALOG_MAX_ROWS) {
+        return false;
+    }
     char *plain = cJSON_PrintUnformatted(root);
     char *encrypted = encrypt_storage_json(plain);
     FILE *file = encrypted ? fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w") : NULL;
@@ -491,6 +502,9 @@ static bool persist_identity_catalog(cJSON *root)
         ok = rename(ADD_IDENTITY_CATALOG_TMP_PATH, ADD_IDENTITY_CATALOG_PATH) == 0;
     }
     if (!ok) (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
+    if (ok && row_count_out) {
+        *row_count_out = (size_t)row_count;
+    }
     return ok;
 }
 
@@ -542,7 +556,7 @@ bool add_connector_persist_command_tombstone(const add_command_t *command)
     cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name);
     cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic);
     cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker);
-    bool ok = persist_identity_catalog(root);
+    bool ok = persist_identity_catalog(root, NULL);
     cJSON_Delete(root);
     return ok;
 }
@@ -852,10 +866,22 @@ static void parse_inbound(const char *data, size_t len)
         return;
     }
     if (cJSON_IsString(type) && strcmp(type->valuestring, "identity_catalog") == 0) {
-        if (!persist_identity_catalog(root)) {
+        size_t row_count = 0;
+        if (!persist_identity_catalog(root, &row_count)) {
             ESP_LOGE(TAG, "Could not persist encrypted ADD identity tombstone catalog");
         } else {
-            ESP_LOGI(TAG, "Updated encrypted ADD identity tombstone catalog");
+            if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                s_identity_catalog_rows = row_count;
+                s_identity_catalog_generation++;
+                if (s_identity_catalog_generation == 0) {
+                    s_identity_catalog_generation = 1;
+                }
+                xSemaphoreGive(s_lock);
+            }
+            ESP_LOGI(
+                TAG,
+                "Updated encrypted ADD identity tombstone catalog rows=%u",
+                (unsigned)row_count);
         }
         cJSON_Delete(root);
         return;
@@ -915,6 +941,56 @@ static void parse_inbound(const char *data, size_t len)
     cJSON_Delete(root);
 }
 
+static void reset_inbound_payload(void)
+{
+    free(s_inbound_payload);
+    s_inbound_payload = NULL;
+    s_inbound_payload_expected = 0;
+    s_inbound_payload_received = 0;
+}
+
+static void receive_inbound_fragment(const esp_websocket_event_data_t *event)
+{
+    if (!event || event->payload_len <= 0 || event->data_len < 0 ||
+        event->payload_offset < 0 ||
+        (size_t)event->payload_len > ADD_MAX_INBOUND_BYTES) {
+        ESP_LOGE(TAG, "Rejected invalid or oversized ADD WebSocket message");
+        reset_inbound_payload();
+        return;
+    }
+    size_t expected = (size_t)event->payload_len;
+    size_t offset = (size_t)event->payload_offset;
+    size_t length = (size_t)event->data_len;
+    if (offset == 0) {
+        reset_inbound_payload();
+        s_inbound_payload = heap_caps_malloc(
+            expected + 1,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_inbound_payload) {
+            s_inbound_payload = malloc(expected + 1);
+        }
+        if (!s_inbound_payload) {
+            ESP_LOGE(TAG, "Could not allocate fragmented ADD WebSocket message");
+            return;
+        }
+        s_inbound_payload_expected = expected;
+    }
+    if (!s_inbound_payload || expected != s_inbound_payload_expected ||
+        offset != s_inbound_payload_received ||
+        length > expected - offset) {
+        ESP_LOGE(TAG, "Rejected incomplete or out-of-order ADD WebSocket message");
+        reset_inbound_payload();
+        return;
+    }
+    memcpy(s_inbound_payload + offset, event->data_ptr, length);
+    s_inbound_payload_received += length;
+    if (s_inbound_payload_received == s_inbound_payload_expected) {
+        s_inbound_payload[s_inbound_payload_expected] = '\0';
+        parse_inbound(s_inbound_payload, s_inbound_payload_expected);
+        reset_inbound_payload();
+    }
+}
+
 static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -931,6 +1007,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         ESP_LOGI(TAG, "ADD live control channel connected");
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
+        reset_inbound_payload();
         mark_transport_disconnected();
         ESP_LOGW(TAG, "ADD live control channel disconnected; client will reconnect");
         break;
@@ -950,12 +1027,12 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
                 reason_len,
                 event->data_len > 2 ? event->data_ptr + 2 : "");
             mark_transport_disconnected();
-        } else if (event && event->op_code == 0x1 && event->payload_offset == 0 &&
-            event->data_len == event->payload_len) {
-            parse_inbound(event->data_ptr, event->data_len);
+        } else if (event && (event->op_code == 0x1 || event->op_code == 0x0)) {
+            receive_inbound_fragment(event);
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
+        reset_inbound_payload();
         mark_transport_disconnected();
         ESP_LOGW(TAG, "ADD WebSocket transport error");
         break;
@@ -2255,6 +2332,21 @@ bool add_connector_lookup_identity(
     if (file) fclose(file);
     free(line);
     return found;
+}
+
+uint32_t add_connector_identity_catalog_generation(size_t *row_count)
+{
+    uint32_t generation = 0;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        generation = s_identity_catalog_generation;
+        if (row_count) {
+            *row_count = s_identity_catalog_rows;
+        }
+        xSemaphoreGive(s_lock);
+    } else if (row_count) {
+        *row_count = 0;
+    }
+    return generation;
 }
 
 bool add_connector_command_update(

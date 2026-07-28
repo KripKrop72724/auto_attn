@@ -367,7 +367,7 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     recovery = source[
-        source.index("static void recover_blocked_events_from_snapshot(") :
+        source.index("static bool recover_blocked_events_from_snapshot(") :
         source.index("static void storage_init(")
     ]
     assert "add_connector_lookup_identity(" in recovery
@@ -378,6 +378,29 @@ def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
         "cJSON_AddStringToObject(root, \"cnic\", recovered_cnic)"
     )
     assert "verified ADD identity alias" in recovery
+
+
+def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+
+    assert "#define ADD_MAX_INBOUND_BYTES (64 * 1024)" in connector
+    assert "receive_inbound_fragment" in connector
+    assert "event->payload_offset" in connector
+    assert "offset != s_inbound_payload_received" in connector
+    assert "s_inbound_payload_received == s_inbound_payload_expected" in connector
+    assert "parse_inbound(s_inbound_payload, s_inbound_payload_expected)" in connector
+    assert "reset_inbound_payload();" in connector
+    assert "ADD_IDENTITY_CATALOG_MAX_ROWS 512" in connector
+    assert "s_identity_catalog_generation++" in connector
+    assert "add_connector_identity_catalog_generation" in connector
+    assert "add_connector_identity_catalog_generation" in header
+    assert '"IDENTITY_CATALOG_APPLIED"' in runtime
+    assert "identity_catalog_generation != applied_identity_catalog_generation" in runtime
+    applied = runtime.index("applied_identity_catalog_generation = identity_catalog_generation")
+    forced = runtime.index("g_force_truth_reconcile = true;", applied)
+    assert applied < forced
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():
@@ -564,7 +587,7 @@ def test_live_identity_is_verified_before_capture_and_blocked_rows_are_repaired(
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     live = source[source.index("if (header->command == CMD_REG_EVENT") :]
     assert live.index("zk_refresh_users_stable(") < live.index("process_live_packet(")
-    assert "recover_blocked_events_from_snapshot(users);" in live
+    assert "recover_blocked_events_from_snapshot(users, NULL);" in live
     assert 'cJSON_AddStringToObject(payload, "state_hash", state_hash);' in source
     assert 'cJSON_AddBoolToObject(payload, "stable", true);' in source
     assert "BLOCKED_IDENTITY_REPAIRED" in source
