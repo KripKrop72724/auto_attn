@@ -155,7 +155,12 @@
 #define MAX_EVENT_JSON 1024
 #define ADD_RECONCILE_BATCH_EVENTS 10
 #define ADD_RECONCILE_COMMIT_BATCHES 32
-#define ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (30 * 1000)
+// A verified refresh performs two complete terminal user-table reads and can
+// take several minutes on real ZKT hardware.  Keep the periodic cadence well
+// above that cost so identity verification cannot starve live attendance
+// capture.  Live punches and explicit ADD refresh commands still perform
+// immediate identity verification.
+#define ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (15 * 60 * 1000)
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -6134,7 +6139,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 if (!zk_refresh_users_stable(
                         sock, &ctx, users, refreshed_users, verified_hash)) break;
                 user_count = refreshed_users;
-                last_user_integrity = now_ms;
+                // The stable refresh above can take minutes.  Start the next
+                // periodic interval from its completion, not the stale
+                // timestamp captured before reconciliation.
+                last_user_integrity = uptime_ms();
                 (void)recover_blocked_events_from_snapshot(users, NULL);
                 (void)add_send_user_snapshot(users);
             }
