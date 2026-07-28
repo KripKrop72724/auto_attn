@@ -313,6 +313,9 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert "http_post_diagnostics_t diagnostics = {0};" in sender
     assert "http_post_json_with_timeout(" in sender
     assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" in sender
+    assert "int status = esp_http_client_get_status_code(client);" in source
+    assert "diagnostics->transport_error = status >= 0 ? ESP_OK : err;" in source
+    assert "if (status >= 0 && captured.data != NULL)" in source
     assert "status >= 0 ||" in sender
     assert "transport_cycles > ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES" in sender
     assert '"ORDS_RECONCILE_TRANSPORT_RETRY"' in sender
@@ -324,6 +327,9 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert '"ORDS_RECONCILE_WINDOW_LIMIT"' in sender
     assert '"ORDS_RECONCILE_PAYLOAD_FAILED"' in sender
     assert '"ORDS_RECONCILE_ENDPOINT_MISSING"' in sender
+    assert '"ORDS_RECONCILE_AUTH_FAILED"' in sender
+    assert "status == 401 || status == 403" in sender
+    assert "HTTP responses are not retried" in sender
     assert '"ORDS_RECONCILE_REJECTED"' in sender
     assert '"ORDS_RECONCILE_RESPONSE_INVALID"' in sender
     assert '"ORDS_RECONCILE_HTTP_FAILED"' in sender

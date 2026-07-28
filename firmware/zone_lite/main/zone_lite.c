@@ -3827,6 +3827,7 @@ typedef struct {
 
 typedef struct {
     esp_err_t transport_error;
+    esp_err_t perform_error;
     const char *trust_source;
     unsigned attempts;
 } http_post_diagnostics_t;
@@ -3879,6 +3880,7 @@ static int http_post_json_with_tls_source(
     if (client == NULL) {
         if (diagnostics != NULL) {
             diagnostics->transport_error = ESP_ERR_NO_MEM;
+            diagnostics->perform_error = ESP_ERR_NO_MEM;
         }
         free(captured.data);
         return -1;
@@ -3889,15 +3891,28 @@ static int http_post_json_with_tls_source(
     esp_http_client_set_header(client, "X-API-Password", ZONE_LITE_ORDS_PASSWORD);
     esp_http_client_set_post_field(client, json, strlen(json));
     esp_err_t err = esp_http_client_perform(client);
-    int status = err == ESP_OK ? esp_http_client_get_status_code(client) : -1;
+    int status = esp_http_client_get_status_code(client);
+    if (status <= 0) {
+        status = -1;
+    }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTPS POST failed using %s: %s", tls_source, esp_err_to_name(err));
+        if (status >= 0) {
+            ESP_LOGW(
+                TAG,
+                "HTTPS POST received status=%d using %s before client error: %s",
+                status,
+                tls_source,
+                esp_err_to_name(err));
+        } else {
+            ESP_LOGW(TAG, "HTTPS POST failed using %s: %s", tls_source, esp_err_to_name(err));
+        }
     }
     if (diagnostics != NULL) {
-        diagnostics->transport_error = err;
+        diagnostics->perform_error = err;
+        diagnostics->transport_error = status >= 0 ? ESP_OK : err;
     }
     if (response_body != NULL) {
-        if (err == ESP_OK && captured.data != NULL) {
+        if (status >= 0 && captured.data != NULL) {
             *response_body = captured.data;
             captured.data = NULL;
         } else {
@@ -3922,6 +3937,7 @@ static int http_post_json_unlocked(
     if (!ensure_system_time_synced()) {
         if (diagnostics != NULL) {
             diagnostics->transport_error = ESP_ERR_INVALID_STATE;
+            diagnostics->perform_error = ESP_ERR_INVALID_STATE;
             diagnostics->trust_source = "time_sync";
         }
         return -1;
@@ -3969,6 +3985,7 @@ static int http_post_json_with_timeout(
 {
     if (diagnostics != NULL) {
         diagnostics->transport_error = ESP_OK;
+        diagnostics->perform_error = ESP_OK;
         diagnostics->trust_source = "none";
         diagnostics->attempts = 0;
     }
@@ -3982,6 +3999,7 @@ static int http_post_json_with_timeout(
         ESP_LOGW(TAG, "Timed out waiting for exclusive ORDS HTTPS transport");
         if (diagnostics != NULL) {
             diagnostics->transport_error = ESP_ERR_TIMEOUT;
+            diagnostics->perform_error = ESP_ERR_TIMEOUT;
             diagnostics->trust_source = "transport_lock";
         }
         return -1;
@@ -4760,6 +4778,34 @@ static bool oracle_send_reconcile(
             g_truth_reconcile_warning = false;
             ESP_LOGI(TAG, "ORDS truth reconcile is clean after previous repair warning");
         }
+    } else if (status == 401 || status == 403) {
+        ESP_LOGW(
+            TAG,
+            "ORDS rejected truth reconcile authentication status=%d client_error=%s",
+            status,
+            esp_err_to_name(diagnostics.perform_error));
+        char message[288];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth authentication rejected status=%d client_error=%s trust=%s cycles=%u attempts=%u window=%04d-%02d-%02d..%02d events=%u; HTTP responses are not retried",
+            status,
+            esp_err_to_name(diagnostics.perform_error),
+            diagnostics.trust_source,
+            transport_cycles,
+            transport_attempts,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_AUTH_FAILED",
+            message);
+        ords_mark_failure();
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
     } else if (status == 400) {
         g_truth_window_blocked = true;
         ESP_LOGW(
@@ -4807,10 +4853,10 @@ static bool oracle_send_reconcile(
             message);
         ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
-    } else {
+    } else if (status < 0) {
         ESP_LOGW(
             TAG,
-            "ORDS truth reconcile failed status=%d response=%s",
+            "ORDS truth reconcile transport failed status=%d response=%s",
             status,
             body && body[0] != '\0' ? "present" : "empty");
         char message[320];
@@ -4820,6 +4866,36 @@ static bool oracle_send_reconcile(
             "Oracle truth transport failed status=%d error=%s trust=%s cycles=%u attempts=%u window=%04d-%02d-%02d..%02d events=%u response=%s",
             status,
             esp_err_to_name(diagnostics.transport_error),
+            diagnostics.trust_source,
+            transport_cycles,
+            transport_attempts,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count,
+            body && body[0] != '\0' ? "present" : "empty");
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_HTTP_FAILED",
+            message);
+        ords_mark_failure();
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
+    } else {
+        ESP_LOGW(
+            TAG,
+            "ORDS truth reconcile HTTP failed status=%d client_error=%s response=%s",
+            status,
+            esp_err_to_name(diagnostics.perform_error),
+            body && body[0] != '\0' ? "present" : "empty");
+        char message[320];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth HTTP failed status=%d client_error=%s trust=%s cycles=%u attempts=%u window=%04d-%02d-%02d..%02d events=%u response=%s",
+            status,
+            esp_err_to_name(diagnostics.perform_error),
             diagnostics.trust_source,
             transport_cycles,
             transport_attempts,
