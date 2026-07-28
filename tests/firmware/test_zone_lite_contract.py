@@ -229,7 +229,7 @@ def test_reconcile_and_restart_cadence_are_production_defaults():
     assert 'nvs_set_i64(handle, "truth_epoch", g_last_full_truth_reconcile_epoch)' in source
     assert "g_last_full_truth_reconcile_epoch" in source
     assert "g_last_full_truth_reconcile_ms" in source
-    assert "ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (30 * 1000)" in source
+    assert "ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (15 * 60 * 1000)" in source
     assert "zk_refresh_users_stable" in source
     assert "USER_SNAPSHOT_UNSTABLE" in source
     assert "LIVE_IDENTITY_VERIFICATION_FAILED" in source
@@ -362,6 +362,12 @@ def test_user_integrity_interval_starts_after_refresh_completion():
     assert integrity_block.index("last_user_integrity = uptime_ms();") < (
         integrity_block.index('add_connector_set_activity("LIVE_CAPTURE");')
     )
+    reconcile_refresh = source[
+        source.index("if (refreshed_users != user_count)") :
+        source.index("int64_t record_delta", source.index("if (refreshed_users != user_count)"))
+    ]
+    assert "last_user_integrity = uptime_ms();" in reconcile_refresh
+    assert "last_user_integrity = now_ms;" not in reconcile_refresh
 
 
 def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
