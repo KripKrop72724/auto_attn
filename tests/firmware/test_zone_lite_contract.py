@@ -308,8 +308,18 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert "window_start_day" in sender
     assert "window_end_day" in sender
     assert "#define ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS 45000" in source
+    assert "#define ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES 1" in source
+    assert "#define ZONE_LITE_ORDS_RECONCILE_RETRY_DELAY_MS 2000" in source
+    assert "http_post_diagnostics_t diagnostics = {0};" in sender
     assert "http_post_json_with_timeout(" in sender
     assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" in sender
+    assert "status >= 0 ||" in sender
+    assert "transport_cycles > ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES" in sender
+    assert '"ORDS_RECONCILE_TRANSPORT_RETRY"' in sender
+    assert '"ORDS_RECONCILE_TRANSPORT_RECOVERED"' in sender
+    assert "esp_err_to_name(diagnostics.transport_error)" in sender
+    assert "diagnostics.trust_source" in sender
+    assert "transport_attempts" in sender
     assert '"ORDS_RECONCILE_BACKOFF"' in sender
     assert '"ORDS_RECONCILE_WINDOW_LIMIT"' in sender
     assert '"ORDS_RECONCILE_PAYLOAD_FAILED"' in sender
@@ -466,6 +476,8 @@ def test_reconcile_timeout_is_isolated_from_live_and_bulk_delivery():
     assert "http_post_json(url, payload, &body)" in bulk
     assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" not in live
     assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" not in bulk
+    assert "ORDS_RECONCILE_TRANSPORT_RETRY" not in live
+    assert "ORDS_RECONCILE_TRANSPORT_RETRY" not in bulk
     assert "http_post_json_with_timeout(" in sender
 
 
