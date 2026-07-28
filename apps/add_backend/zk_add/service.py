@@ -1102,6 +1102,132 @@ def enrich_undelivered_attendance(
     return changed
 
 
+def repair_verified_tombstone_backlog(
+    session: Session,
+    *,
+    limit: int = 500,
+) -> int:
+    """Requeue blocked punches when a preserved terminal identity proves the CNIC.
+
+    A user can disappear from a stable terminal snapshot after punches for that
+    identity were already stored as ``BLOCKED_IDENTITY``.  Deletion correctly
+    preserves an encrypted identity tombstone, but older blocked rows predate
+    that tombstone and therefore need a bounded, durable repair pass.
+
+    The repair fails closed on identity reuse: a row is eligible only when its
+    preserved device-user identity (or, for older rows, its terminal UID)
+    matches the tombstone.  No attendance row is deleted or replaced.
+    """
+
+    bounded_limit = max(1, min(int(limit), 500))
+    eligible_tombstone = (
+        select(IdentityTombstone.id)
+        .where(
+            IdentityTombstone.zkt_device_id == AttendanceEvent.zkt_device_id,
+            IdentityTombstone.user_id == AttendanceEvent.user_id,
+            IdentityTombstone.cnic_encrypted.is_not(None),
+            IdentityTombstone.cnic_lookup_hash.is_not(None),
+            (
+                (
+                    AttendanceEvent.device_user_id.is_not(None)
+                    & (
+                        IdentityTombstone.device_user_id
+                        == AttendanceEvent.device_user_id
+                    )
+                )
+                | (
+                    AttendanceEvent.device_user_id.is_(None)
+                    & AttendanceEvent.uid.is_not(None)
+                    & (AttendanceEvent.uid != "")
+                    & (IdentityTombstone.uid == AttendanceEvent.uid)
+                )
+            ),
+        )
+        .exists()
+    )
+    blocked_rows = session.scalars(
+        select(AttendanceEvent)
+        .where(
+            AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+            AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+            eligible_tombstone,
+        )
+        .order_by(AttendanceEvent.id.asc())
+        .limit(bounded_limit)
+        .with_for_update(skip_locked=True)
+    ).all()
+    if not blocked_rows:
+        return 0
+
+    repaired = 0
+    tombstone_cache: dict[tuple[int, str, int | None, str | None], IdentityTombstone | None] = {}
+    for row in blocked_rows:
+        cache_key = (
+            row.zkt_device_id,
+            row.user_id,
+            row.device_user_id,
+            row.uid,
+        )
+        if cache_key not in tombstone_cache:
+            statement = (
+                select(IdentityTombstone)
+                .where(
+                    IdentityTombstone.zkt_device_id == row.zkt_device_id,
+                    IdentityTombstone.user_id == row.user_id,
+                    IdentityTombstone.cnic_encrypted.is_not(None),
+                    IdentityTombstone.cnic_lookup_hash.is_not(None),
+                )
+                .order_by(IdentityTombstone.id.desc())
+            )
+            if row.device_user_id is not None:
+                statement = statement.where(
+                    IdentityTombstone.device_user_id == row.device_user_id
+                )
+            elif row.uid:
+                statement = statement.where(IdentityTombstone.uid == row.uid)
+            else:
+                # A user ID without a preserved device-user or UID can have
+                # been reused on the same terminal. Operator evidence is
+                # required before such a row can be attributed.
+                tombstone_cache[cache_key] = None
+                continue
+            tombstone_cache[cache_key] = session.scalar(statement.limit(1))
+
+        tombstone = tombstone_cache[cache_key]
+        if tombstone is None:
+            continue
+
+        cnic = decrypt_cnic(tombstone.cnic_encrypted)
+        if not cnic:
+            continue
+
+        row.device_user_id = tombstone.device_user_id
+        row.identity_resolution_status = "RESOLVED_TOMBSTONE"
+        row.identity_resolved_at = utc_now()
+        row.identity_repaired_at = utc_now()
+        row.identity_repair_reason = "VERIFIED_IDENTITY_TOMBSTONE"
+        row.display_name = (
+            decrypt_text(tombstone.display_name_encrypted) or row.display_name
+        )
+        row.cnic_encrypted = tombstone.cnic_encrypted
+        row.cnic_lookup_hash = tombstone.cnic_lookup_hash
+        row.cnic_last4 = tombstone.cnic_last4
+        row.raw_punch = row.raw_punch or tombstone.shift_worker
+        row.ords_status = "PENDING"
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        )
+        if outbox is None:
+            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
+        repaired += 1
+    return repaired
+
+
 def block_undelivered_attendance(
     session: Session,
     *,
