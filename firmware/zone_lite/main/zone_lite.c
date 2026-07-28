@@ -6019,32 +6019,18 @@ static int64_t gateway_run(uint32_t host_order_ip)
             zk_header_t *header = (zk_header_t *)packet;
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
                 if (!zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
-                int32_t verified_users = 0;
-                int32_t verified_records = 0;
-                char verified_hash[65] = {0};
-                add_connector_set_activity("VERIFYING_IDENTITY");
-                if (!zk_get_counts(sock, &ctx, &verified_users, &verified_records) ||
-                    !zk_refresh_users_stable(
-                        sock, &ctx, users, verified_users, verified_hash)) {
-                    add_connector_log(
-                        "WARN",
-                        "identity",
-                        "LIVE_IDENTITY_VERIFICATION_FAILED",
-                        "A live punch was retained in terminal history because post-punch user verification failed; reconciliation will recover it.");
-                    free(packet);
-                    break;
-                }
-                user_count = verified_users;
-                g_add_zkt.user_count = verified_users;
-                g_add_zkt.attendance_count = verified_records;
-                add_connector_set_zkt(&g_add_zkt);
-                (void)recover_blocked_events_from_snapshot(users, NULL);
-                (void)add_send_user_snapshot(users);
+                // The session starts from a two-read stable user snapshot and
+                // refreshes it periodically or on explicit ADD commands.  Do
+                // not perform another multi-minute full-table refresh while
+                // handling a live event: doing so blocks the ZKT event loop,
+                // queues subsequent punches, and eventually flaps the
+                // authenticated session.  Unknown identities remain durable
+                // and fail closed in the ADD identity-blocked queue until a
+                // later verified snapshot or catalog alias repairs them.
                 live_events_since_sync += process_live_packet(
                     packet + sizeof(zk_header_t),
                     top.length - sizeof(zk_header_t),
                     users);
-                last_user_integrity = uptime_ms();
                 add_connector_set_activity("LIVE_CAPTURE");
             }
             free(packet);
