@@ -165,6 +165,12 @@
 #ifndef ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS
 #define ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS 45000
 #endif
+#ifndef ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES
+#define ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES 1
+#endif
+#ifndef ZONE_LITE_ORDS_RECONCILE_RETRY_DELAY_MS
+#define ZONE_LITE_ORDS_RECONCILE_RETRY_DELAY_MS 2000
+#endif
 #ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
 #endif
@@ -3819,6 +3825,12 @@ typedef struct {
     size_t capacity;
 } http_response_buffer_t;
 
+typedef struct {
+    esp_err_t transport_error;
+    const char *trust_source;
+    unsigned attempts;
+} http_post_diagnostics_t;
+
 static esp_err_t http_capture_event(esp_http_client_event_t *event)
 {
     http_response_buffer_t *buffer = event ? event->user_data : NULL;
@@ -3839,8 +3851,13 @@ static int http_post_json_with_tls_source(
     char **response_body,
     const char *ca_cert_pem,
     const char *tls_source,
-    int timeout_ms)
+    int timeout_ms,
+    http_post_diagnostics_t *diagnostics)
 {
+    if (diagnostics != NULL) {
+        diagnostics->attempts++;
+        diagnostics->trust_source = tls_source;
+    }
     http_response_buffer_t captured = {
         .data = response_body ? calloc(1, 8192) : NULL,
         .capacity = response_body ? 8192 : 0,
@@ -3860,6 +3877,10 @@ static int http_post_json_with_tls_source(
     ESP_LOGI(TAG, "HTTPS trust source: %s", tls_source);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
+        if (diagnostics != NULL) {
+            diagnostics->transport_error = ESP_ERR_NO_MEM;
+        }
+        free(captured.data);
         return -1;
     }
     esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -3871,6 +3892,9 @@ static int http_post_json_with_tls_source(
     int status = err == ESP_OK ? esp_http_client_get_status_code(client) : -1;
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "HTTPS POST failed using %s: %s", tls_source, esp_err_to_name(err));
+    }
+    if (diagnostics != NULL) {
+        diagnostics->transport_error = err;
     }
     if (response_body != NULL) {
         if (err == ESP_OK && captured.data != NULL) {
@@ -3889,12 +3913,17 @@ static int http_post_json_unlocked(
     const char *url,
     const char *json,
     char **response_body,
-    int timeout_ms)
+    int timeout_ms,
+    http_post_diagnostics_t *diagnostics)
 {
     if (response_body != NULL) {
         *response_body = NULL;
     }
     if (!ensure_system_time_synced()) {
+        if (diagnostics != NULL) {
+            diagnostics->transport_error = ESP_ERR_INVALID_STATE;
+            diagnostics->trust_source = "time_sync";
+        }
         return -1;
     }
     log_system_time("HTTPS system UTC time");
@@ -3912,8 +3941,9 @@ static int http_post_json_unlocked(
             json,
             response_body,
             ords_ca_cert_pem,
-            "configured ORDS CA",
-            timeout_ms);
+            "configured_ca",
+            timeout_ms,
+            diagnostics);
         if (status >= 0) {
             return status;
         }
@@ -3925,16 +3955,23 @@ static int http_post_json_unlocked(
         json,
         response_body,
         NULL,
-        "ESP-IDF certificate bundle",
-        timeout_ms);
+        "idf_bundle",
+        timeout_ms,
+        diagnostics);
 }
 
 static int http_post_json_with_timeout(
     const char *url,
     const char *json,
     char **response_body,
-    int timeout_ms)
+    int timeout_ms,
+    http_post_diagnostics_t *diagnostics)
 {
+    if (diagnostics != NULL) {
+        diagnostics->transport_error = ESP_OK;
+        diagnostics->trust_source = "none";
+        diagnostics->attempts = 0;
+    }
     if (response_body != NULL) {
         *response_body = NULL;
     }
@@ -3943,13 +3980,18 @@ static int http_post_json_with_timeout(
             g_ords_http_lock,
             pdMS_TO_TICKS(timeout_ms + 10000)) != pdTRUE) {
         ESP_LOGW(TAG, "Timed out waiting for exclusive ORDS HTTPS transport");
+        if (diagnostics != NULL) {
+            diagnostics->transport_error = ESP_ERR_TIMEOUT;
+            diagnostics->trust_source = "transport_lock";
+        }
         return -1;
     }
     int status = http_post_json_unlocked(
         url,
         json,
         response_body,
-        timeout_ms);
+        timeout_ms,
+        diagnostics);
     xSemaphoreGive(g_ords_http_lock);
     return status;
 }
@@ -3963,7 +4005,8 @@ static int http_post_json(
         url,
         json,
         response_body,
-        ZONE_LITE_ORDS_TIMEOUT_MS);
+        ZONE_LITE_ORDS_TIMEOUT_MS,
+        NULL);
 }
 
 static bool oracle_success_body(const char *body)
@@ -4599,11 +4642,69 @@ static bool oracle_send_reconcile(
     char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures/reconcile", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
-    int status = http_post_json_with_timeout(
-        url,
-        payload,
-        &body,
-        ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS);
+    http_post_diagnostics_t diagnostics = {0};
+    unsigned transport_cycles = 0;
+    unsigned transport_attempts = 0;
+    int status = -1;
+    do {
+        free(body);
+        body = NULL;
+        transport_cycles++;
+        status = http_post_json_with_timeout(
+            url,
+            payload,
+            &body,
+            ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS,
+            &diagnostics);
+        transport_attempts += diagnostics.attempts;
+        if (status >= 0 ||
+            transport_cycles > ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES) {
+            break;
+        }
+
+        char message[320];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth transport retry error=%s trust=%s cycle=%u/%u attempts=%u window=%04d-%02d-%02d..%02d events=%u",
+            esp_err_to_name(diagnostics.transport_error),
+            diagnostics.trust_source,
+            transport_cycles,
+            (unsigned)(ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES + 1),
+            transport_attempts,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count);
+        (void)add_connector_log(
+            "WARN",
+            "reconcile",
+            "ORDS_RECONCILE_TRANSPORT_RETRY",
+            message);
+        vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ORDS_RECONCILE_RETRY_DELAY_MS));
+    } while (true);
+
+    if (status >= 0 && transport_cycles > 1) {
+        char message[256];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth transport recovered status=%d cycles=%u attempts=%u window=%04d-%02d-%02d..%02d events=%u",
+            status,
+            transport_cycles,
+            transport_attempts,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count);
+        (void)add_connector_log(
+            "INFO",
+            "reconcile",
+            "ORDS_RECONCILE_TRANSPORT_RECOVERED",
+            message);
+    }
     int deleted = 0;
     int corrected = 0;
     int invalid = 0;
@@ -4712,12 +4813,16 @@ static bool oracle_send_reconcile(
             "ORDS truth reconcile failed status=%d response=%s",
             status,
             body && body[0] != '\0' ? "present" : "empty");
-        char message[224];
+        char message[320];
         snprintf(
             message,
             sizeof(message),
-            "Oracle truth transport failed status=%d window=%04d-%02d-%02d..%02d events=%u response=%s",
+            "Oracle truth transport failed status=%d error=%s trust=%s cycles=%u attempts=%u window=%04d-%02d-%02d..%02d events=%u response=%s",
             status,
+            esp_err_to_name(diagnostics.transport_error),
+            diagnostics.trust_source,
+            transport_cycles,
+            transport_attempts,
             year,
             month,
             window_start_day,
