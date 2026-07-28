@@ -4,9 +4,9 @@ set define off
   SLIC ZKT truth API for Oracle ORDS.
 
   Deployment notes:
-  - Replace both password placeholders with uppercase SHA-256 hex digests and
-    the fleet username placeholder before running in Oracle. Never commit a
-    password or production verifier.
+  - Replace all password placeholders with uppercase SHA-256 hex digests and
+    the fleet/ADD username placeholders before running in Oracle. Never commit
+    a password or production verifier.
   - This script does not change HR_RAW_ATTN_CAPTURE_EVENTS table shape.
   - Reconcile is additive and corrective but deliberately non-destructive.
     API v2 rejects every request unless terminal-event and complete identity-map
@@ -26,11 +26,126 @@ create or replace package slic_zkt_truth_api authid definer as
 end slic_zkt_truth_api;
 /
 
+create or replace procedure slic_zkt_recompute_daily_flags(
+    p_body in clob
+) authid definer
+as
+begin
+    -- Lock affected normal-punch rows in a deterministic order. The caller
+    -- owns the transaction; any later failure rolls back both insertion and
+    -- flag correction together.
+    for affected_day in (
+        select distinct
+               trim(j.cnic) cnic,
+               slic_zkt_truth_api.attendance_date_for(
+                   slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+               ) attendance_date
+          from json_table(
+                   p_body,
+                   '$.events[*]'
+                   columns
+                       cnic varchar2(13) path '$.cnic' null on error,
+                       event_timestamp varchar2(80) path '$.timestamp' null on error
+               ) j
+         where trim(j.cnic) is not null
+           and slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null
+         order by cnic, attendance_date
+    ) loop
+        for locked_event in (
+            select d.event_uid
+              from hr_raw_attn_capture_events d
+             where d.raw_punch = 'F'
+               and d.cnic = affected_day.cnic
+               and d.attendance_date = affected_day.attendance_date
+             order by d.event_timestamp, d.event_uid
+             for update
+        ) loop
+            null;
+        end loop;
+    end loop;
+
+    update hr_raw_attn_capture_events d
+       set d.check_in = 'F',
+           d.check_out = 'F',
+           d.datasync = 0
+     where d.raw_punch = 'F'
+       and (d.check_in <> 'F' or d.check_out <> 'F')
+       and exists (
+               select 1
+                 from json_table(
+                          p_body,
+                          '$.events[*]'
+                          columns
+                              cnic varchar2(13) path '$.cnic' null on error,
+                              event_timestamp varchar2(80) path '$.timestamp' null on error
+                      ) j
+                where trim(j.cnic) = d.cnic
+                  and slic_zkt_truth_api.attendance_date_for(
+                          slic_zkt_truth_api.parse_event_timestamp(
+                              j.event_timestamp
+                          )
+                      ) = d.attendance_date
+           );
+
+    merge into hr_raw_attn_capture_events d
+    using (
+        select ranked.event_uid,
+               case when ranked.rn_in = 1 then 'T' else 'F' end check_in,
+               case
+                   when ranked.normal_count > 1 and ranked.rn_out = 1
+                   then 'T'
+                   else 'F'
+               end check_out
+          from (
+              select stored.event_uid,
+                     row_number() over (
+                         partition by stored.cnic, stored.attendance_date
+                         order by stored.event_timestamp, stored.event_uid
+                     ) rn_in,
+                     row_number() over (
+                         partition by stored.cnic, stored.attendance_date
+                         order by stored.event_timestamp desc, stored.event_uid desc
+                     ) rn_out,
+                     count(*) over (
+                         partition by stored.cnic, stored.attendance_date
+                     ) normal_count
+                from hr_raw_attn_capture_events stored
+               where stored.raw_punch = 'F'
+                 and exists (
+                         select 1
+                           from json_table(
+                                    p_body,
+                                    '$.events[*]'
+                                    columns
+                                        cnic varchar2(13) path '$.cnic' null on error,
+                                        event_timestamp varchar2(80) path '$.timestamp' null on error
+                                ) j
+                          where trim(j.cnic) = stored.cnic
+                            and slic_zkt_truth_api.attendance_date_for(
+                                    slic_zkt_truth_api.parse_event_timestamp(
+                                        j.event_timestamp
+                                    )
+                                ) = stored.attendance_date
+                     )
+          ) ranked
+    ) desired
+       on (d.event_uid = desired.event_uid)
+     when matched then update set
+          d.check_in = desired.check_in,
+          d.check_out = desired.check_out,
+          d.datasync = 0
+      where d.check_in <> desired.check_in
+         or d.check_out <> desired.check_out;
+end slic_zkt_recompute_daily_flags;
+/
+
 create or replace package body slic_zkt_truth_api as
     c_api_username constant varchar2(128) := 'slic_zone_agent';
     c_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_64_CHARACTER_SHA256_HEX';
     c_fleet_api_username constant varchar2(128) := 'REPLACE_WITH_FLEET_API_USERNAME';
     c_fleet_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_FLEET_64_CHARACTER_SHA256_HEX';
+    c_add_api_username constant varchar2(128) := 'REPLACE_WITH_ADD_API_USERNAME';
+    c_add_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_ADD_64_CHARACTER_SHA256_HEX';
     c_attendance_timezone constant varchar2(64) := 'Asia/Karachi';
     c_max_reconcile_days constant number := 45;
 
@@ -147,6 +262,10 @@ create or replace package body slic_zkt_truth_api as
             or (
                 nvl(v_username, chr(0)) = c_fleet_api_username
                 and v_password_digest = c_fleet_api_password_sha256
+            )
+            or (
+                nvl(v_username, chr(0)) = c_add_api_username
+                and v_password_digest = c_add_api_password_sha256
             )
         ) then
             fail_and_stop(
@@ -404,8 +523,8 @@ create or replace package body slic_zkt_truth_api as
         ),
         flagged as (
             select i.*,
-                   case when i.raw_punch = 'F' and n.rn_in = 1 then 'T' else 'F' end check_in,
-                   case when i.raw_punch = 'F' and n.normal_count > 1 and n.rn_out = 1 then 'T' else 'F' end check_out
+                   'F' check_in,
+                   'F' check_out
               from incoming i
               left join normal_rank n on n.event_uid = i.event_uid
         )
@@ -434,6 +553,12 @@ create or replace package body slic_zkt_truth_api as
                );
 
         v_inserted := sql%rowcount;
+        if v_inserted > 0 then
+            -- Non-destructive daily flag recomputation runs inside this
+            -- transaction after new rows enter with false/false flags.
+            slic_zkt_recompute_daily_flags(p_body);
+        end if;
+
         commit;
 
         send_metrics(
@@ -995,6 +1120,26 @@ begin
                 p_status => 'PUBLISHED',
                 p_comments => 'ZKT raw attendance capture API with authoritative truth reconcile');
     end;
+
+    begin
+        ords.define_template(
+            p_module_name => l_module_name,
+            p_pattern => 'raw-captures');
+    exception
+        when dup_val_on_index then
+            null;
+    end;
+
+    ords.define_handler(
+        p_module_name => l_module_name,
+        p_pattern => 'raw-captures',
+        p_method => 'POST',
+        p_source_type => ords.source_type_plsql,
+        p_source => q'[
+begin
+    slic_zkt_truth_api.post_live(:body_text);
+end;]',
+        p_comments => 'Single-event idempotent attendance ingestion through the shared hashed verifier');
 
     begin
         ords.define_template(

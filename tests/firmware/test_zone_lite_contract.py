@@ -408,10 +408,13 @@ def test_oracle_reconcile_auth_is_dual_verifier_and_non_destructive():
 
     assert "c_api_password_sha256 constant" in oracle
     assert "c_fleet_api_password_sha256 constant" in oracle
+    assert "c_add_api_password_sha256 constant" in oracle
     assert "v_password_digest = c_api_password_sha256" in oracle
     assert "v_password_digest = c_fleet_api_password_sha256" in oracle
+    assert "v_password_digest = c_add_api_password_sha256" in oracle
     assert "c_api_password constant varchar2" not in oracle
     assert "c_fleet_api_password constant varchar2" not in oracle
+    assert "c_add_api_password constant varchar2" not in oracle
     assert "Non-destructive ZKT truth reconcile applied" in oracle
     assert oracle.count(
         "delete from hr_raw_attn_capture_events d\n         where 1 = 0"
@@ -427,6 +430,94 @@ def test_oracle_reconcile_auth_is_dual_verifier_and_non_destructive():
     assert "delete from hr_raw_attn_capture_events d" in migration
     assert "insert into hr_raw_attn_capture_events" not in migration
     assert "update hr_raw_attn_capture_events" not in migration
+
+
+def test_oracle_add_auth_migration_is_idempotent_and_non_destructive():
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_allow_add_auth_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "restore_original" in migration
+    assert "l_ddl_attempted" in migration
+    assert "REPLACE_WITH_ADD_API_USERNAME" in migration
+    assert "REPLACE_WITH_ADD_64_CHARACTER_SHA256_HEX" in migration
+    assert "c_add_api_password_sha256 constant" in migration
+    assert "v_password_digest = c_add_api_password_sha256" in migration
+    assert "already installed" in migration
+    assert "where 1 = 0" in migration
+    assert "delete from hr_raw_attn_capture_events" in migration
+    assert "insert into hr_raw_attn_capture_events" not in migration
+    assert "update hr_raw_attn_capture_events" not in migration
+
+
+def test_oracle_live_handler_routes_through_shared_non_destructive_package():
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_route_live_capture_through_package.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "slic_zkt_truth_api.post_live(:body_text)" in oracle
+    assert "p_pattern => 'raw-captures'" in oracle
+    assert "restore_original" in migration
+    assert "l_change_attempted" in migration
+    assert "SLIC_ZKT_TRUTH_API.POST_LIVE" in migration
+    assert "dbms_lob.compare" in migration
+    assert "ords.define_handler" in migration
+    assert "insert into hr_raw_attn_capture_events (" not in migration.lower()
+    assert "update hr_raw_attn_capture_events " not in migration.lower()
+
+
+def test_oracle_live_insert_recomputes_daily_flags_without_delete():
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+    helper = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_create_daily_flag_helper.sql"
+    ).read_text(encoding="utf-8")
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_recompute_live_daily_flags_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+
+    marker = "Non-destructive daily flag recomputation"
+    assert oracle.count(marker) == 1
+    live_start = oracle.index("procedure handle_event_array")
+    live = oracle[live_start : oracle.index("procedure post_live", live_start)]
+    assert "'F' check_in" in live
+    assert "'F' check_out" in live
+    assert "slic_zkt_recompute_daily_flags(p_body)" in live
+    assert "delete from hr_raw_attn_capture_events" not in live
+
+    assert "create or replace procedure slic_zkt_recompute_daily_flags" in helper
+    assert "for update" in helper
+    assert "merge into hr_raw_attn_capture_events d" in helper
+    assert "partition by stored.cnic, stored.attendance_date" in helper
+    assert "delete from hr_raw_attn_capture_events" not in helper
+    assert "commit;" not in helper.lower()
+
+    assert "restore_original" in migration
+    assert "l_ddl_attempted" in migration
+    assert marker in migration
+    assert "slic_zkt_recompute_daily_flags(p_body)" in migration
+    assert "where 1 = 0" in migration
+    assert "delete from hr_raw_attn_capture_events d" in migration
 
 
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
