@@ -269,6 +269,12 @@
 // Use the ZKT TCP protocol's native maximum. It is proven on this MB40 and
 // halves the number of flash-backed requests needed for a multi-megabyte dump.
 #define ZKT_BUFFER_CHUNK_BYTES 0xffc0
+// A fresh-session truth retry deliberately uses smaller requests. Some
+// terminals intermittently wedge a native-maximum flash-backed chunk even
+// though the live event session remains healthy.
+#define ZKT_BUFFER_RECOVERY_CHUNK_BYTES 0x4000
+#define ZKT_TRUTH_FRESH_SESSION_RETRIES 2
+#define ZKT_TRUTH_RETRY_BACKOFF_MS 5000
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
 #define ZKT_KEEPALIVE_COUNT 3
@@ -366,6 +372,9 @@ static bool g_time_synced;
 static int64_t g_ords_next_attempt_ms;
 static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
 static bool g_truth_reconcile_warning;
+static bool g_truth_use_recovery_chunks;
+static bool g_truth_retry_session_requested;
+static uint32_t g_truth_fresh_session_retries;
 static bool g_truth_window_blocked;
 static int g_daily_zkt_reboot_completed_day = -1;
 static int64_t g_daily_zkt_reboot_last_attempt_ms;
@@ -1058,8 +1067,18 @@ static bool zk_get_counts(int sock, zk_context_t *ctx, int32_t *users, int32_t *
     return true;
 }
 
-static bool zk_read_buffer(int sock, zk_context_t *ctx, uint16_t command, uint32_t fct, uint8_t **out, size_t *out_len)
+static bool zk_read_buffer(
+    int sock,
+    zk_context_t *ctx,
+    uint16_t command,
+    uint32_t fct,
+    uint32_t max_chunk,
+    uint8_t **out,
+    size_t *out_len)
 {
+    if (max_chunk == 0 || max_chunk > ZKT_BUFFER_CHUNK_BYTES) {
+        max_chunk = ZKT_BUFFER_CHUNK_BYTES;
+    }
     uint8_t *rx = malloc(8192);
     if (rx == NULL) {
         return false;
@@ -1131,7 +1150,6 @@ static bool zk_read_buffer(int sock, zk_context_t *ctx, uint16_t command, uint32
     uint32_t offset = 0;
     // The MB40 can intermittently spend more than a minute preparing a
     // flash-backed chunk; the authenticated socket deadline accounts for it.
-    const uint32_t max_chunk = ZKT_BUFFER_CHUNK_BYTES;
     while (offset < size) {
         uint32_t want = size - offset > max_chunk ? max_chunk : size - offset;
         uint8_t chunk_payload[8];
@@ -1687,7 +1705,15 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
     ESP_LOGI(TAG, "Requesting ZKT user table (%ld users)", (long)user_count);
     uint8_t *data = NULL;
     size_t len = 0;
-    if (!zk_read_buffer(sock, ctx, CMD_USERTEMP_RRQ, FCT_USER, &data, &len) || len < 4) {
+    if (!zk_read_buffer(
+            sock,
+            ctx,
+            CMD_USERTEMP_RRQ,
+            FCT_USER,
+            ZKT_BUFFER_CHUNK_BYTES,
+            &data,
+            &len) ||
+        len < 4) {
         ESP_LOGW(TAG, "Could not read ZKT users");
         free(data);
         return false;
@@ -3054,11 +3080,13 @@ static bool reconcile_attendance_dump(
     bool historical,
     size_t *added_out,
     bool *identity_blocked_out,
-    bool *history_exhausted_out)
+    bool *history_exhausted_out,
+    bool *fresh_session_retryable_out)
 {
     if (added_out) *added_out = 0;
     if (identity_blocked_out) *identity_blocked_out = false;
     if (history_exhausted_out) *history_exhausted_out = false;
+    if (fresh_session_retryable_out) *fresh_session_retryable_out = false;
     uint8_t *data = NULL;
     size_t len = 0;
     if (records <= 0) {
@@ -3093,8 +3121,20 @@ static bool reconcile_attendance_dump(
             (long)refreshed_records);
     }
     ESP_LOGI(TAG, "Requesting attendance dump records=%ld capturetype=%s", (long)records, capturetype);
-    if (!zk_read_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &data, &len) || len < 4) {
+    uint32_t attendance_chunk_bytes = g_truth_use_recovery_chunks
+        ? ZKT_BUFFER_RECOVERY_CHUNK_BYTES
+        : ZKT_BUFFER_CHUNK_BYTES;
+    if (!zk_read_buffer(
+            sock,
+            ctx,
+            CMD_ATTLOG_RRQ,
+            0,
+            attendance_chunk_bytes,
+            &data,
+            &len) ||
+        len < 4) {
         ESP_LOGW(TAG, "Could not read attendance dump");
+        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
         free(data);
         xSemaphoreGive(g_ords_outbox_gate);
         return false;
@@ -3125,6 +3165,7 @@ static bool reconcile_attendance_dump(
             (long)records,
             (unsigned long)parsed_records,
             (long)verified_records);
+        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
         free(data);
         xSemaphoreGive(g_ords_outbox_gate);
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
@@ -3479,6 +3520,9 @@ static bool reconcile_attendance_dump(
         truth_delivery_ok && add_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
+    } else if (!historical) {
+        g_truth_use_recovery_chunks = false;
+        g_truth_fresh_session_retries = 0;
     }
     ESP_LOGI(
         TAG,
@@ -5501,6 +5545,7 @@ static bool process_add_commands(
 static int64_t gateway_run(uint32_t host_order_ip)
 {
     int64_t session_started_ms = uptime_ms();
+    bool truth_retry_session = false;
     int sock = -1;
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, 3000, &sock)) return 0;
     zk_context_t ctx = {0};
@@ -5797,6 +5842,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         : "DUMP_RECONNECT";
                     bool identity_blocked = false;
                     bool history_exhausted = false;
+                    bool fresh_session_retryable = false;
                     bool dump_succeeded = reconcile_attendance_dump(
                             sock,
                             &ctx,
@@ -5809,7 +5855,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             historical_reconcile,
                             &added,
                             &identity_blocked,
-                            &history_exhausted);
+                            &history_exhausted,
+                            &fresh_session_retryable);
                     if (dump_succeeded) {
                         if (historical_reconcile) {
                             if (history_exhausted) {
@@ -5841,6 +5888,38 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         }
                     } else {
                         reconcile_succeeded = false;
+                        bool retry_with_fresh_session =
+                            !historical_reconcile &&
+                            !identity_blocked &&
+                            fresh_session_retryable &&
+                            g_truth_fresh_session_retries <
+                                ZKT_TRUTH_FRESH_SESSION_RETRIES;
+                        if (retry_with_fresh_session) {
+                            g_truth_fresh_session_retries++;
+                            g_truth_use_recovery_chunks = true;
+                            truth_retry_session = true;
+                            char retry_message[224];
+                            snprintf(
+                                retry_message,
+                                sizeof(retry_message),
+                                "Attendance truth transport will retry on a fresh authenticated ZKT session attempt=%lu/%u chunk_bytes=%u; live capture remains durable",
+                                (unsigned long)g_truth_fresh_session_retries,
+                                (unsigned)ZKT_TRUTH_FRESH_SESSION_RETRIES,
+                                (unsigned)ZKT_BUFFER_RECOVERY_CHUNK_BYTES);
+                            add_connector_log(
+                                "WARN",
+                                "reconcile",
+                                "TRUTH_READ_RETRY_SESSION",
+                                retry_message);
+                        } else if (!historical_reconcile &&
+                                   !identity_blocked &&
+                                   fresh_session_retryable) {
+                            add_connector_log(
+                                "ERROR",
+                                "reconcile",
+                                "TRUTH_READ_RETRY_EXHAUSTED",
+                                "Attendance truth transport exhausted its bounded fresh-session retries; live capture remains active and the periodic cycle will retry.");
+                        }
                         if (historical_reconcile && identity_blocked) {
                             g_history_backfill_had_failures = true;
                             g_history_failed_windows++;
@@ -5864,7 +5943,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             "FULL_RECONCILE_FAILED",
                             identity_blocked
                                 ? "Attendance truth window was unsafe or rejected; Oracle replacement stayed fail-closed and the historical cursor will retry it in the next sweep"
-                                : "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
+                                : retry_with_fresh_session
+                                    ? "Attendance truth read failed; live capture remains active and a bounded fresh-session retry was scheduled"
+                                    : "Attendance truth read failed; live capture remains active and the next periodic cycle will retry");
                     }
                 }
             } else {
@@ -5887,6 +5968,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_zkt(&g_add_zkt);
             add_connector_set_activity("LIVE_CAPTURE");
             if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
+            if (truth_retry_session) {
+                break;
+            }
         }
 
         if (now_ms - last_live_register >= ZKT_LIVE_REREGISTER_INTERVAL_MS) {
@@ -5907,7 +5991,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
             }
         }
     }
-    if (!restarted) {
+    if (!restarted && !truth_retry_session) {
         (void)zk_register_attlog_events(sock, &ctx, false);
         zk_disconnect(sock, &ctx);
     }
@@ -5917,6 +6001,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
     if (restarted) {
         zkt_publish_state("RESTARTING", "ZKT protocol restart accepted", false);
         vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
+    } else if (truth_retry_session) {
+        g_truth_retry_session_requested = true;
+        zkt_publish_state(
+            "RECOVERING",
+            "Refreshing the authenticated ZKT session for a bounded attendance truth retry",
+            false);
     }
     return duration;
 }
@@ -6018,6 +6108,13 @@ static void gateway_task(void *arg)
             ESP_LOGI(TAG, "Opening one live session to last authenticated ZKT %s:%d", direct_ip, ZONE_LITE_ZKT_PORT);
             zkt_publish_state("CONNECTING", "opening live session to last authenticated terminal", false);
             int64_t session_duration = gateway_run(directly_tried_ip);
+            if (g_truth_retry_session_requested) {
+                g_truth_retry_session_requested = false;
+                discovery_failures = 0;
+                offline_started_ms = 0;
+                vTaskDelay(pdMS_TO_TICKS(ZKT_TRUTH_RETRY_BACKOFF_MS));
+                continue;
+            }
             if (session_duration > 0) {
                 discovery_failures = 0;
                 offline_started_ms = 0;
@@ -6041,6 +6138,13 @@ static void gateway_task(void *arg)
             discovery_failures = 0;
             offline_started_ms = 0;
             int64_t session_duration = gateway_run(selected_ip);
+            if (g_truth_retry_session_requested) {
+                g_truth_retry_session_requested = false;
+                discovery_failures = 0;
+                offline_started_ms = 0;
+                vTaskDelay(pdMS_TO_TICKS(ZKT_TRUTH_RETRY_BACKOFF_MS));
+                continue;
+            }
             if (strcmp(g_add_zkt.connection_state, "RESTARTING") == 0) {
                 discovery_failures = 0;
                 continue;

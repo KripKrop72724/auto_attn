@@ -18,7 +18,10 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
 - Arbitrates ORDS outbox work before a full ZKT dump, then releases the multi-megabyte terminal
   buffer before building or sending downstream truth payloads.
 - Reads large MB40 buffers in native `0xffc0`-byte chunks with a 90-second authenticated I/O
-  deadline and sends `CMD_FREE_DATA` on every post-prepare exit path.
+  deadline and sends `CMD_FREE_DATA` on every post-prepare exit path. A failed authoritative
+  attendance read closes the possibly desynchronized protocol session and retries twice on fresh
+  authenticated sessions with bounded `0x4000`-byte recovery chunks; these intentional refreshes
+  do not count as terminal flapping.
 - Stores at most 5,000 reconcile events in PSRAM, serializes ORDS rows one at a time, and durably
   commits ADD truth in groups of 32 batches.
 - Reconciles the current month every six hours and walks retained terminal history one month at a
