@@ -86,6 +86,7 @@ bool add_connector_lookup_identity(
     char *cnic,
     size_t cnic_size,
     bool *shift_worker);
+uint32_t add_connector_identity_catalog_generation(size_t *row_count);
 bool add_connector_command_update(
     const char *command_id,
     const char *status,

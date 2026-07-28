@@ -157,6 +157,10 @@ jobs:
             if ($matchingCampaigns.Count -ne 1) {
               throw 'Exact closed production-canary campaign did not contain one successful deployment.'
             }
+            $campaign = $matchingCampaigns[0]
+            if (-not ([string]$campaign.pause_reason).StartsWith('CANARY_ACCEPTED:')) {
+              throw 'Canary closure does not carry the explicit CANARY_ACCEPTED audit declaration.'
+            }
 
             $deviceQuery = [Uri]::EscapeDataString($env:EXPECTED_MAC)
             $stable = $false
@@ -191,7 +195,44 @@ jobs:
             if (-not $stable) {
               throw 'Production canary did not reach the complete stable live-operation contract.'
             }
-            Write-Host 'Exact production canary is stable and eligible for immutable-byte promotion.'
+            $campaignStarted = [DateTimeOffset]::Parse([string]$campaign.created_at)
+            $logs = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/devices/$($row.connector_id)/logs?limit=1000" `
+              -WebSession $session `
+              -TimeoutSec 30
+            $canaryLogs = @($logs.rows | Where-Object {
+              [DateTimeOffset]::Parse([string]$_.received_at) -ge $campaignStarted
+            } | Sort-Object {
+              [DateTimeOffset]::Parse([string]$_.received_at)
+            })
+            $catalogApplied = @($canaryLogs | Where-Object {
+              $_.code -eq 'IDENTITY_CATALOG_APPLIED'
+            } | Select-Object -Last 1)
+            if ($catalogApplied.Count -ne 1) {
+              throw 'Canary did not prove that the verified ADD identity catalog was consumed.'
+            }
+            $catalogAppliedAt = [DateTimeOffset]::Parse(
+              [string]$catalogApplied[0].received_at
+            )
+            $truthAccepted = @($canaryLogs | Where-Object {
+              $_.code -eq 'ORACLE_RECONCILE_ACCEPTED' -and
+              [DateTimeOffset]::Parse([string]$_.received_at) -ge $catalogAppliedAt
+            } | Select-Object -Last 1)
+            if ($truthAccepted.Count -ne 1) {
+              throw 'Canary did not complete an Oracle-accepted truth pass after catalog application.'
+            }
+            $truthAcceptedAt = [DateTimeOffset]::Parse(
+              [string]$truthAccepted[0].received_at
+            )
+            $laterFailures = @($canaryLogs | Where-Object {
+              $_.code -in @('TRUTH_IDENTITY_INCOMPLETE', 'FULL_RECONCILE_FAILED') -and
+              [DateTimeOffset]::Parse([string]$_.received_at) -gt $truthAcceptedAt
+            })
+            if ($laterFailures.Count -ne 0) {
+              throw 'Canary emitted a fail-closed truth error after its accepted Oracle pass.'
+            }
+            Write-Host 'Exact production canary is stable, identity-complete, and eligible for immutable-byte promotion.'
           } catch {
             $verificationFailed = $true
             throw

@@ -2420,16 +2420,19 @@ static void recover_valid_unclassified_blocked_events(void)
     }
 }
 
-static void recover_blocked_events_from_snapshot(const user_table_t *users)
+static bool recover_blocked_events_from_snapshot(
+    const user_table_t *users,
+    size_t *recovered_out)
 {
+    if (recovered_out) *recovered_out = 0;
     if (!users || !g_storage_lock ||
         xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return;
+        return false;
     }
     FILE *in = fopen(BLOCKED_PATH, "r");
     if (!in) {
         xSemaphoreGive(g_storage_lock);
-        return;
+        return true;
     }
     FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
     FILE *pending = fopen(PENDING_PATH, "a");
@@ -2439,7 +2442,7 @@ static void recover_blocked_events_from_snapshot(const user_table_t *users)
         fclose(in);
         (void)remove(BLOCKED_RECOVERY_TMP_PATH);
         xSemaphoreGive(g_storage_lock);
-        return;
+        return false;
     }
 
     bool ok = true;
@@ -2528,7 +2531,11 @@ static void recover_blocked_events_from_snapshot(const user_table_t *users)
         (void)remove(BLOCKED_RECOVERY_TMP_PATH);
         ESP_LOGE(TAG, "Blocked identity repair was interrupted; preserved the original outbox");
     }
+    if (ok && recovered_out) {
+        *recovered_out = recovered;
+    }
     xSemaphoreGive(g_storage_lock);
+    return ok;
 }
 
 static void storage_init(void)
@@ -5139,7 +5146,7 @@ static bool process_add_commands(
                 g_add_zkt.user_count = *user_count;
                 g_add_zkt.attendance_count = records;
                 add_connector_set_zkt(&g_add_zkt);
-                recover_blocked_events_from_snapshot(users);
+                (void)recover_blocked_events_from_snapshot(users, NULL);
                 ok = add_send_user_snapshot(users);
                 if (!ok) {
                     error_code = "ADD_SNAPSHOT_SEND_FAILED";
@@ -5439,7 +5446,7 @@ static bool process_add_commands(
                     }
                 }
                 if (ok) {
-                    recover_blocked_events_from_snapshot(users);
+                    (void)recover_blocked_events_from_snapshot(users, NULL);
                     (void)add_send_user_snapshot(users);
                 }
                 }
@@ -5558,6 +5565,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     g_add_zkt.user_record_size = users->record_size;
     add_connector_set_zkt(&g_add_zkt);
     (void)add_connector_consume_connected_edge();
+    (void)recover_blocked_events_from_snapshot(users, NULL);
     (void)add_send_user_snapshot(users);
 
     uint8_t rx[1024];
@@ -5574,6 +5582,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     int64_t last_user_integrity = now_ms;
     int64_t last_time_sample = 0;
     size_t live_events_since_sync = 0;
+    uint32_t applied_identity_catalog_generation = 0;
     bool restarted = false;
     while (true) {
         fd_set read_fds;
@@ -5615,7 +5624,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 g_add_zkt.user_count = verified_users;
                 g_add_zkt.attendance_count = verified_records;
                 add_connector_set_zkt(&g_add_zkt);
-                recover_blocked_events_from_snapshot(users);
+                (void)recover_blocked_events_from_snapshot(users, NULL);
                 (void)add_send_user_snapshot(users);
                 live_events_since_sync += process_live_packet(
                     packet + sizeof(zk_header_t),
@@ -5643,6 +5652,30 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_log("INFO", "add", "ADD_RECONNECTED", "ADD channel recovered; publishing a fresh full user snapshot");
             (void)add_send_user_snapshot(users);
         }
+        size_t identity_catalog_rows = 0;
+        uint32_t identity_catalog_generation =
+            add_connector_identity_catalog_generation(&identity_catalog_rows);
+        if (identity_catalog_generation != 0 &&
+            identity_catalog_generation != applied_identity_catalog_generation) {
+            size_t recovered = 0;
+            if (recover_blocked_events_from_snapshot(users, &recovered)) {
+                applied_identity_catalog_generation = identity_catalog_generation;
+                g_force_truth_reconcile = true;
+                char message[240];
+                snprintf(
+                    message,
+                    sizeof(message),
+                    "Verified ADD identity catalog applied generation=%lu rows=%u recovered=%u; forcing authoritative truth reconciliation",
+                    (unsigned long)identity_catalog_generation,
+                    (unsigned)identity_catalog_rows,
+                    (unsigned)recovered);
+                add_connector_log(
+                    "INFO",
+                    "identity",
+                    "IDENTITY_CATALOG_APPLIED",
+                    message);
+            }
+        }
         (void)temp_admin_revoke_if_due(sock, &ctx, users);
 
         if (now_ms - last_user_integrity >= ZONE_LITE_USER_INTEGRITY_INTERVAL_MS) {
@@ -5658,7 +5691,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
             g_add_zkt.user_count = verified_users;
             g_add_zkt.attendance_count = verified_records;
             add_connector_set_zkt(&g_add_zkt);
-            recover_blocked_events_from_snapshot(users);
+            (void)recover_blocked_events_from_snapshot(users, NULL);
             (void)add_send_user_snapshot(users);
             last_user_integrity = now_ms;
             add_connector_set_activity("LIVE_CAPTURE");
@@ -5689,7 +5722,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         sock, &ctx, users, refreshed_users, verified_hash)) break;
                 user_count = refreshed_users;
                 last_user_integrity = now_ms;
-                recover_blocked_events_from_snapshot(users);
+                (void)recover_blocked_events_from_snapshot(users, NULL);
                 (void)add_send_user_snapshot(users);
             }
             int64_t record_delta = g_last_synced_attendance_count >= 0
