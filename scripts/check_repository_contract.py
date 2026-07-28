@@ -13,6 +13,7 @@ REQUIRED = {
     "apps/add_backend/zk_add/web.py",
     "apps/add_frontend/src/App.tsx",
     "firmware/zone_lite/main/zone_lite.c",
+    "deploy/add/oracle/20260728_unify_raw_capture_auth.sql",
     ".github/workflows/add-ci.yml",
     ".github/workflows/add-deploy.yml",
     "docker-compose.add.yml",
@@ -133,6 +134,12 @@ def main() -> int:
     backend = (ROOT / "apps/add_backend/zk_add/web.py").read_text().lower()
     if "register connector" in frontend or "/connectors/register" in backend:
         problems.append("manual connector registration must not exist")
+
+    oracle_truth_api = (ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql").read_text()
+    if re.search(r"\bc_api_password\s+constant\b", oracle_truth_api, re.IGNORECASE):
+        problems.append("Oracle truth API must never embed a plaintext password constant")
+    if "c_api_password_sha256" not in oracle_truth_api:
+        problems.append("Oracle truth API must verify the password through a SHA-256 digest")
 
     logo = ROOT / "apps/add_frontend/public/state-life-logo.png"
     if not logo.is_file() or logo.stat().st_size < 1_000:
