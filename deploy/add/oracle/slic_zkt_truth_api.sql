@@ -4,7 +4,8 @@ set define off
   SLIC ZKT truth API for Oracle ORDS.
 
   Deployment notes:
-  - Replace c_api_password before running in Oracle.
+  - Replace c_api_password_sha256 with the uppercase SHA-256 hex digest of the
+    zone-agent password before running in Oracle. Never commit the password.
   - This script does not change HR_RAW_ATTN_CAPTURE_EVENTS table shape.
   - The reconcile endpoint is intentionally authoritative inside the supplied
     zone_id + device_serial + attendance-date window.
@@ -25,7 +26,7 @@ end slic_zkt_truth_api;
 
 create or replace package body slic_zkt_truth_api as
     c_api_username constant varchar2(128) := 'slic_zone_agent';
-    c_api_password constant varchar2(512) := 'REPLACE_WITH_ZONE_AGENT_PASSWORD';
+    c_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_64_CHARACTER_SHA256_HEX';
     c_attendance_timezone constant varchar2(64) := 'Asia/Karachi';
     c_max_reconcile_days constant number := 45;
 
@@ -111,6 +112,15 @@ create or replace package body slic_zkt_truth_api as
     procedure require_auth is
         v_username varchar2(512);
         v_password varchar2(1024);
+
+        function password_sha256(p_value in varchar2) return varchar2 is
+            v_digest varchar2(64);
+        begin
+            select rawtohex(standard_hash(p_value, 'SHA256'))
+              into v_digest
+              from dual;
+            return v_digest;
+        end password_sha256;
     begin
         v_username := coalesce(
             owa_util.get_cgi_env('HTTP_X_API_USERNAME'),
@@ -124,7 +134,9 @@ create or replace package body slic_zkt_truth_api as
             owa_util.get_cgi_env('x-api-password'));
 
         if nvl(v_username, chr(0)) <> c_api_username
-           or nvl(v_password, chr(0)) <> c_api_password then
+           or password_sha256(
+                  nvl(v_password, chr(0))
+              ) <> c_api_password_sha256 then
             fail_and_stop(
                 p_status => 401,
                 p_message => 'Invalid API credentials',

@@ -151,6 +151,15 @@ ADD also rechecks every independently confirmed UID at least once per day. A tra
 failure retains the last known proof while exposing a retrying membership state; if Oracle reports
 the UID missing, ADD clears the stale confirmation and requeues its immutable event automatically.
 
+`raw-captures/check` and `raw-captures/reconcile` must use the same authorized credential verifier.
+The canonical `SLIC_ZKT_TRUTH_API` stores only an uppercase SHA-256 password digest. If a legacy
+Oracle deployment returns `200` from `check` but `401` from `reconcile`, run
+`deploy/add/oracle/20260728_unify_raw_capture_auth.sql` while authenticated as the owning schema.
+The migration derives the already-working verifier inside Oracle without selecting or printing a
+credential, patches exactly the expected authentication expressions, validates compilation, and
+restores the original package body automatically on failure. Afterward, verify both endpoints with
+the same credentials before allowing any authoritative reconcile or backlog drain.
+
 Every deployment records credential-free DNS, TCP 443, and `OPTIONS` reachability from the Windows
 runner host, the resolved Oracle destination addresses, the runner's public egress address, `OPTIONS`
 reachability from the running API container, and boolean proxy-presence signals. The probe never sends
