@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
 import json
 from datetime import timedelta, timezone
 
@@ -12,6 +14,7 @@ from sqlalchemy import create_engine, event as sqlalchemy_event, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+import zk_add.worker as worker
 from zk_add.crypto import decrypt_cnic, decrypt_json, decrypt_text
 from zk_add.db import Base, SessionLocal
 from zk_add.identity import build_machine_name
@@ -94,9 +97,12 @@ from zk_add.worker import (
     event_uid_is_valid,
     ords_delivery_metrics,
     ords_delivery_succeeded,
+    ords_circuit_is_open,
+    ords_circuit_retry_after_seconds,
     ords_failure_category,
     ords_failure_is_permanent,
     ords_membership_missing,
+    record_ords_route_result,
 )
 
 
@@ -110,6 +116,209 @@ def test_ords_delivery_defaults_drain_retry_backlog_in_bounded_batches():
     assert 1 <= ORDS_DELIVERY_CONCURRENCY <= ORDS_DELIVERY_BATCH_SIZE
     assert ORDS_DELIVERY_BATCH_SIZE <= 500
     assert 1 <= ORDS_FIRMWARE_AUDIT_BATCH_SIZE <= 500
+
+
+def test_ords_transport_circuit_uses_bounded_exponential_backoff(monkeypatch):
+    monkeypatch.setattr(worker, "_ords_circuit_failures", 0)
+    monkeypatch.setattr(worker, "_ords_circuit_open_until", 0.0)
+
+    record_ords_route_result(
+        status=None,
+        transport_error="ConnectTimeout",
+        now=100.0,
+    )
+    assert ords_circuit_is_open(now=100.0)
+    assert ords_circuit_retry_after_seconds(now=100.0) == 15
+    assert not ords_circuit_is_open(now=115.0)
+
+    record_ords_route_result(
+        status=None,
+        transport_error="ConnectTimeout",
+        now=115.0,
+    )
+    assert ords_circuit_retry_after_seconds(now=115.0) == 30
+
+    for failure_index in range(2, 10):
+        record_ords_route_result(
+            status=None,
+            transport_error="ConnectTimeout",
+            now=115.0 + failure_index,
+        )
+    assert ords_circuit_retry_after_seconds(now=125.0) <= 300
+    assert ords_circuit_retry_after_seconds(now=125.0) > 0
+
+
+def test_any_http_response_closes_ords_transport_circuit(monkeypatch):
+    monkeypatch.setattr(worker, "_ords_circuit_failures", 4)
+    monkeypatch.setattr(worker, "_ords_circuit_open_until", 500.0)
+
+    record_ords_route_result(
+        status=503,
+        transport_error=None,
+        now=100.0,
+    )
+
+    assert not ords_circuit_is_open(now=100.0)
+    assert ords_circuit_retry_after_seconds(now=100.0) == 0
+    assert worker._ords_circuit_failures == 0
+
+
+def test_ords_transport_failure_pauses_parallel_worker_paths(monkeypatch):
+    monkeypatch.setattr(worker, "_ords_circuit_failures", 0)
+    monkeypatch.setattr(worker, "_ords_circuit_open_until", 0.0)
+    monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
+    monkeypatch.setattr(settings, "ords_base_url", "https://example.invalid/ords")
+    monkeypatch.setattr(settings, "ords_username", "test-user")
+    monkeypatch.setattr(settings, "ords_password", "test-password")
+
+    claim_counts = {"firmware": 0, "confirmed": 0}
+    request_count = 0
+
+    def claim_firmware(_limit):
+        claim_counts["firmware"] += 1
+        return [(1, "a" * 64, 1)]
+
+    def claim_confirmed(_limit):
+        claim_counts["confirmed"] += 1
+        return [(2, "b" * 64, 2)]
+
+    async def fail_membership_check(_client, _url, _claims):
+        nonlocal request_count
+        request_count += 1
+        await asyncio.sleep(0)
+        return None, None, "ConnectTimeout", False
+
+    monkeypatch.setattr(worker, "claim_firmware_receipt_audit_batch", claim_firmware)
+    monkeypatch.setattr(worker, "claim_confirmed_membership_audit_batch", claim_confirmed)
+    monkeypatch.setattr(worker, "post_ords_membership_check", fail_membership_check)
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
+    monkeypatch.setattr(
+        worker,
+        "apply_firmware_receipt_audit_failure",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker,
+        "apply_confirmed_membership_audit_failure",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def run_parallel_paths():
+        await asyncio.gather(
+            worker.audit_firmware_receipts_batch(limit=1),
+            worker.audit_confirmed_membership_batch(limit=1),
+        )
+
+    asyncio.run(run_parallel_paths())
+
+    assert request_count == 1
+    assert sum(claim_counts.values()) == 1
+    assert ords_circuit_is_open()
+
+
+def test_ords_delivery_preflight_prevents_transport_failure_fanout(monkeypatch):
+    monkeypatch.setattr(worker, "_ords_circuit_failures", 0)
+    monkeypatch.setattr(worker, "_ords_circuit_open_until", 0.0)
+    monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
+    monkeypatch.setattr(settings, "ords_base_url", "https://example.invalid/ords")
+    monkeypatch.setattr(settings, "ords_username", "test-user")
+    monkeypatch.setattr(settings, "ords_password", "test-password")
+
+    claims = [
+        (1, {"event_uid": "a" * 64}, 1, False),
+        (2, {"event_uid": "b" * 64}, 2, True),
+    ]
+    membership_requests = 0
+    delivery_requests = 0
+    failed_claims: list[int] = []
+
+    async def fail_membership_check(_client, _url, requested_claims):
+        nonlocal membership_requests
+        membership_requests += 1
+        assert requested_claims == claims
+        return None, None, "ConnectTimeout", False
+
+    async def unexpected_delivery(*_args, **_kwargs):
+        nonlocal delivery_requests
+        delivery_requests += 1
+        raise AssertionError("delivery must not fan out after the route probe fails")
+
+    monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
+    monkeypatch.setattr(worker, "post_ords_membership_check", fail_membership_check)
+    monkeypatch.setattr(worker, "post_ords_claim", unexpected_delivery)
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
+    monkeypatch.setattr(
+        worker,
+        "apply_ords_membership_failure",
+        lambda _session, *, claimed_id, **_kwargs: failed_claims.append(claimed_id),
+    )
+
+    asyncio.run(worker.deliver_ords_batch(limit=2, concurrency=2))
+
+    assert membership_requests == 1
+    assert delivery_requests == 0
+    assert failed_claims == [1, 2]
+    assert ords_circuit_is_open()
+
+
+def test_ords_delivery_preflight_sends_only_proven_missing_events(monkeypatch):
+    monkeypatch.setattr(worker, "_ords_circuit_failures", 0)
+    monkeypatch.setattr(worker, "_ords_circuit_open_until", 0.0)
+    monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
+    monkeypatch.setattr(settings, "ords_base_url", "https://example.invalid/ords")
+    monkeypatch.setattr(settings, "ords_username", "test-user")
+    monkeypatch.setattr(settings, "ords_password", "test-password")
+
+    existing_uid = "a" * 64
+    missing_uid = "b" * 64
+    claims = [
+        (1, {"event_uid": existing_uid}, 1, False),
+        (2, {"event_uid": missing_uid}, 2, False),
+    ]
+    delivered_claims: list[int] = []
+    confirmed_claims: list[int] = []
+    applied_results: list[int] = []
+
+    async def check_membership(_client, _url, requested_claims):
+        assert requested_claims == claims
+        return (
+            200,
+            {
+                "success": True,
+                "received_count": 2,
+                "existing_count": 1,
+                "missing_count": 1,
+                "missing_event_uids": [missing_uid],
+            },
+            None,
+            True,
+        )
+
+    async def deliver_missing(_client, _semaphore, _url, claim):
+        delivered_claims.append(claim[0])
+        return claim[0], claim[2], 201, {"success": True}, None, True
+
+    monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
+    monkeypatch.setattr(worker, "post_ords_membership_check", check_membership)
+    monkeypatch.setattr(worker, "post_ords_claim", deliver_missing)
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
+    monkeypatch.setattr(
+        worker,
+        "apply_ords_confirmation",
+        lambda _session, *, claimed_id, **_kwargs: confirmed_claims.append(claimed_id),
+    )
+    monkeypatch.setattr(
+        worker,
+        "apply_ords_delivery_result",
+        lambda _session, *, claimed_id, **_kwargs: applied_results.append(claimed_id),
+    )
+
+    asyncio.run(worker.deliver_ords_batch(limit=2, concurrency=2))
+
+    assert confirmed_claims == [1]
+    assert delivered_claims == [2]
+    assert applied_results == [2]
+    assert not ords_circuit_is_open()
 
 
 @pytest.fixture()

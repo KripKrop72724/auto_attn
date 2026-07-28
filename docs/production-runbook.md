@@ -173,6 +173,10 @@ Interpret deployment probe results in this order:
   production host or its upstream firewall/ACL is blocking outbound TCP 443. Permit the Windows host
   and Docker NAT network to reach `eclaim2.slichealth.com:443`, then rerun the deployment probe. Do not
   rotate ORDS credentials for this condition.
+- `selected route=OK` with zero Windows ORDS block candidates and working general public egress
+  narrows that timeout to the upstream outbound route. A nonzero candidate count is only a local
+  firewall lead because application- and service-scoped block rules can share `Any:443`; inspect the
+  matching rule locally without publishing rule names or network topology in CI logs.
 - A successful host probe with a failed container probe points to Docker NAT or container-specific
   egress policy.
 - HTTP `401`/`403` means transport is working and authentication should be checked without logging

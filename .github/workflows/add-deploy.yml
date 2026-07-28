@@ -136,6 +136,62 @@ jobs:
             $dnsResult = "ERROR_$($_.Exception.GetType().Name)"
           }
 
+          $routeResult = 'ERROR_NO_DNS_TARGET'
+          if ($dnsAddresses.Count -gt 0) {
+            try {
+              $routes = @(Find-NetRoute `
+                -RemoteIPAddress $dnsAddresses[0] `
+                -ErrorAction Stop)
+              $routeResult = if ($routes.Count -gt 0) { 'OK' } else { 'ERROR_NO_ROUTE' }
+            } catch {
+              $routeResult = "ERROR_$($_.Exception.GetType().Name)"
+            }
+          }
+
+          $firewallProfileResult = 'ERROR_UNKNOWN'
+          $outboundBlockRuleCount = -1
+          $targetBlockCandidateCount = -1
+          try {
+            $profileTokens = @(
+              Get-NetFirewallProfile -ErrorAction Stop |
+                ForEach-Object { "$($_.Name):$($_.DefaultOutboundAction)" }
+            )
+            $firewallProfileResult = $profileTokens -join ','
+            $outboundBlockRules = @(
+              Get-NetFirewallRule `
+                -PolicyStore ActiveStore `
+                -Direction Outbound `
+                -Enabled True `
+                -Action Block `
+                -ErrorAction Stop
+            )
+            $outboundBlockRuleCount = $outboundBlockRules.Count
+            $targetBlockCandidateCount = 0
+            if ($dnsAddresses.Count -gt 0) {
+              foreach ($rule in $outboundBlockRules) {
+                $addressFilters = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
+                $portFilters = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+                $addressMatches = @(
+                  $addressFilters | Where-Object {
+                    $_.RemoteAddress -contains 'Any' -or
+                    $_.RemoteAddress -contains $dnsAddresses[0]
+                  }
+                ).Count -gt 0
+                $portMatches = @(
+                  $portFilters | Where-Object {
+                    ($_.Protocol -eq 'Any' -or $_.Protocol -eq 'TCP' -or $_.Protocol -eq 6) -and
+                    ($_.RemotePort -contains 'Any' -or $_.RemotePort -contains '443')
+                  }
+                ).Count -gt 0
+                if ($addressMatches -and $portMatches) {
+                  $targetBlockCandidateCount += 1
+                }
+              }
+            }
+          } catch {
+            $firewallProfileResult = "ERROR_$($_.Exception.GetType().Name)"
+          }
+
           $egressResult = 'ERROR_UNKNOWN'
           foreach ($probeUrl in @('https://api.ipify.org', 'https://checkip.amazonaws.com')) {
             try {
@@ -239,6 +295,7 @@ jobs:
 
           Write-Host "ORDS DNS probe=$dnsResult"
           Write-Host "ORDS resolved addresses=$($dnsAddresses -join ',')"
+          Write-Host "ORDS selected route=$routeResult"
           Write-Host "ORDS TCP 443 probe=$tcpResult"
           Write-Host "ORDS host probe=$hostResult"
           Write-Host "ORDS container probe=$containerResult"
@@ -246,6 +303,9 @@ jobs:
           Write-Host "Runner public egress address=$egressResult"
           Write-Host "Runner default proxy used=$defaultProxyUsed"
           Write-Host "Runner proxy environment present=$proxyEnvironmentPresent"
+          Write-Host "Windows firewall outbound defaults=$firewallProfileResult"
+          Write-Host "Windows enabled outbound block rule count=$outboundBlockRuleCount"
+          Write-Host "Windows ORDS block candidate count=$targetBlockCandidateCount"
           if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {
             Write-Warning 'ORDS egress is degraded; attendance remains preserved in the bounded retry queue.'
           }
