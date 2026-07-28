@@ -121,6 +121,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $target = 'https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures'
           $targetUri = [Uri]$target
+          $internalTarget = 'https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures'
+          $internalTargetUri = [Uri]$internalTarget
           $proxyUri = [System.Net.WebRequest]::DefaultWebProxy.GetProxy($targetUri)
           $defaultProxyUsed = $proxyUri -and $proxyUri.AbsoluteUri -ne $targetUri.AbsoluteUri
           $proxyEnvironmentPresent = -not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -or `
@@ -134,6 +136,22 @@ jobs:
             $dnsResult = if ($dnsAddresses.Count -gt 0) { 'OK' } else { 'ERROR_NO_ADDRESSES' }
           } catch {
             $dnsResult = "ERROR_$($_.Exception.GetType().Name)"
+          }
+
+          $internalDnsResult = 'ERROR_UNKNOWN'
+          $internalDnsAddresses = @()
+          try {
+            $internalAddresses = [System.Net.Dns]::GetHostAddresses($internalTargetUri.Host)
+            $internalDnsAddresses = @(
+              $internalAddresses | ForEach-Object { $_.IPAddressToString }
+            )
+            $internalDnsResult = if ($internalDnsAddresses.Count -gt 0) {
+              'OK'
+            } else {
+              'ERROR_NO_ADDRESSES'
+            }
+          } catch {
+            $internalDnsResult = "ERROR_$($_.Exception.GetType().Name)"
           }
 
           $routeResult = 'ERROR_NO_DNS_TARGET'
@@ -229,36 +247,48 @@ jobs:
             $tcpClient.Dispose()
           }
 
-          $hostResult = 'ERROR_UNKNOWN'
-          try {
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-            $response = Invoke-WebRequest -UseBasicParsing -Method Options -Uri $target -TimeoutSec 12
-            $hostResult = "HTTP_$($response.StatusCode)"
-          } catch {
-            $exception = $_.Exception
-            if ($exception.Response -and $exception.Response.StatusCode) {
-              $hostResult = "HTTP_$([int]$exception.Response.StatusCode)"
-            } elseif ($exception -is [System.Net.WebException]) {
-              $hostResult = "ERROR_WEB_$($exception.Status.ToString().ToUpperInvariant())"
-            } else {
-              $hostResult = "ERROR_$($exception.GetType().Name)"
+          function Invoke-BoundedOptionsProbe {
+            param([Parameter(Mandatory = $true)][string]$Uri)
+            try {
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+              $response = Invoke-WebRequest `
+                -UseBasicParsing `
+                -Method Options `
+                -Uri $Uri `
+                -TimeoutSec 12
+              return "HTTP_$($response.StatusCode)"
+            } catch {
+              $exception = $_.Exception
+              if ($exception.Response -and $exception.Response.StatusCode) {
+                return "HTTP_$([int]$exception.Response.StatusCode)"
+              }
+              if ($exception -is [System.Net.WebException]) {
+                return "ERROR_WEB_$($exception.Status.ToString().ToUpperInvariant())"
+              }
+              return "ERROR_$($exception.GetType().Name)"
             }
           }
+          $hostResult = Invoke-BoundedOptionsProbe -Uri $target
+          $internalHostResult = Invoke-BoundedOptionsProbe -Uri $internalTarget
 
           $probe = @'
           import urllib.error
           import urllib.request
 
-          target = "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures"
-          request = urllib.request.Request(target, method="OPTIONS")
-          try:
-              with urllib.request.urlopen(request, timeout=12) as response:
-                  print(f"HTTP_{response.status}")
-          except urllib.error.HTTPError as exc:
-              print(f"HTTP_{exc.code}")
-          except Exception as exc:
-              reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-              print(f"ERROR_{type(reason).__name__}")
+          targets = {
+              "PUBLIC": "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures",
+              "INTERNAL": "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures",
+          }
+          for label, target in targets.items():
+              request = urllib.request.Request(target, method="OPTIONS")
+              try:
+                  with urllib.request.urlopen(request, timeout=12) as response:
+                      print(f"{label}_HTTP_{response.status}")
+              except urllib.error.HTTPError as exc:
+                  print(f"{label}_HTTP_{exc.code}")
+              except Exception as exc:
+                  reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                  print(f"{label}_ERROR_{type(reason).__name__}")
           '@
           # Windows PowerShell 5.1 can split or requote multiline native-command
           # arguments. Encode the script so python -c receives one deterministic
@@ -277,28 +307,32 @@ jobs:
           } finally {
             $ErrorActionPreference = $previousPreference
           }
-          $containerTokens = @()
+          $containerResults = @{
+            PUBLIC = 'ERROR_UNEXPECTED_PROBE_OUTPUT'
+            INTERNAL = 'ERROR_UNEXPECTED_PROBE_OUTPUT'
+          }
           foreach ($line in $containerOutput) {
             $match = [regex]::Match(
               "$line",
-              '(?<![A-Za-z0-9_])(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)(?![A-Za-z0-9_])'
+              '(?<![A-Za-z0-9_])(PUBLIC|INTERNAL)_(HTTP_[0-9]{3}|ERROR_[A-Za-z0-9_]+)(?![A-Za-z0-9_])'
             )
             if ($match.Success) {
-              $containerTokens += $match.Groups[1].Value
+              $containerResults[$match.Groups[1].Value] = $match.Groups[2].Value
             }
           }
-          $containerResult = if ($containerTokens.Count -gt 0) {
-            $containerTokens[-1]
-          } else {
-            'ERROR_UNEXPECTED_PROBE_OUTPUT'
-          }
+          $containerResult = $containerResults.PUBLIC
+          $internalContainerResult = $containerResults.INTERNAL
 
           Write-Host "ORDS DNS probe=$dnsResult"
           Write-Host "ORDS resolved addresses=$($dnsAddresses -join ',')"
+          Write-Host "ORDS internal DNS probe=$internalDnsResult"
+          Write-Host "ORDS internal resolved address count=$($internalDnsAddresses.Count)"
           Write-Host "ORDS selected route=$routeResult"
           Write-Host "ORDS TCP 443 probe=$tcpResult"
           Write-Host "ORDS host probe=$hostResult"
           Write-Host "ORDS container probe=$containerResult"
+          Write-Host "ORDS internal host probe=$internalHostResult"
+          Write-Host "ORDS internal container probe=$internalContainerResult"
           Write-Host "ORDS container command completed=$($containerExit -eq 0)"
           Write-Host "Runner public egress address=$egressResult"
           Write-Host "Runner default proxy used=$defaultProxyUsed"
@@ -308,6 +342,9 @@ jobs:
           Write-Host "Windows ORDS block candidate count=$targetBlockCandidateCount"
           if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {
             Write-Warning 'ORDS egress is degraded; attendance remains preserved in the bounded retry queue.'
+          }
+          if ($internalHostResult -eq 'HTTP_200' -and $internalContainerResult -eq 'HTTP_200') {
+            Write-Warning 'The internal ORDS hostname is reachable from ADD and is a validated route candidate.'
           }
           # A connectivity observation is operational evidence, not a release failure. The
           # outbox is durable and the dashboard carries the degraded-route alert.

@@ -177,6 +177,9 @@ Interpret deployment probe results in this order:
   narrows that timeout to the upstream outbound route. A nonzero candidate count is only a local
   firewall lead because application- and service-scoped block rules can share `Any:443`; inspect the
   matching rule locally without publishing rule names or network topology in CI logs.
+- If both internal host and container probes return `HTTP_200` for `local.slichealth.com` while the
+  public host times out, use the internal hostname for ADD only. Keep remotely deployed Zone Lite
+  devices on the public hostname unless their own route evidence requires otherwise.
 - A successful host probe with a failed container probe points to Docker NAT or container-specific
   egress policy.
 - HTTP `401`/`403` means transport is working and authentication should be checked without logging
