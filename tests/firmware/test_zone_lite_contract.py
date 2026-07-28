@@ -232,7 +232,6 @@ def test_reconcile_and_restart_cadence_are_production_defaults():
     assert "ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (15 * 60 * 1000)" in source
     assert "zk_refresh_users_stable" in source
     assert "USER_SNAPSHOT_UNSTABLE" in source
-    assert "LIVE_IDENTITY_VERIFICATION_FAILED" in source
     assert "integrity_due" not in source
     assert "ZONE_LITE_LED_FAULT_LATCH_MS (2 * 60 * 1000)" in (
         FIRMWARE / "main" / "led_status.c"
@@ -793,11 +792,18 @@ def test_add_reports_the_built_application_version():
     assert '"zone-lite-2.1.' not in source
 
 
-def test_live_identity_is_verified_before_capture_and_blocked_rows_are_repaired():
+def test_live_capture_uses_verified_snapshot_without_blocking_event_loop():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
-    live = source[source.index("if (header->command == CMD_REG_EVENT") :]
-    assert live.index("zk_refresh_users_stable(") < live.index("process_live_packet(")
-    assert "recover_blocked_events_from_snapshot(users, NULL);" in live
+    live_start = source.index("if (header->command == CMD_REG_EVENT")
+    live = source[
+        live_start : source.index("\n            }\n            free(packet);", live_start)
+    ]
+    assert live.index("zk_send_ack_only(") < live.index("process_live_packet(")
+    assert "zk_refresh_users_stable(" not in live
+    assert "zk_get_counts(" not in live
+    assert 'add_connector_set_activity("VERIFYING_IDENTITY")' not in live
+    assert 'add_connector_set_activity("LIVE_CAPTURE")' in live
+    assert "recover_blocked_events_from_snapshot(users, NULL);" in source
     assert 'cJSON_AddStringToObject(payload, "state_hash", state_hash);' in source
     assert 'cJSON_AddBoolToObject(payload, "stable", true);' in source
     assert "BLOCKED_IDENTITY_REPAIRED" in source
