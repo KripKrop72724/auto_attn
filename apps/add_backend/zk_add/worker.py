@@ -5,6 +5,7 @@ from datetime import timedelta
 import hashlib
 import json
 import re
+import time
 
 import httpx
 from sqlalchemy import case, func, or_, select
@@ -79,6 +80,50 @@ ORDS_SAFE_TRANSPORT_ERRORS = {
     "WriteError",
     "WriteTimeout",
 }
+ORDS_CIRCUIT_BACKOFF_INITIAL_SECONDS = 15
+ORDS_CIRCUIT_BACKOFF_MAX_SECONDS = 300
+
+_ords_request_lock = asyncio.Lock()
+_ords_circuit_failures = 0
+_ords_circuit_open_until = 0.0
+
+
+def ords_circuit_is_open(*, now: float | None = None) -> bool:
+    """Return whether Oracle transport attempts are temporarily paused."""
+    observed_at = time.monotonic() if now is None else now
+    return observed_at < _ords_circuit_open_until
+
+
+def ords_circuit_retry_after_seconds(*, now: float | None = None) -> int:
+    """Return the bounded number of seconds before the next route probe."""
+    observed_at = time.monotonic() if now is None else now
+    return max(0, int(_ords_circuit_open_until - observed_at + 0.999))
+
+
+def record_ords_route_result(
+    *,
+    status: int | None,
+    transport_error: str | None,
+    now: float | None = None,
+) -> None:
+    """Open the shared circuit only for failures before an HTTP response."""
+    global _ords_circuit_failures, _ords_circuit_open_until
+
+    observed_at = time.monotonic() if now is None else now
+    if status is not None:
+        _ords_circuit_failures = 0
+        _ords_circuit_open_until = 0.0
+        return
+    if not transport_error:
+        return
+
+    _ords_circuit_failures += 1
+    exponent = min(_ords_circuit_failures - 1, 20)
+    delay = min(
+        ORDS_CIRCUIT_BACKOFF_MAX_SECONDS,
+        ORDS_CIRCUIT_BACKOFF_INITIAL_SECONDS * (2**exponent),
+    )
+    _ords_circuit_open_until = max(_ords_circuit_open_until, observed_at + delay)
 
 
 def event_uid_is_valid(value: object) -> bool:
@@ -628,26 +673,33 @@ async def audit_firmware_receipts_batch(
 ) -> None:
     if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
         return
-    claims = claim_firmware_receipt_audit_batch(max(1, min(limit, 500)))
-    if not claims:
-        return
-    check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
-    async with httpx.AsyncClient(
-        timeout=settings.ords_timeout_seconds,
-        headers={
-            "X-API-Username": settings.ords_username,
-            "X-API-Password": settings.ords_password,
-        },
-    ) as client:
-        check_status, check_body, check_error, check_parsed = (
-            await post_ords_membership_check(
-                client,
-                check_url,
-                [
-                    (row_id, {"event_uid": event_uid}, connector_id, True)
-                    for row_id, event_uid, connector_id in claims
-                ],
+    async with _ords_request_lock:
+        if ords_circuit_is_open():
+            return
+        claims = claim_firmware_receipt_audit_batch(max(1, min(limit, 500)))
+        if not claims:
+            return
+        check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
+        async with httpx.AsyncClient(
+            timeout=settings.ords_timeout_seconds,
+            headers={
+                "X-API-Username": settings.ords_username,
+                "X-API-Password": settings.ords_password,
+            },
+        ) as client:
+            check_status, check_body, check_error, check_parsed = (
+                await post_ords_membership_check(
+                    client,
+                    check_url,
+                    [
+                        (row_id, {"event_uid": event_uid}, connector_id, True)
+                        for row_id, event_uid, connector_id in claims
+                    ],
+                )
             )
+        record_ords_route_result(
+            status=check_status,
+            transport_error=check_error,
         )
     requested = {event_uid for _row_id, event_uid, _connector_id in claims}
     missing = ords_membership_missing(check_status, check_body, requested)
@@ -868,26 +920,33 @@ async def audit_confirmed_membership_batch(
 ) -> None:
     if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
         return
-    claims = claim_confirmed_membership_audit_batch(max(1, min(limit, 500)))
-    if not claims:
-        return
-    check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
-    async with httpx.AsyncClient(
-        timeout=settings.ords_timeout_seconds,
-        headers={
-            "X-API-Username": settings.ords_username,
-            "X-API-Password": settings.ords_password,
-        },
-    ) as client:
-        check_status, check_body, check_error, check_parsed = (
-            await post_ords_membership_check(
-                client,
-                check_url,
-                [
-                    (row_id, {"event_uid": event_uid}, connector_id, True)
-                    for row_id, event_uid, connector_id in claims
-                ],
+    async with _ords_request_lock:
+        if ords_circuit_is_open():
+            return
+        claims = claim_confirmed_membership_audit_batch(max(1, min(limit, 500)))
+        if not claims:
+            return
+        check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
+        async with httpx.AsyncClient(
+            timeout=settings.ords_timeout_seconds,
+            headers={
+                "X-API-Username": settings.ords_username,
+                "X-API-Password": settings.ords_password,
+            },
+        ) as client:
+            check_status, check_body, check_error, check_parsed = (
+                await post_ords_membership_check(
+                    client,
+                    check_url,
+                    [
+                        (row_id, {"event_uid": event_uid}, connector_id, True)
+                        for row_id, event_uid, connector_id in claims
+                    ],
+                )
             )
+        record_ords_route_result(
+            status=check_status,
+            transport_error=check_error,
         )
     requested = {event_uid for _row_id, event_uid, _connector_id in claims}
     missing = ords_membership_missing(check_status, check_body, requested)
@@ -1090,32 +1149,35 @@ async def deliver_ords_batch(
 ) -> None:
     if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
         return
-    claims = claim_ords_batch(max(1, limit))
-    if not claims:
-        return
-    base_url = settings.ords_base_url.rstrip("/")
-    url = base_url + "/raw-captures"
-    check_url = base_url + "/raw-captures/check"
-    semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
-    async with httpx.AsyncClient(
-        timeout=settings.ords_timeout_seconds,
-        headers={
-            "X-API-Username": settings.ords_username,
-            "X-API-Password": settings.ords_password,
-        },
-    ) as client:
-        retry_claims = [claim for claim in claims if claim[3]]
-        send_claims = [claim for claim in claims if not claim[3]]
-        confirmed_claim_ids: list[int] = []
-        membership_failure: tuple[int | None, str | None, bool] | None = None
-        if retry_claims:
+    async with _ords_request_lock:
+        if ords_circuit_is_open():
+            return
+        claims = claim_ords_batch(max(1, limit))
+        if not claims:
+            return
+        base_url = settings.ords_base_url.rstrip("/")
+        url = base_url + "/raw-captures"
+        check_url = base_url + "/raw-captures/check"
+        semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
+        route_results: list[tuple[int | None, str | None]] = []
+        async with httpx.AsyncClient(
+            timeout=settings.ords_timeout_seconds,
+            headers={
+                "X-API-Username": settings.ords_username,
+                "X-API-Password": settings.ords_password,
+            },
+        ) as client:
+            send_claims: list[tuple[int, dict, int, bool]] = []
+            confirmed_claim_ids: list[int] = []
+            membership_failure: tuple[int | None, str | None, bool] | None = None
             check_status, check_body, check_error, check_parsed = (
-                await post_ords_membership_check(client, check_url, retry_claims)
+                await post_ords_membership_check(client, check_url, claims)
             )
-            requested = {claim[1]["event_uid"] for claim in retry_claims}
+            route_results.append((check_status, check_error))
+            requested = {claim[1]["event_uid"] for claim in claims}
             missing = ords_membership_missing(check_status, check_body, requested)
             if missing is not None:
-                for claim in retry_claims:
+                for claim in claims:
                     if claim[1]["event_uid"] in missing:
                         send_claims.append(claim)
                     else:
@@ -1123,11 +1185,29 @@ async def deliver_ords_batch(
             elif check_status in {404, 405}:
                 # Backward compatibility while Oracle environments roll out the
                 # membership endpoint.
-                send_claims.extend(retry_claims)
+                send_claims.extend(claims)
             else:
                 membership_failure = (check_status, check_error, check_parsed)
-        results = await asyncio.gather(
-            *(post_ords_claim(client, semaphore, url, claim) for claim in send_claims)
+            results = await asyncio.gather(
+                *(post_ords_claim(client, semaphore, url, claim) for claim in send_claims)
+            )
+            route_results.extend((status, error) for _, _, status, _, error, _ in results)
+
+        responded_status = next(
+            (status for status, _error in route_results if status is not None),
+            None,
+        )
+        transport_error = next(
+            (
+                error
+                for status, error in route_results
+                if status is None and error is not None
+            ),
+            None,
+        )
+        record_ords_route_result(
+            status=responded_status,
+            transport_error=transport_error,
         )
     with session_scope() as session:
         for claimed_id in confirmed_claim_ids:
@@ -1138,7 +1218,7 @@ async def deliver_ords_batch(
             )
         if membership_failure is not None:
             failure_status, failure_error, failure_parsed = membership_failure
-            for claimed_id, _payload, _connector_id, _was_retry in retry_claims:
+            for claimed_id, _payload, _connector_id, _was_retry in claims:
                 apply_ords_membership_failure(
                     session,
                     claimed_id=claimed_id,
