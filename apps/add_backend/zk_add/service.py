@@ -450,6 +450,51 @@ def update_heartbeat(
             )
         if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
             auto_certify_zkt(session, connector, zkt)
+        history = zkt_payload.get("history_backfill")
+        if isinstance(history, dict):
+            history_state = str(history.get("state") or "NOT_STARTED").upper()
+            allowed_history_states = {
+                "NOT_STARTED",
+                "RUNNING",
+                "RETRYING",
+                "BLOCKED",
+                "COMPLETE",
+            }
+            if history_state not in allowed_history_states:
+                history_state = "NOT_STARTED"
+            try:
+                history_failed_windows = max(
+                    0, int(history.get("failed_windows") or 0)
+                )
+            except (TypeError, ValueError):
+                history_failed_windows = 0
+            zkt.capability_profile = {
+                **(zkt.capability_profile or {}),
+                "history_backfill_state": history_state,
+                "history_coverage_start_month": str(
+                    history.get("coverage_start_month") or ""
+                )[:7],
+                "history_cursor_month": str(history.get("cursor_month") or "")[:7],
+                "history_last_sweep_at": str(history.get("last_sweep_at") or "")[:40],
+                "history_failed_windows": history_failed_windows,
+            }
+            if history_state == "BLOCKED":
+                upsert_alert(
+                    session,
+                    connector,
+                    code="HISTORY_BACKFILL_BLOCKED",
+                    severity="HIGH",
+                    message=(
+                        "Historical attendance truth contains unresolved identity windows; "
+                        "Oracle replacement stayed fail-closed."
+                    ),
+                    details={
+                        "coverage_start_month": history.get("coverage_start_month"),
+                        "failed_windows": history_failed_windows,
+                    },
+                )
+            elif history_state in {"RUNNING", "RETRYING", "COMPLETE"}:
+                resolve_alert(session, connector, code="HISTORY_BACKFILL_BLOCKED")
     session.add(
         DeviceTelemetry(
             connector_id=connector.id,

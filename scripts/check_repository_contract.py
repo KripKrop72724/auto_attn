@@ -140,6 +140,17 @@ def main() -> int:
         problems.append("Oracle truth API must never embed a plaintext password constant")
     if "c_api_password_sha256" not in oracle_truth_api:
         problems.append("Oracle truth API must verify the password through a SHA-256 digest")
+    if "or v_api_version <> 2" not in oracle_truth_api:
+        problems.append("Oracle authoritative truth must require reconcile API v2")
+    for attestation in (
+        "v_terminal_event_count <> v_received",
+        "v_identity_mapped_count <> v_received",
+        "v_identity_map_complete <> 'true'",
+    ):
+        if attestation not in oracle_truth_api:
+            problems.append(
+                f"Oracle authoritative truth is missing completeness guard: {attestation}"
+            )
 
     logo = ROOT / "apps/add_frontend/public/state-life-logo.png"
     if not logo.is_file() or logo.stat().st_size < 1_000:

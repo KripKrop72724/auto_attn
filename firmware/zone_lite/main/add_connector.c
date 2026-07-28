@@ -1016,6 +1016,36 @@ static void heartbeat_task(void *arg)
             json_add_epoch(zkt_json, "stability_since", zkt.stability_since_epoch);
             json_add_epoch(zkt_json, "last_reconcile_at", zkt.last_reconcile_epoch);
             json_add_epoch(zkt_json, "next_restart_at", zkt.next_restart_epoch);
+            cJSON *history = cJSON_AddObjectToObject(zkt_json, "history_backfill");
+            cJSON_AddStringToObject(
+                history,
+                "state",
+                zkt.history_backfill_state[0] ? zkt.history_backfill_state : "NOT_STARTED");
+            if (zkt.history_cursor_year > 0 && zkt.history_cursor_month > 0) {
+                char cursor[24];
+                snprintf(
+                    cursor,
+                    sizeof(cursor),
+                    "%04ld-%02ld",
+                    (long)zkt.history_cursor_year,
+                    (long)zkt.history_cursor_month);
+                cJSON_AddStringToObject(history, "cursor_month", cursor);
+            }
+            if (zkt.history_oldest_year > 0 && zkt.history_oldest_month > 0) {
+                char oldest[24];
+                snprintf(
+                    oldest,
+                    sizeof(oldest),
+                    "%04ld-%02ld",
+                    (long)zkt.history_oldest_year,
+                    (long)zkt.history_oldest_month);
+                cJSON_AddStringToObject(history, "coverage_start_month", oldest);
+            }
+            json_add_epoch(history, "last_sweep_at", zkt.history_last_sweep_epoch);
+            cJSON_AddNumberToObject(
+                history,
+                "failed_windows",
+                zkt.history_failed_windows);
             char *json = cJSON_PrintUnformatted(payload);
             cJSON_Delete(payload);
             if (json) {

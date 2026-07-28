@@ -58,6 +58,13 @@ typedef struct {
     int64_t stability_since_epoch;
     int64_t last_reconcile_epoch;
     int64_t next_restart_epoch;
+    char history_backfill_state[24];
+    int32_t history_cursor_year;
+    int32_t history_cursor_month;
+    int32_t history_oldest_year;
+    int32_t history_oldest_month;
+    int64_t history_last_sweep_epoch;
+    uint32_t history_failed_windows;
 } add_zkt_telemetry_t;
 
 void add_connector_init(void);
