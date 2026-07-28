@@ -32,8 +32,10 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
 - Sends every authoritative Oracle month as independently attested daily windows with a dedicated
   45-second HTTPS deadline, keeping ORDS JSON parsing and delete/merge transactions bounded.
   A transport failure before any HTTP status receives one delayed fresh-transport retry; HTTP
-  responses are never retried. Retry/recovery/final-failure logs expose only the ESP error name,
-  trust source, bounded attempt counts, and window metadata.
+  responses are never retried. A status received before an ESP-IDF authentication-parser error is
+  preserved and classified as an HTTP/authentication failure, never as a TLS transport outage.
+  Retry/recovery/final-failure logs expose only the ESP error name, trust source, bounded attempt
+  counts, and window metadata.
   A failed day stops further Oracle requests for that pass while durable ADD enqueueing continues;
   sanitized status/window diagnostics are reported to ADD without response bodies or identities.
 - Accepts only ADD-audited historical user-ID aliases, stores their catalog encrypted, and uses it
@@ -135,7 +137,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current production version is `2.2.17`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.2.18`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 

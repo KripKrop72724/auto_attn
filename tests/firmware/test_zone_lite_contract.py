@@ -313,6 +313,9 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert "http_post_diagnostics_t diagnostics = {0};" in sender
     assert "http_post_json_with_timeout(" in sender
     assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" in sender
+    assert "int status = esp_http_client_get_status_code(client);" in source
+    assert "diagnostics->transport_error = status >= 0 ? ESP_OK : err;" in source
+    assert "if (status >= 0 && captured.data != NULL)" in source
     assert "status >= 0 ||" in sender
     assert "transport_cycles > ZONE_LITE_ORDS_RECONCILE_TRANSPORT_RETRIES" in sender
     assert '"ORDS_RECONCILE_TRANSPORT_RETRY"' in sender
@@ -324,6 +327,9 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert '"ORDS_RECONCILE_WINDOW_LIMIT"' in sender
     assert '"ORDS_RECONCILE_PAYLOAD_FAILED"' in sender
     assert '"ORDS_RECONCILE_ENDPOINT_MISSING"' in sender
+    assert '"ORDS_RECONCILE_AUTH_FAILED"' in sender
+    assert "status == 401 || status == 403" in sender
+    assert "HTTP responses are not retried" in sender
     assert '"ORDS_RECONCILE_REJECTED"' in sender
     assert '"ORDS_RECONCILE_RESPONSE_INVALID"' in sender
     assert '"ORDS_RECONCILE_HTTP_FAILED"' in sender
@@ -377,14 +383,50 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
     assert "identity_mapped_count != event_count" in sender
 
     attestation = oracle.index("if v_identity_map_complete <> 'true'")
-    destructive_delete = oracle.index(
-        "delete from hr_raw_attn_capture_events d", attestation
-    )
+    first_delete = oracle.index("delete from hr_raw_attn_capture_events d", attestation)
     assert "or v_api_version <> 2" in oracle
     assert "v_terminal_event_count <> v_received" in oracle
     assert "v_identity_mapped_count <> v_received" in oracle
-    assert "no destructive repair was performed" in oracle[attestation:destructive_delete]
-    assert attestation < destructive_delete
+    assert "no destructive repair was performed" in oracle[attestation:first_delete]
+    assert oracle.count(
+        "delete from hr_raw_attn_capture_events d\n         where 1 = 0"
+    ) == 2
+    assert attestation < first_delete
+
+
+def test_oracle_reconcile_auth_is_dual_verifier_and_non_destructive():
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_allow_fleet_auth_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "c_api_password_sha256 constant" in oracle
+    assert "c_fleet_api_password_sha256 constant" in oracle
+    assert "v_password_digest = c_api_password_sha256" in oracle
+    assert "v_password_digest = c_fleet_api_password_sha256" in oracle
+    assert "c_api_password constant varchar2" not in oracle
+    assert "c_fleet_api_password constant varchar2" not in oracle
+    assert "Non-destructive ZKT truth reconcile applied" in oracle
+    assert oracle.count(
+        "delete from hr_raw_attn_capture_events d\n         where 1 = 0"
+    ) == 2
+
+    assert "restore_original" in migration
+    assert "l_ddl_attempted" in migration
+    assert "REPLACE_WITH_FLEET_API_USERNAME" in migration
+    assert "REPLACE_WITH_FLEET_64_CHARACTER_SHA256_HEX" in migration
+    assert "c_fleet_api_password_sha256 constant" in migration
+    assert "v_password_digest = c_fleet_api_password_sha256" in migration
+    assert "where 1 = 0" in migration
+    assert "delete from hr_raw_attn_capture_events d" in migration
+    assert "insert into hr_raw_attn_capture_events" not in migration
+    assert "update hr_raw_attn_capture_events" not in migration
 
 
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():

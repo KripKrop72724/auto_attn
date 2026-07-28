@@ -4,13 +4,13 @@ set define off
   SLIC ZKT truth API for Oracle ORDS.
 
   Deployment notes:
-  - Replace c_api_password_sha256 with the uppercase SHA-256 hex digest of the
-    zone-agent password before running in Oracle. Never commit the password.
+  - Replace both password placeholders with uppercase SHA-256 hex digests and
+    the fleet username placeholder before running in Oracle. Never commit a
+    password or production verifier.
   - This script does not change HR_RAW_ATTN_CAPTURE_EVENTS table shape.
-  - The reconcile endpoint is intentionally authoritative inside the supplied
-    zone_id + device_serial + attendance-date window. API v2 rejects every
-    request unless terminal-event and complete identity-map attestations match
-    the submitted event array before any delete can run.
+  - Reconcile is additive and corrective but deliberately non-destructive.
+    API v2 rejects every request unless terminal-event and complete identity-map
+    attestations match the submitted event array before any repair can run.
 */
 
 create or replace package slic_zkt_truth_api authid definer as
@@ -29,6 +29,8 @@ end slic_zkt_truth_api;
 create or replace package body slic_zkt_truth_api as
     c_api_username constant varchar2(128) := 'slic_zone_agent';
     c_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_64_CHARACTER_SHA256_HEX';
+    c_fleet_api_username constant varchar2(128) := 'REPLACE_WITH_FLEET_API_USERNAME';
+    c_fleet_api_password_sha256 constant varchar2(64) := 'REPLACE_WITH_FLEET_64_CHARACTER_SHA256_HEX';
     c_attendance_timezone constant varchar2(64) := 'Asia/Karachi';
     c_max_reconcile_days constant number := 45;
 
@@ -114,6 +116,7 @@ create or replace package body slic_zkt_truth_api as
     procedure require_auth is
         v_username varchar2(512);
         v_password varchar2(1024);
+        v_password_digest varchar2(64);
 
         function password_sha256(p_value in varchar2) return varchar2 is
             v_digest varchar2(64);
@@ -135,10 +138,17 @@ create or replace package body slic_zkt_truth_api as
             owa_util.get_cgi_env('X-API-Password'),
             owa_util.get_cgi_env('x-api-password'));
 
-        if nvl(v_username, chr(0)) <> c_api_username
-           or password_sha256(
-                  nvl(v_password, chr(0))
-              ) <> c_api_password_sha256 then
+        v_password_digest := password_sha256(nvl(v_password, chr(0)));
+        if not (
+            (
+                nvl(v_username, chr(0)) = c_api_username
+                and v_password_digest = c_api_password_sha256
+            )
+            or (
+                nvl(v_username, chr(0)) = c_fleet_api_username
+                and v_password_digest = c_fleet_api_password_sha256
+            )
+        ) then
             fail_and_stop(
                 p_status => 401,
                 p_message => 'Invalid API credentials',
@@ -712,7 +722,8 @@ create or replace package body slic_zkt_truth_api as
         end if;
 
         delete from hr_raw_attn_capture_events d
-         where d.zone_id = v_zone_id
+         where 1 = 0
+           and d.zone_id = v_zone_id
            and coalesce(d.device_serial, 'unknown') = v_device_serial
            and d.attendance_date between v_window_start and v_window_end
            and exists (
@@ -754,7 +765,8 @@ create or replace package body slic_zkt_truth_api as
         v_corrected := sql%rowcount;
 
         delete from hr_raw_attn_capture_events d
-         where d.zone_id = v_zone_id
+         where 1 = 0
+           and d.zone_id = v_zone_id
            and coalesce(d.device_serial, 'unknown') = v_device_serial
            and d.attendance_date between v_window_start and v_window_end
            and not exists (
@@ -934,7 +946,7 @@ create or replace package body slic_zkt_truth_api as
         send_metrics(
             p_status => 200,
             p_success => true,
-            p_message => 'Authoritative ZKT truth reconcile applied',
+            p_message => 'Non-destructive ZKT truth reconcile applied',
             p_received_count => v_received,
             p_inserted_count => v_inserted,
             p_deleted_count => v_deleted,
