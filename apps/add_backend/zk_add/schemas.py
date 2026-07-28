@@ -273,6 +273,29 @@ class IdentityConflictRevokeRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class HistoricalIdentityAliasRequest(BaseModel):
+    source_user_id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    source_cnic: str = Field(min_length=13, max_length=15)
+    target_user_key: str = Field(min_length=1, max_length=36)
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("source_cnic")
+    @classmethod
+    def validate_source_cnic(cls, value: str) -> str:
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("Historical source CNIC must contain exactly 13 digits")
+        return digits
+
+
 class AdminLeaseRequest(BaseModel):
     uid: str
     idempotency_key: str = Field(min_length=8, max_length=120)

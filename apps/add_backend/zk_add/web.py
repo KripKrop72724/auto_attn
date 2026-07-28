@@ -62,6 +62,7 @@ from zk_add.schemas import (
     CommandUpdate,
     Envelope,
     HeartbeatPayload,
+    HistoricalIdentityAliasRequest,
     IdentityConflictResolveRequest,
     IdentityConflictRevokeRequest,
     LoginRequest,
@@ -96,6 +97,7 @@ from zk_add.service import (
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
     fleet_counts,
@@ -132,6 +134,26 @@ def get_db():
         raise
     finally:
         session.close()
+
+
+def identity_catalog_payload(db: Session, connector: Connector) -> dict:
+    rows = []
+    if connector.zkt_device:
+        for item in db.scalars(
+            select(IdentityTombstone)
+            .where(IdentityTombstone.zkt_device_id == connector.zkt_device.id)
+            .order_by(IdentityTombstone.id.asc())
+        ).all():
+            rows.append(
+                {
+                    "uid": item.uid,
+                    "user_id": item.user_id,
+                    "display_name": decrypt_text(item.display_name_encrypted),
+                    "cnic": decrypt_cnic(item.cnic_encrypted),
+                    "shift_worker": item.shift_worker,
+                }
+            )
+    return {"schema_version": "2", "type": "identity_catalog", "rows": rows}
 
 
 @asynccontextmanager
@@ -677,6 +699,73 @@ def revoke_resolved_identity_conflict(
     return {
         "resolution": serialize_identity_resolution(resolution),
         "report": build_identity_conflict_report(db, zkt=zkt),
+    }
+
+
+@app.post("/api/v2/devices/{connector_id}/identity-aliases", status_code=201)
+async def create_identity_alias(
+    connector_id: str,
+    body: HistoricalIdentityAliasRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    target_user = db.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == body.target_user_key,
+        )
+    )
+    if target_user is None:
+        raise HTTPException(status_code=404, detail="Target terminal user not found.")
+    if target_user.row_version != body.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Target user changed since it was selected. Refresh and retry.",
+        )
+    expected_confirmation = f"{body.source_user_id} -> {target_user.user_id}"
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Typed confirmation must exactly match {expected_confirmation}.",
+        )
+    try:
+        tombstone, repaired = create_historical_identity_alias(
+            db,
+            connector=connector,
+            source_user_id=body.source_user_id,
+            source_cnic=body.source_cnic,
+            target_user=target_user,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(connector)
+    payload = identity_catalog_payload(db, connector)
+    delivered = await connector_hub.send(connector.connector_id, payload)
+    await browser_events.publish(
+        "identity_alias",
+        {
+            "connector_id": connector.connector_id,
+            "source_user_id": body.source_user_id,
+            "repaired_events": repaired,
+        },
+    )
+    return {
+        "ok": True,
+        "alias_id": tombstone.id,
+        "source_user_id": tombstone.user_id,
+        "target_user_key": target_user.user_key,
+        "target_user_id": target_user.user_id,
+        "repaired_events": repaired,
+        "catalog_delivered": delivered,
     }
 
 
@@ -1388,25 +1477,12 @@ async def device_stream(websocket: WebSocket):
     await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
-        rows = []
-        if connector and connector.zkt_device:
-            for item in db.scalars(
-                select(IdentityTombstone)
-                .where(IdentityTombstone.zkt_device_id == connector.zkt_device.id)
-                .order_by(IdentityTombstone.id.asc())
-            ).all():
-                rows.append(
-                    {
-                        "uid": item.uid,
-                        "user_id": item.user_id,
-                        "display_name": decrypt_text(item.display_name_encrypted),
-                        "cnic": decrypt_cnic(item.cnic_encrypted),
-                        "shift_worker": item.shift_worker,
-                    }
-                )
-    await websocket.send_json(
-        {"schema_version": "2", "type": "identity_catalog", "rows": rows}
-    )
+        catalog = identity_catalog_payload(db, connector) if connector else {
+            "schema_version": "2",
+            "type": "identity_catalog",
+            "rows": [],
+        }
+    await websocket.send_json(catalog)
     await send_pending_commands(connector_id)
     try:
         while True:
