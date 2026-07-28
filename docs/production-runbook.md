@@ -139,12 +139,24 @@ those rows intentionally do not enter the ORDS outbox until identity is repaired
 only one open alert per connector and condition code; repeated observations update that alert rather
 than flooding the operations queue.
 
+Firmware-reported Oracle receipts are hints, not final delivery proof. ADD places every such event in
+`FIRMWARE_RECEIPT_UNVERIFIED`, checks up to 500 immutable event UIDs at a time through
+`raw-captures/check`, and promotes only Oracle-present rows to `ACKED_CHECK`. A missing UID is
+automatically returned to `PENDING`, its provisional confirmation fields are cleared, and the
+preserved event is delivered through the normal idempotent outbox. A membership-check outage leaves
+the row visibly unverified with bounded backoff. Late firmware receipts cannot downgrade an
+`ACKED`/`ACKED_CHECK` row. This audit also consumes legacy `ACKED_FIRMWARE` rows after deployment, so
+historic false acknowledgements become self-repairing as soon as the Oracle route is available.
+ADD also rechecks every independently confirmed UID at least once per day. A transient recheck
+failure retains the last known proof while exposing a retrying membership state; if Oracle reports
+the UID missing, ADD clears the stale confirmation and requeues its immutable event automatically.
+
 Every deployment records credential-free DNS, TCP 443, and `OPTIONS` reachability from the Windows
-runner host, `OPTIONS` reachability from the running API container, and boolean proxy-presence signals.
-The probe never sends credentials or prints a response body. It is warning-only because a route outage
-must not roll back an otherwise healthy ADD release. A degraded route remains visible as
-`ORDS_DELIVERY_FAILED`; queued attendance is retained and retried with bounded backoff while network
-routing is repaired.
+runner host, the resolved Oracle destination addresses, the runner's public egress address, `OPTIONS`
+reachability from the running API container, and boolean proxy-presence signals. The probe never sends
+credentials or prints a response body. It is warning-only because a route outage must not roll back an
+otherwise healthy ADD release. A degraded route remains visible as `ORDS_DELIVERY_FAILED`; queued
+attendance is retained and retried with bounded backoff while network routing is repaired.
 
 Interpret deployment probe results in this order:
 

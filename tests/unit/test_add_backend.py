@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from zk_add.crypto import decrypt_cnic, decrypt_json, decrypt_text
-from zk_add.db import Base
+from zk_add.db import Base, SessionLocal
 from zk_add.identity import build_machine_name
 from zk_add.identity_conflicts import (
     build_identity_conflict_report,
@@ -81,7 +81,15 @@ from zk_add.web import app, get_db
 from zk_add.worker import (
     ORDS_DELIVERY_BATCH_SIZE,
     ORDS_DELIVERY_CONCURRENCY,
+    ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
+    apply_confirmed_membership_audit_failure,
+    apply_confirmed_membership_missing,
+    apply_firmware_receipt_audit_failure,
+    apply_firmware_receipt_missing,
+    apply_ords_confirmation,
     apply_ords_delivery_result,
+    claim_confirmed_membership_audit_batch,
+    claim_firmware_receipt_audit_batch,
     event_uid_is_valid,
     ords_delivery_metrics,
     ords_delivery_succeeded,
@@ -100,6 +108,7 @@ def test_ords_delivery_defaults_drain_retry_backlog_in_bounded_batches():
     assert ORDS_DELIVERY_BATCH_SIZE == 100
     assert 1 <= ORDS_DELIVERY_CONCURRENCY <= ORDS_DELIVERY_BATCH_SIZE
     assert ORDS_DELIVERY_BATCH_SIZE <= 500
+    assert 1 <= ORDS_FIRMWARE_AUDIT_BATCH_SIZE <= 500
 
 
 @pytest.fixture()
@@ -1669,10 +1678,11 @@ def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Sessio
     first_outbox = db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == first.id)
     )
-    assert first.ords_status == "ACKED_FIRMWARE"
-    assert first.oracle_confirmation_path == "FIRMWARE_RECONCILE"
-    assert ensure_utc(first.oracle_confirmed_at) == observed_at
-    assert first_outbox.status == "ACKED_FIRMWARE"
+    assert first.ords_status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    assert first.oracle_confirmation_path is None
+    assert first.oracle_confirmed_at is None
+    assert first_outbox.status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    assert first_outbox.acknowledged_at is None
     assert receipt.attendance_event_id == first.id
 
     ingest_attendance(
@@ -1694,8 +1704,9 @@ def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Sessio
         ),
     )
     assert (applied, awaiting, rejected) == (1, 0, 0)
-    assert second.ords_status == "ACKED_FIRMWARE"
-    assert second.oracle_confirmation_path == "FIRMWARE_LIVE"
+    assert second.ords_status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    assert second.oracle_confirmation_path is None
+    assert second.oracle_confirmed_at is None
 
     record_oracle_receipts(
         db,
@@ -1704,9 +1715,243 @@ def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Sessio
     )
     assert receipt.observation_count == 2
     metrics = ords_delivery_metrics(db)
-    assert metrics["backlog"] == 0
-    assert metrics["acknowledged"] == 2
-    assert metrics["acknowledged_firmware"] == 2
+    assert metrics["backlog"] == 2
+    assert metrics["acknowledged"] == 0
+    assert metrics["acknowledged_firmware"] == 0
+    assert metrics["firmware_unverified"] == 2
+
+
+def test_firmware_receipts_require_oracle_proof_and_missing_events_are_requeued(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    observed_at = utc_now()
+    event_uids = ["a" * 64, "b" * 64]
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid=event_uid) for event_uid in event_uids],
+    )
+    record_oracle_receipts(
+        db,
+        connector=connector,
+        batch=OracleReceiptBatchRequest(
+            confirmation_path="FIRMWARE_RECONCILE",
+            oracle_observed_at=observed_at,
+            event_uids=event_uids,
+        ),
+    )
+    rows = db.scalars(
+        select(AttendanceEvent).order_by(AttendanceEvent.event_uid.asc())
+    ).all()
+    outboxes = db.scalars(
+        select(OrdsOutbox).order_by(OrdsOutbox.id.asc())
+    ).all()
+    for row, outbox in zip(rows, outboxes, strict=True):
+        row.ords_status = "FIRMWARE_RECEIPT_VERIFYING"
+        outbox.status = "FIRMWARE_RECEIPT_VERIFYING"
+        outbox.attempt_count = 1
+
+    apply_firmware_receipt_missing(db, claimed_id=outboxes[0].id)
+    apply_ords_confirmation(
+        db,
+        claimed_id=outboxes[1].id,
+        path="FIRMWARE_RECEIPT_MEMBERSHIP_CHECK",
+    )
+
+    assert outboxes[0].status == "PENDING"
+    assert outboxes[0].next_attempt_at is not None
+    assert outboxes[0].last_error == "FIRMWARE_RECEIPT_NOT_IN_ORACLE"
+    assert rows[0].ords_status == "PENDING"
+    assert rows[0].oracle_confirmed_at is None
+    assert rows[0].oracle_confirmation_path is None
+    assert outboxes[1].status == "ACKED_CHECK"
+    assert rows[1].ords_status == "ACKED_CHECK"
+    assert rows[1].oracle_confirmation_path == (
+        "FIRMWARE_RECEIPT_MEMBERSHIP_CHECK"
+    )
+    assert rows[1].oracle_confirmed_at is not None
+    metrics = ords_delivery_metrics(db)
+    assert metrics["backlog"] == 1
+    assert metrics["acknowledged"] == 1
+    assert metrics["firmware_unverified"] == 0
+
+
+def test_legacy_firmware_ack_is_claimed_for_bounded_membership_audit(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    event_uid = "d" * 64
+    ingest_attendance(db, connector=connector, events=[event(event_uid=event_uid)])
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+    )
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    )
+    attendance.ords_status = "ACKED_FIRMWARE"
+    outbox.status = "ACKED_FIRMWARE"
+    outbox.acknowledged_at = utc_now()
+    db.commit()
+
+    previous_bind = SessionLocal.kw.get("bind")
+    SessionLocal.configure(bind=db.get_bind())
+    try:
+        claims = claim_firmware_receipt_audit_batch(limit=1)
+        assert claims == [(outbox.id, event_uid, connector.id)]
+        with SessionLocal() as verification:
+            claimed_outbox = verification.get(OrdsOutbox, outbox.id)
+            claimed_event = verification.get(AttendanceEvent, attendance.id)
+            assert claimed_outbox.status == "FIRMWARE_RECEIPT_VERIFYING"
+            assert claimed_outbox.attempt_count == 1
+            assert claimed_outbox.last_attempt_at is not None
+            assert claimed_event.ords_status == "FIRMWARE_RECEIPT_VERIFYING"
+    finally:
+        SessionLocal.configure(bind=previous_bind)
+
+
+def test_firmware_receipt_audit_failure_stays_unverified_and_late_receipt_cannot_downgrade_direct_proof(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    event_uid = "c" * 64
+    ingest_attendance(db, connector=connector, events=[event(event_uid=event_uid)])
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+    )
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    )
+    outbox.status = "FIRMWARE_RECEIPT_VERIFYING"
+    outbox.attempt_count = 1
+    attendance.ords_status = "FIRMWARE_RECEIPT_VERIFYING"
+    apply_firmware_receipt_audit_failure(
+        db,
+        claimed_id=outbox.id,
+        status=None,
+        transport_error="ConnectTimeout",
+        response_parsed=False,
+    )
+    assert outbox.status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    assert outbox.last_error == "FIRMWARE_CHECK_TRANSPORT_CONNECTTIMEOUT"
+    assert outbox.next_attempt_at is not None
+    assert attendance.ords_status == "FIRMWARE_RECEIPT_UNVERIFIED"
+
+    apply_ords_delivery_result(
+        db,
+        claimed_id=outbox.id,
+        status=201,
+        body={"success": True},
+        transport_error=None,
+        response_parsed=True,
+    )
+    direct_confirmed_at = attendance.oracle_confirmed_at
+    record_oracle_receipts(
+        db,
+        connector=connector,
+        batch=OracleReceiptBatchRequest(
+            confirmation_path="FIRMWARE_LIVE",
+            oracle_observed_at=utc_now(),
+            event_uids=[event_uid],
+        ),
+    )
+    assert outbox.status == "ACKED"
+    assert attendance.ords_status == "ACKED"
+    assert attendance.oracle_confirmation_path == "ADD_DELIVERY"
+    assert attendance.oracle_confirmed_at == direct_confirmed_at
+
+
+def test_confirmed_events_are_periodically_reverified_and_requeued_if_missing(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    event_uid = "e" * 64
+    ingest_attendance(db, connector=connector, events=[event(event_uid=event_uid)])
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+    )
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    )
+    old_confirmation = utc_now() - timedelta(days=2)
+    attendance.ords_status = "ACKED"
+    attendance.oracle_confirmed_at = old_confirmation
+    attendance.oracle_confirmation_path = "ADD_DELIVERY"
+    outbox.status = "ACKED"
+    outbox.acknowledged_at = old_confirmation
+    outbox.last_attempt_at = old_confirmation
+    db.commit()
+
+    previous_bind = SessionLocal.kw.get("bind")
+    previous_interval = settings.ords_membership_reverify_seconds
+    SessionLocal.configure(bind=db.get_bind())
+    settings.ords_membership_reverify_seconds = 60
+    try:
+        claims = claim_confirmed_membership_audit_batch(limit=1)
+        assert claims == [(outbox.id, event_uid, connector.id)]
+        with SessionLocal() as verification:
+            claimed_outbox = verification.get(OrdsOutbox, outbox.id)
+            claimed_event = verification.get(AttendanceEvent, attendance.id)
+            assert claimed_outbox.status == "MEMBERSHIP_REVERIFYING"
+            assert claimed_event.ords_status == "MEMBERSHIP_REVERIFYING"
+            assert ensure_utc(claimed_event.oracle_confirmed_at) == ensure_utc(
+                old_confirmation
+            )
+    finally:
+        settings.ords_membership_reverify_seconds = previous_interval
+        SessionLocal.configure(bind=previous_bind)
+
+    db.expire_all()
+    apply_confirmed_membership_missing(db, claimed_id=outbox.id)
+    missing_outbox = db.get(OrdsOutbox, outbox.id)
+    missing_event = db.get(AttendanceEvent, attendance.id)
+    assert missing_outbox.status == "PENDING"
+    assert missing_outbox.last_error == "CONFIRMED_EVENT_MISSING_FROM_ORACLE"
+    assert missing_event.ords_status == "PENDING"
+    assert missing_event.oracle_confirmed_at is None
+    assert missing_event.oracle_confirmation_path is None
+
+
+def test_periodic_membership_transport_failure_preserves_last_known_proof(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    event_uid = "f" * 64
+    ingest_attendance(db, connector=connector, events=[event(event_uid=event_uid)])
+    attendance = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+    )
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
+    )
+    confirmed_at = utc_now() - timedelta(days=1)
+    attendance.ords_status = "MEMBERSHIP_REVERIFYING"
+    attendance.oracle_confirmed_at = confirmed_at
+    attendance.oracle_confirmation_path = "ADD_DELIVERY"
+    outbox.status = "MEMBERSHIP_REVERIFYING"
+    outbox.attempt_count = 2
+
+    apply_confirmed_membership_audit_failure(
+        db,
+        claimed_id=outbox.id,
+        status=None,
+        transport_error="ConnectTimeout",
+        response_parsed=False,
+    )
+
+    assert outbox.status == "MEMBERSHIP_REVERIFY_RETRY"
+    assert outbox.last_error == "REVERIFY_TRANSPORT_CONNECTTIMEOUT"
+    assert outbox.next_attempt_at is not None
+    assert attendance.ords_status == "MEMBERSHIP_REVERIFY_RETRY"
+    assert ensure_utc(attendance.oracle_confirmed_at) == ensure_utc(confirmed_at)
+    assert attendance.oracle_confirmation_path == "ADD_DELIVERY"
+    metrics = ords_delivery_metrics(db)
+    assert metrics["backlog"] == 1
+    assert metrics["membership_reverify"] == 1
+    assert metrics["acknowledged"] == 0
 
 
 def test_oracle_receipt_batch_uses_one_flush_for_one_hundred_events(db: Session):
@@ -1750,7 +1995,7 @@ def test_oracle_receipt_batch_uses_one_flush_for_one_hundred_events(db: Session)
     assert db.scalar(
         select(func.count())
         .select_from(AttendanceEvent)
-        .where(AttendanceEvent.ords_status == "ACKED_FIRMWARE")
+        .where(AttendanceEvent.ords_status == "FIRMWARE_RECEIPT_UNVERIFIED")
     ) == 100
 
 

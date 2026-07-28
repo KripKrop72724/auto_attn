@@ -149,6 +149,8 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
           acknowledged_add: 24,
           acknowledged_check: 0,
           acknowledged_firmware: 0,
+          firmware_unverified: 0,
+          membership_reverify: 0,
           oldest_backlog_at: '2026-07-13T12:00:00Z',
           last_attempt_at: '2026-07-13T12:05:00Z',
         },

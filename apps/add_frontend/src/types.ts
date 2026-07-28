@@ -90,6 +90,8 @@ export interface Overview {
     acknowledged_add: number
     acknowledged_check: number
     acknowledged_firmware: number
+    firmware_unverified: number
+    membership_reverify: number
     oldest_backlog_at: string | null
     last_attempt_at: string | null
   }
