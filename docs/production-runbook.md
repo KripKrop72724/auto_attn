@@ -35,7 +35,10 @@ encrypted secret `ADD_ENV_FILE_CONTENT` for initial bootstrap. The deploy script
 validated copy under ProgramData with ACLs limited to SYSTEM, Administrators, and NETWORK SERVICE.
 For an existing environment that predates automatic onboarding, configure the repository secret
 `ADD_FLEET_ROOT_SECRET` separately. The runner injects only that value into the protected file and
-preserves the existing PostgreSQL, PII, administrator, and ORDS secrets.
+preserves the existing PostgreSQL and PII secrets. Configure the `add-production` environment
+secrets `ADD_ORDS_USERNAME` and `ADD_ORDS_PASSWORD`; every deployment injects those approved Oracle
+credentials into the protected file so a stale host copy cannot silently restore an obsolete
+verifier.
 The optional `ADD_ADMIN_PASSWORD_HASH` repository secret similarly enforces the approved Argon2id
 administrator verifier without placing the password in the workflow or checkout.
 
@@ -77,16 +80,19 @@ The workflow intentionally does not grant itself repository-administration permi
 `deploy/add/deploy.ps1` performs the following without printing environment values:
 
 1. verifies checkout SHA and required production settings;
-2. protects `C:\ProgramData\StateLife\AttendanceDeviceDashboard` ACLs;
-3. backs up the previous protected env and tags both current application images;
-4. starts durable dependencies and writes a binary-safe PostgreSQL custom-format dump;
-5. validates Compose, pulls bases, and builds the exact checkout;
-6. starts the stack and waits for Compose health, API readiness, and independent UI health;
-7. records commit, Alembic revisions, image IDs, env hash, and backup path—never secrets;
-8. keeps fourteen days of local backups.
+2. makes a read-only authenticated `raw-captures/check` request from the ADD host;
+3. protects `C:\ProgramData\StateLife\AttendanceDeviceDashboard` ACLs;
+4. backs up the previous protected env and tags both current application images;
+5. starts durable dependencies and writes a binary-safe PostgreSQL custom-format dump;
+6. validates Compose, pulls bases, and builds the exact checkout;
+7. starts the stack and waits for Compose health, API readiness, and independent UI health;
+8. repeats the authenticated membership probe inside the running API container, using the exact
+   environment visible to the worker;
+9. records commit, Alembic revisions, image IDs, env hash, and backup path—never secrets;
+10. keeps fourteen days of local backups.
 
 An Ubuntu runner then verifies TLS and both public domains. A deployment is reported successful only
-when local and public checks pass.
+when both authenticated Oracle gates and the local/public application checks pass.
 
 ## Automatic rollback
 
@@ -166,6 +172,11 @@ reachability from the running API container, and boolean proxy-presence signals.
 credentials or prints a response body. It is warning-only because a route outage must not roll back an
 otherwise healthy ADD release. A degraded route remains visible as `ORDS_DELIVERY_FAILED`; queued
 attendance is retained and retried with bounded backoff while network routing is repaired.
+
+The earlier authenticated membership probes are different: they send the configured credentials
+only to the canonical internal Oracle endpoint, submit one synthetic event UID, perform no table
+DML, validate the bounded response contract, and never print a credential or response body. An HTTP
+authorization failure is release-blocking and triggers the normal transactional rollback.
 
 Interpret deployment probe results in this order:
 

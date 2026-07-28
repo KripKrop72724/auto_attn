@@ -162,6 +162,113 @@ function Wait-Endpoint {
     throw "Health check did not become ready: $Uri"
 }
 
+function Assert-OrdsAuthentication {
+    param(
+        [Parameter(Mandatory = $true)][string] $BaseUrl,
+        [Parameter(Mandatory = $true)][string] $Username,
+        [Parameter(Mandatory = $true)][string] $Password
+    )
+
+    $probeEventUid = "7f19a5f6c2d038b37cd20d91d18df7282d27b673a90170ce21c3e44a9bf4be21"
+    $headers = @{
+        "X-API-Username" = $Username
+        "X-API-Password" = $Password
+    }
+    $body = @{
+        event_uids = @($probeEventUid)
+    } | ConvertTo-Json -Compress
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        $response = Invoke-WebRequest `
+            -UseBasicParsing `
+            -Method Post `
+            -Uri ($BaseUrl.TrimEnd("/") + "/raw-captures/check") `
+            -Headers $headers `
+            -ContentType "application/json" `
+            -Body $body `
+            -TimeoutSec 15
+    } catch {
+        $status = $null
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $status = [int]$_.Exception.Response.StatusCode
+        }
+        if ($status) {
+            throw "Oracle membership authentication failed with HTTP $status."
+        }
+        throw "Oracle membership authentication failed before an HTTP response ($($_.Exception.GetType().Name))."
+    }
+
+    if ($response.StatusCode -ne 200) {
+        throw "Oracle membership authentication returned unexpected HTTP $($response.StatusCode)."
+    }
+    try {
+        $result = $response.Content | ConvertFrom-Json
+    } catch {
+        throw "Oracle membership authentication returned an invalid JSON response."
+    }
+    if (
+        $result.success -ne $true -or
+        [int]$result.received_count -ne 1 -or
+        [int]$result.existing_count + [int]$result.missing_count -ne 1
+    ) {
+        throw "Oracle membership authentication returned an invalid response contract."
+    }
+    Write-Host "Authenticated Oracle membership probe passed from the ADD host."
+}
+
+function Assert-OrdsContainerAuthentication {
+    $probe = @'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+probe_uid = "7f19a5f6c2d038b37cd20d91d18df7282d27b673a90170ce21c3e44a9bf4be21"
+url = os.environ["ADD_ORDS_BASE_URL"].rstrip("/") + "/raw-captures/check"
+request = urllib.request.Request(
+    url,
+    data=json.dumps({"event_uids": [probe_uid]}).encode("utf-8"),
+    headers={
+        "Content-Type": "application/json",
+        "X-API-Username": os.environ["ADD_ORDS_USERNAME"],
+        "X-API-Password": os.environ["ADD_ORDS_PASSWORD"],
+    },
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        status = response.status
+        payload = json.load(response)
+except urllib.error.HTTPError as exc:
+    print(f"ORDS_AUTH_HTTP_{exc.code}")
+    sys.exit(1)
+except Exception as exc:
+    print(f"ORDS_AUTH_ERROR_{type(exc).__name__}")
+    sys.exit(1)
+
+valid = (
+    status == 200
+    and payload.get("success") is True
+    and payload.get("received_count") == 1
+    and payload.get("existing_count", -1) + payload.get("missing_count", -1) == 1
+)
+if not valid:
+    print("ORDS_AUTH_INVALID_RESPONSE")
+    sys.exit(1)
+print("ORDS_AUTH_OK")
+'@
+    $probeEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
+    $probeLauncher = "import base64;exec(base64.b64decode('$probeEncoded'))"
+    $result = Invoke-Docker -Arguments ($compose + @(
+        "exec", "-T", "add-api", "python", "-c", $probeLauncher
+    )) -Capture
+    if (@($result -split "\r?\n") -notcontains "ORDS_AUTH_OK") {
+        throw "Authenticated Oracle membership probe failed inside the ADD container."
+    }
+    Write-Host "Authenticated Oracle membership probe passed inside the ADD container."
+}
+
 function Protect-StateDirectory {
     param([Parameter(Mandatory = $true)][string] $Path)
 
@@ -216,6 +323,12 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FLEET_ROOT_SECRET)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ADMIN_PASSWORD_HASH)) {
     $environment["ADD_ADMIN_PASSWORD_HASH"] = $env:ADD_DEPLOY_ADMIN_PASSWORD_HASH
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ORDS_USERNAME)) {
+    $environment["ADD_ORDS_USERNAME"] = $env:ADD_DEPLOY_ORDS_USERNAME
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ORDS_PASSWORD)) {
+    $environment["ADD_ORDS_PASSWORD"] = $env:ADD_DEPLOY_ORDS_PASSWORD
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED)) {
     $environment["ADD_FIRMWARE_OTA_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED
@@ -283,6 +396,10 @@ if ($environment["ADD_PUBLIC_DEVICE_WS_URL"] -ne "wss://autoattn.slichealth.com/
 if ($environment["ADD_ORDS_BASE_URL"] -ne "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event") {
     throw "ADD_ORDS_BASE_URL must use the validated internal production raw attendance capture endpoint."
 }
+Assert-OrdsAuthentication `
+    -BaseUrl $environment["ADD_ORDS_BASE_URL"] `
+    -Username $environment["ADD_ORDS_USERNAME"] `
+    -Password $environment["ADD_ORDS_PASSWORD"]
 
 $stateRoot = if ($env:ADD_DEPLOY_STATE_DIR) {
     $env:ADD_DEPLOY_STATE_DIR
@@ -359,6 +476,7 @@ try {
         Invoke-Docker -Arguments ($compose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "240"))
         Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
         Wait-Endpoint -Uri "http://127.0.0.1:8095/health/ui"
+        Assert-OrdsContainerAuthentication
         $postRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
         if (-not $postRevision) { throw "Alembic schema revision is unavailable after deployment." }
 
