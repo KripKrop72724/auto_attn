@@ -65,6 +65,7 @@ from zk_add.service import (
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_historical_directory_identity,
     create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
@@ -526,6 +527,135 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
     )
     assert replay.id == alias.id
     assert replay_repaired == 0
+
+
+def test_historical_directory_identity_repairs_deleted_service_number_user(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    source = snapshot_user(
+        db,
+        connector,
+        uid="7",
+        user_id="03981",
+        name="Hamza Nawab",
+    )
+    source.present = False
+    source.lifecycle_state = "DELETED"
+    source.deleted_at = utc_now()
+    db.flush()
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="d" * 64,
+                user_id="03981",
+                raw_name="Hamza Nawab",
+            )
+        ],
+    )
+    assert accepted == ["d" * 64]
+    assert duplicates == []
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "d" * 64)
+    )
+    assert blocked is not None
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
+
+    with pytest.raises(ValueError, match="service number"):
+        create_historical_directory_identity(
+            db,
+            connector=connector,
+            source_user=source,
+            source_cnic=CNIC,
+            directory_employee_id="5294",
+            directory_service_number="3982",
+            directory_employee_name="Hamza Nawab",
+            directory_zone_code="75",
+            expected_version=source.row_version,
+            reason="Reject mismatched directory evidence.",
+            idempotency_key="directory-mismatch",
+            actor="StateHealthAdmin",
+        )
+
+    tombstone, repaired = create_historical_directory_identity(
+        db,
+        connector=connector,
+        source_user=source,
+        source_cnic=CNIC,
+        directory_employee_id="5294",
+        directory_service_number="3981",
+        directory_employee_name="Hamza Nawab",
+        directory_zone_code="75",
+        expected_version=source.row_version,
+        reason="Exact HR service number and employee name verified.",
+        idempotency_key="directory-verified",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+    assert repaired == 1
+    assert tombstone.device_user_id == source.id
+    assert decrypt_cnic(tombstone.cnic_encrypted) == CNIC
+    assert decrypt_cnic(source.cnic_encrypted) == CNIC
+    assert blocked.identity_resolution_status == "RESOLVED_DIRECTORY_EVIDENCE"
+    assert blocked.identity_repair_reason == "VERIFIED_HR_DIRECTORY_EVIDENCE"
+    assert blocked.ords_status == "PENDING"
+    assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == blocked.id)
+    )
+    assert outbox is not None
+    assert outbox.status == "PENDING"
+
+    replay, replay_repaired = create_historical_directory_identity(
+        db,
+        connector=connector,
+        source_user=source,
+        source_cnic=CNIC,
+        directory_employee_id="5294",
+        directory_service_number="03981",
+        directory_employee_name="Hamza Nawab",
+        directory_zone_code="75",
+        expected_version=source.row_version,
+        reason="Idempotent directory evidence retry.",
+        idempotency_key="directory-verified",
+        actor="StateHealthAdmin",
+    )
+    assert replay.id == tombstone.id
+    assert replay_repaired == 0
+
+
+def test_historical_directory_identity_rejects_name_only_match(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    source = snapshot_user(
+        db,
+        connector,
+        uid="7",
+        user_id="03981",
+        name="Hamza Nawab",
+    )
+    source.present = False
+    source.lifecycle_state = "DELETED"
+    db.flush()
+
+    with pytest.raises(ValueError, match="employee name"):
+        create_historical_directory_identity(
+            db,
+            connector=connector,
+            source_user=source,
+            source_cnic=CNIC,
+            directory_employee_id="5294",
+            directory_service_number="3981",
+            directory_employee_name="Another Employee",
+            directory_zone_code="75",
+            expected_version=source.row_version,
+            reason="A service number alone must not override a name mismatch.",
+            idempotency_key="directory-name-mismatch",
+            actor="StateHealthAdmin",
+        )
 
 
 def test_verified_tombstone_requeues_existing_blocked_punches(

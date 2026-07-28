@@ -62,6 +62,7 @@ from zk_add.schemas import (
     CommandUpdate,
     Envelope,
     HeartbeatPayload,
+    HistoricalDirectoryIdentityRequest,
     HistoricalIdentityAliasRequest,
     IdentityConflictResolveRequest,
     IdentityConflictRevokeRequest,
@@ -97,6 +98,7 @@ from zk_add.service import (
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_historical_directory_identity,
     create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
@@ -764,6 +766,76 @@ async def create_identity_alias(
         "source_user_id": tombstone.user_id,
         "target_user_key": target_user.user_key,
         "target_user_id": target_user.user_id,
+        "repaired_events": repaired,
+        "catalog_delivered": delivered,
+    }
+
+
+@app.post(
+    "/api/v2/devices/{connector_id}/historical-identities/resolve",
+    status_code=201,
+)
+async def resolve_historical_directory_identity(
+    connector_id: str,
+    body: HistoricalDirectoryIdentityRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    source_user = db.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == body.source_user_key,
+        )
+    )
+    if source_user is None:
+        raise HTTPException(status_code=404, detail="Historical terminal user not found.")
+    expected_confirmation = (
+        f"{source_user.user_id} -> HR {body.directory_employee_id}"
+    )
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Typed confirmation must exactly match {expected_confirmation}.",
+        )
+    try:
+        tombstone, repaired = create_historical_directory_identity(
+            db,
+            connector=connector,
+            source_user=source_user,
+            source_cnic=body.source_cnic,
+            directory_employee_id=body.directory_employee_id,
+            directory_service_number=body.directory_service_number,
+            directory_employee_name=body.directory_employee_name,
+            directory_zone_code=body.directory_zone_code,
+            expected_version=body.expected_version,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(connector)
+    payload = identity_catalog_payload(db, connector)
+    delivered = await connector_hub.send(connector.connector_id, payload)
+    await browser_events.publish(
+        "historical_directory_identity",
+        {
+            "connector_id": connector.connector_id,
+            "source_user_id": source_user.user_id,
+            "repaired_events": repaired,
+        },
+    )
+    return {
+        "ok": True,
+        "tombstone_id": tombstone.id,
+        "source_user_key": source_user.user_key,
+        "source_user_id": source_user.user_id,
         "repaired_events": repaired,
         "catalog_delivered": delivered,
     }

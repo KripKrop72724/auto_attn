@@ -296,6 +296,36 @@ class HistoricalIdentityAliasRequest(BaseModel):
         return digits
 
 
+class HistoricalDirectoryIdentityRequest(BaseModel):
+    source_user_key: str = Field(min_length=1, max_length=36)
+    expected_version: int = Field(ge=1)
+    source_cnic: str = Field(min_length=13, max_length=15)
+    directory_employee_id: str = Field(min_length=1, max_length=40)
+    directory_service_number: str = Field(min_length=1, max_length=40)
+    directory_employee_name: str = Field(min_length=2, max_length=255)
+    directory_zone_code: str | None = Field(default=None, max_length=40)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("source_cnic")
+    @classmethod
+    def validate_directory_cnic(cls, value: str) -> str:
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("Directory CNIC must contain exactly 13 digits")
+        return digits
+
+    @field_validator("directory_employee_id", "directory_service_number")
+    @classmethod
+    def validate_directory_identifier(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.isdigit():
+            raise ValueError("Directory identifiers must contain only digits")
+        return normalized
+
+
 class AdminLeaseRequest(BaseModel):
     uid: str
     idempotency_key: str = Field(min_length=8, max_length=120)

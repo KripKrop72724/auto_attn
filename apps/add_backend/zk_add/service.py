@@ -1024,6 +1024,203 @@ def create_historical_identity_alias(
     return tombstone, repaired
 
 
+def create_historical_directory_identity(
+    session: Session,
+    *,
+    connector: Connector,
+    source_user: DeviceUser,
+    source_cnic: str,
+    directory_employee_id: str,
+    directory_service_number: str,
+    directory_employee_name: str,
+    directory_zone_code: str | None,
+    expected_version: int,
+    reason: str,
+    idempotency_key: str,
+    actor: str,
+) -> tuple[IdentityTombstone, int]:
+    """Repair a deleted terminal identity from exact authoritative HR evidence."""
+
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("Connector has no assigned ZKT device.")
+    if source_user.zkt_device_id != zkt.id:
+        raise ValueError("Historical user does not belong to this terminal.")
+    session.refresh(source_user)
+    if source_user.row_version != expected_version:
+        raise ValueError("Historical user changed since it was selected. Refresh and retry.")
+    if source_user.present or source_user.lifecycle_state == "ACTIVE":
+        raise ValueError("Directory evidence repair is only allowed for a deleted user.")
+    if source_user.identity_conflict_code is not None:
+        raise ValueError("Resolve the historical user's identity conflict first.")
+
+    normalized_cnic = normalize_cnic(source_cnic)
+    normalized_user_id = source_user.user_id.lstrip("0") or "0"
+    normalized_service_number = directory_service_number.strip().lstrip("0") or "0"
+    if not normalized_user_id.isdigit() or normalized_user_id != normalized_service_number:
+        raise ValueError(
+            "Terminal user ID does not exactly match the authoritative HR service number."
+        )
+
+    def normalized_name(value: str) -> str:
+        return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+    terminal_name = normalized_name(source_user.display_name)
+    directory_name = normalized_name(directory_employee_name)
+    if (
+        len(terminal_name) < 5
+        or len(directory_name) < 5
+        or not (
+            secrets.compare_digest(terminal_name, directory_name)
+            or terminal_name.startswith(directory_name)
+            or directory_name.startswith(terminal_name)
+        )
+    ):
+        raise ValueError(
+            "Terminal name does not match the authoritative HR employee name."
+        )
+
+    cnic_hash = cnic_lookup(normalized_cnic)
+    conflicting_claim = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.cnic_lookup_hash == cnic_hash,
+            DeviceUser.id != source_user.id,
+        )
+    )
+    if conflicting_claim is not None:
+        raise ValueError(
+            "That CNIC is already bound to another identity on this terminal."
+        )
+
+    existing = session.scalar(
+        select(IdentityTombstone)
+        .where(
+            IdentityTombstone.zkt_device_id == zkt.id,
+            IdentityTombstone.user_id == source_user.user_id,
+            IdentityTombstone.device_user_id == source_user.id,
+        )
+        .order_by(IdentityTombstone.id.desc())
+    )
+    if existing is not None and existing.cnic_encrypted:
+        existing_cnic = decrypt_cnic(existing.cnic_encrypted)
+        if not existing_cnic or not secrets.compare_digest(existing_cnic, normalized_cnic):
+            raise ValueError("Historical identity already has different verified evidence.")
+        return existing, 0
+
+    eligible_statuses = {
+        "BLOCKED_IDENTITY",
+        "PENDING",
+        "FAILED_RETRYABLE",
+        "RETRYING",
+    }
+    blocked_rows = session.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == source_user.user_id,
+            AttendanceEvent.ords_status.in_(eligible_statuses),
+            AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+        )
+    ).all()
+    if not blocked_rows:
+        raise ValueError("No unresolved attendance exists for that historical user ID.")
+
+    encrypted_cnic = encrypt_cnic(normalized_cnic)
+    encrypted_name = encrypt_text(directory_employee_name.strip()) or ""
+    if existing is None:
+        existing = IdentityTombstone(
+            zkt_device_id=zkt.id,
+            device_user_id=source_user.id,
+            device_serial=zkt.serial,
+            uid=source_user.uid,
+            user_id=source_user.user_id,
+            display_name_encrypted=encrypted_name,
+            cnic_encrypted=encrypted_cnic,
+            cnic_lookup_hash=cnic_hash,
+            cnic_last4=normalized_cnic[-4:],
+            shift_worker=source_user.shift_worker,
+            privilege=source_user.privilege,
+        )
+        session.add(existing)
+    else:
+        existing.display_name_encrypted = encrypted_name
+        existing.cnic_encrypted = encrypted_cnic
+        existing.cnic_lookup_hash = cnic_hash
+        existing.cnic_last4 = normalized_cnic[-4:]
+
+    # Preserve verified evidence on both the deleted source and its tombstone
+    # so future historical sweeps resolve without operator intervention.
+    source_user.cnic_encrypted = encrypted_cnic
+    source_user.cnic_lookup_hash = cnic_hash
+    source_user.cnic_last4 = normalized_cnic[-4:]
+    source_user.row_version += 1
+
+    repaired = 0
+    for row in blocked_rows:
+        identity_reused = bool(
+            (row.device_user_id is not None and row.device_user_id != source_user.id)
+            or (
+                row.device_user_id is None
+                and row.uid
+                and source_user.uid
+                and row.uid != source_user.uid
+            )
+        )
+        if identity_reused:
+            row.ords_status = "QUARANTINED_IDENTITY_REUSE"
+            row.identity_resolution_status = "QUARANTINED_REUSE"
+            continue
+        row.device_user_id = source_user.id
+        row.identity_snapshot_id = zkt.identity_snapshot_id
+        row.identity_terminal_fingerprint = source_user.terminal_identity_fingerprint
+        row.identity_resolution_status = "RESOLVED_DIRECTORY_EVIDENCE"
+        row.identity_resolved_at = utc_now()
+        row.identity_repaired_at = utc_now()
+        row.identity_repair_reason = "VERIFIED_HR_DIRECTORY_EVIDENCE"
+        row.display_name = directory_employee_name.strip()
+        row.cnic_encrypted = encrypted_cnic
+        row.cnic_lookup_hash = cnic_hash
+        row.cnic_last4 = normalized_cnic[-4:]
+        row.raw_punch = row.raw_punch or source_user.shift_worker
+        row.ords_status = "PENDING"
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        )
+        if outbox is None:
+            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
+        repaired += 1
+
+    append_audit(
+        session,
+        actor=actor,
+        action="HISTORICAL_DIRECTORY_IDENTITY_VERIFIED",
+        target_type="zkt_historical_identity",
+        target_id=f"{zkt.id}:{source_user.user_id}",
+        outcome="SUCCEEDED",
+        before={
+            "source_user_key": source_user.user_key,
+            "source_user_id": source_user.user_id,
+            "blocked_events": len(blocked_rows),
+        },
+        after={
+            "directory_employee_id": directory_employee_id,
+            "directory_service_number": directory_service_number,
+            "directory_employee_name": directory_employee_name.strip(),
+            "directory_zone_code": directory_zone_code,
+            "directory_cnic": mask_cnic(normalized_cnic),
+            "repaired_events": repaired,
+            "reason": reason,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return existing, repaired
+
+
 def enrich_undelivered_attendance(
     session: Session,
     *,
