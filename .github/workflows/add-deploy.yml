@@ -127,11 +127,33 @@ jobs:
             -not [string]::IsNullOrWhiteSpace($env:HTTP_PROXY)
 
           $dnsResult = 'ERROR_UNKNOWN'
+          $dnsAddresses = @()
           try {
             $addresses = [System.Net.Dns]::GetHostAddresses($targetUri.Host)
-            $dnsResult = if ($addresses.Count -gt 0) { 'OK' } else { 'ERROR_NO_ADDRESSES' }
+            $dnsAddresses = @($addresses | ForEach-Object { $_.IPAddressToString })
+            $dnsResult = if ($dnsAddresses.Count -gt 0) { 'OK' } else { 'ERROR_NO_ADDRESSES' }
           } catch {
             $dnsResult = "ERROR_$($_.Exception.GetType().Name)"
+          }
+
+          $egressResult = 'ERROR_UNKNOWN'
+          foreach ($probeUrl in @('https://api.ipify.org', 'https://checkip.amazonaws.com')) {
+            try {
+              $egressResponse = Invoke-WebRequest `
+                -UseBasicParsing `
+                -Method Get `
+                -Uri $probeUrl `
+                -TimeoutSec 12
+              $candidateAddress = ([string]$egressResponse.Content).Trim()
+              $parsedAddress = $null
+              if ([System.Net.IPAddress]::TryParse($candidateAddress, [ref]$parsedAddress)) {
+                $egressResult = "OK_$candidateAddress"
+                break
+              }
+              $egressResult = 'ERROR_INVALID_RESPONSE'
+            } catch {
+              $egressResult = "ERROR_$($_.Exception.GetType().Name)"
+            }
           }
 
           $tcpResult = 'ERROR_UNKNOWN'
@@ -216,10 +238,12 @@ jobs:
           }
 
           Write-Host "ORDS DNS probe=$dnsResult"
+          Write-Host "ORDS resolved addresses=$($dnsAddresses -join ',')"
           Write-Host "ORDS TCP 443 probe=$tcpResult"
           Write-Host "ORDS host probe=$hostResult"
           Write-Host "ORDS container probe=$containerResult"
           Write-Host "ORDS container command completed=$($containerExit -eq 0)"
+          Write-Host "Runner public egress address=$egressResult"
           Write-Host "Runner default proxy used=$defaultProxyUsed"
           Write-Host "Runner proxy environment present=$proxyEnvironmentPresent"
           if ($hostResult -ne 'HTTP_200' -or $containerExit -ne 0 -or $containerResult -ne 'HTTP_200') {
