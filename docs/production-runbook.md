@@ -157,14 +157,32 @@ ADD also rechecks every independently confirmed UID at least once per day. A tra
 failure retains the last known proof while exposing a retrying membership state; if Oracle reports
 the UID missing, ADD clears the stale confirmation and requeues its immutable event automatically.
 
-`raw-captures/check` and `raw-captures/reconcile` must use the same authorized credential verifier.
-The canonical `SLIC_ZKT_TRUTH_API` stores only an uppercase SHA-256 password digest. If a legacy
-Oracle deployment returns `200` from `check` but `401` from `reconcile`, run
-`deploy/add/oracle/20260728_unify_raw_capture_auth.sql` while authenticated as the owning schema.
-The migration derives the already-working verifier inside Oracle without selecting or printing a
-credential, patches exactly the expected authentication expressions, validates compilation, and
-restores the original package body automatically on failure. Afterward, verify both endpoints with
-the same credentials before allowing any authoritative reconcile or backlog drain.
+`raw-captures/check`, `raw-captures`, and `raw-captures/reconcile` must accept the same approved ADD
+credential. The canonical `SLIC_ZKT_TRUTH_API` stores only uppercase SHA-256 password digests. If a
+legacy single-verifier Oracle deployment returns `200` from `check` but `401` from package-backed
+endpoints, run `deploy/add/oracle/20260728_unify_raw_capture_auth.sql` while authenticated as the
+owning schema. If the package is already the valid non-destructive dual-verifier version but the
+approved ADD credential receives `401` from `raw-captures`, run
+`deploy/add/oracle/20260728_allow_add_auth_non_destructive.sql` after replacing its two ADD
+placeholders locally. That migration preserves both installed verifiers, adds a third SHA-256-only
+ADD verifier, refuses unexpected package shapes, validates compilation, and restores the original
+package body automatically on failure. Re-running the same substituted migration is idempotent.
+If `raw-captures` is still a large legacy inline handler rather than a package wrapper, run
+`deploy/add/oracle/20260728_route_live_capture_through_package.sql`. It backs up the exact handler,
+requires the known legacy insert/delete/hash shape, replaces only its ORDS source with the
+non-destructive `post_live` wrapper, verifies the installed metadata, and restores the original
+handler automatically on failure. The migration performs no attendance table DML. Afterward, verify
+membership and package-backed delivery with the same approved credential, then allow the preserved
+outbox to drain. Do not start OTA while package-backed delivery returns `401`.
+
+If package-backed live inserts return `ORA-00001` for
+`UK_HR_RAW_ATTN_ONE_CHECKIN` or `UK_HR_RAW_ATTN_ONE_CHECKOUT`, run
+`deploy/add/oracle/20260728_recompute_live_daily_flags_non_destructive.sql`. The package migration
+inserts new normal punches with false/false flags, locks only affected employee-days, clears their
+prior flags, then recomputes the earliest check-in and latest check-out across the complete stored
+day in the same transaction. It never deletes attendance. Compilation or source-invariant failure
+restores the exact prior package body. Verify with a known missing preserved event, then require the
+ADD retry count to drain to zero before OTA.
 
 Every deployment records credential-free DNS, TCP 443, and `OPTIONS` reachability from the Windows
 runner host, the resolved Oracle destination addresses, the runner's public egress address, `OPTIONS`
