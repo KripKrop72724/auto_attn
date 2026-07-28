@@ -162,6 +162,9 @@
 #ifndef ZONE_LITE_ORDS_TIMEOUT_MS
 #define ZONE_LITE_ORDS_TIMEOUT_MS 15000
 #endif
+#ifndef ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS
+#define ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS 45000
+#endif
 #ifndef ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS
 #define ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS 60000
 #endif
@@ -3351,7 +3354,11 @@ static bool reconcile_attendance_dump(
         return false;
     }
 
-    bool daily_windows = reconcile_event_count > reconcile_capacity;
+    // Authoritative Oracle replacement always uses daily transactions. This
+    // keeps JSON parsing, delete/merge work, and TLS response time bounded even
+    // on terminals whose current month contains thousands of punches.
+    bool daily_windows = truth_enabled ||
+        reconcile_event_count > reconcile_capacity;
     int window_start_day = 1;
     size_t truth_count = 0;
     size_t window_count = 0;
@@ -3394,19 +3401,27 @@ static bool reconcile_attendance_dump(
             size_t window_truth_count = 0;
             bool window_truth_ok = true;
             if (truth_enabled) {
-                window_truth_ok = oracle_send_reconcile(
-                    reconcile_events,
-                    window_event_count,
-                    window_terminal_count,
-                    window_identity_mapped_count,
-                    filter_year,
-                    filter_month,
-                    window_start_day,
-                    window_end_day,
-                    &window_truth_count);
-                if (!window_truth_ok && g_truth_window_blocked &&
-                    identity_blocked_out) {
-                    *identity_blocked_out = true;
+                // A failed authoritative window makes the whole month
+                // incomplete. Continue durable ADD enqueueing for later
+                // windows, but do not issue more Oracle requests during this
+                // pass or multiply a single transport fault into 31 failures.
+                if (truth_delivery_ok) {
+                    window_truth_ok = oracle_send_reconcile(
+                        reconcile_events,
+                        window_event_count,
+                        window_terminal_count,
+                        window_identity_mapped_count,
+                        filter_year,
+                        filter_month,
+                        window_start_day,
+                        window_end_day,
+                        &window_truth_count);
+                    if (!window_truth_ok && g_truth_window_blocked &&
+                        identity_blocked_out) {
+                        *identity_blocked_out = true;
+                    }
+                } else {
+                    window_truth_ok = false;
                 }
             } else {
                 for (size_t i = 0; i < window_event_count; i++) {
@@ -3823,7 +3838,8 @@ static int http_post_json_with_tls_source(
     const char *json,
     char **response_body,
     const char *ca_cert_pem,
-    const char *tls_source)
+    const char *tls_source,
+    int timeout_ms)
 {
     http_response_buffer_t captured = {
         .data = response_body ? calloc(1, 8192) : NULL,
@@ -3831,7 +3847,7 @@ static int http_post_json_with_tls_source(
     };
     esp_http_client_config_t cfg = {
         .url = url,
-        .timeout_ms = ZONE_LITE_ORDS_TIMEOUT_MS,
+        .timeout_ms = timeout_ms,
         .event_handler = http_capture_event,
         .user_data = &captured,
     };
@@ -3869,7 +3885,11 @@ static int http_post_json_with_tls_source(
     return status;
 }
 
-static int http_post_json_unlocked(const char *url, const char *json, char **response_body)
+static int http_post_json_unlocked(
+    const char *url,
+    const char *json,
+    char **response_body,
+    int timeout_ms)
 {
     if (response_body != NULL) {
         *response_body = NULL;
@@ -3887,17 +3907,33 @@ static int http_post_json_unlocked(const char *url, const char *json, char **res
 
     const char *ords_ca_cert_pem = ZONE_LITE_ORDS_CA_CERT_PEM;
     if (ords_ca_cert_pem != NULL && ords_ca_cert_pem[0] != '\0') {
-        int status = http_post_json_with_tls_source(url, json, response_body, ords_ca_cert_pem, "configured ORDS CA");
+        int status = http_post_json_with_tls_source(
+            url,
+            json,
+            response_body,
+            ords_ca_cert_pem,
+            "configured ORDS CA",
+            timeout_ms);
         if (status >= 0) {
             return status;
         }
         ESP_LOGW(TAG, "Configured ORDS CA failed; retrying with ESP-IDF certificate bundle");
     }
 
-    return http_post_json_with_tls_source(url, json, response_body, NULL, "ESP-IDF certificate bundle");
+    return http_post_json_with_tls_source(
+        url,
+        json,
+        response_body,
+        NULL,
+        "ESP-IDF certificate bundle",
+        timeout_ms);
 }
 
-static int http_post_json(const char *url, const char *json, char **response_body)
+static int http_post_json_with_timeout(
+    const char *url,
+    const char *json,
+    char **response_body,
+    int timeout_ms)
 {
     if (response_body != NULL) {
         *response_body = NULL;
@@ -3905,13 +3941,29 @@ static int http_post_json(const char *url, const char *json, char **response_bod
     if (g_ords_http_lock == NULL ||
         xSemaphoreTake(
             g_ords_http_lock,
-            pdMS_TO_TICKS(ZONE_LITE_ORDS_TIMEOUT_MS + 10000)) != pdTRUE) {
+            pdMS_TO_TICKS(timeout_ms + 10000)) != pdTRUE) {
         ESP_LOGW(TAG, "Timed out waiting for exclusive ORDS HTTPS transport");
         return -1;
     }
-    int status = http_post_json_unlocked(url, json, response_body);
+    int status = http_post_json_unlocked(
+        url,
+        json,
+        response_body,
+        timeout_ms);
     xSemaphoreGive(g_ords_http_lock);
     return status;
+}
+
+static int http_post_json(
+    const char *url,
+    const char *json,
+    char **response_body)
+{
+    return http_post_json_with_timeout(
+        url,
+        json,
+        response_body,
+        ZONE_LITE_ORDS_TIMEOUT_MS);
 }
 
 static bool oracle_success_body(const char *body)
@@ -4461,10 +4513,40 @@ static bool oracle_send_reconcile(
     }
     if (!ords_send_allowed()) {
         ESP_LOGI(TAG, "Skipping ORDS truth reconcile until current ORDS backoff expires");
+        char message[192];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth window %04d-%02d-%02d..%02d was not attempted because the ORDS transport is in backoff",
+            year,
+            month,
+            window_start_day,
+            window_end_day);
+        (void)add_connector_log(
+            "WARN",
+            "reconcile",
+            "ORDS_RECONCILE_BACKOFF",
+            message);
         return false;
     }
     if (event_count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
         ESP_LOGE(TAG, "Truth reconcile has %u events, above safety limit %u", (unsigned)event_count, (unsigned)ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS);
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth window %04d-%02d-%02d..%02d has %u events above the safety limit %u; no request was attempted",
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)event_count,
+            (unsigned)ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_WINDOW_LIMIT",
+            message);
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
@@ -4494,6 +4576,21 @@ static bool oracle_send_reconcile(
         &truth_count);
     if (payload == NULL) {
         ESP_LOGE(TAG, "Could not build bounded ORDS truth reconcile payload events=%u", (unsigned)event_count);
+        char message[192];
+        snprintf(
+            message,
+            sizeof(message),
+            "Could not build Oracle truth payload window=%04d-%02d-%02d..%02d events=%u",
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)event_count);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_PAYLOAD_FAILED",
+            message);
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
@@ -4502,7 +4599,11 @@ static bool oracle_send_reconcile(
     char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures/reconcile", ZONE_LITE_ORDS_BASE_URL);
     char *body = NULL;
-    int status = http_post_json(url, payload, &body);
+    int status = http_post_json_with_timeout(
+        url,
+        payload,
+        &body,
+        ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS);
     int deleted = 0;
     int corrected = 0;
     int invalid = 0;
@@ -4511,6 +4612,24 @@ static bool oracle_send_reconcile(
 
     if (status == 404 || status == 405) {
         ESP_LOGW(TAG, "ORDS truth reconcile endpoint is not deployed yet status=%d; legacy outbox remains active", status);
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth endpoint unavailable status=%d window=%04d-%02d-%02d..%02d events=%u",
+            status,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_ENDPOINT_MISSING",
+            message);
+        ords_mark_failure();
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
         free(body);
         free(payload);
         return false;
@@ -4542,10 +4661,74 @@ static bool oracle_send_reconcile(
         }
     } else if (status == 400) {
         g_truth_window_blocked = true;
-        ESP_LOGW(TAG, "ORDS rejected truth reconcile payload status=400 body=%s", body ? body : "");
+        ESP_LOGW(
+            TAG,
+            "ORDS rejected truth reconcile payload status=400 response=%s",
+            body && body[0] != '\0' ? "present" : "empty");
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle rejected truth window status=400 window=%04d-%02d-%02d..%02d events=%u; no destructive repair was accepted",
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_REJECTED",
+            message);
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+    } else if (status == 200 || status == 201) {
+        ESP_LOGW(
+            TAG,
+            "ORDS truth reconcile returned an invalid success response status=%d response=%s",
+            status,
+            body && body[0] != '\0' ? "present" : "empty");
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth response failed validation status=%d window=%04d-%02d-%02d..%02d events=%u response=%s",
+            status,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count,
+            body && body[0] != '\0' ? "present" : "empty");
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_RESPONSE_INVALID",
+            message);
+        ords_mark_failure();
+        led_status_fault(LED_STATUS_ORDS_FAILURE);
     } else {
-        ESP_LOGW(TAG, "ORDS truth reconcile failed status=%d body=%s", status, body ? body : "");
+        ESP_LOGW(
+            TAG,
+            "ORDS truth reconcile failed status=%d response=%s",
+            status,
+            body && body[0] != '\0' ? "present" : "empty");
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Oracle truth transport failed status=%d window=%04d-%02d-%02d..%02d events=%u response=%s",
+            status,
+            year,
+            month,
+            window_start_day,
+            window_end_day,
+            (unsigned)truth_count,
+            body && body[0] != '\0' ? "present" : "empty");
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "ORDS_RECONCILE_HTTP_FAILED",
+            message);
         ords_mark_failure();
         led_status_fault(LED_STATUS_ORDS_FAILURE);
     }

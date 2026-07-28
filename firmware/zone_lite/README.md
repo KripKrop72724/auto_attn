@@ -29,6 +29,10 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
   windows are skipped for the remainder of the sweep, reported to ADD, and retried after 24 hours.
 - Requires a stable before/dump/after attendance count and complete identity map before Oracle can
   apply an authoritative window. Oracle API v2 rejects partial truth before any delete.
+- Sends every authoritative Oracle month as independently attested daily windows with a dedicated
+  45-second HTTPS deadline, keeping ORDS JSON parsing and delete/merge transactions bounded.
+  A failed day stops further Oracle requests for that pass while durable ADD enqueueing continues;
+  sanitized status/window diagnostics are reported to ADD without response bodies or identities.
 - Accepts only ADD-audited historical user-ID aliases, stores their catalog encrypted, and uses it
   to repair preserved blocked rows before retrying authoritative history.
 - Reassembles bounded fragmented ADD WebSocket messages before parsing them. Every durably stored
