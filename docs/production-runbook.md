@@ -178,8 +178,10 @@ Interpret deployment probe results in this order:
   firewall lead because application- and service-scoped block rules can share `Any:443`; inspect the
   matching rule locally without publishing rule names or network topology in CI logs.
 - If both internal host and container probes return `HTTP_200` for `local.slichealth.com` while the
-  public host times out, use the internal hostname for ADD only. Keep remotely deployed Zone Lite
-  devices on the public hostname unless their own route evidence requires otherwise.
+  public host times out, ADD uses the validated internal hostname. Keep remotely deployed Zone Lite
+  devices on the public hostname unless their own route evidence requires otherwise. The deployment
+  script canonicalizes the protected ADD environment to this internal endpoint so an older environment
+  file cannot silently restore the unreachable public route.
 - A successful host probe with a failed container probe points to Docker NAT or container-specific
   egress policy.
 - HTTP `401`/`403` means transport is working and authentication should be checked without logging
@@ -197,7 +199,7 @@ Interpret deployment probe results in this order:
 | Duplicate user CNIC | Open Identity Review. If HR confirms one employee has multiple terminal records, use the audited same-employee resolution; otherwise correct the wrong CNIC on the specific user | Do not infer equality from a masked suffix, incomplete punch history, or name similarity alone; never delete punches |
 | Partial/truncated snapshot | Wait for stable complete snapshot; inspect logs/memory | Do not create/edit/delete users |
 | Admin revoke overdue | Keep command active; restore terminal reachability; verify privilege 0 | Do not grant a second lease |
-| ORDS backlog | Check public ORDS/TLS/auth; preserve flash queue | Do not erase connector storage |
+| ORDS backlog | Check the configured ADD ORDS route/TLS/auth; preserve flash queue | Do not erase connector storage |
 | Command retrying | Read pre/postcondition and ZKT state; allow bounded retry | Do not issue duplicates |
 | Terminal clock drift | Confirm ESP SNTP, then controlled terminal correction | Do not alter stored punches |
 
