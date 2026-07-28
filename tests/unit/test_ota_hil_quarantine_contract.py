@@ -26,6 +26,18 @@ def test_deployment_can_explicitly_switch_from_hil_to_national_ota() -> None:
     )
 
 
+def test_add_deployment_uses_the_validated_internal_ords_route() -> None:
+    deploy = (ROOT / "deploy" / "add" / "deploy.ps1").read_text(encoding="utf-8")
+    expected = (
+        "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
+    )
+    assert f'$environment["ADD_ORDS_BASE_URL"] = "{expected}"' in deploy
+    assert (
+        f'if ($environment["ADD_ORDS_BASE_URL"] -ne "{expected}")'
+        in deploy
+    )
+
+
 def test_publication_requires_exact_hil_target_and_promotion_preserves_bytes() -> None:
     publish = (ROOT / "deploy/add/publish-firmware.ps1").read_text(encoding="utf-8")
     promote = (ROOT / "deploy/add/promote-firmware.ps1").read_text(encoding="utf-8")

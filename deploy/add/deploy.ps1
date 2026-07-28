@@ -230,7 +230,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) 
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
 $environment["ADD_PUBLIC_DEVICE_WS_URL"] = "wss://autoattn.slichealth.com/device/v2/stream"
-$environment["ADD_ORDS_BASE_URL"] = "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
+$environment["ADD_ORDS_BASE_URL"] = "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
 if ($environment.ContainsKey("ADD_ADMIN_PASSWORD_HASH") -and
     $environment["ADD_ADMIN_PASSWORD_HASH"].StartsWith('$$argon2id$$')) {
     $environment["ADD_ADMIN_PASSWORD_HASH"] = $environment["ADD_ADMIN_PASSWORD_HASH"].Replace('$$', '$')
@@ -280,8 +280,8 @@ if ($environment["ADD_POSTGRES_PASSWORD"].Length -lt 24) {
 if ($environment["ADD_PUBLIC_DEVICE_WS_URL"] -ne "wss://autoattn.slichealth.com/device/v2/stream") {
     throw "ADD_PUBLIC_DEVICE_WS_URL must use the production TLS device stream."
 }
-if ($environment["ADD_ORDS_BASE_URL"] -ne "https://eclaim2.slichealth.com/ords/slic_hrm/raw_attn_capture_event") {
-    throw "ADD_ORDS_BASE_URL must use the production raw attendance capture endpoint."
+if ($environment["ADD_ORDS_BASE_URL"] -ne "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event") {
+    throw "ADD_ORDS_BASE_URL must use the validated internal production raw attendance capture endpoint."
 }
 
 $stateRoot = if ($env:ADD_DEPLOY_STATE_DIR) {
