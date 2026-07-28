@@ -543,7 +543,7 @@ def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     ]
     assert "static SemaphoreHandle_t g_ords_outbox_gate;" in source
     gate_at = reconcile.index("xSemaphoreTake(\n            g_ords_outbox_gate")
-    dump_at = reconcile.index("zk_read_buffer(sock, ctx, CMD_ATTLOG_RRQ")
+    dump_at = reconcile.index("CMD_ATTLOG_RRQ,")
     assert gate_at < dump_at
     assert "xSemaphoreGive(g_ords_outbox_gate);" in reconcile
     assert "g_ords_outbox_gate = xSemaphoreCreateMutex();" in source
@@ -553,7 +553,14 @@ def test_large_zkt_buffer_reads_allow_slow_prepare_data_delivery():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     assert "#define ZKT_IO_TIMEOUT_SEC 90" in source
     assert "#define ZKT_BUFFER_CHUNK_BYTES 0xffc0" in source
-    assert "const uint32_t max_chunk = ZKT_BUFFER_CHUNK_BYTES;" in source
+    assert "#define ZKT_BUFFER_RECOVERY_CHUNK_BYTES 0x4000" in source
+    assert "#define ZKT_TRUTH_FRESH_SESSION_RETRIES 2" in source
+    assert "attendance_chunk_bytes = g_truth_use_recovery_chunks" in source
+    assert '"TRUTH_READ_RETRY_SESSION"' in source
+    assert '"TRUTH_READ_RETRY_EXHAUSTED"' in source
+    assert "g_truth_retry_session_requested = true;" in source
+    assert "if (g_truth_retry_session_requested)" in source
+    assert "if (!restarted && !truth_retry_session)" in source
     assert "CMD_PREPARE_DATA" in source
     reader = source[
         source.index("static bool zk_read_buffer(") :
