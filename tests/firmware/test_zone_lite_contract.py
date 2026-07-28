@@ -247,8 +247,10 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
     ]
     assert "attendance_event_t *reconcile_events = heap_caps_calloc" in reconcile
     assert "collect_reconcile_window(" in reconcile
-    assert "bool daily_windows = reconcile_event_count > reconcile_capacity;" in reconcile
+    assert "bool daily_windows = truth_enabled ||" in reconcile
+    assert "reconcile_event_count > reconcile_capacity;" in reconcile
     assert "while (window_start_day <= day_end)" in reconcile
+    assert "if (truth_delivery_ok)" in reconcile
     assert "char **truth_events" not in reconcile
     assert "ADD_RECONCILE_MAX_BATCHES" not in source
     assert "#define ADD_RECONCILE_COMMIT_BATCHES 32" in source
@@ -305,6 +307,17 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert '"window_end\\":\\"%04d-%02d-%02d\\"' in payload
     assert "window_start_day" in sender
     assert "window_end_day" in sender
+    assert "#define ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS 45000" in source
+    assert "http_post_json_with_timeout(" in sender
+    assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" in sender
+    assert '"ORDS_RECONCILE_BACKOFF"' in sender
+    assert '"ORDS_RECONCILE_WINDOW_LIMIT"' in sender
+    assert '"ORDS_RECONCILE_PAYLOAD_FAILED"' in sender
+    assert '"ORDS_RECONCILE_ENDPOINT_MISSING"' in sender
+    assert '"ORDS_RECONCILE_REJECTED"' in sender
+    assert '"ORDS_RECONCILE_RESPONSE_INVALID"' in sender
+    assert '"ORDS_RECONCILE_HTTP_FAILED"' in sender
+    assert "body ? body" not in sender
 
 
 def test_firmware_version_change_forces_immediate_truth_reconcile():
@@ -421,15 +434,39 @@ def test_authoritative_truth_requires_a_stable_terminal_dump():
 def test_ords_truth_and_outbox_https_requests_are_serialized():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     wrapper = source[
-        source.index("static int http_post_json(const char *url") :
+        source.index("static int http_post_json_with_timeout(") :
         source.index("static bool oracle_success_body(")
     ]
     assert "static SemaphoreHandle_t g_ords_http_lock;" in source
     assert "xSemaphoreTake(" in wrapper
     assert "g_ords_http_lock" in wrapper
-    assert "http_post_json_unlocked(url, json, response_body)" in wrapper
+    assert "http_post_json_unlocked(" in wrapper
+    assert "timeout_ms" in wrapper
     assert "xSemaphoreGive(g_ords_http_lock);" in wrapper
+    assert "ZONE_LITE_ORDS_TIMEOUT_MS" in wrapper
     assert "g_ords_http_lock = xSemaphoreCreateMutex();" in source
+
+
+def test_reconcile_timeout_is_isolated_from_live_and_bulk_delivery():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    live = source[
+        source.index("static oracle_delivery_result_t oracle_send_live(") :
+        source.index("static char *build_bulk_payload(")
+    ]
+    bulk_start = source.index(
+        "static bool oracle_send_bulk(char **events",
+        source.index("static char *build_bulk_payload("),
+    )
+    bulk = source[bulk_start : source.index("static int days_in_month(", bulk_start)]
+    sender = source[
+        source.index("static bool oracle_send_reconcile(") :
+        source.index("static void append_acked_uid_from_json_to_file(")
+    ]
+    assert "http_post_json(url, normalized_event, &body)" in live
+    assert "http_post_json(url, payload, &body)" in bulk
+    assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" not in live
+    assert "ZONE_LITE_ORDS_RECONCILE_TIMEOUT_MS" not in bulk
+    assert "http_post_json_with_timeout(" in sender
 
 
 def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
