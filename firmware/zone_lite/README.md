@@ -26,6 +26,8 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
   windows are skipped for the remainder of the sweep, reported to ADD, and retried after 24 hours.
 - Requires a stable before/dump/after attendance count and complete identity map before Oracle can
   apply an authoritative window. Oracle API v2 rejects partial truth before any delete.
+- Accepts only ADD-audited historical user-ID aliases, stores their catalog encrypted, and uses it
+  to repair preserved blocked rows before retrying authoritative history.
 - Reports a reconcile successful only after ORDS truth and durable ADD enqueue both succeed; the
   serial completion marker is `complete=true`.
 - Persists commands before execution and verifies fresh terminal pre/postconditions.
@@ -120,7 +122,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current production version is `2.2.12`. ADD onboarding and heartbeat version fields are generated
+The current production version is `2.2.13`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 

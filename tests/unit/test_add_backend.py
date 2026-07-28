@@ -62,6 +62,7 @@ from zk_add.service import (
     create_admin_lease,
     create_command,
     create_device_user_command,
+    create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
     ingest_attendance,
@@ -230,6 +231,91 @@ def event(*, event_uid: str, user_id: str = "1007", raw_name: str | None = None)
         clock_quality="OK",
         raw_event={"raw_name": raw_name, "safe": "retained"},
     )
+
+
+def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    target = snapshot_user(
+        db,
+        connector,
+        uid="61",
+        user_id="13",
+        name=f"NoumanI-{CNIC}",
+    )
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="a" * 64,
+                user_id="CL04209",
+                raw_name=None,
+            )
+        ],
+    )
+    db.flush()
+    assert accepted == ["a" * 64]
+    assert duplicates == []
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "a" * 64)
+    )
+    assert blocked is not None
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
+    assert blocked.cnic_encrypted is None
+
+    with pytest.raises(ValueError, match="does not match"):
+        create_historical_identity_alias(
+            db,
+            connector=connector,
+            source_user_id="CL04209",
+            source_cnic="1111111111111",
+            target_user=target,
+            reason="Untrusted evidence must fail closed.",
+            idempotency_key="alias-wrong-evidence",
+            actor="StateHealthAdmin",
+        )
+    assert db.scalar(select(IdentityTombstone)) is None
+
+    alias, repaired = create_historical_identity_alias(
+        db,
+        connector=connector,
+        source_user_id="CL04209",
+        source_cnic=CNIC,
+        target_user=target,
+        reason="Oracle retained one unique CNIC for this historical terminal identity.",
+        idempotency_key="test-alias-key",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+    assert alias.user_id == "CL04209"
+    assert alias.device_user_id == target.id
+    assert repaired == 1
+    assert blocked.device_user_id == target.id
+    assert blocked.identity_resolution_status == "RESOLVED_HISTORICAL_ALIAS"
+    assert blocked.identity_repair_reason == "VERIFIED_HISTORICAL_ALIAS"
+    assert blocked.ords_status == "PENDING"
+    assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == blocked.id)
+    )
+    assert outbox is not None
+    assert outbox.status == "PENDING"
+
+    replay, replay_repaired = create_historical_identity_alias(
+        db,
+        connector=connector,
+        source_user_id="CL04209",
+        source_cnic=CNIC,
+        target_user=target,
+        reason="Idempotent operator retry.",
+        idempotency_key="test-alias-key",
+        actor="StateHealthAdmin",
+    )
+    assert replay.id == alias.id
+    assert replay_repaired == 0
 
 
 def test_request_signing_fixed_compatibility_vector():

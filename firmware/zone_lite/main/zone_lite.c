@@ -2460,9 +2460,35 @@ static void recover_blocked_events_from_snapshot(const user_table_t *users)
             cJSON_IsString(user_id) && blocked_reason == NULL
                 ? find_user_by_user_id(users, user_id->valuestring)
                 : NULL;
+        char recovered_name[64] = "";
+        char recovered_cnic[16] = "";
+        bool recovered_shift_worker = false;
+        bool identity_found = false;
         if (user && strlen(user->cnic) == 13) {
+            strlcpy(recovered_name, user->employee_name, sizeof(recovered_name));
+            strlcpy(recovered_cnic, user->cnic, sizeof(recovered_cnic));
+            recovered_shift_worker = user->raw_punch;
+            identity_found = true;
+        } else if (cJSON_IsString(user_id) && blocked_reason == NULL) {
+            identity_found = add_connector_lookup_identity(
+                user_id->valuestring,
+                recovered_name,
+                sizeof(recovered_name),
+                recovered_cnic,
+                sizeof(recovered_cnic),
+                &recovered_shift_worker);
+        }
+        if (identity_found && strlen(recovered_cnic) == 13) {
             cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
-            cJSON_AddStringToObject(root, "cnic", user->cnic);
+            cJSON_AddStringToObject(root, "cnic", recovered_cnic);
+            if (recovered_name[0]) {
+                cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
+                cJSON_AddStringToObject(root, "employee_name", recovered_name);
+            }
+            if (recovered_shift_worker) {
+                cJSON_DeleteItemFromObjectCaseSensitive(root, "raw_punch");
+                cJSON_AddBoolToObject(root, "raw_punch", true);
+            }
             output = cJSON_PrintUnformatted(root);
         }
         FILE *destination = output ? pending : kept;
@@ -2496,7 +2522,7 @@ static void recover_blocked_events_from_snapshot(const user_table_t *users)
                 "INFO",
                 "identity",
                 "BLOCKED_IDENTITY_REPAIRED",
-                "Blocked attendance was re-enriched from a stable terminal snapshot and returned to the ORDS queue.");
+                "Blocked attendance was re-enriched from a stable terminal snapshot or verified ADD identity alias and returned to the ORDS queue.");
         }
     } else {
         (void)remove(BLOCKED_RECOVERY_TMP_PATH);

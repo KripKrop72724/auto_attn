@@ -884,6 +884,146 @@ def persist_identity_tombstone(
     return row
 
 
+def create_historical_identity_alias(
+    session: Session,
+    *,
+    connector: Connector,
+    source_user_id: str,
+    source_cnic: str,
+    target_user: DeviceUser,
+    reason: str,
+    idempotency_key: str,
+    actor: str,
+) -> tuple[IdentityTombstone, int]:
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("Connector has no assigned ZKT device.")
+    source_user_id = source_user_id.strip()
+    if not source_user_id or source_user_id == target_user.user_id:
+        raise ValueError("Historical user ID must differ from the active target user ID.")
+    if target_user.zkt_device_id != zkt.id or not target_user.present or (
+        target_user.lifecycle_state != "ACTIVE"
+    ):
+        raise ValueError("Historical aliases require a present active user on this terminal.")
+    if target_user.identity_conflict_code is not None:
+        raise ValueError("Resolve the target user's identity conflict before creating an alias.")
+    cnic = decrypt_cnic(target_user.cnic_encrypted)
+    if not cnic or not target_user.cnic_lookup_hash:
+        raise ValueError("Historical aliases require a verified target CNIC.")
+    if not secrets.compare_digest(source_cnic, cnic):
+        raise ValueError(
+            "Historical source evidence does not match the active target CNIC."
+        )
+    if session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_id == source_user_id,
+            DeviceUser.present == True,  # noqa: E712
+            DeviceUser.lifecycle_state == "ACTIVE",
+        )
+    ):
+        raise ValueError("Historical user ID is currently active on the terminal.")
+    existing = session.scalar(
+        select(IdentityTombstone)
+        .where(
+            IdentityTombstone.zkt_device_id == zkt.id,
+            IdentityTombstone.user_id == source_user_id,
+        )
+        .order_by(IdentityTombstone.id.desc())
+    )
+    if existing is not None:
+        if existing.device_user_id != target_user.id:
+            raise ValueError("Historical user ID is already bound to another identity.")
+        return existing, 0
+
+    eligible_statuses = {
+        "BLOCKED_IDENTITY",
+        "PENDING",
+        "FAILED_RETRYABLE",
+        "RETRYING",
+    }
+    blocked_rows = session.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == source_user_id,
+            AttendanceEvent.ords_status.in_(eligible_statuses),
+            AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+        )
+    ).all()
+    if not blocked_rows:
+        raise ValueError("No unresolved attendance exists for that historical user ID.")
+
+    tombstone = IdentityTombstone(
+        zkt_device_id=zkt.id,
+        device_user_id=target_user.id,
+        device_serial=zkt.serial,
+        uid=target_user.uid,
+        user_id=source_user_id,
+        display_name_encrypted=encrypt_text(target_user.display_name) or "",
+        cnic_encrypted=target_user.cnic_encrypted,
+        cnic_lookup_hash=target_user.cnic_lookup_hash,
+        cnic_last4=target_user.cnic_last4,
+        shift_worker=target_user.shift_worker,
+        privilege=target_user.privilege,
+    )
+    session.add(tombstone)
+    session.flush()
+
+    repaired = 0
+    for row in blocked_rows:
+        if row.device_user_id not in {None, target_user.id}:
+            row.ords_status = "QUARANTINED_IDENTITY_REUSE"
+            row.identity_resolution_status = "QUARANTINED_REUSE"
+            continue
+        row.device_user_id = target_user.id
+        row.identity_snapshot_id = zkt.identity_snapshot_id
+        row.identity_terminal_fingerprint = None
+        row.identity_resolution_status = "RESOLVED_HISTORICAL_ALIAS"
+        row.identity_resolved_at = utc_now()
+        row.identity_repaired_at = utc_now()
+        row.identity_repair_reason = "VERIFIED_HISTORICAL_ALIAS"
+        row.display_name = target_user.display_name
+        row.cnic_encrypted = target_user.cnic_encrypted
+        row.cnic_lookup_hash = target_user.cnic_lookup_hash
+        row.cnic_last4 = target_user.cnic_last4
+        row.raw_punch = row.raw_punch or target_user.shift_worker
+        row.ords_status = "PENDING"
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        )
+        if outbox is None:
+            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
+        repaired += 1
+
+    append_audit(
+        session,
+        actor=actor,
+        action="HISTORICAL_IDENTITY_ALIAS_VERIFIED",
+        target_type="zkt_user_identity_alias",
+        target_id=f"{zkt.id}:{source_user_id}",
+        outcome="SUCCEEDED",
+        before={
+            "source_user_id": source_user_id,
+            "source_cnic": mask_cnic(source_cnic),
+            "blocked_events": len(blocked_rows),
+        },
+        after={
+            "target_user_key": target_user.user_key,
+            "target_user_id": target_user.user_id,
+            "target_cnic": mask_cnic(cnic),
+            "repaired_events": repaired,
+            "reason": reason,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return tombstone, repaired
+
+
 def enrich_undelivered_attendance(
     session: Session,
     *,

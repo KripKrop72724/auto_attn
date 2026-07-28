@@ -364,6 +364,22 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
     assert attestation < destructive_delete
 
 
+def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    recovery = source[
+        source.index("static void recover_blocked_events_from_snapshot(") :
+        source.index("static void storage_init(")
+    ]
+    assert "add_connector_lookup_identity(" in recovery
+    assert "recovered_cnic" in recovery
+    assert "recovered_name" in recovery
+    assert "recovered_shift_worker" in recovery
+    assert recovery.index("add_connector_lookup_identity(") < recovery.index(
+        "cJSON_AddStringToObject(root, \"cnic\", recovered_cnic)"
+    )
+    assert "verified ADD identity alias" in recovery
+
+
 def test_authoritative_truth_requires_a_stable_terminal_dump():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[
