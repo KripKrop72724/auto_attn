@@ -286,7 +286,7 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
         source_cnic=CNIC,
         target_user=target,
         reason="Oracle retained one unique CNIC for this historical terminal identity.",
-        idempotency_key="alias-CL04209-to-13",
+        idempotency_key="test-alias-key",
         actor="StateHealthAdmin",
     )
     db.flush()
@@ -311,7 +311,7 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
         source_cnic=CNIC,
         target_user=target,
         reason="Idempotent operator retry.",
-        idempotency_key="alias-CL04209-to-13",
+        idempotency_key="test-alias-key",
         actor="StateHealthAdmin",
     )
     assert replay.id == alias.id
