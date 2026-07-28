@@ -1483,6 +1483,47 @@ def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     assert alert and alert.severity == "WARNING"
 
 
+def test_heartbeat_surfaces_fail_closed_historical_backfill_state(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="2.2.12",
+        zkt={
+            "online": True,
+            "connection_state": "ONLINE",
+            "serial": SERIAL,
+            "history_backfill": {
+                "state": "BLOCKED",
+                "coverage_start_month": "2023-04",
+                "cursor_month": "2025-11",
+                "failed_windows": 2,
+            },
+        },
+    )
+
+    result = update_heartbeat(
+        db, connector=connector, boot_id="history-boot", sequence=1, payload=payload
+    )
+
+    capabilities = result["zkt"]["capabilities"]
+    assert capabilities["history_backfill_state"] == "BLOCKED"
+    assert capabilities["history_coverage_start_month"] == "2023-04"
+    assert capabilities["history_cursor_month"] == "2025-11"
+    assert capabilities["history_failed_windows"] == 2
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "HISTORY_BACKFILL_BLOCKED"))
+    assert alert and alert.severity == "HIGH"
+
+    payload.zkt["history_backfill"] = {
+        "state": "COMPLETE",
+        "coverage_start_month": "2023-04",
+        "cursor_month": "2026-07",
+        "failed_windows": 0,
+    }
+    update_heartbeat(
+        db, connector=connector, boot_id="history-boot", sequence=2, payload=payload
+    )
+    assert alert.state == "RESOLVED"
+
+
 def test_admin_lease_result_is_durable(db: Session):
     connector = connector_fixture(db)
     make_writable(connector)

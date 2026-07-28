@@ -8,7 +8,9 @@ set define off
     zone-agent password before running in Oracle. Never commit the password.
   - This script does not change HR_RAW_ATTN_CAPTURE_EVENTS table shape.
   - The reconcile endpoint is intentionally authoritative inside the supplied
-    zone_id + device_serial + attendance-date window.
+    zone_id + device_serial + attendance-date window. API v2 rejects every
+    request unless terminal-event and complete identity-map attestations match
+    the submitted event array before any delete can run.
 */
 
 create or replace package slic_zkt_truth_api authid definer as
@@ -565,6 +567,9 @@ create or replace package body slic_zkt_truth_api as
         v_window_start_text varchar2(32);
         v_window_end_text varchar2(32);
         v_mode varchar2(80);
+        v_terminal_event_count number;
+        v_identity_mapped_count number;
+        v_identity_map_complete varchar2(10);
         v_received number := 0;
         v_invalid number := 0;
         v_request_dupes number := 0;
@@ -583,14 +588,24 @@ create or replace package body slic_zkt_truth_api as
                coalesce(nullif(trim(json_value(p_body, '$.device_serial' returning varchar2(100) null on error)), ''), 'unknown'),
                trim(json_value(p_body, '$.window_start' returning varchar2(32) null on error)),
                trim(json_value(p_body, '$.window_end' returning varchar2(32) null on error)),
-               trim(json_value(p_body, '$.mode' returning varchar2(80) null on error))
+               trim(json_value(p_body, '$.mode' returning varchar2(80) null on error)),
+               json_value(p_body, '$.terminal_event_count' returning number null on error),
+               json_value(p_body, '$.identity_mapped_count' returning number null on error),
+               lower(trim(json_value(
+                   p_body,
+                   '$.identity_map_complete'
+                   returning varchar2(10)
+                   null on error)))
           into v_api_version,
                v_zone_id,
                v_device_id,
                v_device_serial,
                v_window_start_text,
                v_window_end_text,
-               v_mode
+               v_mode,
+               v_terminal_event_count,
+               v_identity_mapped_count,
+               v_identity_map_complete
           from dual;
 
         begin
@@ -602,7 +617,7 @@ create or replace package body slic_zkt_truth_api as
         end;
 
         if v_api_version is null
-           or v_api_version <> 1
+           or v_api_version <> 2
            or v_zone_id is null
            or v_device_id is null
            or v_device_serial is null
@@ -618,6 +633,18 @@ create or replace package body slic_zkt_truth_api as
         v_received := event_array_count(p_body);
         if v_received < 0 then
             fail_and_stop(400, 'Malformed JSON payload', 0, 1, '["malformed_json"]');
+        end if;
+        if v_identity_map_complete <> 'true'
+           or v_terminal_event_count is null
+           or v_identity_mapped_count is null
+           or v_terminal_event_count <> v_received
+           or v_identity_mapped_count <> v_received then
+            fail_and_stop(
+                400,
+                'Incomplete terminal truth attestation; no destructive repair was performed',
+                v_received,
+                1,
+                '["incomplete_terminal_truth"]');
         end if;
 
         with incoming as (

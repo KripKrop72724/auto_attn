@@ -213,6 +213,13 @@
 #ifndef ZONE_LITE_FULL_TRUTH_RECONCILE_MS
 #define ZONE_LITE_FULL_TRUTH_RECONCILE_MS (6 * 60 * 60 * 1000LL)
 #endif
+#ifndef ZONE_LITE_HISTORY_RETRY_SECONDS
+#define ZONE_LITE_HISTORY_RETRY_SECONDS (24 * 60 * 60)
+#endif
+#ifndef ZONE_LITE_HISTORY_SWEEP_SECONDS
+#define ZONE_LITE_HISTORY_SWEEP_SECONDS (7 * 24 * 60 * 60)
+#endif
+#define ZONE_LITE_HISTORY_SCHEMA_VERSION 1
 
 // Per-device NVS provisioning overrides compile-time development defaults.
 #undef ZONE_LITE_WIFI_SSID
@@ -345,12 +352,21 @@ static int32_t g_last_synced_attendance_count = -1;
 static int64_t g_last_full_truth_reconcile_epoch;
 static int64_t g_last_full_truth_reconcile_ms;
 static bool g_force_truth_reconcile;
+static bool g_history_backfill_pending;
+static bool g_history_backfill_had_failures;
+static int32_t g_history_cursor_year;
+static int32_t g_history_cursor_month;
+static int32_t g_history_oldest_year;
+static int32_t g_history_oldest_month;
+static int64_t g_history_last_sweep_epoch;
+static uint32_t g_history_failed_windows;
 static uint32_t g_last_zkt_tcp_candidate_ip;
 static bool g_sntp_started;
 static bool g_time_synced;
 static int64_t g_ords_next_attempt_ms;
 static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
 static bool g_truth_reconcile_warning;
+static bool g_truth_window_blocked;
 static int g_daily_zkt_reboot_completed_day = -1;
 static int64_t g_daily_zkt_reboot_last_attempt_ms;
 static int64_t g_last_full_scan_ms;
@@ -364,12 +380,17 @@ static int64_t g_temp_admin_expires_epoch;
 static bool oracle_send_reconcile(
     const attendance_event_t *events,
     size_t event_count,
+    size_t terminal_event_count,
+    size_t identity_mapped_count,
     int year,
     int month,
     int window_start_day,
     int window_end_day,
     size_t *truth_count_out);
 static int days_in_month(int year, int month);
+static int compare_months(int left_year, int left_month, int right_year, int right_month);
+static void advance_month(int32_t *year, int32_t *month);
+static void update_history_telemetry(void);
 
 static int64_t uptime_ms(void)
 {
@@ -399,6 +420,15 @@ static void nvs_save_runtime_state(void)
             : "unknown";
         (void)nvs_set_str(handle, "truth_ver", version);
     }
+    (void)nvs_set_u8(handle, "hist_schema", ZONE_LITE_HISTORY_SCHEMA_VERSION);
+    (void)nvs_set_u8(handle, "hist_pending", g_history_backfill_pending ? 1 : 0);
+    (void)nvs_set_u8(handle, "hist_failed", g_history_backfill_had_failures ? 1 : 0);
+    (void)nvs_set_i32(handle, "hist_year", g_history_cursor_year);
+    (void)nvs_set_i32(handle, "hist_month", g_history_cursor_month);
+    (void)nvs_set_i32(handle, "hist_old_y", g_history_oldest_year);
+    (void)nvs_set_i32(handle, "hist_old_m", g_history_oldest_month);
+    (void)nvs_set_i64(handle, "hist_sweep", g_history_last_sweep_epoch);
+    (void)nvs_set_u32(handle, "hist_fail_n", g_history_failed_windows);
     (void)nvs_set_i32(handle, "restart_slot", g_daily_zkt_reboot_completed_day);
     (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
     (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
@@ -414,6 +444,9 @@ static void nvs_load_runtime_state(void)
         return;
     }
     uint8_t active = 0;
+    uint8_t history_schema = 0;
+    uint8_t history_pending = 0;
+    uint8_t history_failed = 0;
     int32_t restart_slot = -1;
     char truth_version[32] = "";
     size_t truth_version_size = sizeof(truth_version);
@@ -429,6 +462,28 @@ static void nvs_load_runtime_state(void)
         g_force_truth_reconcile = true;
         g_last_full_truth_reconcile_epoch = 0;
         g_last_full_truth_reconcile_ms = 0;
+    }
+    if (nvs_get_u8(handle, "hist_schema", &history_schema) != ESP_OK ||
+        history_schema != ZONE_LITE_HISTORY_SCHEMA_VERSION) {
+        g_history_backfill_pending = true;
+        g_history_backfill_had_failures = false;
+        g_history_cursor_year = 0;
+        g_history_cursor_month = 0;
+        g_history_oldest_year = 0;
+        g_history_oldest_month = 0;
+        g_history_last_sweep_epoch = 0;
+        g_history_failed_windows = 0;
+    } else {
+        (void)nvs_get_u8(handle, "hist_pending", &history_pending);
+        (void)nvs_get_u8(handle, "hist_failed", &history_failed);
+        (void)nvs_get_i32(handle, "hist_year", &g_history_cursor_year);
+        (void)nvs_get_i32(handle, "hist_month", &g_history_cursor_month);
+        (void)nvs_get_i32(handle, "hist_old_y", &g_history_oldest_year);
+        (void)nvs_get_i32(handle, "hist_old_m", &g_history_oldest_month);
+        (void)nvs_get_i64(handle, "hist_sweep", &g_history_last_sweep_epoch);
+        (void)nvs_get_u32(handle, "hist_fail_n", &g_history_failed_windows);
+        g_history_backfill_pending = history_pending != 0;
+        g_history_backfill_had_failures = history_failed != 0;
     }
     if (nvs_get_i32(handle, "restart_slot", &restart_slot) == ESP_OK) {
         g_daily_zkt_reboot_completed_day = (int)restart_slot;
@@ -2806,6 +2861,62 @@ static bool zk_timestamp_in_window(
         decoded.tm_mday <= end_day;
 }
 
+static bool attendance_record_timestamp(
+    const uint8_t *record,
+    uint32_t record_size,
+    uint32_t *timestamp_out)
+{
+    if (!record || !timestamp_out) return false;
+    if (record_size == 8) {
+        *timestamp_out = read_le32(record + 3);
+    } else if (record_size == 16) {
+        *timestamp_out = read_le32(record + 4);
+    } else if (record_size == 40) {
+        *timestamp_out = read_le32(record + 27);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool find_attendance_month_bounds(
+    const uint8_t *data,
+    size_t len,
+    uint32_t record_size,
+    int not_after_year,
+    int not_after_month,
+    int *oldest_year,
+    int *oldest_month)
+{
+    if (!data || len < 4 || !oldest_year || !oldest_month) return false;
+    const uint8_t *record = data + 4;
+    size_t remain = len - 4;
+    bool found = false;
+    while (remain >= record_size) {
+        uint32_t timestamp = 0;
+        if (attendance_record_timestamp(record, record_size, &timestamp)) {
+            struct tm decoded;
+            decode_zk_time(timestamp, &decoded);
+            int year = decoded.tm_year + 1900;
+            int month = decoded.tm_mon + 1;
+            int day = decoded.tm_mday;
+            bool plausible = year >= 2000 && year <= not_after_year &&
+                month >= 1 && month <= 12 && day >= 1 &&
+                day <= days_in_month(year, month) &&
+                compare_months(year, month, not_after_year, not_after_month) <= 0;
+            if (plausible &&
+                (!found || compare_months(year, month, *oldest_year, *oldest_month) < 0)) {
+                *oldest_year = year;
+                *oldest_month = month;
+                found = true;
+            }
+        }
+        record += record_size;
+        remain -= record_size;
+    }
+    return found;
+}
+
 static bool parse_attendance_record(
     const uint8_t *record,
     uint32_t record_size,
@@ -2856,9 +2967,13 @@ static size_t collect_reconcile_window(
     int end_day,
     attendance_event_t *events,
     size_t capacity,
-    bool *overflow)
+    bool *overflow,
+    size_t *terminal_count_out,
+    size_t *identity_mapped_count_out)
 {
     if (overflow) *overflow = false;
+    if (terminal_count_out) *terminal_count_out = 0;
+    if (identity_mapped_count_out) *identity_mapped_count_out = 0;
     if (!data || len < 4 || !events || capacity == 0) return 0;
     const uint8_t *record = data + 4;
     size_t remain = len - 4;
@@ -2867,15 +2982,16 @@ static size_t collect_reconcile_window(
     while (remain >= record_size) {
         attendance_event_t event;
         uint32_t timestamp = 0;
-        if (parse_attendance_record(
-                record, record_size, users, &event, &timestamp)) {
-            struct tm decoded;
-            decode_zk_time(timestamp, &decoded);
-            int event_year = decoded.tm_year + 1900;
-            int event_month = decoded.tm_mon + 1;
-            int event_day = decoded.tm_mday;
-            if (event_year == year && event_month == month &&
-                event_day >= start_day && event_day <= end_day) {
+        bool has_timestamp = attendance_record_timestamp(record, record_size, &timestamp);
+        if (has_timestamp &&
+            zk_timestamp_in_window(timestamp, year, month, start_day, end_day)) {
+            if (terminal_count_out) (*terminal_count_out)++;
+            bool parsed = parse_attendance_record(
+                record, record_size, users, &event, &timestamp);
+            if (parsed && event.cnic[0] != '\0') {
+                if (identity_mapped_count_out) (*identity_mapped_count_out)++;
+            }
+            if (parsed) {
                 if (count >= capacity) {
                     if (overflow) *overflow = true;
                     return count;
@@ -2902,57 +3018,26 @@ static bool reconcile_attendance_dump(
     int filter_year,
     int filter_month,
     int filter_day_end,
-    size_t *added_out)
+    bool historical,
+    size_t *added_out,
+    bool *identity_blocked_out,
+    bool *history_exhausted_out)
 {
     if (added_out) *added_out = 0;
+    if (identity_blocked_out) *identity_blocked_out = false;
+    if (history_exhausted_out) *history_exhausted_out = false;
     uint8_t *data = NULL;
     size_t len = 0;
     if (records <= 0) {
-        int last_day = days_in_month(filter_year, filter_month);
-        int day_end = filter_day_end;
-        if (last_day == 0 || day_end < 1) {
-            return false;
+        if (historical) {
+            if (history_exhausted_out) *history_exhausted_out = true;
+            return true;
         }
-        if (day_end > last_day) day_end = last_day;
-        size_t truth_count = 0;
-        bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED;
-        bool truth_delivery_ok = !truth_enabled || oracle_send_reconcile(
-            NULL,
-            0,
-            filter_year,
-            filter_month,
-            1,
-            day_end,
-            &truth_count);
-        bool add_delivery_ok = add_enqueue_reconcile_events(
-            NULL, 0, capturetype);
-        if (truth_enabled && truth_delivery_ok) {
-            char checkpoint[192];
-            snprintf(
-                checkpoint,
-                sizeof(checkpoint),
-                "Oracle accepted empty truth window %04d-%02d-01..%02d; per-event confirmation delegated to durable ADD delivery/check",
-                filter_year,
-                filter_month,
-                day_end);
-            (void)add_connector_log(
-                "INFO",
-                "reconcile",
-                "ORACLE_RECONCILE_ACCEPTED",
-                checkpoint);
-        }
-        bool reconcile_complete = truth_delivery_ok && add_delivery_ok;
-        ESP_LOGI(
+        ESP_LOGW(
             TAG,
-            "Empty-terminal authoritative reconcile window=%04d-%02d-01..%02d complete=%s",
-            filter_year,
-            filter_month,
-            day_end,
-            reconcile_complete ? "true" : "false");
-        if (!reconcile_complete) {
-            led_status_fault(LED_STATUS_TRUTH_REPAIR);
-        }
-        return reconcile_complete;
+            "Refusing an authoritative empty replacement without a stable attendance dump");
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        return false;
     }
     // Do not download a multi-megabyte ZKT dump while the background ORDS
     // worker owns the durable outbox for a network rewrite. Waiting here keeps
@@ -2995,14 +3080,71 @@ static bool reconcile_attendance_dump(
         return false;
     }
     uint32_t parsed_records = total_size / record_size;
-    if (parsed_records != (uint32_t)records) {
+    int32_t verified_users = 0;
+    int32_t verified_records = 0;
+    if (!zk_get_counts(sock, ctx, &verified_users, &verified_records) ||
+        verified_users != (int32_t)users->count ||
+        verified_records != records ||
+        parsed_records != (uint32_t)records) {
         ESP_LOGW(
             TAG,
-            "ZKT attendance count changed during read reported=%ld parsed=%lu packet_size=%lu",
+            "ZKT attendance snapshot changed during read before=%ld parsed=%lu after=%ld; authoritative replacement aborted",
             (long)records,
             (unsigned long)parsed_records,
-            (unsigned long)record_size);
-        records = (int32_t)parsed_records;
+            (long)verified_records);
+        free(data);
+        xSemaphoreGive(g_ords_outbox_gate);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        return false;
+    }
+    if (historical) {
+        int oldest_year = 0;
+        int oldest_month = 0;
+        if (!find_attendance_month_bounds(
+                data,
+                len,
+                record_size,
+                filter_year,
+                filter_month,
+                &oldest_year,
+                &oldest_month)) {
+            free(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            if (history_exhausted_out) *history_exhausted_out = true;
+            return true;
+        }
+        if (g_history_oldest_year <= 0 || g_history_oldest_month <= 0 ||
+            compare_months(
+                oldest_year,
+                oldest_month,
+                g_history_oldest_year,
+                g_history_oldest_month) < 0) {
+            g_history_oldest_year = oldest_year;
+            g_history_oldest_month = oldest_month;
+        }
+        if (g_history_cursor_year <= 0 || g_history_cursor_month <= 0 ||
+            compare_months(
+                g_history_cursor_year,
+                g_history_cursor_month,
+                oldest_year,
+                oldest_month) < 0) {
+            g_history_cursor_year = oldest_year;
+            g_history_cursor_month = oldest_month;
+        }
+        if (compare_months(
+                g_history_cursor_year,
+                g_history_cursor_month,
+                filter_year,
+                filter_month) >= 0) {
+            free(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            if (history_exhausted_out) *history_exhausted_out = true;
+            return true;
+        }
+        filter_year = g_history_cursor_year;
+        filter_month = g_history_cursor_month;
+        filter_day_end = days_in_month(filter_year, filter_month);
+        update_history_telemetry();
     }
     const uint8_t *p = data + 4;
     size_t remain = len - 4;
@@ -3145,6 +3287,8 @@ static bool reconcile_attendance_dump(
     while (window_start_day <= day_end) {
         int window_end_day = daily_windows ? window_start_day : day_end;
         bool overflow = false;
+        size_t window_terminal_count = 0;
+        size_t window_identity_mapped_count = 0;
         size_t window_event_count = collect_reconcile_window(
             data,
             len,
@@ -3156,7 +3300,9 @@ static bool reconcile_attendance_dump(
             window_end_day,
             reconcile_events,
             reconcile_capacity,
-            &overflow);
+            &overflow,
+            &window_terminal_count,
+            &window_identity_mapped_count);
         window_count++;
         if (overflow) {
             ESP_LOGE(
@@ -3177,17 +3323,45 @@ static bool reconcile_attendance_dump(
                 window_truth_ok = oracle_send_reconcile(
                     reconcile_events,
                     window_event_count,
+                    window_terminal_count,
+                    window_identity_mapped_count,
                     filter_year,
                     filter_month,
                     window_start_day,
                     window_end_day,
                     &window_truth_count);
+                if (!window_truth_ok && g_truth_window_blocked &&
+                    identity_blocked_out) {
+                    *identity_blocked_out = true;
+                }
             } else {
                 for (size_t i = 0; i < window_event_count; i++) {
                     if (reconcile_events[i].cnic[0] != '\0') {
                         window_truth_count++;
                     }
                 }
+            }
+            if (window_terminal_count != window_event_count ||
+                window_identity_mapped_count != window_event_count) {
+                window_truth_ok = false;
+                if (identity_blocked_out) *identity_blocked_out = true;
+                char blocked_message[224];
+                snprintf(
+                    blocked_message,
+                    sizeof(blocked_message),
+                    "Authoritative window %04d-%02d-%02d..%02d blocked: terminal=%u parsed=%u identity_mapped=%u; no Oracle deletion was attempted",
+                    filter_year,
+                    filter_month,
+                    window_start_day,
+                    window_end_day,
+                    (unsigned)window_terminal_count,
+                    (unsigned)window_event_count,
+                    (unsigned)window_identity_mapped_count);
+                (void)add_connector_log(
+                    "ERROR",
+                    "reconcile",
+                    "TRUTH_IDENTITY_INCOMPLETE",
+                    blocked_message);
             }
             // Do not mirror a full terminal history into per-event firmware
             // receipt rows. A 95k-record terminal produces more receipt bytes
@@ -3222,12 +3396,14 @@ static bool reconcile_attendance_dump(
             add_delivery_ok = add_delivery_ok && window_add_ok;
             ESP_LOGI(
                 TAG,
-                "Truth window %04d-%02d-%02d..%02d events=%u truth=%u oracle=%s add=%s",
+                "Truth window %04d-%02d-%02d..%02d terminal=%u parsed=%u identity_mapped=%u truth=%u oracle=%s add=%s",
                 filter_year,
                 filter_month,
                 window_start_day,
                 window_end_day,
+                (unsigned)window_terminal_count,
                 (unsigned)window_event_count,
+                (unsigned)window_identity_mapped_count,
                 (unsigned)window_truth_count,
                 window_truth_ok ? "true" : "false",
                 window_add_ok ? "true" : "false");
@@ -3929,6 +4105,91 @@ static int days_in_month(int year, int month)
     return days[month - 1];
 }
 
+static int compare_months(int left_year, int left_month, int right_year, int right_month)
+{
+    if (left_year != right_year) return left_year < right_year ? -1 : 1;
+    if (left_month != right_month) return left_month < right_month ? -1 : 1;
+    return 0;
+}
+
+static void advance_month(int32_t *year, int32_t *month)
+{
+    if (!year || !month) return;
+    (*month)++;
+    if (*month > 12) {
+        *month = 1;
+        (*year)++;
+    }
+}
+
+static void update_history_telemetry(void)
+{
+    const char *state = "NOT_STARTED";
+    if (g_history_backfill_pending) {
+        state = g_history_backfill_had_failures ? "RETRYING" : "RUNNING";
+    } else if (g_history_last_sweep_epoch > 0) {
+        state = g_history_backfill_had_failures ? "BLOCKED" : "COMPLETE";
+    }
+    strlcpy(
+        g_add_zkt.history_backfill_state,
+        state,
+        sizeof(g_add_zkt.history_backfill_state));
+    g_add_zkt.history_cursor_year = g_history_cursor_year;
+    g_add_zkt.history_cursor_month = g_history_cursor_month;
+    g_add_zkt.history_oldest_year = g_history_oldest_year;
+    g_add_zkt.history_oldest_month = g_history_oldest_month;
+    g_add_zkt.history_last_sweep_epoch = g_history_last_sweep_epoch;
+    g_add_zkt.history_failed_windows = g_history_failed_windows;
+    add_connector_set_zkt(&g_add_zkt);
+}
+
+static bool history_sweep_is_due(int64_t current_epoch)
+{
+    if (g_history_backfill_pending) return true;
+    if (current_epoch <= 1700000000 || g_history_last_sweep_epoch <= 0) return false;
+    int64_t interval = g_history_backfill_had_failures
+        ? ZONE_LITE_HISTORY_RETRY_SECONDS
+        : ZONE_LITE_HISTORY_SWEEP_SECONDS;
+    return current_epoch - g_history_last_sweep_epoch >= interval;
+}
+
+static void history_start_new_sweep(void)
+{
+    g_history_backfill_pending = true;
+    g_history_backfill_had_failures = false;
+    g_history_cursor_year = 0;
+    g_history_cursor_month = 0;
+    g_history_oldest_year = 0;
+    g_history_oldest_month = 0;
+    g_history_failed_windows = 0;
+    update_history_telemetry();
+    nvs_save_runtime_state();
+}
+
+static void history_finish_sweep(int64_t current_epoch)
+{
+    g_history_backfill_pending = false;
+    g_history_last_sweep_epoch = current_epoch > 1700000000 ? current_epoch : epoch_now();
+    update_history_telemetry();
+    nvs_save_runtime_state();
+    char message[224];
+    snprintf(
+        message,
+        sizeof(message),
+        "Historical truth sweep finished coverage_start=%04ld-%02ld failed_windows=%lu state=%s",
+        (long)g_history_oldest_year,
+        (long)g_history_oldest_month,
+        (unsigned long)g_history_failed_windows,
+        g_history_backfill_had_failures ? "BLOCKED" : "COMPLETE");
+    (void)add_connector_log(
+        g_history_backfill_had_failures ? "ERROR" : "INFO",
+        "reconcile",
+        g_history_backfill_had_failures
+            ? "HISTORY_BACKFILL_BLOCKED"
+            : "HISTORY_BACKFILL_COMPLETE",
+        message);
+}
+
 static char *json_escape_alloc(const char *value)
 {
     if (value == NULL) {
@@ -3956,6 +4217,8 @@ static char *json_escape_alloc(const char *value)
 static char *build_reconcile_payload(
     const attendance_event_t *events,
     size_t event_count,
+    size_t terminal_event_count,
+    size_t identity_mapped_count,
     int year,
     int month,
     int window_start_day,
@@ -3978,13 +4241,14 @@ static char *build_reconcile_payload(
         return NULL;
     }
 
-    char header[512];
+    char header[1024];
     int header_len = snprintf(
         header,
         sizeof(header),
-        "{\"api_version\":1,\"zone_id\":\"%s\",\"device_id\":\"%s\",\"device_serial\":\"%s\","
+        "{\"api_version\":2,\"zone_id\":\"%s\",\"device_id\":\"%s\",\"device_serial\":\"%s\","
         "\"window_start\":\"%04d-%02d-%02d\",\"window_end\":\"%04d-%02d-%02d\","
-        "\"mode\":\"authoritative_replace\",\"events\":[",
+        "\"mode\":\"authoritative_replace\",\"terminal_event_count\":%u,"
+        "\"identity_mapped_count\":%u,\"identity_map_complete\":true,\"events\":[",
         zone_id,
         device_id,
         device_serial,
@@ -3993,7 +4257,9 @@ static char *build_reconcile_payload(
         window_start_day,
         year,
         month,
-        window_end_day);
+        window_end_day,
+        (unsigned)terminal_event_count,
+        (unsigned)identity_mapped_count);
     free(zone_id);
     free(device_id);
     free(device_serial);
@@ -4103,6 +4369,8 @@ static bool oracle_reconcile_body_ok(const char *body, int *deleted, int *correc
 static bool oracle_send_reconcile(
     const attendance_event_t *events,
     size_t event_count,
+    size_t terminal_event_count,
+    size_t identity_mapped_count,
     int year,
     int month,
     int window_start_day,
@@ -4110,6 +4378,7 @@ static bool oracle_send_reconcile(
     size_t *truth_count_out)
 {
     if (truth_count_out) *truth_count_out = 0;
+    g_truth_window_blocked = false;
     if (!ZONE_LITE_ORDS_RECONCILE_ENABLED) {
         return true;
     }
@@ -4122,11 +4391,25 @@ static bool oracle_send_reconcile(
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
+    if (terminal_event_count != event_count ||
+        identity_mapped_count != event_count) {
+        g_truth_window_blocked = true;
+        ESP_LOGW(
+            TAG,
+            "Refusing authoritative truth for an incomplete identity window terminal=%u parsed=%u mapped=%u",
+            (unsigned)terminal_event_count,
+            (unsigned)event_count,
+            (unsigned)identity_mapped_count);
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+        return false;
+    }
 
     size_t truth_count = 0;
     char *payload = build_reconcile_payload(
         events,
         event_count,
+        terminal_event_count,
+        identity_mapped_count,
         year,
         month,
         window_start_day,
@@ -4181,6 +4464,7 @@ static bool oracle_send_reconcile(
             ESP_LOGI(TAG, "ORDS truth reconcile is clean after previous repair warning");
         }
     } else if (status == 400) {
+        g_truth_window_blocked = true;
         ESP_LOGW(TAG, "ORDS rejected truth reconcile payload status=400 body=%s", body ? body : "");
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
     } else {
@@ -5388,18 +5672,25 @@ static int64_t gateway_run(uint32_t host_order_ip)
             bool counter_mismatch = record_delta < 0 || (uint64_t)record_delta != live_events_since_sync;
             int64_t current_epoch = epoch_now();
             bool epoch_valid = current_epoch > 1700000000;
-            bool truth_due = g_force_truth_reconcile ||
+            bool current_truth_due = g_force_truth_reconcile ||
                 g_last_synced_attendance_count < 0 ||
                 (g_last_full_truth_reconcile_epoch == 0 && g_last_full_truth_reconcile_ms == 0);
-            if (!truth_due && epoch_valid && g_last_full_truth_reconcile_epoch > 0) {
+            if (!current_truth_due && epoch_valid && g_last_full_truth_reconcile_epoch > 0) {
                 int64_t elapsed_seconds = current_epoch - g_last_full_truth_reconcile_epoch;
-                truth_due = elapsed_seconds < 0 ||
+                current_truth_due = elapsed_seconds < 0 ||
                     elapsed_seconds >= ZONE_LITE_FULL_TRUTH_RECONCILE_MS / 1000;
-            } else if (!truth_due && g_last_full_truth_reconcile_epoch == 0 &&
+            } else if (!current_truth_due && g_last_full_truth_reconcile_epoch == 0 &&
                        g_last_full_truth_reconcile_ms > 0) {
-                truth_due = now_ms - g_last_full_truth_reconcile_ms >=
+                current_truth_due = now_ms - g_last_full_truth_reconcile_ms >=
                     ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
             }
+            if (!g_history_backfill_pending && history_sweep_is_due(current_epoch)) {
+                history_start_new_sweep();
+            }
+            bool historical_reconcile = !counter_mismatch &&
+                !current_truth_due &&
+                g_history_backfill_pending;
+            bool truth_due = current_truth_due || historical_reconcile;
             bool reconcile_succeeded = true;
             if (counter_mismatch || truth_due) {
                 uint32_t bulk_depth = 0;
@@ -5431,11 +5722,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     snprintf(
                         reason,
                         sizeof(reason),
-                        "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s firmware_forced=%s",
+                        "Full reconcile: device_delta=%lld live_observed=%u periodic_truth=%s firmware_forced=%s historical=%s",
                         (long long)record_delta,
                         (unsigned)live_events_since_sync,
-                        truth_due ? "true" : "false",
-                        g_force_truth_reconcile ? "true" : "false");
+                        current_truth_due ? "true" : "false",
+                        g_force_truth_reconcile ? "true" : "false",
+                        historical_reconcile ? "true" : "false");
                     ESP_LOGI(TAG, "%s", reason);
                     add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
                     if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
@@ -5444,7 +5736,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     const char *reconcile_capturetype = g_last_synced_attendance_count < 0
                         ? "DUMP_STARTUP"
                         : "DUMP_RECONNECT";
-                    if (reconcile_attendance_dump(
+                    bool identity_blocked = false;
+                    bool history_exhausted = false;
+                    bool dump_succeeded = reconcile_attendance_dump(
                             sock,
                             &ctx,
                             users,
@@ -5453,22 +5747,65 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             device_now.tm_year + 1900,
                             device_now.tm_mon + 1,
                             device_now.tm_mday,
-                            &added)) {
-                        g_force_truth_reconcile = false;
-                        g_last_synced_attendance_count = refreshed_records;
-                        live_events_since_sync = 0;
-                        g_last_full_truth_reconcile_ms = now_ms;
-                        if (epoch_valid) {
-                            g_last_full_truth_reconcile_epoch = current_epoch;
+                            historical_reconcile,
+                            &added,
+                            &identity_blocked,
+                            &history_exhausted);
+                    if (dump_succeeded) {
+                        if (historical_reconcile) {
+                            if (history_exhausted) {
+                                history_finish_sweep(current_epoch);
+                            } else {
+                                advance_month(
+                                    &g_history_cursor_year,
+                                    &g_history_cursor_month);
+                                if (compare_months(
+                                        g_history_cursor_year,
+                                        g_history_cursor_month,
+                                        device_now.tm_year + 1900,
+                                        device_now.tm_mon + 1) >= 0) {
+                                    history_finish_sweep(current_epoch);
+                                } else {
+                                    update_history_telemetry();
+                                    nvs_save_runtime_state();
+                                }
+                            }
+                        } else {
+                            g_force_truth_reconcile = false;
+                            g_last_synced_attendance_count = refreshed_records;
+                            live_events_since_sync = 0;
+                            g_last_full_truth_reconcile_ms = now_ms;
+                            if (epoch_valid) {
+                                g_last_full_truth_reconcile_epoch = current_epoch;
+                            }
+                            nvs_save_runtime_state();
                         }
-                        nvs_save_runtime_state();
                     } else {
                         reconcile_succeeded = false;
+                        if (historical_reconcile && identity_blocked) {
+                            g_history_backfill_had_failures = true;
+                            g_history_failed_windows++;
+                            advance_month(
+                                &g_history_cursor_year,
+                                &g_history_cursor_month);
+                            if (compare_months(
+                                    g_history_cursor_year,
+                                    g_history_cursor_month,
+                                    device_now.tm_year + 1900,
+                                    device_now.tm_mon + 1) >= 0) {
+                                history_finish_sweep(current_epoch);
+                            } else {
+                                update_history_telemetry();
+                                nvs_save_runtime_state();
+                            }
+                        }
                         add_connector_log(
                             "ERROR",
                             "reconcile",
                             "FULL_RECONCILE_FAILED",
-                            "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
+                            identity_blocked
+                                ? "Attendance truth window was unsafe or rejected; Oracle replacement stayed fail-closed and the historical cursor will retry it in the next sweep"
+                                : "Attendance truth read failed; live capture remains active and the next 15-minute cycle will retry");
                     }
                 }
             } else {
@@ -5710,6 +6047,7 @@ void app_main(void)
         return;
     }
     add_connector_init();
+    update_history_telemetry();
     ota_manager_init();
     zkt_publish_state("BOOTING", "ESP32 firmware boot", false);
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);

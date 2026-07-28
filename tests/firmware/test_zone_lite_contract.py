@@ -297,7 +297,7 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
         source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
         source.index("static void append_acked_uid_from_json_to_file(")
     ]
-    assert "event_day >= start_day && event_day <= end_day" in collector
+    assert "zk_timestamp_in_window(timestamp, year, month, start_day, end_day)" in collector
     assert "if (count >= capacity)" in collector
     assert "window_start_day" in payload
     assert "window_end_day" in payload
@@ -313,11 +313,70 @@ def test_firmware_version_change_forces_immediate_truth_reconcile():
     assert 'nvs_get_str(handle, "truth_ver"' in source
     assert 'strcmp(truth_version, running_version) != 0' in source
     assert "g_force_truth_reconcile = true;" in source
-    assert "bool truth_due = g_force_truth_reconcile ||" in source
+    assert "bool current_truth_due = g_force_truth_reconcile ||" in source
     success = source.index("g_force_truth_reconcile = false;")
     save = source.index("nvs_save_runtime_state();", success)
     assert success < save
     assert 'nvs_set_str(handle, "truth_ver", version)' in source
+
+
+def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "ZONE_LITE_HISTORY_SCHEMA_VERSION 1" in source
+    assert 'nvs_set_i32(handle, "hist_year", g_history_cursor_year)' in source
+    assert 'nvs_set_i32(handle, "hist_month", g_history_cursor_month)' in source
+    assert 'nvs_set_u8(handle, "hist_pending"' in source
+    assert "find_attendance_month_bounds(" in source
+    assert "historical_reconcile = !counter_mismatch" in source
+    assert "advance_month(" in source
+    assert '"HISTORY_BACKFILL_COMPLETE"' in source
+    assert '"HISTORY_BACKFILL_BLOCKED"' in source
+    assert '"history_backfill"' in connector
+
+    payload = source[
+        source.index("static char *build_reconcile_payload(") :
+        source.index("static bool oracle_reconcile_body_ok(")
+    ]
+    sender = source[
+        source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
+        source.index("static void append_acked_uid_from_json_to_file(")
+    ]
+    assert '"api_version\\":2' in payload
+    assert '"terminal_event_count\\":%u' in payload
+    assert '"identity_mapped_count\\":%u' in payload
+    assert '"identity_map_complete\\":true' in payload
+    assert "terminal_event_count != event_count" in sender
+    assert "identity_mapped_count != event_count" in sender
+
+    attestation = oracle.index("if v_identity_map_complete <> 'true'")
+    destructive_delete = oracle.index(
+        "delete from hr_raw_attn_capture_events d", attestation
+    )
+    assert "or v_api_version <> 2" in oracle
+    assert "v_terminal_event_count <> v_received" in oracle
+    assert "v_identity_mapped_count <> v_received" in oracle
+    assert "no destructive repair was performed" in oracle[attestation:destructive_delete]
+    assert attestation < destructive_delete
+
+
+def test_authoritative_truth_requires_a_stable_terminal_dump():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+    stable_guard = reconcile.index("verified_records != records")
+    window_send = reconcile.index("oracle_send_reconcile(", stable_guard)
+    assert "parsed_records != (uint32_t)records" in reconcile
+    assert "verified_users != (int32_t)users->count" in reconcile
+    assert "authoritative replacement aborted" in reconcile
+    assert stable_guard < window_send
+    assert "Refusing an authoritative empty replacement" in reconcile
 
 
 def test_ords_truth_and_outbox_https_requests_are_serialized():

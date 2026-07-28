@@ -134,7 +134,7 @@ const normalizedStatus = (state: unknown) =>
 const statusPattern = (state: unknown) => {
   const normalized = normalizedStatus(state).toUpperCase()
   if (
-    ['ONLINE', 'SUCCEEDED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED'].includes(normalized) ||
+    ['ONLINE', 'SUCCEEDED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED', 'COMPLETE'].includes(normalized) ||
     normalized.includes('ACKED')
   )
     return 'confirmed'
@@ -1760,7 +1760,29 @@ function DeviceDrawer({
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">ZKT TERMINAL</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
-          <article className="detail-card"><p className="eyebrow">CAPTURE HEALTH</p><h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3><p>{device.zkt?.user_count ?? '—'} users · Last 15-minute reconciliation {relativeTime(device.zkt?.last_reconcile_at)}</p></article>
+          <article className="detail-card">
+            <p className="eyebrow">CAPTURE HEALTH</p>
+            <h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3>
+            <p>{device.zkt?.user_count ?? '—'} users · Last 15-minute reconciliation {relativeTime(device.zkt?.last_reconcile_at)}</p>
+            <dl>
+              <div>
+                <dt>Historical truth</dt>
+                <dd><StatusBadge state={String(device.zkt?.capabilities.history_backfill_state || 'NOT_STARTED')} /></dd>
+              </div>
+              <div>
+                <dt>Terminal coverage starts</dt>
+                <dd>{String(device.zkt?.capabilities.history_coverage_start_month || 'Not discovered')}</dd>
+              </div>
+              <div>
+                <dt>Current cursor</dt>
+                <dd>{String(device.zkt?.capabilities.history_cursor_month || '—')}</dd>
+              </div>
+              <div>
+                <dt>Blocked windows</dt>
+                <dd>{Number(device.zkt?.capabilities.history_failed_windows || 0)}</dd>
+              </div>
+            </dl>
+          </article>
           {device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
         </div>}
