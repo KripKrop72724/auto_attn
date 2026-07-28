@@ -71,6 +71,7 @@ from zk_add.service import (
     ingest_attendance,
     onboard_connector,
     oracle_payload,
+    repair_verified_tombstone_backlog,
     replace_user_snapshot,
     record_oracle_receipts,
     serialize_command,
@@ -525,6 +526,104 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
     )
     assert replay.id == alias.id
     assert replay_repaired == 0
+
+
+def test_verified_tombstone_requeues_existing_blocked_punches(
+    db: Session, monkeypatch
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="7" * 64,
+                user_id="unrecoverable",
+                raw_name=None,
+            ),
+            event(event_uid="9" * 64, raw_name=None),
+        ],
+    )
+    assert accepted == ["7" * 64, "9" * 64]
+    assert duplicates == []
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "9" * 64)
+    )
+    assert blocked is not None
+
+    # Model a row that arrived while identity proof was unavailable, followed
+    # by a verified user deletion that preserved the identity tombstone.
+    blocked.cnic_encrypted = None
+    blocked.cnic_lookup_hash = None
+    blocked.cnic_last4 = None
+    blocked.ords_status = "BLOCKED_IDENTITY"
+    blocked.identity_resolution_status = "BLOCKED_IDENTITY"
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == blocked.id)
+    )
+    assert outbox is not None
+    outbox.status = "BLOCKED_IDENTITY"
+    from zk_add.service import persist_identity_tombstone
+
+    tombstone = persist_identity_tombstone(
+        db, zkt=connector.zkt_device, user=user
+    )
+    db.flush()
+
+    # The bounded scan must skip the earlier unrecoverable row instead of
+    # allowing it to starve later rows that have verified tombstones.
+    assert repair_verified_tombstone_backlog(db, limit=1) == 1
+    assert blocked.device_user_id == tombstone.device_user_id
+    assert blocked.identity_resolution_status == "RESOLVED_TOMBSTONE"
+    assert blocked.identity_repair_reason == "VERIFIED_IDENTITY_TOMBSTONE"
+    assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
+    assert blocked.ords_status == "PENDING"
+    assert outbox.status == "PENDING"
+    assert outbox.next_attempt_at is None
+
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
+    claims = worker.claim_ords_batch(1)
+    assert len(claims) == 1
+    assert claims[0][1]["event_uid"] == "9" * 64
+    assert claims[0][1]["cnic"] == CNIC
+
+
+def test_historical_alias_is_eligible_for_ords_delivery(
+    db: Session, monkeypatch
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    target = snapshot_user(
+        db,
+        connector,
+        uid="61",
+        user_id="13",
+        name=f"NoumanI-{CNIC}",
+    )
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="8" * 64, user_id="CL04209", raw_name=None)],
+    )
+    create_historical_identity_alias(
+        db,
+        connector=connector,
+        source_user_id="CL04209",
+        source_cnic=CNIC,
+        target_user=target,
+        reason="Approved Oracle history proves this terminal identity.",
+        idempotency_key="claim-historical-alias",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
+    claims = worker.claim_ords_batch(1)
+    assert len(claims) == 1
+    assert claims[0][1]["event_uid"] == "8" * 64
+    assert claims[0][1]["cnic"] == CNIC
 
 
 def test_request_signing_fixed_compatibility_vector():

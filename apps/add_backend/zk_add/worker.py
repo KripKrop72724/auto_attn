@@ -33,6 +33,7 @@ from zk_add.service import (
     apply_user_command_terminal_state,
     oracle_payload,
     queue_due_revokes,
+    repair_verified_tombstone_backlog,
     resolve_alert,
     serialize_command,
     upsert_alert,
@@ -68,6 +69,11 @@ ORDS_ACTIVE_STATUSES = (
     | ORDS_MEMBERSHIP_REVERIFY_STATUSES
 )
 ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK"}
+VERIFIED_IDENTITY_RESOLUTION_STATUSES = {
+    "RESOLVED",
+    "RESOLVED_HISTORICAL_ALIAS",
+    "RESOLVED_TOMBSTONE",
+}
 ORDS_SAFE_TRANSPORT_ERRORS = {
     "ConnectError",
     "ConnectTimeout",
@@ -267,6 +273,7 @@ async def maintenance_tick() -> None:
                     )
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
+        repair_verified_tombstone_backlog(session)
         for command in session.scalars(
             select(DeviceCommand)
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
@@ -402,7 +409,8 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
             cnic = decrypt_cnic(event.cnic_encrypted)
             identity_unverified = (
                 settings.identity_snapshot_gate_enabled
-                and event.identity_resolution_status != "RESOLVED"
+                and event.identity_resolution_status
+                not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
             )
             if connector is None or zkt is None or not cnic or identity_unverified:
                 row.status = "BLOCKED_IDENTITY"
