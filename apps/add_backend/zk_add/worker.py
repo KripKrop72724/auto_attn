@@ -7,7 +7,7 @@ import json
 import re
 
 import httpx
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.db import session_scope
@@ -46,9 +46,27 @@ ORDS_DELIVERY_CONCURRENCY = max(
     1,
     min(settings.ords_delivery_concurrency, ORDS_DELIVERY_BATCH_SIZE),
 )
+ORDS_FIRMWARE_AUDIT_BATCH_SIZE = max(
+    1,
+    min(settings.ords_firmware_audit_batch_size, 500),
+)
 ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
-ORDS_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
-ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK", "ACKED_FIRMWARE"}
+ORDS_DELIVERY_ACTIVE_STATUSES = {"PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"}
+ORDS_FIRMWARE_UNVERIFIED_STATUSES = {
+    "ACKED_FIRMWARE",
+    "FIRMWARE_RECEIPT_UNVERIFIED",
+    "FIRMWARE_RECEIPT_VERIFYING",
+}
+ORDS_MEMBERSHIP_REVERIFY_STATUSES = {
+    "MEMBERSHIP_REVERIFYING",
+    "MEMBERSHIP_REVERIFY_RETRY",
+}
+ORDS_ACTIVE_STATUSES = (
+    ORDS_DELIVERY_ACTIVE_STATUSES
+    | ORDS_FIRMWARE_UNVERIFIED_STATUSES
+    | ORDS_MEMBERSHIP_REVERIFY_STATUSES
+)
+ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK"}
 ORDS_SAFE_TRANSPORT_ERRORS = {
     "ConnectError",
     "ConnectTimeout",
@@ -106,6 +124,16 @@ def ords_delivery_metrics(session: Session) -> dict:
     active_outbox = sum(
         count for status, count in counts.items() if status.upper() in ORDS_ACTIVE_STATUSES
     )
+    firmware_unverified = sum(
+        count
+        for status, count in counts.items()
+        if status.upper() in ORDS_FIRMWARE_UNVERIFIED_STATUSES
+    )
+    membership_reverify = sum(
+        count
+        for status, count in counts.items()
+        if status.upper() in ORDS_MEMBERSHIP_REVERIFY_STATUSES
+    )
     blocked_identity = int(
         session.scalar(
             select(func.count(AttendanceEvent.id)).where(
@@ -148,6 +176,8 @@ def ords_delivery_metrics(session: Session) -> dict:
         "acknowledged_add": counts.get("acked", 0),
         "acknowledged_check": counts.get("acked_check", 0),
         "acknowledged_firmware": counts.get("acked_firmware", 0),
+        "firmware_unverified": firmware_unverified,
+        "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
     }
@@ -267,7 +297,11 @@ async def maintenance_tick() -> None:
                     command.attempt_count += 1
     for update in connector_updates:
         await browser_events.publish("device", update)
-    await deliver_ords_batch()
+    await asyncio.gather(
+        audit_firmware_receipts_batch(),
+        audit_confirmed_membership_batch(),
+        deliver_ords_batch(),
+    )
 
 
 def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
@@ -422,6 +456,463 @@ def ords_membership_missing(
     return missing_set
 
 
+def claim_firmware_receipt_audit_batch(
+    limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
+) -> list[tuple[int, str, int]]:
+    claims: list[tuple[int, str, int]] = []
+    with session_scope() as session:
+        now = utc_now()
+        stale_before = now - timedelta(
+            seconds=max(60, int(settings.ords_timeout_seconds * 3))
+        )
+        for stale in session.scalars(
+            select(OrdsOutbox)
+            .where(
+                OrdsOutbox.status == "FIRMWARE_RECEIPT_VERIFYING",
+                (OrdsOutbox.last_attempt_at == None)  # noqa: E711
+                | (OrdsOutbox.last_attempt_at < stale_before),
+            )
+            .limit(max(1, limit))
+        ).all():
+            stale.status = "FIRMWARE_RECEIPT_UNVERIFIED"
+            stale.next_attempt_at = now
+            stale.acknowledged_at = None
+            stale.last_error = "RECOVERED_STALE_FIRMWARE_RECEIPT_CHECK"
+            event = (
+                session.get(AttendanceEvent, stale.attendance_event_id)
+                if stale.attendance_event_id
+                else None
+            )
+            if event is not None:
+                event.ords_status = "FIRMWARE_RECEIPT_UNVERIFIED"
+                event.oracle_confirmed_at = None
+                event.oracle_confirmation_path = None
+
+        candidates = session.scalars(
+            select(OrdsOutbox)
+            .where(
+                OrdsOutbox.status.in_(
+                    ["ACKED_FIRMWARE", "FIRMWARE_RECEIPT_UNVERIFIED"]
+                ),
+                (OrdsOutbox.next_attempt_at == None)  # noqa: E711
+                | (OrdsOutbox.next_attempt_at <= now),
+            )
+            .order_by(OrdsOutbox.id.asc())
+            .limit(max(1, min(limit, 500)))
+            .with_for_update(skip_locked=True)
+        ).all()
+        for row in candidates:
+            event = (
+                session.get(AttendanceEvent, row.attendance_event_id)
+                if row.attendance_event_id
+                else None
+            )
+            if event is None or not event_uid_is_valid(event.event_uid):
+                row.status = "QUARANTINED_INVALID_EVENT_UID"
+                row.next_attempt_at = None
+                row.last_error = (
+                    "Firmware receipt cannot be verified because its attendance "
+                    "event_uid is invalid or missing."
+                )
+                if event is not None:
+                    event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+                continue
+            row.status = "FIRMWARE_RECEIPT_VERIFYING"
+            row.attempt_count += 1
+            row.last_attempt_at = now
+            row.next_attempt_at = None
+            row.acknowledged_at = None
+            row.last_error = None
+            event.ords_status = "FIRMWARE_RECEIPT_VERIFYING"
+            event.oracle_confirmed_at = None
+            event.oracle_confirmation_path = None
+            claims.append((row.id, event.event_uid, event.connector_id))
+    return claims
+
+
+def apply_firmware_receipt_audit_failure(
+    session: Session,
+    *,
+    claimed_id: int,
+    status: int | None,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = (
+        session.get(AttendanceEvent, row.attendance_event_id)
+        if row.attendance_event_id
+        else None
+    )
+    connector = session.get(Connector, event.connector_id) if event else None
+    category = ords_failure_category(
+        status,
+        transport_error=transport_error,
+        response_parsed=response_parsed,
+    )
+    row.status = "FIRMWARE_RECEIPT_UNVERIFIED"
+    row.acknowledged_at = None
+    row.last_http_status = status
+    row.last_error = f"FIRMWARE_CHECK_{category}"
+    row.next_attempt_at = utc_now() + timedelta(
+        seconds=min(600, 2 ** min(row.attempt_count, 9))
+    )
+    if event is not None:
+        event.ords_status = "FIRMWARE_RECEIPT_UNVERIFIED"
+        event.oracle_confirmed_at = None
+        event.oracle_confirmation_path = None
+    if connector is not None:
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity="HIGH" if status in {401, 403} else "WARNING",
+            message=(
+                "A firmware receipt is awaiting direct Oracle membership proof; "
+                "the preserved event remains auditable in ADD."
+            ),
+            details={
+                "failure_category": f"FIRMWARE_CHECK_{category}",
+                "http_status": status,
+                "attempt_count": row.attempt_count,
+            },
+        )
+
+
+def apply_firmware_receipt_missing(
+    session: Session,
+    *,
+    claimed_id: int,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = (
+        session.get(AttendanceEvent, row.attendance_event_id)
+        if row.attendance_event_id
+        else None
+    )
+    connector = session.get(Connector, event.connector_id) if event else None
+    now = utc_now()
+    row.status = "PENDING"
+    row.acknowledged_at = None
+    row.last_http_status = 200
+    row.last_error = "FIRMWARE_RECEIPT_NOT_IN_ORACLE"
+    row.next_attempt_at = now
+    if event is not None:
+        event.ords_status = "PENDING"
+        event.oracle_confirmed_at = None
+        event.oracle_confirmation_path = None
+    if connector is not None:
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity="HIGH",
+            message=(
+                "Oracle did not contain a firmware-confirmed attendance event; "
+                "ADD automatically requeued the preserved event."
+            ),
+            details={
+                "failure_category": "FIRMWARE_RECEIPT_NOT_IN_ORACLE",
+                "http_status": 200,
+            },
+        )
+
+
+async def audit_firmware_receipts_batch(
+    *,
+    limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
+) -> None:
+    if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
+        return
+    claims = claim_firmware_receipt_audit_batch(max(1, min(limit, 500)))
+    if not claims:
+        return
+    check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
+    async with httpx.AsyncClient(
+        timeout=settings.ords_timeout_seconds,
+        headers={
+            "X-API-Username": settings.ords_username,
+            "X-API-Password": settings.ords_password,
+        },
+    ) as client:
+        check_status, check_body, check_error, check_parsed = (
+            await post_ords_membership_check(
+                client,
+                check_url,
+                [
+                    (row_id, {"event_uid": event_uid}, connector_id, True)
+                    for row_id, event_uid, connector_id in claims
+                ],
+            )
+        )
+    requested = {event_uid for _row_id, event_uid, _connector_id in claims}
+    missing = ords_membership_missing(check_status, check_body, requested)
+    with session_scope() as session:
+        if missing is None:
+            for row_id, _event_uid, _connector_id in claims:
+                apply_firmware_receipt_audit_failure(
+                    session,
+                    claimed_id=row_id,
+                    status=check_status,
+                    transport_error=check_error,
+                    response_parsed=check_parsed,
+                )
+            return
+        for row_id, event_uid, _connector_id in claims:
+            if event_uid in missing:
+                apply_firmware_receipt_missing(session, claimed_id=row_id)
+            else:
+                apply_ords_confirmation(
+                    session,
+                    claimed_id=row_id,
+                    path="FIRMWARE_RECEIPT_MEMBERSHIP_CHECK",
+                )
+
+
+def claim_confirmed_membership_audit_batch(
+    limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
+) -> list[tuple[int, str, int]]:
+    claims: list[tuple[int, str, int]] = []
+    with session_scope() as session:
+        now = utc_now()
+        stale_before = now - timedelta(
+            seconds=max(60, int(settings.ords_timeout_seconds * 3))
+        )
+        for stale in session.scalars(
+            select(OrdsOutbox)
+            .where(
+                OrdsOutbox.status == "MEMBERSHIP_REVERIFYING",
+                (OrdsOutbox.last_attempt_at == None)  # noqa: E711
+                | (OrdsOutbox.last_attempt_at < stale_before),
+            )
+            .limit(max(1, limit))
+        ).all():
+            stale.status = "MEMBERSHIP_REVERIFY_RETRY"
+            stale.next_attempt_at = now
+            stale.last_error = "RECOVERED_STALE_MEMBERSHIP_REVERIFY"
+            event = (
+                session.get(AttendanceEvent, stale.attendance_event_id)
+                if stale.attendance_event_id
+                else None
+            )
+            if event is not None:
+                event.ords_status = "MEMBERSHIP_REVERIFY_RETRY"
+
+        due_before = now - timedelta(
+            seconds=max(60, settings.ords_membership_reverify_seconds)
+        )
+        proof_at = func.coalesce(
+            AttendanceEvent.oracle_confirmed_at,
+            OrdsOutbox.acknowledged_at,
+            OrdsOutbox.created_at,
+        )
+        candidates = session.scalars(
+            select(OrdsOutbox)
+            .join(
+                AttendanceEvent,
+                AttendanceEvent.id == OrdsOutbox.attendance_event_id,
+            )
+            .where(
+                or_(
+                    (
+                        OrdsOutbox.status.in_(["ACKED", "ACKED_CHECK"])
+                        & (proof_at <= due_before)
+                        & (
+                            (OrdsOutbox.last_attempt_at == None)  # noqa: E711
+                            | (OrdsOutbox.last_attempt_at <= proof_at)
+                        )
+                    ),
+                    (
+                        (OrdsOutbox.status == "MEMBERSHIP_REVERIFY_RETRY")
+                        & (
+                            (OrdsOutbox.next_attempt_at == None)  # noqa: E711
+                            | (OrdsOutbox.next_attempt_at <= now)
+                        )
+                    ),
+                )
+            )
+            .order_by(
+                case(
+                    (OrdsOutbox.status == "MEMBERSHIP_REVERIFY_RETRY", 0),
+                    else_=1,
+                ),
+                OrdsOutbox.id.asc(),
+            )
+            .limit(max(1, min(limit, 500)))
+            .with_for_update(skip_locked=True)
+        ).all()
+        for row in candidates:
+            event = (
+                session.get(AttendanceEvent, row.attendance_event_id)
+                if row.attendance_event_id
+                else None
+            )
+            if event is None or not event_uid_is_valid(event.event_uid):
+                row.status = "QUARANTINED_INVALID_EVENT_UID"
+                row.next_attempt_at = None
+                row.last_error = (
+                    "Oracle membership cannot be reverified because the "
+                    "attendance event_uid is invalid or missing."
+                )
+                if event is not None:
+                    event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+                    event.oracle_confirmed_at = None
+                    event.oracle_confirmation_path = None
+                continue
+            row.status = "MEMBERSHIP_REVERIFYING"
+            row.attempt_count += 1
+            row.last_attempt_at = now
+            row.next_attempt_at = None
+            row.last_error = None
+            event.ords_status = "MEMBERSHIP_REVERIFYING"
+            claims.append((row.id, event.event_uid, event.connector_id))
+    return claims
+
+
+def apply_confirmed_membership_audit_failure(
+    session: Session,
+    *,
+    claimed_id: int,
+    status: int | None,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = (
+        session.get(AttendanceEvent, row.attendance_event_id)
+        if row.attendance_event_id
+        else None
+    )
+    connector = session.get(Connector, event.connector_id) if event else None
+    category = ords_failure_category(
+        status,
+        transport_error=transport_error,
+        response_parsed=response_parsed,
+    )
+    row.status = "MEMBERSHIP_REVERIFY_RETRY"
+    row.last_http_status = status
+    row.last_error = f"REVERIFY_{category}"
+    row.next_attempt_at = utc_now() + timedelta(
+        seconds=min(600, 2 ** min(row.attempt_count, 9))
+    )
+    if event is not None:
+        event.ords_status = "MEMBERSHIP_REVERIFY_RETRY"
+    if connector is not None:
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity="HIGH" if status in {401, 403} else "WARNING",
+            message=(
+                "Periodic Oracle membership verification is retrying; "
+                "the prior confirmation and preserved ADD event remain auditable."
+            ),
+            details={
+                "failure_category": f"REVERIFY_{category}",
+                "http_status": status,
+                "attempt_count": row.attempt_count,
+            },
+        )
+
+
+def apply_confirmed_membership_missing(
+    session: Session,
+    *,
+    claimed_id: int,
+) -> None:
+    row = session.get(OrdsOutbox, claimed_id)
+    if row is None:
+        return
+    event = (
+        session.get(AttendanceEvent, row.attendance_event_id)
+        if row.attendance_event_id
+        else None
+    )
+    connector = session.get(Connector, event.connector_id) if event else None
+    now = utc_now()
+    row.status = "PENDING"
+    row.acknowledged_at = None
+    row.last_http_status = 200
+    row.last_error = "CONFIRMED_EVENT_MISSING_FROM_ORACLE"
+    row.next_attempt_at = now
+    if event is not None:
+        event.ords_status = "PENDING"
+        event.oracle_confirmed_at = None
+        event.oracle_confirmation_path = None
+    if connector is not None:
+        upsert_alert(
+            session,
+            connector,
+            code="ORDS_DELIVERY_FAILED",
+            severity="HIGH",
+            message=(
+                "A previously confirmed attendance event is missing from Oracle; "
+                "ADD automatically requeued its preserved copy."
+            ),
+            details={
+                "failure_category": "CONFIRMED_EVENT_MISSING_FROM_ORACLE",
+                "http_status": 200,
+            },
+        )
+
+
+async def audit_confirmed_membership_batch(
+    *,
+    limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
+) -> None:
+    if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
+        return
+    claims = claim_confirmed_membership_audit_batch(max(1, min(limit, 500)))
+    if not claims:
+        return
+    check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
+    async with httpx.AsyncClient(
+        timeout=settings.ords_timeout_seconds,
+        headers={
+            "X-API-Username": settings.ords_username,
+            "X-API-Password": settings.ords_password,
+        },
+    ) as client:
+        check_status, check_body, check_error, check_parsed = (
+            await post_ords_membership_check(
+                client,
+                check_url,
+                [
+                    (row_id, {"event_uid": event_uid}, connector_id, True)
+                    for row_id, event_uid, connector_id in claims
+                ],
+            )
+        )
+    requested = {event_uid for _row_id, event_uid, _connector_id in claims}
+    missing = ords_membership_missing(check_status, check_body, requested)
+    with session_scope() as session:
+        if missing is None:
+            for row_id, _event_uid, _connector_id in claims:
+                apply_confirmed_membership_audit_failure(
+                    session,
+                    claimed_id=row_id,
+                    status=check_status,
+                    transport_error=check_error,
+                    response_parsed=check_parsed,
+                )
+            return
+        for row_id, event_uid, _connector_id in claims:
+            if event_uid in missing:
+                apply_confirmed_membership_missing(session, claimed_id=row_id)
+            else:
+                apply_ords_confirmation(
+                    session,
+                    claimed_id=row_id,
+                    path="PERIODIC_MEMBERSHIP_REVERIFY",
+                )
+
+
 def apply_ords_confirmation(
     session: Session,
     *,
@@ -539,7 +1030,7 @@ def apply_ords_delivery_result(
                 )
                 .where(
                     AttendanceEvent.connector_id == connector.id,
-                    OrdsOutbox.status == "FAILED_RETRYABLE",
+                    OrdsOutbox.status.in_(ORDS_ACTIVE_STATUSES),
                 )
                 .limit(1)
             )

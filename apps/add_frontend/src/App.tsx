@@ -420,7 +420,7 @@ function FleetView({
         <Metric
           label="ORDS delivery queue"
           value={delivery?.backlog ?? 0}
-          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined · ${delivery?.acknowledged_firmware ?? 0} firmware-confirmed`}
+          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined · ${delivery?.firmware_unverified ?? delivery?.acknowledged_firmware ?? 0} firmware receipts awaiting Oracle proof · ${delivery?.membership_reverify ?? 0} periodic checks`}
           icon="clock"
         />
         <Metric label="National footprint" value={overview.total} detail="Authorized ESP–ZKT pairs" icon="server" />

@@ -1130,16 +1130,12 @@ def ingest_attendance(
             sequence=incoming.sequence,
             raw_event=sanitize_raw_event(incoming.raw_event),
             ords_status=(
-                "ACKED_FIRMWARE"
+                "FIRMWARE_RECEIPT_UNVERIFIED"
                 if receipt_matches_connector
                 else ("PENDING" if cnic else "BLOCKED_IDENTITY")
             ),
-            oracle_confirmed_at=(
-                receipt.oracle_observed_at if receipt_matches_connector else None
-            ),
-            oracle_confirmation_path=(
-                receipt.confirmation_path if receipt_matches_connector else None
-            ),
+            oracle_confirmed_at=None,
+            oracle_confirmation_path=None,
         )
         session.add(row)
         pending_rows.append((row, receipt, receipt_matches_connector, bool(cnic)))
@@ -1156,8 +1152,7 @@ def ingest_attendance(
             session.add(
                 OrdsOutbox(
                     attendance_event_id=row.id,
-                    status="ACKED_FIRMWARE",
-                    acknowledged_at=receipt.oracle_observed_at,
+                    status="FIRMWARE_RECEIPT_UNVERIFIED",
                 )
             )
         elif has_cnic:
@@ -1266,18 +1261,24 @@ def record_oracle_receipts(
             continue
 
         receipt.attendance_event_id = event.id
-        event.ords_status = "ACKED_FIRMWARE"
-        event.oracle_confirmed_at = receipt.oracle_observed_at
-        event.oracle_confirmation_path = receipt.confirmation_path
         outbox = outboxes_by_event_id.get(event.id)
         if outbox is None:
             outbox = OrdsOutbox(attendance_event_id=event.id)
             session.add(outbox)
             outboxes_by_event_id[event.id] = outbox
-        outbox.status = "ACKED_FIRMWARE"
-        outbox.acknowledged_at = receipt.oracle_observed_at
-        outbox.next_attempt_at = None
-        outbox.last_error = None
+        if outbox.status not in {
+            "ACKED",
+            "ACKED_CHECK",
+            "MEMBERSHIP_REVERIFYING",
+            "MEMBERSHIP_REVERIFY_RETRY",
+        }:
+            event.ords_status = "FIRMWARE_RECEIPT_UNVERIFIED"
+            event.oracle_confirmed_at = None
+            event.oracle_confirmation_path = None
+            outbox.status = "FIRMWARE_RECEIPT_UNVERIFIED"
+            outbox.acknowledged_at = None
+            outbox.next_attempt_at = None
+            outbox.last_error = None
         applied += 1
 
     # One flush makes the complete receipt batch durable before the websocket
@@ -1288,7 +1289,16 @@ def record_oracle_receipts(
         .join(AttendanceEvent, AttendanceEvent.id == OrdsOutbox.attendance_event_id)
         .where(
             AttendanceEvent.connector_id == connector.id,
-            OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"]),
+            OrdsOutbox.status.in_(
+                [
+                    "PENDING",
+                    "FAILED_RETRYABLE",
+                    "IN_FLIGHT",
+                    "ACKED_FIRMWARE",
+                    "FIRMWARE_RECEIPT_UNVERIFIED",
+                    "FIRMWARE_RECEIPT_VERIFYING",
+                ]
+            ),
         )
         .limit(1)
     )
