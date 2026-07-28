@@ -349,6 +349,21 @@ def test_firmware_version_change_forces_immediate_truth_reconcile():
     assert 'nvs_set_str(handle, "truth_ver", version)' in source
 
 
+def test_user_integrity_interval_starts_after_refresh_completion():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    integrity_block = source[
+        source.index(
+            "if (now_ms - last_user_integrity >= "
+            "ZONE_LITE_USER_INTEGRITY_INTERVAL_MS)"
+        ) : source.index("if (now_ms - last_time_sample >= 60000)")
+    ]
+    assert "last_user_integrity = uptime_ms();" in integrity_block
+    assert "last_user_integrity = now_ms;" not in integrity_block
+    assert integrity_block.index("last_user_integrity = uptime_ms();") < (
+        integrity_block.index('add_connector_set_activity("LIVE_CAPTURE");')
+    )
+
+
 def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")

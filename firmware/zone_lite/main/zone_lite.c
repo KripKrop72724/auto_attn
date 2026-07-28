@@ -6102,7 +6102,11 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_zkt(&g_add_zkt);
             (void)recover_blocked_events_from_snapshot(users, NULL);
             (void)add_send_user_snapshot(users);
-            last_user_integrity = now_ms;
+            // A stable user refresh can exceed the integrity interval on
+            // larger terminals. Anchor the next interval at completion so
+            // the gateway returns to live capture instead of immediately
+            // entering another back-to-back verification pass.
+            last_user_integrity = uptime_ms();
             add_connector_set_activity("LIVE_CAPTURE");
         }
 
