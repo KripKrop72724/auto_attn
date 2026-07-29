@@ -632,6 +632,8 @@ def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():
     assert "restore_original" in package_migration
     assert "l_ddl_attempted" in package_migration
     assert "where 1 = 0" in package_migration
+    assert "q'~" not in package_migration
+    assert "chr(39)" in package_migration
     assert "update hr_raw_attn_capture_events" not in package_migration.lower()
     assert package_migration.lower().count(
         "delete from hr_raw_attn_capture_events"
