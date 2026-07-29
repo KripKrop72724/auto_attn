@@ -794,6 +794,102 @@ def test_historical_event_group_identity_repairs_exact_orphan_without_touching_l
     ) == 2
 
 
+def test_historical_event_group_identity_accepts_named_legacy_cohort_without_uid(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="6" * 64,
+                user_id="CL04888",
+                raw_name="Legacy Employee",
+                uid="",
+            ),
+            event(
+                event_uid="a" * 64,
+                user_id="CL04888",
+                raw_name="LegacyEmployee",
+                uid="",
+            ),
+        ],
+    )
+    report = build_historical_identity_report(db, zkt=connector.zkt_device)
+    candidate = report["unassigned_groups"][0]
+    assert candidate["uid"] == ""
+    assert candidate["display_name"] == "Legacy Employee"
+    assert candidate["operator_actionable"] is True
+
+    tombstone, repaired = create_historical_event_group_identity(
+        db,
+        connector=connector,
+        group_token=candidate["group_token"],
+        source_user_id="CL04888",
+        source_uid="",
+        source_cnic=CNIC,
+        directory_employee_id="5294",
+        directory_service_number="cl04888",
+        directory_employee_name="Legacy Employee",
+        directory_zone_code="75",
+        reason="Named legacy cohort verified against the HR directory.",
+        idempotency_key="legacy-event-group-verified",
+        actor="StateHealthAdmin",
+    )
+
+    assert repaired == 2
+    assert tombstone.uid == ""
+    assert all(
+        row.ords_status == "PENDING"
+        for row in db.scalars(
+            select(AttendanceEvent).where(
+                AttendanceEvent.event_uid.in_(["6" * 64, "a" * 64])
+            )
+        ).all()
+    )
+
+
+def test_historical_event_group_identity_rejects_unnamed_legacy_cohort_without_uid(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="0" * 64,
+                user_id="CL04777",
+                raw_name=None,
+                uid="",
+            )
+        ],
+    )
+    report = build_historical_identity_report(db, zkt=connector.zkt_device)
+    candidate = report["unassigned_groups"][0]
+    assert candidate["operator_actionable"] is False
+
+    with pytest.raises(ValueError, match="stable terminal name"):
+        create_historical_event_group_identity(
+            db,
+            connector=connector,
+            group_token=candidate["group_token"],
+            source_user_id="CL04777",
+            source_uid="",
+            source_cnic=CNIC,
+            directory_employee_id="5294",
+            directory_service_number="CL04777",
+            directory_employee_name="Legacy Employee",
+            directory_zone_code="75",
+            reason="Unnamed legacy cohort must remain blocked.",
+            idempotency_key="legacy-event-group-unnamed",
+            actor="StateHealthAdmin",
+        )
+
+
 def test_historical_directory_identity_accepts_exact_alphanumeric_service_number(
     db: Session,
 ):

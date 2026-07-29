@@ -1311,9 +1311,11 @@ def create_historical_event_group_identity(
         raise ValueError("Connector has no assigned ZKT device.")
     source_user_id = source_user_id.strip()
     source_uid = source_uid.strip()
-    if not source_user_id or not source_uid:
+    if not source_user_id:
+        raise ValueError("Orphaned historical evidence requires a terminal user ID.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", source_user_id):
         raise ValueError(
-            "Orphaned historical evidence requires exact terminal user ID and UID."
+            "Historical terminal user ID contains unsupported characters."
         )
     if not _service_number_matches(source_user_id, directory_service_number):
         raise ValueError(
@@ -1325,13 +1327,18 @@ def create_historical_event_group_identity(
     if len(normalized_directory_name) < 5:
         raise ValueError("Authoritative HR employee name is too short to verify.")
 
+    uid_condition = (
+        AttendanceEvent.uid == source_uid
+        if source_uid
+        else ((AttendanceEvent.uid == None) | (AttendanceEvent.uid == ""))  # noqa: E711
+    )
     events = list(
         session.scalars(
             select(AttendanceEvent)
             .where(
                 AttendanceEvent.zkt_device_id == zkt.id,
                 AttendanceEvent.user_id == source_user_id,
-                AttendanceEvent.uid == source_uid,
+                uid_condition,
                 AttendanceEvent.device_user_id == None,  # noqa: E711
                 AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
                 AttendanceEvent.ords_status.in_(
@@ -1375,6 +1382,10 @@ def create_historical_event_group_identity(
         raise ValueError(
             "Historical cohort contains multiple terminal names and remains fail-closed."
         )
+    if not source_uid and not event_names:
+        raise ValueError(
+            "A legacy cohort without a UID also requires one stable terminal name."
+        )
     if event_names:
         terminal_name = next(iter(event_names))
         if not (
@@ -1392,7 +1403,11 @@ def create_historical_event_group_identity(
             DeviceUser.lifecycle_state == "ACTIVE",
             (
                 (DeviceUser.user_id == source_user_id)
-                | (DeviceUser.uid == source_uid)
+                | (
+                    (DeviceUser.uid == source_uid)
+                    if source_uid
+                    else (DeviceUser.id == -1)
+                )
             ),
         )
     )
@@ -1626,15 +1641,23 @@ def build_historical_identity_report(
     for event in unassigned_events:
         grouped_unassigned.setdefault((event.user_id, event.uid or ""), []).append(event)
     for (user_id, uid), events in grouped_unassigned.items():
-        display_names = {
-            (event.display_name or "").strip()
-            for event in events
-            if (event.display_name or "").strip()
-        }
+        display_names: dict[str, str] = {}
+        for event in events:
+            display_name = (event.display_name or "").strip()
+            normalized_display_name = _normalized_identity_name(display_name)
+            if normalized_display_name:
+                display_names.setdefault(normalized_display_name, display_name)
         linked_user_ids = {
             event.device_user_id for event in events if event.device_user_id is not None
         }
-        exact_orphan = bool(uid) and not linked_user_ids and len(display_names) <= 1
+        exact_name = len(display_names) == 1
+        service_number_shape = bool(re.fullmatch(r"[A-Za-z0-9._-]+", user_id))
+        exact_orphan = (
+            not linked_user_ids
+            and len(display_names) <= 1
+            and service_number_shape
+            and (bool(uid) or exact_name)
+        )
         event_times = [event.device_event_time for event in events]
         unassigned_groups.append(
             {
@@ -1644,7 +1667,7 @@ def build_historical_identity_report(
                 "uid": uid,
                 "user_id": user_id,
                 "display_name": (
-                    next(iter(display_names))
+                    next(iter(display_names.values()))
                     if len(display_names) == 1
                     else (
                         "Unknown historical user"
