@@ -7,6 +7,8 @@ set serveroutput on
   The event instants are already correct. This transaction:
   - normalizes UTC-represented TSTZ values to Asia/Karachi without arithmetic;
   - corrects ATTENDANCE_DATE only for the eight preflight-proven event UIDs;
+  - clears affected daily flags before moving dates so the one-checkout
+    uniqueness guard cannot see a transient duplicate;
   - recomputes first/last daily flags for both the old and corrected dates;
   - snapshots every normalized event's UTC instant and proves it is unchanged;
   - proves row count and event UID uniqueness are unchanged; and
@@ -59,6 +61,20 @@ declare
         l_days(l_key).cnic := trim(p_cnic);
         l_days(l_key).attendance_date := trunc(p_date);
     end remember_day;
+
+    procedure clear_day_flags(
+        p_cnic in hr_raw_attn_capture_events.cnic%type,
+        p_date in date
+    ) is
+    begin
+        update hr_raw_attn_capture_events d
+           set d.check_in = 'F',
+               d.check_out = 'F',
+               d.datasync = 0
+         where d.raw_punch = 'F'
+           and d.cnic = p_cnic
+           and d.attendance_date = p_date;
+    end clear_day_flags;
 
     procedure recompute_day(
         p_cnic in hr_raw_attn_capture_events.cnic%type,
@@ -268,6 +284,21 @@ begin
             'Timezone normalization count differed from the locked preflight.'
         );
     end if;
+
+    /*
+      Clear both the old and corrected day groups before moving any row.
+      Otherwise an existing CHECK_OUT='T' on the corrected date can conflict
+      with the moved row's old CHECK_OUT='T' under
+      UK_HR_RAW_ATTN_ONE_CHECKOUT before recompute_day gets a chance to run.
+    */
+    l_day_key := l_days.first;
+    while l_day_key is not null loop
+        clear_day_flags(
+            l_days(l_day_key).cnic,
+            l_days(l_day_key).attendance_date
+        );
+        l_day_key := l_days.next(l_day_key);
+    end loop;
 
     update hr_raw_attn_capture_events
        set attendance_date = trunc(
