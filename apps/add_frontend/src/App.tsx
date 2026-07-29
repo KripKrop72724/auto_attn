@@ -1490,7 +1490,8 @@ function FirmwareCampaignControls({
         <input
           value={reason}
           onChange={(event) => setReason(event.target.value)}
-          placeholder="At least 10 characters"
+          maxLength={200}
+          placeholder="10–200 characters"
         />
       </label>
       <label>
