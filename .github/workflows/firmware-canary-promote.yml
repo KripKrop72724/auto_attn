@@ -215,24 +215,64 @@ jobs:
             $catalogAppliedAt = [DateTimeOffset]::Parse(
               [string]$catalogApplied[0].received_at
             )
-            $truthAccepted = @($canaryLogs | Where-Object {
-              $_.code -eq 'ORACLE_RECONCILE_ACCEPTED' -and
+            $truthDelegated = @($canaryLogs | Where-Object {
+              $_.code -eq 'ORACLE_RECONCILE_DELEGATED_TO_ADD' -and
               [DateTimeOffset]::Parse([string]$_.received_at) -ge $catalogAppliedAt
             } | Select-Object -Last 1)
-            if ($truthAccepted.Count -ne 1) {
-              throw 'Canary did not complete an Oracle-accepted truth pass after catalog application.'
+            if ($truthDelegated.Count -ne 1) {
+              throw 'Canary did not durably delegate a complete truth window to ADD after catalog application.'
             }
-            $truthAcceptedAt = [DateTimeOffset]::Parse(
-              [string]$truthAccepted[0].received_at
+            $truthDelegatedAt = [DateTimeOffset]::Parse(
+              [string]$truthDelegated[0].received_at
             )
             $laterFailures = @($canaryLogs | Where-Object {
               $_.code -in @('TRUTH_IDENTITY_INCOMPLETE', 'FULL_RECONCILE_FAILED') -and
-              [DateTimeOffset]::Parse([string]$_.received_at) -gt $truthAcceptedAt
+              [DateTimeOffset]::Parse([string]$_.received_at) -gt $truthDelegatedAt
             })
             if ($laterFailures.Count -ne 0) {
-              throw 'Canary emitted a fail-closed truth error after its accepted Oracle pass.'
+              throw 'Canary emitted a fail-closed truth error after delegating its Oracle pass.'
             }
-            Write-Host 'Exact production canary is stable, identity-complete, and eligible for immutable-byte promotion.'
+
+            $attendanceCount = 0
+            $unconfirmedCount = 0
+            $cursor = $null
+            $seenCursors = @{}
+            do {
+              $attendanceUri = "$env:ADD_BASE_URL/api/v1/attendance?device_id=$($row.connector_id)&limit=500"
+              if ($null -ne $cursor) {
+                $attendanceUri += "&cursor=$cursor"
+              }
+              $attendance = Invoke-RestMethod `
+                -Method Get `
+                -Uri $attendanceUri `
+                -WebSession $session `
+                -TimeoutSec 30
+              $pageRows = @($attendance.rows)
+              $attendanceCount += $pageRows.Count
+              $unconfirmedCount += @($pageRows | Where-Object {
+                [string]::IsNullOrWhiteSpace([string]$_.oracle_confirmed_at) -or
+                $_.ords_status -notin @('ACKED', 'ACKED_CHECK')
+              }).Count
+              $nextCursor = $attendance.next_cursor
+              if ($null -ne $nextCursor) {
+                $cursorKey = [string]$nextCursor
+                if ($seenCursors.ContainsKey($cursorKey)) {
+                  throw 'ADD attendance pagination repeated a cursor during canary verification.'
+                }
+                $seenCursors[$cursorKey] = $true
+              }
+              $cursor = $nextCursor
+            } while ($null -ne $cursor)
+            if ($attendanceCount -ne [int]$row.zkt.attendance_count) {
+              throw "ADD/terminal attendance parity failed: ADD=$attendanceCount terminal=$($row.zkt.attendance_count)."
+            }
+            if ($attendanceCount -lt [int]$env:MINIMUM_TERMINAL_ATTENDANCE) {
+              throw 'ADD attendance ledger fell below the accepted canary baseline.'
+            }
+            if ($unconfirmedCount -ne 0) {
+              throw "ADD still has $unconfirmedCount canary attendance row(s) without Oracle membership confirmation."
+            }
+            Write-Host 'Exact production canary is stable, identity-complete, terminal-parity exact, and fully Oracle-confirmed.'
           } catch {
             $verificationFailed = $true
             throw

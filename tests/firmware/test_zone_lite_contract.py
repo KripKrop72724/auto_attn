@@ -261,8 +261,8 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
     oracle_send = reconcile.index("oracle_send_reconcile(", collect_window)
     free_dump = reconcile.rindex("free(data);")
     assert release_gate < collect_window < oracle_send < free_dump
-    assert reconcile.index("oracle_send_reconcile(") < reconcile.index(
-        "add_enqueue_reconcile_events("
+    assert reconcile.index("add_enqueue_reconcile_events(") < reconcile.index(
+        "oracle_send_reconcile("
     )
     assert 'reconcile_complete ? "true" : "false"' in reconcile
     assert "return reconcile_complete;" in reconcile
@@ -333,6 +333,36 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     assert '"ORDS_RECONCILE_RESPONSE_INVALID"' in sender
     assert '"ORDS_RECONCILE_HTTP_FAILED"' in sender
     assert "body ? body" not in sender
+
+
+def test_add_connected_truth_is_durably_delegated_before_direct_oracle():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static size_t process_live_packet(")
+    ]
+    add_enqueue = reconcile.index(
+        "bool window_add_ok = add_enqueue_reconcile_events("
+    )
+    delegated = reconcile.index(
+        '"ORACLE_RECONCILE_DELEGATED_TO_ADD"',
+        add_enqueue,
+    )
+    direct = reconcile.index(
+        "window_truth_ok = oracle_send_reconcile(",
+        delegated,
+    )
+    assert add_enqueue < delegated < direct
+    assert "zone_config_get()->add_enabled &&" in reconcile
+    assert "window_add_ok" in reconcile
+    assert (
+        "durably delegated to ADD for Oracle delivery and membership confirmation"
+        in reconcile
+    )
+    assert (
+        "!(zone_config_get()->add_enabled && window_add_ok)"
+        in reconcile
+    )
 
 
 def test_firmware_version_change_forces_immediate_truth_reconcile():
