@@ -146,14 +146,16 @@ only one open alert per connector and condition code; repeated observations upda
 than flooding the operations queue.
 
 The Historical identity backlog separates deleted-user evidence from exact orphaned event cohorts.
-An orphaned cohort is operator-actionable only when every preserved row has the same terminal user ID,
-the same non-empty UID, no linked device-user record, and at most one normalized terminal name. Its
-SHA-256 group token versions the complete event membership and status. Saving authoritative HR
+An orphaned cohort is operator-actionable only when every preserved row has the same valid terminal
+user ID, no linked device-user record, and either the same non-empty UID or one exact normalized
+terminal name for legacy rows that predate UID capture. Its SHA-256 group token versions the complete
+event membership and status. Saving authoritative HR
 evidence requires an exact service-number match, compatible name, typed confirmation, audit reason,
 and administrator re-authentication; any concurrent change makes the request stale. ADD creates only
 a deleted identity tombstone and requeues the preserved rows. It never creates or changes a live
-terminal user. Missing UIDs, multiple names, linked identities, duplicate active CNIC claims, and
-identity reuse remain fail-closed. At ingestion, neither a current user nor a tombstone may supply a
+terminal user. Missing UIDs without one stable name, missing names without a UID, multiple names,
+linked identities, malformed user IDs, duplicate active CNIC claims, and identity reuse remain
+fail-closed. At ingestion, neither a current user nor a tombstone may supply a
 CNIC unless both the terminal user ID and UID match exactly; user-ID reuse alone is never accepted.
 
 Firmware-reported Oracle receipts are hints, not final delivery proof. ADD places every such event in

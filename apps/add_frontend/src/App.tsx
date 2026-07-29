@@ -817,7 +817,7 @@ function HistoricalIdentityResolutionDialog({
     if (!password) return setError('Password confirmation is required.')
     if (
       candidate.source_kind === 'EVENT_GROUP' &&
-      (!candidate.group_token || !candidate.uid)
+      !candidate.group_token
     ) {
       return setError('The exact historical event cohort is incomplete. Refresh and retry.')
     }

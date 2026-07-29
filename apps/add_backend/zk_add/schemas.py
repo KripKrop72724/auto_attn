@@ -339,7 +339,7 @@ class HistoricalDirectoryIdentityRequest(BaseModel):
 class HistoricalEventGroupIdentityRequest(BaseModel):
     group_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
     source_user_id: str = Field(min_length=1, max_length=100)
-    source_uid: str = Field(min_length=1, max_length=40)
+    source_uid: str = Field(default="", max_length=40)
     source_cnic: str = Field(min_length=13, max_length=15)
     directory_employee_id: str = Field(min_length=1, max_length=40)
     directory_service_number: str = Field(min_length=1, max_length=40)

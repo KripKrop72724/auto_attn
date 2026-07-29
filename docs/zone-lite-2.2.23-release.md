@@ -38,8 +38,9 @@ Before canary acceptance or nationwide promotion, open the selected terminal's
 
 Rows marked `HR_DIRECTORY_EVIDENCE` may use the deleted-user evidence form. Exact
 unassigned cohorts marked `HR_DIRECTORY_EVENT_GROUP` may use the same guarded
-form only when their terminal user ID, non-empty UID, event membership, and
-terminal name evidence are unambiguous. A SHA-256 group token rejects stale
+form only when their terminal user ID, event membership, and identity evidence
+are unambiguous. A non-empty UID is required unless a legacy cohort has one
+stable terminal name that matches the HR record. A SHA-256 group token rejects stale
 cohorts, and the resulting evidence creates only a deleted identity tombstone;
 it never mutates the live terminal. The operator
 must copy the CNIC, employee ID, service number, employee name, and zone from an
