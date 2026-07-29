@@ -131,6 +131,7 @@ const fetchStub = (
   includeHistorical = false,
   includeEventGroup = false,
   includeActiveEnrichment = false,
+  includeCurrentIdentity = false,
 ) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -252,6 +253,12 @@ const fetchStub = (
       })
     }
     if (
+      path.includes('/api/v2/devices/connector-one/historical-identities/resolve-current-identity') &&
+      init?.method === 'POST'
+    ) {
+      return response({ ok: true, repaired_events: 1 }, 201)
+    }
+    if (
       path.includes('/api/v2/devices/connector-one/historical-identities/resolve-event-group') &&
       init?.method === 'POST'
     ) {
@@ -271,15 +278,21 @@ const fetchStub = (
           unresolved_events:
             (includeHistorical ? 3 : 0) +
             (includeEventGroup ? 2 : 0) +
-            (includeActiveEnrichment ? 1 : 0),
+            (includeActiveEnrichment ? 1 : 0) +
+            (includeCurrentIdentity ? 1 : 0),
           blocked_identity:
             (includeHistorical ? 3 : 0) +
             (includeEventGroup ? 2 : 0) +
-            (includeActiveEnrichment ? 1 : 0),
+            (includeActiveEnrichment ? 1 : 0) +
+            (includeCurrentIdentity ? 1 : 0),
           quarantined_identity_reuse: 0,
           attributed_to_deleted_users: includeHistorical ? 3 : 0,
-          unassigned_events: (includeEventGroup ? 2 : 0) + (includeActiveEnrichment ? 1 : 0),
-          actionable_event_groups: includeEventGroup || includeActiveEnrichment ? 1 : 0,
+          unassigned_events:
+            (includeEventGroup ? 2 : 0) +
+            (includeActiveEnrichment ? 1 : 0) +
+            (includeCurrentIdentity ? 1 : 0),
+          actionable_event_groups:
+            includeEventGroup || includeActiveEnrichment || includeCurrentIdentity ? 1 : 0,
           candidate_users: includeHistorical ? 1 : 0,
         },
         rows: includeHistorical
@@ -302,7 +315,30 @@ const fetchStub = (
               operator_actionable: true,
             }]
           : [],
-        unassigned_groups: includeActiveEnrichment
+        unassigned_groups: includeCurrentIdentity
+          ? [{
+              source_user_key: null,
+              source_kind: 'EVENT_GROUP',
+              group_token: 'c'.repeat(64),
+              active_user_key: user.user_key,
+              active_user_row_version: user.row_version,
+              uid: '',
+              user_id: '03752',
+              display_name: 'Ubaidullah',
+              row_version: null,
+              observed_at: '2026-07-01T08:00:00Z',
+              deleted_at: '2026-07-01T08:00:00Z',
+              cnic_available: false,
+              identity_conflict_code: null,
+              event_count: 1,
+              blocked_count: 1,
+              quarantined_count: 0,
+              first_event_at: '2026-07-01T08:00:00Z',
+              last_event_at: '2026-07-01T08:00:00Z',
+              resolution_path: 'CURRENT_IDENTITY_EVIDENCE',
+              operator_actionable: true,
+            }]
+          : includeActiveEnrichment
           ? [{
               source_user_key: null,
               source_kind: 'EVENT_GROUP',
@@ -555,6 +591,68 @@ describe('State Life ADD interface', () => {
     fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
     expect(screen.getByRole('heading', { name: /edit device user/i })).toBeTruthy()
     expect(screen.getByLabelText(/replacement cnic/i)).toBeTruthy()
+  })
+
+  it('resolves one exact legacy cohort against the unchanged current identity without an employee id', async () => {
+    const currentUser: DeviceUser = {
+      ...user,
+      user_id: '03752',
+      uid: '11',
+      display_name: 'Ubaidullah',
+    }
+    const fetchMock = fetchStub([currentUser], false, false, false, true)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    fireEvent.click(
+      await screen.findByRole('button', { name: /verify against current identity/i }),
+    )
+    expect(
+      screen.getByRole('heading', {
+        name: /verify preserved cohort against current identity/i,
+      }),
+    ).toBeTruthy()
+    expect(screen.queryByLabelText(/hr employee id/i)).toBeNull()
+    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+      target: { value: fullCnic },
+    })
+    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+      target: { value: 'Oracle raw capture exactly matches the current identity.' },
+    })
+    fireEvent.change(screen.getByLabelText(/type “03752 -> current 03752”/i), {
+      target: { value: '03752 -> CURRENT 03752' },
+    })
+    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+      target: { value: 'test-password' },
+    })
+    fireEvent.click(
+      screen.getByRole('button', { name: /verify current identity and requeue/i }),
+    )
+
+    expect(await screen.findByText(/1 preserved attendance event requeued/i)).toBeTruthy()
+    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
+      String(input).includes('/historical-identities/resolve-current-identity') &&
+      (init as RequestInit | undefined)?.method === 'POST',
+    )
+    expect(resolutionCall).toBeTruthy()
+    const requestBody = JSON.parse(
+      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
+    )
+    expect(requestBody).toMatchObject({
+      group_token: 'c'.repeat(64),
+      source_user_id: '03752',
+      source_uid: '',
+      target_user_key: user.user_key,
+      expected_version: user.row_version,
+      source_cnic: fullCnic,
+      verified_employee_name: 'Ubaidullah',
+      typed_confirmation: '03752 -> CURRENT 03752',
+    })
+    expect(requestBody).not.toHaveProperty('directory_employee_id')
   })
 
   it('communicates every state with text, icon, and border pattern', () => {

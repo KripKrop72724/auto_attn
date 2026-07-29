@@ -62,6 +62,7 @@ from zk_add.schemas import (
     CommandUpdate,
     Envelope,
     HeartbeatPayload,
+    HistoricalCurrentIdentityRequest,
     HistoricalDirectoryIdentityRequest,
     HistoricalEventGroupIdentityRequest,
     HistoricalIdentityAliasRequest,
@@ -111,6 +112,7 @@ from zk_add.service import (
     replace_user_snapshot,
     record_oracle_receipts,
     reconcile_device_user_identity_conflicts,
+    resolve_historical_event_group_to_current_identity,
     resolve_alert,
     onboard_connector,
     serialize_command,
@@ -915,6 +917,67 @@ async def resolve_historical_event_group_identity(
         "source_uid": tombstone.uid,
         "repaired_events": repaired,
         "catalog_delivered": delivered,
+    }
+
+
+@app.post(
+    "/api/v2/devices/{connector_id}/historical-identities/resolve-current-identity",
+    status_code=201,
+)
+async def resolve_historical_current_identity(
+    connector_id: str,
+    body: HistoricalCurrentIdentityRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    expected_confirmation = (
+        f"{body.source_user_id} -> CURRENT {body.source_user_id}"
+    )
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Typed confirmation must exactly match {expected_confirmation}.",
+        )
+    try:
+        resolution, target_user, repaired = (
+            resolve_historical_event_group_to_current_identity(
+                db,
+                connector=connector,
+                group_token=body.group_token,
+                source_user_id=body.source_user_id,
+                source_uid=body.source_uid,
+                target_user_key=body.target_user_key,
+                expected_version=body.expected_version,
+                source_cnic=body.source_cnic,
+                verified_employee_name=body.verified_employee_name,
+                reason=body.reason,
+                idempotency_key=body.idempotency_key,
+                actor=context.username,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "historical_current_identity",
+        {
+            "connector_id": connector.connector_id,
+            "source_user_id": body.source_user_id,
+            "source_uid": body.source_uid,
+            "target_user_key": target_user.user_key,
+            "repaired_events": repaired,
+        },
+    )
+    return {
+        "ok": True,
+        "resolution_id": resolution.resolution_id,
+        "source_user_id": body.source_user_id,
+        "source_uid": body.source_uid,
+        "target_user_key": target_user.user_key,
+        "target_user_id": target_user.user_id,
+        "repaired_events": repaired,
     }
 
 

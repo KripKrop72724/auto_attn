@@ -377,6 +377,43 @@ class AttendanceEvent(Base):
 Index("ix_add_attendance_device_time_id", AttendanceEvent.zkt_device_id, AttendanceEvent.device_event_time, AttendanceEvent.id)
 
 
+class HistoricalCurrentIdentityResolution(Base):
+    __tablename__ = "add_historical_current_identity_resolutions"
+    __table_args__ = (
+        UniqueConstraint(
+            "zkt_device_id",
+            "group_token",
+            name="uq_add_historical_current_identity_group",
+        ),
+        UniqueConstraint(
+            "zkt_device_id",
+            "idempotency_key",
+            name="uq_add_historical_current_identity_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resolution_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    device_user_id: Mapped[int] = mapped_column(
+        ForeignKey("add_device_users.id"), index=True
+    )
+    group_token: Mapped[str] = mapped_column(String(64), index=True)
+    source_user_id: Mapped[str] = mapped_column(String(100), index=True)
+    source_uid: Mapped[str] = mapped_column(String(40), default="")
+    source_cnic_lookup_hash: Mapped[str] = mapped_column(String(64))
+    verified_employee_name: Mapped[str] = mapped_column(String(255))
+    event_count: Mapped[int] = mapped_column(Integer)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = utc_column()
+
+
 class DeviceCommand(Base):
     __tablename__ = "add_device_commands"
     __table_args__ = (
