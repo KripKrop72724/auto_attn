@@ -604,6 +604,52 @@ def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows
     assert "update hr_raw_attn_capture_events" not in migration.lower()
 
 
+def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+    package_migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260729_canonicalize_event_timezone_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+    data_migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260729_repair_event_timezone_rows_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+
+    package_body_start = oracle.index("create or replace package body")
+    parser_start = oracle.index("function parse_event_timestamp", package_body_start)
+    parser = oracle[parser_start : oracle.index("end parse_event_timestamp;")]
+    assert ") at time zone c_attendance_timezone;" in parser
+    assert "from_tz(" in parser
+
+    assert "restore_original" in package_migration
+    assert "l_ddl_attempted" in package_migration
+    assert "where 1 = 0" in package_migration
+    assert "update hr_raw_attn_capture_events" not in package_migration.lower()
+    assert package_migration.lower().count(
+        "delete from hr_raw_attn_capture_events"
+    ) == 2
+
+    normalized = data_migration.lower()
+    assert "lock table hr_raw_attn_capture_events" in normalized
+    assert "in share row exclusive mode wait 30" in normalized
+    assert "sys_extract_utc(event_timestamp)" in normalized
+    assert "event_timestamp at time zone 'asia/karachi'" in normalized
+    assert "l_unknown_mismatches" in normalized
+    assert "count(*) - count(distinct event_uid)" in normalized
+    assert "rollback;" in normalized
+    assert normalized.count("commit;") == 1
+    assert "delete from hr_raw_attn_capture_events" not in normalized
+    assert "insert into hr_raw_attn_capture_events" not in normalized
+
+
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     recovery = source[

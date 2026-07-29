@@ -285,7 +285,10 @@ create or replace package body slic_zkt_truth_api as
         v_value := regexp_replace(v_value, 'Z$', '+00:00', 1, 0, 'i');
 
         if regexp_like(v_value, '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$') then
-            return to_timestamp_tz(v_value, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM');
+            return to_timestamp_tz(
+                v_value,
+                'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+            ) at time zone c_attendance_timezone;
         elsif regexp_like(v_value, '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$') then
             return from_tz(to_timestamp(v_value, 'YYYY-MM-DD HH24:MI:SS'), c_attendance_timezone);
         end if;
