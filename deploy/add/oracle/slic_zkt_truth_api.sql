@@ -20,6 +20,9 @@ create or replace package slic_zkt_truth_api authid definer as
     procedure post_reconcile(p_body in clob);
 
     function parse_event_timestamp(p_value in varchar2) return timestamp with time zone;
+    function attendance_timestamp_is_plausible(
+        p_event_ts in timestamp with time zone
+    ) return number;
     function attendance_date_for(p_event_ts in timestamp with time zone) return date;
     function valid_capture_type(p_value in varchar2) return number;
     function valid_trust_status(p_value in varchar2) return number;
@@ -53,8 +56,11 @@ begin
     ) loop
         for locked_event in (
             select d.event_uid
-              from hr_raw_attn_capture_events d
+             from hr_raw_attn_capture_events d
              where d.raw_punch = 'F'
+               and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                       d.event_timestamp
+                   ) = 1
                and d.cnic = affected_day.cnic
                and d.attendance_date = affected_day.attendance_date
              order by d.event_timestamp, d.event_uid
@@ -69,6 +75,9 @@ begin
            d.check_out = 'F',
            d.datasync = 0
      where d.raw_punch = 'F'
+       and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+               d.event_timestamp
+           ) = 1
        and (d.check_in <> 'F' or d.check_out <> 'F')
        and exists (
                select 1
@@ -109,8 +118,11 @@ begin
                      count(*) over (
                          partition by stored.cnic, stored.attendance_date
                      ) normal_count
-                from hr_raw_attn_capture_events stored
+               from hr_raw_attn_capture_events stored
                where stored.raw_punch = 'F'
+                 and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                         stored.event_timestamp
+                     ) = 1
                  and exists (
                          select 1
                            from json_table(
@@ -299,6 +311,21 @@ create or replace package body slic_zkt_truth_api as
             return null;
     end parse_event_timestamp;
 
+    function attendance_timestamp_is_plausible(
+        p_event_ts in timestamp with time zone
+    ) return number is
+    begin
+        if p_event_ts is null
+           or p_event_ts < to_timestamp_tz(
+                  '2010-01-01 00:00:00 Asia/Karachi',
+                  'YYYY-MM-DD HH24:MI:SS TZR'
+              )
+           or p_event_ts > systimestamp + interval '1' day then
+            return 0;
+        end if;
+        return 1;
+    end attendance_timestamp_is_plausible;
+
     function attendance_date_for(p_event_ts in timestamp with time zone) return date is
     begin
         if p_event_ts is null then
@@ -396,7 +423,13 @@ create or replace package body slic_zkt_truth_api as
                    trim(j.employee_name) employee_name,
                    trim(j.cnic) cnic,
                    coalesce(nullif(trim(j.capture_type), ''), p_default_capture_type) capture_type,
-                   coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE') trust_status,
+                   case
+                       when slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                                slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+                            ) = 0
+                       then 'SUSPECT_DEVICE_TIME'
+                       else coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE')
+                   end trust_status,
                    coalesce(nullif(trim(j.raw_punch), ''), 'F') raw_punch,
                    slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) event_ts
               from json_table(
@@ -495,7 +528,13 @@ create or replace package body slic_zkt_truth_api as
                    slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) event_ts,
                    to_number(j.clockdiff default null on conversion error) clock_diff_seconds,
                    coalesce(nullif(trim(j.capture_type), ''), p_default_capture_type) capture_type,
-                   coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE') trust_status,
+                   case
+                       when slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                                slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+                            ) = 0
+                       then 'SUSPECT_DEVICE_TIME'
+                       else coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE')
+                   end trust_status,
                    coalesce(nullif(trim(j.raw_punch), ''), 'F') raw_punch,
                    slic_zkt_truth_api.attendance_date_for(slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)) attendance_date
               from json_table(
@@ -794,7 +833,13 @@ create or replace package body slic_zkt_truth_api as
                    trim(j.employee_name) employee_name,
                    trim(j.cnic) cnic,
                    coalesce(nullif(trim(j.capture_type), ''), 'MANUAL_REPROCESS') capture_type,
-                   coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE') trust_status,
+                   case
+                       when slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                                slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+                            ) = 0
+                       then 'SUSPECT_DEVICE_TIME'
+                       else coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE')
+                   end trust_status,
                    coalesce(nullif(trim(j.raw_punch), ''), 'F') raw_punch,
                    slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) event_ts,
                    slic_zkt_truth_api.attendance_date_for(slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)) attendance_date
@@ -955,7 +1000,13 @@ create or replace package body slic_zkt_truth_api as
                    slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) event_ts,
                    to_number(j.clockdiff default null on conversion error) clock_diff_seconds,
                    coalesce(nullif(trim(j.capture_type), ''), 'MANUAL_REPROCESS') capture_type,
-                   coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE') trust_status,
+                   case
+                       when slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                                slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+                            ) = 0
+                       then 'SUSPECT_DEVICE_TIME'
+                       else coalesce(nullif(trim(j.trust_status), ''), 'TRUSTED_LIVE')
+                   end trust_status,
                    coalesce(nullif(trim(j.raw_punch), ''), 'F') raw_punch,
                    slic_zkt_truth_api.attendance_date_for(slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)) attendance_date
               from json_table(
