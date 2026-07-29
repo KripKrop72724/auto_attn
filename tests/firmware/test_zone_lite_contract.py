@@ -648,6 +648,16 @@ def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():
     assert "count(*) - count(distinct event_uid)" in normalized
     assert "rollback;" in normalized
     assert normalized.count("commit;") == 1
+    clear_before_move = normalized.index(
+        "clear both the old and corrected day groups before moving any row"
+    )
+    attendance_date_move = normalized.index(
+        "update hr_raw_attn_capture_events\n"
+        "       set attendance_date = trunc("
+    )
+    assert clear_before_move < attendance_date_move
+    assert "uk_hr_raw_attn_one_checkout" in normalized
+    assert "clear_day_flags(" in normalized
     assert "delete from hr_raw_attn_capture_events" not in normalized
     assert "insert into hr_raw_attn_capture_events" not in normalized
 
