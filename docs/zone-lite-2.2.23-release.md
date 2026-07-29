@@ -48,6 +48,9 @@ authoritative HR record. ADD requires an exact service-number match, a compatibl
 normalized name, the selected row version or cohort token, an audit reason,
 typed confirmation, and administrator re-authentication. Alphanumeric service
 numbers are supported, but approximate or inferred identity matching is not.
+Legacy rows already linked to one current, conflict-free user with missing CNIC
+are marked `ACTIVE_USER_ENRICHMENT` and must use the normal certified terminal
+user edit instead of creating a historical identity.
 
 A successful resolution preserves the attendance rows, binds the verified
 identity to the deleted terminal user and its tombstone, and requeues those rows

@@ -157,6 +157,10 @@ terminal user. Missing UIDs without one stable name, missing names without a UID
 linked identities, malformed user IDs, duplicate active CNIC claims, and identity reuse remain
 fail-closed. At ingestion, neither a current user nor a tombstone may supply a
 CNIC unless both the terminal user ID and UID match exactly; user-ID reuse alone is never accepted.
+When an older blocked row already carries one durable `device_user_id` that still points to an
+active, conflict-free user with missing CNIC, ADD labels it `ACTIVE_USER_ENRICHMENT` and routes the
+operator to the normal certified user-edit command. A verified terminal write then enriches every
+row linked to that exact device-user record and requeues it; no historical alias is created.
 
 Firmware-reported Oracle receipts are hints, not final delivery proof. ADD places every such event in
 `FIRMWARE_RECEIPT_UNVERIFIED`, checks up to 500 immutable event UIDs at a time through

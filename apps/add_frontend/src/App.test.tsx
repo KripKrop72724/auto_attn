@@ -130,6 +130,7 @@ const fetchStub = (
   users: DeviceUser[] = [user],
   includeHistorical = false,
   includeEventGroup = false,
+  includeActiveEnrichment = false,
 ) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -267,12 +268,18 @@ const fetchStub = (
         device_serial: device.zkt?.serial,
         snapshot_revision: 8,
         totals: {
-          unresolved_events: (includeHistorical ? 3 : 0) + (includeEventGroup ? 2 : 0),
-          blocked_identity: (includeHistorical ? 3 : 0) + (includeEventGroup ? 2 : 0),
+          unresolved_events:
+            (includeHistorical ? 3 : 0) +
+            (includeEventGroup ? 2 : 0) +
+            (includeActiveEnrichment ? 1 : 0),
+          blocked_identity:
+            (includeHistorical ? 3 : 0) +
+            (includeEventGroup ? 2 : 0) +
+            (includeActiveEnrichment ? 1 : 0),
           quarantined_identity_reuse: 0,
           attributed_to_deleted_users: includeHistorical ? 3 : 0,
-          unassigned_events: includeEventGroup ? 2 : 0,
-          actionable_event_groups: includeEventGroup ? 1 : 0,
+          unassigned_events: (includeEventGroup ? 2 : 0) + (includeActiveEnrichment ? 1 : 0),
+          actionable_event_groups: includeEventGroup || includeActiveEnrichment ? 1 : 0,
           candidate_users: includeHistorical ? 1 : 0,
         },
         rows: includeHistorical
@@ -295,7 +302,29 @@ const fetchStub = (
               operator_actionable: true,
             }]
           : [],
-        unassigned_groups: includeEventGroup
+        unassigned_groups: includeActiveEnrichment
+          ? [{
+              source_user_key: null,
+              source_kind: 'EVENT_GROUP',
+              group_token: 'b'.repeat(64),
+              active_user_key: user.user_key,
+              uid: user.uid,
+              user_id: user.user_id,
+              display_name: user.display_name,
+              row_version: null,
+              observed_at: '2026-07-01T08:00:00Z',
+              deleted_at: '2026-07-01T08:00:00Z',
+              cnic_available: false,
+              identity_conflict_code: null,
+              event_count: 1,
+              blocked_count: 1,
+              quarantined_count: 0,
+              first_event_at: '2026-07-01T08:00:00Z',
+              last_event_at: '2026-07-01T08:00:00Z',
+              resolution_path: 'ACTIVE_USER_ENRICHMENT',
+              operator_actionable: true,
+            }]
+          : includeEventGroup
           ? [{
               source_user_key: null,
               source_kind: 'EVENT_GROUP',
@@ -505,6 +534,27 @@ describe('State Life ADD interface', () => {
       directory_service_number: 'CL04999',
       directory_employee_name: 'Former Employee',
     })
+  })
+
+  it('routes linked historical cohorts to the certified current-user enrichment dialog', async () => {
+    const missingIdentityUser: DeviceUser = {
+      ...user,
+      cnic_masked: null,
+      cnic_available: false,
+      identity_complete: false,
+      machine_name_preview: user.display_name,
+    }
+    const fetchMock = fetchStub([missingIdentityUser], false, false, true)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
+    expect(screen.getByRole('heading', { name: /edit device user/i })).toBeTruthy()
+    expect(screen.getByLabelText(/replacement cnic/i)).toBeTruthy()
   })
 
   it('communicates every state with text, icon, and border pattern', () => {
