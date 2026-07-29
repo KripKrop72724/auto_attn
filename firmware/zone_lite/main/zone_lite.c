@@ -3411,38 +3411,20 @@ static bool reconcile_attendance_dump(
         } else {
             size_t window_truth_count = 0;
             bool window_truth_ok = true;
-            if (truth_enabled) {
-                // A failed authoritative window makes the whole month
-                // incomplete. Continue durable ADD enqueueing for later
-                // windows, but do not issue more Oracle requests during this
-                // pass or multiply a single transport fault into 31 failures.
-                if (truth_delivery_ok) {
-                    window_truth_ok = oracle_send_reconcile(
-                        reconcile_events,
-                        window_event_count,
-                        window_terminal_count,
-                        window_identity_mapped_count,
-                        filter_year,
-                        filter_month,
-                        window_start_day,
-                        window_end_day,
-                        &window_truth_count);
-                    if (!window_truth_ok && g_truth_window_blocked &&
-                        identity_blocked_out) {
-                        *identity_blocked_out = true;
-                    }
-                } else {
-                    window_truth_ok = false;
-                }
-            } else {
-                for (size_t i = 0; i < window_event_count; i++) {
-                    if (reconcile_events[i].cnic[0] != '\0') {
-                        window_truth_count++;
-                    }
-                }
-            }
-            if (window_terminal_count != window_event_count ||
-                window_identity_mapped_count != window_event_count) {
+            bool identity_complete =
+                window_terminal_count == window_event_count &&
+                window_identity_mapped_count == window_event_count;
+            // ADD is the durable production route to Oracle. Its local outbox
+            // is fsync'd before this returns and the ADD worker independently
+            // performs idempotent Oracle delivery plus membership checks over
+            // the validated internal route. Enqueue before considering direct
+            // Oracle so a slow public reconcile endpoint can never stall live
+            // capture on an otherwise healthy ADD-connected device.
+            bool window_add_ok = add_enqueue_reconcile_events(
+                reconcile_events,
+                window_event_count,
+                capturetype);
+            if (!identity_complete) {
                 window_truth_ok = false;
                 if (identity_blocked_out) *identity_blocked_out = true;
                 char blocked_message[224];
@@ -3462,19 +3444,53 @@ static bool reconcile_attendance_dump(
                     "reconcile",
                     "TRUTH_IDENTITY_INCOMPLETE",
                     blocked_message);
+            } else if (truth_enabled && zone_config_get()->add_enabled &&
+                       window_add_ok) {
+                window_truth_count = window_event_count;
+                char delegated[240];
+                snprintf(
+                    delegated,
+                    sizeof(delegated),
+                    "Authoritative truth window %04d-%02d-%02d..%02d events=%u was durably delegated to ADD for Oracle delivery and membership confirmation",
+                    filter_year,
+                    filter_month,
+                    window_start_day,
+                    window_end_day,
+                    (unsigned)window_event_count);
+                (void)add_connector_log(
+                    "INFO",
+                    "reconcile",
+                    "ORACLE_RECONCILE_DELEGATED_TO_ADD",
+                    delegated);
+            } else if (truth_enabled) {
+                // Direct Oracle remains a bounded fallback for a deployment
+                // without ADD or when the durable ADD outbox could not accept
+                // this window. A failed direct window makes the whole month
+                // incomplete and later windows are not sent directly during
+                // this pass.
+                if (truth_delivery_ok) {
+                    window_truth_ok = oracle_send_reconcile(
+                        reconcile_events,
+                        window_event_count,
+                        window_terminal_count,
+                        window_identity_mapped_count,
+                        filter_year,
+                        filter_month,
+                        window_start_day,
+                        window_end_day,
+                        &window_truth_count);
+                    if (!window_truth_ok && g_truth_window_blocked &&
+                        identity_blocked_out) {
+                        *identity_blocked_out = true;
+                    }
+                } else {
+                    window_truth_ok = false;
+                }
+            } else {
+                window_truth_count = window_identity_mapped_count;
             }
-            // Do not mirror a full terminal history into per-event firmware
-            // receipt rows. A 95k-record terminal produces more receipt bytes
-            // than the bounded 4 MiB ADD outbox can hold, even though Oracle
-            // has already accepted the authoritative truth. The durable ADD
-            // attendance stream below is the recovery contract: ADD delivers
-            // each event idempotently and its worker independently confirms
-            // existing Oracle membership through raw-captures/check.
-            bool window_add_ok = add_enqueue_reconcile_events(
-                reconcile_events,
-                window_event_count,
-                capturetype);
-            if (truth_enabled && window_truth_ok) {
+            if (truth_enabled && window_truth_ok &&
+                !(zone_config_get()->add_enabled && window_add_ok)) {
                 char checkpoint[192];
                 snprintf(
                     checkpoint,
