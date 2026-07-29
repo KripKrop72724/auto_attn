@@ -233,7 +233,7 @@
 #ifndef ZONE_LITE_HISTORY_SWEEP_SECONDS
 #define ZONE_LITE_HISTORY_SWEEP_SECONDS (7 * 24 * 60 * 60)
 #endif
-#define ZONE_LITE_HISTORY_SCHEMA_VERSION 1
+#define ZONE_LITE_HISTORY_SCHEMA_VERSION 2
 
 // Per-device NVS provisioning overrides compile-time development defaults.
 #undef ZONE_LITE_WIFI_SSID
@@ -2990,6 +2990,60 @@ static bool find_attendance_month_bounds(
     return found;
 }
 
+static bool find_next_attendance_month(
+    const uint8_t *data,
+    size_t len,
+    uint32_t record_size,
+    int not_before_year,
+    int not_before_month,
+    int not_after_year,
+    int not_after_month,
+    int *next_year,
+    int *next_month)
+{
+    if (!data || len < 4 || !next_year || !next_month ||
+        not_before_year < 2000 || not_before_month < 1 ||
+        not_before_month > 12) {
+        return false;
+    }
+    const uint8_t *record = data + 4;
+    size_t remain = len - 4;
+    bool found = false;
+    while (remain >= record_size) {
+        uint32_t timestamp = 0;
+        if (attendance_record_timestamp(record, record_size, &timestamp)) {
+            struct tm decoded;
+            decode_zk_time(timestamp, &decoded);
+            int year = decoded.tm_year + 1900;
+            int month = decoded.tm_mon + 1;
+            int day = decoded.tm_mday;
+            bool plausible = year >= 2000 && year <= not_after_year &&
+                month >= 1 && month <= 12 && day >= 1 &&
+                day <= days_in_month(year, month) &&
+                compare_months(
+                    year,
+                    month,
+                    not_before_year,
+                    not_before_month) >= 0 &&
+                compare_months(
+                    year,
+                    month,
+                    not_after_year,
+                    not_after_month) <= 0;
+            if (plausible &&
+                (!found ||
+                 compare_months(year, month, *next_year, *next_month) < 0)) {
+                *next_year = year;
+                *next_month = month;
+                found = true;
+            }
+        }
+        record += record_size;
+        remain -= record_size;
+    }
+    return found;
+}
+
 static bool parse_attendance_record(
     const uint8_t *record,
     uint32_t record_size,
@@ -3219,6 +3273,45 @@ static bool reconcile_attendance_dump(
             g_history_cursor_year = oldest_year;
             g_history_cursor_month = oldest_month;
         }
+        int next_year = 0;
+        int next_month = 0;
+        if (!find_next_attendance_month(
+                data,
+                len,
+                record_size,
+                g_history_cursor_year,
+                g_history_cursor_month,
+                filter_year,
+                filter_month,
+                &next_year,
+                &next_month)) {
+            free(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            if (history_exhausted_out) *history_exhausted_out = true;
+            return true;
+        }
+        if (compare_months(
+                next_year,
+                next_month,
+                g_history_cursor_year,
+                g_history_cursor_month) > 0) {
+            char skipped[208];
+            snprintf(
+                skipped,
+                sizeof(skipped),
+                "Historical cursor advanced from %04ld-%02ld to next non-empty terminal month %04d-%02d; intervening months contained zero attendance records",
+                (long)g_history_cursor_year,
+                (long)g_history_cursor_month,
+                next_year,
+                next_month);
+            (void)add_connector_log(
+                "INFO",
+                "reconcile",
+                "HISTORY_EMPTY_MONTHS_SKIPPED",
+                skipped);
+        }
+        g_history_cursor_year = next_year;
+        g_history_cursor_month = next_month;
         if (compare_months(
                 g_history_cursor_year,
                 g_history_cursor_month,
