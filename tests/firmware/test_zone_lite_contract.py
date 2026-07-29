@@ -406,11 +406,33 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
         ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
     ).read_text(encoding="utf-8")
 
-    assert "ZONE_LITE_HISTORY_SCHEMA_VERSION 1" in source
+    assert "ZONE_LITE_HISTORY_SCHEMA_VERSION 2" in source
     assert 'nvs_set_i32(handle, "hist_year", g_history_cursor_year)' in source
     assert 'nvs_set_i32(handle, "hist_month", g_history_cursor_month)' in source
     assert 'nvs_set_u8(handle, "hist_pending"' in source
     assert "find_attendance_month_bounds(" in source
+    assert "find_next_attendance_month(" in source
+    assert '"HISTORY_EMPTY_MONTHS_SKIPPED"' in source
+    next_month_block = source[
+        source.index("static bool find_next_attendance_month(") :
+        source.index("static bool parse_attendance_record(")
+    ]
+    assert "not_before_year" in next_month_block
+    assert "not_before_month" in next_month_block
+    assert "not_after_year" in next_month_block
+    assert "not_after_month" in next_month_block
+    assert "compare_months(" in next_month_block
+    historical_start = source.index("if (historical) {\n        int oldest_year")
+    historical_selection = source[
+        historical_start :
+        source.index("const uint8_t *p = data + 4;", historical_start)
+    ]
+    assert historical_selection.index("find_attendance_month_bounds(") < (
+        historical_selection.index("find_next_attendance_month(")
+    )
+    assert historical_selection.index("find_next_attendance_month(") < (
+        historical_selection.index("g_history_cursor_year = next_year;")
+    )
     assert "historical_reconcile = !counter_mismatch" in source
     assert "advance_month(" in source
     assert '"HISTORY_BACKFILL_COMPLETE"' in source
