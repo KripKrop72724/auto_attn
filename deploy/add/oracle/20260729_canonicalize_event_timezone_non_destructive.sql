@@ -24,13 +24,22 @@ declare
     l_body_status             varchar2(30);
     l_compile_errors          number;
     l_ddl_attempted           boolean := false;
-    l_old_count               number;
-    l_new_count               number;
-
-    c_old_return constant varchar2(4000) :=
-        q'~return to_timestamp_tz\([[:space:]]*v_value,[[:space:]]*'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'[[:space:]]*\);~';
-    c_new_return constant varchar2(4000) :=
-        q'~return to_timestamp_tz\([[:space:]]*v_value,[[:space:]]*'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'[[:space:]]*\)[[:space:]]+at time zone c_attendance_timezone;~';
+    l_parser_start            integer;
+    l_parser_end              integer;
+    l_return_start            integer;
+    l_canonical_start         integer;
+    l_old_return              varchar2(4000) :=
+        'return to_timestamp_tz(v_value, '
+        || chr(39)
+        || 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+        || chr(39)
+        || ');';
+    l_new_return              varchar2(4000) :=
+        'return to_timestamp_tz(v_value, '
+        || chr(39)
+        || 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+        || chr(39)
+        || ') at time zone c_attendance_timezone;';
 
     procedure restore_original is
     begin
@@ -49,10 +58,32 @@ begin
         dbms_lob.writeappend(l_body, length(source_line.text), source_line.text);
     end loop;
 
-    l_old_count := regexp_count(l_body, c_old_return, 1, 'i');
-    l_new_count := regexp_count(l_body, c_new_return, 1, 'i');
+    l_parser_start := dbms_lob.instr(
+        lower(l_body),
+        'function parse_event_timestamp',
+        1
+    );
+    l_parser_end := dbms_lob.instr(
+        lower(l_body),
+        'end parse_event_timestamp;',
+        l_parser_start
+    );
+    l_return_start := dbms_lob.instr(
+        lower(l_body),
+        'return to_timestamp_tz',
+        l_parser_start
+    );
+    l_canonical_start := dbms_lob.instr(
+        lower(l_body),
+        'at time zone c_attendance_timezone;',
+        l_return_start
+    );
 
-    if l_old_count = 0 and l_new_count = 1 then
+    if l_parser_start > 0
+       and l_parser_end > l_parser_start
+       and l_return_start > l_parser_start
+       and l_canonical_start > l_return_start
+       and l_canonical_start < l_parser_end then
         dbms_output.put_line(
             'SLIC_ZKT_TRUTH_API already canonicalizes event timestamps to Asia/Karachi.'
         );
@@ -60,11 +91,17 @@ begin
     end if;
 
     if dbms_lob.getlength(l_body) = 0
-       or l_old_count <> 1
-       or l_new_count <> 0
+       or l_parser_start = 0
+       or l_parser_end = 0
+       or dbms_lob.instr(l_body, l_old_return, l_parser_start) = 0
+       or dbms_lob.instr(
+              l_body,
+              l_old_return,
+              dbms_lob.instr(l_body, l_old_return, l_parser_start) + 1
+          ) <> 0
        or regexp_count(
            l_body,
-           q'~delete from hr_raw_attn_capture_events d[[:space:]]+where 1 = 0~',
+           'delete from hr_raw_attn_capture_events d[[:space:]]+where 1 = 0',
            1,
            'i'
        ) <> 2 then
@@ -74,23 +111,21 @@ begin
         );
     end if;
 
-    l_patched_body := regexp_replace(
+    l_patched_body := replace(
         l_body,
-        c_old_return,
-        'return to_timestamp_tz('
-            || 'v_value, '
-            || '''YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'''
-            || ') at time zone c_attendance_timezone;',
-        1,
-        1,
-        'i'
+        l_old_return,
+        l_new_return
     );
 
-    if regexp_count(l_patched_body, c_old_return, 1, 'i') <> 0
-       or regexp_count(l_patched_body, c_new_return, 1, 'i') <> 1
+    if dbms_lob.instr(l_patched_body, l_old_return, l_parser_start) <> 0
+       or dbms_lob.instr(
+              lower(l_patched_body),
+              'at time zone c_attendance_timezone;',
+              l_return_start
+          ) = 0
        or regexp_count(
            l_patched_body,
-           q'~delete from hr_raw_attn_capture_events d[[:space:]]+where 1 = 0~',
+           'delete from hr_raw_attn_capture_events d[[:space:]]+where 1 = 0',
            1,
            'i'
        ) <> 2 then
