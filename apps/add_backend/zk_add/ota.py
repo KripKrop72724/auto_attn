@@ -366,13 +366,40 @@ def campaign_rows(session: Session) -> list[dict[str, Any]]:
         deployments = list(session.scalars(select(FirmwareDeployment).where(
             FirmwareDeployment.campaign_id == campaign.id)).all())
         counts: dict[str, int] = {}
+        deployment_rows = []
         for deployment in deployments:
             counts[deployment.status] = counts.get(deployment.status, 0) + 1
+            connector = session.get(Connector, deployment.connector_id)
+            events = list(session.scalars(
+                select(FirmwareEvent)
+                .where(FirmwareEvent.deployment_id == deployment.id)
+                .order_by(FirmwareEvent.id.desc())
+                .limit(20)
+            ).all())
+            deployment_rows.append({
+                "deployment_id": deployment.deployment_id,
+                "connector_id": connector.connector_id if connector else None,
+                "status": deployment.status,
+                "previous_version": deployment.previous_version,
+                "target_version": deployment.target_version,
+                "bytes_written": deployment.bytes_written,
+                "attempt_count": deployment.attempt_count,
+                "error_code": deployment.error_code,
+                "error_message": deployment.error_message,
+                "offered_at": deployment.offered_at,
+                "completed_at": deployment.completed_at,
+                "events": [{
+                    "state": event.state,
+                    "details": event.details or {},
+                    "created_at": event.created_at,
+                } for event in events],
+            })
         release = session.get(FirmwareRelease, campaign.release_id)
         result.append({"campaign_id": campaign.campaign_id, "zone_id": campaign.zone_id,
             "version": release.version if release else None, "status": campaign.status,
             "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count,
-            "counts": counts, "pause_reason": campaign.pause_reason, "created_at": campaign.created_at})
+            "counts": counts, "pause_reason": campaign.pause_reason,
+            "deployments": deployment_rows, "created_at": campaign.created_at})
     return result
 
 

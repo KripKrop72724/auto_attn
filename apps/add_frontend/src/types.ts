@@ -59,6 +59,8 @@ export interface Device {
   ota_state?: 'LEGACY_MANUAL_UPDATE' | 'OTA_READY' | 'UPDATING' | 'ROLLBACK_REQUIRED' | 'OTA_BLOCKED'
   ota_partition_layout?: string | null
   ota_running_partition?: string | null
+  ota_image_sha256?: string | null
+  ota_signing_key_id?: string | null
   onboarding_generation: number
   last_onboarded_at: string | null
   last_seen_at: string | null
@@ -120,7 +122,33 @@ export interface FirmwareCampaign {
   legacy_skipped: number
   counts: Record<string, number>
   pause_reason: string | null
+  deployments: FirmwareDeployment[]
   created_at: string
+}
+
+export interface FirmwareDeploymentEvent {
+  state: string
+  details: {
+    bytes_written?: number
+    error_code?: string | null
+    [key: string]: unknown
+  }
+  created_at: string
+}
+
+export interface FirmwareDeployment {
+  deployment_id: string
+  connector_id: string | null
+  status: string
+  previous_version: string | null
+  target_version: string
+  bytes_written: number
+  attempt_count: number
+  error_code: string | null
+  error_message: string | null
+  offered_at: string | null
+  completed_at: string | null
+  events: FirmwareDeploymentEvent[]
 }
 
 export interface DeviceUser {

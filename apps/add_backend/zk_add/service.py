@@ -2960,6 +2960,8 @@ def serialize_connector(connector: Connector) -> dict:
         "ota_state": connector.ota_state,
         "ota_partition_layout": connector.ota_partition_layout,
         "ota_running_partition": connector.ota_running_partition,
+        "ota_image_sha256": connector.ota_image_sha256,
+        "ota_signing_key_id": connector.ota_signing_key_id,
         "onboarding_generation": connector.onboarding_generation,
         "last_onboarded_at": connector.last_onboarded_at,
         "last_seen_at": connector.last_seen_at,

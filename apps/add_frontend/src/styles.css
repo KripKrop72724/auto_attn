@@ -366,6 +366,15 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .firmware-campaign-summary code { overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
 .firmware-pause-reason { display: flex; align-items: center; gap: 8px; margin: 18px 0 0; padding: 11px 13px; color: var(--ink); background: #fafafa; font-size: 13px; }
 .firmware-pause-reason svg { flex: 0 0 auto; }
+.firmware-deployment-evidence { margin-top: 14px; border: 1px solid var(--line); background: #fafafa; }
+.firmware-deployment-evidence summary { padding: 11px 13px; cursor: pointer; font-size: 13px; font-weight: 700; }
+.firmware-deployment-evidence dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; margin: 0; padding: 0 13px 13px; }
+.firmware-deployment-evidence dl div { display: grid; gap: 3px; }
+.firmware-deployment-evidence dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.firmware-deployment-evidence dd { margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+.firmware-deployment-events { display: grid; gap: 6px; margin: 0; padding: 0 13px 13px 34px; }
+.firmware-deployment-events li { display: grid; grid-template-columns: minmax(150px, auto) minmax(120px, auto) 1fr; gap: 9px; align-items: baseline; font-size: 12px; }
+.firmware-deployment-events time { color: var(--muted); }
 .firmware-controls {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
