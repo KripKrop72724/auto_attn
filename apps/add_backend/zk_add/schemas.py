@@ -336,6 +336,47 @@ class HistoricalDirectoryIdentityRequest(BaseModel):
         return normalized
 
 
+class HistoricalEventGroupIdentityRequest(BaseModel):
+    group_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    source_user_id: str = Field(min_length=1, max_length=100)
+    source_uid: str = Field(min_length=1, max_length=40)
+    source_cnic: str = Field(min_length=13, max_length=15)
+    directory_employee_id: str = Field(min_length=1, max_length=40)
+    directory_service_number: str = Field(min_length=1, max_length=40)
+    directory_employee_name: str = Field(min_length=2, max_length=255)
+    directory_zone_code: str | None = Field(default=None, max_length=40)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("source_cnic")
+    @classmethod
+    def validate_event_group_cnic(cls, value: str) -> str:
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("Directory CNIC must contain exactly 13 digits")
+        return digits
+
+    @field_validator("directory_employee_id")
+    @classmethod
+    def validate_event_group_employee_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.isdigit():
+            raise ValueError("Directory employee ID must contain only digits")
+        return normalized
+
+    @field_validator("directory_service_number")
+    @classmethod
+    def validate_event_group_service_number(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", normalized):
+            raise ValueError(
+                "Directory service number contains unsupported characters"
+            )
+        return normalized
+
+
 class AdminLeaseRequest(BaseModel):
     uid: str
     idempotency_key: str = Field(min_length=8, max_length=120)

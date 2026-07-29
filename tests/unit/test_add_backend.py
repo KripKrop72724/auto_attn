@@ -67,6 +67,7 @@ from zk_add.service import (
     create_command,
     create_device_user_command,
     create_historical_directory_identity,
+    create_historical_event_group_identity,
     create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
@@ -684,6 +685,7 @@ def test_historical_identity_report_attributes_only_unambiguous_deleted_users(
         "quarantined_identity_reuse": 0,
         "attributed_to_deleted_users": 1,
         "unassigned_events": 1,
+        "actionable_event_groups": 1,
         "candidate_users": 1,
     }
     assert report["rows"][0]["source_user_key"] == source.user_key
@@ -691,7 +693,105 @@ def test_historical_identity_report_attributes_only_unambiguous_deleted_users(
     assert report["rows"][0]["event_count"] == 1
     assert report["rows"][0]["resolution_path"] == "HR_DIRECTORY_EVIDENCE"
     assert report["rows"][0]["operator_actionable"] is True
+    assert len(report["unassigned_groups"]) == 1
+    assert report["unassigned_groups"][0]["user_id"] == "not-in-snapshot"
+    assert report["unassigned_groups"][0]["uid"] == "7"
+    assert report["unassigned_groups"][0]["resolution_path"] == (
+        "HR_DIRECTORY_EVENT_GROUP"
+    )
+    assert report["unassigned_groups"][0]["operator_actionable"] is True
     assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == before
+
+
+def test_historical_event_group_identity_repairs_exact_orphan_without_touching_live_user(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="2" * 64,
+                user_id="CL04999",
+                raw_name="Former Employee",
+                uid="77",
+            ),
+            event(
+                event_uid="3" * 64,
+                user_id="CL04999",
+                raw_name="Former Employee",
+                uid="77",
+            ),
+        ],
+    )
+    report = build_historical_identity_report(db, zkt=connector.zkt_device)
+    candidate = report["unassigned_groups"][0]
+    assert candidate["event_count"] == 2
+    assert candidate["operator_actionable"] is True
+
+    with pytest.raises(ValueError, match="changed since it was selected"):
+        create_historical_event_group_identity(
+            db,
+            connector=connector,
+            group_token="0" * 64,
+            source_user_id="CL04999",
+            source_uid="77",
+            source_cnic=CNIC,
+            directory_employee_id="5294",
+            directory_service_number="CL04999",
+            directory_employee_name="Former Employee",
+            directory_zone_code="75",
+            reason="Reject a stale historical event group.",
+            idempotency_key="event-group-stale",
+            actor="StateHealthAdmin",
+        )
+
+    tombstone, repaired = create_historical_event_group_identity(
+        db,
+        connector=connector,
+        group_token=candidate["group_token"],
+        source_user_id="CL04999",
+        source_uid="77",
+        source_cnic=CNIC,
+        directory_employee_id="5294",
+        directory_service_number="cl04999",
+        directory_employee_name="Former Employee",
+        directory_zone_code="75",
+        reason="Exact orphan cohort verified against the HR directory.",
+        idempotency_key="event-group-verified",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+
+    assert repaired == 2
+    assert tombstone.user_id == "CL04999"
+    assert tombstone.uid == "77"
+    source = db.get(DeviceUser, tombstone.device_user_id)
+    assert source is not None
+    assert source.lifecycle_state == "DELETED"
+    assert source.present is False
+    assert source.source == "HR_DIRECTORY_EVIDENCE"
+    assert decrypt_cnic(source.cnic_encrypted) == CNIC
+    rows = db.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.event_uid.in_(["2" * 64, "3" * 64])
+        )
+    ).all()
+    assert len(rows) == 2
+    assert all(row.device_user_id == source.id for row in rows)
+    assert all(row.ords_status == "PENDING" for row in rows)
+    assert all(
+        row.identity_resolution_status == "RESOLVED_DIRECTORY_EVENT_GROUP"
+        for row in rows
+    )
+    assert all(decrypt_cnic(row.cnic_encrypted) == CNIC for row in rows)
+    assert db.scalar(
+        select(func.count())
+        .select_from(OrdsOutbox)
+        .where(OrdsOutbox.attendance_event_id.in_([row.id for row in rows]))
+    ) == 2
 
 
 def test_historical_directory_identity_accepts_exact_alphanumeric_service_number(
@@ -1185,7 +1285,12 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert all(not row["identity_complete"] for row in conflicted.json()["rows"])
     assert CNIC not in json.dumps(conflicted.json())
 
-    punch = event(event_uid="d" * 64, user_id="1001", raw_name=f"One-{CNIC}")
+    punch = event(
+        event_uid="d" * 64,
+        user_id="1001",
+        uid="1",
+        raw_name=f"One-{CNIC}",
+    )
     ingest_attendance(db, connector=connector, events=[punch])
     attendance = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid))
     assert attendance and attendance.ords_status == "BLOCKED_IDENTITY"
@@ -1278,8 +1383,18 @@ def test_same_employee_resolution_is_audited_reversible_and_never_mutates_punche
         ),
     )
     old_punches = [
-        event(event_uid="7" * 64, user_id="1001", raw_name=f"Same Name-{CNIC}"),
-        event(event_uid="8" * 64, user_id="1002", raw_name=f"Same Name-{CNIC}"),
+        event(
+            event_uid="7" * 64,
+            user_id="1001",
+            uid="1",
+            raw_name=f"Same Name-{CNIC}",
+        ),
+        event(
+            event_uid="8" * 64,
+            user_id="1002",
+            uid="2",
+            raw_name=f"Same Name-{CNIC}",
+        ),
     ]
     ingest_attendance(db, connector=connector, events=old_punches)
     db.flush()
@@ -1405,6 +1520,7 @@ def test_same_employee_resolution_is_audited_reversible_and_never_mutates_punche
     resolved_punch = event(
         event_uid="9" * 64,
         user_id="1002",
+        uid="2",
         raw_name=f"Same Name-{CNIC}",
     )
     ingest_attendance(db, connector=connector, events=[resolved_punch])
@@ -1496,7 +1612,12 @@ def test_same_employee_resolution_becomes_stale_when_terminal_membership_changes
         .order_by(DeviceAlert.id.desc())
     )
     assert alert and alert.details == {"affected_users": 3, "duplicate_groups": 1}
-    punch = event(event_uid="b" * 64, user_id="1003", raw_name=f"Same Name-{CNIC}")
+    punch = event(
+        event_uid="b" * 64,
+        user_id="1003",
+        uid="3",
+        raw_name=f"Same Name-{CNIC}",
+    )
     ingest_attendance(db, connector=connector, events=[punch])
     row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid))
     assert row and row.ords_status == "BLOCKED_IDENTITY"
@@ -2099,6 +2220,79 @@ def test_deleted_identity_tombstone_attributes_later_punches(db: Session):
     assert row.device_user_id == user.id
     assert row.display_name == user.display_name
     assert decrypt_cnic(row.cnic_encrypted) == CNIC
+
+
+def test_reused_terminal_user_id_never_inherits_active_or_tombstoned_identity(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    active = snapshot_user(db, connector)
+    from zk_add.service import persist_identity_tombstone
+
+    persist_identity_tombstone(db, zkt=connector.zkt_device, user=active)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="4" * 64,
+                user_id=active.user_id,
+                uid="999",
+                raw_name="Different Employee",
+            )
+        ],
+    )
+    row = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "4" * 64)
+    )
+    assert row is not None
+    assert row.device_user_id is None
+    assert row.cnic_encrypted is None
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert row.identity_resolution_status == "BLOCKED_IDENTITY"
+
+
+def test_tombstone_lookup_fails_closed_when_exact_user_id_uid_is_ambiguous(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    first = snapshot_user(db, connector)
+    from zk_add.service import persist_identity_tombstone
+
+    persist_identity_tombstone(db, zkt=connector.zkt_device, user=first)
+    first.present = False
+    first.lifecycle_state = "DELETED"
+    second = DeviceUser(
+        zkt_device_id=connector.zkt_device.id,
+        uid=first.uid,
+        user_id=first.user_id,
+        display_name=first.display_name,
+        cnic_encrypted=first.cnic_encrypted,
+        cnic_lookup_hash=first.cnic_lookup_hash,
+        cnic_last4=first.cnic_last4,
+        present=False,
+        lifecycle_state="DELETED",
+        source="HR_DIRECTORY_EVIDENCE",
+        observed_at=utc_now(),
+    )
+    db.add(second)
+    db.flush()
+    persist_identity_tombstone(db, zkt=connector.zkt_device, user=second)
+
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="5" * 64, raw_name="")],
+    )
+    row = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "5" * 64)
+    )
+    assert row is not None
+    assert row.device_user_id is None
+    assert row.cnic_encrypted is None
+    assert row.ords_status == "BLOCKED_IDENTITY"
 
 
 def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):

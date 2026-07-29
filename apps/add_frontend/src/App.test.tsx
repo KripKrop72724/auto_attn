@@ -126,7 +126,11 @@ const response = (body: unknown, status = 200) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
-const fetchStub = (users: DeviceUser[] = [user], includeHistorical = false) =>
+const fetchStub = (
+  users: DeviceUser[] = [user],
+  includeHistorical = false,
+  includeEventGroup = false,
+) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (path.includes('/api/v1/auth/session')) {
@@ -247,6 +251,12 @@ const fetchStub = (users: DeviceUser[] = [user], includeHistorical = false) =>
       })
     }
     if (
+      path.includes('/api/v2/devices/connector-one/historical-identities/resolve-event-group') &&
+      init?.method === 'POST'
+    ) {
+      return response({ ok: true, repaired_events: 2 }, 201)
+    }
+    if (
       path.includes('/api/v2/devices/connector-one/historical-identities/resolve') &&
       init?.method === 'POST'
     ) {
@@ -257,11 +267,12 @@ const fetchStub = (users: DeviceUser[] = [user], includeHistorical = false) =>
         device_serial: device.zkt?.serial,
         snapshot_revision: 8,
         totals: {
-          unresolved_events: includeHistorical ? 3 : 0,
-          blocked_identity: includeHistorical ? 3 : 0,
+          unresolved_events: (includeHistorical ? 3 : 0) + (includeEventGroup ? 2 : 0),
+          blocked_identity: (includeHistorical ? 3 : 0) + (includeEventGroup ? 2 : 0),
           quarantined_identity_reuse: 0,
           attributed_to_deleted_users: includeHistorical ? 3 : 0,
-          unassigned_events: 0,
+          unassigned_events: includeEventGroup ? 2 : 0,
+          actionable_event_groups: includeEventGroup ? 1 : 0,
           candidate_users: includeHistorical ? 1 : 0,
         },
         rows: includeHistorical
@@ -281,6 +292,28 @@ const fetchStub = (users: DeviceUser[] = [user], includeHistorical = false) =>
               first_event_at: '2026-06-01T08:00:00Z',
               last_event_at: '2026-07-01T08:00:00Z',
               resolution_path: 'HR_DIRECTORY_EVIDENCE',
+              operator_actionable: true,
+            }]
+          : [],
+        unassigned_groups: includeEventGroup
+          ? [{
+              source_user_key: null,
+              source_kind: 'EVENT_GROUP',
+              group_token: 'a'.repeat(64),
+              uid: '77',
+              user_id: 'CL04999',
+              display_name: 'Former Employee',
+              row_version: null,
+              observed_at: '2026-06-01T08:00:00Z',
+              deleted_at: '2026-07-01T08:00:00Z',
+              cnic_available: false,
+              identity_conflict_code: null,
+              event_count: 2,
+              blocked_count: 2,
+              quarantined_count: 0,
+              first_event_at: '2026-06-01T08:00:00Z',
+              last_event_at: '2026-07-01T08:00:00Z',
+              resolution_path: 'HR_DIRECTORY_EVENT_GROUP',
               operator_actionable: true,
             }]
           : [],
@@ -424,6 +457,53 @@ describe('State Life ADD interface', () => {
       directory_service_number: 'CL04196',
       directory_employee_name: 'Dr Mehtab',
       typed_confirmation: 'CL04196 -> HR 5294',
+    })
+  })
+
+  it('routes exact orphaned event cohorts through the versioned HR evidence endpoint', async () => {
+    const fetchMock = fetchStub([user], false, true)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    expect(await screen.findByText(/1 exact cohorts can accept guarded hr evidence/i)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
+    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+      target: { value: fullCnic },
+    })
+    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
+      target: { value: '5294' },
+    })
+    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+      target: { value: 'Verified exact event cohort against the HR directory.' },
+    })
+    fireEvent.change(screen.getByLabelText(/type “cl04999 -> hr 5294”/i), {
+      target: { value: 'CL04999 -> HR 5294' },
+    })
+    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+      target: { value: 'test-password' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
+
+    expect(await screen.findByText(/2 preserved attendance events requeued/i)).toBeTruthy()
+    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
+      String(input).includes('/historical-identities/resolve-event-group') &&
+      (init as RequestInit | undefined)?.method === 'POST',
+    )
+    expect(resolutionCall).toBeTruthy()
+    const requestBody = JSON.parse(
+      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
+    )
+    expect(requestBody).toMatchObject({
+      group_token: 'a'.repeat(64),
+      source_user_id: 'CL04999',
+      source_uid: '77',
+      directory_employee_id: '5294',
+      directory_service_number: 'CL04999',
+      directory_employee_name: 'Former Employee',
     })
   })
 
