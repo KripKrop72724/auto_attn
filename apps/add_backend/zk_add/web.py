@@ -2034,7 +2034,10 @@ class _FirmwareCampaignIn(_BaseModel):
 
 
 class _FirmwareControlIn(_BaseModel):
-    reason: str = _Field(min_length=10, max_length=500)
+    # FirmwareCampaign.pause_reason is deliberately bounded to 200 characters.
+    # Validate at the API boundary so an overlong audit reason is a clear 422,
+    # not a database error after the operator has already stepped up.
+    reason: str = _Field(min_length=10, max_length=200)
     password: str = _Field(min_length=1, max_length=512)
 
 

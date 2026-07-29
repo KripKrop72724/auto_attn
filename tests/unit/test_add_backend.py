@@ -3109,6 +3109,31 @@ def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
     assert "13 digits" in response.json()["detail"]
 
 
+def test_firmware_control_reason_is_rejected_before_database_overflow(db: Session):
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(
+        "/api/v1/firmware/campaigns/not-reached/cancel",
+        json={"reason": "x" * 201, "password": "correct-password"},
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "string_too_long"
+
+
 def test_device_detail_exposes_admin_command_status_not_device_wire_envelope(
     db: Session,
 ):
