@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
@@ -39,6 +40,7 @@ from zk_add.models import (
     DeviceTelemetry,
     DeviceUser,
     DeviceUserSnapshot,
+    HistoricalCurrentIdentityResolution,
     IdentityConflictResolution,
     IdentityTombstone,
     OracleReceipt,
@@ -1294,6 +1296,18 @@ def _normalized_identity_name(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", value.upper())
 
 
+def _identity_names_match(left: str, right: str) -> bool:
+    normalized_left = _normalized_identity_name(left)
+    normalized_right = _normalized_identity_name(right)
+    if not normalized_left or not normalized_right:
+        return False
+    return bool(
+        secrets.compare_digest(normalized_left, normalized_right)
+        or normalized_left.startswith(normalized_right)
+        or normalized_right.startswith(normalized_left)
+    )
+
+
 def create_historical_event_group_identity(
     session: Session,
     *,
@@ -1540,6 +1554,281 @@ def create_historical_event_group_identity(
     return tombstone, len(events)
 
 
+def resolve_historical_event_group_to_current_identity(
+    session: Session,
+    *,
+    connector: Connector,
+    group_token: str,
+    source_user_id: str,
+    source_uid: str,
+    target_user_key: str,
+    expected_version: int,
+    source_cnic: str,
+    verified_employee_name: str,
+    reason: str,
+    idempotency_key: str,
+    actor: str,
+) -> tuple[HistoricalCurrentIdentityResolution, DeviceUser, int]:
+    """Attach one exact legacy cohort to its current, independently verified user.
+
+    This is deliberately narrower than a historical alias. The terminal user ID
+    must be unchanged, a non-empty historical UID must match, the active identity
+    must already own the same verified CNIC, the terminal and evidence names must
+    agree, and the reviewed cohort token and active row version must still be
+    current. No terminal user or attendance event is deleted.
+    """
+
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("Connector has no assigned ZKT device.")
+    source_user_id = source_user_id.strip()
+    source_uid = source_uid.strip()
+    verified_employee_name = verified_employee_name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", source_user_id):
+        raise ValueError(
+            "Historical terminal user ID contains unsupported characters."
+        )
+    if len(_normalized_identity_name(verified_employee_name)) < 5:
+        raise ValueError("Authoritative employee name is too short to verify.")
+
+    target_user = session.scalar(
+        select(DeviceUser)
+        .where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == target_user_key,
+        )
+        .with_for_update()
+    )
+    if target_user is None:
+        raise ValueError("The selected current terminal user no longer exists.")
+    if (
+        not target_user.present
+        or target_user.lifecycle_state != "ACTIVE"
+        or target_user.user_id != source_user_id
+    ):
+        raise ValueError(
+            "The selected target is not the active user with this exact terminal user ID."
+        )
+    if target_user.row_version != expected_version:
+        raise ValueError(
+            "Current terminal identity changed since it was selected. Refresh and retry."
+        )
+    if source_uid and target_user.uid != source_uid:
+        raise ValueError(
+            "Historical UID does not match the selected current terminal identity."
+        )
+    if target_user.identity_conflict_code is not None:
+        raise ValueError(
+            "Resolve the current terminal user's identity conflict before using it."
+        )
+
+    normalized_cnic = normalize_cnic(source_cnic)
+    cnic_hash = cnic_lookup(normalized_cnic)
+    current_cnic = decrypt_cnic(target_user.cnic_encrypted)
+    if (
+        not current_cnic
+        or not target_user.cnic_lookup_hash
+        or not secrets.compare_digest(current_cnic, normalized_cnic)
+        or not secrets.compare_digest(target_user.cnic_lookup_hash, cnic_hash)
+    ):
+        raise ValueError(
+            "Authoritative CNIC evidence does not match the selected current identity."
+        )
+    if not _identity_names_match(verified_employee_name, target_user.display_name):
+        raise ValueError(
+            "Authoritative employee name does not match the selected current identity."
+        )
+    conflicting_claim = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.id != target_user.id,
+            DeviceUser.lifecycle_state == "ACTIVE",
+            DeviceUser.cnic_lookup_hash == cnic_hash,
+        )
+    )
+    if conflicting_claim is not None:
+        raise ValueError(
+            "Another active terminal user claims this CNIC. Resolve that conflict first."
+        )
+
+    def validate_existing(
+        existing: HistoricalCurrentIdentityResolution,
+    ) -> tuple[HistoricalCurrentIdentityResolution, DeviceUser, int]:
+        if (
+            existing.group_token != group_token
+            or existing.device_user_id != target_user.id
+            or existing.source_user_id != source_user_id
+            or existing.source_uid != source_uid
+            or not secrets.compare_digest(
+                existing.source_cnic_lookup_hash,
+                cnic_hash,
+            )
+        ):
+            raise ValueError(
+                "That resolution key or cohort is already bound to different evidence."
+            )
+        return existing, target_user, 0
+
+    existing = session.scalar(
+        select(HistoricalCurrentIdentityResolution).where(
+            HistoricalCurrentIdentityResolution.zkt_device_id == zkt.id,
+            HistoricalCurrentIdentityResolution.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        return validate_existing(existing)
+    existing = session.scalar(
+        select(HistoricalCurrentIdentityResolution).where(
+            HistoricalCurrentIdentityResolution.zkt_device_id == zkt.id,
+            HistoricalCurrentIdentityResolution.group_token == group_token,
+        )
+    )
+    if existing is not None:
+        return validate_existing(existing)
+
+    uid_condition = (
+        AttendanceEvent.uid == source_uid
+        if source_uid
+        else ((AttendanceEvent.uid == None) | (AttendanceEvent.uid == ""))  # noqa: E711
+    )
+    events = list(
+        session.scalars(
+            select(AttendanceEvent)
+            .where(
+                AttendanceEvent.zkt_device_id == zkt.id,
+                AttendanceEvent.user_id == source_user_id,
+                uid_condition,
+                AttendanceEvent.device_user_id == None,  # noqa: E711
+                AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+                AttendanceEvent.ords_status.in_(
+                    UNRESOLVED_HISTORICAL_IDENTITY_STATES
+                ),
+            )
+            .order_by(AttendanceEvent.id.asc())
+            .with_for_update()
+        ).all()
+    )
+    if not events:
+        raise ValueError("No unresolved exact historical event cohort remains.")
+    if not secrets.compare_digest(
+        _historical_identity_group_token(zkt, events),
+        group_token,
+    ):
+        raise ValueError(
+            "Historical event cohort changed since it was selected. Refresh and retry."
+        )
+
+    event_names = {
+        (event.display_name or "").strip()
+        for event in events
+        if (event.display_name or "").strip()
+    }
+    normalized_event_names = {
+        _normalized_identity_name(name) for name in event_names
+    }
+    if len(normalized_event_names) != 1:
+        raise ValueError(
+            "Current-identity resolution requires one stable historical terminal name."
+        )
+    terminal_name = next(iter(event_names))
+    if (
+        not _identity_names_match(terminal_name, verified_employee_name)
+        or not _identity_names_match(terminal_name, target_user.display_name)
+    ):
+        raise ValueError(
+            "Historical terminal name does not match the authoritative current identity."
+        )
+
+    resolution = HistoricalCurrentIdentityResolution(
+        zkt_device_id=zkt.id,
+        device_user_id=target_user.id,
+        group_token=group_token,
+        source_user_id=source_user_id,
+        source_uid=source_uid,
+        source_cnic_lookup_hash=cnic_hash,
+        verified_employee_name=verified_employee_name,
+        event_count=len(events),
+        actor=actor,
+        reason=reason,
+        idempotency_key=idempotency_key,
+    )
+    try:
+        with session.begin_nested():
+            session.add(resolution)
+            session.flush()
+    except IntegrityError:
+        concurrent = session.scalar(
+            select(HistoricalCurrentIdentityResolution).where(
+                HistoricalCurrentIdentityResolution.zkt_device_id == zkt.id,
+                (
+                    (
+                        HistoricalCurrentIdentityResolution.idempotency_key
+                        == idempotency_key
+                    )
+                    | (HistoricalCurrentIdentityResolution.group_token == group_token)
+                ),
+            )
+        )
+        if concurrent is None:
+            raise ValueError(
+                "The exact historical resolution changed concurrently. Refresh and retry."
+            )
+        return validate_existing(concurrent)
+
+    repaired_at = utc_now()
+    for event in events:
+        event.device_user_id = target_user.id
+        event.identity_snapshot_id = zkt.identity_snapshot_id
+        event.identity_terminal_fingerprint = None
+        event.identity_resolution_status = "RESOLVED_CURRENT_IDENTITY_EVIDENCE"
+        event.identity_resolved_at = repaired_at
+        event.identity_repaired_at = repaired_at
+        event.identity_repair_reason = "VERIFIED_CURRENT_IDENTITY_EVENT_GROUP"
+        event.display_name = target_user.display_name
+        event.cnic_encrypted = target_user.cnic_encrypted
+        event.cnic_lookup_hash = target_user.cnic_lookup_hash
+        event.cnic_last4 = target_user.cnic_last4
+        event.raw_punch = event.raw_punch or target_user.shift_worker
+        event.ords_status = "PENDING"
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)
+        )
+        if outbox is None:
+            session.add(OrdsOutbox(attendance_event_id=event.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
+
+    append_audit(
+        session,
+        actor=actor,
+        action="HISTORICAL_CURRENT_IDENTITY_VERIFIED",
+        target_type="zkt_historical_event_group",
+        target_id=f"{zkt.id}:{source_user_id}:{source_uid}",
+        outcome="SUCCEEDED",
+        request_id=idempotency_key,
+        before={
+            "group_token": group_token,
+            "source_user_id": source_user_id,
+            "source_uid": source_uid,
+            "blocked_events": len(events),
+        },
+        after={
+            "resolution_id": resolution.resolution_id,
+            "target_user_key": target_user.user_key,
+            "target_user_id": target_user.user_id,
+            "target_row_version": target_user.row_version,
+            "verified_employee_name": verified_employee_name,
+            "verified_cnic": mask_cnic(normalized_cnic),
+            "repaired_events": len(events),
+            "reason": reason,
+        },
+    )
+    return resolution, target_user, len(events)
+
+
 def build_historical_identity_report(
     session: Session,
     *,
@@ -1564,6 +1853,20 @@ def build_historical_identity_report(
             .order_by(DeviceUser.id.asc())
         ).all()
     )
+    active_users = list(
+        session.scalars(
+            select(DeviceUser)
+            .where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.present == True,  # noqa: E712
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+            .order_by(DeviceUser.id.asc())
+        ).all()
+    )
+    active_users_by_user_id: dict[str, list[DeviceUser]] = {}
+    for active_user in active_users:
+        active_users_by_user_id.setdefault(active_user.user_id, []).append(active_user)
     unresolved_events = list(
         session.scalars(
             select(AttendanceEvent)
@@ -1677,6 +1980,24 @@ def build_historical_identity_report(
             and linked_user.cnic_lookup_hash is None
             and linked_user.identity_conflict_code is None
         )
+        current_identity_candidates = [
+            candidate
+            for candidate in active_users_by_user_id.get(user_id, [])
+            if candidate.cnic_lookup_hash
+            and candidate.cnic_encrypted
+            and candidate.identity_conflict_code is None
+            and (not uid or candidate.uid == uid)
+            and len(display_names) == 1
+            and _identity_names_match(
+                next(iter(display_names.values())),
+                candidate.display_name,
+            )
+        ]
+        current_identity = (
+            current_identity_candidates[0]
+            if not linked_user_ids and len(current_identity_candidates) == 1
+            else None
+        )
         exact_name = len(display_names) == 1
         service_number_shape = bool(re.fullmatch(r"[A-Za-z0-9._-]+", user_id))
         exact_orphan = (
@@ -1692,7 +2013,22 @@ def build_historical_identity_report(
                 "source_user_key": None,
                 "source_kind": "EVENT_GROUP",
                 "active_user_key": (
-                    linked_user.user_key if active_enrichment and linked_user else None
+                    linked_user.user_key
+                    if active_enrichment and linked_user
+                    else (
+                        current_identity.user_key
+                        if current_identity is not None
+                        else None
+                    )
+                ),
+                "active_user_row_version": (
+                    current_identity.row_version
+                    if current_identity is not None
+                    else (
+                        linked_user.row_version
+                        if active_enrichment and linked_user
+                        else None
+                    )
                 ),
                 "uid": uid,
                 "user_id": user_id,
@@ -1724,12 +2060,20 @@ def build_historical_identity_report(
                     "ACTIVE_USER_ENRICHMENT"
                     if active_enrichment
                     else (
-                        "HR_DIRECTORY_EVENT_GROUP"
-                        if exact_orphan
-                        else "IDENTITY_REUSE_REVIEW"
+                        "CURRENT_IDENTITY_EVIDENCE"
+                        if current_identity is not None
+                        else (
+                            "HR_DIRECTORY_EVENT_GROUP"
+                            if exact_orphan
+                            else "IDENTITY_REUSE_REVIEW"
+                        )
                     )
                 ),
-                "operator_actionable": exact_orphan or active_enrichment,
+                "operator_actionable": (
+                    exact_orphan
+                    or active_enrichment
+                    or current_identity is not None
+                ),
             }
         )
     unassigned_groups.sort(

@@ -15,7 +15,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 import zk_add.worker as worker
-from zk_add.crypto import decrypt_cnic, decrypt_json, decrypt_text
+from zk_add.crypto import (
+    cnic_lookup,
+    decrypt_cnic,
+    decrypt_json,
+    decrypt_text,
+    encrypt_cnic,
+)
 from zk_add.db import Base, SessionLocal
 from zk_add.identity import build_machine_name
 from zk_add.identity_conflicts import (
@@ -31,6 +37,7 @@ from zk_add.models import (
     DeviceCommand,
     DeviceConnectionEvent,
     DeviceUser,
+    HistoricalCurrentIdentityResolution,
     IdentityConflictResolution,
     IdentityTombstone,
     OnboardingNonce,
@@ -79,6 +86,7 @@ from zk_add.service import (
     record_oracle_receipts,
     serialize_command,
     serialize_user_deletion_job,
+    resolve_historical_event_group_to_current_identity,
     update_device_user_command,
     update_heartbeat,
     upsert_alert,
@@ -849,6 +857,188 @@ def test_historical_event_group_identity_accepts_named_legacy_cohort_without_uid
             )
         ).all()
     )
+
+
+def test_historical_event_group_resolves_to_exact_current_verified_identity(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="9" * 64,
+                user_id="03752",
+                raw_name="Ubaidullah",
+                uid="",
+            )
+        ],
+    )
+    active = snapshot_user(
+        db,
+        connector,
+        uid="11",
+        user_id="03752",
+        name="Ubaidullah",
+    )
+    active.cnic_encrypted = encrypt_cnic(CNIC)
+    active.cnic_lookup_hash = cnic_lookup(CNIC)
+    active.cnic_last4 = CNIC[-4:]
+    db.flush()
+
+    report = build_historical_identity_report(db, zkt=connector.zkt_device)
+    candidate = report["unassigned_groups"][0]
+    assert candidate["resolution_path"] == "CURRENT_IDENTITY_EVIDENCE"
+    assert candidate["active_user_key"] == active.user_key
+    assert candidate["active_user_row_version"] == active.row_version
+    assert candidate["operator_actionable"] is True
+    before = db.scalar(select(func.count()).select_from(AttendanceEvent))
+
+    resolution, target, repaired = (
+        resolve_historical_event_group_to_current_identity(
+            db,
+            connector=connector,
+            group_token=candidate["group_token"],
+            source_user_id="03752",
+            source_uid="",
+            target_user_key=active.user_key,
+            expected_version=active.row_version,
+            source_cnic=CNIC,
+            verified_employee_name="Ubaidullah",
+            reason="Oracle raw capture identity exactly matches the current user.",
+            idempotency_key="current-identity-03752",
+            actor="StateHealthAdmin",
+        )
+    )
+    db.flush()
+
+    assert target.id == active.id
+    assert repaired == 1
+    assert resolution.event_count == 1
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == before
+    row = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "9" * 64)
+    )
+    assert row is not None
+    assert row.device_user_id == active.id
+    assert row.ords_status == "PENDING"
+    assert row.identity_resolution_status == "RESOLVED_CURRENT_IDENTITY_EVIDENCE"
+    assert row.identity_repair_reason == "VERIFIED_CURRENT_IDENTITY_EVENT_GROUP"
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    outbox = db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+    )
+    assert outbox is not None
+    assert outbox.status == "PENDING"
+    audit = db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "HISTORICAL_CURRENT_IDENTITY_VERIFIED"
+        )
+    )
+    assert audit is not None
+    assert audit.request_id == "current-identity-03752"
+    assert "".join(
+        character
+        for character in audit.after["verified_cnic"]
+        if character.isdigit()
+    ).endswith(CNIC[-4:])
+
+    replay, replay_target, replayed = (
+        resolve_historical_event_group_to_current_identity(
+            db,
+            connector=connector,
+            group_token=candidate["group_token"],
+            source_user_id="03752",
+            source_uid="",
+            target_user_key=active.user_key,
+            expected_version=active.row_version,
+            source_cnic=CNIC,
+            verified_employee_name="Ubaidullah",
+            reason="Idempotent retry of the exact Oracle evidence.",
+            idempotency_key="current-identity-03752",
+            actor="StateHealthAdmin",
+        )
+    )
+    assert replay.id == resolution.id
+    assert replay_target.id == active.id
+    assert replayed == 0
+    assert db.scalar(
+        select(func.count()).select_from(HistoricalCurrentIdentityResolution)
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"group_token": "0" * 64}, "changed since it was selected"),
+        ({"expected_version": 999}, "changed since it was selected"),
+        ({"source_cnic": "1111111111111"}, "CNIC evidence does not match"),
+        ({"verified_employee_name": "Different Employee"}, "name does not match"),
+    ],
+)
+def test_historical_current_identity_resolution_rejects_stale_or_mismatched_evidence(
+    db: Session,
+    override: dict,
+    message: str,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="8" * 64,
+                user_id="03752",
+                raw_name="Ubaidullah",
+                uid="",
+            )
+        ],
+    )
+    active = snapshot_user(
+        db,
+        connector,
+        uid="11",
+        user_id="03752",
+        name="Ubaidullah",
+    )
+    active.cnic_encrypted = encrypt_cnic(CNIC)
+    active.cnic_lookup_hash = cnic_lookup(CNIC)
+    active.cnic_last4 = CNIC[-4:]
+    db.flush()
+    candidate = build_historical_identity_report(
+        db,
+        zkt=connector.zkt_device,
+    )["unassigned_groups"][0]
+    arguments = {
+        "connector": connector,
+        "group_token": candidate["group_token"],
+        "source_user_id": "03752",
+        "source_uid": "",
+        "target_user_key": active.user_key,
+        "expected_version": active.row_version,
+        "source_cnic": CNIC,
+        "verified_employee_name": "Ubaidullah",
+        "reason": "Reject stale or mismatched current identity evidence.",
+        "idempotency_key": f"reject-current-{message}",
+        "actor": "StateHealthAdmin",
+    }
+    arguments.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        resolve_historical_event_group_to_current_identity(db, **arguments)
+
+    assert db.scalar(
+        select(func.count()).select_from(HistoricalCurrentIdentityResolution)
+    ) == 0
+    row = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "8" * 64)
+    )
+    assert row is not None
+    assert row.device_user_id is None
+    assert row.ords_status == "BLOCKED_IDENTITY"
 
 
 def test_historical_report_routes_linked_active_identity_to_certified_enrichment(

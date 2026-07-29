@@ -268,6 +268,7 @@ export interface HistoricalIdentityCandidate {
   source_kind?: 'DELETED_USER' | 'EVENT_GROUP'
   group_token?: string
   active_user_key?: string | null
+  active_user_row_version?: number | null
   uid: string
   user_id: string
   display_name: string
@@ -285,6 +286,7 @@ export interface HistoricalIdentityCandidate {
     | 'HR_DIRECTORY_EVIDENCE'
     | 'HR_DIRECTORY_EVENT_GROUP'
     | 'ACTIVE_USER_ENRICHMENT'
+    | 'CURRENT_IDENTITY_EVIDENCE'
     | 'VERIFIED_TOMBSTONE_REPAIR'
     | 'IDENTITY_CONFLICT_REVIEW'
     | 'IDENTITY_REUSE_REVIEW'

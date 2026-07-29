@@ -799,15 +799,21 @@ function HistoricalIdentityResolutionDialog({
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const expectedConfirmation = `${candidate.user_id} -> HR ${employeeId}`
+  const currentIdentityEvidence =
+    candidate.resolution_path === 'CURRENT_IDENTITY_EVIDENCE'
+  const expectedConfirmation = currentIdentityEvidence
+    ? `${candidate.user_id} -> CURRENT ${candidate.user_id}`
+    : `${candidate.user_id} -> HR ${employeeId}`
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     setError('')
     if (!/^\d{13}$/.test(cnic)) return setError('Directory CNIC must contain exactly 13 digits.')
-    if (!/^\d+$/.test(employeeId)) return setError('Directory employee ID must contain only digits.')
-    if (!/^[A-Za-z0-9._-]+$/.test(serviceNumber)) {
-      return setError('Directory service number contains unsupported characters.')
+    if (!currentIdentityEvidence) {
+      if (!/^\d+$/.test(employeeId)) return setError('Directory employee ID must contain only digits.')
+      if (!/^[A-Za-z0-9._-]+$/.test(serviceNumber)) {
+        return setError('Directory service number contains unsupported characters.')
+      }
     }
     if (!employeeName.trim()) return setError('Directory employee name is required.')
     if (reason.trim().length < 10) return setError('Record an audit reason of at least 10 characters.')
@@ -822,6 +828,12 @@ function HistoricalIdentityResolutionDialog({
       return setError('The exact historical event cohort is incomplete. Refresh and retry.')
     }
     if (
+      currentIdentityEvidence &&
+      (!candidate.active_user_key || candidate.active_user_row_version == null)
+    ) {
+      return setError('The current terminal identity changed or is incomplete. Refresh and retry.')
+    }
+    if (
       candidate.source_kind !== 'EVENT_GROUP' &&
       (!candidate.source_user_key || candidate.row_version == null)
     ) {
@@ -830,14 +842,26 @@ function HistoricalIdentityResolutionDialog({
     setBusy(true)
     try {
       const eventGroup = candidate.source_kind === 'EVENT_GROUP'
+      const endpoint = currentIdentityEvidence
+        ? 'resolve-current-identity'
+        : eventGroup
+          ? 'resolve-event-group'
+          : 'resolve'
       const response = await api<{ repaired_events: number }>(
-        `/api/v2/devices/${device.connector_id}/historical-identities/${
-          eventGroup ? 'resolve-event-group' : 'resolve'
-        }`,
+        `/api/v2/devices/${device.connector_id}/historical-identities/${endpoint}`,
         {
           method: 'POST',
           body: JSON.stringify({
-            ...(eventGroup
+            ...(currentIdentityEvidence
+              ? {
+                  group_token: candidate.group_token,
+                  source_user_id: candidate.user_id,
+                  source_uid: candidate.uid,
+                  target_user_key: candidate.active_user_key,
+                  expected_version: candidate.active_user_row_version,
+                  verified_employee_name: employeeName.trim(),
+                }
+              : eventGroup
               ? {
                   group_token: candidate.group_token,
                   source_user_id: candidate.user_id,
@@ -848,14 +872,22 @@ function HistoricalIdentityResolutionDialog({
                   expected_version: candidate.row_version,
                 }),
             source_cnic: cnic,
-            directory_employee_id: employeeId,
-            directory_service_number: serviceNumber,
-            directory_employee_name: employeeName.trim(),
-            directory_zone_code: zoneCode.trim() || null,
+            ...(!currentIdentityEvidence
+              ? {
+                  directory_employee_id: employeeId,
+                  directory_service_number: serviceNumber,
+                  directory_employee_name: employeeName.trim(),
+                  directory_zone_code: zoneCode.trim() || null,
+                }
+              : {}),
             reason: reason.trim(),
             typed_confirmation: confirmation,
             password,
-            idempotency_key: idempotency('historical-directory-identity'),
+            idempotency_key: idempotency(
+              currentIdentityEvidence
+                ? 'historical-current-identity'
+                : 'historical-directory-identity',
+            ),
           }),
         },
       )
@@ -878,8 +910,10 @@ function HistoricalIdentityResolutionDialog({
   return (
     <Dialog
       titleId="historical-identity-resolution-title"
-      title="Enter verified HR identity evidence"
-      description="Use authoritative HR directory evidence only. ADD will preserve every attendance event and requeue only an exact, unambiguous match."
+      title={currentIdentityEvidence ? 'Verify preserved cohort against current identity' : 'Enter verified HR identity evidence'}
+      description={currentIdentityEvidence
+        ? 'Use the authoritative Oracle capture identity to confirm this exact historical cohort belongs to the unchanged current terminal user.'
+        : 'Use authoritative HR directory evidence only. ADD will preserve every attendance event and requeue only an exact, unambiguous match.'}
       onClose={onClose}
     >
       <form className="dialog-body" onSubmit={submit}>
@@ -893,14 +927,16 @@ function HistoricalIdentityResolutionDialog({
         </div>
         <div className="form-grid">
           <label>Authoritative CNIC<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
-          <label>HR employee ID<input inputMode="numeric" value={employeeId} onChange={(event) => setEmployeeId(event.target.value.replace(/\D/g, '').slice(0, 32))} /></label>
-          <label>HR service number<input value={serviceNumber} onChange={(event) => setServiceNumber(event.target.value.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64))} /></label>
-          <label>HR employee name<input value={employeeName} onChange={(event) => setEmployeeName(event.target.value)} maxLength={255} /></label>
-          <label>HR zone code<input value={zoneCode} onChange={(event) => setZoneCode(event.target.value)} maxLength={64} /></label>
+          {!currentIdentityEvidence && <label>HR employee ID<input inputMode="numeric" value={employeeId} onChange={(event) => setEmployeeId(event.target.value.replace(/\D/g, '').slice(0, 32))} /></label>}
+          {!currentIdentityEvidence && <label>HR service number<input value={serviceNumber} onChange={(event) => setServiceNumber(event.target.value.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64))} /></label>}
+          <label>{currentIdentityEvidence ? 'Authoritative employee name' : 'HR employee name'}<input value={employeeName} onChange={(event) => setEmployeeName(event.target.value)} maxLength={255} /></label>
+          {!currentIdentityEvidence && <label>HR zone code<input value={zoneCode} onChange={(event) => setZoneCode(event.target.value)} maxLength={64} /></label>}
         </div>
         <div className="message pattern-blocked" role="note">
           <Icon name="alert" />
-          Do not infer or guess a CNIC. The terminal service number and employee name must match the authoritative HR record.
+          {currentIdentityEvidence
+            ? 'Do not infer or guess a CNIC. ADD will require it to match the encrypted current identity, the exact terminal user ID, stable historical name, reviewed cohort token, and current row version.'
+            : 'Do not infer or guess a CNIC. The terminal service number and employee name must match the authoritative HR record.'}
         </div>
         <label>Audit reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
         <label>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
@@ -908,7 +944,7 @@ function HistoricalIdentityResolutionDialog({
         {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
         <footer className="dialog-actions">
           <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
-          <button className="button primary" disabled={busy}>{busy ? 'Verifying and requeuing…' : 'Save verified HR evidence'}</button>
+          <button className="button primary" disabled={busy}>{busy ? 'Verifying and requeuing…' : currentIdentityEvidence ? 'Verify current identity and requeue' : 'Save verified HR evidence'}</button>
         </footer>
       </form>
     </Dialog>
@@ -1318,8 +1354,10 @@ function UsersView({
                     <div className="conflict-group-actions">
                       <small>
                         {candidate.operator_actionable
-                          ? candidate.active_user_key
+                          ? candidate.resolution_path === 'ACTIVE_USER_ENRICHMENT'
                             ? 'This preserved cohort is linked to one current user. Enrich that certified terminal record with authoritative CNIC evidence.'
+                            : candidate.resolution_path === 'CURRENT_IDENTITY_EVIDENCE'
+                              ? 'This exact legacy cohort can be compared with the unchanged, CNIC-complete current user. Authoritative CNIC and name evidence are still required.'
                             : 'Requires exact authoritative HR CNIC, employee ID, service number, name, and audit approval.'
                           : candidate.source_kind === 'EVENT_GROUP'
                             ? 'This cohort remains fail-closed because it lacks a unique UID, has conflicting terminal names, or is linked to another identity.'
@@ -1329,7 +1367,7 @@ function UsersView({
                         className="button secondary"
                         disabled={!candidate.operator_actionable}
                         onClick={() => {
-                          if (candidate.active_user_key) {
+                          if (candidate.resolution_path === 'ACTIVE_USER_ENRICHMENT') {
                             const activeUser = rows.find(
                               (row) => row.user_key === candidate.active_user_key,
                             )
@@ -1341,7 +1379,11 @@ function UsersView({
                         }}
                       >
                         <Icon name="shield" />
-                        {candidate.active_user_key ? 'Enrich current user' : 'Enter verified HR evidence'}
+                        {candidate.resolution_path === 'ACTIVE_USER_ENRICHMENT'
+                          ? 'Enrich current user'
+                          : candidate.resolution_path === 'CURRENT_IDENTITY_EVIDENCE'
+                            ? 'Verify against current identity'
+                            : 'Enter verified HR evidence'}
                       </button>
                     </div>
                   </article>

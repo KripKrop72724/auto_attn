@@ -377,6 +377,32 @@ class HistoricalEventGroupIdentityRequest(BaseModel):
         return normalized
 
 
+class HistoricalCurrentIdentityRequest(BaseModel):
+    group_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    source_user_id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    source_uid: str = Field(default="", max_length=40)
+    target_user_key: str = Field(min_length=1, max_length=36)
+    expected_version: int = Field(ge=1)
+    source_cnic: str = Field(min_length=13, max_length=15)
+    verified_employee_name: str = Field(min_length=2, max_length=255)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("source_cnic")
+    @classmethod
+    def validate_current_identity_cnic(cls, value: str) -> str:
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 13:
+            raise ValueError("Authoritative CNIC must contain exactly 13 digits")
+        return digits
+
+
 class AdminLeaseRequest(BaseModel):
     uid: str
     idempotency_key: str = Field(min_length=8, max_length=120)
