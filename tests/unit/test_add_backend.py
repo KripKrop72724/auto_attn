@@ -851,6 +851,46 @@ def test_historical_event_group_identity_accepts_named_legacy_cohort_without_uid
     )
 
 
+def test_historical_report_routes_linked_active_identity_to_certified_enrichment(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    active = snapshot_user(
+        db,
+        connector,
+        uid="88",
+        user_id="CL04666",
+        name="Current Employee",
+    )
+    assert active.cnic_lookup_hash is None
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="b" * 64,
+                user_id=active.user_id,
+                raw_name="Current Employee",
+                uid=active.uid,
+            )
+        ],
+    )
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "b" * 64)
+    )
+    assert blocked is not None
+    assert blocked.device_user_id == active.id
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
+
+    report = build_historical_identity_report(db, zkt=connector.zkt_device)
+    candidate = report["unassigned_groups"][0]
+    assert candidate["active_user_key"] == active.user_key
+    assert candidate["resolution_path"] == "ACTIVE_USER_ENRICHMENT"
+    assert candidate["operator_actionable"] is True
+    assert report["totals"]["actionable_event_groups"] == 1
+
+
 def test_historical_event_group_identity_rejects_unnamed_legacy_cohort_without_uid(
     db: Session,
 ):

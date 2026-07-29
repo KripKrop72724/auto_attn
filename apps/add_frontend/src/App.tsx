@@ -1318,7 +1318,9 @@ function UsersView({
                     <div className="conflict-group-actions">
                       <small>
                         {candidate.operator_actionable
-                          ? 'Requires exact authoritative HR CNIC, employee ID, service number, name, and audit approval.'
+                          ? candidate.active_user_key
+                            ? 'This preserved cohort is linked to one current user. Enrich that certified terminal record with authoritative CNIC evidence.'
+                            : 'Requires exact authoritative HR CNIC, employee ID, service number, name, and audit approval.'
                           : candidate.source_kind === 'EVENT_GROUP'
                             ? 'This cohort remains fail-closed because it lacks a unique UID, has conflicting terminal names, or is linked to another identity.'
                             : 'This row remains fail-closed until its identity conflict or reuse review is resolved.'}
@@ -1326,10 +1328,20 @@ function UsersView({
                       <button
                         className="button secondary"
                         disabled={!candidate.operator_actionable}
-                        onClick={() => setHistoricalDialog({ candidate })}
+                        onClick={() => {
+                          if (candidate.active_user_key) {
+                            const activeUser = rows.find(
+                              (row) => row.user_key === candidate.active_user_key,
+                            )
+                            if (activeUser) setDialog({ mode: 'edit', user: activeUser })
+                            else toast.error('Linked current user is no longer available. Refresh and retry.')
+                          } else {
+                            setHistoricalDialog({ candidate })
+                          }
+                        }}
                       >
                         <Icon name="shield" />
-                        Enter verified HR evidence
+                        {candidate.active_user_key ? 'Enrich current user' : 'Enter verified HR evidence'}
                       </button>
                     </div>
                   </article>

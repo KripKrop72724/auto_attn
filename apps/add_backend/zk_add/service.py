@@ -1650,6 +1650,19 @@ def build_historical_identity_report(
         linked_user_ids = {
             event.device_user_id for event in events if event.device_user_id is not None
         }
+        linked_user = (
+            session.get(DeviceUser, next(iter(linked_user_ids)))
+            if len(linked_user_ids) == 1
+            else None
+        )
+        active_enrichment = bool(
+            linked_user
+            and linked_user.present
+            and linked_user.lifecycle_state == "ACTIVE"
+            and linked_user.user_id == user_id
+            and linked_user.cnic_lookup_hash is None
+            and linked_user.identity_conflict_code is None
+        )
         exact_name = len(display_names) == 1
         service_number_shape = bool(re.fullmatch(r"[A-Za-z0-9._-]+", user_id))
         exact_orphan = (
@@ -1664,6 +1677,9 @@ def build_historical_identity_report(
                 "group_token": _historical_identity_group_token(zkt, events),
                 "source_user_key": None,
                 "source_kind": "EVENT_GROUP",
+                "active_user_key": (
+                    linked_user.user_key if active_enrichment and linked_user else None
+                ),
                 "uid": uid,
                 "user_id": user_id,
                 "display_name": (
@@ -1691,11 +1707,15 @@ def build_historical_identity_report(
                 "first_event_at": min(event_times) if event_times else None,
                 "last_event_at": max(event_times) if event_times else None,
                 "resolution_path": (
-                    "HR_DIRECTORY_EVENT_GROUP"
-                    if exact_orphan
-                    else "IDENTITY_REUSE_REVIEW"
+                    "ACTIVE_USER_ENRICHMENT"
+                    if active_enrichment
+                    else (
+                        "HR_DIRECTORY_EVENT_GROUP"
+                        if exact_orphan
+                        else "IDENTITY_REUSE_REVIEW"
+                    )
                 ),
-                "operator_actionable": exact_orphan,
+                "operator_actionable": exact_orphan or active_enrichment,
             }
         )
     unassigned_groups.sort(
