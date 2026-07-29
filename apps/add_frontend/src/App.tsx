@@ -815,15 +815,38 @@ function HistoricalIdentityResolutionDialog({
       return setError(`Type ${expectedConfirmation} exactly to continue.`)
     }
     if (!password) return setError('Password confirmation is required.')
+    if (
+      candidate.source_kind === 'EVENT_GROUP' &&
+      (!candidate.group_token || !candidate.uid)
+    ) {
+      return setError('The exact historical event cohort is incomplete. Refresh and retry.')
+    }
+    if (
+      candidate.source_kind !== 'EVENT_GROUP' &&
+      (!candidate.source_user_key || candidate.row_version == null)
+    ) {
+      return setError('The historical terminal user is incomplete. Refresh and retry.')
+    }
     setBusy(true)
     try {
+      const eventGroup = candidate.source_kind === 'EVENT_GROUP'
       const response = await api<{ repaired_events: number }>(
-        `/api/v2/devices/${device.connector_id}/historical-identities/resolve`,
+        `/api/v2/devices/${device.connector_id}/historical-identities/${
+          eventGroup ? 'resolve-event-group' : 'resolve'
+        }`,
         {
           method: 'POST',
           body: JSON.stringify({
-            source_user_key: candidate.source_user_key,
-            expected_version: candidate.row_version,
+            ...(eventGroup
+              ? {
+                  group_token: candidate.group_token,
+                  source_user_id: candidate.user_id,
+                  source_uid: candidate.uid,
+                }
+              : {
+                  source_user_key: candidate.source_user_key,
+                  expected_version: candidate.row_version,
+                }),
             source_cnic: cnic,
             directory_employee_id: employeeId,
             directory_service_number: serviceNumber,
@@ -1261,18 +1284,22 @@ function UsersView({
                     {historicalReport.totals.unresolved_events.toLocaleString()} events remain fail-closed:
                     {' '}{historicalReport.totals.blocked_identity.toLocaleString()} missing verified identity and
                     {' '}{historicalReport.totals.quarantined_identity_reuse.toLocaleString()} quarantined for identity reuse.
-                    {' '}{historicalReport.totals.unassigned_events.toLocaleString()} cannot yet be attributed to one deleted terminal user.
+                    {' '}{historicalReport.totals.unassigned_events.toLocaleString()} are not linked to one deleted terminal user;
+                    {' '}{(historicalReport.totals.actionable_event_groups ?? 0).toLocaleString()} exact cohorts can accept guarded HR evidence.
                   </p>
                 </div>
                 <StatusBadge state="HR EVIDENCE REQUIRED" />
               </div>
               <div className="conflict-groups">
-                {historicalReport.rows.map((candidate) => (
-                  <article key={candidate.source_user_key} className="conflict-group pattern-blocked">
+                {[...historicalReport.rows, ...(historicalReport.unassigned_groups ?? [])].map((candidate) => (
+                  <article key={candidate.source_user_key || candidate.group_token} className="conflict-group pattern-blocked">
                     <div className="conflict-group-heading">
                       <div>
                         <strong>{candidate.display_name}</strong>
-                        <small>User {candidate.user_id} · UID {candidate.uid} · version {candidate.row_version}</small>
+                        <small>
+                          User {candidate.user_id} · UID {candidate.uid || 'missing'}
+                          {candidate.row_version == null ? ' · exact event cohort' : ` · version ${candidate.row_version}`}
+                        </small>
                       </div>
                       <StatusBadge state={candidate.resolution_path.replaceAll('_', ' ')} />
                     </div>
@@ -1292,7 +1319,9 @@ function UsersView({
                       <small>
                         {candidate.operator_actionable
                           ? 'Requires exact authoritative HR CNIC, employee ID, service number, name, and audit approval.'
-                          : 'This row remains fail-closed until its identity conflict or reuse review is resolved.'}
+                          : candidate.source_kind === 'EVENT_GROUP'
+                            ? 'This cohort remains fail-closed because it lacks a unique UID, has conflicting terminal names, or is linked to another identity.'
+                            : 'This row remains fail-closed until its identity conflict or reuse review is resolved.'}
                       </small>
                       <button
                         className="button secondary"

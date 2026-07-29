@@ -1235,6 +1235,282 @@ def create_historical_directory_identity(
     return existing, repaired
 
 
+def _historical_identity_group_token(
+    zkt: ZKTDevice,
+    events: list[AttendanceEvent],
+) -> str:
+    """Version one exact unresolved terminal-identity cohort.
+
+    The token includes every event and the fields that can change its identity
+    disposition.  An operator can therefore never apply evidence to a cohort
+    that changed after it was reviewed.
+    """
+
+    digest = hashlib.sha256()
+    digest.update(str(zkt.id).encode("utf-8"))
+    digest.update(b"\0")
+    for event in sorted(events, key=lambda row: (row.id or 0, row.event_uid)):
+        for value in (
+            event.id,
+            event.event_uid,
+            event.user_id,
+            event.uid or "",
+            event.device_user_id,
+            event.ords_status,
+        ):
+            digest.update(str(value if value is not None else "").encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _service_number_matches(user_id: str, service_number: str) -> bool:
+    normalized_user_id = user_id.strip()
+    normalized_service_number = service_number.strip()
+    if normalized_user_id.isdigit() and normalized_service_number.isdigit():
+        return (
+            normalized_user_id.lstrip("0") or "0"
+        ) == (normalized_service_number.lstrip("0") or "0")
+    return secrets.compare_digest(
+        normalized_user_id.upper(),
+        normalized_service_number.upper(),
+    )
+
+
+def _normalized_identity_name(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+
+def create_historical_event_group_identity(
+    session: Session,
+    *,
+    connector: Connector,
+    group_token: str,
+    source_user_id: str,
+    source_uid: str,
+    source_cnic: str,
+    directory_employee_id: str,
+    directory_service_number: str,
+    directory_employee_name: str,
+    directory_zone_code: str | None,
+    reason: str,
+    idempotency_key: str,
+    actor: str,
+) -> tuple[IdentityTombstone, int]:
+    """Bind exact orphaned historical events to authoritative HR evidence.
+
+    This path exists for old attendance whose terminal identity disappeared
+    before ADD captured a stable user snapshot.  It never matches on a name or
+    service number alone: the exact terminal user ID, non-empty terminal UID,
+    complete unresolved event membership, and a versioned group token must all
+    agree.  A synthetic *deleted* device-user record preserves that evidence
+    without mutating the live terminal.
+    """
+
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("Connector has no assigned ZKT device.")
+    source_user_id = source_user_id.strip()
+    source_uid = source_uid.strip()
+    if not source_user_id or not source_uid:
+        raise ValueError(
+            "Orphaned historical evidence requires exact terminal user ID and UID."
+        )
+    if not _service_number_matches(source_user_id, directory_service_number):
+        raise ValueError(
+            "Terminal user ID does not exactly match the authoritative HR service number."
+        )
+
+    normalized_cnic = normalize_cnic(source_cnic)
+    normalized_directory_name = _normalized_identity_name(directory_employee_name)
+    if len(normalized_directory_name) < 5:
+        raise ValueError("Authoritative HR employee name is too short to verify.")
+
+    events = list(
+        session.scalars(
+            select(AttendanceEvent)
+            .where(
+                AttendanceEvent.zkt_device_id == zkt.id,
+                AttendanceEvent.user_id == source_user_id,
+                AttendanceEvent.uid == source_uid,
+                AttendanceEvent.device_user_id == None,  # noqa: E711
+                AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+                AttendanceEvent.ords_status.in_(
+                    UNRESOLVED_HISTORICAL_IDENTITY_STATES
+                ),
+            )
+            .order_by(AttendanceEvent.id.asc())
+            .with_for_update()
+        ).all()
+    )
+    if not events:
+        existing = session.scalar(
+            select(IdentityTombstone)
+            .where(
+                IdentityTombstone.zkt_device_id == zkt.id,
+                IdentityTombstone.user_id == source_user_id,
+                IdentityTombstone.uid == source_uid,
+                IdentityTombstone.cnic_lookup_hash == cnic_lookup(normalized_cnic),
+            )
+            .order_by(IdentityTombstone.id.desc())
+        )
+        if existing is not None:
+            return existing, 0
+        raise ValueError("No unresolved exact historical event cohort remains.")
+    if not secrets.compare_digest(
+        _historical_identity_group_token(zkt, events),
+        group_token,
+    ):
+        raise ValueError(
+            "Historical event cohort changed since it was selected. Refresh and retry."
+        )
+
+    event_names = {
+        normalized
+        for normalized in (
+            _normalized_identity_name(event.display_name or "") for event in events
+        )
+        if normalized
+    }
+    if len(event_names) > 1:
+        raise ValueError(
+            "Historical cohort contains multiple terminal names and remains fail-closed."
+        )
+    if event_names:
+        terminal_name = next(iter(event_names))
+        if not (
+            secrets.compare_digest(terminal_name, normalized_directory_name)
+            or terminal_name.startswith(normalized_directory_name)
+            or normalized_directory_name.startswith(terminal_name)
+        ):
+            raise ValueError(
+                "Terminal name does not match the authoritative HR employee name."
+            )
+
+    current_identity = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.lifecycle_state == "ACTIVE",
+            (
+                (DeviceUser.user_id == source_user_id)
+                | (DeviceUser.uid == source_uid)
+            ),
+        )
+    )
+    if current_identity is not None:
+        raise ValueError(
+            "A current terminal user claims this user ID or UID. Enrich or resolve "
+            "that live identity instead of creating historical evidence."
+        )
+
+    cnic_hash = cnic_lookup(normalized_cnic)
+    conflicting_claim = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.cnic_lookup_hash == cnic_hash,
+            DeviceUser.lifecycle_state == "ACTIVE",
+        )
+    )
+    if conflicting_claim is not None:
+        raise ValueError(
+            "That CNIC is already active on this terminal. Resolve the exact identity "
+            "relationship before applying historical evidence."
+        )
+
+    encrypted_cnic = encrypt_cnic(normalized_cnic)
+    source = DeviceUser(
+        zkt_device_id=zkt.id,
+        uid=source_uid,
+        user_id=source_user_id,
+        machine_name_encrypted=None,
+        terminal_identity_fingerprint=None,
+        terminal_state_fingerprint=None,
+        display_name=directory_employee_name.strip(),
+        cnic_encrypted=encrypted_cnic,
+        cnic_lookup_hash=cnic_hash,
+        cnic_last4=normalized_cnic[-4:],
+        identity_conflict_code=None,
+        shift_worker=any(event.raw_punch for event in events),
+        privilege=0,
+        card=None,
+        present=False,
+        lifecycle_state="DELETED",
+        source="HR_DIRECTORY_EVIDENCE",
+        deleted_at=max(event.device_event_time for event in events),
+        deleted_by=actor,
+        row_version=1,
+        observed_at=min(event.device_event_time for event in events),
+    )
+    session.add(source)
+    session.flush()
+
+    tombstone = IdentityTombstone(
+        zkt_device_id=zkt.id,
+        device_user_id=source.id,
+        device_serial=zkt.serial,
+        uid=source_uid,
+        user_id=source_user_id,
+        display_name_encrypted=encrypt_text(directory_employee_name.strip()) or "",
+        cnic_encrypted=encrypted_cnic,
+        cnic_lookup_hash=cnic_hash,
+        cnic_last4=normalized_cnic[-4:],
+        shift_worker=source.shift_worker,
+        privilege=source.privilege,
+    )
+    session.add(tombstone)
+    session.flush()
+
+    for event in events:
+        event.device_user_id = source.id
+        event.identity_snapshot_id = zkt.identity_snapshot_id
+        event.identity_terminal_fingerprint = None
+        event.identity_resolution_status = "RESOLVED_DIRECTORY_EVENT_GROUP"
+        event.identity_resolved_at = utc_now()
+        event.identity_repaired_at = utc_now()
+        event.identity_repair_reason = "VERIFIED_HR_DIRECTORY_EVENT_GROUP"
+        event.display_name = directory_employee_name.strip()
+        event.cnic_encrypted = encrypted_cnic
+        event.cnic_lookup_hash = cnic_hash
+        event.cnic_last4 = normalized_cnic[-4:]
+        event.raw_punch = event.raw_punch or source.shift_worker
+        event.ords_status = "PENDING"
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)
+        )
+        if outbox is None:
+            session.add(OrdsOutbox(attendance_event_id=event.id, status="PENDING"))
+        else:
+            outbox.status = "PENDING"
+            outbox.next_attempt_at = None
+            outbox.last_http_status = None
+            outbox.last_error = None
+
+    append_audit(
+        session,
+        actor=actor,
+        action="HISTORICAL_EVENT_GROUP_IDENTITY_VERIFIED",
+        target_type="zkt_historical_event_group",
+        target_id=f"{zkt.id}:{source_user_id}:{source_uid}",
+        outcome="SUCCEEDED",
+        before={
+            "group_token": group_token,
+            "source_user_id": source_user_id,
+            "source_uid": source_uid,
+            "blocked_events": len(events),
+        },
+        after={
+            "directory_employee_id": directory_employee_id,
+            "directory_service_number": directory_service_number,
+            "directory_employee_name": directory_employee_name.strip(),
+            "directory_zone_code": directory_zone_code,
+            "directory_cnic": mask_cnic(normalized_cnic),
+            "repaired_events": len(events),
+            "reason": reason,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return tombstone, len(events)
+
+
 def build_historical_identity_report(
     session: Session,
     *,
@@ -1279,7 +1555,7 @@ def build_historical_identity_report(
         users_by_user_id.setdefault(row.user_id, []).append(row)
 
     attributed: dict[int, list[AttendanceEvent]] = {}
-    unassigned = 0
+    unassigned_events: list[AttendanceEvent] = []
     for event in unresolved_events:
         source = users_by_id.get(event.device_user_id)
         if source is None:
@@ -1291,7 +1567,7 @@ def build_historical_identity_report(
             if len(candidates) == 1:
                 source = candidates[0]
         if source is None or source.id is None:
-            unassigned += 1
+            unassigned_events.append(event)
             continue
         attributed.setdefault(source.id, []).append(event)
 
@@ -1319,6 +1595,7 @@ def build_historical_identity_report(
         rows.append(
             {
                 "source_user_key": source.user_key,
+                "source_kind": "DELETED_USER",
                 "uid": source.uid,
                 "user_id": source.user_id,
                 "display_name": source.display_name,
@@ -1344,6 +1621,68 @@ def build_historical_identity_report(
             str(row["source_user_key"]),
         )
     )
+    unassigned_groups: list[dict] = []
+    grouped_unassigned: dict[tuple[str, str], list[AttendanceEvent]] = {}
+    for event in unassigned_events:
+        grouped_unassigned.setdefault((event.user_id, event.uid or ""), []).append(event)
+    for (user_id, uid), events in grouped_unassigned.items():
+        display_names = {
+            (event.display_name or "").strip()
+            for event in events
+            if (event.display_name or "").strip()
+        }
+        linked_user_ids = {
+            event.device_user_id for event in events if event.device_user_id is not None
+        }
+        exact_orphan = bool(uid) and not linked_user_ids and len(display_names) <= 1
+        event_times = [event.device_event_time for event in events]
+        unassigned_groups.append(
+            {
+                "group_token": _historical_identity_group_token(zkt, events),
+                "source_user_key": None,
+                "source_kind": "EVENT_GROUP",
+                "uid": uid,
+                "user_id": user_id,
+                "display_name": (
+                    next(iter(display_names))
+                    if len(display_names) == 1
+                    else (
+                        "Unknown historical user"
+                        if not display_names
+                        else "Multiple terminal names"
+                    )
+                ),
+                "row_version": None,
+                "observed_at": min(event_times) if event_times else None,
+                "deleted_at": max(event_times) if event_times else None,
+                "cnic_available": False,
+                "identity_conflict_code": None,
+                "event_count": len(events),
+                "blocked_count": sum(
+                    event.ords_status == "BLOCKED_IDENTITY" for event in events
+                ),
+                "quarantined_count": sum(
+                    event.ords_status == "QUARANTINED_IDENTITY_REUSE"
+                    for event in events
+                ),
+                "first_event_at": min(event_times) if event_times else None,
+                "last_event_at": max(event_times) if event_times else None,
+                "resolution_path": (
+                    "HR_DIRECTORY_EVENT_GROUP"
+                    if exact_orphan
+                    else "IDENTITY_REUSE_REVIEW"
+                ),
+                "operator_actionable": exact_orphan,
+            }
+        )
+    unassigned_groups.sort(
+        key=lambda row: (
+            -int(row["event_count"]),
+            str(row["user_id"]),
+            str(row["uid"]),
+        )
+    )
+
     return {
         "device_serial": zkt.serial,
         "snapshot_revision": zkt.identity_snapshot_revision,
@@ -1360,10 +1699,14 @@ def build_historical_identity_report(
             "attributed_to_deleted_users": sum(
                 len(events) for events in attributed.values()
             ),
-            "unassigned_events": unassigned,
+            "unassigned_events": len(unassigned_events),
+            "actionable_event_groups": sum(
+                bool(group["operator_actionable"]) for group in unassigned_groups
+            ),
             "candidate_users": len(rows),
         },
         "rows": rows,
+        "unassigned_groups": unassigned_groups,
     }
 
 
@@ -1650,18 +1993,17 @@ def ingest_attendance(
             )
         ).all()
     }
-    missing_user_ids = user_ids - users_by_id.keys()
-    tombstones_by_id: dict[str, IdentityTombstone] = {}
-    if missing_user_ids:
+    tombstones_by_id: dict[str, list[IdentityTombstone]] = {}
+    if user_ids:
         for row in session.scalars(
             select(IdentityTombstone)
             .where(
                 IdentityTombstone.zkt_device_id == zkt.id,
-                IdentityTombstone.user_id.in_(missing_user_ids),
+                IdentityTombstone.user_id.in_(user_ids),
             )
             .order_by(IdentityTombstone.id.desc())
         ).all():
-            tombstones_by_id.setdefault(row.user_id, row)
+            tombstones_by_id.setdefault(row.user_id, []).append(row)
     receipts_by_uid = {
         row.event_uid: row
         for row in session.scalars(
@@ -1679,10 +2021,31 @@ def ingest_attendance(
     ] = []
     for incoming in pending_events:
         parsed = parse_machine_name(incoming.raw_name)
-        user = users_by_id.get(incoming.user_id)
-        tombstone = (
-            tombstones_by_id.get(incoming.user_id) if user is None else None
-        )
+        active_user = users_by_id.get(incoming.user_id)
+        user = active_user
+        # A terminal user ID is not an identity by itself: ZKT terminals can
+        # reuse it after deletion.  Only the exact current (user ID, UID) pair
+        # may inherit a live identity.  A mismatch is handled as historical
+        # identity evidence, never silently attached to the current employee.
+        if (
+            user is not None
+            and (
+                not incoming.uid
+                or not user.uid
+                or not secrets.compare_digest(incoming.uid, user.uid)
+            )
+        ):
+            user = None
+        tombstone = None
+        if user is None and incoming.uid:
+            matching_tombstones = [
+                candidate
+                for candidate in tombstones_by_id.get(incoming.user_id, [])
+                if candidate.uid
+                and secrets.compare_digest(candidate.uid, incoming.uid)
+            ]
+            if len(matching_tombstones) == 1:
+                tombstone = matching_tombstones[0]
         identity_resolution = None
         if user and user.identity_conflict_code and user.cnic_lookup_hash:
             lookup = user.cnic_lookup_hash
@@ -1707,7 +2070,7 @@ def ingest_attendance(
         cnic = (
             decrypt_cnic(user.cnic_encrypted)
             if usable_user_identity and user
-            else (parsed.cnic if user is None else None)
+            else (parsed.cnic if user is None and active_user is None else None)
         )
         if settings.identity_snapshot_gate_enabled and not snapshot_verified:
             cnic = None

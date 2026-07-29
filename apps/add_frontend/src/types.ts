@@ -264,12 +264,14 @@ export interface IdentityConflictReport {
 }
 
 export interface HistoricalIdentityCandidate {
-  source_user_key: string
+  source_user_key: string | null
+  source_kind?: 'DELETED_USER' | 'EVENT_GROUP'
+  group_token?: string
   uid: string
   user_id: string
   display_name: string
-  row_version: number
-  observed_at: string
+  row_version: number | null
+  observed_at: string | null
   deleted_at: string | null
   cnic_available: boolean
   identity_conflict_code: string | null
@@ -280,6 +282,7 @@ export interface HistoricalIdentityCandidate {
   last_event_at: string | null
   resolution_path:
     | 'HR_DIRECTORY_EVIDENCE'
+    | 'HR_DIRECTORY_EVENT_GROUP'
     | 'VERIFIED_TOMBSTONE_REPAIR'
     | 'IDENTITY_CONFLICT_REVIEW'
     | 'IDENTITY_REUSE_REVIEW'
@@ -295,9 +298,11 @@ export interface HistoricalIdentityReport {
     quarantined_identity_reuse: number
     attributed_to_deleted_users: number
     unassigned_events: number
+    actionable_event_groups?: number
     candidate_users: number
   }
   rows: HistoricalIdentityCandidate[]
+  unassigned_groups?: HistoricalIdentityCandidate[]
 }
 
 export interface AttendanceEvent {

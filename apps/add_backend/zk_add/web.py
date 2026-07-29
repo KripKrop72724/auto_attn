@@ -63,6 +63,7 @@ from zk_add.schemas import (
     Envelope,
     HeartbeatPayload,
     HistoricalDirectoryIdentityRequest,
+    HistoricalEventGroupIdentityRequest,
     HistoricalIdentityAliasRequest,
     IdentityConflictResolveRequest,
     IdentityConflictRevokeRequest,
@@ -100,6 +101,7 @@ from zk_add.service import (
     create_command,
     create_device_user_command,
     create_historical_directory_identity,
+    create_historical_event_group_identity,
     create_historical_identity_alias,
     create_user_deletion_job,
     delete_device_user_command,
@@ -850,6 +852,67 @@ async def resolve_historical_directory_identity(
         "tombstone_id": tombstone.id,
         "source_user_key": source_user.user_key,
         "source_user_id": source_user.user_id,
+        "repaired_events": repaired,
+        "catalog_delivered": delivered,
+    }
+
+
+@app.post(
+    "/api/v2/devices/{connector_id}/historical-identities/resolve-event-group",
+    status_code=201,
+)
+async def resolve_historical_event_group_identity(
+    connector_id: str,
+    body: HistoricalEventGroupIdentityRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    expected_confirmation = (
+        f"{body.source_user_id} -> HR {body.directory_employee_id}"
+    )
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Typed confirmation must exactly match {expected_confirmation}.",
+        )
+    try:
+        tombstone, repaired = create_historical_event_group_identity(
+            db,
+            connector=connector,
+            group_token=body.group_token,
+            source_user_id=body.source_user_id,
+            source_uid=body.source_uid,
+            source_cnic=body.source_cnic,
+            directory_employee_id=body.directory_employee_id,
+            directory_service_number=body.directory_service_number,
+            directory_employee_name=body.directory_employee_name,
+            directory_zone_code=body.directory_zone_code,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(connector)
+    payload = identity_catalog_payload(db, connector)
+    delivered = await connector_hub.send(connector.connector_id, payload)
+    await browser_events.publish(
+        "historical_event_group_identity",
+        {
+            "connector_id": connector.connector_id,
+            "source_user_id": body.source_user_id,
+            "source_uid": body.source_uid,
+            "repaired_events": repaired,
+        },
+    )
+    return {
+        "ok": True,
+        "tombstone_id": tombstone.id,
+        "source_user_id": tombstone.user_id,
+        "source_uid": tombstone.uid,
         "repaired_events": repaired,
         "catalog_delivered": delivered,
     }

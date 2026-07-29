@@ -36,12 +36,17 @@ Before canary acceptance or nationwide promotion, open the selected terminal's
 - identity-reuse or duplicate-CNIC conflicts that require separate review; and
 - unassigned events that cannot be safely attributed.
 
-Only rows marked `HR_DIRECTORY_EVIDENCE` may use the evidence form. The operator
+Rows marked `HR_DIRECTORY_EVIDENCE` may use the deleted-user evidence form. Exact
+unassigned cohorts marked `HR_DIRECTORY_EVENT_GROUP` may use the same guarded
+form only when their terminal user ID, non-empty UID, event membership, and
+terminal name evidence are unambiguous. A SHA-256 group token rejects stale
+cohorts, and the resulting evidence creates only a deleted identity tombstone;
+it never mutates the live terminal. The operator
 must copy the CNIC, employee ID, service number, employee name, and zone from an
 authoritative HR record. ADD requires an exact service-number match, a compatible
-normalized name, the selected row version, an audit reason, typed confirmation,
-and administrator re-authentication. Alphanumeric service numbers are supported,
-but approximate or inferred identity matching is not.
+normalized name, the selected row version or cohort token, an audit reason,
+typed confirmation, and administrator re-authentication. Alphanumeric service
+numbers are supported, but approximate or inferred identity matching is not.
 
 A successful resolution preserves the attendance rows, binds the verified
 identity to the deleted terminal user and its tombstone, and requeues those rows
