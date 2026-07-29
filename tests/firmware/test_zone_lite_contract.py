@@ -644,12 +644,26 @@ def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():
         / "oracle"
         / "20260729_repair_event_timezone_rows_non_destructive.sql"
     ).read_text(encoding="utf-8")
+    sentinel_migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260729_quarantine_implausible_device_times_non_destructive.sql"
+    ).read_text(encoding="utf-8")
 
     package_body_start = oracle.index("create or replace package body")
     parser_start = oracle.index("function parse_event_timestamp", package_body_start)
     parser = oracle[parser_start : oracle.index("end parse_event_timestamp;")]
     assert ") at time zone c_attendance_timezone;" in parser
     assert "from_tz(" in parser
+    assert "function attendance_timestamp_is_plausible" in oracle
+    assert "2010-01-01 00:00:00 Asia/Karachi" in oracle
+    assert oracle.count("then 'SUSPECT_DEVICE_TIME'") == 4
+    assert oracle.count("trust_status <> 'SUSPECT_DEVICE_TIME'") == 0
+    assert oracle.count(
+        "slic_zkt_truth_api.attendance_timestamp_is_plausible("
+    ) >= 7
 
     assert "restore_original" in package_migration
     assert "l_ddl_attempted" in package_migration
@@ -682,6 +696,36 @@ def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():
     assert "clear_day_flags(" in normalized
     assert "delete from hr_raw_attn_capture_events" not in normalized
     assert "insert into hr_raw_attn_capture_events" not in normalized
+    sentinel_normalized = sentinel_migration.lower()
+    assert "delete from hr_raw_attn_capture_events" not in sentinel_normalized
+    assert "expected exactly two proven sentinel rows" in sentinel_normalized
+    assert "trust_status = 'suspect_device_time'" in sentinel_normalized
+    assert "datasync = 0" in sentinel_normalized
+    assert "l_matches <> 2" in sentinel_normalized
+    assert "l_updated <> 2" in sentinel_normalized
+    assert "restore_original" in sentinel_normalized
+    assert "2010-01-01 00:00:00 asia/karachi" in sentinel_normalized
+
+
+def test_firmware_excludes_zero_and_implausible_terminal_timestamps():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    validator_start = source.index(
+        "static bool zk_attendance_timestamp_is_plausible("
+    )
+    validator_end = source.index("static void iso_from_zk_time(", validator_start)
+    validator = source[validator_start:validator_end]
+    builder_start = source.index("static bool build_attendance_event(")
+    builder_end = source.index("static bool zk_timestamp_in_window(", builder_start)
+    builder = source[builder_start:builder_end]
+
+    assert "#define ZONE_LITE_MIN_ATTENDANCE_YEAR 2010" in source
+    assert "if (value == 0) return false;" in validator
+    assert "year >= ZONE_LITE_MIN_ATTENDANCE_YEAR" in validator
+    assert "zk_attendance_timestamp_is_plausible(timestamp)" in builder
+    assert "ATTENDANCE_TIMESTAMP_QUARANTINED" in builder
+    assert builder.index("zk_attendance_timestamp_is_plausible(timestamp)") < builder.index(
+        "build_event_uid(out)"
+    )
 
 
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():

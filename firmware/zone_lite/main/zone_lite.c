@@ -233,6 +233,9 @@
 #ifndef ZONE_LITE_HISTORY_SWEEP_SECONDS
 #define ZONE_LITE_HISTORY_SWEEP_SECONDS (7 * 24 * 60 * 60)
 #endif
+#ifndef ZONE_LITE_MIN_ATTENDANCE_YEAR
+#define ZONE_LITE_MIN_ATTENDANCE_YEAR 2010
+#endif
 #define ZONE_LITE_HISTORY_SCHEMA_VERSION 2
 
 // Per-device NVS provisioning overrides compile-time development defaults.
@@ -991,6 +994,22 @@ static void decode_zk_time(uint32_t value, struct tm *out)
     out->tm_mon = value % 12;
     value /= 12;
     out->tm_year = (int)value + 100;
+}
+
+static bool zk_attendance_timestamp_is_plausible(uint32_t value)
+{
+    if (value == 0) return false;
+    struct tm decoded;
+    decode_zk_time(value, &decoded);
+    int year = decoded.tm_year + 1900;
+    int month = decoded.tm_mon + 1;
+    int day = decoded.tm_mday;
+    return year >= ZONE_LITE_MIN_ATTENDANCE_YEAR && year <= 2099 &&
+        month >= 1 && month <= 12 &&
+        day >= 1 && day <= days_in_month(year, month) &&
+        decoded.tm_hour >= 0 && decoded.tm_hour <= 23 &&
+        decoded.tm_min >= 0 && decoded.tm_min <= 59 &&
+        decoded.tm_sec >= 0 && decoded.tm_sec <= 59;
 }
 
 static void iso_from_zk_time(uint32_t value, char out[24])
@@ -2888,6 +2907,20 @@ static bool build_attendance_event(
     uint8_t punch)
 {
     memset(out, 0, sizeof(*out));
+    if (!zk_attendance_timestamp_is_plausible(timestamp)) {
+        ESP_LOGW(
+            TAG,
+            "Rejected non-attendance ZKT record with implausible timestamp raw=%lu user_id=%s uid=%u",
+            (unsigned long)timestamp,
+            user_id ? user_id : "",
+            (unsigned)uid);
+        (void)add_connector_log(
+            "WARN",
+            "attendance",
+            "ATTENDANCE_TIMESTAMP_QUARANTINED",
+            "A terminal record with a zero or implausible timestamp was excluded from attendance delivery; terminal truth remains unchanged.");
+        return false;
+    }
     const zkt_user_t *user = NULL;
     if (user_id != NULL && user_id[0] != '\0') {
         user = find_user_by_user_id(users, user_id);
@@ -2973,7 +3006,7 @@ static bool find_attendance_month_bounds(
             int year = decoded.tm_year + 1900;
             int month = decoded.tm_mon + 1;
             int day = decoded.tm_mday;
-            bool plausible = year >= 2000 && year <= not_after_year &&
+            bool plausible = year >= ZONE_LITE_MIN_ATTENDANCE_YEAR && year <= not_after_year &&
                 month >= 1 && month <= 12 && day >= 1 &&
                 day <= days_in_month(year, month) &&
                 compare_months(year, month, not_after_year, not_after_month) <= 0;
@@ -3017,7 +3050,7 @@ static bool find_next_attendance_month(
             int year = decoded.tm_year + 1900;
             int month = decoded.tm_mon + 1;
             int day = decoded.tm_mday;
-            bool plausible = year >= 2000 && year <= not_after_year &&
+            bool plausible = year >= ZONE_LITE_MIN_ATTENDANCE_YEAR && year <= not_after_year &&
                 month >= 1 && month <= 12 && day >= 1 &&
                 day <= days_in_month(year, month) &&
                 compare_months(

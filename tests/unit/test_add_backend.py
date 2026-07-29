@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import nullcontext
 import json
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.fernet import Fernet
@@ -2593,6 +2593,40 @@ def test_attendance_ingestion_is_idempotent_sanitized_and_ords_is_ephemeral(db: 
     payload = oracle_payload(connector, connector.zkt_device, row, CNIC)
     assert payload["cnic"] == CNIC
     assert payload["capturetype"] == "LIVE"
+
+
+def test_impossible_device_time_is_preserved_but_never_queued_as_attendance(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    incoming = event(event_uid="0" * 64, raw_name=f"Ayesha-{CNIC}")
+    incoming.device_event_time = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[incoming],
+    )
+    db.flush()
+
+    assert accepted == [incoming.event_uid]
+    assert duplicates == []
+    row = db.scalar(
+        select(AttendanceEvent).where(
+            AttendanceEvent.event_uid == incoming.event_uid
+        )
+    )
+    assert row is not None
+    assert row.ords_status == "QUARANTINED_INVALID_DEVICE_TIME"
+    assert row.clock_quality == "INVALID"
+    assert db.scalar(select(OrdsOutbox)) is None
+    alert = db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ATTENDANCE_TIMESTAMP_QUARANTINED",
+        )
+    )
+    assert alert is not None
 
 
 def test_attendance_batch_uses_bounded_flushes_and_duplicate_retry_uses_none(

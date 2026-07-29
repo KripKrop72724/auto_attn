@@ -98,6 +98,20 @@ ORACLE_CONFIRMATION_PATH_PRIORITY = {
     "FIRMWARE_BULK": 2,
     "FIRMWARE_RECONCILE": 3,
 }
+MIN_PLAUSIBLE_ATTENDANCE_TIME = datetime(2010, 1, 1, tzinfo=timezone.utc)
+MAX_DEVICE_CLOCK_LEAD = timedelta(days=1)
+
+
+def attendance_device_time_is_plausible(
+    device_event_time: datetime,
+    captured_at: datetime,
+) -> bool:
+    event_time = ensure_utc(device_event_time)
+    capture_time = ensure_utc(captured_at)
+    return (
+        event_time >= MIN_PLAUSIBLE_ATTENDANCE_TIME
+        and event_time <= capture_time + MAX_DEVICE_CLOCK_LEAD
+    )
 
 
 def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
@@ -2060,9 +2074,13 @@ def ingest_attendance(
 
     identity_resolution_cache: dict[str, IdentityConflictResolution | None] = {}
     pending_rows: list[
-        tuple[AttendanceEvent, OracleReceipt | None, bool, bool]
+        tuple[AttendanceEvent, OracleReceipt | None, bool, bool, bool]
     ] = []
     for incoming in pending_events:
+        plausible_device_time = attendance_device_time_is_plausible(
+            incoming.device_event_time,
+            incoming.captured_at,
+        )
         parsed = parse_machine_name(incoming.raw_name)
         active_user = users_by_id.get(incoming.user_id)
         user = active_user
@@ -2149,6 +2167,18 @@ def ingest_attendance(
                 ),
                 details={"event_uid_prefix": incoming.event_uid[:12]},
             )
+        if not plausible_device_time:
+            upsert_alert(
+                session,
+                connector,
+                code="ATTENDANCE_TIMESTAMP_QUARANTINED",
+                severity="HIGH",
+                message=(
+                    "ADD preserved a terminal record with an impossible attendance "
+                    "timestamp and excluded it from normal Oracle delivery."
+                ),
+                details={"event_uid_prefix": incoming.event_uid[:12]},
+            )
         row = AttendanceEvent(
             event_uid=incoming.event_uid,
             connector_id=connector.id,
@@ -2185,27 +2215,42 @@ def ingest_attendance(
             punch=None if incoming.punch is None else str(incoming.punch),
             raw_punch=incoming.raw_punch or shift_worker,
             clock_drift_seconds=incoming.clock_drift_seconds,
-            clock_quality=incoming.clock_quality,
+            clock_quality=(
+                incoming.clock_quality if plausible_device_time else "INVALID"
+            ),
             boot_id=incoming.boot_id,
             sequence=incoming.sequence,
             raw_event=sanitize_raw_event(incoming.raw_event),
             ords_status=(
-                "FIRMWARE_RECEIPT_UNVERIFIED"
-                if receipt_matches_connector
-                else ("PENDING" if cnic else "BLOCKED_IDENTITY")
+                "QUARANTINED_INVALID_DEVICE_TIME"
+                if not plausible_device_time
+                else (
+                    "FIRMWARE_RECEIPT_UNVERIFIED"
+                    if receipt_matches_connector
+                    else ("PENDING" if cnic else "BLOCKED_IDENTITY")
+                )
             ),
             oracle_confirmed_at=None,
             oracle_confirmation_path=None,
         )
         session.add(row)
-        pending_rows.append((row, receipt, receipt_matches_connector, bool(cnic)))
+        pending_rows.append(
+            (row, receipt, receipt_matches_connector, bool(cnic), plausible_device_time)
+        )
         accepted.append(incoming.event_uid)
 
     # Assign all attendance IDs in one flush. The previous per-event
     # SELECT/flush loop made a 100-event firmware batch exceed its ACK timeout
     # and stalled the device's durable outbox.
     session.flush()
-    for row, receipt, receipt_matches_connector, has_cnic in pending_rows:
+    for row, receipt, receipt_matches_connector, has_cnic, plausible_device_time in pending_rows:
+        if not plausible_device_time:
+            if receipt_matches_connector:
+                assert receipt is not None
+                receipt.attendance_event_id = row.id
+                row.oracle_confirmed_at = receipt.oracle_observed_at
+                row.oracle_confirmation_path = receipt.confirmation_path
+            continue
         if receipt_matches_connector:
             assert receipt is not None
             receipt.attendance_event_id = row.id
