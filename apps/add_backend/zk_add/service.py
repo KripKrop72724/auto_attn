@@ -89,6 +89,10 @@ ORACLE_ALLOWED_CAPTURE_TYPES = {
 IDENTITY_CONFLICT_DUPLICATE_CNIC = "DUPLICATE_CNIC"
 ACTIVE_USER_DELETION_JOB_STATES = {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
 TERMINAL_USER_DELETION_ITEM_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"}
+UNRESOLVED_HISTORICAL_IDENTITY_STATES = {
+    "BLOCKED_IDENTITY",
+    "QUARANTINED_IDENTITY_REUSE",
+}
 ORACLE_CONFIRMATION_PATH_PRIORITY = {
     "FIRMWARE_LIVE": 1,
     "FIRMWARE_BULK": 2,
@@ -1055,9 +1059,19 @@ def create_historical_directory_identity(
         raise ValueError("Resolve the historical user's identity conflict first.")
 
     normalized_cnic = normalize_cnic(source_cnic)
-    normalized_user_id = source_user.user_id.lstrip("0") or "0"
-    normalized_service_number = directory_service_number.strip().lstrip("0") or "0"
-    if not normalized_user_id.isdigit() or normalized_user_id != normalized_service_number:
+    normalized_user_id = source_user.user_id.strip()
+    normalized_service_number = directory_service_number.strip()
+    if normalized_user_id.isdigit() and normalized_service_number.isdigit():
+        service_number_matches = (
+            (normalized_user_id.lstrip("0") or "0")
+            == (normalized_service_number.lstrip("0") or "0")
+        )
+    else:
+        service_number_matches = secrets.compare_digest(
+            normalized_user_id.upper(),
+            normalized_service_number.upper(),
+        )
+    if not service_number_matches:
         raise ValueError(
             "Terminal user ID does not exactly match the authoritative HR service number."
         )
@@ -1219,6 +1233,138 @@ def create_historical_directory_identity(
         },
     )
     return existing, repaired
+
+
+def build_historical_identity_report(
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+) -> dict:
+    """Describe unresolved history without exposing or mutating identity data.
+
+    Rows are attributed to a deleted terminal user only when the preserved
+    device-user foreign key matches, or when one unique deleted user has the
+    exact same terminal user ID and a compatible UID. Ambiguous rows stay in
+    the unassigned count and therefore remain fail-closed.
+    """
+
+    deleted_users = list(
+        session.scalars(
+            select(DeviceUser)
+            .where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.present == False,  # noqa: E712
+                DeviceUser.lifecycle_state == "DELETED",
+            )
+            .order_by(DeviceUser.id.asc())
+        ).all()
+    )
+    unresolved_events = list(
+        session.scalars(
+            select(AttendanceEvent)
+            .where(
+                AttendanceEvent.zkt_device_id == zkt.id,
+                AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+                AttendanceEvent.ords_status.in_(
+                    UNRESOLVED_HISTORICAL_IDENTITY_STATES
+                ),
+            )
+            .order_by(AttendanceEvent.id.asc())
+        ).all()
+    )
+
+    users_by_id = {row.id: row for row in deleted_users if row.id is not None}
+    users_by_user_id: dict[str, list[DeviceUser]] = {}
+    for row in deleted_users:
+        users_by_user_id.setdefault(row.user_id, []).append(row)
+
+    attributed: dict[int, list[AttendanceEvent]] = {}
+    unassigned = 0
+    for event in unresolved_events:
+        source = users_by_id.get(event.device_user_id)
+        if source is None:
+            candidates = [
+                candidate
+                for candidate in users_by_user_id.get(event.user_id, [])
+                if not event.uid or not candidate.uid or event.uid == candidate.uid
+            ]
+            if len(candidates) == 1:
+                source = candidates[0]
+        if source is None or source.id is None:
+            unassigned += 1
+            continue
+        attributed.setdefault(source.id, []).append(event)
+
+    rows = []
+    for source in deleted_users:
+        events = attributed.get(source.id or -1, [])
+        if not events:
+            continue
+        blocked_count = sum(
+            event.ords_status == "BLOCKED_IDENTITY" for event in events
+        )
+        quarantined_count = sum(
+            event.ords_status == "QUARANTINED_IDENTITY_REUSE"
+            for event in events
+        )
+        event_times = [event.device_event_time for event in events]
+        if quarantined_count:
+            resolution_path = "IDENTITY_REUSE_REVIEW"
+        elif source.cnic_lookup_hash:
+            resolution_path = "VERIFIED_TOMBSTONE_REPAIR"
+        elif source.identity_conflict_code:
+            resolution_path = "IDENTITY_CONFLICT_REVIEW"
+        else:
+            resolution_path = "HR_DIRECTORY_EVIDENCE"
+        rows.append(
+            {
+                "source_user_key": source.user_key,
+                "uid": source.uid,
+                "user_id": source.user_id,
+                "display_name": source.display_name,
+                "row_version": source.row_version,
+                "observed_at": source.observed_at,
+                "deleted_at": source.deleted_at,
+                "cnic_available": bool(source.cnic_lookup_hash),
+                "identity_conflict_code": source.identity_conflict_code,
+                "event_count": len(events),
+                "blocked_count": blocked_count,
+                "quarantined_count": quarantined_count,
+                "first_event_at": min(event_times) if event_times else None,
+                "last_event_at": max(event_times) if event_times else None,
+                "resolution_path": resolution_path,
+                "operator_actionable": resolution_path == "HR_DIRECTORY_EVIDENCE",
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            -int(row["event_count"]),
+            str(row["user_id"]),
+            str(row["source_user_key"]),
+        )
+    )
+    return {
+        "device_serial": zkt.serial,
+        "snapshot_revision": zkt.identity_snapshot_revision,
+        "totals": {
+            "unresolved_events": len(unresolved_events),
+            "blocked_identity": sum(
+                event.ords_status == "BLOCKED_IDENTITY"
+                for event in unresolved_events
+            ),
+            "quarantined_identity_reuse": sum(
+                event.ords_status == "QUARANTINED_IDENTITY_REUSE"
+                for event in unresolved_events
+            ),
+            "attributed_to_deleted_users": sum(
+                len(events) for events in attributed.values()
+            ),
+            "unassigned_events": unassigned,
+            "candidate_users": len(rows),
+        },
+        "rows": rows,
+    }
 
 
 def enrich_undelivered_attendance(

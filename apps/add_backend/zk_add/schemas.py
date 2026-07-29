@@ -317,12 +317,22 @@ class HistoricalDirectoryIdentityRequest(BaseModel):
             raise ValueError("Directory CNIC must contain exactly 13 digits")
         return digits
 
-    @field_validator("directory_employee_id", "directory_service_number")
+    @field_validator("directory_employee_id")
     @classmethod
-    def validate_directory_identifier(cls, value: str) -> str:
+    def validate_directory_employee_id(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized.isdigit():
-            raise ValueError("Directory identifiers must contain only digits")
+            raise ValueError("Directory employee ID must contain only digits")
+        return normalized
+
+    @field_validator("directory_service_number")
+    @classmethod
+    def validate_directory_service_number(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", normalized):
+            raise ValueError(
+                "Directory service number contains unsupported characters"
+            )
         return normalized
 
 

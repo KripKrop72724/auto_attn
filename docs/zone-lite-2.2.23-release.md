@@ -26,3 +26,28 @@ or the durable ADD outbox cannot accept a window.
    blocked, quarantined, unconfirmed, or absent from ADD.
 
 No attendance data is deleted by this release.
+
+## Historical identity clearance
+
+Before canary acceptance or nationwide promotion, open the selected terminal's
+**Historical identity backlog** in ADD. The read-only report separates:
+
+- events attributed to one exact deleted terminal user;
+- identity-reuse or duplicate-CNIC conflicts that require separate review; and
+- unassigned events that cannot be safely attributed.
+
+Only rows marked `HR_DIRECTORY_EVIDENCE` may use the evidence form. The operator
+must copy the CNIC, employee ID, service number, employee name, and zone from an
+authoritative HR record. ADD requires an exact service-number match, a compatible
+normalized name, the selected row version, an audit reason, typed confirmation,
+and administrator re-authentication. Alphanumeric service numbers are supported,
+but approximate or inferred identity matching is not.
+
+A successful resolution preserves the attendance rows, binds the verified
+identity to the deleted terminal user and its tombstone, and requeues those rows
+for Oracle delivery and independent membership confirmation. It does not delete
+or merge a terminal user, fingerprint, UID, or attendance event.
+
+Promotion remains forbidden until the report is empty, ADD count equals the
+terminal count, every ADD event has Oracle confirmation, and the permitted
+Oracle raw-capture checks independently agree.

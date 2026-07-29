@@ -61,6 +61,7 @@ from zk_add.security import (
 from zk_add.service import (
     advance_user_deletion_jobs,
     apply_command_update,
+    build_historical_identity_report,
     cancel_user_deletion_job,
     create_admin_lease,
     create_command,
@@ -428,10 +429,16 @@ def snapshot_user(
     )
 
 
-def event(*, event_uid: str, user_id: str = "1007", raw_name: str | None = None):
+def event(
+    *,
+    event_uid: str,
+    user_id: str = "1007",
+    raw_name: str | None = None,
+    uid: str = "7",
+):
     return AttendanceEventIn(
         event_uid=event_uid,
-        uid="7",
+        uid=uid,
         user_id=user_id,
         raw_name=raw_name,
         device_event_time=utc_now(),
@@ -625,6 +632,120 @@ def test_historical_directory_identity_repairs_deleted_service_number_user(
     )
     assert replay.id == tombstone.id
     assert replay_repaired == 0
+
+
+def test_historical_identity_report_attributes_only_unambiguous_deleted_users(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    source = snapshot_user(
+        db,
+        connector,
+        uid="34",
+        user_id="CL04197",
+        name="Dr M Sohail Khan",
+    )
+    source.present = False
+    source.lifecycle_state = "DELETED"
+    source.deleted_at = utc_now()
+    db.flush()
+    accepted, duplicates = ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="e" * 64,
+                user_id="CL04197",
+                raw_name="Dr M Sohail Khan",
+                uid="34",
+            ),
+            event(
+                event_uid="f" * 64,
+                user_id="not-in-snapshot",
+                raw_name=None,
+            ),
+        ],
+    )
+    assert accepted == ["e" * 64, "f" * 64]
+    assert duplicates == []
+    before = db.scalar(
+        select(func.count()).select_from(AttendanceEvent)
+    )
+
+    report = build_historical_identity_report(
+        db,
+        zkt=connector.zkt_device,
+    )
+
+    assert report["totals"] == {
+        "unresolved_events": 2,
+        "blocked_identity": 2,
+        "quarantined_identity_reuse": 0,
+        "attributed_to_deleted_users": 1,
+        "unassigned_events": 1,
+        "candidate_users": 1,
+    }
+    assert report["rows"][0]["source_user_key"] == source.user_key
+    assert report["rows"][0]["user_id"] == "CL04197"
+    assert report["rows"][0]["event_count"] == 1
+    assert report["rows"][0]["resolution_path"] == "HR_DIRECTORY_EVIDENCE"
+    assert report["rows"][0]["operator_actionable"] is True
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == before
+
+
+def test_historical_directory_identity_accepts_exact_alphanumeric_service_number(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    source = snapshot_user(
+        db,
+        connector,
+        uid="33",
+        user_id="CL04196",
+        name="Dr Mehtab",
+    )
+    source.present = False
+    source.lifecycle_state = "DELETED"
+    source.deleted_at = utc_now()
+    db.flush()
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[
+            event(
+                event_uid="1" * 64,
+                user_id="CL04196",
+                raw_name="Dr Mehtab",
+                uid="33",
+            )
+        ],
+    )
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == "1" * 64)
+    )
+    assert blocked is not None
+
+    tombstone, repaired = create_historical_directory_identity(
+        db,
+        connector=connector,
+        source_user=source,
+        source_cnic=CNIC,
+        directory_employee_id="5294",
+        directory_service_number="cl04196",
+        directory_employee_name="Dr Mehtab",
+        directory_zone_code="75",
+        expected_version=source.row_version,
+        reason="Exact alphanumeric HR service number and employee name verified.",
+        idempotency_key="directory-alphanumeric-service",
+        actor="StateHealthAdmin",
+    )
+
+    assert tombstone.device_user_id == source.id
+    assert repaired == 1
+    assert blocked.ords_status == "PENDING"
+    assert blocked.identity_resolution_status == "RESOLVED_DIRECTORY_EVIDENCE"
 
 
 def test_historical_directory_identity_rejects_name_only_match(db: Session):

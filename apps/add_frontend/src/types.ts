@@ -263,6 +263,43 @@ export interface IdentityConflictReport {
   groups: IdentityConflictGroup[]
 }
 
+export interface HistoricalIdentityCandidate {
+  source_user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  row_version: number
+  observed_at: string
+  deleted_at: string | null
+  cnic_available: boolean
+  identity_conflict_code: string | null
+  event_count: number
+  blocked_count: number
+  quarantined_count: number
+  first_event_at: string | null
+  last_event_at: string | null
+  resolution_path:
+    | 'HR_DIRECTORY_EVIDENCE'
+    | 'VERIFIED_TOMBSTONE_REPAIR'
+    | 'IDENTITY_CONFLICT_REVIEW'
+    | 'IDENTITY_REUSE_REVIEW'
+  operator_actionable: boolean
+}
+
+export interface HistoricalIdentityReport {
+  device_serial: string | null
+  snapshot_revision: number
+  totals: {
+    unresolved_events: number
+    blocked_identity: number
+    quarantined_identity_reuse: number
+    attributed_to_deleted_users: number
+    unassigned_events: number
+    candidate_users: number
+  }
+  rows: HistoricalIdentityCandidate[]
+}
+
 export interface AttendanceEvent {
   id: number
   event_uid: string

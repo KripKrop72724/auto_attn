@@ -20,6 +20,8 @@ import type {
   DeviceUser,
   FirmwareCampaign,
   FirmwareRelease,
+  HistoricalIdentityCandidate,
+  HistoricalIdentityReport,
   IdentityConflictGroup,
   IdentityConflictReport,
   IdentityIntegrity,
@@ -40,6 +42,9 @@ type UserDialogState =
 type IdentityResolutionDialogState = {
   mode: 'resolve' | 'revoke'
   group: IdentityConflictGroup
+} | null
+type HistoricalIdentityDialogState = {
+  candidate: HistoricalIdentityCandidate
 } | null
 
 const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
@@ -770,6 +775,123 @@ function IdentityResolutionDialog({
   )
 }
 
+function HistoricalIdentityResolutionDialog({
+  state,
+  device,
+  onClose,
+  onComplete,
+  toast,
+}: {
+  state: Exclude<HistoricalIdentityDialogState, null>
+  device: Device
+  onClose: () => void
+  onComplete: () => Promise<void>
+  toast: ReturnType<typeof useToast>
+}) {
+  const candidate = state.candidate
+  const [cnic, setCnic] = useState('')
+  const [employeeId, setEmployeeId] = useState('')
+  const [serviceNumber, setServiceNumber] = useState(candidate.user_id)
+  const [employeeName, setEmployeeName] = useState(candidate.display_name)
+  const [zoneCode, setZoneCode] = useState(device.zone_id)
+  const [reason, setReason] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const expectedConfirmation = `${candidate.user_id} -> HR ${employeeId}`
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    if (!/^\d{13}$/.test(cnic)) return setError('Directory CNIC must contain exactly 13 digits.')
+    if (!/^\d+$/.test(employeeId)) return setError('Directory employee ID must contain only digits.')
+    if (!/^[A-Za-z0-9._-]+$/.test(serviceNumber)) {
+      return setError('Directory service number contains unsupported characters.')
+    }
+    if (!employeeName.trim()) return setError('Directory employee name is required.')
+    if (reason.trim().length < 10) return setError('Record an audit reason of at least 10 characters.')
+    if (confirmation !== expectedConfirmation) {
+      return setError(`Type ${expectedConfirmation} exactly to continue.`)
+    }
+    if (!password) return setError('Password confirmation is required.')
+    setBusy(true)
+    try {
+      const response = await api<{ repaired_events: number }>(
+        `/api/v2/devices/${device.connector_id}/historical-identities/resolve`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            source_user_key: candidate.source_user_key,
+            expected_version: candidate.row_version,
+            source_cnic: cnic,
+            directory_employee_id: employeeId,
+            directory_service_number: serviceNumber,
+            directory_employee_name: employeeName.trim(),
+            directory_zone_code: zoneCode.trim() || null,
+            reason: reason.trim(),
+            typed_confirmation: confirmation,
+            password,
+            idempotency_key: idempotency('historical-directory-identity'),
+          }),
+        },
+      )
+      await onComplete()
+      toast.notice(
+        `${response.repaired_events.toLocaleString()} preserved attendance event${response.repaired_events === 1 ? '' : 's'} requeued for Oracle confirmation.`,
+      )
+      onClose()
+    } catch (reasonValue) {
+      setError(
+        reasonValue instanceof Error
+          ? reasonValue.message
+          : 'Historical identity evidence could not be saved.',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog
+      titleId="historical-identity-resolution-title"
+      title="Enter verified HR identity evidence"
+      description="Use authoritative HR directory evidence only. ADD will preserve every attendance event and requeue only an exact, unambiguous match."
+      onClose={onClose}
+    >
+      <form className="dialog-body" onSubmit={submit}>
+        <div className="info-copy pattern-waiting">
+          <Icon name="shield" />
+          <div>
+            <h3>{candidate.display_name}</h3>
+            <p>User {candidate.user_id} · UID {candidate.uid} · version {candidate.row_version}</p>
+            <p>{candidate.event_count.toLocaleString()} preserved events from {dateTime(candidate.first_event_at)} to {dateTime(candidate.last_event_at)}.</p>
+          </div>
+        </div>
+        <div className="form-grid">
+          <label>Authoritative CNIC<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
+          <label>HR employee ID<input inputMode="numeric" value={employeeId} onChange={(event) => setEmployeeId(event.target.value.replace(/\D/g, '').slice(0, 32))} /></label>
+          <label>HR service number<input value={serviceNumber} onChange={(event) => setServiceNumber(event.target.value.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64))} /></label>
+          <label>HR employee name<input value={employeeName} onChange={(event) => setEmployeeName(event.target.value)} maxLength={255} /></label>
+          <label>HR zone code<input value={zoneCode} onChange={(event) => setZoneCode(event.target.value)} maxLength={64} /></label>
+        </div>
+        <div className="message pattern-blocked" role="note">
+          <Icon name="alert" />
+          Do not infer or guess a CNIC. The terminal service number and employee name must match the authoritative HR record.
+        </div>
+        <label>Audit reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
+        <label>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
+        <label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
+        <footer className="dialog-actions">
+          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className="button primary" disabled={busy}>{busy ? 'Verifying and requeuing…' : 'Save verified HR evidence'}</button>
+        </footer>
+      </form>
+    </Dialog>
+  )
+}
+
 function BulkDeletionDialog({
   users,
   device,
@@ -935,6 +1057,8 @@ function UsersView({
   const [integrity, setIntegrity] = useState<IdentityIntegrity | null>(null)
   const [conflictReport, setConflictReport] = useState<IdentityConflictReport | null>(null)
   const [resolutionDialog, setResolutionDialog] = useState<IdentityResolutionDialogState>(null)
+  const [historicalReport, setHistoricalReport] = useState<HistoricalIdentityReport | null>(null)
+  const [historicalDialog, setHistoricalDialog] = useState<HistoricalIdentityDialogState>(null)
   const [selectedUserKeys, setSelectedUserKeys] = useState<Set<string>>(new Set())
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
   const [deletionJob, setDeletionJob] = useState<UserDeletionJob | null>(null)
@@ -944,13 +1068,14 @@ function UsersView({
       setRows([])
       setIntegrity(null)
       setConflictReport(null)
+      setHistoricalReport(null)
       return
     }
     setLoading(true)
     try {
       const compact = query.replace(/\D/g, '')
       const cnicSearch = compact.length === 13 && compact === query.replace(/[\s-]/g, '')
-      const [result, conflicts, latestJob] = await Promise.all([
+      const [result, conflicts, history, latestJob] = await Promise.all([
         api<{
           rows: DeviceUser[]
           identity_integrity: IdentityIntegrity
@@ -965,6 +1090,9 @@ function UsersView({
         api<IdentityConflictReport>(
           `/api/v2/devices/${selected.connector_id}/identity-conflicts`,
         ),
+        api<HistoricalIdentityReport>(
+          `/api/v2/devices/${selected.connector_id}/historical-identities`,
+        ),
         api<{ job: UserDeletionJob | null }>(
           `/api/v2/devices/${selected.connector_id}/user-deletion-jobs/latest`,
         ),
@@ -976,6 +1104,7 @@ function UsersView({
       })
       setIntegrity(result.identity_integrity || null)
       setConflictReport(conflicts)
+      setHistoricalReport(history?.totals ? history : null)
       setDeletionJob(latestJob.job)
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : 'Unable to load users.')
@@ -992,6 +1121,7 @@ function UsersView({
   useEffect(() => {
     setSelectedUserKeys(new Set())
     setBulkDialogOpen(false)
+    setHistoricalDialog(null)
   }, [selectedDeviceId])
 
   useEffect(() => {
@@ -1121,6 +1251,63 @@ function UsersView({
           )}
           {command && <CommandProgress command={command} onCancel={cancel} />}
           {deletionJob && <BulkDeletionProgress job={deletionJob} onCancel={cancelDeletionJob} />}
+          {historicalReport && historicalReport.totals.unresolved_events > 0 && (
+            <section className="panel conflict-workbench" aria-label="Historical identity backlog">
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">PRESERVED ATTENDANCE · IDENTITY REQUIRED</p>
+                  <h2>Historical identity backlog</h2>
+                  <p>
+                    {historicalReport.totals.unresolved_events.toLocaleString()} events remain fail-closed:
+                    {' '}{historicalReport.totals.blocked_identity.toLocaleString()} missing verified identity and
+                    {' '}{historicalReport.totals.quarantined_identity_reuse.toLocaleString()} quarantined for identity reuse.
+                    {' '}{historicalReport.totals.unassigned_events.toLocaleString()} cannot yet be attributed to one deleted terminal user.
+                  </p>
+                </div>
+                <StatusBadge state="HR EVIDENCE REQUIRED" />
+              </div>
+              <div className="conflict-groups">
+                {historicalReport.rows.map((candidate) => (
+                  <article key={candidate.source_user_key} className="conflict-group pattern-blocked">
+                    <div className="conflict-group-heading">
+                      <div>
+                        <strong>{candidate.display_name}</strong>
+                        <small>User {candidate.user_id} · UID {candidate.uid} · version {candidate.row_version}</small>
+                      </div>
+                      <StatusBadge state={candidate.resolution_path.replaceAll('_', ' ')} />
+                    </div>
+                    <div className="conflict-members">
+                      <div>
+                        <span>
+                          <strong>{candidate.event_count.toLocaleString()} preserved events</strong>
+                          <small>{candidate.blocked_count.toLocaleString()} blocked · {candidate.quarantined_count.toLocaleString()} quarantined</small>
+                        </span>
+                        <span>
+                          <strong>{dateTime(candidate.first_event_at)}</strong>
+                          <small>through {dateTime(candidate.last_event_at)}</small>
+                        </span>
+                      </div>
+                    </div>
+                    <div className="conflict-group-actions">
+                      <small>
+                        {candidate.operator_actionable
+                          ? 'Requires exact authoritative HR CNIC, employee ID, service number, name, and audit approval.'
+                          : 'This row remains fail-closed until its identity conflict or reuse review is resolved.'}
+                      </small>
+                      <button
+                        className="button secondary"
+                        disabled={!candidate.operator_actionable}
+                        onClick={() => setHistoricalDialog({ candidate })}
+                      >
+                        <Icon name="shield" />
+                        Enter verified HR evidence
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
           {conflictReport && conflictReport.raw_duplicate_groups > 0 && (
             <section className="panel conflict-workbench" aria-label="Identity conflict review">
               <div className="section-heading">
@@ -1241,6 +1428,17 @@ function UsersView({
         />
       )}
       {resolutionDialog && selected && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void load() }} toast={toast} />}
+      {historicalDialog && selected && (
+        <HistoricalIdentityResolutionDialog
+          state={historicalDialog}
+          device={selected}
+          onClose={() => setHistoricalDialog(null)}
+          onComplete={async () => {
+            await Promise.all([load(), refreshFleet()])
+          }}
+          toast={toast}
+        />
+      )}
     </>
   )
 }
