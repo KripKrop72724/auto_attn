@@ -56,8 +56,8 @@
 
 #define ADD_COMMAND_QUEUE_DEPTH 32
 #define ADD_SEND_TIMEOUT_MS 5000
-#define ADD_MAX_INBOUND_BYTES (64 * 1024)
-#define ADD_IDENTITY_CATALOG_MAX_ROWS 512
+#define ADD_MAX_INBOUND_BYTES (512 * 1024)
+#define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
 #define ADD_ACK_TIMEOUT_MS 60000
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
@@ -1929,6 +1929,8 @@ void add_connector_init(void)
         "%02x%02x%02x%02x%02x%02x-%08lx",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned long)esp_random());
     strlcpy(s_zkt.connection_state, "BOOTING", sizeof(s_zkt.connection_state));
+    s_zkt.user_count = -1;
+    s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
                 s_ack_sem && s_command_lock && s_commands;
 }
@@ -2178,6 +2180,21 @@ bool add_connector_is_connected(void)
         connected = false;
     }
     return connected;
+}
+
+bool add_connector_boot_health_ready(void)
+{
+    bool ready = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ready = s_connected
+            && s_identity_catalog_generation > 0
+            && s_zkt.online
+            && strcmp(s_zkt.connection_state, "ONLINE") == 0
+            && s_zkt.user_count >= 0
+            && s_zkt.attendance_count >= 0;
+        xSemaphoreGive(s_lock);
+    }
+    return ready;
 }
 
 bool add_connector_consume_connected_edge(void)

@@ -980,8 +980,8 @@ create or replace package body slic_zkt_truth_api as
         ),
         flagged as (
             select i.*,
-                   case when i.raw_punch = 'F' and n.rn_in = 1 then 'T' else 'F' end check_in,
-                   case when i.raw_punch = 'F' and n.normal_count > 1 and n.rn_out = 1 then 'T' else 'F' end check_out
+                   'F' check_in,
+                   'F' check_out
               from incoming i
               left join normal_rank n on n.event_uid = i.event_uid
         )
@@ -1010,48 +1010,11 @@ create or replace package body slic_zkt_truth_api as
                );
         v_inserted := sql%rowcount;
 
-        merge into hr_raw_attn_capture_events d
-        using (
-            with incoming as (
-                select trim(j.event_uid) event_uid,
-                       trim(j.cnic) cnic,
-                       slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) event_ts,
-                       coalesce(nullif(trim(j.raw_punch), ''), 'F') raw_punch,
-                       slic_zkt_truth_api.attendance_date_for(slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)) attendance_date
-                  from json_table(
-                           p_body,
-                           '$.events[*]'
-                           columns
-                               event_uid varchar2(150) path '$.event_uid' null on error,
-                               cnic varchar2(13) path '$.cnic' null on error,
-                               event_timestamp varchar2(80) path '$.timestamp' null on error,
-                               raw_punch varchar2(1) path '$.raw_punch' null on error
-                       ) j
-            ),
-            normal_rank as (
-                select event_uid,
-                       row_number() over (partition by cnic, attendance_date order by event_ts, event_uid) rn_in,
-                       row_number() over (partition by cnic, attendance_date order by event_ts desc, event_uid desc) rn_out,
-                       count(*) over (partition by cnic, attendance_date) normal_count
-                  from incoming
-                 where raw_punch = 'F'
-            )
-            select i.event_uid,
-                   i.raw_punch,
-                   case when i.raw_punch = 'F' and n.rn_in = 1 then 'T' else 'F' end check_in,
-                   case when i.raw_punch = 'F' and n.normal_count > 1 and n.rn_out = 1 then 'T' else 'F' end check_out
-              from incoming i
-              left join normal_rank n on n.event_uid = i.event_uid
-        ) f
-           on (d.event_uid = f.event_uid)
-         when matched then update set
-              d.check_in = f.check_in,
-              d.check_out = f.check_out,
-              d.raw_punch = f.raw_punch
-          where d.check_in <> f.check_in
-             or d.check_out <> f.check_out
-             or d.raw_punch <> f.raw_punch;
-        v_flag_corrected := sql%rowcount;
+        -- Reconcile uses the same deterministic whole-day flag calculation as
+        -- live/bulk ingestion. New rows enter neutral so an existing daily
+        -- check-in/check-out can never create a transient uniqueness failure.
+        slic_zkt_recompute_daily_flags(p_body);
+        v_flag_corrected := 0;
 
         update hr_raw_attn_capture_events d
            set d.datasync = 0

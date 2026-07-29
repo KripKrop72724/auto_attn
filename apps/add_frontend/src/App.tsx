@@ -1565,6 +1565,31 @@ function FirmwareView({
                 <div><strong>{Object.entries(campaign.counts).map(([state, count]) => `${state.replaceAll('_', ' ')} ${count}`).join(' · ') || 'No offers yet'}</strong><small>Created {dateTime(campaign.created_at)}</small></div>
               </div>
               {campaign.pause_reason && <p className="firmware-pause-reason"><Icon name="alert" /> {campaign.pause_reason}</p>}
+              {campaign.deployments?.map((deployment) => (
+                <details className="firmware-deployment-evidence" key={deployment.deployment_id}>
+                  <summary>
+                    {deployment.connector_id || 'Unknown connector'} · {deployment.status.replaceAll('_', ' ')}
+                    {deployment.error_code ? ` · ${deployment.error_code}` : ''}
+                  </summary>
+                  <dl>
+                    <div><dt>Deployment</dt><dd><code>{deployment.deployment_id}</code></dd></div>
+                    <div><dt>Version</dt><dd>{deployment.previous_version || 'Unknown'} → {deployment.target_version}</dd></div>
+                    <div><dt>Bytes</dt><dd>{new Intl.NumberFormat('en-PK').format(deployment.bytes_written)}</dd></div>
+                    <div><dt>Attempts</dt><dd>{deployment.attempt_count}</dd></div>
+                  </dl>
+                  {deployment.events.length > 0 && (
+                    <ol className="firmware-deployment-events">
+                      {deployment.events.map((event, index) => (
+                        <li key={`${event.created_at}-${index}`}>
+                          <time>{dateTime(event.created_at)}</time>
+                          <strong>{event.state.replaceAll('_', ' ')}</strong>
+                          {event.details.error_code ? <code>{String(event.details.error_code)}</code> : null}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </details>
+              ))}
               <FirmwareCampaignControls campaign={campaign} onChanged={load} toast={toast} />
             </article>
           ))}

@@ -13,6 +13,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_random.h"
+#include "esp_secure_boot.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -26,7 +27,8 @@
 
 #define OTA_NAMESPACE "zone_ota"
 #define OTA_POLL_MS 60000
-#define OTA_BOOT_CONFIRM_SECONDS 180
+#define OTA_BOOT_CONFIRM_SECONDS 900
+#define OTA_BOOT_HEALTH_REPORT_SECONDS 30
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
@@ -225,12 +227,18 @@ static bool report_capability(void)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "capable", true);
-    cJSON_AddBoolToObject(root, "secure_boot", true);
+    cJSON_AddBoolToObject(root, "secure_boot", esp_secure_boot_enabled());
     cJSON_AddBoolToObject(root, "rollback_enabled", true);
     cJSON_AddStringToObject(root, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT);
     cJSON_AddStringToObject(root, "running_version", esp_app_get_description()->version);
     const esp_partition_t *running = esp_ota_get_running_partition();
     cJSON_AddStringToObject(root, "running_partition", running ? running->label : "unknown");
+    unsigned char digest[32];
+    char digest_hex[65];
+    if (running && esp_partition_get_sha256(running, digest) == ESP_OK) {
+        hex_bytes(digest, sizeof(digest), digest_hex);
+        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
+    }
     bool ok = post_json("/device/v2/firmware/capability", root);
     cJSON_Delete(root);
     return ok;
@@ -383,8 +391,21 @@ static bool confirm_or_report_rollback(void)
         return true;
     }
     int64_t deadline = (esp_timer_get_time() / 1000000) + OTA_BOOT_CONFIRM_SECONDS;
+    int64_t last_health_report = 0;
+    bool add_acknowledged = false;
     while ((esp_timer_get_time() / 1000000) < deadline) {
-        if (report_state("BOOTED_PENDING", NULL)) {
+        int64_t now = esp_timer_get_time() / 1000000;
+        if (!add_acknowledged) {
+            add_acknowledged = report_state(
+                "BOOTED_PENDING",
+                "WAITING_FOR_RUNTIME_HEALTH");
+            last_health_report = now;
+        }
+        if (add_acknowledged && add_connector_boot_health_ready()) {
+            if (!report_state("BOOTED_PENDING", "RUNTIME_HEALTHY")) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
             if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
                 strlcpy(s_journal.state, "RECONCILING", sizeof(s_journal.state));
                 (void)save_journal();
@@ -397,8 +418,14 @@ static bool confirm_or_report_rollback(void)
             }
             break;
         }
+        if (add_acknowledged &&
+            now - last_health_report >= OTA_BOOT_HEALTH_REPORT_SECONDS) {
+            (void)report_state("BOOTED_PENDING", "WAITING_FOR_RUNTIME_HEALTH");
+            last_health_report = now;
+        }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+    (void)report_state("FAILED", "BOOT_HEALTH_TIMEOUT");
     (void)esp_ota_mark_app_invalid_rollback_and_reboot();
     return false;
 }
@@ -475,7 +502,7 @@ void ota_manager_append_telemetry(cJSON *heartbeat)
     if (!heartbeat) return;
     cJSON *ota = cJSON_AddObjectToObject(heartbeat, "ota");
     cJSON_AddBoolToObject(ota, "capable", true);
-    cJSON_AddBoolToObject(ota, "secure_boot", true);
+    cJSON_AddBoolToObject(ota, "secure_boot", esp_secure_boot_enabled());
     cJSON_AddBoolToObject(ota, "rollback_enabled", true);
     cJSON_AddStringToObject(ota, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT);
     cJSON_AddStringToObject(ota, "state", s_busy ? "UPDATING" : s_journal.state);

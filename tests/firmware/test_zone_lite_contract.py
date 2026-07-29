@@ -540,6 +540,40 @@ def test_oracle_live_insert_recomputes_daily_flags_without_delete():
     assert "delete from hr_raw_attn_capture_events d" in migration
 
 
+def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows():
+    oracle = (
+        ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"
+    ).read_text(encoding="utf-8")
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260728_recompute_reconcile_daily_flags_non_destructive.sql"
+    ).read_text(encoding="utf-8")
+
+    package_body_start = oracle.index("create or replace package body")
+    reconcile_start = oracle.index("procedure post_reconcile", package_body_start)
+    reconcile = oracle[reconcile_start : oracle.index("end post_reconcile;")]
+    assert "'F' check_in" in reconcile
+    assert "'F' check_out" in reconcile
+    assert "slic_zkt_recompute_daily_flags(p_body)" in reconcile
+    assert "v_flag_corrected := 0" in reconcile
+    assert "merge into hr_raw_attn_capture_events d" not in reconcile
+    assert reconcile.count(
+        "delete from hr_raw_attn_capture_events d\n         where 1 = 0"
+    ) == 2
+
+    assert "restore_original" in migration
+    assert "l_ddl_attempted" in migration
+    assert "slic_zkt_recompute_daily_flags(p_body)" in migration
+    assert "v_flag_corrected := 0" in migration
+    assert "where 1 = 0" in migration
+    assert "execute immediate l_patched_ddl" in migration
+    assert "insert into hr_raw_attn_capture_events" not in migration.lower()
+    assert "update hr_raw_attn_capture_events" not in migration.lower()
+
+
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     recovery = source[
@@ -561,14 +595,14 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
     runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 
-    assert "#define ADD_MAX_INBOUND_BYTES (64 * 1024)" in connector
+    assert "#define ADD_MAX_INBOUND_BYTES (512 * 1024)" in connector
     assert "receive_inbound_fragment" in connector
     assert "event->payload_offset" in connector
     assert "offset != s_inbound_payload_received" in connector
     assert "s_inbound_payload_received == s_inbound_payload_expected" in connector
     assert "parse_inbound(s_inbound_payload, s_inbound_payload_expected)" in connector
     assert "reset_inbound_payload();" in connector
-    assert "ADD_IDENTITY_CATALOG_MAX_ROWS 512" in connector
+    assert "ADD_IDENTITY_CATALOG_MAX_ROWS 4096" in connector
     assert "s_identity_catalog_generation++" in connector
     assert "add_connector_identity_catalog_generation" in connector
     assert "add_connector_identity_catalog_generation" in header
@@ -577,6 +611,31 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     applied = runtime.index("applied_identity_catalog_generation = identity_catalog_generation")
     forced = runtime.index("g_force_truth_reconcile = true;", applied)
     assert applied < forced
+
+
+def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
+    ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+
+    assert ota.count("esp_secure_boot_enabled()") == 2
+    assert '"image_sha256"' in ota
+    assert "esp_partition_get_sha256(running, digest)" in ota
+    assert "OTA_BOOT_CONFIRM_SECONDS 900" in ota
+    assert "add_connector_boot_health_ready()" in ota
+    assert '"WAITING_FOR_RUNTIME_HEALTH"' in ota
+    assert '"RUNTIME_HEALTHY"' in ota
+    assert '"BOOT_HEALTH_TIMEOUT"' in ota
+    healthy = ota.index('report_state("BOOTED_PENDING", "RUNTIME_HEALTHY")')
+    valid = ota.index("esp_ota_mark_app_valid_cancel_rollback()", healthy)
+    assert healthy < valid
+
+    assert "bool add_connector_boot_health_ready(void)" in connector
+    assert "s_identity_catalog_generation > 0" in connector
+    assert 'strcmp(s_zkt.connection_state, "ONLINE") == 0' in connector
+    assert "s_zkt.user_count >= 0" in connector
+    assert "s_zkt.attendance_count >= 0" in connector
+    assert "bool add_connector_boot_health_ready(void);" in header
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():
