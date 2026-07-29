@@ -95,6 +95,7 @@ from zk_add.service import (
     apply_command_update,
     apply_user_command_terminal_state,
     cancel_user_deletion_job,
+    build_historical_identity_report,
     create_admin_lease,
     create_command,
     create_device_user_command,
@@ -769,6 +770,19 @@ async def create_identity_alias(
         "repaired_events": repaired,
         "catalog_delivered": delivered,
     }
+
+
+@app.get("/api/v2/devices/{connector_id}/historical-identities")
+def historical_identity_report(
+    connector_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise HTTPException(status_code=409, detail="No assigned ZKT device.")
+    return build_historical_identity_report(db, zkt=zkt)
 
 
 @app.post(

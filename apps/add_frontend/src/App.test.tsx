@@ -126,7 +126,7 @@ const response = (body: unknown, status = 200) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
-const fetchStub = (users: DeviceUser[] = [user]) =>
+const fetchStub = (users: DeviceUser[] = [user], includeHistorical = false) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (path.includes('/api/v1/auth/session')) {
@@ -246,6 +246,46 @@ const fetchStub = (users: DeviceUser[] = [user]) =>
           : [],
       })
     }
+    if (
+      path.includes('/api/v2/devices/connector-one/historical-identities/resolve') &&
+      init?.method === 'POST'
+    ) {
+      return response({ ok: true, repaired_events: 3 }, 201)
+    }
+    if (path.includes('/api/v2/devices/connector-one/historical-identities')) {
+      return response({
+        device_serial: device.zkt?.serial,
+        snapshot_revision: 8,
+        totals: {
+          unresolved_events: includeHistorical ? 3 : 0,
+          blocked_identity: includeHistorical ? 3 : 0,
+          quarantined_identity_reuse: 0,
+          attributed_to_deleted_users: includeHistorical ? 3 : 0,
+          unassigned_events: 0,
+          candidate_users: includeHistorical ? 1 : 0,
+        },
+        rows: includeHistorical
+          ? [{
+              source_user_key: 'historical-user-key',
+              uid: '33',
+              user_id: 'CL04196',
+              display_name: 'Dr Mehtab',
+              row_version: 366,
+              observed_at: '2026-07-13T12:00:00Z',
+              deleted_at: '2026-07-14T12:00:00Z',
+              cnic_available: false,
+              identity_conflict_code: null,
+              event_count: 3,
+              blocked_count: 3,
+              quarantined_count: 0,
+              first_event_at: '2026-06-01T08:00:00Z',
+              last_event_at: '2026-07-01T08:00:00Z',
+              resolution_path: 'HR_DIRECTORY_EVIDENCE',
+              operator_actionable: true,
+            }]
+          : [],
+      })
+    }
     if (path.includes('/api/v2/devices/connector-one/user-deletion-jobs/latest')) {
       return response({ job: null })
     }
@@ -337,6 +377,54 @@ describe('State Life ADD interface', () => {
     expect(
       screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),
     ).toBeTruthy()
+  })
+
+  it('requires exact HR evidence before requeuing historical attendance', async () => {
+    const fetchMock = fetchStub([user], true)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
+      target: { value: device.connector_id },
+    })
+    expect(await screen.findByRole('heading', { name: /historical identity backlog/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
+    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+      target: { value: fullCnic },
+    })
+    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
+      target: { value: '5294' },
+    })
+    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+      target: { value: 'Verified against the authoritative HR directory.' },
+    })
+    fireEvent.change(screen.getByLabelText(/type “cl04196 -> hr 5294”/i), {
+      target: { value: 'CL04196 -> HR 5294' },
+    })
+    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+      target: { value: 'test-password' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
+
+    expect(await screen.findByText(/3 preserved attendance events requeued/i)).toBeTruthy()
+    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
+      String(input).includes('/historical-identities/resolve') &&
+      (init as RequestInit | undefined)?.method === 'POST',
+    )
+    expect(resolutionCall).toBeTruthy()
+    const requestBody = JSON.parse(
+      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
+    )
+    expect(requestBody).toMatchObject({
+      source_user_key: 'historical-user-key',
+      expected_version: 366,
+      source_cnic: fullCnic,
+      directory_employee_id: '5294',
+      directory_service_number: 'CL04196',
+      directory_employee_name: 'Dr Mehtab',
+      typed_confirmation: 'CL04196 -> HR 5294',
+    })
   })
 
   it('communicates every state with text, icon, and border pattern', () => {
