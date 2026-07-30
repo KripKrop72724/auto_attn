@@ -157,15 +157,34 @@ def main() -> None:
             request["recipient_public_key_b64"],
             aad,
         )
+        hmac_aad = {
+            "schema_version": 1,
+            "request_id": request["request_id"],
+            "target_mac": request["target_mac"],
+            "purpose": "zone-lite-nvs-hmac-efuse-key",
+            "key_size": len(hmac_key),
+        }
+        hmac_ciphertext, hmac_envelope = encrypt_for_recipient(
+            hmac_key,
+            request["recipient_public_key_b64"],
+            hmac_aad,
+        )
 
     ciphertext_path = args.output / "provision.bin.enc"
     ciphertext_path.write_bytes(ciphertext)
+    hmac_ciphertext_path = args.output / "hmac-key.bin.enc"
+    hmac_ciphertext_path.write_bytes(hmac_ciphertext)
     manifest = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "aad": aad,
         "envelope": envelope,
         "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+        "hmac_key": {
+            "aad": hmac_aad,
+            "envelope": hmac_envelope,
+            "ciphertext_sha256": hashlib.sha256(hmac_ciphertext).hexdigest(),
+        },
     }
     (args.output / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

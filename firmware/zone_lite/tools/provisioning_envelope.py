@@ -115,6 +115,7 @@ def decrypt_package(
     package: Path,
     private_path: Path,
     output: Path,
+    hmac_key_output: Path | None,
     expected_request_id: str,
     expected_mac: str,
 ) -> None:
@@ -140,6 +141,39 @@ def decrypt_package(
         handle.write(plaintext)
     temporary.chmod(0o600)
     os.replace(temporary, output)
+    if hmac_key_output is not None:
+        hmac_manifest = manifest.get("hmac_key")
+        if not isinstance(hmac_manifest, dict):
+            raise ValueError("Provisioning package has no encrypted HMAC eFuse key")
+        hmac_aad = hmac_manifest.get("aad", {})
+        if hmac_aad.get("request_id") != expected_request_id:
+            raise ValueError("Provisioning HMAC request ID mismatch")
+        if str(hmac_aad.get("target_mac", "")).lower() != expected_mac.lower():
+            raise ValueError("Provisioning HMAC MAC mismatch")
+        if hmac_aad.get("purpose") != "zone-lite-nvs-hmac-efuse-key":
+            raise ValueError("Provisioning HMAC purpose mismatch")
+        hmac_ciphertext = (package / "hmac-key.bin.enc").read_bytes()
+        if hashlib.sha256(hmac_ciphertext).hexdigest() != hmac_manifest.get(
+            "ciphertext_sha256"
+        ):
+            raise ValueError("Provisioning HMAC ciphertext hash mismatch")
+        hmac_key = decrypt_envelope(
+            hmac_ciphertext,
+            private_path.read_bytes(),
+            hmac_manifest,
+        )
+        if len(hmac_key) != 32 or hmac_aad.get("key_size") != 32:
+            raise ValueError("Provisioning HMAC key has the wrong size")
+        if hmac_key_output.exists():
+            raise FileExistsError(f"Refusing to overwrite {hmac_key_output}")
+        hmac_key_output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=hmac_key_output.parent, delete=False
+        ) as handle:
+            hmac_temporary = Path(handle.name)
+            handle.write(hmac_key)
+        hmac_temporary.chmod(0o600)
+        os.replace(hmac_temporary, hmac_key_output)
     print(f"Decrypted and verified provisioning NVS for {expected_mac}")
 
 
@@ -152,6 +186,7 @@ def main() -> None:
     decrypt.add_argument("--package", type=Path, required=True)
     decrypt.add_argument("--private-key", type=Path, required=True)
     decrypt.add_argument("--output", type=Path, required=True)
+    decrypt.add_argument("--hmac-key-output", type=Path)
     decrypt.add_argument("--expected-request-id", required=True)
     decrypt.add_argument("--expected-mac", required=True)
     args = parser.parse_args()
@@ -162,6 +197,7 @@ def main() -> None:
             args.package,
             args.private_key,
             args.output,
+            args.hmac_key_output,
             args.expected_request_id,
             args.expected_mac,
         )

@@ -155,7 +155,7 @@ jobs:
             & docker cp "${container}:/output/." $output
             if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve encrypted package' }
             $files = @(Get-ChildItem -LiteralPath $output -File | Select-Object -ExpandProperty Name)
-            if (($files | Sort-Object) -join ',' -ne 'manifest.json,provision.bin.enc') { throw 'Unexpected provisioning artifact contents' }
+            if (($files | Sort-Object) -join ',' -ne 'hmac-key.bin.enc,manifest.json,provision.bin.enc') { throw 'Unexpected provisioning artifact contents' }
           }
           finally {
             & docker rm -f $container 2>$null | Out-Null
