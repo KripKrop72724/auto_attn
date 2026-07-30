@@ -59,6 +59,8 @@ jobs:
           persist-credentials: false
       - name: Run large-catalog rollout preflight
         run: python3 tests/firmware/test_identity_catalog_rollout_preflight.py
+      - name: Run Oracle reconcile load preflight
+        run: python3 tests/firmware/test_oracle_reconcile_load_preflight.py
       - name: Build the exact unsigned candidate
         working-directory: firmware/zone_lite
         shell: bash

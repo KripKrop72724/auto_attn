@@ -603,6 +603,13 @@ def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows
         / "oracle"
         / "20260728_recompute_reconcile_daily_flags_non_destructive.sql"
     ).read_text(encoding="utf-8")
+    cpu_migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260730_bound_noop_reconcile_cpu_non_destructive.sql"
+    ).read_text(encoding="utf-8")
 
     package_body_start = oracle.index("create or replace package body")
     reconcile_start = oracle.index("procedure post_reconcile", package_body_start)
@@ -610,7 +617,9 @@ def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows
     assert "'F' check_in" in reconcile
     assert "'F' check_out" in reconcile
     assert "slic_zkt_recompute_daily_flags(p_body)" in reconcile
+    assert "if v_inserted + v_corrected + v_deleted > 0 then" in reconcile
     assert "v_flag_corrected := 0" in reconcile
+    assert "where nvl(d.datasync, 0) <> 0" in reconcile
     assert "merge into hr_raw_attn_capture_events d" not in reconcile
     assert reconcile.count(
         "delete from hr_raw_attn_capture_events d\n         where 1 = 0"
@@ -624,6 +633,16 @@ def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows
     assert "execute immediate l_patched_ddl" in migration
     assert "insert into hr_raw_attn_capture_events" not in migration.lower()
     assert "update hr_raw_attn_capture_events" not in migration.lower()
+
+    assert "restore_original" in cpu_migration
+    assert "attempted boolean := false" in cpu_migration
+    assert "if v_inserted + v_corrected + v_deleted > 0 then" in cpu_migration
+    assert "where nvl(d.datasync, 0) <> 0" in cpu_migration
+    assert "where 1 = 0" in cpu_migration
+    assert "execute immediate p" in cpu_migration
+    assert "execute immediate o" in cpu_migration
+    assert "delete from hr_raw_attn_capture_events" in cpu_migration.lower()
+    assert "insert into hr_raw_attn_capture_events" not in cpu_migration.lower()
 
 
 def test_oracle_timestamp_ingestion_and_repair_preserve_event_instants():

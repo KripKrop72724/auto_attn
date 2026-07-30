@@ -1065,14 +1065,19 @@ create or replace package body slic_zkt_truth_api as
         v_inserted := sql%rowcount;
 
         -- Reconcile uses the same deterministic whole-day flag calculation as
-        -- live/bulk ingestion. New rows enter neutral so an existing daily
-        -- check-in/check-out can never create a transient uniqueness failure.
-        slic_zkt_recompute_daily_flags(p_body);
+        -- live/bulk ingestion, but only when the stored event set changed.
+        -- Replaying an already-present authoritative window is a true no-op;
+        -- rerunning the whole-day helper in that case needlessly scans and
+        -- rewrites the shared attendance table.
+        if v_inserted + v_corrected + v_deleted > 0 then
+            slic_zkt_recompute_daily_flags(p_body);
+        end if;
         v_flag_corrected := 0;
 
         update hr_raw_attn_capture_events d
            set d.datasync = 0
-         where exists (
+         where nvl(d.datasync, 0) <> 0
+           and exists (
                    select 1
                      from json_table(
                               p_body,
