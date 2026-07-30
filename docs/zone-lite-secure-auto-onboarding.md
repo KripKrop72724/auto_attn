@@ -174,16 +174,20 @@ the short-lived Actions secret `ZONE_LITE_PROVISIONING_INPUT_B64`, dispatch oper
 `build-package` with confirmation `BUILD ENCRYPTED NVS`, then delete the secret immediately.
 
 The ADD runner reads fleet and ORDS credentials only from the running production ADD container,
-derives device-bound material in an ephemeral ESP-IDF container, and uploads only
-`provision.bin.enc` plus a credential-free manifest for one day. Plaintext NVS, fleet roots, ORDS
-credentials, Wi-Fi credentials, Comm Keys, bootstrap secrets, and XTS/HMAC keys are never Actions
-artifacts. Decrypt locally with the one-time private key and exact request/MAC expectations:
+derives device-bound material in an ephemeral ESP-IDF container, and uploads
+`provision.bin.enc`, `hmac-key.bin.enc`, plus a credential-free manifest for one day. Both payloads
+are independently X25519/AES-256-GCM encrypted to the one-time workstation key and bound to the
+exact request ID and MAC. Plaintext NVS, fleet roots, ORDS credentials, Wi-Fi credentials, Comm
+Keys, bootstrap secrets, and HMAC keys are never Actions artifacts. A new device decrypts both
+payloads; an already-attested `HMAC_UP` device decrypts only NVS. Decrypt locally with the one-time
+private key and exact request/MAC expectations:
 
 ```bash
 python firmware/zone_lite/tools/provisioning_envelope.py decrypt \
   --package /protected/temporary/package \
   --private-key /protected/temporary/request.key \
   --output /protected/temporary/provision.bin \
+  --hmac-key-output /protected/temporary/hmac-key.bin \
   --expected-request-id REQUEST_ID \
   --expected-mac 00:00:00:00:00:00
 ```
