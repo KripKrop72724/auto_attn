@@ -55,7 +55,7 @@
 #endif
 
 #define ADD_COMMAND_QUEUE_DEPTH 32
-#define ADD_INBOUND_QUEUE_DEPTH 8
+#define ADD_INBOUND_QUEUE_DEPTH 96
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
@@ -86,6 +86,8 @@
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
 #define ADD_IDENTITY_CATALOG_TMP_PATH "/storage/add_identities.tmp"
+#define ADD_IDENTITY_CATALOG_STAGE_PATH "/storage/add_identities.stage"
+#define ADD_IDENTITY_CATALOG_BACKUP_PATH "/storage/add_identities.backup"
 #define ADD_CANCELLED_COMMANDS_PATH "/storage/add_cancelled.txt"
 
 typedef struct {
@@ -134,6 +136,9 @@ static size_t s_inbound_payload_expected;
 static size_t s_inbound_payload_received;
 static uint32_t s_identity_catalog_generation;
 static size_t s_identity_catalog_rows;
+static char s_identity_catalog_stage_id[40];
+static size_t s_identity_catalog_stage_expected;
+static size_t s_identity_catalog_stage_rows;
 static add_outbox_t s_bulk_outbox = {
     .path = ADD_OUTBOX_PATH,
     .tmp_path = ADD_OUTBOX_TMP_PATH,
@@ -489,6 +494,39 @@ static char *decrypt_storage_line(const char *line)
     return (char *)plain;
 }
 
+static bool write_encrypted_json_line(FILE *file, cJSON *value)
+{
+    char *plain = value ? cJSON_PrintUnformatted(value) : NULL;
+    char *encrypted = encrypt_storage_json(plain);
+    bool ok = file && encrypted && fprintf(file, "%s\n", encrypted) > 0;
+    free(plain);
+    free(encrypted);
+    return ok;
+}
+
+static bool activate_identity_catalog(const char *staged_path)
+{
+    if (!staged_path) return false;
+    (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
+    bool had_active = access(ADD_IDENTITY_CATALOG_PATH, F_OK) == 0;
+    if (had_active &&
+        rename(
+            ADD_IDENTITY_CATALOG_PATH,
+            ADD_IDENTITY_CATALOG_BACKUP_PATH) != 0) {
+        return false;
+    }
+    if (rename(staged_path, ADD_IDENTITY_CATALOG_PATH) == 0) {
+        (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
+        return true;
+    }
+    if (had_active) {
+        (void)rename(
+            ADD_IDENTITY_CATALOG_BACKUP_PATH,
+            ADD_IDENTITY_CATALOG_PATH);
+    }
+    return false;
+}
+
 static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
 {
     cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
@@ -496,22 +534,142 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
     if (row_count < 0 || row_count > ADD_IDENTITY_CATALOG_MAX_ROWS) {
         return false;
     }
-    char *plain = cJSON_PrintUnformatted(root);
-    char *encrypted = encrypt_storage_json(plain);
-    FILE *file = encrypted ? fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w") : NULL;
-    bool ok = file && fprintf(file, "%s\n", encrypted) > 0 && fflush(file) == 0 &&
-              fsync(fileno(file)) == 0;
-    if (file) fclose(file);
-    free(plain);
-    free(encrypted);
+    // Persist a bounded encrypted record stream instead of materializing a
+    // second catalog-sized JSON string and ciphertext buffer.  The inbound
+    // payload and cJSON tree already account for the catalog once; duplicating
+    // both on large terminals can exhaust internal heap before boot health can
+    // acknowledge the freshly delivered catalog.
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w");
+    cJSON *metadata = cJSON_CreateObject();
+    bool ok = file && metadata;
     if (ok) {
-        (void)remove(ADD_IDENTITY_CATALOG_PATH);
-        ok = rename(ADD_IDENTITY_CATALOG_TMP_PATH, ADD_IDENTITY_CATALOG_PATH) == 0;
+        cJSON_AddStringToObject(metadata, "schema_version", "3");
+        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
+        cJSON_AddNumberToObject(metadata, "rows_count", row_count);
+        ok = write_encrypted_json_line(file, metadata);
+    }
+    cJSON_Delete(metadata);
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+        if (ok && !write_encrypted_json_line(file, row)) {
+            ok = false;
+        }
+    }
+    if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) ok = false;
+    if (file) fclose(file);
+    if (ok) {
+        ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH);
     }
     if (!ok) (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
     if (ok && row_count_out) {
         *row_count_out = (size_t)row_count;
     }
+    return ok;
+}
+
+static bool identity_catalog_stage_begin(cJSON *root)
+{
+    cJSON *catalog_id = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
+        : NULL;
+    cJSON *rows_count = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "rows_count")
+        : NULL;
+    int expected = cJSON_IsNumber(rows_count) ? rows_count->valueint : -1;
+    if (!cJSON_IsString(catalog_id) || !catalog_id->valuestring[0] ||
+        strlen(catalog_id->valuestring) >= sizeof(s_identity_catalog_stage_id) ||
+        expected < 0 || expected > ADD_IDENTITY_CATALOG_MAX_ROWS) {
+        return false;
+    }
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "w");
+    cJSON *metadata = cJSON_CreateObject();
+    bool ok = file && metadata;
+    if (ok) {
+        cJSON_AddStringToObject(metadata, "schema_version", "3");
+        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
+        cJSON_AddNumberToObject(metadata, "rows_count", expected);
+        ok = write_encrypted_json_line(file, metadata) &&
+            fflush(file) == 0 && fsync(fileno(file)) == 0;
+    }
+    cJSON_Delete(metadata);
+    if (file) fclose(file);
+    if (!ok) {
+        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+        s_identity_catalog_stage_id[0] = '\0';
+        s_identity_catalog_stage_expected = 0;
+        s_identity_catalog_stage_rows = 0;
+        return false;
+    }
+    strlcpy(
+        s_identity_catalog_stage_id,
+        catalog_id->valuestring,
+        sizeof(s_identity_catalog_stage_id));
+    s_identity_catalog_stage_expected = (size_t)expected;
+    s_identity_catalog_stage_rows = 0;
+    return true;
+}
+
+static bool identity_catalog_stage_chunk(cJSON *root)
+{
+    cJSON *catalog_id = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
+        : NULL;
+    cJSON *offset = root ? cJSON_GetObjectItemCaseSensitive(root, "offset") : NULL;
+    cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+    int chunk_offset = cJSON_IsNumber(offset) ? offset->valueint : -1;
+    int chunk_rows = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
+    if (!cJSON_IsString(catalog_id) ||
+        strcmp(catalog_id->valuestring, s_identity_catalog_stage_id) != 0 ||
+        chunk_offset < 0 ||
+        (size_t)chunk_offset != s_identity_catalog_stage_rows ||
+        chunk_rows < 0 ||
+        s_identity_catalog_stage_rows + (size_t)chunk_rows >
+            s_identity_catalog_stage_expected) {
+        return false;
+    }
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "a");
+    bool ok = file != NULL;
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+        if (!cJSON_IsObject(row) ||
+            (ok && !write_encrypted_json_line(file, row))) {
+            ok = false;
+        }
+    }
+    if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) ok = false;
+    if (file) fclose(file);
+    if (ok) {
+        s_identity_catalog_stage_rows += (size_t)chunk_rows;
+    }
+    return ok;
+}
+
+static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out)
+{
+    cJSON *catalog_id = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
+        : NULL;
+    cJSON *rows_count = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "rows_count")
+        : NULL;
+    int expected = cJSON_IsNumber(rows_count) ? rows_count->valueint : -1;
+    bool ok = cJSON_IsString(catalog_id) &&
+        strcmp(catalog_id->valuestring, s_identity_catalog_stage_id) == 0 &&
+        expected >= 0 &&
+        (size_t)expected == s_identity_catalog_stage_expected &&
+        s_identity_catalog_stage_rows == s_identity_catalog_stage_expected;
+    if (ok) {
+        ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    }
+    if (ok && row_count_out) {
+        *row_count_out = s_identity_catalog_stage_rows;
+    }
+    if (!ok) {
+        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    }
+    s_identity_catalog_stage_id[0] = '\0';
+    s_identity_catalog_stage_expected = 0;
+    s_identity_catalog_stage_rows = 0;
     return ok;
 }
 
@@ -525,6 +683,28 @@ bool add_connector_persist_command_tombstone(const add_command_t *command)
         char *plain = decrypt_storage_line(line);
         root = plain ? cJSON_Parse(plain) : NULL;
         free(plain);
+        cJSON *legacy_rows = root
+            ? cJSON_GetObjectItemCaseSensitive(root, "rows")
+            : NULL;
+        if (root && !cJSON_IsArray(legacy_rows)) {
+            cJSON_Delete(root);
+            root = cJSON_CreateObject();
+            cJSON_AddStringToObject(root, "schema_version", "3");
+            cJSON_AddStringToObject(root, "type", "identity_catalog");
+            cJSON *stream_rows = cJSON_AddArrayToObject(root, "rows");
+            while (stream_rows && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+                char *row_plain = decrypt_storage_line(line);
+                cJSON *row = row_plain ? cJSON_Parse(row_plain) : NULL;
+                free(row_plain);
+                if (!cJSON_IsObject(row)) {
+                    cJSON_Delete(row);
+                    cJSON_Delete(root);
+                    root = NULL;
+                    break;
+                }
+                cJSON_AddItemToArray(stream_rows, row);
+            }
+        }
     }
     if (file) fclose(file);
     free(line);
@@ -866,10 +1046,68 @@ static void parse_inbound(const char *data, size_t len)
         cJSON_Delete(root);
         return;
     }
+    if (cJSON_IsString(type) &&
+        strcmp(type->valuestring, "identity_catalog_begin") == 0) {
+        if (!identity_catalog_stage_begin(root)) {
+            add_connector_log(
+                "ERROR",
+                "identity",
+                "IDENTITY_CATALOG_STAGE_FAILED",
+                "Could not start bounded ADD identity catalog staging; active catalog remains unchanged");
+        }
+        cJSON_Delete(root);
+        return;
+    }
+    if (cJSON_IsString(type) &&
+        strcmp(type->valuestring, "identity_catalog_chunk") == 0) {
+        if (!identity_catalog_stage_chunk(root)) {
+            (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+            s_identity_catalog_stage_id[0] = '\0';
+            s_identity_catalog_stage_expected = 0;
+            s_identity_catalog_stage_rows = 0;
+            add_connector_log(
+                "ERROR",
+                "identity",
+                "IDENTITY_CATALOG_CHUNK_REJECTED",
+                "ADD identity catalog chunk was incomplete or out of order; active catalog remains unchanged");
+        }
+        cJSON_Delete(root);
+        return;
+    }
+    if (cJSON_IsString(type) &&
+        strcmp(type->valuestring, "identity_catalog_commit") == 0) {
+        size_t row_count = 0;
+        if (!identity_catalog_stage_commit(root, &row_count)) {
+            add_connector_log(
+                "ERROR",
+                "identity",
+                "IDENTITY_CATALOG_COMMIT_REJECTED",
+                "ADD identity catalog commit did not match the complete staged row count; active catalog remains unchanged");
+        } else if (s_lock &&
+                   xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            s_identity_catalog_rows = row_count;
+            s_identity_catalog_generation++;
+            if (s_identity_catalog_generation == 0) {
+                s_identity_catalog_generation = 1;
+            }
+            xSemaphoreGive(s_lock);
+            ESP_LOGI(
+                TAG,
+                "Committed bounded encrypted ADD identity catalog rows=%u",
+                (unsigned)row_count);
+        }
+        cJSON_Delete(root);
+        return;
+    }
     if (cJSON_IsString(type) && strcmp(type->valuestring, "identity_catalog") == 0) {
         size_t row_count = 0;
         if (!persist_identity_catalog(root, &row_count)) {
             ESP_LOGE(TAG, "Could not persist encrypted ADD identity tombstone catalog");
+            add_connector_log(
+                "ERROR",
+                "identity",
+                "IDENTITY_CATALOG_PERSIST_FAILED",
+                "Fresh ADD identity catalog could not be committed atomically; boot health remains fail-closed");
         } else {
             if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 s_identity_catalog_rows = row_count;
@@ -2357,6 +2595,7 @@ bool add_connector_lookup_identity(
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+        bool legacy_catalog = cJSON_IsArray(rows);
         cJSON *row = NULL;
         cJSON_ArrayForEach(row, rows) {
             cJSON *candidate = cJSON_GetObjectItemCaseSensitive(row, "user_id");
@@ -2376,6 +2615,42 @@ bool add_connector_lookup_identity(
         }
         cJSON_Delete(root);
         free(plain);
+        // Schema v3 stores one encrypted JSON row per line.  This keeps
+        // lookups and catalog replacement bounded independently of fleet size
+        // while retaining support for the legacy single-object catalog.
+        if (!found && !legacy_catalog) {
+            while (fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+                char *row_plain = decrypt_storage_line(line);
+                row = row_plain ? cJSON_Parse(row_plain) : NULL;
+                free(row_plain);
+                cJSON *candidate = row
+                    ? cJSON_GetObjectItemCaseSensitive(row, "user_id")
+                    : NULL;
+                if (cJSON_IsString(candidate) &&
+                    strcmp(candidate->valuestring, user_id) == 0) {
+                    cJSON *name =
+                        cJSON_GetObjectItemCaseSensitive(row, "display_name");
+                    cJSON *identity =
+                        cJSON_GetObjectItemCaseSensitive(row, "cnic");
+                    cJSON *shift =
+                        cJSON_GetObjectItemCaseSensitive(row, "shift_worker");
+                    if (display_name && display_name_size &&
+                        cJSON_IsString(name)) {
+                        strlcpy(
+                            display_name,
+                            name->valuestring,
+                            display_name_size);
+                    }
+                    if (cnic && cnic_size && cJSON_IsString(identity)) {
+                        strlcpy(cnic, identity->valuestring, cnic_size);
+                    }
+                    if (shift_worker) *shift_worker = cJSON_IsTrue(shift);
+                    found = true;
+                }
+                cJSON_Delete(row);
+                if (found) break;
+            }
+        }
     }
     if (file) fclose(file);
     free(line);

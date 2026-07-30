@@ -66,6 +66,7 @@ class BrowserEventHub:
 class ConnectorHub:
     def __init__(self) -> None:
         self._connections: dict[str, WebSocket] = {}
+        self._send_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, connector_id: str, websocket: WebSocket) -> None:
@@ -75,6 +76,7 @@ class ConnectorHub:
         async with self._lock:
             previous = self._connections.get(connector_id)
             self._connections[connector_id] = websocket
+            self._send_locks.setdefault(connector_id, asyncio.Lock())
         if previous and previous is not websocket:
             try:
                 await previous.close(code=4001, reason="Superseded by a newer connector session")
@@ -87,16 +89,24 @@ class ConnectorHub:
                 self._connections.pop(connector_id, None)
 
     async def send(self, connector_id: str, payload: dict) -> bool:
+        return await self.send_many(connector_id, [payload])
+
+    async def send_many(self, connector_id: str, payloads: list[dict]) -> bool:
         async with self._lock:
             websocket = self._connections.get(connector_id)
+            send_lock = self._send_locks.setdefault(connector_id, asyncio.Lock())
         if websocket is None:
             return False
-        try:
-            await websocket.send_text(json.dumps(payload, separators=(",", ":"), default=str))
-            return True
-        except Exception:
-            await self.disconnect(connector_id, websocket)
-            return False
+        async with send_lock:
+            try:
+                for payload in payloads:
+                    await websocket.send_text(
+                        json.dumps(payload, separators=(",", ":"), default=str)
+                    )
+                return True
+            except Exception:
+                await self.disconnect(connector_id, websocket)
+                return False
 
     async def is_connected(self, connector_id: str) -> bool:
         async with self._lock:

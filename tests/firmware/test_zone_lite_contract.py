@@ -754,7 +754,7 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     assert "event->payload_offset" in connector
     assert "offset != s_inbound_payload_received" in connector
     assert "s_inbound_payload_received == s_inbound_payload_expected" in connector
-    assert "#define ADD_INBOUND_QUEUE_DEPTH 8" in connector
+    assert "#define ADD_INBOUND_QUEUE_DEPTH 96" in connector
     assert "inbound_message_task" in connector
     assert 'xTaskCreate(inbound_message_task, "add_inbound", 12288' in connector
     assert "xQueueSend(s_inbound_messages, &message, 0)" in connector
@@ -771,6 +771,28 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     applied = runtime.index("applied_identity_catalog_generation = identity_catalog_generation")
     forced = runtime.index("g_force_truth_reconcile = true;", applied)
     assert applied < forced
+
+
+def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
+    connector = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
+    backend = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
+    realtime = (ROOT / "apps/add_backend/zk_add/realtime.py").read_text()
+
+    assert "#define ADD_INBOUND_QUEUE_DEPTH 96" in connector
+    assert 'cJSON_AddStringToObject(metadata, "schema_version", "3")' in connector
+    assert 'cJSON_AddNumberToObject(metadata, "rows_count", row_count)' in connector
+    assert "write_encrypted_json_line(file, metadata)" in connector
+    assert "write_encrypted_json_line(file, row)" in connector
+    assert "fflush(file) != 0 || fsync(fileno(file)) != 0" in connector
+    assert "activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH)" in connector
+    assert "ADD_IDENTITY_CATALOG_BACKUP_PATH" in connector
+    assert '"IDENTITY_CATALOG_PERSIST_FAILED"' in connector
+    assert '"type": "identity_catalog_begin"' in backend
+    assert '"type": "identity_catalog_chunk"' in backend
+    assert '"type": "identity_catalog_commit"' in backend
+    assert "IDENTITY_CATALOG_CHUNK_ROWS = 64" in backend
+    assert "connector_hub.send_many" in backend
+    assert "async def send_many" in realtime
 
 
 def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():

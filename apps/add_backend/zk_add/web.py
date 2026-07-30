@@ -129,6 +129,7 @@ from zk_add.time_utils import utc_now
 
 
 logger = logging.getLogger(__name__)
+IDENTITY_CATALOG_CHUNK_ROWS = 64
 
 
 def get_db():
@@ -161,6 +162,45 @@ def identity_catalog_payload(db: Session, connector: Connector) -> dict:
                 }
             )
     return {"schema_version": "2", "type": "identity_catalog", "rows": rows}
+
+
+def identity_catalog_messages(catalog: dict) -> list[dict]:
+    rows = list(catalog.get("rows") or [])
+    catalog_id = uuid4().hex
+    messages = [
+        {
+            "schema_version": "3",
+            "type": "identity_catalog_begin",
+            "catalog_id": catalog_id,
+            "rows_count": len(rows),
+        }
+    ]
+    for offset in range(0, len(rows), IDENTITY_CATALOG_CHUNK_ROWS):
+        messages.append(
+            {
+                "schema_version": "3",
+                "type": "identity_catalog_chunk",
+                "catalog_id": catalog_id,
+                "offset": offset,
+                "rows": rows[offset : offset + IDENTITY_CATALOG_CHUNK_ROWS],
+            }
+        )
+    messages.append(
+        {
+            "schema_version": "3",
+            "type": "identity_catalog_commit",
+            "catalog_id": catalog_id,
+            "rows_count": len(rows),
+        }
+    )
+    return messages
+
+
+async def send_identity_catalog(connector_id: str, catalog: dict) -> bool:
+    return await connector_hub.send_many(
+        connector_id,
+        identity_catalog_messages(catalog),
+    )
 
 
 @asynccontextmanager
@@ -756,7 +796,7 @@ async def create_identity_alias(
     db.commit()
     db.refresh(connector)
     payload = identity_catalog_payload(db, connector)
-    delivered = await connector_hub.send(connector.connector_id, payload)
+    delivered = await send_identity_catalog(connector.connector_id, payload)
     await browser_events.publish(
         "identity_alias",
         {
@@ -840,7 +880,7 @@ async def resolve_historical_directory_identity(
     db.commit()
     db.refresh(connector)
     payload = identity_catalog_payload(db, connector)
-    delivered = await connector_hub.send(connector.connector_id, payload)
+    delivered = await send_identity_catalog(connector.connector_id, payload)
     await browser_events.publish(
         "historical_directory_identity",
         {
@@ -900,7 +940,7 @@ async def resolve_historical_event_group_identity(
     db.commit()
     db.refresh(connector)
     payload = identity_catalog_payload(db, connector)
-    delivered = await connector_hub.send(connector.connector_id, payload)
+    delivered = await send_identity_catalog(connector.connector_id, payload)
     await browser_events.publish(
         "historical_event_group_identity",
         {
@@ -1694,7 +1734,9 @@ async def device_stream(websocket: WebSocket):
             "type": "identity_catalog",
             "rows": [],
         }
-    await websocket.send_json(catalog)
+    if not await send_identity_catalog(connector_id, catalog):
+        await websocket.close(code=1011, reason="Identity catalog delivery failed")
+        return
     await send_pending_commands(connector_id)
     try:
         while True:
