@@ -776,6 +776,7 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
 def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
     connector = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
     backend = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
+    catalog = (ROOT / "apps/add_backend/zk_add/identity_catalog.py").read_text()
     realtime = (ROOT / "apps/add_backend/zk_add/realtime.py").read_text()
 
     assert "#define ADD_INBOUND_QUEUE_DEPTH 96" in connector
@@ -786,11 +787,15 @@ def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
     assert "fflush(file) != 0 || fsync(fileno(file)) != 0" in connector
     assert "activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH)" in connector
     assert "ADD_IDENTITY_CATALOG_BACKUP_PATH" in connector
+    assert "backup_result == 0" in connector
+    assert "errno != ENOENT" in connector
+    assert "access(ADD_IDENTITY_CATALOG_PATH" not in connector
     assert '"IDENTITY_CATALOG_PERSIST_FAILED"' in connector
-    assert '"type": "identity_catalog_begin"' in backend
-    assert '"type": "identity_catalog_chunk"' in backend
-    assert '"type": "identity_catalog_commit"' in backend
-    assert "IDENTITY_CATALOG_CHUNK_ROWS = 64" in backend
+    assert '"type": "identity_catalog_begin"' in catalog
+    assert '"type": "identity_catalog_chunk"' in catalog
+    assert '"type": "identity_catalog_commit"' in catalog
+    assert "IDENTITY_CATALOG_CHUNK_ROWS = 64" in catalog
+    assert "from zk_add.identity_catalog import identity_catalog_messages" in backend
     assert "connector_hub.send_many" in backend
     assert "async def send_many" in realtime
 

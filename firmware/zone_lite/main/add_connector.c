@@ -508,11 +508,15 @@ static bool activate_identity_catalog(const char *staged_path)
 {
     if (!staged_path) return false;
     (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    bool had_active = access(ADD_IDENTITY_CATALOG_PATH, F_OK) == 0;
-    if (had_active &&
-        rename(
-            ADD_IDENTITY_CATALOG_PATH,
-            ADD_IDENTITY_CATALOG_BACKUP_PATH) != 0) {
+    // Some ESP-IDF VFS backends do not implement access() even though rename()
+    // is supported.  Treat a successful rename as the authoritative existence
+    // check; ENOENT is the only valid "no active catalog yet" result.
+    errno = 0;
+    int backup_result = rename(
+        ADD_IDENTITY_CATALOG_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH);
+    bool had_active = backup_result == 0;
+    if (!had_active && errno != ENOENT) {
         return false;
     }
     if (rename(staged_path, ADD_IDENTITY_CATALOG_PATH) == 0) {
