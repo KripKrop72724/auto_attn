@@ -57,6 +57,8 @@ jobs:
           ref: ${{ needs.provenance.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+      - name: Run large-catalog rollout preflight
+        run: python3 tests/firmware/test_identity_catalog_rollout_preflight.py
       - name: Build the exact unsigned candidate
         working-directory: firmware/zone_lite
         shell: bash

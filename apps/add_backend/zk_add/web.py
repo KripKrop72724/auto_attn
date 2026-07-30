@@ -34,6 +34,7 @@ from zk_add.identity_conflicts import (
     revoke_identity_resolution,
     valid_identity_resolutions,
 )
+from zk_add.identity_catalog import identity_catalog_messages
 from zk_add.db import SessionLocal, init_db, session_scope
 from zk_add.models import (
     AdminSession,
@@ -129,7 +130,6 @@ from zk_add.time_utils import utc_now
 
 
 logger = logging.getLogger(__name__)
-IDENTITY_CATALOG_CHUNK_ROWS = 64
 
 
 def get_db():
@@ -162,38 +162,6 @@ def identity_catalog_payload(db: Session, connector: Connector) -> dict:
                 }
             )
     return {"schema_version": "2", "type": "identity_catalog", "rows": rows}
-
-
-def identity_catalog_messages(catalog: dict) -> list[dict]:
-    rows = list(catalog.get("rows") or [])
-    catalog_id = uuid4().hex
-    messages = [
-        {
-            "schema_version": "3",
-            "type": "identity_catalog_begin",
-            "catalog_id": catalog_id,
-            "rows_count": len(rows),
-        }
-    ]
-    for offset in range(0, len(rows), IDENTITY_CATALOG_CHUNK_ROWS):
-        messages.append(
-            {
-                "schema_version": "3",
-                "type": "identity_catalog_chunk",
-                "catalog_id": catalog_id,
-                "offset": offset,
-                "rows": rows[offset : offset + IDENTITY_CATALOG_CHUNK_ROWS],
-            }
-        )
-    messages.append(
-        {
-            "schema_version": "3",
-            "type": "identity_catalog_commit",
-            "catalog_id": catalog_id,
-            "rows_count": len(rows),
-        }
-    )
-    return messages
 
 
 async def send_identity_catalog(connector_id: str, catalog: dict) -> bool:
