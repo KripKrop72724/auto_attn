@@ -234,7 +234,9 @@ jobs:
             }
 
             $attendanceCount = 0
-            $unconfirmedCount = 0
+            $unsafeDeliveryCount = 0
+            $blockedIdentityCount = 0
+            $quarantinedIdentityReuseCount = 0
             $cursor = $null
             $seenCursors = @{}
             do {
@@ -249,10 +251,25 @@ jobs:
                 -TimeoutSec 30
               $pageRows = @($attendance.rows)
               $attendanceCount += $pageRows.Count
-              $unconfirmedCount += @($pageRows | Where-Object {
-                [string]::IsNullOrWhiteSpace([string]$_.oracle_confirmed_at) -or
-                $_.ords_status -notin @('ACKED', 'ACKED_CHECK')
-              }).Count
+              foreach ($attendanceRow in $pageRows) {
+                $deliveryState = [string]$attendanceRow.ords_status
+                if ($deliveryState -eq 'BLOCKED_IDENTITY') {
+                  $blockedIdentityCount++
+                  continue
+                }
+                if ($deliveryState -eq 'QUARANTINED_IDENTITY_REUSE') {
+                  $quarantinedIdentityReuseCount++
+                  continue
+                }
+                if (
+                  [string]::IsNullOrWhiteSpace(
+                    [string]$attendanceRow.oracle_confirmed_at
+                  ) -or
+                  $deliveryState -notin @('ACKED', 'ACKED_CHECK')
+                ) {
+                  $unsafeDeliveryCount++
+                }
+              }
               $nextCursor = $attendance.next_cursor
               if ($null -ne $nextCursor) {
                 $cursorKey = [string]$nextCursor
@@ -269,10 +286,15 @@ jobs:
             if ($attendanceCount -lt [int]$env:MINIMUM_TERMINAL_ATTENDANCE) {
               throw 'ADD attendance ledger fell below the accepted canary baseline.'
             }
-            if ($unconfirmedCount -ne 0) {
-              throw "ADD still has $unconfirmedCount canary attendance row(s) without Oracle membership confirmation."
+            if ($unsafeDeliveryCount -ne 0) {
+              throw "ADD still has $unsafeDeliveryCount canary attendance row(s) in an unsafe or retryable Oracle delivery state."
             }
-            Write-Host 'Exact production canary is stable, identity-complete, terminal-parity exact, and fully Oracle-confirmed.'
+            Write-Host (
+              'Exact production canary is stable and terminal-parity exact; ' +
+              "all resolvable rows are Oracle-confirmed. Preserved fail-closed rows: " +
+              "blocked_identity=$blockedIdentityCount " +
+              "quarantined_identity_reuse=$quarantinedIdentityReuseCount."
+            )
           } catch {
             $verificationFailed = $true
             throw

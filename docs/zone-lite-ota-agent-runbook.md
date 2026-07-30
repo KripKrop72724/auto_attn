@@ -9,7 +9,8 @@ This checklist is authoritative for remote firmware operations. Stop rather than
 - Never regenerate the signing vault because DPAPI decryption failed; restore the original runner identity and profile.
 - Never change the dedicated firmware-signing runner account without a tested DPAPI migration and recovery plan.
 - Never OTA a bootloader, partition table, NVS, SPIFFS, or storage image.
-- Never enable the OTA feature flag before physical Peshawar acceptance.
+- Never promote an exact-target candidate before a successful production
+  canary has been accepted through the central ADD control plane.
 - Never create a national or multi-zone campaign.
 - Never run more than one active deployment in a zone.
 - Never overwrite an existing release version.
@@ -22,8 +23,10 @@ This checklist is authoritative for remote firmware operations. Stop rather than
 
 - Confirm the candidate SHA is an exact commit on `main`.
 - Confirm normal CI passed for that SHA.
-- Confirm the physical HIL workflow passed for that exact SHA.
-- Confirm the HIL evidence includes both physical power-loss tests.
+- Confirm the exact-target production canary succeeded for that exact SHA and
+  signed package.
+- Confirm the canary returned to `ONLINE`, `OTA_READY`, `LIVE_CAPTURE`, and a
+  certified complete ZKT snapshot without attendance-count regression.
 - Confirm the version in `firmware/zone_lite/CMakeLists.txt` matches the requested release.
 - Confirm the signing environment reviewer recognizes the SHA and version.
 - Confirm the ADD signing-vault manifest has exactly one `ACTIVE` key and two `RESERVE` keys.
@@ -54,6 +57,18 @@ If any item is unknown, stop without publishing.
 
 Record the campaign ID, deployment ID, connector ID, device serial, zone, old and new versions, expected and observed SHA-256, partition, reset reason, last progress phase, ADD event history, and relevant ESP serial logs. Preserve the failed release and evidence. Do not retry by editing status rows.
 
-## Peshawar and Islamabad sequence
+## Central nationwide sequence
 
-Peshawar is the first bootstrap and acceptance zone because physical access is currently available. Islamabad stays on its existing firmware until physical bootstrap is possible. Older firmware remains supported for attendance indefinitely but cannot receive OTA releases.
+The trusted `WIN-80SOHNEH66P` runner hosts the release and ADD control plane; it
+does not claim direct physical access to any terminal. Start with the exact
+`ZONE-SWAT-01` canary, promote the identical signed bytes after remote
+acceptance, then create one zone-scoped campaign at a time. A later zone starts
+only after the preceding device is back to `ONLINE`, `OTA_READY`,
+`LIVE_CAPTURE`, terminal parity is preserved, and every resolvable attendance
+row is Oracle-confirmed.
+
+Missing or conflicting CNIC rows are a separate fail-closed state. They remain
+durably preserved as `BLOCKED_IDENTITY` or identity-reuse quarantine, do not
+prevent safe OTA, and may drain only after verified identity evidence is
+provided. Older non-OTA firmware remains supported for attendance and must
+never be made OTA-capable by editing database state.

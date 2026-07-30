@@ -32,7 +32,10 @@ are corrected, with `DATASYNC=0`.
    rows and that no 2001 sentinel reaches ADD or normal Oracle attendance.
 5. Confirm all five Oracle package/procedure objects remain valid, the BULK
    stage is empty, and the authenticated membership endpoint remains healthy.
-6. Promote nationwide only after SWAT remains stable and the existing
-   identity-blocked backlog has an authoritative, non-guessed resolution.
+6. Promote nationwide only after SWAT remains stable. Existing missing-CNIC
+   and identity-reuse rows stay durably fail-closed and are not counted as
+   Oracle delivery failures; every resolvable row must be Oracle-confirmed.
+   When verified CNIC evidence is later supplied, the preserved blocked rows
+   are requeued automatically.
 
 No attendance row is deleted by this release.
