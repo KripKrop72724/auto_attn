@@ -125,6 +125,7 @@ static bool s_connected_edge;
 static bool s_ack_matched;
 static bool s_onboarding_task_started;
 static bool s_command_inbox_restored;
+static bool s_inbound_worker_started;
 static char s_waiting_ack[80];
 static char s_running_command_id[48];
 static char s_queued_command_ids[ADD_COMMAND_QUEUE_DEPTH][48];
@@ -1009,7 +1010,10 @@ static void receive_inbound_fragment(const esp_websocket_event_data_t *event)
         s_inbound_payload = NULL;
         s_inbound_payload_expected = 0;
         s_inbound_payload_received = 0;
-        if (xQueueSend(s_inbound_messages, &message, 0) != pdTRUE) {
+        if (!s_inbound_worker_started) {
+            ESP_LOGE(TAG, "Inbound ADD worker is unavailable; rejecting complete message");
+            free(message.data);
+        } else if (xQueueSend(s_inbound_messages, &message, 0) != pdTRUE) {
             ESP_LOGE(TAG, "Inbound ADD message queue is full; dropping complete message");
             free(message.data);
         }
@@ -1959,9 +1963,11 @@ void add_connector_init(void)
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
                 s_ack_sem && s_command_lock && s_commands && s_inbound_messages;
-    if (s_started &&
-        xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
-        s_started = false;
+    if (s_started) {
+        s_inbound_worker_started =
+            xTaskCreate(inbound_message_task, "add_inbound", 8192, NULL, 4, NULL) == pdPASS;
+    }
+    if (s_started && !s_inbound_worker_started) {
         ESP_LOGE(TAG, "Could not start bounded ADD inbound message worker");
     }
 }
@@ -2218,6 +2224,7 @@ bool add_connector_boot_health_ready(void)
     bool ready = false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         ready = s_connected
+            && s_inbound_worker_started
             && s_identity_catalog_generation > 0
             && s_zkt.online
             && strcmp(s_zkt.connection_state, "ONLINE") == 0

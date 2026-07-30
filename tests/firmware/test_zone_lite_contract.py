@@ -756,7 +756,8 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     assert "s_inbound_payload_received == s_inbound_payload_expected" in connector
     assert "#define ADD_INBOUND_QUEUE_DEPTH 8" in connector
     assert "inbound_message_task" in connector
-    assert 'xTaskCreate(inbound_message_task, "add_inbound", 12288' in connector
+    assert 'xTaskCreate(inbound_message_task, "add_inbound", 8192' in connector
+    assert "&& s_inbound_worker_started" in connector
     assert "xQueueSend(s_inbound_messages, &message, 0)" in connector
     assert "parse_inbound(message.data, message.length)" in connector
     assert "cJSON *root = cJSON_Parse(data);" in connector
