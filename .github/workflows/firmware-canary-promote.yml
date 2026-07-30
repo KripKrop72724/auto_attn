@@ -181,7 +181,12 @@ jobs:
                   [bool]$row.connected -and
                   [bool]$row.ota_capable -and
                   $row.ota_state -eq 'OTA_READY' -and
-                  $row.current_activity -eq 'LIVE_CAPTURE' -and
+                  # A freshly recovered live socket reports ONLINE until the
+                  # first punch or reconciliation changes the activity label
+                  # to LIVE_CAPTURE. Both states are operational; the ZKT,
+                  # snapshot, attendance-parity, and Oracle-proof checks below
+                  # remain mandatory.
+                  @('ONLINE', 'LIVE_CAPTURE') -contains [string]$row.current_activity -and
                   [bool]$row.zkt.online -and
                   $row.zkt.connection_state -eq 'ONLINE' -and
                   $row.zkt.certification_state -eq 'CERTIFIED' -and

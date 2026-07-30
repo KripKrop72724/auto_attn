@@ -69,7 +69,7 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         "CANARY_ACCEPTED:",
         '$row.firmware_version -eq "zone-lite-$env:EXPECTED_VERSION"',
         "$row.ota_state -eq 'OTA_READY'",
-        "$row.current_activity -eq 'LIVE_CAPTURE'",
+        "@('ONLINE', 'LIVE_CAPTURE') -contains [string]$row.current_activity",
         "$row.zkt.connection_state -eq 'ONLINE'",
         "$row.zkt.certification_state -eq 'CERTIFIED'",
         "[int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE",
