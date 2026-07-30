@@ -2459,10 +2459,20 @@ bool add_connector_boot_health_ready(void)
 {
     bool ready = false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        time_t now = time(NULL);
+        bool authenticated_stability_elapsed =
+            s_zkt.stability_since_epoch > 1700000000 &&
+            now >= s_zkt.stability_since_epoch &&
+            ((uint64_t)(now - s_zkt.stability_since_epoch) * 1000ULL) >=
+                ZONE_LITE_RECOVERY_STABILITY_MS;
+        bool stable_terminal_session =
+            strcmp(s_zkt.connection_state, "ONLINE") == 0 ||
+            (strcmp(s_zkt.connection_state, "RECOVERING") == 0 &&
+             authenticated_stability_elapsed);
         ready = s_connected
             && s_identity_catalog_generation > 0
             && s_zkt.online
-            && strcmp(s_zkt.connection_state, "ONLINE") == 0
+            && stable_terminal_session
             && s_zkt.user_count >= 0
             && s_zkt.attendance_count >= 0;
         xSemaphoreGive(s_lock);

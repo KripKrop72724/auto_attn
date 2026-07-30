@@ -839,6 +839,10 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     assert "bool add_connector_boot_health_ready(void)" in connector
     assert "s_identity_catalog_generation > 0" in connector
     assert 'strcmp(s_zkt.connection_state, "ONLINE") == 0' in connector
+    assert 'strcmp(s_zkt.connection_state, "RECOVERING") == 0' in connector
+    assert "authenticated_stability_elapsed" in connector
+    assert "s_zkt.stability_since_epoch > 1700000000" in connector
+    assert "ZONE_LITE_RECOVERY_STABILITY_MS" in connector
     assert "s_zkt.user_count >= 0" in connector
     assert "s_zkt.attendance_count >= 0" in connector
     assert "bool add_connector_boot_health_ready(void);" in header
