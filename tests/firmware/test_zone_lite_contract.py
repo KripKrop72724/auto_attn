@@ -754,7 +754,13 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     assert "event->payload_offset" in connector
     assert "offset != s_inbound_payload_received" in connector
     assert "s_inbound_payload_received == s_inbound_payload_expected" in connector
-    assert "parse_inbound(s_inbound_payload, s_inbound_payload_expected)" in connector
+    assert "#define ADD_INBOUND_QUEUE_DEPTH 8" in connector
+    assert "inbound_message_task" in connector
+    assert 'xTaskCreate(inbound_message_task, "add_inbound", 12288' in connector
+    assert "xQueueSend(s_inbound_messages, &message, 0)" in connector
+    assert "parse_inbound(message.data, message.length)" in connector
+    assert "cJSON *root = cJSON_Parse(data);" in connector
+    assert "char *copy = calloc(1, len + 1);" not in connector
     assert "reset_inbound_payload();" in connector
     assert "ADD_IDENTITY_CATALOG_MAX_ROWS 4096" in connector
     assert "s_identity_catalog_generation++" in connector

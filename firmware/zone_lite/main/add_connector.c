@@ -55,6 +55,7 @@
 #endif
 
 #define ADD_COMMAND_QUEUE_DEPTH 32
+#define ADD_INBOUND_QUEUE_DEPTH 8
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
@@ -101,9 +102,15 @@ typedef struct {
     SemaphoreHandle_t lock;
 } add_outbox_t;
 
+typedef struct {
+    char *data;
+    size_t length;
+} add_inbound_message_t;
+
 static const char *TAG = "add_connector";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
+static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
@@ -821,13 +828,7 @@ static void parse_inbound(const char *data, size_t len)
     if (len == 0 || len > ADD_MAX_INBOUND_BYTES) {
         return;
     }
-    char *copy = calloc(1, len + 1);
-    if (!copy) {
-        return;
-    }
-    memcpy(copy, data, len);
-    cJSON *root = cJSON_Parse(copy);
-    free(copy);
+    cJSON *root = cJSON_Parse(data);
     if (!root) {
         return;
     }
@@ -949,6 +950,21 @@ static void reset_inbound_payload(void)
     s_inbound_payload_received = 0;
 }
 
+static void inbound_message_task(void *argument)
+{
+    (void)argument;
+    add_inbound_message_t message = {0};
+    while (true) {
+        if (xQueueReceive(s_inbound_messages, &message, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        parse_inbound(message.data, message.length);
+        free(message.data);
+        message.data = NULL;
+        message.length = 0;
+    }
+}
+
 static void receive_inbound_fragment(const esp_websocket_event_data_t *event)
 {
     if (!event || event->payload_len <= 0 || event->data_len < 0 ||
@@ -986,8 +1002,17 @@ static void receive_inbound_fragment(const esp_websocket_event_data_t *event)
     s_inbound_payload_received += length;
     if (s_inbound_payload_received == s_inbound_payload_expected) {
         s_inbound_payload[s_inbound_payload_expected] = '\0';
-        parse_inbound(s_inbound_payload, s_inbound_payload_expected);
-        reset_inbound_payload();
+        add_inbound_message_t message = {
+            .data = s_inbound_payload,
+            .length = s_inbound_payload_expected,
+        };
+        s_inbound_payload = NULL;
+        s_inbound_payload_expected = 0;
+        s_inbound_payload_received = 0;
+        if (xQueueSend(s_inbound_messages, &message, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Inbound ADD message queue is full; dropping complete message");
+            free(message.data);
+        }
     }
 }
 
@@ -1921,6 +1946,7 @@ void add_connector_init(void)
     s_ack_sem = xSemaphoreCreateBinary();
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(
@@ -1932,7 +1958,12 @@ void add_connector_init(void)
     s_zkt.user_count = -1;
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
-                s_ack_sem && s_command_lock && s_commands;
+                s_ack_sem && s_command_lock && s_commands && s_inbound_messages;
+    if (s_started &&
+        xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
+        s_started = false;
+        ESP_LOGE(TAG, "Could not start bounded ADD inbound message worker");
+    }
 }
 
 typedef struct {
