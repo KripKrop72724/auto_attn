@@ -16,9 +16,20 @@ Devices on older firmware remain fully operational and continue sending attendan
 ## Architecture
 
 1. GitHub Actions builds an exact commit from `main` with ESP-IDF 5.5.3.
-2. The protected signing and production environments publish an immutable `HIL_ONLY` package quarantined to one exact, locally attached ESP MAC. National OTA remains disabled.
-3. A physical hardware-in-the-loop run proves attendance continuity, download power-loss recovery, first-boot rollback, and queue preservation for that exact SHA and exact signed package.
-4. The protected `firmware-production` environment promotes the same tested bytes by removing the server-side quarantine marker. It never rebuilds, resigns, or replaces the package.
+2. The protected signing and production environments publish an immutable
+   `HIL_ONLY` package quarantined to one exact production-canary ESP MAC.
+   `HIL_ONLY` is retained as the storage-state name for exact-target
+   quarantine; it does not imply that the head-office runner has a physically
+   attached device. National OTA remains disabled.
+3. The exact-target production canary remotely proves signed-package
+   acceptance, attendance continuity, reconnect recovery, terminal parity,
+   durable queue preservation, and restored live operation for that exact SHA
+   and package. Physical HIL remains an optional laboratory qualification when
+   a directly attached rig exists; the head-office runner must never be
+   falsely labelled as a physical rig.
+4. The protected `firmware-production` environment promotes the same
+   canary-tested bytes by removing the server-side quarantine marker. It never
+   rebuilds, resigns, or replaces the package.
 5. An administrator creates a per-zone production campaign after password step-up and typed confirmation.
 6. ADD offers the release to one eligible ESP at a time in that zone.
 7. The ESP downloads to the inactive OTA slot, checkpoints progress in encrypted NVS, verifies metadata and SHA-256, and switches the boot partition.
@@ -91,13 +102,20 @@ The rig must deliberately remove power during download and again during first bo
 ## Release procedure
 
 1. Merge the firmware change to `main` only after normal CI is green.
-2. Run `Zone Lite quarantined HIL candidate` with the exact main SHA, semantic version, and locally attached ESP MAC.
+2. Run `Zone Lite quarantined HIL candidate` with the exact main SHA, semantic
+   version, and exact production-canary ESP MAC.
 3. Confirm ADD shows the release as `HIL_ONLY`, national OTA remains disabled, and only that exact MAC is eligible.
-4. Run `Zone Lite OTA hardware gate` with the exact main SHA and physical rig.
-5. Record the successful HIL workflow run ID.
-6. Run `Zone Lite signed firmware release` with the same SHA, semantic version, and HIL run ID. This promotes the exact tested package without rebuilding it.
-7. Approve the protected production environment only after checking its displayed SHA, version, image hash, and HIL run.
-8. Keep `ADD_FIRMWARE_OTA_ENABLED=false` until the Peshawar acceptance checklist is signed off.
+4. Run one exact-target campaign for `ZONE-SWAT-01`, observe successful OTA,
+   restored live capture, preserved terminal counts, and Oracle delivery for
+   every resolvable attendance row, then close it with an audited
+   `CANARY_ACCEPTED:` reason.
+5. Run `Zone Lite production canary promotion` with the same SHA, version,
+   accepted campaign, zone, and ESP MAC. This promotes the exact tested
+   package without rebuilding or resigning it.
+6. Approve the protected production environment only after checking its
+   displayed SHA, version, image hashes, accepted campaign, and canary device.
+7. Keep each subsequent campaign zone-scoped and start the next only after the
+   preceding zone returns to its complete stable-operation contract.
 
 Published versions are immutable. If a defect is found, revoke the release and publish a new version. Never replace a `.bin` or manifest under an existing version.
 
@@ -105,12 +123,13 @@ Published versions are immutable. If a defect is found, revoke the release and p
 
 Campaigns are always per-zone. Creation requires a recent password step-up, CSRF protection, the typed zone name, and the typed firmware version.
 
-1. Start with one Peshawar canary ESP.
+1. Start with the exact `ZONE-SWAT-01` canary ESP.
 2. Observe download, reboot, first-boot confirmation, normal punch ingestion, identity reconciliation, and queued-delivery recovery.
 3. Wait through the agreed observation period.
-4. Continue one device at a time in Peshawar.
+4. Continue one zone-scoped campaign at a time from the central ADD backend.
 5. Pause immediately on any failure, rollback, unexpected identity state, or attendance regression.
-6. Roll out to Islamabad only after physical bootstrap there and a separate Islamabad HIL acceptance run.
+6. Update only devices that attest `OTA_READY`; legacy devices remain
+   operational and are reported separately.
 
 Do not convert a legacy device into an OTA campaign participant by editing the database. Eligibility must come from device capability attestation.
 
