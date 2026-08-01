@@ -7,6 +7,23 @@ export type DeviceState =
   | 'QUARANTINED_DUPLICATE_SERIAL'
   | string
 
+export interface PaginatedResponse<T> {
+  rows: T[]
+  next_cursor: number | null
+}
+
+export type DashboardRoute = 'fleet' | 'users' | 'attendance' | 'firmware' | 'alerts'
+
+export type FirmwareSection = 'overview' | 'releases' | 'campaigns'
+
+export interface FirmwareScopePreview {
+  zoneId: string
+  candidates: Device[]
+  otaReady: Device[]
+  excluded: Device[]
+  isHil: boolean
+}
+
 export interface ZktDevice {
   id: number
   serial: string | null

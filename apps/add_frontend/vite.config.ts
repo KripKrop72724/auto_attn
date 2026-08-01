@@ -6,6 +6,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: false,
+    exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
   },
   server: {
     proxy: {

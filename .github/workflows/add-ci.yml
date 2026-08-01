@@ -198,6 +198,18 @@ jobs:
         run: pnpm test
       - name: Build production dashboard
         run: pnpm run build
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run responsive and accessibility browser tests
+        run: pnpm test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: add-playwright-report
+          path: apps/add_frontend/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
 
   firmware:
     runs-on: ubuntu-latest
