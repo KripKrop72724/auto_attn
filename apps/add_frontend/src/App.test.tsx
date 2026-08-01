@@ -411,6 +411,7 @@ const fetchStub = (
 
 describe('State Life ADD interface', () => {
   beforeEach(() => {
+    window.history.replaceState({}, '', '/fleet')
     vi.stubGlobal('EventSource', EventSourceStub)
     vi.stubGlobal('fetch', fetchStub())
   })
@@ -677,12 +678,13 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
-    expect(await screen.findByRole('heading', { name: 'Firmware releases and campaigns' })).toBeTruthy()
-    expect(await screen.findByText(device.hardware_id)).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Firmware operations' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'New campaign' }))
 
     fireEvent.change(screen.getByLabelText('Signed release'), {
       target: { value: 'release-2-2-4' },
     })
+    expect(await screen.findByText(device.hardware_id)).toBeTruthy()
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).value).toBe(device.zone_id)
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText('Audited reason'), {
@@ -708,7 +710,8 @@ describe('State Life ADD interface', () => {
       typed_confirmation: '2.2.4',
       password: 'local-step-up-value',
     })
-    expect(password.value).toBe('')
+    expect(screen.queryByRole('dialog', { name: 'Create firmware campaign' })).toBeNull()
+    expect(document.body.textContent).not.toContain('local-step-up-value')
   })
 
   it('returns to the login screen when any request reports an expired session', async () => {

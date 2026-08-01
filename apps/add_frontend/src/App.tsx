@@ -8,8 +8,11 @@ import {
   useRef,
   useState,
 } from 'react'
+import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 import { api, ApiError, queryString, setCsrfToken } from './api'
+import { AppShell } from './AppShell'
 import { Icon } from './Icon'
+import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
 import type {
   Alert,
   AttendanceEvent,
@@ -28,9 +31,10 @@ import type {
   Overview,
   UserCommandResponse,
   UserDeletionJob,
+  DashboardRoute,
 } from './types'
 
-type View = 'fleet' | 'users' | 'attendance' | 'firmware' | 'alerts'
+type View = DashboardRoute
 type DrawerTab = 'overview' | 'logs' | 'control'
 type ToastState = { kind: 'notice' | 'error'; text: string } | null
 type UserDialogState =
@@ -372,9 +376,9 @@ function PageHeader({
   )
 }
 
-function Metric({ label, value, detail, icon }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name'] }) {
+function Metric({ label, value, detail, icon, tone = 'neutral' }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: 'neutral' | 'positive' | 'warning' | 'critical' }) {
   return (
-    <article className="metric-card">
+    <article className={`metric-card metric-${tone}`}>
       <span className="metric-icon"><Icon name={icon} /></span>
       <div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div>
     </article>
@@ -417,18 +421,19 @@ function FleetView({
         eyebrow="NATIONAL FLEET"
         title="Attendance device command center"
         description="Live operational state of every authorized Zone Lite ESP and its assigned ZKT terminal."
+        action={<div className="page-context"><span>National footprint</span><strong>{overview.total} authorized pairs</strong><small>Live control · PKT</small></div>}
       />
       <section className="metric-grid" aria-label="Fleet key indicators">
-        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" />
-        <Metric label="Needs review" value={overview.open_alerts} detail={`${attention} devices degraded or offline`} icon="alert" />
-        <Metric label="Enrollment access" value={overview.active_leases} detail="Temporary 10-minute leases" icon="shield" />
+        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" tone="positive" />
+        <Metric label="Open operations queue" value={overview.open_alerts} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline`} icon="alert" tone={overview.open_alerts ? 'warning' : 'positive'} />
         <Metric
           label="ORDS delivery queue"
           value={delivery?.backlog ?? 0}
-          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined · ${delivery?.firmware_unverified ?? delivery?.acknowledged_firmware ?? 0} firmware receipts awaiting Oracle proof · ${delivery?.membership_reverify ?? 0} periodic checks`}
+          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`}
           icon="clock"
+          tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 ? 'warning' : 'positive'}
         />
-        <Metric label="National footprint" value={overview.total} detail="Authorized ESP–ZKT pairs" icon="server" />
+        <Metric label="Enrollment access" value={overview.active_leases} detail="Active temporary administrator leases" icon="shield" tone={overview.active_leases ? 'warning' : 'neutral'} />
       </section>
       <section className="panel">
         <header className="panel-header">
@@ -1311,7 +1316,8 @@ function UsersView({
           {command && <CommandProgress command={command} onCancel={cancel} />}
           {deletionJob && <BulkDeletionProgress job={deletionJob} onCancel={cancelDeletionJob} />}
           {historicalReport && historicalReport.totals.unresolved_events > 0 && (
-            <section className="panel conflict-workbench" aria-label="Historical identity backlog">
+            <details className="panel conflict-workbench disclosure-panel" aria-label="Historical identity backlog">
+              <summary><span><Icon name="shield" /><strong>Historical identity backlog</strong></span><span>{historicalReport.totals.unresolved_events.toLocaleString()} preserved events <Icon name="chevron" /></span></summary>
               <div className="section-heading">
                 <div>
                   <p className="eyebrow">PRESERVED ATTENDANCE · IDENTITY REQUIRED</p>
@@ -1389,10 +1395,11 @@ function UsersView({
                   </article>
                 ))}
               </div>
-            </section>
+            </details>
           )}
           {conflictReport && conflictReport.raw_duplicate_groups > 0 && (
-            <section className="panel conflict-workbench" aria-label="Identity conflict review">
+            <details className="panel conflict-workbench disclosure-panel" aria-label="Identity conflict review">
+              <summary><span><Icon name="alert" /><strong>Exact-CNIC identity review</strong></span><span>{conflictReport.unresolved_groups} awaiting review <Icon name="chevron" /></span></summary>
               <div className="section-heading">
                 <div>
                   <p className="eyebrow">REVERSIBLE IDENTITY REVIEW</p>
@@ -1436,7 +1443,7 @@ function UsersView({
                   </article>
                 ))}
               </div>
-            </section>
+            </details>
           )}
           <section className="panel">
             <div className="toolbar user-toolbar">
@@ -1544,6 +1551,7 @@ function FirmwareCampaignControls({
   const [reason, setReason] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
+  const [pendingAction, setPendingAction] = useState<'pause' | 'resume' | 'cancel' | null>(null)
   const actionAllowed = reason.trim().length >= 10 && Boolean(password) && !busy
 
   const control = async (action: 'pause' | 'resume' | 'cancel') => {
@@ -1555,6 +1563,7 @@ function FirmwareCampaignControls({
       })
       setPassword('')
       setReason('')
+      setPendingAction(null)
       toast.notice(`Firmware campaign ${action === 'pause' ? 'paused' : action === 'resume' ? 'resumed' : 'cancelled'} with an audit entry.`)
       await onChanged()
     } catch (error) {
@@ -1568,39 +1577,30 @@ function FirmwareCampaignControls({
   if (!['ACTIVE', 'PAUSED'].includes(campaign.status)) return null
   return (
     <div className="firmware-controls">
-      <label>
-        Control reason
-        <input
-          value={reason}
-          onChange={(event) => setReason(event.target.value)}
-          maxLength={200}
-          placeholder="10–200 characters"
-        />
-      </label>
-      <label>
-        Administrator password
-        <input
-          type="password"
-          autoComplete="current-password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-        />
-      </label>
+      <div className="firmware-control-copy"><strong>Campaign controls</strong><small>Every change records an audited reason and administrator step-up.</small></div>
       <div className="firmware-control-actions">
         {campaign.status === 'ACTIVE' && (
-          <button className="button secondary" disabled={!actionAllowed} onClick={() => void control('pause')}>
+          <button className="button secondary" onClick={() => setPendingAction('pause')}>
             <Icon name="pause" /> Pause
           </button>
         )}
         {campaign.status === 'PAUSED' && (
-          <button className="button primary" disabled={!actionAllowed} onClick={() => void control('resume')}>
+          <button className="button primary" onClick={() => setPendingAction('resume')}>
             <Icon name="refresh" /> Resume
           </button>
         )}
-        <button className="button destructive" disabled={!actionAllowed} onClick={() => void control('cancel')}>
+        <button className="button destructive" onClick={() => setPendingAction('cancel')}>
           <Icon name="x" /> Cancel campaign
         </button>
       </div>
+      {pendingAction && <Dialog titleId="campaign-control-title" title={`${pendingAction === 'cancel' ? 'Cancel' : pendingAction === 'pause' ? 'Pause' : 'Resume'} firmware campaign`} description={`${campaign.zone_id} · ${campaign.version || 'Unknown release'} · ${campaign.campaign_id}`} onClose={() => { setPendingAction(null); setPassword(''); setReason('') }}>
+        <div className="dialog-body">
+          <div className={`info-copy pattern-${pendingAction === 'cancel' ? 'blocked' : 'waiting'}`}><Icon name={pendingAction === 'cancel' ? 'alert' : 'info'} /><div><h3>{pendingAction === 'cancel' ? 'This rollout cannot be resumed after cancellation.' : 'The campaign state changes immediately after server verification.'}</h3><p>Devices already applying signed bytes continue according to the durable deployment state.</p></div></div>
+          <label>Control reason<input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={200} placeholder="10–200 characters" /></label>
+          <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <div className="dialog-actions"><button className="button secondary" onClick={() => setPendingAction(null)}>Keep current state</button><button className={`button ${pendingAction === 'cancel' ? 'destructive' : 'primary'}`} disabled={!actionAllowed} onClick={() => void control(pendingAction)}>{busy ? 'Verifying…' : `Confirm ${pendingAction}`}</button></div>
+        </div>
+      </Dialog>}
     </div>
   )
 }
@@ -1609,10 +1609,14 @@ function FirmwareView({
   devices,
   revision,
   toast,
+  section,
+  onSection,
 }: {
   devices: Device[]
   revision: number
   toast: ReturnType<typeof useToast>
+  section: 'overview' | 'releases' | 'campaigns'
+  onSection: (section: 'overview' | 'releases' | 'campaigns') => void
 }) {
   const [releases, setReleases] = useState<FirmwareRelease[]>([])
   const [campaigns, setCampaigns] = useState<FirmwareCampaign[]>([])
@@ -1625,6 +1629,7 @@ function FirmwareView({
   const [reason, setReason] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
+  const [creatorOpen, setCreatorOpen] = useState(false)
 
   const zones = useMemo(
     () => [...new Set(devices.map((device) => device.zone_id).filter(Boolean))].sort(),
@@ -1710,6 +1715,7 @@ function FirmwareView({
       setConfirmation('')
       setReason('')
       toast.notice(`Firmware campaign created for ${result.eligible} eligible device${result.eligible === 1 ? '' : 's'}; ${result.legacy_skipped} skipped.`)
+      setCreatorOpen(false)
       await load()
     } catch (error) {
       setPassword('')
@@ -1720,13 +1726,16 @@ function FirmwareView({
     }
   }
 
+  const activeCampaigns = campaigns.filter((campaign) => ['ACTIVE', 'PAUSED'].includes(campaign.status))
+  const newestRelease = releases.find((release) => release.state !== 'REVOKED') || null
+
   return (
     <>
       <PageHeader
         eyebrow="SIGNED OTA CONTROL PLANE"
-        title="Firmware releases and campaigns"
-        description="Inspect signed artifacts, enforce HIL quarantine, and operate audited zone-scoped rollouts."
-        action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>}
+        title="Firmware operations"
+        description="Operate signed Zone Lite releases with exact scope, visible rollout evidence, and audited controls."
+        action={<div className="page-actions"><button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button><button className="button primary" onClick={() => setCreatorOpen(true)}><Icon name="plus" /> New campaign</button></div>}
       />
       <div className="firmware-mode-grid">
         <article className={`firmware-mode pattern-${enabled ? 'confirmed' : 'blocked'}`}>
@@ -1739,9 +1748,19 @@ function FirmwareView({
         </article>
       </div>
 
-      <section className="panel firmware-start-panel">
+      <nav className="section-tabs" aria-label="Firmware sections">
+        {(['overview', 'releases', 'campaigns'] as const).map((value) => <button key={value} className={section === value ? 'active' : ''} aria-current={section === value ? 'page' : undefined} onClick={() => onSection(value)}>{value === 'overview' ? 'Overview' : value === 'releases' ? `Signed releases (${releases.length})` : `Campaigns (${campaigns.length})`}</button>)}
+      </nav>
+
+      {section === 'overview' && <section className="firmware-overview-grid">
+        <article className="overview-hero"><p className="eyebrow">RELEASE POSTURE</p><h2>{newestRelease ? `Zone Lite ${newestRelease.version}` : 'No deployable release'}</h2><p>{newestRelease ? `Published ${dateTime(newestRelease.published_at)} · ${newestRelease.partition_layout}` : 'Publish a signed release before creating a production campaign.'}</p><button className="text-button" onClick={() => onSection('releases')}>Review release inventory <Icon name="chevron" /></button></article>
+        <article><span className="overview-icon"><Icon name="pulse" /></span><div><p>Active campaigns</p><strong>{activeCampaigns.length}</strong><small>{activeCampaigns.filter((campaign) => campaign.status === 'PAUSED').length} paused</small></div></article>
+        <article><span className="overview-icon"><Icon name="server" /></span><div><p>OTA-ready fleet</p><strong>{devices.filter((device) => device.ota_capable).length}/{devices.length}</strong><small>{devices.filter((device) => !device.ota_capable).length} legacy or blocked</small></div></article>
+      </section>}
+
+      {creatorOpen && <Dialog titleId="firmware-campaign-title" title="Create firmware campaign" description="Choose signed bytes, verify the exact scope, then complete administrator step-up." onClose={() => { setCreatorOpen(false); setPassword(''); setConfirmation(''); setReason('') }} className="firmware-campaign-dialog"><div className="firmware-start-panel">
         <div className="panel-header">
-          <div><h2>Start a constrained campaign</h2><p>Every start requires an exact release, zone, reason, typed version, and administrator step-up.</p></div>
+          <div><p className="eyebrow">1 RELEASE · 2 SCOPE · 3 CONFIRM</p><h2>Constrained rollout</h2><p>Server-side eligibility remains authoritative when the campaign is created.</p></div>
           <StatusBadge state={isHilRelease ? 'HIL_ONLY' : selectedRelease?.state || 'NO RELEASE SELECTED'} />
         </div>
         <form className="firmware-start-form" onSubmit={(event) => void start(event)}>
@@ -1808,9 +1827,9 @@ function FirmwareView({
             <Icon name="power" /> {busy ? 'Starting audited campaign…' : 'Start firmware campaign'}
           </button>
         </form>
-      </section>
+      </div></Dialog>}
 
-      <section className="panel firmware-section">
+      {section === 'releases' && <section className="panel firmware-section">
         <div className="panel-header"><div><h2>Signed release inventory</h2><p>Cryptographic identity and publication state from the server-side release store.</p></div></div>
         <div className="firmware-release-list" aria-busy={loading}>
           {releases.map((release) => (
@@ -1833,9 +1852,9 @@ function FirmwareView({
           ))}
           {!loading && !releases.length && <div className="empty-state"><Icon name="terminal" /><h3>No signed firmware releases are published.</h3></div>}
         </div>
-      </section>
+      </section>}
 
-      <section className="panel firmware-section">
+      {section === 'campaigns' && <section className="panel firmware-section">
         <div className="panel-header"><div><h2>Campaign history and controls</h2><p>Deployment counts are durable server state; pause, resume, and cancel require step-up authentication.</p></div></div>
         <div className="firmware-campaign-list" aria-busy={loading}>
           {campaigns.map((campaign) => (
@@ -1877,7 +1896,7 @@ function FirmwareView({
           ))}
           {!loading && !campaigns.length && <div className="empty-state"><Icon name="shield" /><h3>No firmware campaigns have been started.</h3></div>}
         </div>
-      </section>
+      </section>}
     </>
   )
 }
@@ -1885,21 +1904,32 @@ function FirmwareView({
 function AttendanceView({ devices, revision }: { devices: Device[]; revision: number }) {
   const [rows, setRows] = useState<AttendanceEvent[]>([])
   const [loading, setLoading] = useState(false)
+  const [nextCursor, setNextCursor] = useState<number | null>(null)
   const [filters, setFilters] = useState({ device_id: '', q: '', cnic: '', punch: '', clock_quality: '', from_time: '', to_time: '' })
-  const load = useCallback(async () => {
+  const load = useCallback(async (cursor?: number, append = false) => {
     setLoading(true)
     try {
-      const response = await api<{ rows: AttendanceEvent[] }>(`/api/v1/attendance${queryString(filters)}`)
-      setRows(response.rows)
+      const response = await api<{ rows: AttendanceEvent[]; next_cursor: number | null }>(`/api/v1/attendance${queryString({ ...filters, cursor, limit: 100 })}`)
+      setRows((current) => append ? [...current, ...response.rows] : response.rows)
+      setNextCursor(response.next_cursor ?? null)
     } finally {
       setLoading(false)
     }
   }, [filters])
-  useEffect(() => { void load() }, [load, revision])
+  useEffect(() => { void load(undefined, false) }, [load, revision])
+  const reset = () => setFilters({ device_id: '', q: '', cnic: '', punch: '', clock_quality: '', from_time: '', to_time: '' })
+  const today = () => {
+    const start = new Date()
+    start.setHours(0, 0, 0, 0)
+    const local = new Date(start.getTime() - start.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+    setFilters((current) => ({ ...current, from_time: local, to_time: '' }))
+  }
+  const activeFilterCount = Object.values(filters).filter(Boolean).length
   return (
     <>
-      <PageHeader eyebrow="IMMUTABLE CAPTURE LEDGER" title="Attendance events" description="Filter live and reconciled punches without changing terminal history." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <PageHeader eyebrow="IMMUTABLE CAPTURE LEDGER" title="Attendance events" description="Review live and reconciled punches without changing terminal history." action={<button className="button secondary" onClick={() => void load(undefined, false)}><Icon name="refresh" /> Refresh</button>} />
       <section className="panel">
+        <div className="filter-actions"><div><button className="filter-chip" onClick={today}>Today</button><span className="filter-summary">{activeFilterCount ? `${activeFilterCount} filters applied` : 'All attendance events'}</span></div>{activeFilterCount > 0 && <button className="text-button" onClick={reset}><Icon name="x" /> Clear filters</button>}</div>
         <div className="filter-grid">
           <label>Device<select value={filters.device_id} onChange={(event) => setFilters({ ...filters, device_id: event.target.value })}><option value="">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label>
           <label>Name / user ID<input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} /></label>
@@ -1915,6 +1945,7 @@ function AttendanceView({ devices, revision }: { devices: Device[]; revision: nu
           {!loading && rows.map((row) => <article key={row.event_uid}><div><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id}`}</small></div><div><strong>{dateTime(row.device_event_time)}</strong><small>Received {relativeTime(row.received_at)}</small></div><div><strong>{row.device_serial || 'Unreported serial'}</strong><small>UID {row.uid || '—'} · User {row.user_id}</small></div><div><StatusBadge state={row.source} /><small>Punch {row.punch ?? '—'} · {row.clock_quality}</small></div><div><StatusBadge state={row.ords_status} /><small>{row.oracle_confirmed_at ? `Oracle confirmed ${relativeTime(row.oracle_confirmed_at)} via ${(row.oracle_confirmation_path || 'unknown path').replaceAll('_', ' ').toLowerCase()}` : row.clock_drift_seconds == null ? 'No Oracle confirmation yet' : `${Math.round(row.clock_drift_seconds)}s clock drift`}</small></div></article>)}
           {!loading && !rows.length && <div className="empty-state"><Icon name="clock" /><h3>No attendance matches these filters.</h3></div>}
         </div>
+        {nextCursor && <div className="load-more"><button className="button secondary" disabled={loading} onClick={() => void load(nextCursor, true)}>{loading ? 'Loading…' : 'Load older events'}</button><small>{rows.length.toLocaleString()} events loaded</small></div>}
       </section>
     </>
   )
@@ -1922,6 +1953,9 @@ function AttendanceView({ devices, revision }: { devices: Device[]; revision: nu
 
 function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: ReturnType<typeof useToast>; revision: number }) {
   const [rows, setRows] = useState<(Alert & { device: Device })[]>([])
+  const [queue, setQueue] = useState<'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED' | 'ALL'>('OPEN')
+  const [severity, setSeverity] = useState('ALL')
+  const [deviceId, setDeviceId] = useState('ALL')
   const load = useCallback(async () => {
     const responses = await Promise.all(devices.map(async (device) => ({ device, rows: (await api<{ rows: Alert[] }>(`/api/v1/devices/${device.connector_id}/alerts`)).rows })))
     setRows(responses.flatMap((response) => response.rows.map((row) => ({ ...row, device: response.device }))).sort((a, b) => +new Date(b.last_seen_at) - +new Date(a.last_seen_at)))
@@ -1936,15 +1970,30 @@ function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: Re
       toast.error(reason instanceof Error ? reason.message : 'Unable to acknowledge alert.')
     }
   }
+  const shown = rows.filter((row) => {
+    const queueMatch = queue === 'ALL' || row.state === queue || (queue === 'ACKNOWLEDGED' && row.state === 'ACKNOWLEDGED')
+    return queueMatch && (severity === 'ALL' || row.severity === severity) && (deviceId === 'ALL' || row.device.connector_id === deviceId)
+  })
+  const openCount = rows.filter((row) => row.state === 'OPEN').length
+  const resolvedCount = rows.filter((row) => row.state === 'RESOLVED').length
   return (
     <>
-      <PageHeader eyebrow="OPERATIONS QUEUE" title="Alerts and exceptions" description="Device conditions prioritized with labels, icons, and border patterns." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <PageHeader eyebrow="OPERATIONS QUEUE" title="Alerts and exceptions" description="Triage current device conditions before reviewing acknowledged and resolved history." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <section className="queue-toolbar" aria-label="Alert filters">
+        <div className="segmented-control" role="group" aria-label="Alert queue">
+          <button className={queue === 'OPEN' ? 'active' : ''} onClick={() => setQueue('OPEN')}>Open <span>{openCount}</span></button>
+          <button className={queue === 'ACKNOWLEDGED' ? 'active' : ''} onClick={() => setQueue('ACKNOWLEDGED')}>Acknowledged</button>
+          <button className={queue === 'RESOLVED' ? 'active' : ''} onClick={() => setQueue('RESOLVED')}>Resolved <span>{resolvedCount}</span></button>
+          <button className={queue === 'ALL' ? 'active' : ''} onClick={() => setQueue('ALL')}>All</button>
+        </div>
+        <div className="queue-selects"><label><span>Severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="WARNING">Warning</option></select></label><label><span>Device</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)}><option value="ALL">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label></div>
+      </section>
       <section className="alert-list">
-        {rows.map((row) => {
+        {shown.map((row) => {
           const diagnostics = formatAlertDiagnostics(row.details)
           return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div>{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</article>
         })}
-        {!rows.length && <div className="panel empty-state"><Icon name="shield" /><h2>No recorded device exceptions.</h2><p>The queue will update from live ESP telemetry.</p></div>}
+        {!shown.length && <div className="panel empty-state"><Icon name="shield" /><h2>No alerts in this view.</h2><p>Change the queue filters or wait for the next live telemetry update.</p></div>}
       </section>
     </>
   )
@@ -2105,10 +2154,11 @@ function DeviceDrawer({
   )
 }
 
-export default function App() {
+function DashboardApp() {
+  const location = useLocation()
+  const navigate = useNavigate()
   const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
   const [username, setUsername] = useState('')
-  const [view, setView] = useState<View>('fleet')
   const [devices, setDevices] = useState<Device[]>([])
   const [overview, setOverview] = useState<Overview>({ total: 0, open_alerts: 0, active_leases: 0 })
   const [loading, setLoading] = useState(true)
@@ -2116,6 +2166,35 @@ export default function App() {
   const [selectedDeviceId, setSelectedDeviceId] = useState('')
   const [drawer, setDrawer] = useState<Device | null>(null)
   const toast = useToast()
+  const view = dashboardRoute(location.pathname)
+  const setView = useCallback((next: View) => navigate(routePath(next)), [navigate])
+
+  useEffect(() => {
+    const legacy = window.location.hash.replace(/^#/, '') as View
+    if (legacy && ['fleet', 'users', 'attendance', 'firmware', 'alerts'].includes(legacy)) {
+      navigate(routePath(legacy), { replace: true })
+      window.history.replaceState(null, '', routePath(legacy))
+      return
+    }
+    if (location.pathname === '/' || dashboardRoute(location.pathname) !== location.pathname.split('/').filter(Boolean)[0]) {
+      navigate('/fleet', { replace: true })
+    }
+  }, [location.pathname, navigate])
+
+  useEffect(() => {
+    const userDevice = routeDeviceId(location.pathname, 'users')
+    if (userDevice && userDevice !== selectedDeviceId) setSelectedDeviceId(userDevice)
+  }, [location.pathname, selectedDeviceId])
+
+  useEffect(() => {
+    const fleetDevice = routeDeviceId(location.pathname, 'fleet')
+    if (!fleetDevice) {
+      if (drawer) setDrawer(null)
+      return
+    }
+    const match = devices.find((device) => device.connector_id === fleetDevice)
+    if (match && drawer?.connector_id !== match.connector_id) setDrawer(match)
+  }, [devices, drawer, location.pathname])
 
   const refreshFleet = useCallback(async () => {
     setLoading(true)
@@ -2190,36 +2269,42 @@ export default function App() {
   const manageUsers = (device: Device) => {
     setSelectedDeviceId(device.connector_id)
     setDrawer(null)
-    setView('users')
+    navigate(routePath('users', device.connector_id))
   }
 
-  const nav = useMemo(() => [
-    { id: 'fleet' as const, label: 'Fleet', icon: 'grid' as const },
-    { id: 'users' as const, label: 'Users', icon: 'users' as const },
-    { id: 'attendance' as const, label: 'Attendance', icon: 'clock' as const },
-    { id: 'firmware' as const, label: 'Firmware', icon: 'terminal' as const },
-    { id: 'alerts' as const, label: 'Alerts', icon: 'alert' as const },
-  ], [])
+  const inspectDevice = (device: Device) => {
+    setDrawer(device)
+    navigate(routePath('fleet', device.connector_id))
+  }
+
+  const closeDevice = () => {
+    setDrawer(null)
+    navigate('/fleet')
+  }
+
+  const selectUserDevice = (id: string) => {
+    setSelectedDeviceId(id)
+    navigate(id ? routePath('users', id) : '/users')
+  }
 
   if (authState === 'loading') return <main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
   if (authState === 'anonymous') return <Login onLogin={login} />
 
   return (
-    <div className="app-shell">
-      <header className="app-header">
-        <a className="app-brand" href="#fleet" onClick={() => setView('fleet')}><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><span><strong>Attendance Device Dashboard</strong><small>National command center</small></span></a>
-        <nav aria-label="Primary navigation">{nav.map((item) => <button key={item.id} className={view === item.id ? 'active' : ''} aria-current={view === item.id ? 'page' : undefined} onClick={() => setView(item.id)}><Icon name={item.icon} />{item.label}{item.id === 'alerts' && overview.open_alerts > 0 && <span className="nav-count" aria-label={`${overview.open_alerts} open alerts`}>{overview.open_alerts}</span>}</button>)}</nav>
-        <div className="operator-area"><span className="live-sync"><i /> Live sync</span><span><strong>{username}</strong><small>State Life operator</small></span><button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><Icon name="logout" /></button></div>
-      </header>
-      <main className="page-content">
-        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={setDrawer} onManageUsers={manageUsers} />}
-        {view === 'users' && <UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={setSelectedDeviceId} revision={revision} toast={toast} refreshFleet={refreshFleet} />}
+    <>
+      <AppShell username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()}>
+        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} />}
+        {view === 'users' && <UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revision} toast={toast} refreshFleet={refreshFleet} />}
         {view === 'attendance' && <AttendanceView devices={devices} revision={revision} />}
-        {view === 'firmware' && <FirmwareView devices={devices} revision={revision} toast={toast} />}
+        {view === 'firmware' && <FirmwareView devices={devices} revision={revision} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}
         {view === 'alerts' && <AlertsView devices={devices} toast={toast} revision={revision} />}
-      </main>
-      {drawer && <DeviceDrawer seed={drawer} revision={revision} onClose={() => setDrawer(null)} onManageUsers={manageUsers} toast={toast} />}
+      </AppShell>
+      {drawer && <DeviceDrawer seed={drawer} revision={revision} onClose={closeDevice} onManageUsers={manageUsers} toast={toast} />}
       {toast.toast && <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role="status" aria-live="polite"><Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />{toast.toast.text}</div>}
-    </div>
+    </>
   )
+}
+
+export default function App() {
+  return <BrowserRouter><DashboardApp /></BrowserRouter>
 }
