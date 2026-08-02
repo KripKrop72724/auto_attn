@@ -1,0 +1,46 @@
+#include "setup_portal_assets.h"
+
+const char setup_portal_html_prefix[] =
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>SLIC Attendance Wi-Fi Setup</title><link rel=\"stylesheet\" href=\"/app.css\"></head>"
+    "<body><main><section class=\"card\"><header><img class=\"logo\" src=\"data:image/png;base64,";
+
+const char setup_portal_logo_base64[] =
+    "iVBORw0KGgoAAAANSUhEUgAAAIwAAAA5CAMAAADTGTPKAAAAflBMVEUpGh4iHh8iHh8ImPYiHh9kruyb3vsBc9kA+P8Aa/lf0v4AW60Asf0AIKuNu+bN6/4AIdscx/8Ao/8Az/8AX18AdehjAAAAAGMAYr0AfwBqamoAAAAlICEiHiD8/f4iHh4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACom6HeAAAAIHRSTlMYnVz+1Pz6/gwX/AMOKfj/Gf1RUgJSAgr+AgIA/vf/bFzYDu8AAAQsSURBVHja7ZjrchshDIUFy4I3cW0nTZukLOb937JHErCsL5n+8nQmq0wc7nwchMCh+B8ZbTAbzAazwWwwG8wG8zXM6Rk2qe1XtvvWypzi/hfstdrPxV5fdw+GmeI0+jv2so+CQ2pLijpF+yK6qu+l51Lqm1w0p/gcT/4wdPZSbfBPU9w9VBmGGcNwy54UhmzOFpYtkW1WVhpJK1Gdo82reu5aEpJZD5D7jKUC8+MKxvsG8xatS7OaiWauhjkoEfovRSamlp6zzj/PrsFYNKGlRaK8ZFyDOVzCnM8NBlO2DjHPKSXnUsLEhMGtzMBlKHKR8Edac/1vgeFUg0kM41Kqy7Etkyjeg/Hn87HBmDmZDIOsER9Z8yQTYQzW22AWbAFg5mSzNC5+ewNmNtKEtw9rkwwPfQ9mPMNGTowngVkFI4ygbmBmV2aydUrXbcpdmNwNNdtLB2aYwDhh4EM+HBnmXGHsnJxhy7qtFUb2RDl7GKN2X5kymhFlZlMzn2uYEA5KIcqwNAID7TsnqzDsuC6xNH9WMGnufOA2THN3HqplaAUTgleIoNL4ITDMWySTiouaBiP+4dhH+ED1MGJfwji2VGCc6HsJMxSWY3WaM8P8kKAnMdLy7AsMXCkZV45VB7MOwDcduDVhn7mMwOLAQQkgjPfKpcpw0KN30qNCyzbNcijVa3qfuQjwaZmbKszagbnuvVwmDUbd1g98Jw0ikSiDbXJF2E4ZESY5VXiljCtWIrDEpVJC1zCt0qy2qQiDPfLHkaXxKBvf49viwKk4sISr2YnCqeR0hrSOqL33o6RE4JUyXUBvMB9BWQ443YcRbLxLH6wMlt3DI8+rNnXpGeVaJKGnLtRVB3ZdCTKZatMyVB175TPFe0M1BpJtOtW3wdWTjCIRffVqq/3oX59wFxF4bBYqzIOfEHJrh3JDVpMDxtuEez5asobY8TlW8jsAHxklHGktipBGFfK5JqWLkX7SOtpaLiNgDLwgjOUR2PeijddPCL/QDAXGGifjGsMDWUQ6g7eDkRI8Q8gBQdNShF+8atAkcw3/ZEfMKXUMYDBG6cI/hOG5xY3H1bHB+FBhTFkB3k64oXQQCBBVJ9x7vGCnKLJ2bpXx+CGRgSv+aELUkfEQjxhIBMxksr0F02nTlLHZiehRNMjKporzhyrvZK14FEorzMmrzYazyEQkGJGVYR4eBGQQRQUzpm7T5Mf+remPak9Bb20h13VnG3FGoT9vgd7OZcM09RllJuKtZLTSiZyWc+Q2QufAKZ1Y4pywUfwYKzChf4tXLL0OJJJHdl8rCXnU86nmEi7SXynjAUsy1jtA+5dELdVqq9GhtChfVbwfx6dLw/H2ejc98Gjv4zTc+940PPqrSoz78iV7txhy+tX7m/9LBBLsrm2anqftn0UbzAazwWwwG8z3hvkLU/2qaKkNIJkAAAAASUVORK5CYII=";
+
+const char setup_portal_html_middle[] =
+    "\" alt=\"State Life Insurance Corporation of Pakistan\"><div><p class=\"eyebrow\">STATE LIFE INSURANCE CORPORATION OF PAKISTAN</p>"
+    "<h1>SLIC Attendance</h1><p class=\"sub\">Secure ZKT network setup</p></div></header>"
+    "<div class=\"notice\">This page can only change the attendance device's Wi-Fi network. No attendance, device, or update controls are exposed.</div>"
+    "<form id=\"wifi-form\" autocomplete=\"off\"><input id=\"csrf\" type=\"hidden\" value=\"";
+
+const char setup_portal_html_suffix[] =
+    "\"><label for=\"network\">Wi-Fi network</label><div class=\"row\"><select id=\"network\" required>"
+    "<option value=\"\">Select a 2.4 GHz network</option></select><button id=\"scan\" type=\"button\" class=\"secondary\">Scan</button></div>"
+    "<label class=\"check\"><input id=\"hidden\" type=\"checkbox\"> Hidden network</label>"
+    "<label id=\"manual-label\" class=\"hidden\" for=\"manual-ssid\">Network name (SSID)</label>"
+    "<input id=\"manual-ssid\" class=\"hidden\" maxlength=\"32\" placeholder=\"Enter SSID\">"
+    "<label for=\"wifi-password\">Wi-Fi password</label><input id=\"wifi-password\" type=\"password\" minlength=\"8\" maxlength=\"63\" required>"
+    "<label for=\"setup-password\">Setup password</label><input id=\"setup-password\" type=\"password\" minlength=\"8\" maxlength=\"63\" required>"
+    "<button id=\"save\" type=\"submit\">Test and save network</button></form>"
+    "<div id=\"status\" role=\"status\" aria-live=\"polite\"></div>"
+    "<footer>State Life · Attendance network configuration</footer></section></main><script src=\"/app.js\"></script></body></html>";
+
+const char setup_portal_css[] =
+    ":root{color-scheme:light;--green:#08783e;--deep:#064d2b;--gold:#d9a928;--ink:#173127;--muted:#61756b;--line:#dce7e1}"
+    "*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#eef8f2,#fdfaf0);color:var(--ink);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}"
+    "main{min-height:100vh;display:grid;place-items:center;padding:22px}.card{width:min(620px,100%);background:#fff;border:1px solid var(--line);border-radius:22px;box-shadow:0 18px 60px #0b4e2920;padding:28px}"
+    "header{display:flex;gap:18px;align-items:center;padding-bottom:20px;border-bottom:4px solid var(--gold)}.logo{display:block;width:140px;height:auto;object-fit:contain}"
+    "h1{margin:2px 0 0;color:var(--deep);font-size:1.75rem}.eyebrow{margin:0;color:var(--green);font-size:.68rem;font-weight:800;letter-spacing:.08em}.sub{margin:2px 0;color:var(--muted)}"
+    ".notice{margin:20px 0;padding:12px 14px;border-left:4px solid var(--gold);background:#fff9e7;border-radius:8px;font-size:.9rem}label{display:block;margin:14px 0 6px;font-weight:700}.row{display:grid;grid-template-columns:1fr auto;gap:9px}"
+    "input,select,button{width:100%;min-height:46px;border-radius:10px;border:1px solid #b8cbc1;padding:10px 12px;font:inherit}input:focus,select:focus{outline:3px solid #08783e25;border-color:var(--green)}button{margin-top:20px;border:0;background:var(--green);color:#fff;font-weight:800;cursor:pointer}.secondary{width:auto;margin:0;background:#edf6f1;color:var(--deep);border:1px solid #b8cbc1}.check{display:flex;align-items:center;gap:8px;font-weight:500}.check input{width:18px;min-height:18px}.hidden{display:none}"
+    "#status{display:none;margin-top:18px;padding:12px;border-radius:10px;background:#edf6f1}#status.show{display:block}#status.error{background:#fff0ef;color:#8c1d18}footer{margin-top:24px;text-align:center;color:var(--muted);font-size:.78rem}@media(max-width:480px){.card{padding:20px}header{align-items:flex-start}.logo{width:105px}h1{font-size:1.4rem}}";
+
+const char setup_portal_js[] =
+    "const $=s=>document.querySelector(s),status=$('#status'),form=$('#wifi-form'),network=$('#network');let poll;"
+    "function say(message,error=false){status.textContent=message;status.className='show'+(error?' error':'')}"
+    "async function scan(){say('Scanning nearby compatible networks…');$('#scan').disabled=true;try{const r=await fetch('/api/networks',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.message||'Scan failed');network.innerHTML='<option value=\"\">Select a 2.4 GHz network</option>';for(const n of d.networks){const o=document.createElement('option');o.value=n.ssid;o.textContent=`${n.ssid} (${n.rssi} dBm)`;network.append(o)}say(d.networks.length?'Select a network below.':'No compatible network found. You can enter a hidden SSID.',!d.networks.length)}catch(e){say(e.message,true)}finally{$('#scan').disabled=false}}"
+    "$('#scan').onclick=scan;$('#hidden').onchange=e=>{for(const id of ['#manual-label','#manual-ssid'])$(id).classList.toggle('hidden',!e.target.checked);network.required=!e.target.checked;$('#manual-ssid').required=e.target.checked};"
+    "async function check(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();say(d.message,d.state==='failed');if(['saved','failed'].includes(d.state)){clearInterval(poll);form.querySelectorAll('input,select,button').forEach(x=>x.disabled=false)}}catch(e){say('Waiting for device…')}}"
+    "form.onsubmit=async e=>{e.preventDefault();const hidden=$('#hidden').checked,ssid=hidden?$('#manual-ssid').value.trim():network.value;form.querySelectorAll('input,select,button').forEach(x=>x.disabled=true);say('Testing the new network for up to 30 seconds…');try{const r=await fetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csrf:$('#csrf').value,setup_password:$('#setup-password').value,ssid,password:$('#wifi-password').value})}),d=await r.json();if(!r.ok)throw Error(d.message||'Unable to save');poll=setInterval(check,1500);check()}catch(e){say(e.message,true);form.querySelectorAll('input,select,button').forEach(x=>x.disabled=false)}};scan();";

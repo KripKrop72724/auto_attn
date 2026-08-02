@@ -44,6 +44,7 @@
 #include "led_status.h"
 #include "add_connector.h"
 #include "ota_manager.h"
+#include "setup_portal.h"
 #include "zone_config.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
@@ -6524,6 +6525,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        if (setup_portal_handle_sta_disconnected()) return;
         led_status_set(LED_STATUS_WIFI_CONNECTING);
         if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
@@ -6533,11 +6535,24 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (setup_portal_handle_sta_got_ip()) return;
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi connected with IP " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
         led_status_set(LED_STATUS_ZKT_DISCOVERING);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void setup_portal_station_visibility(bool connected)
+{
+    if (connected) {
+        wifi_retry_count = 0;
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        led_status_set(LED_STATUS_ZKT_DISCOVERING);
+    } else {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        led_status_set(LED_STATUS_WIFI_CONNECTING);
     }
 }
 
@@ -6547,8 +6562,10 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(setup_portal_prepare(setup_portal_station_visibility));
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
@@ -6562,6 +6579,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(setup_portal_start_controller());
     ESP_LOGI(TAG, "Wi-Fi power save disabled for long-lived ZKT sockets");
     led_status_set(LED_STATUS_WIFI_CONNECTING);
     ESP_LOGI(TAG, "Connecting to Wi-Fi SSID %s", ZONE_LITE_WIFI_SSID);
@@ -6571,15 +6589,14 @@ static bool wait_for_wifi(void)
 {
     EventBits_t bits = xEventGroupWaitBits(
         wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        WIFI_CONNECTED_BIT,
         pdFALSE,
         pdFALSE,
         portMAX_DELAY);
     if ((bits & WIFI_CONNECTED_BIT) != 0) {
         return true;
     }
-    ESP_LOGE(TAG, "Could not connect to Wi-Fi SSID %s", ZONE_LITE_WIFI_SSID);
-    led_status_fault(LED_STATUS_FATAL);
+    ESP_LOGE(TAG, "Wi-Fi wait ended unexpectedly for SSID %s", ZONE_LITE_WIFI_SSID);
     return false;
 }
 

@@ -51,6 +51,9 @@ jobs:
   build:
     needs: provenance
     runs-on: ubuntu-latest
+    environment: firmware-signing
+    env:
+      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,8 +69,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$ZONE_LITE_SETUP_PASSWORD"
           test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
           docker run --rm \
+            -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
@@ -114,7 +119,9 @@ jobs:
           name: zone-lite-${{ inputs.version }}-hil-only
           path: release/
           if-no-files-found: error
-          retention-days: 90
+          # The shared setup credential is embedded for WPA2 operation. Keep
+          # transient CI transport short-lived; durable bytes live only in ADD.
+          retention-days: 1
 
   publish-hil:
     needs: [provenance, sign]

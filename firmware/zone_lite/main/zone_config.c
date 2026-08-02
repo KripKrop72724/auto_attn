@@ -200,3 +200,27 @@ esp_err_t zone_config_save_connector(
     }
     return err;
 }
+
+esp_err_t zone_config_save_wifi(const char *ssid, const char *password)
+{
+    if (!ssid || !password) return ESP_ERR_INVALID_ARG;
+    size_t ssid_length = strlen(ssid);
+    size_t password_length = strlen(password);
+    if (ssid_length == 0 || ssid_length > 32 || password_length < 8 || password_length > 63) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(handle, "wifi_ssid", ssid)) == ESP_OK &&
+        (err = nvs_set_str(handle, "wifi_pass", password)) == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        copy_default(s_config.wifi_ssid, sizeof(s_config.wifi_ssid), ssid);
+        copy_default(s_config.wifi_password, sizeof(s_config.wifi_password), password);
+        ESP_LOGI(TAG, "Updated encrypted Wi-Fi configuration for SSID=%s", ssid);
+    }
+    return err;
+}
