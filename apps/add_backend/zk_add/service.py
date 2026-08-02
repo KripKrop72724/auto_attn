@@ -72,6 +72,13 @@ ACTIVE_COMMAND_STATES = {
     "RUNNING",
     "CANCEL_REQUESTED",
 }
+TERMINAL_COMMAND_STATES = {
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED",
+    "CANCELED",
+    "EXPIRED",
+}
 MUTATING_COMMANDS = {
     "CREATE_USER",
     "UPDATE_USER",
@@ -4033,6 +4040,115 @@ def fleet_counts(session: Session) -> dict:
     return counts
 
 
+def reconcile_admin_lease_command(
+    session: Session,
+    *,
+    command: DeviceCommand,
+    now: datetime | None = None,
+) -> TemporaryAdminLease | None:
+    """Project a terminal grant/revoke command onto its lease state.
+
+    Lease state is intentionally durable and separate from command state.  All
+    command completion paths (connector result, local cancellation, expiry, and
+    the maintenance repair sweep) must therefore use the same projection.
+    """
+
+    observed_at = now or utc_now()
+    lease: TemporaryAdminLease | None = None
+    if command.command_type == "GRANT_TEMP_ADMIN":
+        lease = session.scalar(
+            select(TemporaryAdminLease).where(
+                TemporaryAdminLease.grant_command_id == command.id
+            )
+        )
+        if lease is None or lease.state not in {"REQUESTED", "GRANTING"}:
+            return lease
+        if command.status == "SUCCEEDED":
+            result = command.result or {}
+            expires_epoch = result.get("expires_epoch")
+            try:
+                expires_at = (
+                    datetime.fromtimestamp(int(expires_epoch), tz=timezone.utc)
+                    if expires_epoch
+                    else observed_at + timedelta(seconds=600)
+                )
+            except (TypeError, ValueError, OverflowError):
+                expires_at = observed_at + timedelta(seconds=600)
+            lease.state = "ACTIVE"
+            lease.granted_at = command.completed_at or observed_at
+            lease.expires_at = expires_at
+            lease.last_error = None
+        elif command.status in TERMINAL_COMMAND_STATES:
+            lease.state = "FAILED"
+            lease.last_error = (
+                command.error_message
+                or command.error_code
+                or f"Enrollment access grant command {command.status.lower()}."
+            )
+    elif command.command_type == "REVOKE_TEMP_ADMIN":
+        lease = session.scalar(
+            select(TemporaryAdminLease).where(
+                TemporaryAdminLease.revoke_command_id == command.id
+            )
+        )
+        if lease is None or lease.state not in {"REVOKING", "OVERDUE"}:
+            return lease
+        zkt = session.get(ZKTDevice, lease.zkt_device_id)
+        connector = session.get(Connector, zkt.connector_id) if zkt else None
+        if command.status == "SUCCEEDED":
+            lease.state = "REVOKED"
+            lease.revoked_at = command.completed_at or observed_at
+            lease.last_error = None
+            if connector:
+                resolve_alert(session, connector, code="ADMIN_REVOKE_OVERDUE")
+        elif command.status in TERMINAL_COMMAND_STATES:
+            lease.state = "OVERDUE"
+            lease.last_error = (
+                command.error_message
+                or command.error_code
+                or f"Enrollment access revoke command {command.status.lower()}."
+            )
+            if connector:
+                upsert_alert(
+                    session,
+                    connector,
+                    code="ADMIN_REVOKE_OVERDUE",
+                    severity="CRITICAL",
+                    message="Temporary administrator could not be verified as revoked.",
+                    details={"lease_id": lease.lease_id},
+                )
+    if lease is not None:
+        lease.updated_at = observed_at
+    return lease
+
+
+def reconcile_admin_lease_states(session: Session) -> int:
+    """Repair leases left active by an older command completion path."""
+
+    repaired = 0
+    leases = session.scalars(
+        select(TemporaryAdminLease).where(
+            TemporaryAdminLease.state.in_(
+                ["REQUESTED", "GRANTING", "REVOKING", "OVERDUE"]
+            )
+        )
+    ).all()
+    for lease in leases:
+        command_id = (
+            lease.grant_command_id
+            if lease.state in {"REQUESTED", "GRANTING"}
+            else lease.revoke_command_id
+        )
+        command = session.get(DeviceCommand, command_id) if command_id else None
+        if command is None or command.status not in TERMINAL_COMMAND_STATES:
+            continue
+        previous_state = lease.state
+        reconcile_admin_lease_command(session, command=command)
+        if lease.state != previous_state:
+            repaired += 1
+    return repaired
+
+
 def apply_command_update(
     session: Session,
     *,
@@ -4051,7 +4167,7 @@ def apply_command_update(
     )
     if command is None:
         raise ValueError("Unknown command ID.")
-    if command.status in {"SUCCEEDED", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"}:
+    if command.status in TERMINAL_COMMAND_STATES:
         return command
     if status == "SUCCEEDED" and command.command_type == "DELETE_USER":
         before_count = result.get("attendance_count_before")
@@ -4071,7 +4187,7 @@ def apply_command_update(
     elif status in {"WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
         command.error_code = error_code
         command.error_message = error_message
-    elif status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
+    elif status in TERMINAL_COMMAND_STATES:
         command.completed_at = now
         command.result = result
         command.error_code = error_code
@@ -4083,54 +4199,12 @@ def apply_command_update(
             details={"result": result, "error_code": error_code, "error_message": error_message},
         )
     )
-    if command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"} and status in {
-        "SUCCEEDED",
-        "FAILED",
-        "CANCELLED",
-        "EXPIRED",
-    }:
+    if (
+        command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"}
+        and status in TERMINAL_COMMAND_STATES
+    ):
         apply_user_command_terminal_state(session, command=command, status=status)
-    lease = None
-    if command.command_type == "GRANT_TEMP_ADMIN":
-        lease = session.scalar(
-            select(TemporaryAdminLease).where(TemporaryAdminLease.grant_command_id == command.id)
-        )
-        if lease:
-            if status == "SUCCEEDED":
-                lease.state = "ACTIVE"
-                lease.granted_at = now
-                expires_epoch = result.get("expires_epoch")
-                lease.expires_at = (
-                    datetime.fromtimestamp(int(expires_epoch), tz=timezone.utc)
-                    if expires_epoch
-                    else now + timedelta(seconds=600)
-                )
-            elif status == "FAILED":
-                lease.state = "FAILED"
-                lease.last_error = error_message or error_code
-            lease.updated_at = now
-    elif command.command_type == "REVOKE_TEMP_ADMIN":
-        lease = session.scalar(
-            select(TemporaryAdminLease).where(TemporaryAdminLease.revoke_command_id == command.id)
-        )
-        if lease:
-            if status == "SUCCEEDED":
-                lease.state = "REVOKED"
-                lease.revoked_at = now
-            elif status == "FAILED":
-                lease.state = "OVERDUE"
-                lease.last_error = error_message or error_code
-                parent_connector = session.get(Connector, connector.id)
-                if parent_connector:
-                    upsert_alert(
-                        session,
-                        parent_connector,
-                        code="ADMIN_REVOKE_OVERDUE",
-                        severity="CRITICAL",
-                        message="Temporary administrator could not be verified as revoked.",
-                        details={"lease_id": lease.lease_id},
-                    )
-            lease.updated_at = now
+    lease = reconcile_admin_lease_command(session, command=command, now=now)
     if lease is not None and status == "SUCCEEDED":
         lease_user = session.get(DeviceUser, lease.device_user_id)
         if lease_user is not None:
@@ -4276,7 +4350,12 @@ def queue_due_revokes(session: Session) -> list[DeviceCommand]:
     for lease in leases:
         if lease.revoke_command_id:
             existing = session.get(DeviceCommand, lease.revoke_command_id)
-            if existing and existing.status not in {"FAILED", "EXPIRED", "CANCELED"}:
+            if existing and existing.status not in {
+                "FAILED",
+                "EXPIRED",
+                "CANCELED",
+                "CANCELLED",
+            }:
                 continue
         zkt = session.get(ZKTDevice, lease.zkt_device_id)
         connector = session.get(Connector, zkt.connector_id) if zkt else None

@@ -84,6 +84,7 @@ from zk_add.service import (
     repair_verified_tombstone_backlog,
     replace_user_snapshot,
     record_oracle_receipts,
+    reconcile_admin_lease_states,
     serialize_command,
     serialize_user_deletion_job,
     resolve_historical_event_group_to_current_identity,
@@ -2714,6 +2715,85 @@ def test_admin_lease_result_is_durable(db: Session):
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     assert int(expires_at.timestamp()) == 1_900_000_000
+
+
+@pytest.mark.parametrize("status", ["FAILED", "CANCELLED", "CANCELED", "EXPIRED"])
+def test_admin_lease_terminal_grant_does_not_remain_active(
+    db: Session, status: str
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name=f"Ayesha-S-{CNIC}")
+    lease, command = create_admin_lease(
+        db,
+        connector=connector,
+        user=user,
+        idempotency_key=f"lease-terminal-{status.lower()}",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=command.command_id,
+        status=status,
+        result={},
+        error_code="GRANT_NOT_COMPLETED",
+        error_message=None,
+    )
+    assert lease.state == "FAILED"
+    assert lease.last_error == "GRANT_NOT_COMPLETED"
+
+
+def test_stale_granting_lease_is_repaired_from_terminal_command(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name=f"Ayesha-S-{CNIC}")
+    lease, command = create_admin_lease(
+        db,
+        connector=connector,
+        user=user,
+        idempotency_key="lease-stale-granting",
+        actor="StateHealthAdmin",
+    )
+    command.status = "EXPIRED"
+    command.completed_at = utc_now()
+    db.flush()
+
+    assert lease.state == "GRANTING"
+    assert reconcile_admin_lease_states(db) == 1
+    assert lease.state == "FAILED"
+    assert "expired" in (lease.last_error or "")
+
+
+def test_cancelled_revoke_is_retried_instead_of_sticking(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, name=f"Ayesha-S-{CNIC}")
+    lease, grant = create_admin_lease(
+        db,
+        connector=connector,
+        user=user,
+        idempotency_key="lease-revoke-retry",
+        actor="StateHealthAdmin",
+    )
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=grant.command_id,
+        status="SUCCEEDED",
+        result={"verified_privilege": 14, "expires_epoch": 1},
+        error_code=None,
+        error_message=None,
+    )
+    first_revoke = worker.queue_due_revokes(db)[0]
+    first_revoke.status = "CANCELLED"
+    lease.state = "OVERDUE"
+    db.flush()
+
+    retries = worker.queue_due_revokes(db)
+    assert len(retries) == 1
+    assert retries[0].id != first_revoke.id
+    assert lease.state == "REVOKING"
 
 
 def test_step_up_authentication_rejects_wrong_password(db: Session):

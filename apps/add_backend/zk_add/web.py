@@ -113,6 +113,7 @@ from zk_add.service import (
     replace_user_snapshot,
     record_oracle_receipts,
     reconcile_device_user_identity_conflicts,
+    reconcile_admin_lease_command,
     resolve_historical_event_group_to_current_identity,
     resolve_alert,
     onboard_connector,
@@ -1484,6 +1485,7 @@ async def cancel_command(
     if can_cancel_locally:
         row.completed_at = utc_now()
         apply_user_command_terminal_state(db, command=row, status="CANCELLED")
+        reconcile_admin_lease_command(db, command=row, now=row.completed_at)
     db.add(
         DeviceCommandEvent(
             command_id=row.id,

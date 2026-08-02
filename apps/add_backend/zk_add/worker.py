@@ -33,6 +33,8 @@ from zk_add.service import (
     apply_user_command_terminal_state,
     oracle_payload,
     queue_due_revokes,
+    reconcile_admin_lease_command,
+    reconcile_admin_lease_states,
     repair_verified_tombstone_backlog,
     resolve_alert,
     serialize_command,
@@ -275,6 +277,7 @@ async def maintenance_tick() -> None:
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
         repair_verified_tombstone_backlog(session)
+        reconcile_admin_lease_states(session)
         for command in session.scalars(
             select(DeviceCommand)
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
@@ -284,6 +287,7 @@ async def maintenance_tick() -> None:
                 command.status = "EXPIRED"
                 command.completed_at = now
                 apply_user_command_terminal_state(session, command=command, status="EXPIRED")
+                reconcile_admin_lease_command(session, command=command, now=now)
                 continue
             connector = session.get(Connector, command.connector_id)
             if connector is None:
