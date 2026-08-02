@@ -27,14 +27,9 @@ on:
         description: Fail closed if the canary reports fewer preserved terminal punches
         required: true
         type: number
-      publish_disaster_recovery_copy:
-        description: Also create an immutable GitHub release copy
-        required: true
-        default: true
-        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: zone-lite-firmware-release
@@ -345,38 +340,6 @@ jobs:
             -Version "${{ inputs.version }}" `
             -GitSha "${{ needs.provenance.outputs.sha }}" `
             -OutputDirectory promoted-release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zone-lite-${{ inputs.version }}
-          path: promoted-release/
-          if-no-files-found: error
-          include-hidden-files: true
-          retention-days: 90
-
-  disaster-recovery-copy:
-    if: ${{ inputs.publish_disaster_recovery_copy }}
-    needs: [provenance, promote-add]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: zone-lite-${{ inputs.version }}
-          path: release
-      - name: Ensure the promoted package is no longer HIL-targeted
-        shell: bash
-        run: |
-          set -euo pipefail
-          test ! -e release/.hil-only.json
-      - name: Publish immutable disaster-recovery copy
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="zone-lite-v${{ inputs.version }}"
-          ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1
-          gh release create "$tag" release/* \
-            --repo "${{ github.repository }}" \
-            --target "${{ needs.provenance.outputs.sha }}" \
-            --title "Zone Lite ${{ inputs.version }}" \
-            --notes "Exact immutable bytes promoted after a successful production canary and live health acceptance."
+          if (Test-Path -LiteralPath 'promoted-release/.hil-only.json') {
+            throw 'Promoted production package is still HIL-targeted.'
+          }

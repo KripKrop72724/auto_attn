@@ -1,4 +1,5 @@
 #include "ota_manager.h"
+#include "setup_portal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -470,7 +471,8 @@ static void ota_task(void *argument)
                     vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
                     continue;
                 }
-                if (fetch_assignment()) {
+                /* A local network change and an OTA write never run concurrently. */
+                if (!setup_portal_active() && fetch_assignment()) {
                     s_busy = true;
                     (void)perform_update();
                     s_busy = false;

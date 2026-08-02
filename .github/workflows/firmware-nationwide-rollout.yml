@@ -1,0 +1,77 @@
+name: Zone Lite nationwide OTA rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green main commit promoted after canary acceptance
+        required: true
+        type: string
+      version:
+        description: SemVer firmware version, without a v prefix
+        required: true
+        type: string
+      canary_campaign_id:
+        description: Closed CANARY_ACCEPTED production campaign
+        required: true
+        type: string
+      batch_size:
+        description: Concurrent zones per batch (maximum five)
+        required: true
+        default: 5
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-firmware-release
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.provenance.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${{ inputs.canary_campaign_id }}" =~ ^[0-9a-f]{32}$ ]]
+          test "${{ inputs.batch_size }}" -ge 1
+          test "${{ inputs.batch_size }}" -le 5
+          git fetch origin main
+          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  rollout:
+    needs: provenance
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Roll out in fail-closed batches and verify every eligible device
+        shell: powershell
+        env:
+          ADD_ADMIN_PASSWORD: ${{ secrets.ADD_CANARY_ADMIN_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_ADMIN_PASSWORD) { throw 'ADD_CANARY_ADMIN_PASSWORD is not configured.' }
+          ./deploy/add/Invoke-NationwideFirmwareRollout.ps1 `
+            -Version '${{ inputs.version }}' `
+            -GitSha '${{ needs.provenance.outputs.sha }}' `
+            -CanaryCampaignId '${{ inputs.canary_campaign_id }}' `
+            -AdminPassword $env:ADD_ADMIN_PASSWORD `
+            -BatchSize '${{ inputs.batch_size }}'

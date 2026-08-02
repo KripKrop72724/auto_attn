@@ -86,7 +86,7 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         "all resolvable rows are Oracle-confirmed",
         "'ACKED', 'ACKED_CHECK'",
         "deploy/add/promote-firmware.ps1",
-        "test ! -e release/.hil-only.json",
+        "Test-Path -LiteralPath 'promoted-release/.hil-only.json'",
     ):
         assert required in workflow
 
