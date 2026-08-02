@@ -340,3 +340,6 @@ jobs:
             -Version "${{ inputs.version }}" `
             -GitSha "${{ needs.provenance.outputs.sha }}" `
             -OutputDirectory promoted-release
+          if (Test-Path -LiteralPath 'promoted-release/.hil-only.json') {
+            throw 'Promoted production package is still HIL-targeted.'
+          }
