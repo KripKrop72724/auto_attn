@@ -19,6 +19,7 @@ from zk_add.models import (
     ConnectorCredential,
     ConnectorNonce,
     OnboardingNonce,
+    DeviceAlert,
     DeviceCommand,
     DeviceLog,
     DeviceTelemetry,
@@ -258,6 +259,46 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
             pass
 
 
+def reconcile_ords_delivery_alerts(session: Session) -> int:
+    """Resolve stale delivery alerts after a connector's durable queue drains.
+
+    Concurrent batch results are applied one row at a time.  A connector's
+    final successful row can therefore be processed while another row from the
+    same batch still appears active, leaving its alert open even though the
+    completed transaction drains the queue moments later.  Maintenance closes
+    only that stale alert; permanent rejection and identity alerts are not
+    affected.
+    """
+
+    active_connector_ids = set(
+        session.scalars(
+            select(AttendanceEvent.connector_id)
+            .join(
+                OrdsOutbox,
+                OrdsOutbox.attendance_event_id == AttendanceEvent.id,
+            )
+            .where(OrdsOutbox.status.in_(ORDS_ACTIVE_STATUSES))
+            .distinct()
+        ).all()
+    )
+    alerts = session.scalars(
+        select(DeviceAlert).where(
+            DeviceAlert.code == "ORDS_DELIVERY_FAILED",
+            DeviceAlert.state == "OPEN",
+        )
+    ).all()
+    resolved = 0
+    for alert in alerts:
+        if alert.connector_id in active_connector_ids:
+            continue
+        connector = session.get(Connector, alert.connector_id)
+        if connector is None:
+            continue
+        resolve_alert(session, connector, code="ORDS_DELIVERY_FAILED")
+        resolved += 1
+    return resolved
+
+
 async def maintenance_tick() -> None:
     now = utc_now()
     dispatch: list[tuple[str, dict]] = []
@@ -280,6 +321,7 @@ async def maintenance_tick() -> None:
         advance_user_deletion_jobs(session)
         repair_verified_tombstone_backlog(session)
         repair_verified_active_identity_backlog(session)
+        reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
         for command in session.scalars(
             select(DeviceCommand)

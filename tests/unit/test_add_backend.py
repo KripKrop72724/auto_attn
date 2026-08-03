@@ -116,6 +116,7 @@ from zk_add.worker import (
     ords_failure_category,
     ords_failure_is_permanent,
     ords_membership_missing,
+    reconcile_ords_delivery_alerts,
     record_ords_route_result,
 )
 
@@ -1397,6 +1398,42 @@ def test_verified_active_snapshot_requires_duplicate_cnic_resolution(db: Session
     assert blocked.identity_resolution_id == resolution.id
     assert blocked.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
     assert blocked.ords_status == "PENDING"
+
+
+def test_maintenance_resolves_delivery_alert_only_after_queue_drains(db: Session):
+    connector = connector_fixture(db)
+    snapshot_user(db, connector)
+    ingest_attendance(
+        db,
+        connector=connector,
+        events=[event(event_uid="0" * 64)],
+    )
+    upsert_alert(
+        db,
+        connector,
+        code="ORDS_DELIVERY_FAILED",
+        severity="WARNING",
+        message="A transient Oracle delivery attempt is retrying.",
+        details={"failure_category": "TRANSPORT_READTIMEOUT"},
+    )
+    db.flush()
+    alert = db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ORDS_DELIVERY_FAILED",
+        )
+    )
+    outbox = db.scalar(select(OrdsOutbox))
+    assert alert is not None
+    assert outbox is not None
+    assert alert.state == "OPEN"
+    assert reconcile_ords_delivery_alerts(db) == 0
+    assert alert.state == "OPEN"
+
+    outbox.status = "ACKED"
+    assert reconcile_ords_delivery_alerts(db) == 1
+    assert alert.state == "RESOLVED"
+    assert alert.resolved_at is not None
 
 
 def test_historical_alias_is_eligible_for_ords_delivery(
