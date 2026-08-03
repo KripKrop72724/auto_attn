@@ -853,6 +853,8 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
 
     assert "bool add_connector_boot_health_ready(void)" in connector
     assert "s_identity_catalog_generation > 0" in connector
+    assert "s_zkt.user_record_size > 0" in connector
+    assert "identity_ready" in connector
     assert 'strcmp(s_zkt.connection_state, "ONLINE") == 0' in connector
     assert 'strcmp(s_zkt.connection_state, "RECOVERING") == 0' in connector
     assert "authenticated_stability_elapsed" in connector
@@ -875,6 +877,9 @@ def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
     assert "add_connector_enqueue_validated_line(line, true)" in connector
     assert "send_payload_and_wait_for_ack(" in connector
     assert "ADD_PRIORITY_ACK_TIMEOUT_MS" in connector
+    assert "ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS" in connector
+    assert "s_priority_delivery_until_ms" in connector
+    assert "ADD_OUTBOX_ACK_TIMEOUT_MS" in connector
     assert "s_ack_wait_lock" in connector
     assert "!historical && window_start_day == day_end" in runtime
     assert "flush_add_reconcile_payloads(" in runtime
@@ -985,7 +990,7 @@ def test_large_truth_stream_delegates_confirmation_to_durable_add_delivery():
     assert "truth_delivery_ok && add_delivery_ok" in reconcile
     assert "receipt_delivery_ok" not in reconcile
     assert "#define ADD_BULK_CAPACITY_WAIT_MS" in connector_source
-    assert "#define ADD_ACK_TIMEOUT_MS 60000" in connector_source
+    assert "#define ADD_OUTBOX_ACK_TIMEOUT_MS 10000" in connector_source
     assert "ADD_BULK_CAPACITY_POLL_MS" in connector_source
     assert "refresh_capacity_deadline_on_progress" in connector_source
     assert "outbox->depth < *last_depth" in connector_source
