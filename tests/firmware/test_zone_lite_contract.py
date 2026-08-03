@@ -763,6 +763,21 @@ def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
     assert "verified ADD identity alias" in recovery
 
 
+def test_large_blocked_identity_backlog_is_deferred_before_storage_lock():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert "#define ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES (64 * 1024)" in source
+    recovery = source[
+        source.index("static bool recover_blocked_events_from_snapshot(") :
+        source.index("static void storage_init(")
+    ]
+    size_gate = recovery.index("blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES")
+    storage_lock = recovery.index("xSemaphoreTake(g_storage_lock")
+    assert size_gate < storage_lock
+    assert '"BLOCKED_IDENTITY_RECOVERY_DEFERRED"' in recovery
+    assert "records remain preserved for bounded truth recovery" in recovery
+    assert recovery.index("return true;", size_gate) < storage_lock
+
+
 def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
     header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
