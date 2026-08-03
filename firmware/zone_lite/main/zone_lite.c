@@ -384,6 +384,13 @@ static int32_t g_last_synced_attendance_count = -1;
 static int64_t g_last_full_truth_reconcile_epoch;
 static int64_t g_last_full_truth_reconcile_ms;
 static bool g_force_truth_reconcile;
+// The ADD identity catalog belongs to the ESP runtime, not to an individual
+// authenticated ZKT session.  A bounded truth read can intentionally refresh
+// only the ZKT session; retaining the applied generation here prevents that
+// refresh from treating the unchanged catalog as new and starting a permanent
+// reconcile/refresh loop.  This remains zero after a real ESP boot, so the
+// restored durable catalog is still applied and reconciled once per boot.
+static uint32_t g_applied_identity_catalog_generation;
 static bool g_history_backfill_pending;
 static bool g_history_backfill_had_failures;
 static int32_t g_history_cursor_year;
@@ -6197,7 +6204,6 @@ static int64_t gateway_run(uint32_t host_order_ip)
     int64_t last_user_integrity = now_ms;
     int64_t last_time_sample = 0;
     size_t live_events_since_sync = 0;
-    uint32_t applied_identity_catalog_generation = 0;
     bool restarted = false;
     while (true) {
         fd_set read_fds;
@@ -6257,10 +6263,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
         uint32_t identity_catalog_generation =
             add_connector_identity_catalog_generation(&identity_catalog_rows);
         if (identity_catalog_generation != 0 &&
-            identity_catalog_generation != applied_identity_catalog_generation) {
+            identity_catalog_generation !=
+                g_applied_identity_catalog_generation) {
             size_t recovered = 0;
             if (recover_blocked_events_from_snapshot(users, &recovered)) {
-                applied_identity_catalog_generation = identity_catalog_generation;
+                g_applied_identity_catalog_generation =
+                    identity_catalog_generation;
                 g_force_truth_reconcile = true;
                 char message[240];
                 snprintf(
