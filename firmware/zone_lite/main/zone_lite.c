@@ -211,6 +211,7 @@
 #ifndef ZONE_LITE_RECOVERY_STABILITY_MS
 #define ZONE_LITE_RECOVERY_STABILITY_MS (2 * 60 * 1000)
 #endif
+#define ZONE_LITE_POST_STABILITY_RECONCILE_GRACE_MS (30 * 1000)
 #ifndef ZONE_LITE_FLAP_WINDOW_MS
 #define ZONE_LITE_FLAP_WINDOW_MS (15 * 60 * 1000)
 #endif
@@ -6189,7 +6190,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
     }
 
     int64_t now_ms = uptime_ms();
-    int64_t last_reconcile = now_ms - ZONE_LITE_RECONCILE_INTERVAL_MS + ZONE_LITE_RECOVERY_STABILITY_MS;
+    int64_t last_reconcile = now_ms - ZONE_LITE_RECONCILE_INTERVAL_MS +
+        ZONE_LITE_RECOVERY_STABILITY_MS +
+        ZONE_LITE_POST_STABILITY_RECONCILE_GRACE_MS;
     int64_t last_live_register = now_ms;
     int64_t last_user_integrity = now_ms;
     int64_t last_time_sample = 0;
@@ -6497,6 +6500,23 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                 nvs_save_runtime_state();
                             }
                         }
+                        if (!historical_reconcile && identity_blocked) {
+                            // The terminal dump was complete, but one or more
+                            // identities could not be authorized. Repeating
+                            // the same heavy dump on every reconnect cannot
+                            // improve that catalog state and can destabilize
+                            // terminals that close their event session after a
+                            // bulk read. Record the bounded attempt, preserve
+                            // fail-closed Oracle semantics, and refresh the
+                            // live session without counting it as a flap.
+                            g_force_truth_reconcile = false;
+                            g_last_full_truth_reconcile_ms = now_ms;
+                            if (epoch_valid) {
+                                g_last_full_truth_reconcile_epoch = current_epoch;
+                            }
+                            nvs_save_runtime_state();
+                            truth_retry_session = true;
+                        }
                         add_connector_log(
                             "ERROR",
                             "reconcile",
@@ -6565,7 +6585,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
         g_truth_retry_session_requested = true;
         zkt_publish_state(
             "RECOVERING",
-            "Refreshing the authenticated ZKT session for a bounded attendance truth retry",
+            "Refreshing the authenticated ZKT session after a bounded attendance truth cycle",
             false);
     }
     return duration;
