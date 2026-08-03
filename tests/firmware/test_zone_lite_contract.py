@@ -873,9 +873,25 @@ def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
     assert "add_connector_enqueue_attendance_priority" in connector
     assert "add_connector_enqueue_attendance_priority" in header
     assert "add_connector_enqueue_validated_line(line, true)" in connector
+    assert "send_payload_and_wait_for_ack(" in connector
+    assert "ADD_PRIORITY_ACK_TIMEOUT_MS" in connector
+    assert "s_ack_wait_lock" in connector
     assert "!historical && window_start_day == day_end" in runtime
     assert "flush_add_reconcile_payloads(" in runtime
     assert "priority" in runtime
+
+
+def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+
+    assert "ZONE_LITE_POST_STABILITY_RECONCILE_GRACE_MS" in runtime
+    assert "g_force_truth_reconcile = false;" in runtime
+    assert "g_last_full_truth_reconcile_epoch = current_epoch;" in runtime
+    assert "truth_retry_session = true;" in runtime
+    assert (
+        "Refreshing the authenticated ZKT session after a bounded attendance truth cycle"
+        in runtime
+    )
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():

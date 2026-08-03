@@ -60,6 +60,7 @@
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
 #define ADD_ACK_TIMEOUT_MS 60000
+#define ADD_PRIORITY_ACK_TIMEOUT_MS 10000
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
 #define ADD_TRANSPORT_RESTART_GUARD_MS 45000
@@ -116,6 +117,7 @@ static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
+static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
@@ -381,6 +383,33 @@ static bool send_payload(
     }
     xSemaphoreGive(s_send_lock);
     return ok;
+}
+
+static bool send_payload_and_wait_for_ack(
+    const char *type,
+    const char *payload_json,
+    TickType_t lock_timeout,
+    TickType_t ack_timeout)
+{
+    if (!s_ack_wait_lock ||
+        xSemaphoreTake(s_ack_wait_lock, lock_timeout) != pdTRUE) {
+        return false;
+    }
+    char message_id[80] = {0};
+    bool sent = send_payload(type, payload_json, true, message_id);
+    bool awakened = sent && xSemaphoreTake(s_ack_sem, ack_timeout) == pdTRUE;
+    bool acknowledged = false;
+    if (awakened && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        acknowledged = s_ack_matched;
+        s_ack_matched = false;
+        xSemaphoreGive(s_lock);
+    }
+    if (!acknowledged && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (strcmp(s_waiting_ack, message_id) == 0) s_waiting_ack[0] = '\0';
+        xSemaphoreGive(s_lock);
+    }
+    xSemaphoreGive(s_ack_wait_lock);
+    return acknowledged;
 }
 
 bool add_connector_send_payload(const char *type, const char *payload_json)
@@ -2000,6 +2029,23 @@ bool add_connector_enqueue_attendance_priority(const char *payload_json)
     // idempotent, while ordinary historical windows remain on the bulk path.
     bool ok = add_connector_enqueue_validated_line(line, true);
     free(line);
+    if (!ok && add_connector_is_connected()) {
+        // A terminal with a fully occupied preservation partition may have no
+        // filesystem block available even though the separately bounded live
+        // outbox has not reached its own byte limit. Current-day truth still
+        // exists durably on the ZKT, so use a bounded, acknowledged WebSocket
+        // delivery as the recovery path. A timeout returns false and the
+        // periodic terminal truth cycle retries without deleting any record.
+        ok = send_payload_and_wait_for_ack(
+            "attendance_batch",
+            payload_json,
+            pdMS_TO_TICKS(2000),
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS));
+        ESP_LOGW(
+            TAG,
+            "ADD priority outbox unavailable; acknowledged direct delivery %s",
+            ok ? "succeeded" : "failed");
+    }
     return ok;
 }
 
@@ -2270,27 +2316,19 @@ static void outbox_task(void *arg)
             }
             continue;
         }
-        char message_id[80] = {0};
-        bool sent = send_payload(type->valuestring, payload_json, true, message_id);
+        bool acknowledged = send_payload_and_wait_for_ack(
+            type->valuestring,
+            payload_json,
+            portMAX_DELAY,
+            pdMS_TO_TICKS(ADD_ACK_TIMEOUT_MS));
         cJSON_Delete(record);
         free(payload_json);
-        bool awakened = sent && xSemaphoreTake(s_ack_sem, pdMS_TO_TICKS(ADD_ACK_TIMEOUT_MS)) == pdTRUE;
-        bool acknowledged = false;
-        if (awakened && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            acknowledged = s_ack_matched;
-            s_ack_matched = false;
-            xSemaphoreGive(s_lock);
-        }
         if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
             if (!advance_outbox_locked(outbox, row_end)) {
                 ESP_LOGE(TAG, "Could not advance acknowledged ADD %s attendance outbox", outbox->label);
             }
             xSemaphoreGive(outbox->lock);
         } else {
-            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-                if (strcmp(s_waiting_ack, message_id) == 0) s_waiting_ack[0] = '\0';
-                xSemaphoreGive(s_lock);
-            }
             vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
         }
     }
@@ -2306,6 +2344,7 @@ void add_connector_init(void)
     s_live_outbox.lock = xSemaphoreCreateMutex();
     s_bulk_outbox.lock = xSemaphoreCreateMutex();
     s_ack_sem = xSemaphoreCreateBinary();
+    s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
@@ -2320,7 +2359,8 @@ void add_connector_init(void)
     s_zkt.user_count = -1;
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
-                s_ack_sem && s_command_lock && s_commands && s_inbound_messages;
+                s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
+                s_inbound_messages;
     if (s_started &&
         xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
         s_started = false;
