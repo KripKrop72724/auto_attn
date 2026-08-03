@@ -504,6 +504,34 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     return ok;
 }
 
+static void recover_identity_catalog_backup_if_active_missing(void)
+{
+    struct stat active = {0};
+    errno = 0;
+    if (stat(ADD_IDENTITY_CATALOG_PATH, &active) == 0) {
+        return;
+    }
+    if (errno != ENOENT) {
+        ESP_LOGW(TAG, "Could not inspect the active ADD identity catalog");
+        return;
+    }
+
+    // Finish only the interrupted active-to-backup transaction before the
+    // WebSocket can deliver a fresh catalog.  This rename is constant-time and
+    // does not parse or decrypt catalog rows, so it cannot hide the first boot
+    // heartbeat.  Once transport starts, restore_valid_identity_catalog()
+    // validates the recovered bytes and exact row count before publishing a
+    // non-zero generation to the OTA health gate.
+    errno = 0;
+    if (rename(
+            ADD_IDENTITY_CATALOG_BACKUP_PATH,
+            ADD_IDENTITY_CATALOG_PATH) == 0) {
+        ESP_LOGW(TAG, "Recovered interrupted ADD identity catalog transaction");
+    } else if (errno != ENOENT) {
+        ESP_LOGW(TAG, "Could not recover the ADD identity catalog backup");
+    }
+}
+
 static bool restore_valid_identity_catalog(void)
 {
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
@@ -2536,6 +2564,7 @@ void add_connector_start(void)
         }
         return;
     }
+    recover_identity_catalog_backup_if_active_missing();
     start_websocket();
 }
 

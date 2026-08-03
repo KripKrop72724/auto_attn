@@ -78,6 +78,33 @@ class IdentityCatalogRolloutPreflight(unittest.TestCase):
         self.assertNotIn("rename(", restore_function)
         self.assertNotIn("remove(", restore_function)
 
+    def test_interrupted_catalog_transaction_is_recovered_before_transport(self) -> None:
+        connector = (
+            ROOT / "firmware" / "zone_lite" / "main" / "add_connector.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "static void recover_identity_catalog_backup_if_active_missing(void)",
+            connector,
+        )
+        recovery_function = connector[
+            connector.index(
+                "static void recover_identity_catalog_backup_if_active_missing(void)"
+            ) : connector.index("static bool restore_valid_identity_catalog(void)")
+        ]
+        self.assertIn("stat(ADD_IDENTITY_CATALOG_PATH", recovery_function)
+        self.assertIn("errno != ENOENT", recovery_function)
+        self.assertIn("ADD_IDENTITY_CATALOG_BACKUP_PATH", recovery_function)
+        self.assertNotIn("decrypt_storage_line", recovery_function)
+        self.assertNotIn("remove(", recovery_function)
+
+        start = connector.index("void add_connector_start(void)")
+        recover = connector.index(
+            "recover_identity_catalog_backup_if_active_missing();", start
+        )
+        websocket = connector.index("start_websocket();", recover)
+        self.assertLess(recover, websocket)
+
 
 if __name__ == "__main__":
     unittest.main()
