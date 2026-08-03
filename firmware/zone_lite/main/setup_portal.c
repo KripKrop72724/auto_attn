@@ -42,6 +42,8 @@
 #define PORTAL_STABLE_CLOSE_MS (30 * 1000)
 #define PORTAL_BUTTON_GPIO     GPIO_NUM_0
 #define PORTAL_BUTTON_HOLD_MS  5000
+#define PORTAL_STA_RETRY_MS    5000
+#define PORTAL_PENDING_ROLLBACK_MS (15 * 60 * 1000)
 #define VALIDATION_TIMEOUT_MS  30000
 #define VALIDATION_OK_BIT      BIT0
 #define VALIDATION_FAIL_BIT    BIT1
@@ -71,9 +73,11 @@ static volatile bool s_validation_connecting;
 static volatile bool s_dns_running;
 static int64_t s_disconnected_since_ms;
 static int64_t s_connected_since_ms;
+static int64_t s_last_sta_retry_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_lockout_until_ms;
 static uint8_t s_failed_passwords;
+static bool s_pending_rollback_attempted;
 static char s_csrf[33];
 static portal_result_t s_result = PORTAL_RESULT_IDLE;
 static char s_result_message[128] = "Ready to select a network.";
@@ -82,6 +86,14 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static bool running_app_pending_verify(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY;
 }
 
 static void secure_zero(void *buffer, size_t length)
@@ -549,6 +561,11 @@ static esp_err_t portal_start(bool recovery)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "enable APSTA");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "configure setup AP");
     secure_zero(&ap, sizeof(ap));
+    esp_err_t dhcp = esp_netif_dhcps_start(s_ap_netif);
+    if (dhcp != ESP_OK) {
+        (void)esp_wifi_set_mode(WIFI_MODE_STA);
+        return dhcp;
+    }
     generate_csrf();
     set_result(PORTAL_RESULT_IDLE, "Ready to select a network.");
     s_recovery_mode = recovery;
@@ -557,6 +574,7 @@ static esp_err_t portal_start(bool recovery)
     esp_err_t err = start_http_server();
     if (err != ESP_OK) {
         s_active = false;
+        (void)esp_netif_dhcps_stop(s_ap_netif);
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         return err;
     }
@@ -566,6 +584,7 @@ static esp_err_t portal_start(bool recovery)
         httpd_stop(s_httpd);
         s_httpd = NULL;
         s_active = false;
+        (void)esp_netif_dhcps_stop(s_ap_netif);
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         return ESP_ERR_NO_MEM;
     }
@@ -582,6 +601,7 @@ static void portal_stop(void)
         httpd_stop(s_httpd);
         s_httpd = NULL;
     }
+    (void)esp_netif_dhcps_stop(s_ap_netif);
     (void)esp_wifi_set_mode(WIFI_MODE_STA);
     secure_zero(s_csrf, sizeof(s_csrf));
     ESP_LOGI(TAG, "Wi-Fi setup access point disabled; station-only operation restored");
@@ -602,6 +622,23 @@ static void controller_task(void *argument)
         } else if (!button_latched && current - pressed_since >= PORTAL_BUTTON_HOLD_MS) {
             button_latched = true;
             (void)portal_start(false);
+        }
+        if (!s_station_owned && s_disconnected_since_ms &&
+            current - s_last_sta_retry_ms >= PORTAL_STA_RETRY_MS) {
+            s_last_sta_retry_ms = current;
+            esp_err_t retry = esp_wifi_connect();
+            if (retry != ESP_OK) {
+                ESP_LOGW(TAG, "Bounded station retry failed: %s", esp_err_to_name(retry));
+            }
+        }
+        if (!s_station_owned && !s_pending_rollback_attempted &&
+            s_disconnected_since_ms &&
+            current - s_disconnected_since_ms >= PORTAL_PENDING_ROLLBACK_MS &&
+            running_app_pending_verify()) {
+            s_pending_rollback_attempted = true;
+            ESP_LOGE(TAG, "Pending OTA image could not restore Wi-Fi; rolling back safely");
+            esp_err_t rollback = esp_ota_mark_app_invalid_rollback_and_reboot();
+            ESP_LOGE(TAG, "Pending OTA rollback failed: %s", esp_err_to_name(rollback));
         }
         if (!s_active && s_disconnected_since_ms &&
             current - s_disconnected_since_ms >= PORTAL_RECOVERY_MS) {
@@ -635,7 +672,6 @@ esp_err_t setup_portal_prepare(setup_portal_station_visibility_cb_t visibility_c
                                                ESP_NETIF_CAPTIVEPORTAL_URI,
                                                (void *)captive_uri, strlen(captive_uri)),
                         TAG, "set captive portal DHCP option");
-    ESP_RETURN_ON_ERROR(esp_netif_dhcps_start(s_ap_netif), TAG, "start AP DHCP");
     return ESP_OK;
 }
 
@@ -656,7 +692,10 @@ esp_err_t setup_portal_start_controller(void)
 bool setup_portal_handle_sta_disconnected(void)
 {
     s_connected_since_ms = 0;
-    if (!s_disconnected_since_ms) s_disconnected_since_ms = now_ms();
+    if (!s_disconnected_since_ms) {
+        s_disconnected_since_ms = now_ms();
+        s_last_sta_retry_ms = s_disconnected_since_ms;
+    }
     if (s_station_owned) {
         if (s_validation_connecting) xEventGroupSetBits(s_validation_events, VALIDATION_FAIL_BIT);
         return true;
@@ -671,6 +710,8 @@ bool setup_portal_handle_sta_got_ip(void)
         return true;
     }
     s_disconnected_since_ms = 0;
+    s_last_sta_retry_ms = 0;
+    s_pending_rollback_attempted = false;
     if (!s_connected_since_ms) s_connected_since_ms = now_ms();
     return false;
 }
