@@ -507,11 +507,6 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
 static bool restore_valid_identity_catalog(void)
 {
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
-    if (!file && rename(
-            ADD_IDENTITY_CATALOG_BACKUP_PATH,
-            ADD_IDENTITY_CATALOG_PATH) == 0) {
-        file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
-    }
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     bool ok = file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file);
     size_t row_count = 0;
@@ -578,13 +573,6 @@ static bool restore_valid_identity_catalog(void)
     s_identity_catalog_rows = row_count;
     s_identity_catalog_generation = 1;
     xSemaphoreGive(s_lock);
-    // Once the active catalog has been decrypted and its exact row count has
-    // been verified, abandoned transaction files can be reclaimed safely.
-    // This is important on large terminals whose durable attendance backlog
-    // leaves little SPIFFS headroom for the next atomic catalog refresh.
-    (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
-    (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
     ESP_LOGI(
         TAG,
         "Restored validated encrypted ADD identity catalog rows=%u",
@@ -2513,6 +2501,12 @@ static void start_websocket(void)
         (unsigned long)s_bulk_outbox.depth);
     xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, NULL);
     xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, NULL);
+    // Start transport and heartbeat visibility before scanning the encrypted
+    // catalog.  The scan is bounded and fail-closed, but SPIFFS latency must
+    // never delay OTA boot supervision or make an otherwise running connector
+    // disappear from the control plane.  Do not touch transaction files here:
+    // a fresh catalog may already be arriving on the inbound worker.
+    (void)restore_valid_identity_catalog();
 }
 
 static void onboarding_task(void *arg)
@@ -2533,7 +2527,6 @@ static void onboarding_task(void *arg)
 void add_connector_start(void)
 {
     if (!s_started || s_client || s_onboarding_task_started) return;
-    (void)restore_valid_identity_catalog();
     restore_command_inbox();
     if (zone_config_needs_onboarding()) {
         s_onboarding_task_started = true;
