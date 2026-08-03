@@ -861,6 +861,8 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     assert "s_zkt.user_count >= 0" in connector
     assert "s_zkt.attendance_count >= 0" in connector
     assert "bool add_connector_boot_health_ready(void);" in header
+    assert "restore_valid_identity_catalog();" in connector
+    assert "s_identity_catalog_generation = 1" in connector
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():

@@ -504,6 +504,94 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     return ok;
 }
 
+static bool restore_valid_identity_catalog(void)
+{
+    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    if (!file && rename(
+            ADD_IDENTITY_CATALOG_BACKUP_PATH,
+            ADD_IDENTITY_CATALOG_PATH) == 0) {
+        file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    }
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool ok = file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file);
+    size_t row_count = 0;
+    int expected_rows = -1;
+    bool legacy_catalog = false;
+    if (ok) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *metadata = plain ? cJSON_Parse(plain) : NULL;
+        free(plain);
+        cJSON *type = metadata
+            ? cJSON_GetObjectItemCaseSensitive(metadata, "type")
+            : NULL;
+        cJSON *rows = metadata
+            ? cJSON_GetObjectItemCaseSensitive(metadata, "rows")
+            : NULL;
+        cJSON *rows_count = metadata
+            ? cJSON_GetObjectItemCaseSensitive(metadata, "rows_count")
+            : NULL;
+        legacy_catalog = cJSON_IsArray(rows);
+        if (!cJSON_IsString(type) ||
+            strcmp(type->valuestring, "identity_catalog") != 0) {
+            ok = false;
+        } else if (legacy_catalog) {
+            expected_rows = cJSON_GetArraySize(rows);
+            cJSON *row = NULL;
+            cJSON_ArrayForEach(row, rows) {
+                if (!cJSON_IsObject(row)) ok = false;
+            }
+            row_count = expected_rows >= 0 ? (size_t)expected_rows : 0;
+        } else if (cJSON_IsNumber(rows_count)) {
+            expected_rows = rows_count->valueint;
+        } else {
+            ok = false;
+        }
+        cJSON_Delete(metadata);
+    }
+    if (ok && (expected_rows < 0 ||
+               expected_rows > ADD_IDENTITY_CATALOG_MAX_ROWS)) {
+        ok = false;
+    }
+    while (ok && !legacy_catalog && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *row = plain ? cJSON_Parse(plain) : NULL;
+        free(plain);
+        if (!cJSON_IsObject(row) ||
+            row_count >= (size_t)expected_rows) {
+            ok = false;
+        } else {
+            row_count++;
+        }
+        cJSON_Delete(row);
+    }
+    if (file && ferror(file)) ok = false;
+    if (ok && row_count != (size_t)expected_rows) ok = false;
+    if (file) fclose(file);
+    free(line);
+    if (!ok) {
+        ESP_LOGW(TAG, "No complete encrypted ADD identity catalog was restored");
+        return false;
+    }
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+    s_identity_catalog_rows = row_count;
+    s_identity_catalog_generation = 1;
+    xSemaphoreGive(s_lock);
+    // Once the active catalog has been decrypted and its exact row count has
+    // been verified, abandoned transaction files can be reclaimed safely.
+    // This is important on large terminals whose durable attendance backlog
+    // leaves little SPIFFS headroom for the next atomic catalog refresh.
+    (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
+    (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
+    (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    ESP_LOGI(
+        TAG,
+        "Restored validated encrypted ADD identity catalog rows=%u",
+        (unsigned)row_count);
+    return true;
+}
+
 static bool activate_identity_catalog(const char *staged_path)
 {
     if (!staged_path) return false;
@@ -2429,6 +2517,7 @@ static void onboarding_task(void *arg)
 void add_connector_start(void)
 {
     if (!s_started || s_client || s_onboarding_task_started) return;
+    (void)restore_valid_identity_catalog();
     restore_command_inbox();
     if (zone_config_needs_onboarding()) {
         s_onboarding_task_started = true;
