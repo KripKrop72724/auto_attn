@@ -57,6 +57,19 @@ class IdentityCatalogRolloutPreflight(unittest.TestCase):
         self.assertIn("ADD_IDENTITY_CATALOG_BACKUP_PATH", connector)
         self.assertIn("activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH)", connector)
 
+    def test_valid_durable_catalog_is_restored_before_websocket_refresh(self) -> None:
+        connector = (
+            ROOT / "firmware" / "zone_lite" / "main" / "add_connector.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("static bool restore_valid_identity_catalog(void)", connector)
+        self.assertIn("row_count != (size_t)expected_rows", connector)
+        self.assertIn("s_identity_catalog_generation = 1", connector)
+        start = connector.index("void add_connector_start(void)")
+        restored = connector.index("restore_valid_identity_catalog();", start)
+        websocket = connector.index("start_websocket();", restored)
+        self.assertLess(restored, websocket)
+
 
 if __name__ == "__main__":
     unittest.main()

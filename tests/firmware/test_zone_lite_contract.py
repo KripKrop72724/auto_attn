@@ -861,6 +861,21 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     assert "s_zkt.user_count >= 0" in connector
     assert "s_zkt.attendance_count >= 0" in connector
     assert "bool add_connector_boot_health_ready(void);" in header
+    assert "restore_valid_identity_catalog();" in connector
+    assert "s_identity_catalog_generation = 1" in connector
+
+
+def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+
+    assert "add_connector_enqueue_attendance_priority" in connector
+    assert "add_connector_enqueue_attendance_priority" in header
+    assert "add_connector_enqueue_validated_line(line, true)" in connector
+    assert "!historical && window_start_day == day_end" in runtime
+    assert "flush_add_reconcile_payloads(" in runtime
+    assert "priority" in runtime
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():
