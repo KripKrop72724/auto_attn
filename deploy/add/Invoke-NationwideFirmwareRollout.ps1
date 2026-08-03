@@ -53,11 +53,25 @@ if ($CanaryCampaignId -notmatch '^[0-9a-f]{32}$') { throw 'CanaryCampaignId is i
 if ([string]::IsNullOrWhiteSpace($AdminPassword)) { throw 'AdminPassword is required.' }
 
 $loginBody = @{ username = $AdminUsername; password = $AdminPassword } | ConvertTo-Json -Compress
-$login = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/v1/auth/login" `
-    -ContentType 'application/json' -Body $loginBody -SessionVariable Session -TimeoutSec 30
+$loginResponse = Invoke-WebRequest -UseBasicParsing -Method Post `
+    -Uri "$BaseUrl/api/v1/auth/login" -ContentType 'application/json' `
+    -Body $loginBody -TimeoutSec 30
+$login = $loginResponse.Content | ConvertFrom-Json
 if (-not $login.ok -or [string]::IsNullOrWhiteSpace([string]$login.csrf_token)) {
     throw 'Could not establish an authenticated ADD rollout session.'
 }
+$setCookie = @($loginResponse.Headers['Set-Cookie']) -join ','
+$cookieMatch = [regex]::Match($setCookie, '(?:^|[,\s])add_admin=([^;,\s]+)')
+if (-not $cookieMatch.Success) {
+    throw 'ADD rollout login did not return the administrator cookie.'
+}
+$script:Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$adminCookie = New-Object System.Net.Cookie
+$adminCookie.Name = 'add_admin'
+$adminCookie.Value = $cookieMatch.Groups[1].Value
+$adminCookie.Path = '/'
+$adminCookie.Secure = $false
+$script:Session.Cookies.Add([Uri]$BaseUrl, $adminCookie)
 $script:CsrfToken = [string]$login.csrf_token
 
 try {

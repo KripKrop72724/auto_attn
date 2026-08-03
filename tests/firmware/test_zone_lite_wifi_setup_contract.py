@@ -97,4 +97,10 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "ROLLED_BACK" in rollout
     assert "NATIONWIDE_ACCEPTED:" in rollout
     assert "Post-rollout stability verification failed" in rollout
+    assert "Invoke-WebRequest -UseBasicParsing -Method Post" in rollout
+    assert "'(?:^|[,\\s])add_admin=([^;,\\s]+)'" in rollout
+    assert "$adminCookie.Secure = $false" in rollout
+    assert "$script:Session.Cookies.Add([Uri]$BaseUrl, $adminCookie)" in rollout
+    assert "-SessionVariable Session" not in rollout
     assert "environment: firmware-production" in workflow
+    assert "ref: main" in workflow

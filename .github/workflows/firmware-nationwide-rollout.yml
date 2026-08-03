@@ -59,7 +59,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.provenance.outputs.sha }}
+          # The operational rollout client comes from current protected main,
+          # while the immutable release identity remains pinned below to the
+          # canary-tested SHA supplied by the promotion gate.
+          ref: main
           fetch-depth: 1
           persist-credentials: false
       - name: Roll out in fail-closed batches and verify every eligible device
