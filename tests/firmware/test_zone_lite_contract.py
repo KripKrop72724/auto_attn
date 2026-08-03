@@ -801,10 +801,30 @@ def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
     assert "add_connector_identity_catalog_generation" in connector
     assert "add_connector_identity_catalog_generation" in header
     assert '"IDENTITY_CATALOG_APPLIED"' in runtime
-    assert "identity_catalog_generation != applied_identity_catalog_generation" in runtime
-    applied = runtime.index("applied_identity_catalog_generation = identity_catalog_generation")
+    assert "static uint32_t g_applied_identity_catalog_generation;" in runtime
+    assert "identity_catalog_generation !=\n                g_applied_identity_catalog_generation" in runtime
+    assert "uint32_t applied_identity_catalog_generation = 0;" not in runtime
+    applied = runtime.index(
+        "g_applied_identity_catalog_generation =\n                    identity_catalog_generation"
+    )
     forced = runtime.index("g_force_truth_reconcile = true;", applied)
     assert applied < forced
+
+
+def test_identity_catalog_generation_survives_bounded_zkt_session_refresh():
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+
+    global_generation = runtime.index(
+        "static uint32_t g_applied_identity_catalog_generation;"
+    )
+    gateway_run = runtime.index("static int64_t gateway_run(")
+    assert global_generation < gateway_run
+    session_body = runtime[
+        gateway_run : runtime.index("static void event_handler(", gateway_run)
+    ]
+    assert "g_applied_identity_catalog_generation" in session_body
+    assert "uint32_t applied_identity_catalog_generation" not in session_body
+    assert "g_applied_identity_catalog_generation = 0" not in runtime
 
 
 def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
