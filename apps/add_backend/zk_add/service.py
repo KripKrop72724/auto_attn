@@ -2322,6 +2322,139 @@ def repair_verified_tombstone_backlog(
     return repaired
 
 
+def repair_verified_active_identity_backlog(
+    session: Session,
+    *,
+    limit: int = 500,
+) -> int:
+    """Requeue recent missing-UID punches proven by a later stable snapshot.
+
+    Some ZKT attendance records contain a user ID and name but no terminal UID.
+    A user ID alone is never sufficient identity evidence because terminals may
+    reuse it.  This bounded repair therefore requires the punch to be newer than
+    the terminal's last identity change and covered by a stable, complete
+    snapshot.  The exact current name must match, and any supplied UID or
+    terminal fingerprint must also match.  Historical or ambiguous rows remain
+    blocked for operator evidence.
+    """
+
+    bounded_limit = max(1, min(int(limit), 500))
+    tolerance = timedelta(
+        seconds=max(0, settings.identity_snapshot_capture_tolerance_seconds)
+    )
+    repaired = 0
+
+    zkts = session.scalars(
+        select(ZKTDevice).where(
+            ZKTDevice.snapshot_complete == True,  # noqa: E712
+            ZKTDevice.identity_snapshot_stable == True,  # noqa: E712
+            ZKTDevice.identity_snapshot_id.is_not(None),
+            ZKTDevice.identity_snapshot_observed_at.is_not(None),
+            ZKTDevice.last_identity_change_at.is_not(None),
+        )
+    ).all()
+    for zkt in zkts:
+        if repaired >= bounded_limit:
+            break
+        assert zkt.identity_snapshot_observed_at is not None
+        assert zkt.last_identity_change_at is not None
+        observed_at = ensure_utc(zkt.identity_snapshot_observed_at)
+        identity_change_at = ensure_utc(zkt.last_identity_change_at)
+        valid_resolutions = valid_identity_resolutions(session, zkt=zkt)
+
+        candidates = session.execute(
+            select(AttendanceEvent, DeviceUser)
+            .join(
+                DeviceUser,
+                (DeviceUser.zkt_device_id == AttendanceEvent.zkt_device_id)
+                & (DeviceUser.user_id == AttendanceEvent.user_id),
+            )
+            .where(
+                AttendanceEvent.zkt_device_id == zkt.id,
+                AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+                AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
+                AttendanceEvent.device_event_time >= identity_change_at,
+                DeviceUser.lifecycle_state == "ACTIVE",
+                DeviceUser.present == True,  # noqa: E712
+                DeviceUser.cnic_encrypted.is_not(None),
+                DeviceUser.cnic_lookup_hash.is_not(None),
+                (
+                    AttendanceEvent.device_user_id.is_(None)
+                    | (AttendanceEvent.device_user_id == DeviceUser.id)
+                ),
+                (
+                    AttendanceEvent.uid.is_(None)
+                    | (AttendanceEvent.uid == "")
+                    | (AttendanceEvent.uid == DeviceUser.uid)
+                ),
+            )
+            .order_by(AttendanceEvent.id.desc())
+            .limit(bounded_limit - repaired)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        for row, user in candidates:
+            if ensure_utc(row.captured_at) > observed_at + tolerance:
+                continue
+            if not _identity_names_match(row.display_name or "", user.display_name or ""):
+                continue
+            if (
+                row.identity_terminal_fingerprint
+                and user.terminal_identity_fingerprint
+                and not secrets.compare_digest(
+                    row.identity_terminal_fingerprint,
+                    user.terminal_identity_fingerprint,
+                )
+            ):
+                continue
+
+            identity_resolution = None
+            if user.identity_conflict_code:
+                identity_resolution = valid_resolutions.get(
+                    user.cnic_lookup_hash or ""
+                )
+                if identity_resolution is None:
+                    continue
+
+            cnic = decrypt_cnic(user.cnic_encrypted)
+            if not cnic:
+                continue
+
+            now = utc_now()
+            row.device_user_id = user.id
+            row.identity_resolution_id = (
+                identity_resolution.id if identity_resolution is not None else None
+            )
+            row.identity_snapshot_id = zkt.identity_snapshot_id
+            row.identity_terminal_fingerprint = user.terminal_identity_fingerprint
+            row.identity_resolution_status = "RESOLVED_CURRENT_SNAPSHOT"
+            row.identity_resolved_at = now
+            row.identity_repaired_at = now
+            row.identity_repair_reason = "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
+            row.display_name = user.display_name
+            row.cnic_encrypted = user.cnic_encrypted
+            row.cnic_lookup_hash = user.cnic_lookup_hash
+            row.cnic_last4 = user.cnic_last4
+            row.raw_punch = row.raw_punch or user.shift_worker
+            row.ords_status = "PENDING"
+            outbox = session.scalar(
+                select(OrdsOutbox).where(
+                    OrdsOutbox.attendance_event_id == row.id
+                )
+            )
+            if outbox is None:
+                session.add(
+                    OrdsOutbox(attendance_event_id=row.id, status="PENDING")
+                )
+            else:
+                outbox.status = "PENDING"
+                outbox.next_attempt_at = None
+                outbox.last_http_status = None
+                outbox.last_error = None
+            repaired += 1
+    return repaired
+
+
 def block_undelivered_attendance(
     session: Session,
     *,

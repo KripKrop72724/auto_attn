@@ -81,6 +81,7 @@ from zk_add.service import (
     ingest_attendance,
     onboard_connector,
     oracle_payload,
+    repair_verified_active_identity_backlog,
     repair_verified_tombstone_backlog,
     replace_user_snapshot,
     record_oracle_receipts,
@@ -444,7 +445,7 @@ def event(
     event_uid: str,
     user_id: str = "1007",
     raw_name: str | None = None,
-    uid: str = "7",
+    uid: str | None = "7",
 ):
     return AttendanceEventIn(
         event_uid=event_uid,
@@ -1266,6 +1267,136 @@ def test_verified_tombstone_requeues_existing_blocked_punches(
     assert len(claims) == 1
     assert claims[0][1]["event_uid"] == "9" * 64
     assert claims[0][1]["cnic"] == CNIC
+
+
+def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector)
+    zkt = connector.zkt_device
+    assert zkt is not None
+    assert user is not None
+
+    base = utc_now()
+    zkt.last_identity_change_at = base - timedelta(minutes=30)
+    zkt.identity_snapshot_observed_at = base
+    punches = [
+        event(event_uid="1" * 64, uid=None, raw_name="Ayesha").model_copy(
+            update={
+                "device_event_time": base - timedelta(minutes=5),
+                "captured_at": base - timedelta(minutes=4),
+            }
+        ),
+        event(event_uid="2" * 64, uid=None, raw_name="Ayesha").model_copy(
+            update={
+                "device_event_time": base - timedelta(minutes=40),
+                "captured_at": base - timedelta(minutes=39),
+            }
+        ),
+        event(event_uid="3" * 64, uid=None, raw_name="Different Person").model_copy(
+            update={
+                "device_event_time": base - timedelta(minutes=3),
+                "captured_at": base - timedelta(minutes=2),
+            }
+        ),
+        event(event_uid="4" * 64, uid="999", raw_name="Ayesha").model_copy(
+            update={
+                "device_event_time": base - timedelta(minutes=3),
+                "captured_at": base - timedelta(minutes=2),
+            }
+        ),
+        event(event_uid="5" * 64, uid=None, raw_name="Ayesha").model_copy(
+            update={
+                "device_event_time": base + timedelta(minutes=1),
+                "captured_at": base + timedelta(minutes=1),
+            }
+        ),
+    ]
+    ingest_attendance(db, connector=connector, events=punches)
+    rows = {
+        row.event_uid: row
+        for row in db.scalars(
+            select(AttendanceEvent).where(
+                AttendanceEvent.event_uid.in_([p.event_uid for p in punches])
+            )
+        ).all()
+    }
+    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows.values())
+
+    assert repair_verified_active_identity_backlog(db) == 1
+    repaired = rows["1" * 64]
+    assert repaired.device_user_id == user.id
+    assert repaired.identity_snapshot_id == zkt.identity_snapshot_id
+    assert repaired.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
+    assert repaired.identity_repair_reason == "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
+    assert decrypt_cnic(repaired.cnic_encrypted) == CNIC
+    assert repaired.ords_status == "PENDING"
+    assert db.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == repaired.id)
+    )
+    for event_uid in ("2" * 64, "3" * 64, "4" * 64, "5" * 64):
+        assert rows[event_uid].ords_status == "BLOCKED_IDENTITY"
+        assert rows[event_uid].cnic_lookup_hash is None
+
+
+def test_verified_active_snapshot_requires_duplicate_cnic_resolution(db: Session):
+    connector = connector_fixture(db)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="duplicate-current-users",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="1", user_id="1001", name=f"Same Name-{CNIC}"),
+                UserSnapshotRow(uid="2", user_id="1002", name=f"Same Name-{CNIC}"),
+            ],
+        ),
+    )
+    zkt = connector.zkt_device
+    assert zkt is not None
+    base = utc_now()
+    zkt.last_identity_change_at = base - timedelta(minutes=30)
+    zkt.identity_snapshot_observed_at = base
+    punch = event(
+        event_uid="6" * 64,
+        user_id="1001",
+        uid=None,
+        raw_name="Same Name",
+    ).model_copy(
+        update={
+            "device_event_time": base - timedelta(minutes=2),
+            "captured_at": base - timedelta(minutes=1),
+        }
+    )
+    ingest_attendance(db, connector=connector, events=[punch])
+    blocked = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid)
+    )
+    assert blocked is not None
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
+    assert repair_verified_active_identity_backlog(db) == 0
+
+    group = build_identity_conflict_report(db, zkt=zkt)["groups"][0]
+    resolution = create_same_employee_resolution(
+        db,
+        zkt=zkt,
+        group_token=group["group_token"],
+        members=[
+            (member["user_key"], member["row_version"])
+            for member in group["members"]
+        ],
+        reason="Exact current membership was independently reviewed.",
+        idempotency_key="repair-current-snapshot-duplicate",
+        actor="StateHealthAdmin",
+    )
+    assert repair_verified_active_identity_backlog(db) == 1
+    assert blocked.identity_resolution_id == resolution.id
+    assert blocked.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
+    assert blocked.ords_status == "PENDING"
 
 
 def test_historical_alias_is_eligible_for_ords_delivery(
