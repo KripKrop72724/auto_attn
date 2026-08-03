@@ -59,8 +59,10 @@
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
-#define ADD_ACK_TIMEOUT_MS 60000
+#define ADD_OUTBOX_ACK_TIMEOUT_MS 10000
 #define ADD_PRIORITY_ACK_TIMEOUT_MS 10000
+#define ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS 12000
+#define ADD_PRIORITY_HOLD_MS 3000
 #define ADD_OUTBOX_RETRY_MS 5000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
 #define ADD_TRANSPORT_RESTART_GUARD_MS 45000
@@ -161,10 +163,17 @@ static add_outbox_t s_live_outbox = {
 };
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
+static volatile uint32_t s_priority_delivery_until_ms;
 
 static int64_t monotonic_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static bool priority_delivery_hold_active(void)
+{
+    uint32_t now = (uint32_t)monotonic_ms();
+    return (int32_t)(s_priority_delivery_until_ms - now) > 0;
 }
 
 static const char *firmware_version(void)
@@ -2036,11 +2045,15 @@ bool add_connector_enqueue_attendance_priority(const char *payload_json)
         // exists durably on the ZKT, so use a bounded, acknowledged WebSocket
         // delivery as the recovery path. A timeout returns false and the
         // periodic terminal truth cycle retries without deleting any record.
+        s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
+            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
         ok = send_payload_and_wait_for_ack(
             "attendance_batch",
             payload_json,
-            pdMS_TO_TICKS(2000),
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
             pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS));
+        s_priority_delivery_until_ms =
+            (uint32_t)monotonic_ms() + ADD_PRIORITY_HOLD_MS;
         ESP_LOGW(
             TAG,
             "ADD priority outbox unavailable; acknowledged direct delivery %s",
@@ -2277,6 +2290,10 @@ static void outbox_task(void *arg)
         return;
     }
     while (true) {
+        if (priority_delivery_hold_active()) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
         bool have_row = false;
         add_outbox_t *outbox = NULL;
         off_t row_end = 0;
@@ -2320,7 +2337,7 @@ static void outbox_task(void *arg)
             type->valuestring,
             payload_json,
             portMAX_DELAY,
-            pdMS_TO_TICKS(ADD_ACK_TIMEOUT_MS));
+            pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS));
         cJSON_Delete(record);
         free(payload_json);
         if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
@@ -2636,8 +2653,14 @@ bool add_connector_boot_health_ready(void)
             strcmp(s_zkt.connection_state, "ONLINE") == 0 ||
             (strcmp(s_zkt.connection_state, "RECOVERING") == 0 &&
              authenticated_stability_elapsed);
+        // A complete authenticated terminal snapshot is sufficient to prove
+        // the running image when a saturated preservation partition cannot
+        // stage the optional ADD alias catalog. Oracle truth remains
+        // independently fail-closed for every unresolved identity.
+        bool identity_ready = s_identity_catalog_generation > 0 ||
+            (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
         ready = s_connected
-            && s_identity_catalog_generation > 0
+            && identity_ready
             && s_zkt.online
             && stable_terminal_session
             && s_zkt.user_count >= 0
