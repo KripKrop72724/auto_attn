@@ -1971,6 +1971,22 @@ bool add_connector_enqueue_attendance(const char *payload_json)
     return add_connector_enqueue_record("attendance_batch", payload_json);
 }
 
+bool add_connector_enqueue_attendance_priority(const char *payload_json)
+{
+    if (!zone_config_get()->add_enabled) return true;
+    bool inferred_live = false;
+    char *line = attendance_outbox_record_line(payload_json, &inferred_live);
+    if (!line) return false;
+    // A current-day reconnect dump is not a historical bulk sweep: operators
+    // need those punches even when an older reconcile backlog has filled the
+    // bounded bulk outbox.  Route the already-validated batch through the
+    // separately bounded live queue.  The ADD event UID keeps partial retries
+    // idempotent, while ordinary historical windows remain on the bulk path.
+    bool ok = add_connector_enqueue_validated_line(line, true);
+    free(line);
+    return ok;
+}
+
 bool add_connector_enqueue_oracle_receipts(
     const char *const *event_uids,
     size_t count,

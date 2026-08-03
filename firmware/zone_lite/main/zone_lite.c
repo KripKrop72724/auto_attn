@@ -2792,13 +2792,28 @@ static void free_reconcile_payloads(char **payloads, size_t count)
     }
 }
 
-static bool flush_add_reconcile_payloads(char **payloads, size_t *count)
+static bool flush_add_reconcile_payloads(
+    char **payloads,
+    size_t *count,
+    bool priority)
 {
     if (*count == 0) {
         return true;
     }
     size_t queued = *count;
-    bool ok = add_connector_enqueue_attendance_bulk((const char *const *)payloads, queued);
+    bool ok = true;
+    if (priority) {
+        for (size_t i = 0; i < queued; i++) {
+            if (!add_connector_enqueue_attendance_priority(payloads[i])) {
+                ok = false;
+                break;
+            }
+        }
+    } else {
+        ok = add_connector_enqueue_attendance_bulk(
+            (const char *const *)payloads,
+            queued);
+    }
     free_reconcile_payloads(payloads, queued);
     *count = 0;
     return ok;
@@ -2807,7 +2822,8 @@ static bool flush_add_reconcile_payloads(char **payloads, size_t *count)
 static bool add_enqueue_reconcile_events(
     const attendance_event_t *events,
     size_t event_count,
-    const char *capturetype)
+    const char *capturetype,
+    bool priority)
 {
     char *payloads[ADD_RECONCILE_COMMIT_BATCHES] = {0};
     size_t payload_count = 0;
@@ -2847,7 +2863,10 @@ static bool add_enqueue_reconcile_events(
         payloads[payload_count++] = batch_json;
         total_batches++;
         if (payload_count == ADD_RECONCILE_COMMIT_BATCHES &&
-            !flush_add_reconcile_payloads(payloads, &payload_count)) {
+            !flush_add_reconcile_payloads(
+                payloads,
+                &payload_count,
+                priority)) {
             ESP_LOGE(TAG, "Could not durably append an ADD reconcile payload chunk");
             return false;
         }
@@ -2856,7 +2875,10 @@ static bool add_enqueue_reconcile_events(
         }
     }
 
-    if (!flush_add_reconcile_payloads(payloads, &payload_count)) {
+    if (!flush_add_reconcile_payloads(
+            payloads,
+            &payload_count,
+            priority)) {
         ESP_LOGE(TAG, "Could not durably append the final ADD reconcile payload chunk");
         return false;
     }
@@ -3577,10 +3599,13 @@ static bool reconcile_attendance_dump(
             // the validated internal route. Enqueue before considering direct
             // Oracle so a slow public reconcile endpoint can never stall live
             // capture on an otherwise healthy ADD-connected device.
+            bool current_day_priority =
+                !historical && window_start_day == day_end;
             bool window_add_ok = add_enqueue_reconcile_events(
                 reconcile_events,
                 window_event_count,
-                capturetype);
+                capturetype,
+                current_day_priority);
             if (!identity_complete) {
                 window_truth_ok = false;
                 if (identity_blocked_out) *identity_blocked_out = true;
