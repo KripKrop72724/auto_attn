@@ -35,6 +35,7 @@ from zk_add.service import (
     queue_due_revokes,
     reconcile_admin_lease_command,
     reconcile_admin_lease_states,
+    repair_verified_active_identity_backlog,
     repair_verified_tombstone_backlog,
     resolve_alert,
     serialize_command,
@@ -73,6 +74,7 @@ ORDS_ACTIVE_STATUSES = (
 ORDS_ACKNOWLEDGED_STATUSES = {"ACKED", "ACKED_CHECK"}
 VERIFIED_IDENTITY_RESOLUTION_STATUSES = {
     "RESOLVED",
+    "RESOLVED_CURRENT_SNAPSHOT",
     "RESOLVED_DIRECTORY_EVIDENCE",
     "RESOLVED_HISTORICAL_ALIAS",
     "RESOLVED_TOMBSTONE",
@@ -277,6 +279,7 @@ async def maintenance_tick() -> None:
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
         repair_verified_tombstone_backlog(session)
+        repair_verified_active_identity_backlog(session)
         reconcile_admin_lease_states(session)
         for command in session.scalars(
             select(DeviceCommand)
