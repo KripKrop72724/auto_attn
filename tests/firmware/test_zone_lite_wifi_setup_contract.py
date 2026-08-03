@@ -32,6 +32,21 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "local_ip == 0xC0A8FE01UL" in PORTAL
     assert "(peer_ip & PORTAL_MASK) == PORTAL_NET" in PORTAL
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
+    prepare = PORTAL[
+        PORTAL.index("esp_err_t setup_portal_prepare") :
+        PORTAL.index("esp_err_t setup_portal_start_controller")
+    ]
+    start = PORTAL[
+        PORTAL.index("static esp_err_t portal_start") :
+        PORTAL.index("static void portal_stop")
+    ]
+    stop = PORTAL[
+        PORTAL.index("static void portal_stop") :
+        PORTAL.index("static void controller_task")
+    ]
+    assert "esp_netif_dhcps_start" not in prepare
+    assert "esp_netif_dhcps_start(s_ap_netif)" in start
+    assert "esp_netif_dhcps_stop(s_ap_netif)" in stop
     assert "CONFIG_LWIP_IP_FORWARD=n" in defaults
     assert "ip_napt_enable" not in PORTAL
 
@@ -41,6 +56,11 @@ def test_recovery_and_manual_activation_windows_match_the_operating_contract() -
     assert "PORTAL_BUTTON_HOLD_MS  5000" in PORTAL
     assert "PORTAL_MANUAL_IDLE_MS  (10 * 60 * 1000)" in PORTAL
     assert "PORTAL_STABLE_CLOSE_MS (30 * 1000)" in PORTAL
+    assert "PORTAL_STA_RETRY_MS    5000" in PORTAL
+    assert "PORTAL_PENDING_ROLLBACK_MS (15 * 60 * 1000)" in PORTAL
+    assert "esp_wifi_connect()" in PORTAL
+    assert "esp_ota_mark_app_invalid_rollback_and_reboot()" in PORTAL
+    assert "running_app_pending_verify()" in PORTAL
     assert "GPIO_NUM_0" in PORTAL
     assert "ota_manager_busy()" in PORTAL
 
