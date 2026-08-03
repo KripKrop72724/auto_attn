@@ -147,6 +147,13 @@
 #define BLOCKED_PATH STORAGE_BASE "/blocked_identity.jsonl"
 #define BLOCKED_RECOVERY_TMP_PATH STORAGE_BASE "/blocked_recovery.tmp"
 #define BLOCKED_RECOVERY_BACKUP_PATH STORAGE_BASE "/blocked_recovery.bak"
+#ifndef ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES
+// Blocked-identity repair rewrites the complete local queue.  Keep automatic
+// repair bounded so a large historical backlog cannot delay ZKT live-event
+// registration or monopolize the storage lock.  Oversized queues remain
+// durably preserved for a later bounded repair/truth pass.
+#define ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES (64 * 1024)
+#endif
 #define CORRUPT_ORDS_PATH STORAGE_BASE "/corrupt_ords.jsonl"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
@@ -394,6 +401,7 @@ static bool g_truth_use_recovery_chunks;
 static bool g_truth_retry_session_requested;
 static uint32_t g_truth_fresh_session_retries;
 static bool g_truth_window_blocked;
+static bool g_blocked_recovery_deferred_logged;
 static int g_daily_zkt_reboot_completed_day = -1;
 static int64_t g_daily_zkt_reboot_last_attempt_ms;
 static int64_t g_last_full_scan_ms;
@@ -2485,6 +2493,28 @@ static bool recover_blocked_events_from_snapshot(
     size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
+    struct stat blocked_stat = {0};
+    if (stat(BLOCKED_PATH, &blocked_stat) == 0 &&
+        blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES) {
+        if (!g_blocked_recovery_deferred_logged) {
+            g_blocked_recovery_deferred_logged = true;
+            char message[224];
+            snprintf(
+                message,
+                sizeof(message),
+                "Deferred blocked-identity repair: queue=%lld bytes exceeds live-safe limit=%u; records remain preserved for bounded truth recovery.",
+                (long long)blocked_stat.st_size,
+                (unsigned)ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES);
+            ESP_LOGW(TAG, "%s", message);
+            add_connector_log(
+                "WARN",
+                "identity",
+                "BLOCKED_IDENTITY_RECOVERY_DEFERRED",
+                message);
+        }
+        return true;
+    }
+    g_blocked_recovery_deferred_logged = false;
     if (!users || !g_storage_lock ||
         xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return false;
