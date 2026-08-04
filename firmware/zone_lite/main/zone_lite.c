@@ -367,6 +367,7 @@ typedef struct {
 
 typedef struct {
     char uid[16];
+    char attendance_record_uid[16];
     char user_id[32];
     char employee_name[64];
     char cnic[16];
@@ -2739,6 +2740,12 @@ static char *event_to_json(const attendance_event_t *event, const char *capturet
     if (event->uid[0]) {
         cJSON_AddStringToObject(root, "_terminal_uid", event->uid);
     }
+    if (event->attendance_record_uid[0]) {
+        cJSON_AddStringToObject(
+            root,
+            "_attendance_record_uid",
+            event->attendance_record_uid);
+    }
     if (event->terminal_identity_fingerprint[0]) {
         cJSON_AddStringToObject(
             root,
@@ -2796,6 +2803,12 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
     cJSON *raw_event = cJSON_AddObjectToObject(row, "raw_event");
     if (raw_event && event->uid[0]) {
         cJSON_AddStringToObject(raw_event, "terminal_uid", event->uid);
+    }
+    if (raw_event && event->attendance_record_uid[0]) {
+        cJSON_AddStringToObject(
+            raw_event,
+            "attendance_record_uid",
+            event->attendance_record_uid);
     }
     return row;
 }
@@ -3276,8 +3289,39 @@ static bool parse_attendance_record(
         return false;
     }
     *timestamp_out = timestamp;
-    return build_attendance_event(
-        event, users, user_id, uid, timestamp, status, punch, false);
+
+    uint16_t record_uid = uid;
+    bool snapshot_identity = record_size == 16 || record_size == 40;
+    if (record_size == 40 && user_id[0] && uid != 0) {
+        const zkt_user_t *user_by_id = find_user_by_user_id(users, user_id);
+        const zkt_user_t *user_by_uid = find_user_by_uid(users, uid);
+        if (user_by_id && user_by_uid != user_by_id) {
+            // On some ZKT models the first 16-bit field in a 40-byte
+            // attendance record is not in the current enrollment UID
+            // namespace. Treat it as audit evidence, not as an identity veto.
+            // The current signed user snapshot supplies the verified UID and
+            // fingerprint; ADD still enforces captured-at continuity before
+            // any historical CNIC repair.
+            uid = 0;
+        }
+    }
+    bool built = build_attendance_event(
+        event,
+        users,
+        user_id,
+        uid,
+        timestamp,
+        status,
+        punch,
+        snapshot_identity);
+    if (built && record_uid != 0) {
+        snprintf(
+            event->attendance_record_uid,
+            sizeof(event->attendance_record_uid),
+            "%u",
+            (unsigned)record_uid);
+    }
+    return built;
 }
 
 static size_t collect_reconcile_window(
@@ -4394,6 +4438,7 @@ static char *oracle_normalize_event_json(const char *event_json)
     // raw-capture contract does not consume them.
     cJSON_DeleteItemFromObjectCaseSensitive(root, "_terminal_uid");
     cJSON_DeleteItemFromObjectCaseSensitive(root, "_terminal_identity_fingerprint");
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "_attendance_record_uid");
     char *result = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return result;
@@ -6936,6 +6981,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);
     storage_init();
     wifi_init_sta();
+    // An unconfirmed OTA image must enforce its rollback deadline even when
+    // it cannot associate with Wi-Fi. Starting the OTA manager before the
+    // blocking Wi-Fi wait keeps the fail-safe entirely local; once Wi-Fi and
+    // ADD recover, the same task can still complete normal boot-health proof.
+    ota_manager_start();
     if (!wait_for_wifi()) {
         return;
     }
@@ -6943,7 +6993,6 @@ void app_main(void)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
-    ota_manager_start();
     bool runtime_start_failed = false;
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");

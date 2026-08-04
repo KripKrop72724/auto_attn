@@ -324,10 +324,20 @@ def test_attendance_carries_verified_terminal_identity_to_add():
     assert "live_snapshot_identity" in event_builder
     assert "out->uid" in event_builder
     assert "terminal_identity_fingerprint" in event_builder
+    parser = source[
+        source.index("static bool parse_attendance_record(") :
+        source.index("static size_t collect_reconcile_window(")
+    ]
+    assert "user_by_uid != user_by_id" in parser
+    assert "uid = 0;" in parser
+    assert "snapshot_identity" in parser
+    assert "attendance_record_uid" in parser
     assert 'cJSON_AddStringToObject(row, "uid", event->uid);' in add_row
     assert '"terminal_identity_fingerprint"' in add_row
+    assert '"attendance_record_uid"' in add_row
     assert '"_terminal_uid"' in normalizer
     assert '"_terminal_identity_fingerprint"' in normalizer
+    assert '"_attendance_record_uid"' in normalizer
 
 
 def test_truth_reconcile_uses_bounded_authoritative_day_windows():
@@ -904,6 +914,7 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
     header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 
     assert ota.count("esp_secure_boot_enabled()") == 2
     assert '"image_sha256"' in ota
@@ -931,6 +942,13 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     assert "bool add_connector_boot_health_ready(void);" in header
     assert "restore_valid_identity_catalog();" in connector
     assert "s_identity_catalog_generation = 1" in connector
+
+    wifi_start = runtime.index("wifi_init_sta();")
+    ota_start = runtime.index("ota_manager_start();", wifi_start)
+    wifi_wait = runtime.index("wait_for_wifi()", ota_start)
+    connector_start = runtime.index("add_connector_start();", wifi_wait)
+    assert wifi_start < ota_start < wifi_wait < connector_start
+    assert runtime.count("ota_manager_start();") == 1
 
 
 def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
