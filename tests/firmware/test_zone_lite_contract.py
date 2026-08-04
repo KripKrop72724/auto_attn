@@ -284,6 +284,52 @@ def test_recoverable_truth_memory_pressure_never_latches_fatal_led():
     assert "LED_STATUS_TRUTH_REPAIR" in sender
 
 
+def test_runtime_failures_self_heal_and_heartbeat_reports_the_real_led():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    led = (FIRMWARE / "main" / "led_status.c").read_text(encoding="utf-8")
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+
+    # Solid red is reserved for inert boot failures. Every failure raised after
+    # storage initialization is retryable and must not poison a healthy runtime.
+    runtime = source[source.index("static enqueue_result_t enqueue_event_to_files(") :]
+    app_main = runtime[runtime.index("void app_main(void)") :]
+    runtime_before_app_main = runtime[: runtime.index("void app_main(void)")]
+    assert "led_status_fault(LED_STATUS_FATAL)" not in runtime_before_app_main
+    assert "LED_STATUS_LOCAL_FAILURE" in runtime_before_app_main
+    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" in runtime_before_app_main
+    assert "runtime_start_failed" in app_main
+    assert "esp_restart();" in app_main
+    assert "expire_recoverable_fault" in led
+    assert 'return "LOCAL_FAILURE";' in led
+    assert 'cJSON_AddStringToObject(payload, "led_state", led_status_current_name());' in connector
+
+
+def test_attendance_carries_verified_terminal_identity_to_add():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    event_builder = source[
+        source.index("static bool build_attendance_event(") :
+        source.index("static bool zk_timestamp_in_window(")
+    ]
+    add_row = source[
+        source.index("static cJSON *add_attendance_json_row(") :
+        source.index("static char *add_serialize_attendance_events(")
+    ]
+    normalizer = source[
+        source.index("static char *oracle_normalize_event_json(") :
+        source.index("static char *oracle_mark_permanent_rejection(")
+    ]
+
+    assert "user_by_id == user_by_uid" in event_builder
+    assert "identity_conflict = true" in event_builder
+    assert "live_snapshot_identity" in event_builder
+    assert "out->uid" in event_builder
+    assert "terminal_identity_fingerprint" in event_builder
+    assert 'cJSON_AddStringToObject(row, "uid", event->uid);' in add_row
+    assert '"terminal_identity_fingerprint"' in add_row
+    assert '"_terminal_uid"' in normalizer
+    assert '"_terminal_identity_fingerprint"' in normalizer
+
+
 def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     collector = source[

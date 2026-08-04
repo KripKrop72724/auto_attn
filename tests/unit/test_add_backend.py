@@ -1342,6 +1342,47 @@ def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
         assert rows[event_uid].cnic_lookup_hash is None
 
 
+def test_verified_active_snapshot_repair_is_not_starved_by_newer_bad_names(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    zkt = connector.zkt_device
+    assert zkt is not None
+
+    base = utc_now()
+    zkt.last_identity_change_at = base - timedelta(hours=2)
+    zkt.identity_snapshot_observed_at = base
+    valid = event(event_uid=f"{1:064x}", uid=None, raw_name="Ayesha").model_copy(
+        update={
+            "device_event_time": base - timedelta(hours=1),
+            "captured_at": base - timedelta(minutes=59),
+        }
+    )
+    ingest_attendance(db, connector=connector, events=[valid])
+    for index in range(2, 27):
+        invalid = event(
+            event_uid=f"{index:064x}",
+            uid=None,
+            raw_name=f"Wrong Employee {index}",
+        ).model_copy(
+            update={
+                "device_event_time": base - timedelta(minutes=30),
+                "captured_at": base - timedelta(minutes=29),
+            }
+        )
+        ingest_attendance(db, connector=connector, events=[invalid])
+
+    assert repair_verified_active_identity_backlog(db, limit=1) == 1
+    repaired = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == valid.event_uid)
+    )
+    assert repaired is not None
+    assert repaired.ords_status == "PENDING"
+    assert repaired.identity_repair_reason == "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
+
+
 def test_verified_active_snapshot_requires_duplicate_cnic_resolution(db: Session):
     connector = connector_fixture(db)
     replace_user_snapshot(
@@ -2855,6 +2896,37 @@ def test_heartbeat_surfaces_fail_closed_historical_backfill_state(db: Session):
     update_heartbeat(
         db, connector=connector, boot_id="history-boot", sequence=2, payload=payload
     )
+    assert alert.state == "RESOLVED"
+
+
+def test_heartbeat_surfaces_and_resolves_real_local_led_failure(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="2.2.40",
+        led_state="LOCAL_FAILURE",
+        zkt={
+            "online": True,
+            "connection_state": "ONLINE",
+            "serial": SERIAL,
+        },
+    )
+
+    result = update_heartbeat(
+        db, connector=connector, boot_id="local-fault", sequence=1, payload=payload
+    )
+    assert result["state"] == "DEGRADED"
+    assert connector.last_error_code == "ESP_LOCAL_FAILURE"
+    alert = db.scalar(
+        select(DeviceAlert).where(DeviceAlert.code == "ESP_LOCAL_FAILURE")
+    )
+    assert alert and alert.state == "OPEN" and alert.severity == "HIGH"
+
+    payload.led_state = "HEALTHY"
+    result = update_heartbeat(
+        db, connector=connector, boot_id="local-fault", sequence=2, payload=payload
+    )
+    assert result["state"] == "ONLINE"
+    assert connector.last_error_code is None
     assert alert.state == "RESOLVED"
 
 

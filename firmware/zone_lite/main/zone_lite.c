@@ -366,9 +366,11 @@ typedef struct {
 } user_table_t;
 
 typedef struct {
+    char uid[16];
     char user_id[32];
     char employee_name[64];
     char cnic[16];
+    char terminal_identity_fingerprint[65];
     char timestamp[24];
     char event_uid[65];
     uint8_t status;
@@ -604,6 +606,7 @@ static void zkt_mark_authenticated(uint32_t ip, const char *reason)
     if (authenticated_ip_changed) {
         nvs_save_runtime_state();
     }
+    led_status_clear_fault(LED_STATUS_ZKT_FAILURE);
     zkt_publish_state("RECOVERING", reason, true);
 }
 
@@ -2557,10 +2560,20 @@ static bool recover_blocked_events_from_snapshot(
         cJSON *user_id = root
             ? cJSON_GetObjectItemCaseSensitive(root, "user_id")
             : NULL;
+        cJSON *terminal_uid = root
+            ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid")
+            : NULL;
+        const char *verified_uid = cJSON_IsString(terminal_uid)
+            ? terminal_uid->valuestring
+            : NULL;
         const zkt_user_t *user =
             cJSON_IsString(user_id) && blocked_reason == NULL
                 ? find_user_by_user_id(users, user_id->valuestring)
                 : NULL;
+        if (user && verified_uid && verified_uid[0] &&
+            strcmp(user->uid, verified_uid) != 0) {
+            user = NULL;
+        }
         char recovered_name[64] = "";
         char recovered_cnic[16] = "";
         bool recovered_shift_worker = false;
@@ -2573,6 +2586,7 @@ static bool recover_blocked_events_from_snapshot(
         } else if (cJSON_IsString(user_id) && blocked_reason == NULL) {
             identity_found = add_connector_lookup_identity(
                 user_id->valuestring,
+                verified_uid,
                 recovered_name,
                 sizeof(recovered_name),
                 recovered_cnic,
@@ -2644,7 +2658,7 @@ static void storage_init(void)
     }
     if (g_seen_hashes == NULL) {
         ESP_LOGE(TAG, "Could not allocate event UID cache");
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
     }
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
@@ -2701,6 +2715,15 @@ static char *event_to_json(const attendance_event_t *event, const char *capturet
     json_add_utf8_string(root, "user_id", event->user_id);
     json_add_utf8_string(root, "employee_name", event->employee_name);
     cJSON_AddStringToObject(root, "cnic", event->cnic);
+    if (event->uid[0]) {
+        cJSON_AddStringToObject(root, "_terminal_uid", event->uid);
+    }
+    if (event->terminal_identity_fingerprint[0]) {
+        cJSON_AddStringToObject(
+            root,
+            "_terminal_identity_fingerprint",
+            event->terminal_identity_fingerprint);
+    }
     cJSON_AddStringToObject(root, "timestamp", event->timestamp);
     cJSON_AddStringToObject(root, "clockdiff", "0.0");
     cJSON_AddStringToObject(root, "capturetype", normalized_capturetype);
@@ -2723,6 +2746,15 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
     cJSON *row = cJSON_CreateObject();
     if (!row) return NULL;
     cJSON_AddStringToObject(row, "event_uid", event->event_uid);
+    if (event->uid[0]) {
+        cJSON_AddStringToObject(row, "uid", event->uid);
+    }
+    if (event->terminal_identity_fingerprint[0]) {
+        cJSON_AddStringToObject(
+            row,
+            "terminal_identity_fingerprint",
+            event->terminal_identity_fingerprint);
+    }
     json_add_utf8_string(row, "user_id", event->user_id);
     char raw_name[128];
     if (event->cnic[0]) {
@@ -2740,7 +2772,10 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
     cJSON_AddNumberToObject(row, "punch", event->punch);
     cJSON_AddBoolToObject(row, "raw_punch", event->raw_punch);
     cJSON_AddStringToObject(row, "clock_quality", "OK");
-    cJSON_AddItemToObject(row, "raw_event", cJSON_CreateObject());
+    cJSON *raw_event = cJSON_AddObjectToObject(row, "raw_event");
+    if (raw_event && event->uid[0]) {
+        cJSON_AddStringToObject(raw_event, "terminal_uid", event->uid);
+    }
     return row;
 }
 
@@ -2917,7 +2952,7 @@ static enqueue_result_t enqueue_event_to_files(
     if (event->cnic[0] == '\0') {
         if (!append_line_to_open_file(blocked_file, BLOCKED_PATH, json)) {
             free(json);
-            led_status_fault(LED_STATUS_FATAL);
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
@@ -2928,7 +2963,7 @@ static enqueue_result_t enqueue_event_to_files(
     } else {
         if (!append_line_to_open_file(pending_file, PENDING_PATH, json)) {
             free(json);
-            led_status_fault(LED_STATUS_FATAL);
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_set_backlog(true);
@@ -2941,7 +2976,11 @@ static enqueue_result_t enqueue_event_to_files(
     }
     if (publish_add && !add_send_attendance_event(event, capturetype)) {
         ESP_LOGE(TAG, "Attendance persisted for ORDS but could not be added to the independent ADD outbox");
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    } else if (publish_add) {
+        // A fully durable live path proves that a transient local resource or
+        // storage failure recovered; do not leave the operator-facing LED red.
+        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
     }
     free(json);
     return result;
@@ -2965,7 +3004,8 @@ static bool build_attendance_event(
     uint16_t uid,
     uint32_t timestamp,
     uint8_t status,
-    uint8_t punch)
+    uint8_t punch,
+    bool live_snapshot_identity)
 {
     memset(out, 0, sizeof(*out));
     if (!zk_attendance_timestamp_is_plausible(timestamp)) {
@@ -2982,29 +3022,71 @@ static bool build_attendance_event(
             "A terminal record with a zero or implausible timestamp was excluded from attendance delivery; terminal truth remains unchanged.");
         return false;
     }
+    const zkt_user_t *user_by_id = user_id && user_id[0]
+        ? find_user_by_user_id(users, user_id)
+        : NULL;
+    const zkt_user_t *user_by_uid = uid != 0
+        ? find_user_by_uid(users, uid)
+        : NULL;
     const zkt_user_t *user = NULL;
-    if (user_id != NULL && user_id[0] != '\0') {
-        user = find_user_by_user_id(users, user_id);
-    } else if (uid != 0) {
-        user = find_user_by_uid(users, uid);
+    bool identity_conflict = false;
+    if (user_by_id && user_by_uid) {
+        if (user_by_id == user_by_uid) {
+            user = user_by_id;
+        } else {
+            identity_conflict = true;
+        }
+    } else if (uid != 0 && user_id && user_id[0]) {
+        // A record carrying both identifiers must match the same current
+        // terminal row. Never silently prefer one side of a UID/user-ID reuse.
+        identity_conflict = true;
+    } else {
+        user = user_by_id ? user_by_id : user_by_uid;
     }
     if (user != NULL) {
         snprintf(out->user_id, sizeof(out->user_id), "%s", user->user_id);
         snprintf(out->employee_name, sizeof(out->employee_name), "%s", user->employee_name);
         snprintf(out->cnic, sizeof(out->cnic), "%s", user->cnic);
         out->raw_punch = user->raw_punch;
+        if (uid != 0 || live_snapshot_identity) {
+            snprintf(out->uid, sizeof(out->uid), "%s", user->uid);
+            snprintf(
+                out->terminal_identity_fingerprint,
+                sizeof(out->terminal_identity_fingerprint),
+                "%s",
+                user->terminal_identity_fingerprint);
+        }
+        if (out->cnic[0] == '\0') {
+            // The encrypted ADD catalog is only allowed to enrich a current
+            // row when its terminal UID agrees. This repairs valid aliases
+            // without attributing reused user IDs to the wrong employee.
+            (void)add_connector_lookup_identity(
+                out->user_id,
+                user->uid,
+                out->employee_name,
+                sizeof(out->employee_name),
+                out->cnic,
+                sizeof(out->cnic),
+                &out->raw_punch);
+        }
     } else {
-        snprintf(out->user_id, sizeof(out->user_id), "%s", user_id);
+        snprintf(out->user_id, sizeof(out->user_id), "%s", user_id ? user_id : "");
+        if (uid != 0) {
+            snprintf(out->uid, sizeof(out->uid), "%u", (unsigned)uid);
+        }
         out->employee_name[0] = '\0';
         out->cnic[0] = '\0';
         out->raw_punch = false;
-        (void)add_connector_lookup_identity(
-            out->user_id,
-            out->employee_name,
-            sizeof(out->employee_name),
-            out->cnic,
-            sizeof(out->cnic),
-            &out->raw_punch);
+        if (!identity_conflict) {
+            (void)add_connector_lookup_identity(
+                out->user_id,
+                out->uid,
+                out->employee_name,
+                sizeof(out->employee_name),
+                out->cnic,
+                sizeof(out->cnic),
+                &out->raw_punch);
+        }
     }
     out->status = status;
     out->punch = punch;
@@ -3174,7 +3256,7 @@ static bool parse_attendance_record(
     }
     *timestamp_out = timestamp;
     return build_attendance_event(
-        event, users, user_id, uid, timestamp, status, punch);
+        event, users, user_id, uid, timestamp, status, punch, false);
 }
 
 static size_t collect_reconcile_window(
@@ -3752,9 +3834,12 @@ static bool reconcile_attendance_dump(
         truth_delivery_ok && add_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
-    } else if (!historical) {
-        g_truth_use_recovery_chunks = false;
-        g_truth_fresh_session_retries = 0;
+    } else {
+        led_status_clear_fault(LED_STATUS_TRUTH_REPAIR);
+        if (!historical) {
+            g_truth_use_recovery_chunks = false;
+            g_truth_fresh_session_retries = 0;
+        }
     }
     ESP_LOGI(
         TAG,
@@ -4012,6 +4097,7 @@ static void ords_mark_success(void)
 {
     g_ords_next_attempt_ms = 0;
     g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
+    led_status_clear_fault(LED_STATUS_ORDS_FAILURE);
 }
 
 static void ords_mark_failure(void)
@@ -4283,6 +4369,10 @@ static char *oracle_normalize_event_json(const char *event_json)
     cJSON_AddStringToObject(root, "capturetype", normalized);
     cJSON_DeleteItemFromObjectCaseSensitive(root, "trust_status");
     cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized));
+    // These fields are durable local/ADD identity provenance. The public ORDS
+    // raw-capture contract does not consume them.
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "_terminal_uid");
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "_terminal_identity_fingerprint");
     char *result = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return result;
@@ -4448,7 +4538,7 @@ static bool oracle_send_bulk(char **events, size_t count)
     }
     char **normalized_events = calloc(count, sizeof(char *));
     if (!normalized_events) {
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return false;
     }
     for (size_t i = 0; i < count; i++) {
@@ -4457,7 +4547,7 @@ static bool oracle_send_bulk(char **events, size_t count)
             for (size_t j = 0; j < count; j++) free(normalized_events[j]);
             free(normalized_events);
             ESP_LOGE(TAG, "Could not normalize ORDS bulk event index=%u", (unsigned)i);
-            led_status_fault(LED_STATUS_FATAL);
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
             return false;
         }
     }
@@ -5226,7 +5316,7 @@ static void oracle_drain_pending_locked(bool live_first)
     FILE *out = fopen(PENDING_TMP_PATH, "w");
     if (out == NULL) {
         fclose(in);
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return;
     }
     FILE *acked_file = fopen(ACKED_PATH, "a");
@@ -5241,7 +5331,7 @@ static void oracle_drain_pending_locked(bool live_first)
         if (acked_file != NULL) {
             fclose(acked_file);
         }
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return;
     }
     size_t bulk_count = 0;
@@ -5402,7 +5492,9 @@ static void oracle_drain_pending_locked(bool live_first)
     }
     if (!replace_pending_with_backup()) {
         (void)remove(PENDING_TMP_PATH);
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    } else {
+        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
     }
     bool has_backlog = failed || file_has_nonempty_line(PENDING_PATH);
     led_status_set_backlog(has_backlog);
@@ -5594,7 +5686,7 @@ static size_t process_live_packet(const uint8_t *data, size_t len, const user_ta
             len -= packet_len;
         }
         attendance_event_t event;
-        if (build_attendance_event(&event, users, user_id, 0, timestamp, status, punch)) {
+        if (build_attendance_event(&event, users, user_id, 0, timestamp, status, punch, true)) {
             enqueue_result_t result = enqueue_event(&event, "LIVE");
             if (result == ENQUEUE_PENDING) {
                 led_status_event(LED_EVENT_LIVE_PUNCH);
@@ -5704,7 +5796,7 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
         }
     }
     add_connector_log("CRITICAL", "enrollment", "LEASE_REVOKE_FAILED", "Temporary administrator privilege could not be revoked; retrying");
-    led_status_fault(LED_STATUS_FATAL);
+    led_status_fault(LED_STATUS_ZKT_FAILURE);
     return false;
 }
 
@@ -6810,7 +6902,9 @@ void app_main(void)
     g_ords_outbox_gate = xSemaphoreCreateMutex();
     if (!g_storage_lock || !g_ords_http_lock || !g_ords_outbox_gate) {
         ESP_LOGE(TAG, "Could not create durable storage or ORDS coordination locks");
-        led_status_fault(LED_STATUS_FATAL);
+        led_status_set(LED_STATUS_RECOVERY_REBOOT);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
         return;
     }
     add_connector_init();
@@ -6828,12 +6922,21 @@ void app_main(void)
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
     ota_manager_start();
+    bool runtime_start_failed = false;
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");
-        led_status_fault(LED_STATUS_FATAL);
+        runtime_start_failed = true;
     }
     if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start Zone Lite gateway task");
-        led_status_fault(LED_STATUS_FATAL);
+        runtime_start_failed = true;
+    }
+    if (runtime_start_failed) {
+        // Running with only half of the attendance pipeline is unsafe. Task
+        // allocation pressure is normally transient, and a controlled reboot
+        // also lets the OTA rollback gate reject a bad candidate.
+        led_status_set(LED_STATUS_RECOVERY_REBOOT);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
     }
 }

@@ -92,6 +92,12 @@ class UserSnapshotRequest(BaseModel):
 class AttendanceEventIn(BaseModel):
     event_uid: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     uid: str | None = None
+    terminal_identity_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     user_id: str = Field(min_length=1, max_length=100)
     raw_name: str | None = None
     device_event_time: datetime

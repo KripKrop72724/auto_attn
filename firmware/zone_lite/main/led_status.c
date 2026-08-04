@@ -80,6 +80,8 @@ static int priority_for_status(led_status_t status)
         return 100;
     case LED_STATUS_RECOVERY_REBOOT:
         return 90;
+    case LED_STATUS_LOCAL_FAILURE:
+        return 85;
     case LED_STATUS_ORDS_FAILURE:
         return 80;
     case LED_STATUS_ZKT_FAILURE:
@@ -112,7 +114,15 @@ static bool is_fault_status(led_status_t status)
 {
     return status == LED_STATUS_ORDS_FAILURE || status == LED_STATUS_ZKT_FAILURE ||
            status == LED_STATUS_TRUTH_REPAIR || status == LED_STATUS_BLOCKED_IDENTITY ||
-           status == LED_STATUS_FATAL;
+           status == LED_STATUS_LOCAL_FAILURE || status == LED_STATUS_FATAL;
+}
+
+static void expire_recoverable_fault(led_state_t *state, int64_t tick_ms)
+{
+    if (state->has_latched_fault && tick_ms >= state->latched_until_ms &&
+        state->latched_fault != LED_STATUS_FATAL) {
+        state->has_latched_fault = false;
+    }
 }
 
 static led_status_t select_status(const led_state_t *state, int64_t tick_ms, bool *live_flash)
@@ -198,6 +208,9 @@ static void render_status(led_status_t status, bool live_flash, int64_t tick_ms)
     case LED_STATUS_RECOVERY_REBOOT:
         set_rgb(fast_on ? 255 : 0, 0, 0);
         break;
+    case LED_STATUS_LOCAL_FAILURE:
+        set_rgb(slow_on ? 255 : 0, slow_on ? 24 : 0, 0);
+        break;
     case LED_STATUS_FATAL:
         set_rgb(255, 0, 0);
         break;
@@ -218,10 +231,7 @@ static void led_status_task(void *arg)
         int64_t tick_ms = now_ms();
         bool live_flash = false;
         if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (s_state.has_latched_fault && tick_ms >= s_state.latched_until_ms &&
-                s_state.latched_fault != LED_STATUS_FATAL) {
-                s_state.has_latched_fault = false;
-            }
+            expire_recoverable_fault(&s_state, tick_ms);
             snapshot = s_state;
             xSemaphoreGive(s_led_lock);
         } else {
@@ -304,6 +314,19 @@ void led_status_fault(led_status_t status)
     }
 }
 
+void led_status_clear_fault(led_status_t status)
+{
+    if (!s_started || s_led_lock == NULL || status == LED_STATUS_FATAL) {
+        return;
+    }
+    if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (s_state.has_latched_fault && s_state.latched_fault == status) {
+            s_state.has_latched_fault = false;
+        }
+        xSemaphoreGive(s_led_lock);
+    }
+}
+
 void led_status_event(led_status_event_t event)
 {
     if (!s_started || s_led_lock == NULL) {
@@ -326,5 +349,39 @@ void led_status_set_backlog(bool has_backlog)
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
         s_state.has_backlog = has_backlog;
         xSemaphoreGive(s_led_lock);
+    }
+}
+
+const char *led_status_current_name(void)
+{
+    if (!s_started || s_led_lock == NULL) {
+        return "UNAVAILABLE";
+    }
+    if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return "STATE_LOCK_BUSY";
+    }
+    int64_t tick_ms = now_ms();
+    bool live_flash = false;
+    expire_recoverable_fault(&s_state, tick_ms);
+    led_status_t status = select_status(&s_state, tick_ms, &live_flash);
+    xSemaphoreGive(s_led_lock);
+
+    switch (status) {
+    case LED_STATUS_BOOTING: return "BOOTING";
+    case LED_STATUS_WIFI_CONNECTING: return "WIFI_CONNECTING";
+    case LED_STATUS_ZKT_DISCOVERING: return "ZKT_DISCOVERING";
+    case LED_STATUS_ZKT_AUTHENTICATED: return "ZKT_AUTHENTICATED";
+    case LED_STATUS_SYNCING: return "SYNCING";
+    case LED_STATUS_HEALTHY: return "HEALTHY";
+    case LED_STATUS_BACKLOG: return "BACKLOG";
+    case LED_STATUS_ORDS_FAILURE: return "ORDS_FAILURE";
+    case LED_STATUS_ZKT_FAILURE: return "ZKT_FAILURE";
+    case LED_STATUS_ZKT_FLAPPING: return "ZKT_FLAPPING";
+    case LED_STATUS_TRUTH_REPAIR: return "TRUTH_REPAIR";
+    case LED_STATUS_RECOVERY_REBOOT: return "RECOVERY_REBOOT";
+    case LED_STATUS_LOCAL_FAILURE: return "LOCAL_FAILURE";
+    case LED_STATUS_FATAL: return "FATAL";
+    case LED_STATUS_BLOCKED_IDENTITY: return "BLOCKED_IDENTITY";
+    default: return "UNKNOWN";
     }
 }

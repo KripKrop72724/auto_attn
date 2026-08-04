@@ -137,7 +137,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current firmware version is `2.2.21`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.2.40`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 
@@ -153,8 +153,8 @@ is used directly. Serial pinning prevents attaching to a different ZKT that happ
 
 ## LED states
 
-The onboard RGB LED defaults to GPIO 48. Recoverable faults latch for two minutes; fatal local
-storage/security errors remain latched.
+The onboard RGB LED defaults to GPIO 48. Recoverable faults latch for at most two minutes and clear
+immediately after a matching success signal; fatal boot/security errors remain latched.
 
 - white pulse — boot/storage initialization;
 - blue blink — Wi-Fi connection;
@@ -165,7 +165,8 @@ storage/security errors remain latched.
 - orange blink — ORDS delivery failure;
 - yellow blink — ZKT protocol/auth failure or bounded retry;
 - red fast blink — controlled terminal restart;
-- red solid — fatal local failure;
+- red slow blink — recoverable local storage/resource failure under automatic retry;
+- red solid — fatal boot/security failure that left the connector intentionally inert;
 - magenta blink — blocked/ambiguous identity row.
 
 ## Hardware release gate

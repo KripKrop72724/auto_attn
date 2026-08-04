@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -522,6 +522,32 @@ def update_heartbeat(
                 )
             elif history_state in {"RUNNING", "RETRYING", "COMPLETE"}:
                 resolve_alert(session, connector, code="HISTORY_BACKFILL_BLOCKED")
+    reported_led_state = (payload.led_state or "").strip().upper()
+    if reported_led_state in {"FATAL", "LOCAL_FAILURE"}:
+        code = "ESP_FATAL" if reported_led_state == "FATAL" else "ESP_LOCAL_FAILURE"
+        message = (
+            "The connector reports a fatal boot/security failure and may be inert."
+            if reported_led_state == "FATAL"
+            else "The connector reports a recoverable local storage/resource failure."
+        )
+        if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
+            connector.lifecycle_state = "DEGRADED"
+        connector.last_error_code = code
+        connector.last_error_message = message
+        upsert_alert(
+            session,
+            connector,
+            code=code,
+            severity="CRITICAL" if reported_led_state == "FATAL" else "HIGH",
+            message=message,
+            details={"led_state": reported_led_state},
+        )
+    else:
+        resolve_alert(session, connector, code="ESP_FATAL")
+        resolve_alert(session, connector, code="ESP_LOCAL_FAILURE")
+        if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
+            connector.last_error_code = None
+            connector.last_error_message = None
     session.add(
         DeviceTelemetry(
             connector_id=connector.id,
@@ -730,7 +756,12 @@ def replace_user_snapshot(
         zkt.identity_snapshot_observed_at = observed_at
         zkt.identity_snapshot_received_at = updated_at
         zkt.identity_snapshot_stable = True
-        if previous_state_hash and previous_state_hash != computed_state_hash:
+        if zkt.last_identity_change_at is None:
+            # The first complete stable snapshot establishes the beginning of
+            # provable identity continuity. Missing-UID punches after this
+            # point can be repaired safely if later snapshots remain stable.
+            zkt.last_identity_change_at = observed_at
+        elif previous_state_hash and previous_state_hash != computed_state_hash:
             zkt.last_identity_change_at = updated_at
         if zkt.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED":
             zkt.writes_disabled_reason = None
@@ -2361,6 +2392,7 @@ def repair_verified_active_identity_backlog(
         observed_at = ensure_utc(zkt.identity_snapshot_observed_at)
         identity_change_at = ensure_utc(zkt.last_identity_change_at)
         valid_resolutions = valid_identity_resolutions(session, zkt=zkt)
+        resolved_conflict_hashes = tuple(valid_resolutions)
 
         candidates = session.execute(
             select(AttendanceEvent, DeviceUser)
@@ -2378,6 +2410,24 @@ def repair_verified_active_identity_backlog(
                 DeviceUser.present == True,  # noqa: E712
                 DeviceUser.cnic_encrypted.is_not(None),
                 DeviceUser.cnic_lookup_hash.is_not(None),
+                # Make the database select only rows that can actually be
+                # repaired. Previously, newer bad-name rows consumed the
+                # bounded LIMIT forever and starved older valid punches.
+                func.lower(func.trim(AttendanceEvent.display_name))
+                == func.lower(func.trim(DeviceUser.display_name)),
+                AttendanceEvent.captured_at <= observed_at + tolerance,
+                or_(
+                    AttendanceEvent.identity_terminal_fingerprint.is_(None),
+                    DeviceUser.terminal_identity_fingerprint.is_(None),
+                    AttendanceEvent.identity_terminal_fingerprint
+                    == DeviceUser.terminal_identity_fingerprint,
+                ),
+                or_(
+                    DeviceUser.identity_conflict_code.is_(None),
+                    DeviceUser.cnic_lookup_hash.in_(resolved_conflict_hashes)
+                    if resolved_conflict_hashes
+                    else DeviceUser.identity_conflict_code.is_(None),
+                ),
                 (
                     AttendanceEvent.device_user_id.is_(None)
                     | (AttendanceEvent.device_user_id == DeviceUser.id)
@@ -2578,6 +2628,14 @@ def ingest_attendance(
                 not incoming.uid
                 or not user.uid
                 or not secrets.compare_digest(incoming.uid, user.uid)
+                or (
+                    incoming.terminal_identity_fingerprint
+                    and user.terminal_identity_fingerprint
+                    and not secrets.compare_digest(
+                        incoming.terminal_identity_fingerprint,
+                        user.terminal_identity_fingerprint,
+                    )
+                )
             )
         ):
             user = None
@@ -2673,7 +2731,12 @@ def ingest_attendance(
             ),
             identity_snapshot_id=zkt.identity_snapshot_id if snapshot_verified else None,
             identity_terminal_fingerprint=(
-                user.terminal_identity_fingerprint if usable_user_identity and user else None
+                (
+                    incoming.terminal_identity_fingerprint
+                    or user.terminal_identity_fingerprint
+                )
+                if usable_user_identity and user
+                else incoming.terminal_identity_fingerprint
             ),
             identity_resolution_status=(
                 "RESOLVED"

@@ -15,6 +15,7 @@ typedef enum {
     LED_STATUS_ZKT_FLAPPING,
     LED_STATUS_TRUTH_REPAIR,
     LED_STATUS_RECOVERY_REBOOT,
+    LED_STATUS_LOCAL_FAILURE,
     LED_STATUS_FATAL,
     LED_STATUS_BLOCKED_IDENTITY,
 } led_status_t;
@@ -26,5 +27,7 @@ typedef enum {
 void led_status_init(void);
 void led_status_set(led_status_t status);
 void led_status_fault(led_status_t status);
+void led_status_clear_fault(led_status_t status);
 void led_status_event(led_status_event_t event);
 void led_status_set_backlog(bool has_backlog);
+const char *led_status_current_name(void);

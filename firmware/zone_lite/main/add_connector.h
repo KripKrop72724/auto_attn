@@ -82,6 +82,7 @@ bool add_connector_command_complete(const char *command_id);
 bool add_connector_persist_command_tombstone(const add_command_t *command);
 bool add_connector_lookup_identity(
     const char *user_id,
+    const char *uid,
     char *display_name,
     size_t display_name_size,
     char *cnic,

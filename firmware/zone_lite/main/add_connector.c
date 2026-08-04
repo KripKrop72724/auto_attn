@@ -32,6 +32,7 @@
 #include "mbedtls/sha256.h"
 
 #include "zone_config.h"
+#include "led_status.h"
 
 #include "zone_lite_config.example.h"
 
@@ -1476,7 +1477,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(payload, "outbox_depth", add_connector_outbox_depth());
             ota_manager_append_telemetry(payload);
             cJSON_AddStringToObject(payload, "current_activity", activity);
-            cJSON_AddStringToObject(payload, "led_state", zkt.online ? "HEALTHY" : zkt.connection_state);
+            cJSON_AddStringToObject(payload, "led_state", led_status_current_name());
             cJSON *zkt_json = cJSON_AddObjectToObject(payload, "zkt");
             cJSON_AddBoolToObject(zkt_json, "online", zkt.online);
             cJSON_AddStringToObject(zkt_json, "connection_state", zkt.connection_state[0] ? zkt.connection_state : "UNKNOWN");
@@ -2785,13 +2786,14 @@ bool add_connector_command_complete(const char *command_id)
 
 bool add_connector_lookup_identity(
     const char *user_id,
+    const char *uid,
     char *display_name,
     size_t display_name_size,
     char *cnic,
     size_t cnic_size,
     bool *shift_worker)
 {
-    if (!user_id || !user_id[0]) return false;
+    if ((!user_id || !user_id[0]) && (!uid || !uid[0])) return false;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     bool found = false;
@@ -2803,7 +2805,12 @@ bool add_connector_lookup_identity(
         cJSON *row = NULL;
         cJSON_ArrayForEach(row, rows) {
             cJSON *candidate = cJSON_GetObjectItemCaseSensitive(row, "user_id");
-            if (!cJSON_IsString(candidate) || strcmp(candidate->valuestring, user_id) != 0) continue;
+            cJSON *candidate_uid = cJSON_GetObjectItemCaseSensitive(row, "uid");
+            bool user_matches = !user_id || !user_id[0] ||
+                (cJSON_IsString(candidate) && strcmp(candidate->valuestring, user_id) == 0);
+            bool uid_matches = !uid || !uid[0] ||
+                (cJSON_IsString(candidate_uid) && strcmp(candidate_uid->valuestring, uid) == 0);
+            if (!user_matches || !uid_matches) continue;
             cJSON *name = cJSON_GetObjectItemCaseSensitive(row, "display_name");
             cJSON *identity = cJSON_GetObjectItemCaseSensitive(row, "cnic");
             cJSON *shift = cJSON_GetObjectItemCaseSensitive(row, "shift_worker");
@@ -2830,8 +2837,16 @@ bool add_connector_lookup_identity(
                 cJSON *candidate = row
                     ? cJSON_GetObjectItemCaseSensitive(row, "user_id")
                     : NULL;
-                if (cJSON_IsString(candidate) &&
-                    strcmp(candidate->valuestring, user_id) == 0) {
+                cJSON *candidate_uid = row
+                    ? cJSON_GetObjectItemCaseSensitive(row, "uid")
+                    : NULL;
+                bool user_matches = !user_id || !user_id[0] ||
+                    (cJSON_IsString(candidate) &&
+                     strcmp(candidate->valuestring, user_id) == 0);
+                bool uid_matches = !uid || !uid[0] ||
+                    (cJSON_IsString(candidate_uid) &&
+                     strcmp(candidate_uid->valuestring, uid) == 0);
+                if (user_matches && uid_matches) {
                     cJSON *name =
                         cJSON_GetObjectItemCaseSensitive(row, "display_name");
                     cJSON *identity =
