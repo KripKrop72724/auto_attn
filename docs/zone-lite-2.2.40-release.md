@@ -1,14 +1,16 @@
 # Zone Lite 2.2.40 guarded resilience release
 
-Zone Lite 2.2.40 fixes two production defects exposed at
-`ZONE-SLICTOWER-3FL`:
+Zone Lite 2.2.40 fixes production defects exposed at
+`ZONE-SLICTOWER-3FL` and the large Peshawar terminals:
 
 - recoverable local allocation, outbox, and rewrite failures could raise the
   permanent `FATAL` LED state even while live capture and ADD heartbeats kept
   running;
 - attendance batches did not carry the terminal UID and identity fingerprint
   already verified by the firmware user snapshot, so ADD could preserve an
-  otherwise resolvable punch as `BLOCKED_IDENTITY`.
+  otherwise resolvable punch as `BLOCKED_IDENTITY`;
+- deliberate fresh sessions between bounded truth reads were counted as real
+  connection flaps, leaving Peshawar degraded during successful reconciliation.
 
 ## Runtime invariants
 
@@ -20,6 +22,9 @@ Zone Lite 2.2.40 fixes two production defects exposed at
   visible connector alerts.
 - Failure to start either core runtime task triggers a controlled reboot so a
   connector never remains online with half of the attendance pipeline absent.
+- Planned truth-session rotations are reported as `SESSION_REFRESH`, preserve
+  the stable connection evidence, and do not increment flap counters. A failed
+  planned refresh is immediately reclassified as a real connection failure.
 
 ## Identity invariants
 
@@ -31,9 +36,10 @@ Zone Lite 2.2.40 fixes two production defects exposed at
 - The encrypted ADD alias/tombstone catalog may enrich a punch only when any
   available UID evidence also matches. A conflicting UID/user-ID pair remains
   fail closed.
-- The backend records the first stable complete snapshot as the start of
-  provable identity continuity and automatically requeues safe missing-UID
-  punches after that point.
+- The backend reconstructs the current identity-continuity start from the
+  earliest uninterrupted run of identical complete, stable snapshots and
+  automatically requeues safe missing-UID punches after that point. A
+  different, partial, or unstable snapshot is a hard evidence boundary.
 - The bounded repair query filters unrecoverable names, future captures,
   fingerprint conflicts, and unresolved duplicate-CNIC claims before applying
   its limit. Invalid newer rows therefore cannot starve an older valid punch.
@@ -45,7 +51,7 @@ tombstone, timestamp, or authoritative-truth safeguards.
 ## Verification completed before publication
 
 - Ruff passes for the changed backend and tests.
-- All 173 repository tests pass.
+- All 176 repository tests pass.
 - ESP-IDF 5.5.3 builds the ESP32-S3 application successfully.
 - The application image is `0x120000` bytes with 55% of the smallest app
   partition free.
