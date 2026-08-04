@@ -3872,11 +3872,6 @@ static bool reconcile_attendance_dump(
     free(data);
     free(reconcile_events);
 
-    if (!durable_enqueue_ok) {
-        ESP_LOGE(
-            TAG,
-            "One or more terminal events could not be durably appended to the local attendance outbox");
-    }
     if (truth_count != identity_mapped_count) {
         ESP_LOGW(
             TAG,
@@ -3895,7 +3890,39 @@ static bool reconcile_attendance_dump(
             "ADD_TRUTH_QUEUE_SATURATED",
             "Dashboard truth cycle could not be fully persisted; live punches remain prioritized and history will be repaired by the next truth cycle");
     }
-    bool reconcile_complete = durable_enqueue_ok && !window_overflow &&
+    // A pressure-filled preservation partition can reject the redundant
+    // pending/blocked append even after the complete authoritative window has
+    // been accepted by ADD.  In that exact case the records remain durable on
+    // the ZKT and every idempotent truth batch has a server acknowledgement,
+    // so retaining a third local copy is not required to complete the cycle.
+    // No queue is truncated here.  A missing/failed ADD acknowledgement keeps
+    // the existing fail-closed behavior.
+    bool add_acknowledged_local_recovery =
+        !durable_enqueue_ok &&
+        truth_enabled &&
+        zone_config_get()->add_enabled &&
+        !window_overflow &&
+        truth_delivery_ok &&
+        add_delivery_ok;
+    if (!durable_enqueue_ok) {
+        if (add_acknowledged_local_recovery) {
+            ESP_LOGW(
+                TAG,
+                "Local reconcile append unavailable; ZKT truth remains durable and ADD acknowledged the complete authoritative window");
+            (void)add_connector_log(
+                "WARN",
+                "reconcile",
+                "LOCAL_RECONCILE_STORAGE_RECOVERED",
+                "Local preservation storage was full, but the unchanged ZKT retained source truth and ADD acknowledged every authoritative batch; no queue was deleted");
+        } else {
+            ESP_LOGE(
+                TAG,
+                "One or more terminal events could not be durably appended to the local attendance outbox");
+        }
+    }
+    bool reconcile_complete =
+        (durable_enqueue_ok || add_acknowledged_local_recovery) &&
+        !window_overflow &&
         truth_delivery_ok && add_delivery_ok;
     if (!reconcile_complete) {
         led_status_fault(LED_STATUS_TRUTH_REPAIR);

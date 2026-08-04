@@ -1109,6 +1109,24 @@ def test_large_truth_stream_delegates_confirmation_to_durable_add_delivery():
     assert "waiting for acknowledged rows before appending more truth" in connector_source
 
 
+def test_acknowledged_truth_recovers_redundant_local_append_pressure():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+
+    assert "bool add_acknowledged_local_recovery" in reconcile
+    assert "!durable_enqueue_ok &&" in reconcile
+    assert "truth_enabled &&" in reconcile
+    assert "zone_config_get()->add_enabled &&" in reconcile
+    assert "truth_delivery_ok &&" in reconcile
+    assert "add_delivery_ok;" in reconcile
+    assert '"LOCAL_RECONCILE_STORAGE_RECOVERED"' in reconcile
+    assert "(durable_enqueue_ok || add_acknowledged_local_recovery)" in reconcile
+    assert "No queue is truncated here" in reconcile
+
+
 def test_full_reconcile_defers_until_prior_durable_add_backlog_drains():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     connector_source = (FIRMWARE / "main" / "add_connector.c").read_text()
