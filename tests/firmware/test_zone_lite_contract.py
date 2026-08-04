@@ -963,6 +963,11 @@ def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
         "Refreshing the authenticated ZKT session after a bounded attendance truth cycle"
         in runtime
     )
+    assert "g_truth_retry_reconnect_pending = true;" in runtime
+    assert 'zkt_publish_state(\n            "SESSION_REFRESH"' in runtime
+    assert "if (!g_add_zkt.online && !g_truth_retry_reconnect_pending)" in runtime
+    assert "planned_refresh_failed" in runtime
+    assert '"ZKT_SESSION_REFRESHED"' in runtime
 
 
 def test_authoritative_truth_requires_a_stable_terminal_dump():

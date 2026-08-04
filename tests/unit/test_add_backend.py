@@ -2858,6 +2858,47 @@ def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     assert alert and alert.severity == "WARNING"
 
 
+def test_planned_truth_session_refresh_does_not_degrade_or_count_as_flapping(db: Session):
+    connector = connector_fixture(db)
+    connector.lifecycle_state = "ONLINE"
+    connector.zkt_device.connection_state = "ONLINE"
+    connector.zkt_device.online = True
+    connector.zkt_device.flap_count_15m = 2
+    db.flush()
+
+    payload = HeartbeatPayload(
+        firmware_version="2.2.40",
+        current_activity="SESSION_REFRESH",
+        zkt={
+            "online": False,
+            "connection_state": "SESSION_REFRESH",
+            "serial": SERIAL,
+            "ip_address": "192.168.110.137",
+            "model": "MB20/ID",
+            "platform": "ZLM60_TFT",
+            "consecutive_failures": 0,
+            "consecutive_successes": 3,
+            "flap_count_15m": 2,
+            "user_record_size": 72,
+        },
+    )
+
+    result = update_heartbeat(
+        db, connector=connector, boot_id="boot-refresh", sequence=1, payload=payload
+    )
+
+    assert result["state"] == "ONLINE"
+    assert connector.lifecycle_state == "ONLINE"
+    assert connector.zkt_device.connection_state == "SESSION_REFRESH"
+    assert connector.zkt_device.online is False
+    assert connector.zkt_device.flap_count_15m == 2
+    assert connector.zkt_device.offline_since is None
+    assert (
+        db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
+        is None
+    )
+
+
 def test_heartbeat_surfaces_fail_closed_historical_backfill_state(db: Session):
     connector = connector_fixture(db)
     payload = HeartbeatPayload(

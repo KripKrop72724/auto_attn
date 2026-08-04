@@ -357,6 +357,9 @@ def update_heartbeat(
             or ("ONLINE" if zkt_payload.get("online", False) else "OFFLINE")
         ).upper()
         previous_state = zkt.connection_state
+        # SESSION_REFRESH is a short, deliberate socket rotation used between
+        # bounded truth reads. It remains command-gated by the connector while
+        # the socket is closed, but must not be classified as a network flap.
         zkt.online = reported_state in {"ONLINE", "RECOVERING"}
         zkt.connection_state = reported_state
         zkt.consecutive_failures = int(
@@ -387,7 +390,7 @@ def update_heartbeat(
         )
         zkt.last_seen_at = now
         zkt.updated_at = now
-        if reported_state in {"ONLINE", "RECOVERING"}:
+        if reported_state in {"ONLINE", "RECOVERING", "SESSION_REFRESH"}:
             zkt.last_online_at = now
             zkt.offline_since = None
         elif zkt.offline_since is None:
@@ -440,6 +443,8 @@ def update_heartbeat(
             connector.lifecycle_state = "ONLINE" if reported_state == "ONLINE" else "DEGRADED"
             if zkt.consecutive_successes >= 3:
                 resolve_alert(session, connector, code="ZKT_CONNECTION_FLAPPING")
+        elif reported_state == "SESSION_REFRESH":
+            connector.lifecycle_state = "ONLINE"
         sample = zkt_payload.get("device_time")
         sampled_at = zkt_payload.get("device_time_sampled_at")
         if sample:

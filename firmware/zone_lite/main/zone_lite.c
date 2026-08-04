@@ -409,6 +409,7 @@ static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITI
 static bool g_truth_reconcile_warning;
 static bool g_truth_use_recovery_chunks;
 static bool g_truth_retry_session_requested;
+static bool g_truth_retry_reconnect_pending;
 static uint32_t g_truth_fresh_session_retries;
 static bool g_truth_window_blocked;
 static bool g_blocked_recovery_deferred_logged;
@@ -574,7 +575,9 @@ static uint32_t zkt_failure_backoff_ms(void)
 static uint32_t zkt_mark_failure(const char *reason)
 {
     bool was_online = g_add_zkt.online || strcmp(g_add_zkt.connection_state, "RECOVERING") == 0;
-    if (was_online) zkt_count_transition();
+    bool planned_refresh_failed = g_truth_retry_reconnect_pending;
+    g_truth_retry_reconnect_pending = false;
+    if (was_online || planned_refresh_failed) zkt_count_transition();
     g_add_zkt.online = false;
     g_add_zkt.consecutive_failures++;
     g_add_zkt.consecutive_successes = 0;
@@ -593,20 +596,38 @@ static uint32_t zkt_mark_failure(const char *reason)
     return backoff;
 }
 
-static void zkt_mark_authenticated(uint32_t ip, const char *reason)
+static void zkt_mark_authenticated(uint32_t ip, const char *reason, bool live_session)
 {
-    if (!g_add_zkt.online) zkt_count_transition();
+    bool planned_refresh_probe = g_truth_retry_reconnect_pending && !live_session;
+    bool planned_refresh_complete = g_truth_retry_reconnect_pending && live_session;
+    if (!g_add_zkt.online && !g_truth_retry_reconnect_pending) zkt_count_transition();
     g_add_zkt.consecutive_successes++;
     g_add_zkt.consecutive_failures = 0;
     g_add_zkt.backoff_until_epoch = 0;
-    g_session_stable_since_ms = uptime_ms();
-    g_add_zkt.stability_since_epoch = epoch_now();
     bool authenticated_ip_changed = g_last_authenticated_zkt_ip != ip;
     g_last_authenticated_zkt_ip = ip;
     if (authenticated_ip_changed) {
         nvs_save_runtime_state();
     }
     led_status_clear_fault(LED_STATUS_ZKT_FAILURE);
+    if (planned_refresh_probe) {
+        zkt_publish_state("SESSION_REFRESH", reason, true);
+        return;
+    }
+    if (planned_refresh_complete) {
+        g_truth_retry_reconnect_pending = false;
+        g_add_zkt.consecutive_successes =
+            g_add_zkt.consecutive_successes < 3 ? 3 : g_add_zkt.consecutive_successes;
+        zkt_publish_state("ONLINE", "planned attendance truth session refresh completed", true);
+        add_connector_log(
+            "INFO",
+            "zkt",
+            "ZKT_SESSION_REFRESHED",
+            "Planned attendance truth session refresh completed without a connectivity flap");
+        return;
+    }
+    g_session_stable_since_ms = uptime_ms();
+    g_add_zkt.stability_since_epoch = epoch_now();
     zkt_publish_state("RECOVERING", reason, true);
 }
 
@@ -5588,7 +5609,7 @@ static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
         (long)records,
         ZONE_LITE_ZONE_DEVICE_ID);
     *selected_ip = host_order_ip;
-    zkt_mark_authenticated(host_order_ip, "authenticated discovery probe");
+    zkt_mark_authenticated(host_order_ip, "authenticated discovery probe", false);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     ok = true;
 
@@ -6262,7 +6283,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     g_add_zkt.user_count = user_count;
     g_add_zkt.attendance_count = records;
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
-    zkt_mark_authenticated(host_order_ip, "live session authenticated and identified");
+    zkt_mark_authenticated(host_order_ip, "live session authenticated and identified", true);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
     user_table_t *users = heap_caps_calloc(1, sizeof(user_table_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!users) users = calloc(1, sizeof(user_table_t));
@@ -6683,8 +6704,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
         vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ZKT_REBOOT_WAIT_MS));
     } else if (truth_retry_session) {
         g_truth_retry_session_requested = true;
+        g_truth_retry_reconnect_pending = true;
         zkt_publish_state(
-            "RECOVERING",
+            "SESSION_REFRESH",
             "Refreshing the authenticated ZKT session after a bounded attendance truth cycle",
             false);
     }
