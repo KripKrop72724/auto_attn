@@ -1945,6 +1945,61 @@ static char *attendance_outbox_record_line(const char *payload_json, bool *live_
     return outbox_record_line("attendance_batch", payload_json, live_out);
 }
 
+static bool deliver_attendance_payloads_acknowledged(
+    const char *const *payloads,
+    size_t count)
+{
+    if (!payloads || count == 0 || !add_connector_is_connected()) return false;
+
+    // The ZKT remains the durable source of truth while this bounded direct
+    // path is in flight.  It is used only when the preserved reconcile outbox
+    // cannot accept more bytes, and every batch is acknowledged by ADD before
+    // success.  Event UIDs make a later terminal retry or old-outbox drain
+    // idempotent.
+    s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
+        ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        bool inferred_live = false;
+        char *line = attendance_outbox_record_line(payloads[i], &inferred_live);
+        if (!line) {
+            ok = false;
+            break;
+        }
+        free(line);
+        if (!send_payload_and_wait_for_ack(
+                "attendance_batch",
+                payloads[i],
+                pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
+                pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS))) {
+            ok = false;
+            break;
+        }
+        s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
+            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+    }
+    s_priority_delivery_until_ms =
+        (uint32_t)monotonic_ms() + ADD_PRIORITY_HOLD_MS;
+    ESP_LOGW(
+        TAG,
+        "ADD reconcile outbox unavailable; acknowledged direct delivery %s batches=%lu",
+        ok ? "succeeded" : "failed",
+        (unsigned long)count);
+    char message[160];
+    snprintf(
+        message,
+        sizeof(message),
+        "Preserved attendance outbox unavailable; acknowledged direct ADD delivery %s batches=%lu",
+        ok ? "succeeded" : "failed",
+        (unsigned long)count);
+    (void)add_connector_log(
+        ok ? "WARN" : "ERROR",
+        "reconcile",
+        ok ? "ADD_DIRECT_ACK_FALLBACK_SUCCEEDED" : "ADD_DIRECT_ACK_FALLBACK_FAILED",
+        message);
+    return ok;
+}
+
 static void refresh_capacity_deadline_on_progress(
     const add_outbox_t *outbox,
     uint32_t *last_depth,
@@ -2046,19 +2101,8 @@ bool add_connector_enqueue_attendance_priority(const char *payload_json)
         // exists durably on the ZKT, so use a bounded, acknowledged WebSocket
         // delivery as the recovery path. A timeout returns false and the
         // periodic terminal truth cycle retries without deleting any record.
-        s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
-            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
-        ok = send_payload_and_wait_for_ack(
-            "attendance_batch",
-            payload_json,
-            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
-            pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS));
-        s_priority_delivery_until_ms =
-            (uint32_t)monotonic_ms() + ADD_PRIORITY_HOLD_MS;
-        ESP_LOGW(
-            TAG,
-            "ADD priority outbox unavailable; acknowledged direct delivery %s",
-            ok ? "succeeded" : "failed");
+        const char *payloads[] = {payload_json};
+        ok = deliver_attendance_payloads_acknowledged(payloads, 1);
     }
     return ok;
 }
@@ -2205,6 +2249,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
     int64_t deadline_ms = monotonic_ms() + ADD_BULK_CAPACITY_WAIT_MS;
     uint32_t last_depth = UINT32_MAX;
     bool waiting_logged = false;
+    bool direct_attempted = false;
     while (true) {
         if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
             if (monotonic_ms() >= deadline_ms) {
@@ -2228,6 +2273,12 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         }
         if (current + (off_t)required_bytes > s_bulk_outbox.max_bytes) {
             xSemaphoreGive(s_bulk_outbox.lock);
+            if (!direct_attempted && add_connector_is_connected()) {
+                direct_attempted = true;
+                if (deliver_attendance_payloads_acknowledged(payloads, count)) {
+                    return true;
+                }
+            }
             if (monotonic_ms() >= deadline_ms) {
                 ESP_LOGE(
                     TAG,
@@ -2277,7 +2328,17 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
                 "Durably appended %lu ADD reconcile batch(es) with one flash sync",
                 (unsigned long)written);
         }
-        return ok && written == count;
+        if (ok && written == count) return true;
+
+        // SPIFFS can run out of physical blocks before this logical outbox's
+        // byte ceiling when another preserved queue is large.  Some rows may
+        // already be durable locally; direct delivery of the complete chunk
+        // is safe because ADD deduplicates every event UID.
+        if (add_connector_is_connected() &&
+            deliver_attendance_payloads_acknowledged(payloads, count)) {
+            return true;
+        }
+        return false;
     }
 }
 

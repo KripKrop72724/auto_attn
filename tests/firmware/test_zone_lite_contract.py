@@ -961,6 +961,8 @@ def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
     assert "add_connector_enqueue_validated_line(line, true)" in connector
     assert "send_payload_and_wait_for_ack(" in connector
     assert "ADD_PRIORITY_ACK_TIMEOUT_MS" in connector
+    assert '"ADD_DIRECT_ACK_FALLBACK_SUCCEEDED"' in connector
+    assert '"ADD_DIRECT_ACK_FALLBACK_FAILED"' in connector
     assert "ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS" in connector
     assert "s_priority_delivery_until_ms" in connector
     assert "ADD_OUTBOX_ACK_TIMEOUT_MS" in connector
@@ -968,6 +970,23 @@ def test_current_day_reconnect_truth_bypasses_saturated_historical_outbox():
     assert "!historical && window_start_day == day_end" in runtime
     assert "flush_add_reconcile_payloads(" in runtime
     assert "priority" in runtime
+
+
+def test_reconcile_truth_uses_acknowledged_add_fallback_when_preservation_is_full():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+
+    assert "deliver_attendance_payloads_acknowledged" in connector
+    assert "if (!payloads || count == 0 || !add_connector_is_connected()) return false;" in connector
+    assert 'send_payload_and_wait_for_ack(\n                "attendance_batch"' in connector
+    assert "ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS" in connector
+    assert "ADD_PRIORITY_ACK_TIMEOUT_MS" in connector
+    assert connector.count(
+        "deliver_attendance_payloads_acknowledged(payloads, count)"
+    ) >= 2
+    assert "bool direct_attempted = false;" in connector
+    assert "if (!direct_attempted && add_connector_is_connected())" in connector
+    assert "ADD deduplicates every event UID" in connector
+    assert "return ok && written == count;" not in connector
 
 
 def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
