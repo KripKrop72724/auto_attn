@@ -580,7 +580,6 @@ def replace_user_snapshot(
     computed_state_hash = user_snapshot_state_hash(snapshot)
     if snapshot.state_hash and snapshot.state_hash != computed_state_hash:
         raise ValueError("User snapshot state hash does not match its terminal rows.")
-    previous_state_hash = zkt.identity_snapshot_state_hash
     stable_complete = snapshot.complete and snapshot.stable
     latest_recorded_revision = session.scalar(
         select(func.max(DeviceUserSnapshot.revision)).where(
@@ -761,13 +760,36 @@ def replace_user_snapshot(
         zkt.identity_snapshot_observed_at = observed_at
         zkt.identity_snapshot_received_at = updated_at
         zkt.identity_snapshot_stable = True
-        if zkt.last_identity_change_at is None:
-            # The first complete stable snapshot establishes the beginning of
-            # provable identity continuity. Missing-UID punches after this
-            # point can be repaired safely if later snapshots remain stable.
-            zkt.last_identity_change_at = observed_at
-        elif previous_state_hash and previous_state_hash != computed_state_hash:
-            zkt.last_identity_change_at = updated_at
+        # Reconstruct the start of the current uninterrupted identity state
+        # from durable snapshot revisions. This safely recovers back-dated
+        # missing-UID punches when several complete snapshots prove that the
+        # terminal catalog did not change. A different, partial, or unstable
+        # snapshot is an evidence boundary and prevents repair across it.
+        continuity_boundary_revision = session.scalar(
+            select(func.max(DeviceUserSnapshot.revision)).where(
+                DeviceUserSnapshot.zkt_device_id == zkt.id,
+                or_(
+                    DeviceUserSnapshot.complete == False,  # noqa: E712
+                    DeviceUserSnapshot.stable == False,  # noqa: E712
+                    DeviceUserSnapshot.state_hash.is_(None),
+                    DeviceUserSnapshot.state_hash != computed_state_hash,
+                ),
+            )
+        )
+        continuity_filters = [
+            DeviceUserSnapshot.zkt_device_id == zkt.id,
+            DeviceUserSnapshot.complete == True,  # noqa: E712
+            DeviceUserSnapshot.stable == True,  # noqa: E712
+            DeviceUserSnapshot.state_hash == computed_state_hash,
+        ]
+        if continuity_boundary_revision is not None:
+            continuity_filters.append(
+                DeviceUserSnapshot.revision > continuity_boundary_revision
+            )
+        continuity_started_at = session.scalar(
+            select(func.min(DeviceUserSnapshot.observed_at)).where(*continuity_filters)
+        )
+        zkt.last_identity_change_at = continuity_started_at or observed_at
         if zkt.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED":
             zkt.writes_disabled_reason = None
     else:

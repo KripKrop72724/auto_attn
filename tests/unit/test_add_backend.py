@@ -1342,6 +1342,96 @@ def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
         assert rows[event_uid].cnic_lookup_hash is None
 
 
+def test_snapshot_history_recovers_backdated_punches_across_unchanged_catalog(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    continuity_start = utc_now() - timedelta(days=2)
+    latest_observation = utc_now()
+    user = UserSnapshotRow(uid="7", user_id="1007", name=f"Ayesha-{CNIC}")
+
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="continuity-start",
+            complete=True,
+            stable=True,
+            observed_at=continuity_start,
+            users=[user],
+        ),
+    )
+    # Simulate the production rows created before continuity initialization
+    # was repaired. The next identical snapshot must recover the durable
+    # history, not treat the latest observation as the beginning of identity.
+    connector.zkt_device.last_identity_change_at = None
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="continuity-current",
+            complete=True,
+            stable=True,
+            observed_at=latest_observation,
+            users=[user],
+        ),
+    )
+
+    assert ensure_utc(connector.zkt_device.last_identity_change_at) == ensure_utc(
+        continuity_start
+    )
+    punch = event(
+        event_uid="b" * 64,
+        uid=None,
+        raw_name="Ayesha",
+    ).model_copy(
+        update={
+            "device_event_time": continuity_start + timedelta(days=1),
+            "captured_at": latest_observation,
+        }
+    )
+    ingest_attendance(db, connector=connector, events=[punch])
+
+    assert repair_verified_active_identity_backlog(db) == 1
+    repaired = db.scalar(
+        select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid)
+    )
+    assert repaired is not None
+    assert repaired.ords_status == "PENDING"
+    assert decrypt_cnic(repaired.cnic_encrypted) == CNIC
+
+
+def test_partial_snapshot_breaks_identity_continuity_for_backdated_repair(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    first_observation = utc_now() - timedelta(days=2)
+    boundary_observation = utc_now() - timedelta(days=1)
+    latest_observation = utc_now()
+    user = UserSnapshotRow(uid="7", user_id="1007", name=f"Ayesha-{CNIC}")
+
+    for snapshot_id, complete, stable, observed_at in (
+        ("before-boundary", True, True, first_observation),
+        ("evidence-boundary", False, False, boundary_observation),
+        ("after-boundary", True, True, latest_observation),
+    ):
+        replace_user_snapshot(
+            db,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id=snapshot_id,
+                complete=complete,
+                stable=stable,
+                observed_at=observed_at,
+                users=[user],
+            ),
+        )
+
+    assert ensure_utc(connector.zkt_device.last_identity_change_at) == ensure_utc(
+        latest_observation
+    )
+
+
 def test_verified_active_snapshot_repair_is_not_starved_by_newer_bad_names(
     db: Session,
 ):
