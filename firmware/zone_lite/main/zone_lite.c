@@ -5478,8 +5478,16 @@ static void append_acked_uid_from_json_to_file(const char *event_json, FILE *ack
     cJSON_Delete(root);
 }
 
-static bool replace_pending_with_backup(void)
+static bool replace_pending_with_backup(
+    bool *authoritative_source_preserved,
+    int *error_out)
 {
+    if (authoritative_source_preserved != NULL) {
+        *authoritative_source_preserved = true;
+    }
+    if (error_out != NULL) {
+        *error_out = 0;
+    }
     bool had_backup = false;
     if (remove(PENDING_BACKUP_PATH) != 0 && errno != ENOENT) {
         ESP_LOGW(TAG, "Could not remove stale pending backup errno=%d", errno);
@@ -5487,7 +5495,11 @@ static bool replace_pending_with_backup(void)
     if (rename(PENDING_PATH, PENDING_BACKUP_PATH) == 0) {
         had_backup = true;
     } else if (errno != ENOENT) {
+        int preserve_errno = errno;
         ESP_LOGW(TAG, "Could not preserve pending outbox before rewrite errno=%d", errno);
+        if (error_out != NULL) {
+            *error_out = preserve_errno;
+        }
         return false;
     }
 
@@ -5501,7 +5513,18 @@ static bool replace_pending_with_backup(void)
     int rewrite_errno = errno;
     ESP_LOGW(TAG, "Could not rewrite pending outbox errno=%d", rewrite_errno);
     if (had_backup && rename(PENDING_BACKUP_PATH, PENDING_PATH) != 0) {
-        ESP_LOGE(TAG, "Could not restore pending outbox backup errno=%d", errno);
+        int restore_errno = errno;
+        ESP_LOGE(TAG, "Could not restore pending outbox backup errno=%d", restore_errno);
+        if (authoritative_source_preserved != NULL) {
+            *authoritative_source_preserved = false;
+        }
+        if (error_out != NULL) {
+            *error_out = restore_errno;
+        }
+        return false;
+    }
+    if (error_out != NULL) {
+        *error_out = rewrite_errno;
     }
     return false;
 }
@@ -5549,18 +5572,21 @@ static bool pending_rewrite_write(FILE *out, const char *line, bool add_newline,
     return false;
 }
 
-static void ords_drain_storage_backpressure(const char *stage, int error_code)
+static void ords_drain_preserved_deferred(const char *stage, int error_code)
 {
     int64_t now_ms = uptime_ms();
     g_ords_drain_retry_not_before_ms = now_ms + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
     led_status_set_backlog(true);
-    // The authoritative pending outbox is still intact. Storage pressure is a
-    // backlog condition, not a corrupt-local-state fault, so do not re-latch
-    // ESP_LOCAL_FAILURE while live capture and direct delivery remain healthy.
+    // The authoritative pending outbox is still intact. Failure to construct
+    // or commit a disposable rewrite is a bounded backlog condition, not a
+    // corrupt-local-state fault. Clear a stale rewrite fault so repeated
+    // resource pressure cannot keep ADD degraded while live capture, direct
+    // delivery, and ZKT source truth remain healthy.
+    led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
     led_status_set(LED_STATUS_HEALTHY);
     ESP_LOGW(
         TAG,
-        "ORDS pending rewrite deferred at %s due to storage pressure errno=%d; original outbox remains intact",
+        "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable errno=%d; original outbox remains intact",
         stage,
         error_code);
     if (g_ords_storage_last_log_ms == 0 ||
@@ -5569,7 +5595,7 @@ static void ords_drain_storage_backpressure(const char *stage, int error_code)
         snprintf(
             message,
             sizeof(message),
-            "ORDS pending rewrite deferred at %s because preservation storage is full (errno=%d). The original pending outbox remains unchanged; delivery retry is backed off without deleting a queue.",
+            "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable (errno=%d). The original pending outbox remains unchanged; delivery retry is backed off without deleting a queue or latching a local failure.",
             stage,
             error_code);
         (void)add_connector_log(
@@ -5609,12 +5635,7 @@ static void oracle_drain_pending_locked(bool live_first)
     if (out == NULL) {
         int open_error = errno;
         fclose(in);
-        if (open_error == ENOSPC) {
-            ords_drain_storage_backpressure("open", open_error);
-        } else {
-            led_status_set(LED_STATUS_HEALTHY);
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        }
+        ords_drain_preserved_deferred("open", open_error);
         return;
     }
     FILE *acked_file = fopen(ACKED_PATH, "a");
@@ -5629,7 +5650,8 @@ static void oracle_drain_pending_locked(bool live_first)
         if (acked_file != NULL) {
             fclose(acked_file);
         }
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        (void)remove(PENDING_TMP_PATH);
+        ords_drain_preserved_deferred("allocate", ENOMEM);
         return;
     }
     size_t bulk_count = 0;
@@ -5799,13 +5821,7 @@ static void oracle_drain_pending_locked(bool live_first)
             fclose(acked_file);
         }
         (void)remove(PENDING_TMP_PATH);
-        led_status_set_backlog(true);
-        if (rewrite_error == ENOSPC) {
-            ords_drain_storage_backpressure("write", rewrite_error);
-        } else {
-            led_status_set(LED_STATUS_HEALTHY);
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        }
+        ords_drain_preserved_deferred("write", rewrite_error);
         free(bulk);
         return;
     }
@@ -5817,6 +5833,7 @@ static void oracle_drain_pending_locked(bool live_first)
         }
         (void)remove(PENDING_TMP_PATH);
         led_status_set_backlog(true);
+        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
         led_status_set(LED_STATUS_HEALTHY);
         free(bulk);
         return;
@@ -5851,19 +5868,21 @@ static void oracle_drain_pending_locked(bool live_first)
     }
     if (!rewrite_ok) {
         (void)remove(PENDING_TMP_PATH);
-        led_status_set_backlog(true);
-        if (rewrite_error == ENOSPC) {
-            ords_drain_storage_backpressure("commit", rewrite_error);
-        } else {
-            led_status_set(LED_STATUS_HEALTHY);
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        }
+        ords_drain_preserved_deferred("commit", rewrite_error);
         free(bulk);
         return;
     }
-    if (!replace_pending_with_backup()) {
+    bool authoritative_source_preserved = true;
+    int replace_error = 0;
+    if (!replace_pending_with_backup(
+            &authoritative_source_preserved,
+            &replace_error)) {
         (void)remove(PENDING_TMP_PATH);
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (authoritative_source_preserved) {
+            ords_drain_preserved_deferred("replace", replace_error);
+        } else {
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        }
     } else {
         g_ords_drain_retry_not_before_ms = 0;
         led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);

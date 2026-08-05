@@ -1265,17 +1265,22 @@ def test_ords_drain_preserves_authoritative_outbox_under_storage_pressure():
     assert "ORDS_DRAIN_STORAGE_BACKPRESSURE" in drain
     assert "g_ords_drain_retry_not_before_ms" in drain
     assert "ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS" in drain
-    assert "open_error == ENOSPC" in drain
-    assert "rewrite_error == ENOSPC" in drain
+    assert 'ords_drain_preserved_deferred("open", open_error)' in drain
+    assert 'ords_drain_preserved_deferred("allocate", ENOMEM)' in drain
+    assert 'ords_drain_preserved_deferred("write", rewrite_error)' in drain
+    assert 'ords_drain_preserved_deferred("commit", rewrite_error)' in drain
+    assert 'ords_drain_preserved_deferred("replace", replace_error)' in drain
     assert "pending_rewrite_write(" in drain
     assert "fflush(out)" in drain
     assert "fsync(fileno(out))" in drain
     assert "if (!rewrite_ok)" in drain
-    replacement = drain.index("replace_pending_with_backup()")
+    replacement = drain.index("replace_pending_with_backup(")
     durable_flush = drain.index("fsync(fileno(out))")
     assert durable_flush < replacement
     assert "original pending outbox remains unchanged" in drain
     assert "without deleting a queue" in drain
+    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);" in drain
+    assert "authoritative_source_preserved" in drain
     assert "led_status_fault(LED_STATUS_LOCAL_FAILURE);" in drain
 
 
