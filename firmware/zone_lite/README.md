@@ -27,8 +27,10 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
   attendance read closes the possibly desynchronized protocol session and retries twice on fresh
   authenticated sessions with bounded `0x4000`-byte recovery chunks; these intentional refreshes
   do not count as terminal flapping.
-- Stores at most 5,000 reconcile events in PSRAM, serializes ORDS rows one at a time, and durably
-  commits ADD truth in groups of 32 batches.
+- Measures the largest current-month daily window before allocating truth working memory, retains
+  the 5,000-event fail-closed ceiling, serializes ORDS rows one at a time, and durably commits ADD
+  truth in groups of 32 batches. This prevents a 90,000-record ZKT dump from coexisting with an
+  unnecessary fixed 5,000-event array and reports bounded memory evidence to ADD for large terminals.
 - Reconciles the current month every six hours and walks retained terminal history one month at a
   time from the oldest discovered punch. The encrypted-NVS cursor survives reboot; blocked identity
   windows are skipped for the remainder of the sweep, reported to ADD, and retried after 24 hours.
@@ -142,7 +144,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current firmware version is `2.2.49`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.2.50`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 

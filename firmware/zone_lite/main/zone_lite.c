@@ -432,6 +432,7 @@ static bool g_truth_use_recovery_chunks;
 static bool g_truth_retry_session_requested;
 static bool g_truth_retry_reconnect_pending;
 static uint32_t g_truth_fresh_session_retries;
+static bool g_truth_retry_chain_active;
 static int64_t g_truth_ords_gate_priority_until_ms;
 static int64_t g_truth_ords_gate_last_defer_log_ms;
 static portMUX_TYPE g_truth_ords_gate_priority_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -3747,7 +3748,8 @@ static bool reconcile_attendance_dump(
     if (day_end > last_day) day_end = last_day;
     size_t reconcile_event_count = 0;
     size_t identity_mapped_count = 0;
-    size_t reconcile_capacity = ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
+    size_t daily_reconcile_event_counts[32] = {0};
+    size_t max_daily_reconcile_event_count = 0;
     bool durable_enqueue_ok = true;
     ESP_LOGI(
         TAG,
@@ -3805,6 +3807,14 @@ static bool reconcile_attendance_dump(
             p, record_size, users, &event, &timestamp);
         if (parsed) {
             reconcile_event_count++;
+            struct tm event_time = {0};
+            decode_zk_time(timestamp, &event_time);
+            if (event_time.tm_mday >= 1 && event_time.tm_mday <= 31) {
+                size_t daily_count = ++daily_reconcile_event_counts[event_time.tm_mday];
+                if (daily_count > max_daily_reconcile_event_count) {
+                    max_daily_reconcile_event_count = daily_count;
+                }
+            }
             if (event.cnic[0] != '\0') {
                 identity_mapped_count++;
             }
@@ -3884,6 +3894,51 @@ static bool reconcile_attendance_dump(
         (unsigned)reconcile_event_count,
         (unsigned)identity_mapped_count);
 
+    // Production truth replacement is normally split into daily windows. Do
+    // not reserve the maximum 5,000-event array while the multi-megabyte ZKT
+    // dump is still resident: on large terminals that needlessly fragments
+    // PSRAM and can make a valid 90k+ record snapshot look like a read
+    // failure. Allocate only the largest measured window, while retaining the
+    // existing hard ceiling and overflow fail-closed behavior.
+    bool daily_windows = truth_enabled ||
+        reconcile_event_count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
+    size_t required_window_capacity = daily_windows
+        ? max_daily_reconcile_event_count
+        : reconcile_event_count;
+    size_t reconcile_capacity = required_window_capacity;
+    if (reconcile_capacity == 0) reconcile_capacity = 1;
+    if (reconcile_capacity > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
+        reconcile_capacity = ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS;
+    }
+    ESP_LOGI(
+        TAG,
+        "Sizing bounded reconcile window required=%u capacity=%u monthly_events=%u daily=%s",
+        (unsigned)required_window_capacity,
+        (unsigned)reconcile_capacity,
+        (unsigned)reconcile_event_count,
+        daily_windows ? "true" : "false");
+
+    size_t reconcile_allocation_bytes =
+        reconcile_capacity * sizeof(attendance_event_t);
+    if (reconcile_event_count > ZONE_LITE_ORDS_RECONCILE_MAX_EVENTS) {
+        char memory_summary[240];
+        snprintf(
+            memory_summary,
+            sizeof(memory_summary),
+            "Large ZKT truth uses a measured daily work window: month_events=%u max_daily_events=%u capacity=%u bytes=%u psram_free=%u psram_largest=%u",
+            (unsigned)reconcile_event_count,
+            (unsigned)max_daily_reconcile_event_count,
+            (unsigned)reconcile_capacity,
+            (unsigned)reconcile_allocation_bytes,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        (void)add_connector_log(
+            "INFO",
+            "reconcile",
+            "TRUTH_WINDOW_MEMORY_BOUNDED",
+            memory_summary);
+    }
+
     attendance_event_t *reconcile_events = heap_caps_calloc(
         reconcile_capacity,
         sizeof(attendance_event_t),
@@ -3892,10 +3947,28 @@ static bool reconcile_attendance_dump(
         reconcile_events = calloc(reconcile_capacity, sizeof(attendance_event_t));
     }
     if (reconcile_events == NULL) {
+        char allocation_failure[240];
+        snprintf(
+            allocation_failure,
+            sizeof(allocation_failure),
+            "Truth window allocation failed: capacity=%u bytes=%u month_events=%u max_daily_events=%u psram_free=%u psram_largest=%u internal_free=%u",
+            (unsigned)reconcile_capacity,
+            (unsigned)reconcile_allocation_bytes,
+            (unsigned)reconcile_event_count,
+            (unsigned)max_daily_reconcile_event_count,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         ESP_LOGE(
             TAG,
-            "Could not allocate bounded reconcile window capacity=%u",
-            (unsigned)reconcile_capacity);
+            "%s",
+            allocation_failure);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "TRUTH_WINDOW_ALLOCATION_FAILED",
+            allocation_failure);
+        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
         free(data);
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
@@ -3904,8 +3977,6 @@ static bool reconcile_attendance_dump(
     // Authoritative Oracle replacement always uses daily transactions. This
     // keeps JSON parsing, delete/merge work, and TLS response time bounded even
     // on terminals whose current month contains thousands of punches.
-    bool daily_windows = truth_enabled ||
-        reconcile_event_count > reconcile_capacity;
     int window_start_day = 1;
     size_t truth_count = 0;
     size_t window_count = 0;
@@ -4134,6 +4205,7 @@ static bool reconcile_attendance_dump(
         if (!historical) {
             g_truth_use_recovery_chunks = false;
             g_truth_fresh_session_retries = 0;
+            g_truth_retry_chain_active = false;
         }
     }
     ESP_LOGI(
@@ -6963,6 +7035,15 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     bool history_exhausted = false;
                     bool fresh_session_retryable = false;
                     bool ords_gate_deferred = false;
+                    // A fresh-session retry chain owns one bounded retry
+                    // budget. Once that chain ends, the next independent
+                    // periodic truth cycle starts clean instead of inheriting
+                    // exhausted attempts or permanently using recovery-sized
+                    // chunks from an older incident.
+                    if (!historical_reconcile && !g_truth_retry_chain_active) {
+                        g_truth_fresh_session_retries = 0;
+                        g_truth_use_recovery_chunks = false;
+                    }
                     bool dump_succeeded = reconcile_attendance_dump(
                             sock,
                             &ctx,
@@ -7028,6 +7109,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             if (retry_with_fresh_session) {
                                 g_truth_fresh_session_retries++;
                                 g_truth_use_recovery_chunks = true;
+                                g_truth_retry_chain_active = true;
                                 truth_retry_session = true;
                                 char retry_message[224];
                                 snprintf(
@@ -7050,6 +7132,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                     "reconcile",
                                     "TRUTH_READ_RETRY_EXHAUSTED",
                                     "Attendance truth transport exhausted its bounded fresh-session retries; live capture remains active and the periodic cycle will retry.");
+                                g_truth_retry_chain_active = false;
+                            } else if (!historical_reconcile &&
+                                       !identity_blocked) {
+                                g_truth_retry_chain_active = false;
                             }
                             if (historical_reconcile && identity_blocked) {
                                 g_history_backfill_had_failures = true;
@@ -7069,6 +7155,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                 }
                             }
                             if (!historical_reconcile && identity_blocked) {
+                                g_truth_retry_chain_active = false;
                                 // The terminal dump was complete, but one or more
                                 // identities could not be authorized. Repeating
                                 // the same heavy dump on every reconnect cannot

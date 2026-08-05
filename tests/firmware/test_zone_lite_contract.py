@@ -247,7 +247,12 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
     assert "attendance_event_t *reconcile_events = heap_caps_calloc" in reconcile
     assert "collect_reconcile_window(" in reconcile
     assert "bool daily_windows = truth_enabled ||" in reconcile
-    assert "reconcile_event_count > reconcile_capacity;" in reconcile
+    assert "size_t daily_reconcile_event_counts[32] = {0};" in reconcile
+    assert "required_window_capacity = daily_windows" in reconcile
+    assert "? max_daily_reconcile_event_count" in reconcile
+    assert "TRUTH_WINDOW_MEMORY_BOUNDED" in reconcile
+    assert "TRUTH_WINDOW_ALLOCATION_FAILED" in reconcile
+    assert "heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)" in reconcile
     assert "while (window_start_day <= day_end)" in reconcile
     assert "if (truth_delivery_ok)" in reconcile
     assert "char **truth_events" not in reconcile
@@ -266,6 +271,20 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
     )
     assert 'reconcile_complete ? "true" : "false"' in reconcile
     assert "return reconcile_complete;" in reconcile
+
+
+def test_each_truth_retry_chain_has_an_independent_bounded_budget():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    gateway = source[
+        source.index("static int64_t gateway_run(uint32_t host_order_ip)") :
+        source.index("static void event_handler(")
+    ]
+    assert "static bool g_truth_retry_chain_active;" in source
+    assert "if (!historical_reconcile && !g_truth_retry_chain_active)" in gateway
+    assert "g_truth_fresh_session_retries = 0;" in gateway
+    assert "g_truth_use_recovery_chunks = false;" in gateway
+    assert "g_truth_retry_chain_active = true;" in gateway
+    assert gateway.count("g_truth_retry_chain_active = false;") >= 3
 
 
 def test_recoverable_truth_memory_pressure_never_latches_fatal_led():
