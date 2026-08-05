@@ -1298,7 +1298,7 @@ def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     assert "g_ords_outbox_gate = xSemaphoreCreateMutex();" in source
 
 
-def test_full_reconcile_has_expiring_priority_over_storage_full_ords_drain():
+def test_full_reconcile_priority_lease_covers_measured_busy_session_retry():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[
         source.index("static bool reconcile_attendance_dump(") :
@@ -1316,7 +1316,9 @@ def test_full_reconcile_has_expiring_priority_over_storage_full_ords_drain():
 
     assert "#define ZKT_TRUTH_ORDS_GATE_WAIT_MS 5000" in source
     assert "#define ZKT_TRUTH_ORDS_GATE_RETRY_MS 10000" in source
-    assert "#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 30000" in source
+    # Tower-3 measured up to 96 seconds between a gate deferral and the next
+    # gateway attempt. The bounded lease must cover that cadence with margin.
+    assert "#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 180000" in source
     assert "truth_ords_gate_reserve_until(" in reconcile
     assert "pdMS_TO_TICKS(ZKT_TRUTH_ORDS_GATE_WAIT_MS)" in reconcile
     assert '"FULL_RECONCILE_DEFERRED_ORDS_GATE"' in reconcile

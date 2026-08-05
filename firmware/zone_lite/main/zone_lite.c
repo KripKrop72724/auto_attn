@@ -308,13 +308,16 @@
 #define ZKT_TRUTH_FRESH_SESSION_RETRIES 2
 #define ZKT_TRUTH_RETRY_BACKOFF_MS 5000
 // A storage-full ORDS rewrite can legitimately own the outbox gate for longer
-// than a ZKT reconcile interval. Give authoritative truth short, expiring
+// than a ZKT reconcile interval. Give authoritative truth bounded, expiring
 // priority instead of blocking the live session for the old 75-second wait.
-// If a drain is already in flight, retry quickly after it releases the gate;
-// the expiring reservation prevents the two tasks from starving each other.
+// Tower-3 proved that a busy live session can take up to 96 seconds to return
+// to the scheduled ten-second retry. Keep the lease above that measured
+// cadence with margin, while still bounding the delay if the gateway session
+// disappears. If a drain is already in flight, it finishes before the next
+// truth attempt; subsequent drains yield until truth acquires the gate.
 #define ZKT_TRUTH_ORDS_GATE_WAIT_MS 5000
 #define ZKT_TRUTH_ORDS_GATE_RETRY_MS 10000
-#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 30000
+#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 180000
 #define ZKT_TRUTH_ORDS_GATE_DEFER_LOG_MS 60000
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
