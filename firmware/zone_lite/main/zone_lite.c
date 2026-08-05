@@ -2766,6 +2766,7 @@ typedef enum {
     ENQUEUE_DUPLICATE = 0,
     ENQUEUE_PENDING,
     ENQUEUE_BLOCKED,
+    ENQUEUE_ACKNOWLEDGED,
     ENQUEUE_STORAGE_ERROR,
 } enqueue_result_t;
 
@@ -2859,6 +2860,73 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
     }
     cJSON_AddItemToArray(events, row);
     return add_enqueue_attendance_events(events, event->event_uid);
+}
+
+static bool add_send_attendance_event_acknowledged(
+    const attendance_event_t *event,
+    const char *capturetype)
+{
+    cJSON *events = cJSON_CreateArray();
+    cJSON *row = add_attendance_json_row(event, capturetype);
+    if (!events || !row) {
+        cJSON_Delete(events);
+        cJSON_Delete(row);
+        return false;
+    }
+    cJSON_AddItemToArray(events, row);
+    char *json = add_serialize_attendance_events(events, event->event_uid);
+    bool ok = json && add_connector_deliver_attendance_acknowledged(json);
+    free(json);
+    return ok;
+}
+
+static bool recover_live_event_after_storage_error(
+    const attendance_event_t *event,
+    const char *capturetype,
+    const char *storage_failure)
+{
+    if (strcmp(capturetype, "LIVE") != 0) {
+        return false;
+    }
+    if (!zone_config_get()->add_enabled ||
+        !add_send_attendance_event_acknowledged(event, capturetype)) {
+        char message[224];
+        snprintf(
+            message,
+            sizeof(message),
+            "Live event was not locally durable and received no ADD acknowledgement (%s); ZKT counter truth will force recovery",
+            storage_failure);
+        (void)add_connector_log(
+            "ERROR",
+            "live",
+            "LIVE_EVENT_DURABILITY_DEFERRED",
+            message);
+        return false;
+    }
+
+    if (!seen_add(event->event_uid)) {
+        ESP_LOGW(
+            TAG,
+            "ADD acknowledged live event but volatile dedup cache could not record %s",
+            event->event_uid);
+    }
+    if (event->cnic[0] == '\0') {
+        led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
+    }
+    led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
+    char message[224];
+    snprintf(
+        message,
+        sizeof(message),
+        "Recovered live event after %s; ADD acknowledged event_uid=%s and unchanged ZKT source truth remains available",
+        storage_failure,
+        event->event_uid);
+    (void)add_connector_log(
+        "WARN",
+        "live",
+        "LIVE_LOCAL_STORAGE_RECOVERED",
+        message);
+    return true;
 }
 
 static void free_reconcile_payloads(char **payloads, size_t count)
@@ -2987,6 +3055,12 @@ static enqueue_result_t enqueue_event_to_files(
         if (!append_line_to_open_file(blocked_file, BLOCKED_PATH, json)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (recover_live_event_after_storage_error(
+                    event,
+                    capturetype,
+                    "blocked-identity append failure")) {
+                return ENQUEUE_ACKNOWLEDGED;
+            }
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
@@ -2998,6 +3072,12 @@ static enqueue_result_t enqueue_event_to_files(
         if (!append_line_to_open_file(pending_file, PENDING_PATH, json)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (recover_live_event_after_storage_error(
+                    event,
+                    capturetype,
+                    "pending-event append failure")) {
+                return ENQUEUE_ACKNOWLEDGED;
+            }
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_set_backlog(true);
@@ -3024,6 +3104,13 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
 {
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGE(TAG, "Could not lock durable attendance outbox");
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (recover_live_event_after_storage_error(
+                event,
+                capturetype,
+                "attendance outbox lock timeout")) {
+            return ENQUEUE_ACKNOWLEDGED;
+        }
         return ENQUEUE_STORAGE_ERROR;
     }
     enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL, true);
@@ -3914,6 +4001,7 @@ static bool reconcile_attendance_dump(
                 "reconcile",
                 "LOCAL_RECONCILE_STORAGE_RECOVERED",
                 "Local preservation storage was full, but the unchanged ZKT retained source truth and ADD acknowledged every authoritative batch; no queue was deleted");
+            led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
         } else {
             ESP_LOGE(
                 TAG,
@@ -5781,10 +5869,17 @@ static size_t process_live_packet(const uint8_t *data, size_t len, const user_ta
         attendance_event_t event;
         if (build_attendance_event(&event, users, user_id, 0, timestamp, status, punch, true)) {
             enqueue_result_t result = enqueue_event(&event, "LIVE");
-            if (result == ENQUEUE_PENDING) {
+            if (result == ENQUEUE_PENDING || result == ENQUEUE_ACKNOWLEDGED) {
                 led_status_event(LED_EVENT_LIVE_PUNCH);
             }
-            observed++;
+            // ZKT's counter may advance even when local flash is exhausted.
+            // Count the live record only after local durability or an
+            // authenticated ADD acknowledgement. A storage failure therefore
+            // creates a deliberate counter mismatch and forces authoritative
+            // terminal truth repair at the next reconcile interval.
+            if (result != ENQUEUE_STORAGE_ERROR) {
+                observed++;
+            }
         }
     }
     return observed;

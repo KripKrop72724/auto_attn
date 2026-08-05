@@ -98,6 +98,7 @@ bool add_connector_command_update(
 bool add_connector_send_payload(const char *type, const char *payload_json);
 bool add_connector_enqueue_attendance(const char *payload_json);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
+bool add_connector_deliver_attendance_acknowledged(const char *payload_json);
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count);
 bool add_connector_enqueue_oracle_receipts(
     const char *const *event_uids,

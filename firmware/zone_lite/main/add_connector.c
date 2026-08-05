@@ -2000,6 +2000,21 @@ static bool deliver_attendance_payloads_acknowledged(
     return ok;
 }
 
+bool add_connector_deliver_attendance_acknowledged(const char *payload_json)
+{
+    if (!payload_json) return false;
+    const char *payloads[] = {payload_json};
+    bool ok = deliver_attendance_payloads_acknowledged(payloads, 1);
+    (void)add_connector_log(
+        ok ? "WARN" : "ERROR",
+        "live",
+        ok ? "LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED" : "LIVE_DIRECT_ACK_FALLBACK_FAILED",
+        ok
+            ? "Local live preservation was unavailable; ADD acknowledged the idempotent event while the ZKT retained source truth"
+            : "Local live preservation was unavailable and ADD did not acknowledge the event; the next counter reconcile must recover it from ZKT truth");
+    return ok;
+}
+
 static void refresh_capacity_deadline_on_progress(
     const add_outbox_t *outbox,
     uint32_t *last_depth,

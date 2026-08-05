@@ -989,6 +989,33 @@ def test_reconcile_truth_uses_acknowledged_add_fallback_when_preservation_is_ful
     assert "return ok && written == count;" not in connector
 
 
+def test_live_capture_counts_only_durable_or_acknowledged_events():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    enqueue = source[
+        source.index("typedef enum {\n    ENQUEUE_DUPLICATE") :
+        source.index("static bool build_attendance_event(")
+    ]
+    live = source[
+        source.index("static size_t process_live_packet(") :
+        source.index("static bool zk_register_attlog_events(")
+    ]
+
+    assert "ENQUEUE_ACKNOWLEDGED" in enqueue
+    assert "recover_live_event_after_storage_error(" in enqueue
+    assert "add_send_attendance_event_acknowledged(" in enqueue
+    assert '"LIVE_EVENT_DURABILITY_DEFERRED"' in enqueue
+    assert '"LIVE_LOCAL_STORAGE_RECOVERED"' in enqueue
+    assert "add_connector_deliver_attendance_acknowledged" in connector
+    assert "add_connector_deliver_attendance_acknowledged" in header
+    assert '"LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED"' in connector
+    assert '"LIVE_DIRECT_ACK_FALLBACK_FAILED"' in connector
+    assert "result == ENQUEUE_PENDING || result == ENQUEUE_ACKNOWLEDGED" in live
+    assert "if (result != ENQUEUE_STORAGE_ERROR)" in live
+    assert live.index("if (result != ENQUEUE_STORAGE_ERROR)") < live.index("observed++;")
+
+
 def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
     runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 
