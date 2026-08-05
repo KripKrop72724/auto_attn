@@ -133,6 +133,7 @@ static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
+static bool s_ota_restart_claimed;
 static char s_boot_id[48];
 static uint64_t s_sequence;
 static bool s_started;
@@ -2940,9 +2941,59 @@ void add_connector_set_activity(const char *activity)
 {
     if (!s_lock || !activity) return;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        strlcpy(s_activity, activity, sizeof(s_activity));
+        if (!s_ota_restart_claimed || strcmp(activity, "OTA_RESTART") == 0) {
+            strlcpy(s_activity, activity, sizeof(s_activity));
+        }
         xSemaphoreGive(s_lock);
     }
+}
+
+bool add_connector_begin_exclusive_activity(const char *activity)
+{
+    if (!s_lock || !activity) return false;
+    bool started = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (!s_ota_restart_claimed) {
+            strlcpy(s_activity, activity, sizeof(s_activity));
+            started = true;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return started;
+}
+
+bool add_connector_claim_ota_restart(void)
+{
+    if (!s_lock) return false;
+    bool claimed = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bool activity_is_safe =
+            strcmp(s_activity, "LIVE_CAPTURE") == 0 ||
+            strcmp(s_activity, "ONLINE") == 0;
+        bool terminal_is_stable =
+            s_zkt.online && strcmp(s_zkt.connection_state, "ONLINE") == 0;
+        if (!s_ota_restart_claimed && activity_is_safe && terminal_is_stable) {
+            s_ota_restart_claimed = true;
+            strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));
+            claimed = true;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return claimed;
+}
+
+bool add_connector_begin_pending_command_activity(void)
+{
+    if (!s_lock || !s_commands) return false;
+    bool started = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (!s_ota_restart_claimed && uxQueueMessagesWaiting(s_commands) > 0) {
+            strlcpy(s_activity, "PROCESSING_COMMAND", sizeof(s_activity));
+            started = true;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return started;
 }
 
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry)

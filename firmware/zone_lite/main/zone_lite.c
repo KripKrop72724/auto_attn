@@ -6792,6 +6792,11 @@ static int64_t gateway_run(uint32_t host_order_ip)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     zkt_mark_authenticated(host_order_ip, "live session authenticated and identified", true);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
+    if (!add_connector_begin_exclusive_activity("VERIFYING_IDENTITY")) {
+        zk_disconnect(sock, &ctx);
+        close(sock);
+        return uptime_ms() - session_started_ms;
+    }
     user_table_t *users = heap_caps_calloc(1, sizeof(user_table_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!users) users = calloc(1, sizeof(user_table_t));
     if (!users) {
@@ -6815,6 +6820,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     if (!zk_register_attlog_events(sock, &ctx, true)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
+    add_connector_set_activity("LIVE_CAPTURE");
 
     int64_t now_ms = uptime_ms();
     int64_t last_reconcile = now_ms - ZONE_LITE_RECONCILE_INTERVAL_MS +
@@ -6871,9 +6877,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
             zkt_mark_stable();
             if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
         }
-        if (process_add_commands(sock, &ctx, users, &user_count)) {
-            restarted = true;
-            break;
+        if (add_connector_begin_pending_command_activity()) {
+            if (process_add_commands(sock, &ctx, users, &user_count)) {
+                restarted = true;
+                break;
+            }
+            add_connector_set_activity("LIVE_CAPTURE");
         }
         if (add_connector_consume_connected_edge()) {
             add_connector_log("INFO", "add", "ADD_RECONNECTED", "ADD channel recovered; publishing a fresh full user snapshot");
@@ -6905,13 +6914,24 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     message);
             }
         }
-        (void)temp_admin_revoke_if_due(sock, &ctx, users);
+        if (g_temp_admin_active) {
+            if (!add_connector_begin_exclusive_activity("VERIFYING_ADMIN_LEASE")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            bool lease_ok = temp_admin_revoke_if_due(sock, &ctx, users);
+            add_connector_set_activity("LIVE_CAPTURE");
+            if (!lease_ok) break;
+        }
 
         if (now_ms - last_user_integrity >= ZONE_LITE_USER_INTEGRITY_INTERVAL_MS) {
             int32_t verified_users = 0;
             int32_t verified_records = 0;
             char verified_hash[65] = {0};
-            add_connector_set_activity("VERIFYING_IDENTITY");
+            if (!add_connector_begin_exclusive_activity("VERIFYING_IDENTITY")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
             if (!zk_get_counts(sock, &ctx, &verified_users, &verified_records) ||
                 !zk_refresh_users_stable(sock, &ctx, users, verified_users, verified_hash)) {
                 break;
@@ -6931,6 +6951,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
         }
 
         if (now_ms - last_time_sample >= 60000) {
+            if (!add_connector_begin_exclusive_activity("SAMPLING_TIME")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
             last_time_sample = now_ms;
             g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
             char device_time[32] = {0};
@@ -6940,14 +6964,18 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 g_add_zkt.consecutive_successes++;
             }
             add_connector_set_zkt(&g_add_zkt);
+            add_connector_set_activity("LIVE_CAPTURE");
         }
 
         if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
             now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+            if (!add_connector_begin_exclusive_activity("RECONCILING")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
             last_reconcile = now_ms;
             int32_t refreshed_users = 0;
             int32_t refreshed_records = 0;
-            add_connector_set_activity("RECONCILING");
             if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) break;
             if (refreshed_users != user_count) {
                 char verified_hash[65] = {0};
@@ -7216,7 +7244,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
 
         int restart_slot = -1;
         if (daily_zkt_reboot_should_attempt(&restart_slot)) {
-            add_connector_set_activity("SCHEDULED_RESTART");
+            if (!add_connector_begin_exclusive_activity("SCHEDULED_RESTART")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
             if (zk_protocol_restart(sock, &ctx)) {
                 daily_zkt_reboot_mark_complete(restart_slot);
                 g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
@@ -7225,6 +7256,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 restarted = true;
                 break;
             }
+            add_connector_set_activity("LIVE_CAPTURE");
         }
     }
     if (!restarted && !truth_retry_session) {

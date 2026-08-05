@@ -31,6 +31,26 @@ def test_ota_manager_uses_safe_application_ota_and_first_boot_confirmation() -> 
     assert "esp_ota_mark_app_invalid_rollback_and_reboot" in text
 
 
+def test_ota_restart_waits_for_an_atomic_zkt_safepoint() -> None:
+    ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+
+    update = ota[
+        ota.index("static bool perform_update(void)") :
+        ota.index("static bool confirm_or_report_rollback(void)")
+    ]
+    assert "while (!add_connector_claim_ota_restart())" in update
+    assert 'report_state("READY_TO_BOOT", "WAITING_FOR_ZKT_SAFEPOINT")' in update
+    assert update.index("wait_for_zkt_safepoint();") < update.index("esp_restart();")
+    assert "static bool s_ota_restart_claimed;" in connector
+    assert 'strlcpy(s_activity, "OTA_RESTART"' in connector
+    assert 'strcmp(s_activity, "LIVE_CAPTURE") == 0' in connector
+    assert 'strcmp(s_zkt.connection_state, "ONLINE") == 0' in connector
+    assert "add_connector_begin_pending_command_activity()" in runtime
+    assert runtime.count("add_connector_begin_exclusive_activity(") >= 5
+
+
 def test_ota_hash_uses_the_esp_application_digest_contract() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "esp_partition_get_sha256(target, digest)" in text

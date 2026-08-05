@@ -30,6 +30,7 @@
 #define OTA_POLL_MS 60000
 #define OTA_BOOT_CONFIRM_SECONDS 900
 #define OTA_BOOT_HEALTH_REPORT_SECONDS 30
+#define OTA_SAFEPOINT_REPORT_SECONDS 30
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
@@ -56,6 +57,8 @@ static ota_journal_t s_journal;
 static bool s_started;
 static bool s_busy;
 static char s_last_error[64];
+
+static void wait_for_zkt_safepoint(void);
 
 static void hex_bytes(const unsigned char *input, size_t length, char *output)
 {
@@ -377,9 +380,22 @@ static bool perform_update(void)
     strlcpy(s_journal.state, "READY_TO_BOOT", sizeof(s_journal.state));
     (void)save_journal();
     (void)report_state("READY_TO_BOOT", NULL);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    wait_for_zkt_safepoint();
     esp_restart();
     return true;
+}
+
+static void wait_for_zkt_safepoint(void)
+{
+    int64_t last_report = 0;
+    while (!add_connector_claim_ota_restart()) {
+        int64_t now = esp_timer_get_time() / 1000000;
+        if (last_report == 0 || now - last_report >= OTA_SAFEPOINT_REPORT_SECONDS) {
+            (void)report_state("READY_TO_BOOT", "WAITING_FOR_ZKT_SAFEPOINT");
+            last_report = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 
 static bool confirm_or_report_rollback(void)

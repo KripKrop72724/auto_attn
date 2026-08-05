@@ -144,7 +144,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current firmware version is `2.2.50`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.2.51`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 
@@ -157,6 +157,12 @@ stability gating. It is not used for ordinary intermittent availability.
 
 Preferred IP `0.0.0.0` enables bounded DHCP-subnet discovery. Once authenticated, the last good IP
 is used directly. Serial pinning prevents attaching to a different ZKT that happens to answer first.
+
+An OTA image may download while live capture continues, but its reboot is claimed only at an
+atomic ZKT safepoint. Startup/user verification, ADD commands, administrator-lease enforcement,
+time sampling, reconciliation, and scheduled terminal restarts cannot begin after that claim; OTA
+waits for any one already in progress to finish. This prevents an ESP reboot from abandoning a
+prepared ZKT bulk-read buffer while preserving live punch capture during the download.
 
 ## LED states
 
