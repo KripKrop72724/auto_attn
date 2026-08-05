@@ -1255,6 +1255,30 @@ def test_oracle_receipt_batches_collapse_duplicate_terminal_event_uids():
     assert "add_connector_enqueue_validated_line(" in receipt_enqueue
 
 
+def test_ords_drain_preserves_authoritative_outbox_under_storage_pressure():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    drain = source[
+        source.index("static bool pending_rewrite_write(") :
+        source.index("static void oracle_drain_pending(bool live_first)")
+    ]
+
+    assert "ORDS_DRAIN_STORAGE_BACKPRESSURE" in drain
+    assert "g_ords_drain_retry_not_before_ms" in drain
+    assert "ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS" in drain
+    assert "open_error == ENOSPC" in drain
+    assert "rewrite_error == ENOSPC" in drain
+    assert "pending_rewrite_write(" in drain
+    assert "fflush(out)" in drain
+    assert "fsync(fileno(out))" in drain
+    assert "if (!rewrite_ok)" in drain
+    replacement = drain.index("replace_pending_with_backup()")
+    durable_flush = drain.index("fsync(fileno(out))")
+    assert durable_flush < replacement
+    assert "original pending outbox remains unchanged" in drain
+    assert "without deleting a queue" in drain
+    assert "led_status_fault(LED_STATUS_LOCAL_FAILURE);" in drain
+
+
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     reconcile = source[
