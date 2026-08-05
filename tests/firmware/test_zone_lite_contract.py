@@ -803,6 +803,51 @@ def test_firmware_excludes_zero_and_implausible_terminal_timestamps():
     )
 
 
+def test_bulk_truth_scan_aggregates_invalid_timestamp_telemetry():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+
+    assert "invalid_timestamp_count" in reconcile
+    assert "attendance_record_timestamp(" in reconcile
+    assert "zk_attendance_timestamp_is_plausible(timestamp)" in reconcile
+    assert "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY" in reconcile
+    assert reconcile.index("xSemaphoreGive(g_storage_lock);") < reconcile.index(
+        "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY"
+    )
+    assert reconcile.count("ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY") == 1
+    assert "invalid_timestamp_count > processed / 2" in reconcile
+    assert "TRUTH_SNAPSHOT_IMPLAUSIBLE" in reconcile
+    assert "fresh_session_retryable_out" in reconcile
+
+
+def test_identity_catalog_has_bounded_memory_fallback_under_storage_pressure():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(
+        encoding="utf-8"
+    )
+    staging = connector[
+        connector.index("static void reset_identity_catalog_stage(") :
+        connector.index("bool add_connector_persist_command_tombstone(")
+    ]
+    lookup = connector[
+        connector.index("bool add_connector_lookup_identity(") :
+        connector.index("uint32_t add_connector_identity_catalog_generation(")
+    ]
+
+    assert "heap_caps_calloc(" in staging
+    assert "ADD_IDENTITY_CATALOG_MAX_ROWS" in staging
+    assert "identity_alias_from_json(" in staging
+    assert "persisted || memory_ready" in staging
+    assert "IDENTITY_CATALOG_MEMORY_FALLBACK" in connector
+    assert "s_identity_catalog_active_aliases" in lookup
+    assert "if (memory_catalog_valid) return found;" in lookup
+    assert lookup.index("s_identity_catalog_active_aliases") < lookup.index(
+        "fopen(ADD_IDENTITY_CATALOG_PATH"
+    )
+
+
 def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     recovery = source[

@@ -3664,6 +3664,7 @@ static bool reconcile_attendance_dump(
     size_t duplicates = 0;
     size_t filtered = 0;
     size_t skipped = 0;
+    size_t invalid_timestamp_count = 0;
     bool truth_enabled = ZONE_LITE_ORDS_RECONCILE_ENABLED &&
         filter_year > 0 && filter_month > 0;
     int last_day = days_in_month(filter_year, filter_month);
@@ -3709,9 +3710,22 @@ static bool reconcile_attendance_dump(
     while (remain >= record_size) {
         attendance_event_t event;
         uint32_t timestamp = 0;
-        bool parsed = parse_attendance_record(
-            p, record_size, users, &event, &timestamp);
-        if (parsed && filter_year > 0 && filter_month > 0 &&
+        bool has_timestamp = attendance_record_timestamp(
+            p, record_size, &timestamp);
+        if (!has_timestamp || !zk_attendance_timestamp_is_plausible(timestamp)) {
+            if (has_timestamp) {
+                invalid_timestamp_count++;
+            }
+            skipped++;
+            p += record_size;
+            remain -= record_size;
+            processed++;
+            if ((processed % 50) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            continue;
+        }
+        if (filter_year > 0 && filter_month > 0 &&
             !zk_timestamp_in_window(
                 timestamp, filter_year, filter_month, 1, day_end)) {
             filtered++;
@@ -3723,6 +3737,8 @@ static bool reconcile_attendance_dump(
             }
             continue;
         }
+        bool parsed = parse_attendance_record(
+            p, record_size, users, &event, &timestamp);
         if (parsed) {
             reconcile_event_count++;
             if (event.cnic[0] != '\0') {
@@ -3763,6 +3779,41 @@ static bool reconcile_attendance_dump(
     }
     xSemaphoreGive(g_storage_lock);
     xSemaphoreGive(g_ords_outbox_gate);
+    if (invalid_timestamp_count > 0) {
+        char quarantine_summary[224];
+        snprintf(
+            quarantine_summary,
+            sizeof(quarantine_summary),
+            "Bulk truth scan excluded %u zero or implausible terminal timestamps; terminal truth remains unchanged",
+            (unsigned)invalid_timestamp_count);
+        ESP_LOGW(TAG, "%s", quarantine_summary);
+        (void)add_connector_log(
+            "WARN",
+            "attendance",
+            "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY",
+            quarantine_summary);
+    }
+    bool implausible_snapshot = processed > 0 &&
+        invalid_timestamp_count > processed / 2;
+    if (implausible_snapshot) {
+        char invalid_snapshot[224];
+        snprintf(
+            invalid_snapshot,
+            sizeof(invalid_snapshot),
+            "Rejected unreliable ZKT truth snapshot: invalid_timestamps=%u processed=%u; retrying on a fresh authenticated session without sending authoritative windows",
+            (unsigned)invalid_timestamp_count,
+            (unsigned)processed);
+        ESP_LOGE(TAG, "%s", invalid_snapshot);
+        (void)add_connector_log(
+            "ERROR",
+            "reconcile",
+            "TRUTH_SNAPSHOT_IMPLAUSIBLE",
+            invalid_snapshot);
+        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
+        free(data);
+        led_status_fault(LED_STATUS_TRUTH_REPAIR);
+        return false;
+    }
     ESP_LOGI(
         TAG,
         "Released durable outbox before bounded downstream windows events=%u identity_mapped=%u",

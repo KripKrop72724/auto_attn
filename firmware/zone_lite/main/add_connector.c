@@ -1,6 +1,7 @@
 #include "add_connector.h"
 #include "ota_manager.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -113,6 +114,14 @@ typedef struct {
     size_t length;
 } add_inbound_message_t;
 
+typedef struct {
+    char uid[32];
+    char user_id[64];
+    char display_name[96];
+    char cnic[16];
+    bool shift_worker;
+} add_identity_alias_t;
+
 static const char *TAG = "add_connector";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
@@ -144,6 +153,12 @@ static size_t s_identity_catalog_rows;
 static char s_identity_catalog_stage_id[40];
 static size_t s_identity_catalog_stage_expected;
 static size_t s_identity_catalog_stage_rows;
+static add_identity_alias_t *s_identity_catalog_stage_aliases;
+static size_t s_identity_catalog_stage_alias_capacity;
+static bool s_identity_catalog_stage_file_ok;
+static add_identity_alias_t *s_identity_catalog_active_aliases;
+static size_t s_identity_catalog_active_alias_rows;
+static bool s_identity_catalog_active_memory_valid;
 static add_outbox_t s_bulk_outbox = {
     .path = ADD_OUTBOX_PATH,
     .tmp_path = ADD_OUTBOX_TMP_PATH,
@@ -714,6 +729,63 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
     return ok;
 }
 
+static void reset_identity_catalog_stage(bool remove_file)
+{
+    if (remove_file) {
+        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    }
+    free(s_identity_catalog_stage_aliases);
+    s_identity_catalog_stage_aliases = NULL;
+    s_identity_catalog_stage_alias_capacity = 0;
+    s_identity_catalog_stage_file_ok = false;
+    s_identity_catalog_stage_id[0] = '\0';
+    s_identity_catalog_stage_expected = 0;
+    s_identity_catalog_stage_rows = 0;
+}
+
+static bool identity_alias_from_json(
+    cJSON *row,
+    add_identity_alias_t *alias)
+{
+    if (!cJSON_IsObject(row) || !alias) return false;
+    cJSON *uid = cJSON_GetObjectItemCaseSensitive(row, "uid");
+    cJSON *user_id = cJSON_GetObjectItemCaseSensitive(row, "user_id");
+    cJSON *display_name =
+        cJSON_GetObjectItemCaseSensitive(row, "display_name");
+    cJSON *cnic = cJSON_GetObjectItemCaseSensitive(row, "cnic");
+    cJSON *shift_worker =
+        cJSON_GetObjectItemCaseSensitive(row, "shift_worker");
+    const char *uid_value = cJSON_IsString(uid) ? uid->valuestring : "";
+    const char *user_id_value =
+        cJSON_IsString(user_id) ? user_id->valuestring : "";
+    const char *display_name_value =
+        cJSON_IsString(display_name) ? display_name->valuestring : "";
+    const char *cnic_value = cJSON_IsString(cnic) ? cnic->valuestring : "";
+    if ((!uid_value[0] && !user_id_value[0]) ||
+        strlen(uid_value) >= sizeof(alias->uid) ||
+        strlen(user_id_value) >= sizeof(alias->user_id) ||
+        strlen(display_name_value) >= sizeof(alias->display_name) ||
+        strlen(cnic_value) >= sizeof(alias->cnic)) {
+        return false;
+    }
+    if (cnic_value[0]) {
+        if (strlen(cnic_value) != 13) return false;
+        for (size_t i = 0; i < 13; i++) {
+            if (!isdigit((unsigned char)cnic_value[i])) return false;
+        }
+    }
+    memset(alias, 0, sizeof(*alias));
+    strlcpy(alias->uid, uid_value, sizeof(alias->uid));
+    strlcpy(alias->user_id, user_id_value, sizeof(alias->user_id));
+    strlcpy(
+        alias->display_name,
+        display_name_value,
+        sizeof(alias->display_name));
+    strlcpy(alias->cnic, cnic_value, sizeof(alias->cnic));
+    alias->shift_worker = cJSON_IsTrue(shift_worker);
+    return true;
+}
+
 static bool identity_catalog_stage_begin(cJSON *root)
 {
     cJSON *catalog_id = root
@@ -728,6 +800,23 @@ static bool identity_catalog_stage_begin(cJSON *root)
         expected < 0 || expected > ADD_IDENTITY_CATALOG_MAX_ROWS) {
         return false;
     }
+    reset_identity_catalog_stage(true);
+    bool memory_ok = expected == 0;
+    if (expected > 0) {
+        s_identity_catalog_stage_aliases = heap_caps_calloc(
+            (size_t)expected,
+            sizeof(add_identity_alias_t),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_identity_catalog_stage_aliases) {
+            s_identity_catalog_stage_aliases = calloc(
+                (size_t)expected,
+                sizeof(add_identity_alias_t));
+        }
+        memory_ok = s_identity_catalog_stage_aliases != NULL;
+        if (memory_ok) {
+            s_identity_catalog_stage_alias_capacity = (size_t)expected;
+        }
+    }
     FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "w");
     cJSON *metadata = cJSON_CreateObject();
     bool ok = file && metadata;
@@ -740,11 +829,12 @@ static bool identity_catalog_stage_begin(cJSON *root)
     }
     cJSON_Delete(metadata);
     if (file) fclose(file);
+    s_identity_catalog_stage_file_ok = ok;
     if (!ok) {
         (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
-        s_identity_catalog_stage_id[0] = '\0';
-        s_identity_catalog_stage_expected = 0;
-        s_identity_catalog_stage_rows = 0;
+    }
+    if (!ok && !memory_ok) {
+        reset_identity_catalog_stage(true);
         return false;
     }
     strlcpy(
@@ -774,25 +864,58 @@ static bool identity_catalog_stage_chunk(cJSON *root)
             s_identity_catalog_stage_expected) {
         return false;
     }
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "a");
-    bool ok = file != NULL;
+    bool memory_ok = chunk_rows == 0 ||
+        (s_identity_catalog_stage_aliases != NULL &&
+         s_identity_catalog_stage_rows + (size_t)chunk_rows <=
+             s_identity_catalog_stage_alias_capacity);
+    bool rows_ok = memory_ok || s_identity_catalog_stage_file_ok;
     cJSON *row = NULL;
+    size_t row_index = s_identity_catalog_stage_rows;
     cJSON_ArrayForEach(row, rows) {
-        if (!cJSON_IsObject(row) ||
-            (ok && !write_encrypted_json_line(file, row))) {
-            ok = false;
+        if (!cJSON_IsObject(row)) {
+            rows_ok = false;
+            break;
+        }
+        if (memory_ok && !identity_alias_from_json(
+                row,
+                &s_identity_catalog_stage_aliases[row_index])) {
+            rows_ok = false;
+            break;
+        }
+        row_index++;
+    }
+    if (!rows_ok) return false;
+
+    if (s_identity_catalog_stage_file_ok) {
+        FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "a");
+        bool file_ok = file != NULL;
+        cJSON_ArrayForEach(row, rows) {
+            if (file_ok && !write_encrypted_json_line(file, row)) {
+                file_ok = false;
+            }
+        }
+        if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+            file_ok = false;
+        }
+        if (file) fclose(file);
+        if (!file_ok) {
+            s_identity_catalog_stage_file_ok = false;
+            (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
         }
     }
-    if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) ok = false;
-    if (file) fclose(file);
-    if (ok) {
+    if (memory_ok || s_identity_catalog_stage_file_ok) {
         s_identity_catalog_stage_rows += (size_t)chunk_rows;
+        return true;
     }
-    return ok;
+    return false;
 }
 
-static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out)
+static bool identity_catalog_stage_commit(
+    cJSON *root,
+    size_t *row_count_out,
+    bool *volatile_fallback_out)
 {
+    if (volatile_fallback_out) *volatile_fallback_out = false;
     cJSON *catalog_id = root
         ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
         : NULL;
@@ -805,18 +928,40 @@ static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out)
         expected >= 0 &&
         (size_t)expected == s_identity_catalog_stage_expected &&
         s_identity_catalog_stage_rows == s_identity_catalog_stage_expected;
-    if (ok) {
-        ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    bool persisted = ok && s_identity_catalog_stage_file_ok &&
+        activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    bool memory_ready = ok &&
+        (s_identity_catalog_stage_expected == 0 ||
+         (s_identity_catalog_stage_aliases != NULL &&
+          s_identity_catalog_stage_alias_capacity ==
+              s_identity_catalog_stage_expected));
+    add_identity_alias_t *old_active = NULL;
+    if (memory_ready && s_lock &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        old_active = s_identity_catalog_active_aliases;
+        s_identity_catalog_active_aliases =
+            s_identity_catalog_stage_aliases;
+        s_identity_catalog_active_alias_rows =
+            s_identity_catalog_stage_expected;
+        s_identity_catalog_active_memory_valid = true;
+        s_identity_catalog_stage_aliases = NULL;
+        s_identity_catalog_stage_alias_capacity = 0;
+        xSemaphoreGive(s_lock);
+    } else if (memory_ready && !persisted) {
+        ok = false;
     }
+    free(old_active);
+    ok = ok && (persisted || memory_ready);
     if (ok && row_count_out) {
         *row_count_out = s_identity_catalog_stage_rows;
     }
-    if (!ok) {
+    if (ok && volatile_fallback_out) {
+        *volatile_fallback_out = !persisted && memory_ready;
+    }
+    if (!persisted) {
         (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
     }
-    s_identity_catalog_stage_id[0] = '\0';
-    s_identity_catalog_stage_expected = 0;
-    s_identity_catalog_stage_rows = 0;
+    reset_identity_catalog_stage(false);
     return ok;
 }
 
@@ -1208,10 +1353,7 @@ static void parse_inbound(const char *data, size_t len)
     if (cJSON_IsString(type) &&
         strcmp(type->valuestring, "identity_catalog_chunk") == 0) {
         if (!identity_catalog_stage_chunk(root)) {
-            (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
-            s_identity_catalog_stage_id[0] = '\0';
-            s_identity_catalog_stage_expected = 0;
-            s_identity_catalog_stage_rows = 0;
+            reset_identity_catalog_stage(true);
             add_connector_log(
                 "ERROR",
                 "identity",
@@ -1224,7 +1366,11 @@ static void parse_inbound(const char *data, size_t len)
     if (cJSON_IsString(type) &&
         strcmp(type->valuestring, "identity_catalog_commit") == 0) {
         size_t row_count = 0;
-        if (!identity_catalog_stage_commit(root, &row_count)) {
+        bool volatile_fallback = false;
+        if (!identity_catalog_stage_commit(
+                root,
+                &row_count,
+                &volatile_fallback)) {
             add_connector_log(
                 "ERROR",
                 "identity",
@@ -1242,6 +1388,13 @@ static void parse_inbound(const char *data, size_t len)
                 TAG,
                 "Committed bounded encrypted ADD identity catalog rows=%u",
                 (unsigned)row_count);
+            if (volatile_fallback) {
+                add_connector_log(
+                    "WARN",
+                    "identity",
+                    "IDENTITY_CATALOG_MEMORY_FALLBACK",
+                    "Verified ADD identity catalog is active in bounded PSRAM because flash storage is full; encrypted persistence will retry on reconnect");
+            }
         }
         cJSON_Delete(root);
         return;
@@ -2870,9 +3023,40 @@ bool add_connector_lookup_identity(
     bool *shift_worker)
 {
     if ((!user_id || !user_id[0]) && (!uid || !uid[0])) return false;
+    bool found = false;
+    bool memory_catalog_valid = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        memory_catalog_valid = s_identity_catalog_active_memory_valid;
+        for (size_t i = 0; i < s_identity_catalog_active_alias_rows; i++) {
+            const add_identity_alias_t *alias =
+                &s_identity_catalog_active_aliases[i];
+            bool user_matches = !user_id || !user_id[0] ||
+                strcmp(alias->user_id, user_id) == 0;
+            bool uid_matches = !uid || !uid[0] ||
+                strcmp(alias->uid, uid) == 0;
+            if (!user_matches || !uid_matches) continue;
+            if (display_name && display_name_size) {
+                strlcpy(
+                    display_name,
+                    alias->display_name,
+                    display_name_size);
+            }
+            if (cnic && cnic_size) {
+                strlcpy(cnic, alias->cnic, cnic_size);
+            }
+            if (shift_worker) *shift_worker = alias->shift_worker;
+            found = true;
+            break;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    // A complete volatile catalog is authoritative even when it contains no
+    // matching alias. Falling through to an older flash catalog could revive
+    // an alias that the latest verified catalog deliberately removed.
+    if (memory_catalog_valid) return found;
+
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    bool found = false;
     if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
