@@ -1298,6 +1298,43 @@ def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
     assert "g_ords_outbox_gate = xSemaphoreCreateMutex();" in source
 
 
+def test_full_reconcile_has_expiring_priority_over_storage_full_ords_drain():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+    drain = source[
+        source.index("static void oracle_drain_pending(bool live_first)") :
+        source.index("static void ords_uploader_task(void *arg)")
+    ]
+    gateway = source[
+        source.index("bool ords_gate_deferred = false;") :
+        source.index('add_connector_set_activity("LIVE_CAPTURE");',
+                     source.index("bool ords_gate_deferred = false;"))
+    ]
+
+    assert "#define ZKT_TRUTH_ORDS_GATE_WAIT_MS 5000" in source
+    assert "#define ZKT_TRUTH_ORDS_GATE_RETRY_MS 10000" in source
+    assert "#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 30000" in source
+    assert "truth_ords_gate_reserve_until(" in reconcile
+    assert "pdMS_TO_TICKS(ZKT_TRUTH_ORDS_GATE_WAIT_MS)" in reconcile
+    assert '"FULL_RECONCILE_DEFERRED_ORDS_GATE"' in reconcile
+    assert "ZONE_LITE_ORDS_TIMEOUT_MS * 5" not in reconcile
+    assert "truth_ords_gate_priority_active(now_ms)" in drain
+    assert "portENTER_CRITICAL(&g_truth_ords_gate_priority_mux);" in source
+    assert "portEXIT_CRITICAL(&g_truth_ords_gate_priority_mux);" in source
+    assert "if (ords_gate_deferred)" in gateway
+    assert "ZKT_TRUTH_ORDS_GATE_RETRY_MS" in gateway
+    deferred = gateway[
+        gateway.index("if (ords_gate_deferred)") :
+        gateway.index("} else {", gateway.index("if (ords_gate_deferred)"))
+    ]
+    assert "FULL_RECONCILE_FAILED" not in deferred
+    assert "g_force_truth_reconcile = false" not in deferred
+    assert "truth_retry_session = true" not in deferred
+
+
 def test_large_zkt_buffer_reads_allow_slow_prepare_data_delivery():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     assert "#define ZKT_IO_TIMEOUT_SEC 90" in source

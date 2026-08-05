@@ -307,6 +307,15 @@
 #define ZKT_BUFFER_RECOVERY_CHUNK_BYTES 0x4000
 #define ZKT_TRUTH_FRESH_SESSION_RETRIES 2
 #define ZKT_TRUTH_RETRY_BACKOFF_MS 5000
+// A storage-full ORDS rewrite can legitimately own the outbox gate for longer
+// than a ZKT reconcile interval. Give authoritative truth short, expiring
+// priority instead of blocking the live session for the old 75-second wait.
+// If a drain is already in flight, retry quickly after it releases the gate;
+// the expiring reservation prevents the two tasks from starving each other.
+#define ZKT_TRUTH_ORDS_GATE_WAIT_MS 5000
+#define ZKT_TRUTH_ORDS_GATE_RETRY_MS 10000
+#define ZKT_TRUTH_ORDS_GATE_PRIORITY_MS 30000
+#define ZKT_TRUTH_ORDS_GATE_DEFER_LOG_MS 60000
 #define ZKT_KEEPALIVE_IDLE_SEC 60
 #define ZKT_KEEPALIVE_INTERVAL_SEC 10
 #define ZKT_KEEPALIVE_COUNT 3
@@ -420,6 +429,9 @@ static bool g_truth_use_recovery_chunks;
 static bool g_truth_retry_session_requested;
 static bool g_truth_retry_reconnect_pending;
 static uint32_t g_truth_fresh_session_retries;
+static int64_t g_truth_ords_gate_priority_until_ms;
+static int64_t g_truth_ords_gate_last_defer_log_ms;
+static portMUX_TYPE g_truth_ords_gate_priority_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool g_truth_window_blocked;
 static bool g_blocked_recovery_deferred_logged;
 static int g_daily_zkt_reboot_completed_day = -1;
@@ -450,6 +462,21 @@ static void update_history_telemetry(void);
 static int64_t uptime_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static void truth_ords_gate_reserve_until(int64_t deadline_ms)
+{
+    portENTER_CRITICAL(&g_truth_ords_gate_priority_mux);
+    g_truth_ords_gate_priority_until_ms = deadline_ms;
+    portEXIT_CRITICAL(&g_truth_ords_gate_priority_mux);
+}
+
+static bool truth_ords_gate_priority_active(int64_t now_ms)
+{
+    portENTER_CRITICAL(&g_truth_ords_gate_priority_mux);
+    bool active = g_truth_ords_gate_priority_until_ms > now_ms;
+    portEXIT_CRITICAL(&g_truth_ords_gate_priority_mux);
+    return active;
 }
 
 static int64_t epoch_now(void)
@@ -3485,12 +3512,14 @@ static bool reconcile_attendance_dump(
     size_t *added_out,
     bool *identity_blocked_out,
     bool *history_exhausted_out,
-    bool *fresh_session_retryable_out)
+    bool *fresh_session_retryable_out,
+    bool *ords_gate_deferred_out)
 {
     if (added_out) *added_out = 0;
     if (identity_blocked_out) *identity_blocked_out = false;
     if (history_exhausted_out) *history_exhausted_out = false;
     if (fresh_session_retryable_out) *fresh_session_retryable_out = false;
+    if (ords_gate_deferred_out) *ords_gate_deferred_out = false;
     uint8_t *data = NULL;
     size_t len = 0;
     if (records <= 0) {
@@ -3507,13 +3536,37 @@ static bool reconcile_attendance_dump(
     // Do not download a multi-megabyte ZKT dump while the background ORDS
     // worker owns the durable outbox for a network rewrite. Waiting here keeps
     // the expensive device read outside that contention window.
-    if (g_ords_outbox_gate == NULL ||
-        xSemaphoreTake(
-            g_ords_outbox_gate,
-            pdMS_TO_TICKS(ZONE_LITE_ORDS_TIMEOUT_MS * 5)) != pdTRUE) {
-        ESP_LOGW(TAG, "Timed out waiting for ORDS outbox before full reconcile");
+    if (g_ords_outbox_gate == NULL) {
+        ESP_LOGE(TAG, "ORDS outbox arbitration is unavailable before full reconcile");
         return false;
     }
+    int64_t gate_wait_started_ms = uptime_ms();
+    truth_ords_gate_reserve_until(
+        gate_wait_started_ms + ZKT_TRUTH_ORDS_GATE_PRIORITY_MS);
+    if (xSemaphoreTake(
+            g_ords_outbox_gate,
+            pdMS_TO_TICKS(ZKT_TRUTH_ORDS_GATE_WAIT_MS)) != pdTRUE) {
+        int64_t deferred_at_ms = uptime_ms();
+        if (ords_gate_deferred_out) *ords_gate_deferred_out = true;
+        ESP_LOGW(
+            TAG,
+            "Deferred full reconcile after %u ms because an ORDS outbox transaction is still in progress; priority reservation remains active",
+            (unsigned)ZKT_TRUTH_ORDS_GATE_WAIT_MS);
+        if (g_truth_ords_gate_last_defer_log_ms == 0 ||
+            deferred_at_ms - g_truth_ords_gate_last_defer_log_ms >=
+                ZKT_TRUTH_ORDS_GATE_DEFER_LOG_MS) {
+            g_truth_ords_gate_last_defer_log_ms = deferred_at_ms;
+            (void)add_connector_log(
+                "INFO",
+                "reconcile",
+                "FULL_RECONCILE_DEFERRED_ORDS_GATE",
+                "Authoritative truth yielded to an in-progress ORDS outbox transaction; live capture remains active and a priority retry is scheduled without reporting a ZKT read failure.");
+        }
+        return false;
+    }
+    // The mutex itself now excludes the uploader. Clear the expiring
+    // reservation so ORDS can resume immediately after truth releases it.
+    truth_ords_gate_reserve_until(0);
     int32_t refreshed_users = 0;
     int32_t refreshed_records = 0;
     if (zk_get_counts(sock, ctx, &refreshed_users, &refreshed_records) && refreshed_records > 0) {
@@ -5897,6 +5950,8 @@ static void oracle_drain_pending_locked(bool live_first)
 
 static void oracle_drain_pending(bool live_first)
 {
+    int64_t now_ms = uptime_ms();
+    if (truth_ords_gate_priority_active(now_ms)) return;
     if (!g_ords_outbox_gate ||
         xSemaphoreTake(g_ords_outbox_gate, pdMS_TO_TICKS(100)) != pdTRUE) return;
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
@@ -6904,6 +6959,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     bool identity_blocked = false;
                     bool history_exhausted = false;
                     bool fresh_session_retryable = false;
+                    bool ords_gate_deferred = false;
                     bool dump_succeeded = reconcile_attendance_dump(
                             sock,
                             &ctx,
@@ -6917,7 +6973,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             &added,
                             &identity_blocked,
                             &history_exhausted,
-                            &fresh_session_retryable);
+                            &fresh_session_retryable,
+                            &ords_gate_deferred);
                     if (dump_succeeded) {
                         if (historical_reconcile) {
                             if (history_exhausted) {
@@ -6949,81 +7006,92 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         }
                     } else {
                         reconcile_succeeded = false;
-                        bool retry_with_fresh_session =
-                            !historical_reconcile &&
-                            !identity_blocked &&
-                            fresh_session_retryable &&
-                            g_truth_fresh_session_retries <
-                                ZKT_TRUTH_FRESH_SESSION_RETRIES;
-                        if (retry_with_fresh_session) {
-                            g_truth_fresh_session_retries++;
-                            g_truth_use_recovery_chunks = true;
-                            truth_retry_session = true;
-                            char retry_message[224];
-                            snprintf(
-                                retry_message,
-                                sizeof(retry_message),
-                                "Attendance truth transport will retry on a fresh authenticated ZKT session attempt=%lu/%u chunk_bytes=%u; live capture remains durable",
-                                (unsigned long)g_truth_fresh_session_retries,
-                                (unsigned)ZKT_TRUTH_FRESH_SESSION_RETRIES,
-                                (unsigned)ZKT_BUFFER_RECOVERY_CHUNK_BYTES);
-                            add_connector_log(
-                                "WARN",
-                                "reconcile",
-                                "TRUTH_READ_RETRY_SESSION",
-                                retry_message);
-                        } else if (!historical_reconcile &&
-                                   !identity_blocked &&
-                                   fresh_session_retryable) {
+                        if (ords_gate_deferred) {
+                            // Do not spend a fresh ZKT session or wait another
+                            // 15 minutes for a local scheduling conflict. The
+                            // expiring priority reservation lets the in-flight
+                            // ORDS transaction finish, then the gateway retries
+                            // truth promptly without misreporting a read fault.
+                            last_reconcile = uptime_ms() -
+                                ZONE_LITE_RECONCILE_INTERVAL_MS +
+                                ZKT_TRUTH_ORDS_GATE_RETRY_MS;
+                        } else {
+                            bool retry_with_fresh_session =
+                                !historical_reconcile &&
+                                !identity_blocked &&
+                                fresh_session_retryable &&
+                                g_truth_fresh_session_retries <
+                                    ZKT_TRUTH_FRESH_SESSION_RETRIES;
+                            if (retry_with_fresh_session) {
+                                g_truth_fresh_session_retries++;
+                                g_truth_use_recovery_chunks = true;
+                                truth_retry_session = true;
+                                char retry_message[224];
+                                snprintf(
+                                    retry_message,
+                                    sizeof(retry_message),
+                                    "Attendance truth transport will retry on a fresh authenticated ZKT session attempt=%lu/%u chunk_bytes=%u; live capture remains durable",
+                                    (unsigned long)g_truth_fresh_session_retries,
+                                    (unsigned)ZKT_TRUTH_FRESH_SESSION_RETRIES,
+                                    (unsigned)ZKT_BUFFER_RECOVERY_CHUNK_BYTES);
+                                add_connector_log(
+                                    "WARN",
+                                    "reconcile",
+                                    "TRUTH_READ_RETRY_SESSION",
+                                    retry_message);
+                            } else if (!historical_reconcile &&
+                                       !identity_blocked &&
+                                       fresh_session_retryable) {
+                                add_connector_log(
+                                    "ERROR",
+                                    "reconcile",
+                                    "TRUTH_READ_RETRY_EXHAUSTED",
+                                    "Attendance truth transport exhausted its bounded fresh-session retries; live capture remains active and the periodic cycle will retry.");
+                            }
+                            if (historical_reconcile && identity_blocked) {
+                                g_history_backfill_had_failures = true;
+                                g_history_failed_windows++;
+                                advance_month(
+                                    &g_history_cursor_year,
+                                    &g_history_cursor_month);
+                                if (compare_months(
+                                        g_history_cursor_year,
+                                        g_history_cursor_month,
+                                        device_now.tm_year + 1900,
+                                        device_now.tm_mon + 1) >= 0) {
+                                    history_finish_sweep(current_epoch);
+                                } else {
+                                    update_history_telemetry();
+                                    nvs_save_runtime_state();
+                                }
+                            }
+                            if (!historical_reconcile && identity_blocked) {
+                                // The terminal dump was complete, but one or more
+                                // identities could not be authorized. Repeating
+                                // the same heavy dump on every reconnect cannot
+                                // improve that catalog state and can destabilize
+                                // terminals that close their event session after a
+                                // bulk read. Record the bounded attempt, preserve
+                                // fail-closed Oracle semantics, and refresh the
+                                // live session without counting it as a flap.
+                                g_force_truth_reconcile = false;
+                                g_last_full_truth_reconcile_ms = now_ms;
+                                if (epoch_valid) {
+                                    g_last_full_truth_reconcile_epoch = current_epoch;
+                                }
+                                nvs_save_runtime_state();
+                                truth_retry_session = true;
+                            }
                             add_connector_log(
                                 "ERROR",
                                 "reconcile",
-                                "TRUTH_READ_RETRY_EXHAUSTED",
-                                "Attendance truth transport exhausted its bounded fresh-session retries; live capture remains active and the periodic cycle will retry.");
+                                "FULL_RECONCILE_FAILED",
+                                identity_blocked
+                                    ? "Attendance truth window was unsafe or rejected; Oracle replacement stayed fail-closed and the historical cursor will retry it in the next sweep"
+                                    : retry_with_fresh_session
+                                        ? "Attendance truth read failed; live capture remains active and a bounded fresh-session retry was scheduled"
+                                        : "Attendance truth read failed; live capture remains active and the next periodic cycle will retry");
                         }
-                        if (historical_reconcile && identity_blocked) {
-                            g_history_backfill_had_failures = true;
-                            g_history_failed_windows++;
-                            advance_month(
-                                &g_history_cursor_year,
-                                &g_history_cursor_month);
-                            if (compare_months(
-                                    g_history_cursor_year,
-                                    g_history_cursor_month,
-                                    device_now.tm_year + 1900,
-                                    device_now.tm_mon + 1) >= 0) {
-                                history_finish_sweep(current_epoch);
-                            } else {
-                                update_history_telemetry();
-                                nvs_save_runtime_state();
-                            }
-                        }
-                        if (!historical_reconcile && identity_blocked) {
-                            // The terminal dump was complete, but one or more
-                            // identities could not be authorized. Repeating
-                            // the same heavy dump on every reconnect cannot
-                            // improve that catalog state and can destabilize
-                            // terminals that close their event session after a
-                            // bulk read. Record the bounded attempt, preserve
-                            // fail-closed Oracle semantics, and refresh the
-                            // live session without counting it as a flap.
-                            g_force_truth_reconcile = false;
-                            g_last_full_truth_reconcile_ms = now_ms;
-                            if (epoch_valid) {
-                                g_last_full_truth_reconcile_epoch = current_epoch;
-                            }
-                            nvs_save_runtime_state();
-                            truth_retry_session = true;
-                        }
-                        add_connector_log(
-                            "ERROR",
-                            "reconcile",
-                            "FULL_RECONCILE_FAILED",
-                            identity_blocked
-                                ? "Attendance truth window was unsafe or rejected; Oracle replacement stayed fail-closed and the historical cursor will retry it in the next sweep"
-                                : retry_with_fresh_session
-                                    ? "Attendance truth read failed; live capture remains active and a bounded fresh-session retry was scheduled"
-                                    : "Attendance truth read failed; live capture remains active and the next periodic cycle will retry");
                     }
                 }
             } else {

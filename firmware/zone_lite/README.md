@@ -17,6 +17,9 @@ revocation, intermittent-terminal recovery, and three daily maintenance restarts
   other or the live ZKT socket.
 - Arbitrates ORDS outbox work before a full ZKT dump, then releases the multi-megabyte terminal
   buffer before building or sending downstream truth payloads.
+- Gives a due authoritative truth read short, expiring priority over background ORDS rewrites. If
+  a storage-full rewrite is already in flight, live capture continues and truth retries after ten
+  seconds instead of blocking for 75 seconds or falsely reporting a ZKT read failure.
 - Reads large MB40 buffers in native `0xffc0`-byte chunks with a 90-second authenticated I/O
   deadline and sends `CMD_FREE_DATA` on every post-prepare exit path. A failed authoritative
   attendance read closes the possibly desynchronized protocol session and retries twice on fresh
@@ -137,7 +140,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current firmware version is `2.2.47`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.2.48`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 
