@@ -47,6 +47,18 @@ function Stop-CampaignsFailClosed {
     }
 }
 
+function Test-ReportedFirmwareVersion {
+    param(
+        [AllowEmptyString()][string]$ReportedVersion,
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion
+    )
+    $normalized = $ReportedVersion.Trim()
+    if ($normalized.StartsWith('zone-lite-')) {
+        $normalized = $normalized.Substring(10)
+    }
+    return $normalized -eq $ExpectedVersion
+}
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be SemVer without a v prefix.' }
 if ($GitSha -notmatch '^[0-9a-f]{40}$') { throw 'GitSha must be an exact lowercase commit SHA.' }
 if ($CanaryCampaignId -notmatch '^[0-9a-f]{32}$') { throw 'CanaryCampaignId is invalid.' }
@@ -98,10 +110,12 @@ try {
     })
     if ($eligibleDevices.Count -eq 0) { throw 'No OTA-capable devices were found.' }
     $allZones = @($eligibleDevices | ForEach-Object { [string]$_.zone_id } | Sort-Object -Unique)
-    $targetVersion = "zone-lite-$Version"
     $pendingZones = @($allZones | Where-Object {
         $zone = $_
-        @($eligibleDevices | Where-Object { $_.zone_id -eq $zone -and $_.firmware_version -ne $targetVersion }).Count -gt 0
+        @($eligibleDevices | Where-Object {
+            $_.zone_id -eq $zone -and
+            -not (Test-ReportedFirmwareVersion -ReportedVersion ([string]$_.firmware_version) -ExpectedVersion $Version)
+        }).Count -gt 0
     })
 
     Write-Host "Nationwide rollout inventory: devices=$($eligibleDevices.Count), zones=$($allZones.Count), pending_zones=$($pendingZones.Count)."
@@ -165,7 +179,8 @@ try {
         [bool]$_.ota_capable -and $_.zone_id -in $allZones
     })
     $unstable = @($finalDevices | Where-Object {
-        $_.firmware_version -ne $targetVersion -or -not [bool]$_.connected -or
+        -not (Test-ReportedFirmwareVersion -ReportedVersion ([string]$_.firmware_version) -ExpectedVersion $Version) -or
+        -not [bool]$_.connected -or
         $_.state -ne 'ONLINE' -or $_.ota_state -ne 'OTA_READY' -or
         -not [bool]$_.zkt.online -or $_.zkt.certification_state -ne 'CERTIFIED' -or
         -not [bool]$_.zkt.snapshot_complete -or
