@@ -1085,6 +1085,16 @@ def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
 
     assert "ZONE_LITE_POST_STABILITY_RECONCILE_GRACE_MS" in runtime
     assert "g_force_truth_reconcile = false;" in runtime
+    identity_blocked = runtime[
+        runtime.index("if (!historical_reconcile && identity_blocked)") :
+        runtime.index(
+            'add_connector_log(\n                                "ERROR",',
+            runtime.index("if (!historical_reconcile && identity_blocked)"),
+        )
+    ]
+    assert "g_last_synced_attendance_count = refreshed_records;" in identity_blocked
+    assert "live_events_since_sync = 0;" in identity_blocked
+    assert "nvs_save_runtime_state();" in identity_blocked
     assert "g_last_full_truth_reconcile_epoch = current_epoch;" in runtime
     assert "truth_retry_session = true;" in runtime
     assert (
@@ -1361,10 +1371,15 @@ def test_large_zkt_buffer_reads_allow_slow_prepare_data_delivery():
     assert "#define ZKT_IO_TIMEOUT_SEC 90" in source
     assert "#define ZKT_BUFFER_CHUNK_BYTES 0xffc0" in source
     assert "#define ZKT_BUFFER_RECOVERY_CHUNK_BYTES 0x4000" in source
-    assert "#define ZKT_TRUTH_FRESH_SESSION_RETRIES 2" in source
+    assert "#define ZKT_TRUTH_FRESH_SESSION_RETRIES 1" in source
+    assert "#define ZKT_TRUTH_RETRY_COOLDOWN_MS (30 * 60 * 1000)" in source
     assert "attendance_chunk_bytes = g_truth_use_recovery_chunks" in source
     assert '"TRUTH_READ_RETRY_SESSION"' in source
     assert '"TRUTH_READ_RETRY_EXHAUSTED"' in source
+    assert '"TRUTH_RETRY_COOLDOWN"' in source
+    assert "g_truth_retry_not_before_ms = uptime_ms() +" in source
+    assert "now_ms >= g_truth_retry_not_before_ms" in source
+    assert "g_truth_retry_not_before_ms = 0;" in source
     assert "g_truth_retry_session_requested = true;" in source
     assert "if (g_truth_retry_session_requested)" in source
     assert "if (!restarted && !truth_retry_session)" in source

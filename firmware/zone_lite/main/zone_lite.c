@@ -305,8 +305,14 @@
 // terminals intermittently wedge a native-maximum flash-backed chunk even
 // though the live event session remains healthy.
 #define ZKT_BUFFER_RECOVERY_CHUNK_BYTES 0x4000
-#define ZKT_TRUTH_FRESH_SESSION_RETRIES 2
+#define ZKT_TRUTH_FRESH_SESSION_RETRIES 1
 #define ZKT_TRUTH_RETRY_BACKOFF_MS 5000
+// A failed authoritative read never invalidates live capture or the unchanged
+// ZKT source truth.  After the one bounded fresh-session retry, keep the
+// gateway in live capture for a meaningful quiet period instead of repeatedly
+// opening flash-backed terminal dumps that can destabilize otherwise healthy
+// terminals.  A new verified identity catalog explicitly clears this gate.
+#define ZKT_TRUTH_RETRY_COOLDOWN_MS (30 * 60 * 1000)
 // A storage-full ORDS rewrite can legitimately own the outbox gate for longer
 // than a ZKT reconcile interval. Give authoritative truth bounded, expiring
 // priority instead of blocking the live session for the old 75-second wait.
@@ -433,6 +439,7 @@ static bool g_truth_retry_session_requested;
 static bool g_truth_retry_reconnect_pending;
 static uint32_t g_truth_fresh_session_retries;
 static bool g_truth_retry_chain_active;
+static int64_t g_truth_retry_not_before_ms;
 static int64_t g_truth_ords_gate_priority_until_ms;
 static int64_t g_truth_ords_gate_last_defer_log_ms;
 static portMUX_TYPE g_truth_ords_gate_priority_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -6899,6 +6906,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 g_applied_identity_catalog_generation =
                     identity_catalog_generation;
                 g_force_truth_reconcile = true;
+                g_truth_retry_not_before_ms = 0;
                 char message[240];
                 snprintf(
                     message,
@@ -6968,6 +6976,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
         }
 
         if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
+            (g_truth_retry_not_before_ms == 0 ||
+             now_ms >= g_truth_retry_not_before_ms) &&
             now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
             if (!add_connector_begin_exclusive_activity("RECONCILING")) {
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -7108,6 +7118,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             }
                         } else {
                             g_force_truth_reconcile = false;
+                            g_truth_retry_not_before_ms = 0;
                             g_last_synced_attendance_count = refreshed_records;
                             live_events_since_sync = 0;
                             g_last_full_truth_reconcile_ms = now_ms;
@@ -7159,11 +7170,20 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                     "ERROR",
                                     "reconcile",
                                     "TRUTH_READ_RETRY_EXHAUSTED",
-                                    "Attendance truth transport exhausted its bounded fresh-session retries; live capture remains active and the periodic cycle will retry.");
+                                    "Attendance truth transport exhausted its bounded fresh-session retry; live capture remains active and a cooldown precedes the next periodic attempt.");
                                 g_truth_retry_chain_active = false;
+                                g_truth_retry_not_before_ms = uptime_ms() +
+                                    ZKT_TRUTH_RETRY_COOLDOWN_MS;
+                                add_connector_log(
+                                    "WARN",
+                                    "reconcile",
+                                    "TRUTH_RETRY_COOLDOWN",
+                                    "Authoritative truth retry is cooling down for 30 minutes; live punches remain active and unchanged ZKT source truth remains available.");
                             } else if (!historical_reconcile &&
                                        !identity_blocked) {
                                 g_truth_retry_chain_active = false;
+                                g_truth_retry_not_before_ms = uptime_ms() +
+                                    ZKT_TRUTH_RETRY_COOLDOWN_MS;
                             }
                             if (historical_reconcile && identity_blocked) {
                                 g_history_backfill_had_failures = true;
@@ -7193,6 +7213,17 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                 // fail-closed Oracle semantics, and refresh the
                                 // live session without counting it as a flap.
                                 g_force_truth_reconcile = false;
+                                // The terminal dump itself was complete, so its
+                                // count is a safe local observation even though
+                                // unresolved identities make Oracle replacement
+                                // fail closed. Advancing this baseline prevents
+                                // the identical dump from being retriggered as a
+                                // false counter mismatch. New live punches advance
+                                // both sides of the next light-reconcile check;
+                                // genuinely missed events still create a mismatch.
+                                g_last_synced_attendance_count = refreshed_records;
+                                live_events_since_sync = 0;
+                                g_truth_retry_not_before_ms = 0;
                                 g_last_full_truth_reconcile_ms = now_ms;
                                 if (epoch_valid) {
                                     g_last_full_truth_reconcile_epoch = current_epoch;
