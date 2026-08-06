@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import re
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -27,6 +28,7 @@ from zk_add.models import (
     ZKTDevice,
 )
 from zk_add.schemas import (
+    ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
@@ -50,7 +52,19 @@ ACTIVE_COMMAND_STATES = {
 ACTIVE_LEASE_STATES = {"REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"}
 ORDS_CONFIRMED_STATES = {"ACKED", "ACKED_CHECK"}
 RECONCILIATION_CAPABILITY = "history_stream_v1"
+RECONCILIATION_V2_CAPABILITY = "history_stream_v2"
 RANGE_RESUME_CAPABILITY = "history_range_resume_verified"
+
+
+def _release_assignment(job: ReconciliationJob) -> None:
+    job.active_assignment_id = None
+    job.credit_start_ordinal = None
+    job.credit_end_ordinal = None
+    job.credit_committed_through = job.committed_next_ordinal
+    job.assignment_granted_at = None
+    job.assignment_expires_at = None
+    job.assignment_accepted_at = None
+    job.assignment_heartbeat_at = None
 
 
 def _version_tuple(value: str | None) -> tuple[int, int, int]:
@@ -302,6 +316,7 @@ def control_reconciliation_job(
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
     before = job.status
+    _release_assignment(job)
     if action == "pause":
         # A device source step advances only after ADD's atomic transaction is
         # acknowledged. Holding the job row lock therefore makes pause/cancel
@@ -398,6 +413,7 @@ def apply_reconciliation_anchor(
     job.last_progress_at = now
     job.updated_at = now
     job.next_retry_at = None
+    _release_assignment(job)
     _event(
         session,
         job,
@@ -445,6 +461,16 @@ def apply_reconciliation_chunk(
             # committed. Raising here would roll back the durable hold.
             return job, existing, False
         return job, existing, True
+    if payload.assignment_id is not None:
+        if job.active_assignment_id != payload.assignment_id:
+            raise ValueError("Reconciliation assignment lease is no longer active.")
+        if (
+            job.credit_start_ordinal is None
+            or job.credit_end_ordinal is None
+            or payload.start_ordinal < job.credit_start_ordinal
+            or payload.end_ordinal > job.credit_end_ordinal
+        ):
+            raise ValueError("Chunk is outside its durable reconciliation credit.")
     if payload.start_ordinal != job.committed_next_ordinal:
         raise ValueError(
             f"Expected source ordinal {job.committed_next_ordinal}, got {payload.start_ordinal}."
@@ -557,6 +583,15 @@ def apply_reconciliation_chunk(
     job.last_progress_at = now
     job.updated_at = now
     job.next_retry_at = None
+    if payload.assignment_id is not None:
+        job.assignment_accepted_at = job.assignment_accepted_at or now
+        job.assignment_heartbeat_at = now
+        job.credit_committed_through = payload.end_ordinal
+        job.assignment_expires_at = now + timedelta(
+            seconds=settings.reconciliation_v2_assignment_seconds
+        )
+        if job.credit_end_ordinal is not None and payload.end_ordinal >= job.credit_end_ordinal:
+            _release_assignment(job)
     job.status = "RUNNING"
     job.phase = "SCANNING_TERMINAL"
     _event(
@@ -573,6 +608,36 @@ def apply_reconciliation_chunk(
         },
     )
     return job, chunk, False
+
+
+def apply_reconciliation_assignment_release(
+    session: Session,
+    *,
+    connector: Connector,
+    payload: ReconciliationAssignmentReleaseRequest,
+) -> ReconciliationJob:
+    """Release only transport credit; the committed source checkpoint is immutable."""
+
+    job = _device_job(session, connector, payload.job_id)
+    _require_runnable(job, payload.generation)
+    if payload.committed_next_ordinal != job.committed_next_ordinal:
+        raise ValueError("Released reconciliation credit did not match ADD's durable cursor.")
+    if job.active_assignment_id == payload.assignment_id:
+        _release_assignment(job)
+        now = utc_now()
+        job.next_retry_at = now
+        job.updated_at = now
+        _event(
+            session,
+            job,
+            "ASSIGNMENT_RELEASED",
+            {
+                "assignment_id": payload.assignment_id,
+                "committed_next_ordinal": payload.committed_next_ordinal,
+                "reason": payload.reason,
+            },
+        )
+    return job
 
 
 def apply_reconciliation_manifest(
@@ -670,6 +735,7 @@ def apply_reconciliation_manifest(
     job.last_progress_at = now
     job.updated_at = now
     job.next_retry_at = None
+    _release_assignment(job)
     _event(session, job, capture_state, evidence)
     return refresh_reconciliation_assurance(session, job)
 
@@ -768,6 +834,19 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"]),
         )
     ) or 0
+    now = utc_now()
+    reserved_credit = 0
+    for leased in rows:
+        if (
+            leased.active_assignment_id
+            and leased.assignment_expires_at
+            and ensure_utc(leased.assignment_expires_at) > now
+            and leased.credit_end_ordinal is not None
+        ):
+            reserved_credit += max(
+                0,
+                leased.credit_end_ordinal - leased.committed_next_ordinal,
+            )
     # Each ready job owns one isolated device slot through its short assignment
     # cooldown. A disconnected or safety-blocked device releases its slot so it
     # cannot stall another zone; the durable checkpoint lets it resume later.
@@ -775,7 +854,6 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
     # ADD or ORDS can be overloaded.
     slot_limit = settings.reconciliation_device_concurrency
     slots_owned = 0
-    now = utc_now()
     for job in rows:
         connector = session.get(Connector, job.connector_id)
         if connector is None or not connector.connected:
@@ -811,9 +889,31 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
         slots_owned += 1
         job.wait_reason = None
         job.phase = "ANCHORING" if job.cutoff_count is None else "SCANNING_TERMINAL"
+        zkt = connector.zkt_device
+        capabilities = (zkt.capability_profile if zkt else {}) or {}
+        supports_v2 = bool(capabilities.get(RECONCILIATION_V2_CAPABILITY))
+        assignment_v2 = supports_v2 and job.cutoff_count is not None
+        if supports_v2 and job.active_assignment_id:
+            lease_live = bool(
+                job.assignment_expires_at
+                and ensure_utc(job.assignment_expires_at) > now
+            )
+            credit_matches = bool(
+                job.credit_start_ordinal is not None
+                and job.credit_end_ordinal is not None
+                and job.credit_start_ordinal <= job.committed_next_ordinal
+                and job.committed_next_ordinal < job.credit_end_ordinal
+            )
+            if lease_live and credit_matches:
+                continue
+            reserved_credit -= max(
+                0,
+                (job.credit_end_ordinal or job.committed_next_ordinal)
+                - job.committed_next_ordinal,
+            )
+            _release_assignment(job)
         if job.next_retry_at is not None and job.next_retry_at > now:
             continue
-        zkt = connector.zkt_device
         try:
             device_chunk_limit = int(
                 ((zkt.capability_profile if zkt else {}) or {}).get(
@@ -831,9 +931,59 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                     TerminalRecordManifest.ordinal == job.committed_next_ordinal - 1,
                 )
             )
+        chunk_records = min(
+            100,
+            max(1, settings.reconciliation_chunk_records),
+            max(1, device_chunk_limit),
+        )
+        assignment_id = None
+        credit_end = None
+        max_chunks = 1
+        lease_expires = None
+        if assignment_v2:
+            try:
+                device_credit_limit = int(
+                    capabilities.get("history_credit_max_records") or chunk_records
+                )
+            except (TypeError, ValueError):
+                device_credit_limit = chunk_records
+            available_credit = max(
+                0,
+                settings.reconciliation_history_backlog_pause
+                - history_backlog
+                - reserved_credit,
+            )
+            requested_credit = min(
+                settings.reconciliation_v2_credit_records,
+                max(chunk_records, device_credit_limit),
+                chunk_records * settings.reconciliation_v2_max_chunks,
+                max(0, job.cutoff_count - job.committed_next_ordinal),
+                available_credit,
+            )
+            if requested_credit < chunk_records and job.committed_next_ordinal < job.cutoff_count:
+                job.phase = "WAITING_FOR_SAFE_WINDOW"
+                job.wait_reason = "HISTORY_BACKLOG_CREDIT_EXHAUSTED"
+                continue
+            assignment_id = str(uuid4())
+            credit_end = job.committed_next_ordinal + requested_credit
+            max_chunks = max(1, (requested_credit + chunk_records - 1) // chunk_records)
+            lease_expires = now + timedelta(
+                seconds=settings.reconciliation_v2_assignment_seconds
+            )
+            job.active_assignment_id = assignment_id
+            job.credit_start_ordinal = job.committed_next_ordinal
+            job.credit_end_ordinal = credit_end
+            job.credit_committed_through = job.committed_next_ordinal
+            job.assignment_granted_at = now
+            job.assignment_expires_at = lease_expires
+            job.assignment_accepted_at = None
+            job.assignment_heartbeat_at = None
+            reserved_credit += requested_credit
         payload = {
-            "schema_version": "1",
+            "schema_version": "2" if assignment_v2 else "1",
             "type": "reconcile_assignment",
+            "protocol": "history_stream_v2" if assignment_v2 else "history_stream_v1",
+            "assignment_id": assignment_id,
             "job_id": job.job_id,
             "generation": job.terminal_generation,
             "mode": job.mode,
@@ -845,16 +995,21 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             "committed_predecessor_digest": (
                 predecessor.raw_record_digest if predecessor is not None else None
             ),
-            "chunk_records": min(
-                100,
-                max(1, settings.reconciliation_chunk_records),
-                max(1, device_chunk_limit),
-            ),
+            "chunk_records": chunk_records,
+            "credit_end_ordinal": credit_end,
+            "max_chunks": max_chunks,
+            "lease_expires_at": lease_expires.isoformat() if lease_expires else None,
+            "lease_expires_epoch": int(lease_expires.timestamp()) if lease_expires else None,
             "source_policy": "APPEND_ONLY_NO_DELETE",
         }
         assignments.append((connector.connector_id, payload))
         job.next_retry_at = now + timedelta(
-            seconds=max(2, settings.reconciliation_assignment_seconds)
+            seconds=max(
+                2,
+                settings.reconciliation_v2_assignment_seconds
+                if assignment_v2
+                else settings.reconciliation_assignment_seconds,
+            )
         )
     return assignments
 
@@ -929,6 +1084,16 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "next_ordinal": job.committed_next_ordinal,
             "chain_digest": job.last_chain_digest,
             "last_progress_at": job.last_progress_at,
+        },
+        "assignment": {
+            "assignment_id": job.active_assignment_id,
+            "credit_start_ordinal": job.credit_start_ordinal,
+            "credit_end_ordinal": job.credit_end_ordinal,
+            "credit_committed_through": job.credit_committed_through,
+            "granted_at": job.assignment_granted_at,
+            "expires_at": job.assignment_expires_at,
+            "accepted_at": job.assignment_accepted_at,
+            "heartbeat_at": job.assignment_heartbeat_at,
         },
         "eta": eta,
         "capture_certificate": job.capture_certificate or None,
@@ -1178,6 +1343,7 @@ def _require_runnable(job: ReconciliationJob, generation: int) -> None:
 def _safety_hold(
     session: Session, job: ReconciliationJob, code: str, message: str
 ) -> ReconciliationJob:
+    _release_assignment(job)
     job.status = "NEEDS_ATTENTION"
     job.phase = "WAITING_FOR_SAFE_WINDOW"
     job.wait_reason = code

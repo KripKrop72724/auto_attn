@@ -16,9 +16,11 @@ from zk_add.reconciliation import (
     _version_tuple,
     apply_reconciliation_device_fault,
     apply_reconciliation_anchor,
+    apply_reconciliation_assignment_release,
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
     assignment_rows,
+    control_reconciliation_job,
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_chain_digest,
@@ -29,6 +31,7 @@ from zk_add.reconciliation import (
 from zk_add.schemas import (
     AttendanceEventIn,
     ReconciliationAnchorRequest,
+    ReconciliationAssignmentReleaseRequest,
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
     ReconciliationSourceRecord,
@@ -373,6 +376,92 @@ def test_scan_slot_stays_owned_during_assignment_cooldown(reconciliation_db):
     second = assignment_rows(session)
     assert first and first[0][1]["job_id"] == job.job_id
     assert second == []
+
+
+def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "history_chunk_max_records": 100,
+        "history_credit_max_records": 400,
+    }
+    zkt.attendance_count = 500
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify durable stream-v2 source credits and cursor continuity.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="reconcile-stream-v2-0001",
+    )
+    job.cutoff_count = 500
+    job.record_size = 8
+    job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
+    job.committed_next_ordinal = 100
+    job.scanned_count = 100
+    job.last_chain_digest = hashlib.sha256(b"checkpoint-100").hexdigest()
+    assignment = assignment_rows(session)[0][1]
+    assert assignment["protocol"] == "history_stream_v2"
+    assert assignment["committed_next_ordinal"] == 100
+    assert assignment["chunk_records"] == 100
+    assert assignment["credit_end_ordinal"] == 500
+    assert assignment["max_chunks"] == 4
+    assert assignment["assignment_id"] == job.active_assignment_id
+    assert assignment_rows(session) == []
+    assert job.committed_next_ordinal == 100
+    assert job.last_chain_digest == hashlib.sha256(b"checkpoint-100").hexdigest()
+    apply_reconciliation_assignment_release(
+        session,
+        connector=connector,
+        payload=ReconciliationAssignmentReleaseRequest(
+            assignment_id=assignment["assignment_id"],
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            committed_next_ordinal=100,
+            reason="COMMAND_PENDING",
+        ),
+    )
+    assert job.active_assignment_id is None
+    assert job.committed_next_ordinal == 100
+    assert job.last_chain_digest == hashlib.sha256(b"checkpoint-100").hexdigest()
+
+
+def test_retry_releases_transport_lease_but_preserves_source_checkpoint(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify a held job resumes without losing durable source progress.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="reconcile-retry-preserves-0001",
+    )
+    digest = hashlib.sha256(b"preserved-checkpoint").hexdigest()
+    job.status = "NEEDS_ATTENTION"
+    job.committed_next_ordinal = 2250
+    job.scanned_count = 2250
+    job.last_chain_digest = digest
+    job.active_assignment_id = "11111111-1111-1111-1111-111111111111"
+    resumed = control_reconciliation_job(
+        session,
+        job=job,
+        action="retry",
+        actor="operator",
+        reason="Revalidate the same source boundary after the firmware demultiplexer upgrade.",
+        idempotency_key="retry-preserved-checkpoint-0001",
+    )
+    assert resumed.status == "QUEUED"
+    assert resumed.committed_next_ordinal == 2250
+    assert resumed.scanned_count == 2250
+    assert resumed.last_chain_digest == digest
+    assert resumed.active_assignment_id is None
 
 
 def test_six_parallel_scan_slots_are_bounded_and_device_isolated(

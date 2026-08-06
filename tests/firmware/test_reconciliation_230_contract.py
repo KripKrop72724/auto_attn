@@ -8,8 +8,8 @@ PROJECT = (ROOT / "firmware/zone_lite/CMakeLists.txt").read_text()
 HIL_GATE = (ROOT / "firmware/zone_lite/tools/run_ota_hil_gate.py").read_text()
 
 
-def test_230_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.3.0)" in PROJECT
+def test_240_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.0)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -18,6 +18,17 @@ def test_230_uses_bounded_verified_range_resume_and_add_checkpoints():
     assert '"reconcile_chunk"' in ZONE
     assert '"reconcile_source_manifest"' in ZONE
     assert "committed_predecessor_digest" in CONNECTOR
+
+
+def test_240_streams_four_durable_100_record_chunks_per_prepared_burst():
+    assert '"history_stream_v2"' in CONNECTOR
+    assert '"max_chunk_records", 100' in CONNECTOR
+    assert '"max_credit_records", 400' in CONNECTOR
+    assert "credit_end_ordinal" in CONNECTOR
+    assert "add_connector_send_reconcile_chunk_acknowledged" in ZONE
+    assert "ack.committed_next_ordinal == end" in ZONE
+    assert "zk_close_bounded_buffer(sock, ctx, &source);" in ZONE
+    assert "Deferred an interleaved live event" in ZONE
 
 
 def test_add_is_command_authority_when_optional_flash_cache_is_full():
@@ -50,6 +61,16 @@ def test_physical_hil_gate_requires_reconciliation_fault_and_resume_evidence():
         "reconciliation_full_storage_command_succeeded",
         "reconciliation_tail_audit_advanced",
         "reconciliation_no_legacy_full_scan_after_certificate",
+        "reconciliation_stream_v2_advertised",
+        "reconciliation_four_chunks_one_prepare",
+        "reconciliation_free_data_before_network_wait",
+        "reconciliation_ack_cursor_chain_validated",
+        "reconciliation_stale_assignment_rejected",
+        "reconciliation_live_event_interleaving_recovered",
+        "reconciliation_heap_stable",
+        "reconciliation_24h_soak_stable",
         "admin_lease_duration_started_after_grant",
     ):
         assert f'"{check}"' in HIL_GATE
+    assert 'evidence.get("zone_id") != "ZONE-KARACHI-01"' in HIL_GATE
+    assert "stream_v2_rate / baseline_rate < 4.0" in HIL_GATE

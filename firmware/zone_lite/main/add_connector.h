@@ -38,6 +38,7 @@ typedef struct {
 } add_command_t;
 
 typedef struct {
+    char assignment_id[40];
     char job_id[40];
     char expected_terminal_serial[80];
     char first_anchor_digest[65];
@@ -46,9 +47,24 @@ typedef struct {
     uint32_t generation;
     uint32_t committed_next_ordinal;
     uint32_t cutoff_count;
+    uint32_t credit_end_ordinal;
+    uint16_t max_chunks;
     uint16_t chunk_records;
+    int64_t lease_expires_epoch;
     bool has_cutoff;
+    bool stream_v2;
 } add_reconcile_assignment_t;
+
+typedef struct {
+    char assignment_id[40];
+    char job_id[40];
+    char resulting_chain_digest[65];
+    uint32_t generation;
+    uint32_t committed_next_ordinal;
+    uint32_t credit_end_ordinal;
+    bool continue_allowed;
+    bool valid;
+} add_reconcile_chunk_ack_t;
 
 typedef struct {
     bool online;
@@ -119,6 +135,10 @@ bool add_connector_send_payload_acknowledged(
     const char *type,
     const char *payload_json,
     uint32_t timeout_ms);
+bool add_connector_send_reconcile_chunk_acknowledged(
+    const char *payload_json,
+    uint32_t timeout_ms,
+    add_reconcile_chunk_ack_t *ack_out);
 bool add_connector_enqueue_attendance(const char *payload_json);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);

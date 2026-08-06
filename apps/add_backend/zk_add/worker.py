@@ -245,7 +245,7 @@ def ords_delivery_metrics(session: Session) -> dict:
     }
 
 
-async def maintenance_loop(stop: asyncio.Event) -> None:
+async def _control_plane_loop(stop: asyncio.Event) -> None:
     retention_counter = 0
     while not stop.is_set():
         try:
@@ -262,6 +262,55 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=2)
         except asyncio.TimeoutError:
             pass
+
+
+async def _ords_delivery_loop(stop: asyncio.Event) -> None:
+    """Drain Oracle independently so route latency never stalls source credits."""
+
+    while not stop.is_set():
+        try:
+            await deliver_ords_batch()
+        except Exception as exc:
+            await browser_events.publish(
+                "backend_error",
+                {"code": "ORDS_DELIVERY_LOOP_ERROR", "message": str(exc)[:500]},
+            )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _ords_audit_loop(stop: asyncio.Event) -> None:
+    """Run lower-priority Oracle evidence audits outside source scheduling."""
+
+    while not stop.is_set():
+        try:
+            await asyncio.gather(
+                audit_firmware_receipts_batch(),
+                audit_confirmed_membership_batch(),
+            )
+        except Exception as exc:
+            await browser_events.publish(
+                "backend_error",
+                {"code": "ORDS_AUDIT_LOOP_ERROR", "message": str(exc)[:500]},
+            )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def maintenance_loop(stop: asyncio.Event) -> None:
+    tasks = [
+        asyncio.create_task(_control_plane_loop(stop)),
+        asyncio.create_task(_ords_delivery_loop(stop)),
+        asyncio.create_task(_ords_audit_loop(stop)),
+    ]
+    try:
+        await stop.wait()
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def reconcile_ords_delivery_alerts(session: Session) -> int:
@@ -427,11 +476,6 @@ async def maintenance_tick() -> None:
     for update in connector_updates:
         await browser_events.publish("device", update)
     await dispatch_reconciliation_assignments(reconciliation_dispatch)
-    await asyncio.gather(
-        audit_firmware_receipts_batch(),
-        audit_confirmed_membership_batch(),
-        deliver_ords_batch(),
-    )
 
 
 def fair_ords_candidate_order(

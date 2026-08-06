@@ -76,6 +76,7 @@ from zk_add.schemas import (
     LogBatchRequest,
     OracleReceiptBatchRequest,
     RestartRequest,
+    ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationControlRequest,
@@ -135,6 +136,7 @@ from zk_add.settings import settings
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.time_utils import utc_now
 from zk_add.reconciliation import (
+    apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
@@ -2113,6 +2115,21 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "status": job.status,
                 "committed_next_ordinal": job.committed_next_ordinal,
             }
+        elif envelope.type == "reconcile_assignment_release":
+            release = ReconciliationAssignmentReleaseRequest.model_validate(
+                envelope.payload
+            )
+            job = apply_reconciliation_assignment_release(
+                db,
+                connector=connector,
+                payload=release,
+            )
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "job_id": job.job_id,
+                "phase": job.phase,
+                "committed_next_ordinal": job.committed_next_ordinal,
+            }
         elif envelope.type == "reconcile_chunk":
             source_chunk = ReconciliationChunkRequest.model_validate(envelope.payload)
             job, chunk, duplicate = apply_reconciliation_chunk(
@@ -2132,11 +2149,20 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "code": job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
+                "assignment_id": source_chunk.assignment_id,
                 "generation": chunk.generation,
                 "sequence": chunk.sequence,
                 "committed_next_ordinal": job.committed_next_ordinal,
                 "resulting_chain_digest": chunk.resulting_chain_digest,
                 "duplicate": duplicate,
+                "continue_allowed": bool(
+                    source_chunk.assignment_id
+                    and job.active_assignment_id == source_chunk.assignment_id
+                    and job.credit_end_ordinal is not None
+                    and job.committed_next_ordinal < job.credit_end_ordinal
+                ),
+                "credit_end_ordinal": job.credit_end_ordinal,
+                "lease_expires_at": job.assignment_expires_at,
             }
         elif envelope.type == "reconcile_source_manifest":
             manifest = ReconciliationManifestRequest.model_validate(envelope.payload)

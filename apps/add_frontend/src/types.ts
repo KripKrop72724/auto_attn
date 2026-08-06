@@ -185,6 +185,16 @@ export interface ReconciliationJob {
     oracle_pending: number
     retry_count: number
   }
+  assignment: {
+    assignment_id: string | null
+    credit_start_ordinal: number | null
+    credit_end_ordinal: number | null
+    credit_committed_through: number | null
+    granted_at: string | null
+    expires_at: string | null
+    accepted_at: string | null
+    heartbeat_at: string | null
+  }
   eta: {
     low_seconds: number | null
     high_seconds: number | null

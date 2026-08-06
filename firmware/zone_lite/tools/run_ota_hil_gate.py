@@ -31,6 +31,14 @@ REQUIRED_CHECKS = (
     "reconciliation_full_storage_command_succeeded",
     "reconciliation_tail_audit_advanced",
     "reconciliation_no_legacy_full_scan_after_certificate",
+    "reconciliation_stream_v2_advertised",
+    "reconciliation_four_chunks_one_prepare",
+    "reconciliation_free_data_before_network_wait",
+    "reconciliation_ack_cursor_chain_validated",
+    "reconciliation_stale_assignment_rejected",
+    "reconciliation_live_event_interleaving_recovered",
+    "reconciliation_heap_stable",
+    "reconciliation_24h_soak_stable",
     "admin_lease_duration_started_after_grant",
 )
 
@@ -53,9 +61,17 @@ def main() -> int:
         raise SystemExit("HIL evidence is missing passing checks: " + ", ".join(missing))
     if not evidence.get("device_serial") or not evidence.get("firmware_sha256"):
         raise SystemExit("HIL evidence must identify the device and tested firmware hash")
+    if evidence.get("zone_id") != "ZONE-KARACHI-01":
+        raise SystemExit("Reconciliation stream-v2 promotion requires the production Karachi canary")
+    baseline_rate = float(evidence.get("baseline_records_per_second") or 0)
+    stream_v2_rate = float(evidence.get("stream_v2_records_per_second") or 0)
+    if baseline_rate <= 0 or stream_v2_rate / baseline_rate < 4.0:
+        raise SystemExit(
+            "Karachi stream-v2 throughput must be at least 4x the preserved 2.3.0 baseline"
+        )
     print(
         "OTA, Wi-Fi setup, and ADD-owned reconciliation hardware gates passed "
-        "with complete power-loss, isolation, resume, and regression evidence"
+        "with complete power-loss, isolation, resume, 24-hour stability, and >=4x Karachi evidence"
     )
     return 0
 
