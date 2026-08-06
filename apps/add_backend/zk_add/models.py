@@ -676,6 +676,214 @@ class OracleReceipt(Base):
     observation_count: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class ReconciliationJob(Base):
+    __tablename__ = "add_reconciliation_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_id",
+            "idempotency_key",
+            name="uq_add_reconciliation_job_idempotency",
+        ),
+        Index(
+            "uq_add_reconciliation_active_connector",
+            "connector_id",
+            unique=True,
+            postgresql_where=text(
+                "status not in ('COMPLETED','CANCELLED','FAILED','INVALIDATED')"
+            ),
+            sqlite_where=text(
+                "status not in ('COMPLETED','CANCELLED','FAILED','INVALIDATED')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    connector_id: Mapped[int] = mapped_column(
+        ForeignKey("add_connectors.id"), index=True
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    mode: Mapped[str] = mapped_column(
+        String(40), default="FULL_HISTORY_BASELINE", index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
+    phase: Mapped[str] = mapped_column(String(50), default="PREFLIGHT", index=True)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    terminal_serial: Mapped[str | None] = mapped_column(String(120), index=True)
+    terminal_generation: Mapped[int] = mapped_column(Integer, default=1)
+    firmware_version: Mapped[str | None] = mapped_column(String(80))
+    identity_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_device_user_snapshots.id"), index=True
+    )
+    cutoff_count: Mapped[int | None] = mapped_column(Integer)
+    latest_terminal_count: Mapped[int | None] = mapped_column(Integer)
+    record_size: Mapped[int | None] = mapped_column(Integer)
+    source_total_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    committed_next_ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    scanned_count: Mapped[int] = mapped_column(Integer, default=0)
+    add_durable_count: Mapped[int] = mapped_column(Integer, default=0)
+    already_present_count: Mapped[int] = mapped_column(Integer, default=0)
+    terminal_duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
+    quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    ords_target_count: Mapped[int] = mapped_column(Integer, default=0)
+    ords_confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
+    ords_pending_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_anchor_digest: Mapped[str | None] = mapped_column(String(64))
+    last_chain_digest: Mapped[str | None] = mapped_column(String(64))
+    wait_reason: Mapped[str | None] = mapped_column(String(160), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    capture_certificate: Mapped[dict] = mapped_column(JSON, default=dict)
+    oracle_certificate: Mapped[dict] = mapped_column(JSON, default=dict)
+    requested_at: Mapped[datetime] = utc_column()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capture_certified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    oracle_certified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class ReconciliationChunk(Base):
+    __tablename__ = "add_reconciliation_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "generation", "sequence", name="uq_add_reconcile_chunk_sequence"
+        ),
+        UniqueConstraint(
+            "job_id",
+            "generation",
+            "start_ordinal",
+            name="uq_add_reconcile_chunk_start",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    generation: Mapped[int] = mapped_column(Integer)
+    sequence: Mapped[int] = mapped_column(Integer)
+    start_ordinal: Mapped[int] = mapped_column(Integer)
+    end_ordinal: Mapped[int] = mapped_column(Integer)
+    record_count: Mapped[int] = mapped_column(Integer)
+    chunk_digest: Mapped[str] = mapped_column(String(64), index=True)
+    previous_chain_digest: Mapped[str | None] = mapped_column(String(64))
+    resulting_chain_digest: Mapped[str] = mapped_column(String(64), index=True)
+    accepted_count: Mapped[int] = mapped_column(Integer, default=0)
+    already_present_count: Mapped[int] = mapped_column(Integer, default=0)
+    blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
+    quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    committed_at: Mapped[datetime] = utc_column()
+
+
+class TerminalRecordManifest(Base):
+    __tablename__ = "add_terminal_record_manifest"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "generation", "ordinal", name="uq_add_terminal_record_ordinal"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    chunk_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_chunks.id"), index=True
+    )
+    generation: Mapped[int] = mapped_column(Integer)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    raw_record_digest: Mapped[str] = mapped_column(String(64), index=True)
+    terminal_record_key: Mapped[str] = mapped_column(String(64), index=True)
+    occurrence_index: Mapped[int] = mapped_column(Integer, default=1)
+    attendance_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_attendance_events.id"), index=True
+    )
+    disposition: Mapped[str] = mapped_column(String(50), index=True)
+    protected_raw_record: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class ReconciliationCoverage(Base):
+    __tablename__ = "add_reconciliation_coverage"
+    __table_args__ = (
+        Index(
+            "uq_add_reconciliation_active_coverage",
+            "zkt_device_id",
+            unique=True,
+            postgresql_where=text("active = true"),
+            sqlite_where=text("active = 1"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    coverage_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    terminal_serial: Mapped[str] = mapped_column(String(120), index=True)
+    terminal_generation: Mapped[int] = mapped_column(Integer)
+    certified_source_cursor: Mapped[int] = mapped_column(Integer)
+    source_chain_digest: Mapped[str] = mapped_column(String(64))
+    capture_state: Mapped[str] = mapped_column(String(50), index=True)
+    oracle_state: Mapped[str] = mapped_column(String(50), index=True)
+    capture_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    oracle_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    invalidated_reason: Mapped[str | None] = mapped_column(String(160))
+    captured_at: Mapped[datetime] = utc_column()
+    oracle_certified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class ReconciliationEvent(Base):
+    __tablename__ = "add_reconciliation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "idempotency_key",
+            name="uq_add_reconciliation_event_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(50), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = utc_column()
+
+
 class IdentityTombstone(Base):
     __tablename__ = "add_identity_tombstones"
     __table_args__ = (

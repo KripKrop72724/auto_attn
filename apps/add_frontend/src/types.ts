@@ -12,7 +12,13 @@ export interface PaginatedResponse<T> {
   next_cursor: number | null
 }
 
-export type DashboardRoute = 'fleet' | 'users' | 'attendance' | 'firmware' | 'alerts'
+export type DashboardRoute =
+  | 'fleet'
+  | 'users'
+  | 'attendance'
+  | 'reconciliation'
+  | 'firmware'
+  | 'alerts'
 
 export type FirmwareSection = 'overview' | 'releases' | 'campaigns'
 
@@ -114,6 +120,83 @@ export interface Overview {
     oldest_backlog_at: string | null
     last_attempt_at: string | null
   }
+}
+
+export interface ReconciliationPreflight {
+  eligible: boolean
+  ready_now: boolean
+  hard_blockers: Array<{ code: string; message: string }>
+  waitable_blockers: Array<{ code: string; message: string }>
+  terminal: null | {
+    serial: string | null
+    model: string | null
+    attendance_count: number | null
+    user_count: number | null
+    connection_state: string
+    range_resume_verified: boolean
+  }
+  coverage: ReconciliationCoverage | null
+}
+
+export interface ReconciliationCoverage {
+  coverage_id: string
+  certified_source_cursor: number
+  capture_state: string
+  oracle_state: string
+  active: boolean
+  captured_at: string
+  oracle_certified_at: string | null
+  invalidated_reason: string | null
+}
+
+export interface ReconciliationJob {
+  job_id: string
+  mode: string
+  status: string
+  phase: string
+  wait_reason: string | null
+  error_code: string | null
+  error_message: string | null
+  connector: null | {
+    connector_id: string
+    device_id: string
+    display_name: string
+    zone_id: string
+    connected: boolean
+  }
+  terminal: {
+    serial: string | null
+    generation: number
+    cutoff_count: number | null
+    latest_count: number | null
+    record_size: number | null
+    source_total_bytes: number | null
+  }
+  progress: {
+    scanned: number
+    remaining: number | null
+    add_durable: number
+    already_present: number
+    terminal_duplicates: number
+    blocked_identity: number
+    quarantined: number
+    oracle_target: number
+    oracle_confirmed: number
+    oracle_pending: number
+    retry_count: number
+  }
+  eta: {
+    low_seconds: number | null
+    high_seconds: number | null
+    confidence: string
+    unavailable_reason: string | null
+  }
+  requested_at: string
+  started_at: string | null
+  capture_certified_at: string | null
+  oracle_certified_at: string | null
+  completed_at: string | null
+  updated_at: string
 }
 
 export interface FirmwareRelease {

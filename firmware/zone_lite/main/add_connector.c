@@ -125,6 +125,7 @@ typedef struct {
 static const char *TAG = "add_connector";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
+static QueueHandle_t s_reconcile_assignments;
 static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
@@ -441,6 +442,18 @@ static bool send_payload_and_wait_for_ack(
 bool add_connector_send_payload(const char *type, const char *payload_json)
 {
     return send_payload(type, payload_json, false, NULL);
+}
+
+bool add_connector_send_payload_acknowledged(
+    const char *type,
+    const char *payload_json,
+    uint32_t timeout_ms)
+{
+    return send_payload_and_wait_for_ack(
+        type,
+        payload_json,
+        portMAX_DELAY,
+        pdMS_TO_TICKS(timeout_ms));
 }
 
 static const char *storage_key_material(void)
@@ -1172,6 +1185,71 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
     return true;
 }
 
+static bool parse_reconcile_assignment(
+    cJSON *root,
+    add_reconcile_assignment_t *assignment)
+{
+    if (!root || !assignment) return false;
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
+    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
+    cJSON *expected_serial = cJSON_GetObjectItemCaseSensitive(
+        root,
+        "expected_terminal_serial");
+    cJSON *committed = cJSON_GetObjectItemCaseSensitive(
+        root,
+        "committed_next_ordinal");
+    cJSON *chunk_records = cJSON_GetObjectItemCaseSensitive(root, "chunk_records");
+    if (!cJSON_IsString(type) || strcmp(type->valuestring, "reconcile_assignment") != 0 ||
+        !cJSON_IsString(job_id) || strlen(job_id->valuestring) != 36 ||
+        !cJSON_IsNumber(generation) || generation->valuedouble < 1 ||
+        !cJSON_IsString(expected_serial) || expected_serial->valuestring[0] == '\0' ||
+        !cJSON_IsNumber(committed) || committed->valuedouble < 0 ||
+        !cJSON_IsNumber(chunk_records) || chunk_records->valuedouble < 1) {
+        return false;
+    }
+    memset(assignment, 0, sizeof(*assignment));
+    strlcpy(assignment->job_id, job_id->valuestring, sizeof(assignment->job_id));
+    strlcpy(
+        assignment->expected_terminal_serial,
+        expected_serial->valuestring,
+        sizeof(assignment->expected_terminal_serial));
+    assignment->generation = (uint32_t)generation->valuedouble;
+    assignment->committed_next_ordinal = (uint32_t)committed->valuedouble;
+    assignment->chunk_records = (uint16_t)(chunk_records->valueint > 25
+        ? 25
+        : chunk_records->valueint);
+    cJSON *cutoff = cJSON_GetObjectItemCaseSensitive(root, "cutoff_count");
+    if (cJSON_IsNumber(cutoff) && cutoff->valuedouble >= 0) {
+        assignment->has_cutoff = true;
+        assignment->cutoff_count = (uint32_t)cutoff->valuedouble;
+    }
+    cJSON *anchor = cJSON_GetObjectItemCaseSensitive(root, "first_anchor_digest");
+    if (cJSON_IsString(anchor) && strlen(anchor->valuestring) == 64) {
+        strlcpy(
+            assignment->first_anchor_digest,
+            anchor->valuestring,
+            sizeof(assignment->first_anchor_digest));
+    }
+    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "preceding_chain_digest");
+    if (cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
+        strlcpy(
+            assignment->preceding_chain_digest,
+            chain->valuestring,
+            sizeof(assignment->preceding_chain_digest));
+    }
+    cJSON *predecessor = cJSON_GetObjectItemCaseSensitive(
+        root,
+        "committed_predecessor_digest");
+    if (cJSON_IsString(predecessor) && strlen(predecessor->valuestring) == 64) {
+        strlcpy(
+            assignment->committed_predecessor_digest,
+            predecessor->valuestring,
+            sizeof(assignment->committed_predecessor_digest));
+    }
+    return true;
+}
+
 static bool command_journal_contains_locked(const char *command_id)
 {
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
@@ -1306,7 +1384,11 @@ static void parse_inbound(const char *data, size_t len)
         return;
     }
     cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
-    if (cJSON_IsString(type) && strcmp(type->valuestring, "ack") == 0) {
+    if (cJSON_IsString(type) &&
+        (strcmp(type->valuestring, "ack") == 0 ||
+         strcmp(type->valuestring, "reconcile_anchor_ack") == 0 ||
+         strcmp(type->valuestring, "reconcile_chunk_ack") == 0 ||
+         strcmp(type->valuestring, "reconcile_manifest_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
@@ -1454,26 +1536,38 @@ static void parse_inbound(const char *data, size_t len)
         cJSON_Delete(root);
         return;
     }
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "reconcile_assignment") == 0) {
+        add_reconcile_assignment_t assignment;
+        if (!parse_reconcile_assignment(root, &assignment) || !s_reconcile_assignments ||
+            xQueueOverwrite(s_reconcile_assignments, &assignment) != pdTRUE) {
+            ESP_LOGW(TAG, "Rejected malformed or unqueueable reconciliation assignment");
+        }
+        cJSON_Delete(root);
+        return;
+    }
     add_command_t command;
     if (!parse_command_object(root, &command)) {
         cJSON_Delete(root);
         return;
     }
-    if (!command_journal_append(root, command.command_id)) {
-        ESP_LOGE(TAG, "Could not durably journal ADD command %s", command.command_id);
-        add_connector_command_update(
-            command.command_id,
-            "FAILED",
-            "COMMAND_JOURNAL_FAILED",
-            "Command was not acknowledged because durable storage failed.",
-            "{}");
-    } else if (!queue_command_if_idle(&command)) {
+    // ADD is the durable command authority and reoffers unfinished commands
+    // after reconnect/reboot. The local journal is only a recovery cache: a
+    // full SPIFFS partition must never prevent a safe command or lease from
+    // reaching the serialized ZKT executor.
+    bool journaled = command_journal_append(root, command.command_id);
+    if (!journaled) {
+        ESP_LOGW(
+            TAG,
+            "ADD command recovery cache unavailable; executing from durable control-plane offer command=%s",
+            command.command_id);
+    }
+    if (!queue_command_if_idle(&command)) {
         ESP_LOGW(TAG, "Command queue full; rejecting %s", command.command_id);
         add_connector_command_update(
             command.command_id,
             "RETRYING",
             "COMMAND_EXECUTOR_BUSY",
-            "Command is durable and waiting for the serialized executor.",
+            "ADD retains the command and will reoffer it to the serialized executor.",
             "{}");
     } else {
         add_connector_command_update(command.command_id, "ACKNOWLEDGED", NULL, NULL, "{}");
@@ -1653,6 +1747,23 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(zkt_json, "flap_count_15m", zkt.flap_count_15m);
             cJSON_AddNumberToObject(zkt_json, "probe_latency_ms", zkt.probe_latency_ms);
             cJSON_AddNumberToObject(zkt_json, "user_record_size", zkt.user_record_size);
+            cJSON *reconciliation = cJSON_AddObjectToObject(
+                zkt_json,
+                "reconciliation_capabilities");
+            cJSON_AddBoolToObject(reconciliation, "history_stream_v1", true);
+            cJSON_AddBoolToObject(
+                reconciliation,
+                "history_range_resume_verified",
+                true);
+            cJSON_AddNumberToObject(reconciliation, "max_chunk_records", 25);
+            cJSON_AddBoolToObject(
+                reconciliation,
+                "source_coverage_certified",
+                zkt.add_source_coverage_certified);
+            cJSON_AddNumberToObject(
+                reconciliation,
+                "source_coverage_cursor",
+                zkt.add_source_coverage_cursor);
             json_add_epoch(zkt_json, "backoff_until", zkt.backoff_until_epoch);
             json_add_epoch(zkt_json, "stability_since", zkt.stability_since_epoch);
             json_add_epoch(zkt_json, "last_reconcile_at", zkt.last_reconcile_epoch);
@@ -2595,6 +2706,7 @@ void add_connector_init(void)
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -2608,6 +2720,7 @@ void add_connector_init(void)
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
                 s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
+                s_reconcile_assignments &&
                 s_inbound_messages;
     if (s_started &&
         xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
@@ -3014,6 +3127,12 @@ bool add_connector_take_command(add_command_t *out)
         xSemaphoreGive(s_command_lock);
     }
     return true;
+}
+
+bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out)
+{
+    return s_reconcile_assignments && out &&
+        xQueueReceive(s_reconcile_assignments, out, 0) == pdTRUE;
 }
 
 void add_connector_command_retry(const char *command_id)

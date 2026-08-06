@@ -34,6 +34,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -473,6 +474,9 @@ static add_zkt_telemetry_t g_add_zkt;
 static bool g_temp_admin_active;
 static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
+static bool g_add_source_coverage_certified;
+static uint32_t g_add_source_coverage_cursor;
+static int64_t g_add_source_assignment_seen_ms;
 
 static bool oracle_send_reconcile(
     const attendance_event_t *events,
@@ -547,6 +551,11 @@ static void nvs_save_runtime_state(void)
     (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
     (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
     (void)nvs_set_i64(handle, "lease_exp", g_temp_admin_expires_epoch);
+    (void)nvs_set_u8(
+        handle,
+        "add_src_cert",
+        g_add_source_coverage_certified ? 1 : 0);
+    (void)nvs_set_u32(handle, "add_src_cur", g_add_source_coverage_cursor);
     (void)nvs_commit(handle);
     nvs_close(handle);
 }
@@ -558,6 +567,7 @@ static void nvs_load_runtime_state(void)
         return;
     }
     uint8_t active = 0;
+    uint8_t add_source_certified = 0;
     uint8_t history_schema = 0;
     uint8_t history_pending = 0;
     uint8_t history_failed = 0;
@@ -606,6 +616,9 @@ static void nvs_load_runtime_state(void)
     (void)nvs_get_u16(handle, "lease_uid", &g_temp_admin_uid);
     (void)nvs_get_i64(handle, "lease_exp", &g_temp_admin_expires_epoch);
     g_temp_admin_active = active != 0;
+    (void)nvs_get_u8(handle, "add_src_cert", &add_source_certified);
+    (void)nvs_get_u32(handle, "add_src_cur", &g_add_source_coverage_cursor);
+    g_add_source_coverage_certified = add_source_certified != 0;
     nvs_close(handle);
 }
 
@@ -1349,6 +1362,137 @@ static bool zk_read_buffer(
     *out = buffer;
     *out_len = size;
     return true;
+}
+
+typedef struct {
+    bool prepared;
+    uint32_t size;
+    uint8_t *direct_data;
+} zk_bounded_buffer_t;
+
+static bool zk_prepare_bounded_buffer(
+    int sock,
+    zk_context_t *ctx,
+    uint16_t command,
+    uint32_t fct,
+    zk_bounded_buffer_t *buffer)
+{
+    if (!buffer) return false;
+    memset(buffer, 0, sizeof(*buffer));
+    uint8_t *rx = malloc(8192);
+    if (!rx) return false;
+    uint8_t payload[11] = {0};
+    payload[0] = 1;
+    write_le16(payload + 1, command);
+    write_le32(payload + 3, fct);
+    write_le32(payload + 7, 0);
+    zk_response_t response = {0};
+    bool ok = zk_send_command(
+        sock,
+        ctx,
+        CMD_READ_WITH_BUFFER,
+        payload,
+        sizeof(payload),
+        rx,
+        8192,
+        &response) && zk_status_ok(response.code);
+    if (!ok) {
+        free(rx);
+        return false;
+    }
+    if (response.code == CMD_DATA) {
+        if (response.data_len < 4) {
+            free(rx);
+            return false;
+        }
+        buffer->direct_data = heap_caps_malloc(
+            response.data_len,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buffer->direct_data) buffer->direct_data = malloc(response.data_len);
+        if (!buffer->direct_data) {
+            free(rx);
+            return false;
+        }
+        memcpy(buffer->direct_data, response.data, response.data_len);
+        buffer->size = response.data_len;
+        free(rx);
+        return true;
+    }
+    if (response.data_len < 5) {
+        free(rx);
+        return false;
+    }
+    buffer->size = read_le32(response.data + 1);
+    buffer->prepared = buffer->size >= 4 && buffer->size <= 128 * 1024 * 1024;
+    free(rx);
+    return buffer->prepared;
+}
+
+static bool zk_read_bounded_range(
+    int sock,
+    zk_context_t *ctx,
+    const zk_bounded_buffer_t *buffer,
+    uint32_t offset,
+    uint8_t *output,
+    uint32_t length)
+{
+    if (!buffer || !output || length == 0 || offset > buffer->size ||
+        length > buffer->size - offset) {
+        return false;
+    }
+    if (!buffer->prepared) {
+        memcpy(output, buffer->direct_data + offset, length);
+        return true;
+    }
+    uint8_t payload[8];
+    write_le32(payload, offset);
+    write_le32(payload + 4, length);
+    uint8_t *rx = malloc(length + 64);
+    if (!rx) return false;
+    zk_response_t response = {0};
+    bool ok = zk_send_command(
+        sock,
+        ctx,
+        CMD_READ_BUFFER_CHUNK,
+        payload,
+        sizeof(payload),
+        rx,
+        length + 64,
+        &response);
+    if (ok && response.code == CMD_PREPARE_DATA) {
+        size_t actual = 0;
+        ok = zk_recv_data_stream(sock, rx, length, &actual);
+        response.data = rx;
+        response.data_len = actual;
+        response.code = ok ? CMD_DATA : response.code;
+    }
+    ok = ok && response.code == CMD_DATA && response.data_len >= length;
+    if (ok) memcpy(output, response.data, length);
+    free(rx);
+    return ok;
+}
+
+static void zk_close_bounded_buffer(
+    int sock,
+    zk_context_t *ctx,
+    zk_bounded_buffer_t *buffer)
+{
+    if (!buffer) return;
+    if (buffer->prepared) {
+        uint8_t rx[128];
+        zk_response_t response = {0};
+        (void)zk_send_command(
+            sock,
+            ctx,
+            CMD_FREE_DATA,
+            NULL,
+            0,
+            rx,
+            sizeof(rx),
+            &response);
+    }
+    free(buffer->direct_data);
+    memset(buffer, 0, sizeof(*buffer));
 }
 
 static void zk_disconnect(int sock, zk_context_t *ctx)
@@ -2753,14 +2897,19 @@ static void storage_init(void)
         .base_path = STORAGE_BASE,
         .partition_label = NULL,
         .max_files = 16,
-        .format_if_mount_failed = true,
+        // Attendance preservation storage is never reformatted implicitly.
+        // A corrupt/unavailable partition is an observable degraded state;
+        // erasing it would destroy the only offline copy of unsent punches.
+        .format_if_mount_failed = false,
     };
     esp_err_t spiffs_ret = esp_vfs_spiffs_register(&conf);
     if (spiffs_ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not mount SPIFFS storage: %s", esp_err_to_name(spiffs_ret));
-        led_status_fault(LED_STATUS_FATAL);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_ERROR_CHECK(spiffs_ret);
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        ESP_LOGE(
+            TAG,
+            "Continuing in fail-safe online-delivery mode without erasing attendance storage");
+        return;
     }
     restore_pending_backup_if_needed();
     recover_valid_unclassified_blocked_events();
@@ -3476,6 +3625,466 @@ static bool parse_attendance_record(
             (unsigned)record_uid);
     }
     return built;
+}
+
+static void sha256_bytes_hex(const uint8_t *input, size_t length, char out[65])
+{
+    unsigned char digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, input, length);
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+    for (size_t index = 0; index < sizeof(digest); index++) {
+        snprintf(out + index * 2, 3, "%02x", digest[index]);
+    }
+    out[64] = '\0';
+}
+
+static bool encode_record_base64(
+    const uint8_t *record,
+    size_t record_size,
+    char *output,
+    size_t output_size)
+{
+    size_t written = 0;
+    return mbedtls_base64_encode(
+               (unsigned char *)output,
+               output_size,
+               &written,
+               record,
+               record_size) == 0 &&
+        written < output_size && (output[written] = '\0') == '\0';
+}
+
+static bool process_add_reconciliation_assignment(
+    int sock,
+    zk_context_t *ctx,
+    const user_table_t *users,
+    const add_reconcile_assignment_t *assignment)
+{
+    if (!assignment || strcmp(g_device_serial, assignment->expected_terminal_serial) != 0) {
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "RECONCILE_TERMINAL_SERIAL_MISMATCH",
+            "ADD source assignment did not match the authenticated ZKT terminal serial.");
+        return true;
+    }
+    int32_t current_users = 0;
+    int32_t latest_records = 0;
+    if (!zk_get_counts(sock, ctx, &current_users, &latest_records) || latest_records < 0) {
+        return false;
+    }
+    zk_bounded_buffer_t source = {0};
+    if (!zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source)) {
+        add_connector_log(
+            "WARN",
+            "reconcile",
+            "SOURCE_RANGE_PREPARE_FAILED",
+            "Bounded terminal source preparation failed; ADD will resume from its durable checkpoint.");
+        return false;
+    }
+    uint8_t header[4];
+    bool ok = zk_read_bounded_range(sock, ctx, &source, 0, header, sizeof(header));
+    uint32_t total_size = ok ? read_le32(header) : 0;
+    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+    uint32_t record_size = latest_records == 0 && total_size == 0
+        ? 40
+        : choose_zk_record_size(
+              total_size,
+              (uint32_t)latest_records,
+              attendance_record_sizes,
+              sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
+    if (!ok || record_size == 0 || source.size < 4 + total_size ||
+        total_size != (uint32_t)latest_records * record_size) {
+        zk_close_bounded_buffer(sock, ctx, &source);
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "SOURCE_RANGE_LAYOUT_INVALID",
+            "Prepared terminal attendance source did not match its reported record count.");
+        return false;
+    }
+    uint32_t cutoff = assignment->has_cutoff
+        ? assignment->cutoff_count
+        : (uint32_t)latest_records;
+    if ((uint32_t)latest_records < cutoff || assignment->committed_next_ordinal > cutoff) {
+        zk_close_bounded_buffer(sock, ctx, &source);
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "SOURCE_RANGE_COUNT_REGRESSION",
+            "Terminal attendance count regressed below ADD's durable source checkpoint.");
+        return true;
+    }
+    char first_digest[65];
+    if (cutoff > 0) {
+        uint8_t first_record[40];
+        ok = zk_read_bounded_range(
+            sock,
+            ctx,
+            &source,
+            4,
+            first_record,
+            record_size);
+        if (ok) sha256_bytes_hex(first_record, record_size, first_digest);
+    } else {
+        sha256_bytes_hex((const uint8_t *)"", 0, first_digest);
+    }
+    if (!ok || (assignment->first_anchor_digest[0] &&
+                strcmp(first_digest, assignment->first_anchor_digest) != 0)) {
+        zk_close_bounded_buffer(sock, ctx, &source);
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "SOURCE_FIRST_ANCHOR_DIVERGED",
+            "Prepared terminal source no longer matches the ADD first-record anchor.");
+        return true;
+    }
+    if (assignment->committed_next_ordinal > 0) {
+        uint8_t predecessor[40];
+        char predecessor_digest[65];
+        uint32_t predecessor_offset = 4 +
+            (assignment->committed_next_ordinal - 1) * record_size;
+        ok = zk_read_bounded_range(
+            sock,
+            ctx,
+            &source,
+            predecessor_offset,
+            predecessor,
+            record_size);
+        if (ok) sha256_bytes_hex(predecessor, record_size, predecessor_digest);
+        if (!ok || assignment->committed_predecessor_digest[0] == '\0' ||
+            strcmp(predecessor_digest, assignment->committed_predecessor_digest) != 0) {
+            zk_close_bounded_buffer(sock, ctx, &source);
+            add_connector_log(
+                "ERROR",
+                "reconcile",
+                "SOURCE_COMMITTED_BOUNDARY_DIVERGED",
+                "Terminal source changed at ADD's committed resume boundary; scanning stopped fail-closed.");
+            return true;
+        }
+    }
+
+    if (!assignment->has_cutoff) {
+        cJSON *anchor = cJSON_CreateObject();
+        cJSON_AddStringToObject(anchor, "job_id", assignment->job_id);
+        cJSON_AddNumberToObject(anchor, "generation", assignment->generation);
+        cJSON_AddStringToObject(anchor, "terminal_serial", g_device_serial);
+        cJSON_AddNumberToObject(anchor, "terminal_generation", assignment->generation);
+        cJSON_AddNumberToObject(anchor, "cutoff_count", cutoff);
+        cJSON_AddNumberToObject(anchor, "latest_terminal_count", latest_records);
+        cJSON_AddNumberToObject(anchor, "record_size", record_size);
+        cJSON_AddNumberToObject(anchor, "source_total_bytes", source.size);
+        cJSON_AddStringToObject(anchor, "first_anchor_digest", first_digest);
+        char *json = cJSON_PrintUnformatted(anchor);
+        cJSON_Delete(anchor);
+        zk_close_bounded_buffer(sock, ctx, &source);
+        ok = json && add_connector_send_payload_acknowledged(
+            "reconcile_anchor",
+            json,
+            30000);
+        free(json);
+        return ok;
+    }
+
+    if (assignment->committed_next_ordinal == cutoff) {
+        cJSON *manifest = cJSON_CreateObject();
+        cJSON_AddStringToObject(manifest, "job_id", assignment->job_id);
+        cJSON_AddNumberToObject(manifest, "generation", assignment->generation);
+        cJSON_AddStringToObject(manifest, "terminal_serial", g_device_serial);
+        cJSON_AddNumberToObject(manifest, "terminal_generation", assignment->generation);
+        cJSON_AddNumberToObject(manifest, "cutoff_count", cutoff);
+        cJSON_AddNumberToObject(manifest, "latest_terminal_count", latest_records);
+        cJSON_AddStringToObject(
+            manifest,
+            "final_chain_digest",
+            assignment->preceding_chain_digest[0]
+                ? assignment->preceding_chain_digest
+                : "0000000000000000000000000000000000000000000000000000000000000000");
+        char *json = cJSON_PrintUnformatted(manifest);
+        cJSON_Delete(manifest);
+        zk_close_bounded_buffer(sock, ctx, &source);
+        ok = json && add_connector_send_payload_acknowledged(
+            "reconcile_source_manifest",
+            json,
+            30000);
+        free(json);
+        if (ok) {
+            g_add_source_coverage_certified = true;
+            g_add_source_coverage_cursor = cutoff;
+            g_add_zkt.add_source_coverage_certified = true;
+            g_add_zkt.add_source_coverage_cursor = cutoff;
+            g_last_synced_attendance_count = latest_records;
+            g_force_truth_reconcile = false;
+            g_history_backfill_pending = false;
+            g_history_backfill_had_failures = false;
+            nvs_save_runtime_state();
+            add_connector_log(
+                "INFO",
+                "reconcile",
+                "ADD_SOURCE_COVERAGE_CERTIFIED",
+                "ADD acknowledged complete terminal source evidence; legacy historical scans are retired in favor of bounded append-tail audits.");
+        }
+        return ok;
+    }
+
+    uint32_t start = assignment->committed_next_ordinal;
+    uint32_t chunk_records = assignment->chunk_records > 0
+        ? assignment->chunk_records
+        : 1;
+    uint32_t end = start + chunk_records > cutoff ? cutoff : start + chunk_records;
+    uint32_t raw_length = (end - start) * record_size;
+    uint8_t *raw = heap_caps_malloc(raw_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) raw = malloc(raw_length);
+    ok = raw && zk_read_bounded_range(
+        sock,
+        ctx,
+        &source,
+        4 + start * record_size,
+        raw,
+        raw_length);
+    zk_close_bounded_buffer(sock, ctx, &source);
+    if (!ok) {
+        free(raw);
+        return false;
+    }
+    cJSON *records = cJSON_CreateArray();
+    cJSON *canonical = cJSON_CreateArray();
+    for (uint32_t ordinal = start; ok && ordinal < end; ordinal++) {
+        const uint8_t *record = raw + (ordinal - start) * record_size;
+        char raw_digest[65];
+        char terminal_key_material[160];
+        char terminal_key[65];
+        char raw_base64[96];
+        sha256_bytes_hex(record, record_size, raw_digest);
+        snprintf(
+            terminal_key_material,
+            sizeof(terminal_key_material),
+            "%s:%s",
+            g_device_serial,
+            raw_digest);
+        sha256_hex(terminal_key_material, terminal_key);
+        attendance_event_t event;
+        uint32_t timestamp = 0;
+        bool has_timestamp = attendance_record_timestamp(record, record_size, &timestamp);
+        bool parsed = has_timestamp && parse_attendance_record(
+            record,
+            record_size,
+            users,
+            &event,
+            &timestamp);
+        const char *disposition = parsed
+            ? "EVENT"
+            : has_timestamp && !zk_attendance_timestamp_is_plausible(timestamp)
+                ? "INVALID_TIME"
+                : "MALFORMED";
+        ok = encode_record_base64(
+            record,
+            record_size,
+            raw_base64,
+            sizeof(raw_base64));
+        cJSON *source_row = ok ? cJSON_CreateObject() : NULL;
+        cJSON *canonical_row = ok ? cJSON_CreateObject() : NULL;
+        if (!source_row || !canonical_row) ok = false;
+        if (!ok) {
+            cJSON_Delete(source_row);
+            cJSON_Delete(canonical_row);
+            break;
+        }
+        cJSON_AddNumberToObject(source_row, "ordinal", ordinal);
+        cJSON_AddStringToObject(source_row, "raw_record_digest", raw_digest);
+        cJSON_AddStringToObject(source_row, "terminal_record_key", terminal_key);
+        cJSON_AddNumberToObject(source_row, "occurrence_index", ordinal + 1);
+        cJSON_AddStringToObject(source_row, "disposition", disposition);
+        if (parsed) {
+            cJSON *event_row = add_attendance_json_row(&event, "FULL_HISTORY");
+            if (!event_row) {
+                cJSON_Delete(source_row);
+                cJSON_Delete(canonical_row);
+                ok = false;
+                break;
+            }
+            cJSON_AddItemToObject(source_row, "event", event_row);
+        } else {
+            cJSON_AddStringToObject(
+                source_row,
+                "error_code",
+                strcmp(disposition, "INVALID_TIME") == 0
+                    ? "IMPLAUSIBLE_TERMINAL_TIME"
+                    : "UNPARSEABLE_TERMINAL_RECORD");
+        }
+        cJSON_AddStringToObject(source_row, "raw_record_b64", raw_base64);
+        cJSON_AddItemToArray(records, source_row);
+
+        // This insertion order exactly matches ADD's sorted-key canonical
+        // digest contract in reconciliation_chunk_digest().
+        cJSON_AddStringToObject(canonical_row, "disposition", disposition);
+        if (parsed) cJSON_AddStringToObject(canonical_row, "event_uid", event.event_uid);
+        else cJSON_AddNullToObject(canonical_row, "event_uid");
+        cJSON_AddNumberToObject(canonical_row, "occurrence_index", ordinal + 1);
+        cJSON_AddNumberToObject(canonical_row, "ordinal", ordinal);
+        cJSON_AddStringToObject(canonical_row, "raw_record_digest", raw_digest);
+        cJSON_AddStringToObject(canonical_row, "terminal_record_key", terminal_key);
+        cJSON_AddItemToArray(canonical, canonical_row);
+    }
+    free(raw);
+    char *canonical_json = ok ? cJSON_PrintUnformatted(canonical) : NULL;
+    cJSON_Delete(canonical);
+    char chunk_digest[65] = {0};
+    if (canonical_json) sha256_hex(canonical_json, chunk_digest);
+    free(canonical_json);
+    const char *previous = assignment->preceding_chain_digest[0]
+        ? assignment->preceding_chain_digest
+        : "0000000000000000000000000000000000000000000000000000000000000000";
+    char chain_material[220];
+    char resulting_chain[65];
+    snprintf(
+        chain_material,
+        sizeof(chain_material),
+        "%s:%lu:%lu:%s",
+        previous,
+        (unsigned long)start,
+        (unsigned long)end,
+        chunk_digest);
+    sha256_hex(chain_material, resulting_chain);
+    cJSON *chunk = ok && records ? cJSON_CreateObject() : NULL;
+    if (chunk) {
+        cJSON_AddStringToObject(chunk, "job_id", assignment->job_id);
+        cJSON_AddNumberToObject(chunk, "generation", assignment->generation);
+        cJSON_AddNumberToObject(chunk, "sequence", start);
+        cJSON_AddNumberToObject(chunk, "start_ordinal", start);
+        cJSON_AddNumberToObject(chunk, "end_ordinal", end);
+        cJSON_AddStringToObject(chunk, "chunk_digest", chunk_digest);
+        if (assignment->preceding_chain_digest[0]) {
+            cJSON_AddStringToObject(
+                chunk,
+                "previous_chain_digest",
+                assignment->preceding_chain_digest);
+        } else {
+            cJSON_AddNullToObject(chunk, "previous_chain_digest");
+        }
+        cJSON_AddStringToObject(chunk, "resulting_chain_digest", resulting_chain);
+        cJSON_AddItemToObject(chunk, "records", records);
+        records = NULL;
+    }
+    cJSON_Delete(records);
+    char *json = chunk ? cJSON_PrintUnformatted(chunk) : NULL;
+    cJSON_Delete(chunk);
+    ok = json && add_connector_send_payload_acknowledged(
+        "reconcile_chunk",
+        json,
+        30000);
+    free(json);
+    return ok;
+}
+
+static bool process_add_incremental_tail(
+    int sock,
+    zk_context_t *ctx,
+    const user_table_t *users,
+    int32_t latest_records,
+    bool *more_out)
+{
+    if (more_out) *more_out = false;
+    if (!g_add_source_coverage_certified || latest_records < 0) return false;
+    if ((uint32_t)latest_records < g_add_source_coverage_cursor) {
+        g_add_source_coverage_certified = false;
+        g_add_zkt.add_source_coverage_certified = false;
+        nvs_save_runtime_state();
+        add_connector_log(
+            "CRITICAL",
+            "reconcile",
+            "ADD_SOURCE_COVERAGE_INVALIDATED",
+            "Terminal attendance count regressed below its certified ADD source cursor.");
+        return false;
+    }
+    if ((uint32_t)latest_records == g_add_source_coverage_cursor) {
+        g_last_synced_attendance_count = latest_records;
+        return true;
+    }
+    zk_bounded_buffer_t source = {0};
+    if (!zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source)) return false;
+    uint8_t header[4];
+    bool ok = zk_read_bounded_range(sock, ctx, &source, 0, header, sizeof(header));
+    uint32_t total_size = ok ? read_le32(header) : 0;
+    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+    uint32_t record_size = choose_zk_record_size(
+        total_size,
+        (uint32_t)latest_records,
+        attendance_record_sizes,
+        sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
+    if (!ok || record_size == 0 || total_size != (uint32_t)latest_records * record_size) {
+        zk_close_bounded_buffer(sock, ctx, &source);
+        return false;
+    }
+    uint32_t start = g_add_source_coverage_cursor;
+    uint32_t end = start + 25 > (uint32_t)latest_records
+        ? (uint32_t)latest_records
+        : start + 25;
+    uint32_t raw_length = (end - start) * record_size;
+    uint8_t *raw = heap_caps_malloc(raw_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) raw = malloc(raw_length);
+    ok = raw && zk_read_bounded_range(
+        sock,
+        ctx,
+        &source,
+        4 + start * record_size,
+        raw,
+        raw_length);
+    zk_close_bounded_buffer(sock, ctx, &source);
+    cJSON *events = ok ? cJSON_CreateArray() : NULL;
+    for (uint32_t ordinal = start; ok && ordinal < end; ordinal++) {
+        const uint8_t *record = raw + (ordinal - start) * record_size;
+        attendance_event_t event;
+        uint32_t timestamp = 0;
+        ok = parse_attendance_record(
+            record,
+            record_size,
+            users,
+            &event,
+            &timestamp);
+        cJSON *row = ok ? add_attendance_json_row(&event, "CURRENT_RECONCILE") : NULL;
+        if (!row) {
+            ok = false;
+            break;
+        }
+        cJSON_AddItemToArray(events, row);
+    }
+    free(raw);
+    char batch_material[180];
+    char batch_id[65];
+    snprintf(
+        batch_material,
+        sizeof(batch_material),
+        "%s:%lu:%lu:CURRENT_RECONCILE",
+        g_device_serial,
+        (unsigned long)start,
+        (unsigned long)end);
+    sha256_hex(batch_material, batch_id);
+    char *json = ok ? add_serialize_attendance_events(events, batch_id) : NULL;
+    if (!ok) cJSON_Delete(events);
+    ok = json && add_connector_deliver_attendance_acknowledged(json);
+    free(json);
+    if (!ok) {
+        add_connector_log(
+            "WARN",
+            "reconcile",
+            "CURRENT_TAIL_CHECKPOINT_RETRY",
+            "The bounded append-tail audit did not commit to ADD; its cursor was not advanced.");
+        return false;
+    }
+    g_add_source_coverage_cursor = end;
+    g_add_zkt.add_source_coverage_cursor = end;
+    if (end == (uint32_t)latest_records) {
+        g_last_synced_attendance_count = latest_records;
+        g_last_full_truth_reconcile_epoch = epoch_now();
+    }
+    nvs_save_runtime_state();
+    if (more_out) *more_out = end < (uint32_t)latest_records;
+    return true;
 }
 
 static size_t collect_reconcile_window(
@@ -6645,9 +7254,13 @@ static bool process_add_commands(
                 } else if (
                     strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
                     user->privilege == 14) {
+                    int lease_seconds =
+                        command.duration_seconds > 0 && command.duration_seconds <= 600
+                            ? command.duration_seconds
+                            : 600;
                     int64_t deadline = command.lease_expires_epoch > 0
                         ? command.lease_expires_epoch
-                        : epoch_now() + 600;
+                        : epoch_now() + lease_seconds;
                     if (deadline <= epoch_now()) {
                         error_code = "COMMAND_EXPIRED";
                         error_message = "The enrollment lease deadline passed before recovery completed.";
@@ -6728,9 +7341,13 @@ static bool process_add_commands(
                             } else {
                                 g_temp_admin_active = true;
                                 g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
+                                int lease_seconds =
+                                    command.duration_seconds > 0 && command.duration_seconds <= 600
+                                        ? command.duration_seconds
+                                        : 600;
                                 g_temp_admin_expires_epoch = command.lease_expires_epoch > 0
                                     ? command.lease_expires_epoch
-                                    : epoch_now() + 600;
+                                    : epoch_now() + lease_seconds;
                                 if (g_temp_admin_expires_epoch <= epoch_now()) {
                                     g_temp_admin_active = true;
                                     g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
@@ -6916,6 +7533,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
     }
     g_add_zkt.user_count = user_count;
     g_add_zkt.attendance_count = records;
+    g_add_zkt.add_source_coverage_certified = g_add_source_coverage_certified;
+    g_add_zkt.add_source_coverage_cursor = g_add_source_coverage_cursor;
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     zkt_mark_authenticated(host_order_ip, "live session authenticated and identified", true);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
@@ -7011,6 +7630,26 @@ static int64_t gateway_run(uint32_t host_order_ip)
             }
             add_connector_set_activity("LIVE_CAPTURE");
         }
+        add_reconcile_assignment_t reconciliation_assignment;
+        if (!g_temp_admin_active &&
+            add_connector_take_reconcile_assignment(&reconciliation_assignment)) {
+            g_add_source_assignment_seen_ms = uptime_ms();
+            if (add_connector_begin_exclusive_activity("ADD_SOURCE_RECONCILE")) {
+                bool source_ok = process_add_reconciliation_assignment(
+                    sock,
+                    &ctx,
+                    users,
+                    &reconciliation_assignment);
+                add_connector_set_activity("LIVE_CAPTURE");
+                if (!source_ok) {
+                    add_connector_log(
+                        "WARN",
+                        "reconcile",
+                        "ADD_SOURCE_CHECKPOINT_RETRY",
+                        "A bounded source step did not commit; ADD will reoffer the unchanged durable checkpoint.");
+                }
+            }
+        }
         if (add_connector_consume_connected_edge()) {
             add_connector_log("INFO", "add", "ADD_RECONNECTED", "ADD channel recovered; publishing a fresh full user snapshot");
             (void)add_send_user_snapshot(users);
@@ -7095,7 +7734,45 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_activity("LIVE_CAPTURE");
         }
 
-        if (now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
+        bool add_source_job_active = g_add_source_assignment_seen_ms > 0 &&
+            now_ms - g_add_source_assignment_seen_ms < 30 * 60 * 1000;
+        if (g_add_source_coverage_certified &&
+            now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
+            now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+            if (!add_connector_begin_exclusive_activity("CURRENT_TAIL_AUDIT")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            int32_t audit_users = 0;
+            int32_t audit_records = 0;
+            bool more = false;
+            bool audit_ok = zk_get_counts(sock, &ctx, &audit_users, &audit_records) &&
+                process_add_incremental_tail(
+                    sock,
+                    &ctx,
+                    users,
+                    audit_records,
+                    &more);
+            g_add_zkt.attendance_count = audit_records;
+            add_connector_set_zkt(&g_add_zkt);
+            last_reconcile = more
+                ? uptime_ms() - ZONE_LITE_RECONCILE_INTERVAL_MS + 5000
+                : uptime_ms();
+            add_connector_set_activity("LIVE_CAPTURE");
+            if (!audit_ok) {
+                add_connector_log(
+                    "WARN",
+                    "reconcile",
+                    "CURRENT_TAIL_AUDIT_RETRY",
+                    "Append-tail assurance paused without advancing its durable cursor.");
+            }
+        } else if (add_source_job_active && !g_add_source_coverage_certified &&
+                   now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS) {
+            // The operator-requested ADD source job owns historical truth.
+            // Never run the legacy full-dump reconciler concurrently.
+            last_reconcile = now_ms;
+        } else if (!g_add_source_coverage_certified && !add_source_job_active &&
+            now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
             (g_truth_retry_not_before_ms == 0 ||
              now_ms >= g_truth_retry_not_before_ms) &&
             now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {

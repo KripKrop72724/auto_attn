@@ -4,6 +4,7 @@ import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './rou
 describe('dashboard routing', () => {
   it('maps supported paths and defaults unknown locations to fleet', () => {
     expect(dashboardRoute('/attendance')).toBe('attendance')
+    expect(dashboardRoute('/reconciliation')).toBe('reconciliation')
     expect(dashboardRoute('/firmware')).toBe('firmware')
     expect(dashboardRoute('/not-a-dashboard-route')).toBe('fleet')
   })

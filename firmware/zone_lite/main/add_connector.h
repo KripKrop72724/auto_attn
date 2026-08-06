@@ -38,6 +38,19 @@ typedef struct {
 } add_command_t;
 
 typedef struct {
+    char job_id[40];
+    char expected_terminal_serial[80];
+    char first_anchor_digest[65];
+    char preceding_chain_digest[65];
+    char committed_predecessor_digest[65];
+    uint32_t generation;
+    uint32_t committed_next_ordinal;
+    uint32_t cutoff_count;
+    uint16_t chunk_records;
+    bool has_cutoff;
+} add_reconcile_assignment_t;
+
+typedef struct {
     bool online;
     char connection_state[24];
     char ip_address[16];
@@ -65,6 +78,8 @@ typedef struct {
     int32_t history_oldest_month;
     int64_t history_last_sweep_epoch;
     uint32_t history_failed_windows;
+    bool add_source_coverage_certified;
+    uint32_t add_source_coverage_cursor;
 } add_zkt_telemetry_t;
 
 void add_connector_init(void);
@@ -80,6 +95,7 @@ bool add_connector_claim_ota_restart(void);
 bool add_connector_begin_pending_command_activity(void);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
+bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out);
 void add_connector_command_retry(const char *command_id);
 bool add_connector_command_complete(const char *command_id);
 bool add_connector_persist_command_tombstone(const add_command_t *command);
@@ -99,6 +115,10 @@ bool add_connector_command_update(
     const char *error_message,
     const char *result_json);
 bool add_connector_send_payload(const char *type, const char *payload_json);
+bool add_connector_send_payload_acknowledged(
+    const char *type,
+    const char *payload_json,
+    uint32_t timeout_ms);
 bool add_connector_enqueue_attendance(const char *payload_json);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);

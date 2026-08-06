@@ -55,17 +55,16 @@ hash in the protected server environment; plaintext credentials are never commit
 
 ## Current Zone Lite release
 
-The current firmware candidate is **Zone Lite 2.2.0**. It adds stable, versioned terminal identity snapshots,
-post-punch identity verification, 30-second external-edit detection, and verified blocked-event repair
-without changing event UIDs, attendance history, or the independent ADD and ORDS outboxes. It retains
-the production-hardened full reconciliation introduced in 2.1.10 for
-large MB40 attendance tables: native 64 KiB buffered reads with a slow-flash deadline, guaranteed
-terminal buffer release on every failure path, bounded PSRAM truth storage, serialized ORDS HTTPS,
-durable chunked ADD truth enqueue, and an 8 KiB main-task stack for large persistent dedup indexes.
+The current firmware candidate is **Zone Lite 2.3.0**. It moves request-based start-of-time
+reconciliation checkpoints and evidence to ADD, reads only bounded terminal ranges, resumes from the
+last ADD-committed ordinal, and replaces certified legacy full scans with lightweight append-tail
+audits. ADD commands no longer depend on free ESP flash, and preservation storage is never
+auto-formatted. Identity-blocked attendance remains fail-closed without changing event UIDs or
+deleting terminal/Oracle history.
 Heartbeat and onboarding versions are derived from the built application descriptor so ADD always
 reports the actual image version.
 
-See [the Zone Lite 2.2.0 release record](docs/zone-lite-2.2.0-release.md) and
+See [the ADD-owned reconciliation runbook](docs/add-owned-reconciliation.md) and
 [the remote firmware update runbook](docs/zone-lite-remote-firmware-updates.md) for bootstrap, release,
 campaign, rollback, and recovery procedures. See [the Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md) for identity-snapshot upgrade notes,
 validation evidence, and the required `complete=true` acceptance markers.
@@ -122,7 +121,7 @@ Use these runbooks before operating production:
 - [Production deployment and rollback](docs/production-runbook.md)
 - [ESP/ZKT hardware acceptance](docs/hardware-acceptance.md)
 - [Zone Lite build and provisioning](firmware/zone_lite/README.md)
-- [Zone Lite 2.2.0 release record](docs/zone-lite-2.2.0-release.md)
+- [ADD-owned reconciliation](docs/add-owned-reconciliation.md)
 - [Zone Lite remote firmware updates](docs/zone-lite-remote-firmware-updates.md)
 - [Zone Lite OTA operator and AI-agent runbook](docs/zone-lite-ota-agent-runbook.md)
 - [Zone Lite signing-key custody](docs/zone-lite-signing-key-custody.md)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import timedelta
 import hashlib
 import json
@@ -44,6 +45,10 @@ from zk_add.service import (
 )
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
+from zk_add.reconciliation import (
+    assignment_rows,
+    refresh_all_reconciliation_assurance,
+)
 
 
 EVENT_UID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -303,6 +308,7 @@ async def maintenance_tick() -> None:
     now = utc_now()
     dispatch: list[tuple[str, dict]] = []
     connector_updates: list[dict] = []
+    reconciliation_dispatch: list[tuple[str, dict]] = []
     with session_scope() as session:
         for connector in session.scalars(select(Connector).where(Connector.active == True)):  # noqa: E712
             if connector.last_seen_at and connector.last_seen_at + timedelta(seconds=settings.offline_after_seconds) < now:
@@ -323,6 +329,7 @@ async def maintenance_tick() -> None:
         repair_verified_active_identity_backlog(session)
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
+        refresh_all_reconciliation_assurance(session)
         for command in session.scalars(
             select(DeviceCommand)
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
@@ -377,6 +384,7 @@ async def maintenance_tick() -> None:
             connector = session.get(Connector, command.connector_id)
             if connector:
                 dispatch.append((connector.connector_id, serialize_command(command)))
+        reconciliation_dispatch = assignment_rows(session)
     for connector_id, update in dispatch:
         if await connector_hub.send(connector_id, update):
             with session_scope() as session:
@@ -399,11 +407,48 @@ async def maintenance_tick() -> None:
                     command.attempt_count += 1
     for update in connector_updates:
         await browser_events.publish("device", update)
+    for connector_id, assignment in reconciliation_dispatch:
+        if await connector_hub.send(connector_id, assignment):
+            await browser_events.publish(
+                "reconciliation",
+                {
+                    "job_id": assignment["job_id"],
+                    "phase": "ASSIGNMENT_OFFERED",
+                    "connector_id": connector_id,
+                },
+            )
     await asyncio.gather(
         audit_firmware_receipts_batch(),
         audit_confirmed_membership_batch(),
         deliver_ords_batch(),
     )
+
+
+def fair_ords_candidate_order(
+    session: Session, candidates: list[OrdsOutbox]
+) -> list[OrdsOutbox]:
+    priority = [row for row in candidates if row.delivery_type != "FULL_HISTORY"]
+    buckets: dict[int, deque[OrdsOutbox]] = {}
+    for row in candidates:
+        if row.delivery_type != "FULL_HISTORY":
+            continue
+        event = (
+            session.get(AttendanceEvent, row.attendance_event_id)
+            if row.attendance_event_id
+            else None
+        )
+        # Invalid/missing event rows still get a stable bucket so validation
+        # can quarantine them without stalling valid connector histories.
+        connector_id = event.connector_id if event is not None else -row.id
+        buckets.setdefault(connector_id, deque()).append(row)
+    history: list[OrdsOutbox] = []
+    while buckets:
+        for connector_id in list(buckets):
+            bucket = buckets[connector_id]
+            history.append(bucket.popleft())
+            if not bucket:
+                del buckets[connector_id]
+    return [*priority, *history]
 
 
 def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
@@ -434,13 +479,18 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 | (OrdsOutbox.next_attempt_at <= now),
             )
             .order_by(
+                case(
+                    (OrdsOutbox.delivery_type == "LIVE", 0),
+                    (OrdsOutbox.delivery_type == "CURRENT_RECONCILE", 1),
+                    else_=2,
+                ),
                 case((OrdsOutbox.status == "PENDING", 0), else_=1),
                 OrdsOutbox.id.asc(),
             )
             .limit(max(200, limit * 20))
             .with_for_update(skip_locked=True)
         ).all()
-        for row in candidates:
+        for row in fair_ords_candidate_order(session, candidates):
             was_retry = row.status == "FAILED_RETRYABLE"
             event = (
                 session.get(AttendanceEvent, row.attendance_event_id)

@@ -352,6 +352,8 @@ def update_heartbeat(
     zkt = connector.zkt_device
     zkt_payload = payload.zkt
     if zkt:
+        previous_terminal_serial = zkt.serial
+        previous_attendance_count = zkt.attendance_count
         reported_state = str(
             zkt_payload.get("connection_state")
             or ("ONLINE" if zkt_payload.get("online", False) else "OFFLINE")
@@ -385,6 +387,42 @@ def update_heartbeat(
         zkt.firmware_version = zkt_payload.get("firmware_version") or zkt.firmware_version
         zkt.user_count = zkt_payload.get("user_count", zkt.user_count)
         zkt.attendance_count = zkt_payload.get("attendance_count", zkt.attendance_count)
+        capabilities = zkt_payload.get("reconciliation_capabilities")
+        if isinstance(capabilities, dict):
+            try:
+                max_chunk_records = int(capabilities.get("max_chunk_records") or 1)
+            except (TypeError, ValueError):
+                max_chunk_records = 1
+            try:
+                source_coverage_cursor = int(
+                    capabilities.get("source_coverage_cursor") or 0
+                )
+            except (TypeError, ValueError):
+                source_coverage_cursor = 0
+            zkt.capability_profile = {
+                **(zkt.capability_profile or {}),
+                "history_stream_v1": bool(capabilities.get("history_stream_v1")),
+                "history_range_resume_verified": bool(
+                    capabilities.get("history_range_resume_verified")
+                ),
+                "history_chunk_max_records": max(
+                    1, min(100, max_chunk_records)
+                ),
+                "source_coverage_certified": bool(
+                    capabilities.get("source_coverage_certified")
+                ),
+                "source_coverage_cursor": max(
+                    0, source_coverage_cursor
+                ),
+            }
+        from zk_add.reconciliation import invalidate_coverage_for_terminal_change
+
+        invalidate_coverage_for_terminal_change(
+            session,
+            zkt=zkt,
+            previous_serial=previous_terminal_serial,
+            previous_attendance_count=previous_attendance_count,
+        )
         zkt.device_time_drift_seconds = zkt_payload.get(
             "drift_seconds", zkt.device_time_drift_seconds
         )
@@ -2831,11 +2869,34 @@ def ingest_attendance(
             session.add(
                 OrdsOutbox(
                     attendance_event_id=row.id,
+                    delivery_type=(
+                        "FULL_HISTORY"
+                        if row.source == "FULL_HISTORY"
+                        else (
+                            "CURRENT_RECONCILE"
+                            if row.source in {"CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"}
+                            else "LIVE"
+                        )
+                    ),
                     status="FIRMWARE_RECEIPT_UNVERIFIED",
                 )
             )
         elif has_cnic:
-            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
+            session.add(
+                OrdsOutbox(
+                    attendance_event_id=row.id,
+                    delivery_type=(
+                        "FULL_HISTORY"
+                        if row.source == "FULL_HISTORY"
+                        else (
+                            "CURRENT_RECONCILE"
+                            if row.source in {"CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"}
+                            else "LIVE"
+                        )
+                    ),
+                    status="PENDING",
+                )
+            )
     # Persist the corresponding Oracle outbox rows in one second flush so the
     # whole firmware message is durable before its websocket acknowledgement.
     session.flush()
@@ -3026,6 +3087,8 @@ def oracle_payload(connector: Connector, zkt: ZKTDevice, row: AttendanceEvent, c
 
 
 def ingest_logs(session: Session, *, connector: Connector, logs: list) -> int:
+    from zk_add.reconciliation import apply_reconciliation_device_fault
+
     accepted = 0
     for incoming in logs[:500]:
         if session.scalar(
@@ -3050,6 +3113,11 @@ def ingest_logs(session: Session, *, connector: Connector, logs: list) -> int:
                 context=context,
                 device_time=incoming.device_time,
             )
+        )
+        apply_reconciliation_device_fault(
+            session,
+            connector=connector,
+            code=incoming.code,
         )
         accepted += 1
     return accepted
@@ -4522,7 +4590,6 @@ def create_admin_lease(
     if active:
         raise ValueError(f"Device already has active lease {active.lease_id}.")
     lease_id = str(uuid4())
-    lease_expires_at = utc_now() + timedelta(seconds=600)
     command = create_command(
         session,
         connector=connector,
@@ -4532,7 +4599,6 @@ def create_admin_lease(
             "uid": user.uid,
             "user_id": user.user_id,
             "duration_seconds": 600,
-            "lease_expires_epoch": int(lease_expires_at.timestamp()),
         },
         expected_state={
             "serial": zkt.serial,
@@ -4545,7 +4611,10 @@ def create_admin_lease(
         desired_state={"privilege": 14},
         idempotency_key=idempotency_key,
         actor=actor,
-        expires_in_seconds=120,
+        # The grant request may wait for the device for up to ten minutes. The
+        # enrollment lease itself starts only after the terminal elevation has
+        # been reread and verified by firmware.
+        expires_in_seconds=600,
     )
     lease = TemporaryAdminLease(
         lease_id=lease_id,

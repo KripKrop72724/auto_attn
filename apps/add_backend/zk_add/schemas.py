@@ -109,6 +109,8 @@ class AttendanceEventIn(BaseModel):
         "DUMP_RECONNECT",
         "MANUAL_REPROCESS",
         "RECONCILE_15M",
+        "FULL_HISTORY",
+        "CURRENT_RECONCILE",
     ]
     status: str | int | None = None
     punch: str | int | None = None
@@ -124,6 +126,100 @@ class AttendanceBatchRequest(BaseModel):
     batch_id: str = Field(min_length=1, max_length=120)
     payload_digest: str | None = None
     events: list[AttendanceEventIn] = Field(min_length=1, max_length=100)
+
+
+class ReconciliationCreateRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    confirmation: str = Field(min_length=10, max_length=180)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class ReconciliationControlRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class ReconciliationAnchorRequest(BaseModel):
+    job_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    terminal_generation: int = Field(ge=1)
+    cutoff_count: int = Field(ge=0)
+    latest_terminal_count: int = Field(ge=0)
+    record_size: Literal[8, 16, 40]
+    source_total_bytes: int = Field(ge=4, le=128 * 1024 * 1024)
+    first_anchor_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    identity_snapshot_id: str | None = Field(default=None, max_length=120)
+
+
+class ReconciliationSourceRecord(BaseModel):
+    ordinal: int = Field(ge=0)
+    raw_record_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    terminal_record_key: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    occurrence_index: int = Field(default=1, ge=1)
+    disposition: Literal[
+        "EVENT",
+        "BLOCKED_IDENTITY",
+        "INVALID_TIME",
+        "MALFORMED",
+        "TERMINAL_DUPLICATE",
+    ]
+    event: AttendanceEventIn | None = None
+    raw_record_b64: str = Field(min_length=4, max_length=512)
+    error_code: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_record_evidence(self):
+        if self.disposition in {"EVENT", "BLOCKED_IDENTITY"} and self.event is None:
+            raise ValueError("Parsed reconciliation rows require an attendance event")
+        return self
+
+
+class ReconciliationChunkRequest(BaseModel):
+    job_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    sequence: int = Field(ge=0)
+    start_ordinal: int = Field(ge=0)
+    end_ordinal: int = Field(ge=1)
+    chunk_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    previous_chain_digest: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    resulting_chain_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    records: list[ReconciliationSourceRecord] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_contiguous_chunk(self):
+        if self.end_ordinal - self.start_ordinal != len(self.records):
+            raise ValueError("Chunk range must exactly match its record count")
+        expected = list(range(self.start_ordinal, self.end_ordinal))
+        if [row.ordinal for row in self.records] != expected:
+            raise ValueError("Chunk records must be ordered and contiguous")
+        return self
+
+
+class ReconciliationManifestRequest(BaseModel):
+    job_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    terminal_generation: int = Field(ge=1)
+    cutoff_count: int = Field(ge=0)
+    latest_terminal_count: int = Field(ge=0)
+    final_chain_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class OracleReceiptBatchRequest(BaseModel):
