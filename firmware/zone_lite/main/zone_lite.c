@@ -7881,6 +7881,14 @@ static int64_t gateway_run(uint32_t host_order_ip)
             (g_truth_retry_not_before_ms == 0 ||
              now_ms >= g_truth_retry_not_before_ms) &&
             now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+            // The ADD scheduler and gateway task are independent. An
+            // assignment can arrive just after the earlier queue check.
+            // Re-check immediately before claiming the terminal for a legacy
+            // full read so the bounded resumable source job wins that race.
+            if (add_connector_has_reconcile_assignment()) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
             if (!add_connector_begin_exclusive_activity("RECONCILING")) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;

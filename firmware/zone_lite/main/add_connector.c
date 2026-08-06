@@ -3233,6 +3233,12 @@ bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out)
         xQueueReceive(s_reconcile_assignments, out, 0) == pdTRUE;
 }
 
+bool add_connector_has_reconcile_assignment(void)
+{
+    return s_reconcile_assignments &&
+        uxQueueMessagesWaiting(s_reconcile_assignments) > 0;
+}
+
 void add_connector_command_retry(const char *command_id)
 {
     if (!command_id || !s_command_lock ||

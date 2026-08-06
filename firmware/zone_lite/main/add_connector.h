@@ -112,6 +112,7 @@ bool add_connector_begin_pending_command_activity(void);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
 bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out);
+bool add_connector_has_reconcile_assignment(void);
 void add_connector_command_retry(const char *command_id);
 bool add_connector_command_complete(const char *command_id);
 bool add_connector_persist_command_tombstone(const add_command_t *command);
