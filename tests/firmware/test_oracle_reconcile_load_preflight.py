@@ -41,7 +41,7 @@ class OracleReconcileLoadPreflight(unittest.TestCase):
         )
         delegation = firmware[
             delegation_start : firmware.index(
-                "free(data);",
+                "reconcile_dump_release(data);",
                 delegation_start,
             )
         ]

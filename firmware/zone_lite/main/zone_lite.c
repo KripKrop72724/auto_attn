@@ -248,6 +248,20 @@
 #ifndef ZONE_LITE_HISTORY_SWEEP_SECONDS
 #define ZONE_LITE_HISTORY_SWEEP_SECONDS (7 * 24 * 60 * 60)
 #endif
+// Historical reconstruction is deliberately constrained to Pakistan's quiet
+// hours (22:00-05:00 PKT).  The system clock is UTC and Pakistan has no DST,
+// so the bounded window is 17:00-00:00 UTC.  Current truth and live capture
+// remain eligible at all hours.
+#ifndef ZONE_LITE_HISTORY_WINDOW_START_HOUR_UTC
+#define ZONE_LITE_HISTORY_WINDOW_START_HOUR_UTC 17
+#endif
+#ifndef ZONE_LITE_HISTORY_WINDOW_END_HOUR_UTC
+#define ZONE_LITE_HISTORY_WINDOW_END_HOUR_UTC 0
+#endif
+// A verified historical dump is an immutable prefix of the append-only ZKT
+// attendance table.  Reuse it only for the active overnight sweep and bound
+// its lifetime so a future sweep always observes a fresh terminal snapshot.
+#define ZONE_LITE_HISTORY_DUMP_CACHE_MAX_AGE_MS (8 * 60 * 60 * 1000LL)
 #ifndef ZONE_LITE_MIN_ATTENDANCE_YEAR
 #define ZONE_LITE_MIN_ATTENDANCE_YEAR 2010
 #endif
@@ -426,6 +440,11 @@ static int32_t g_history_oldest_year;
 static int32_t g_history_oldest_month;
 static int64_t g_history_last_sweep_epoch;
 static uint32_t g_history_failed_windows;
+static uint8_t *g_history_dump_cache;
+static size_t g_history_dump_cache_len;
+static uint32_t g_history_dump_cache_record_size;
+static int32_t g_history_dump_cache_records;
+static int64_t g_history_dump_cache_captured_ms;
 static uint32_t g_last_zkt_tcp_candidate_ip;
 static bool g_sntp_started;
 static bool g_time_synced;
@@ -469,6 +488,8 @@ static int days_in_month(int year, int month);
 static int compare_months(int left_year, int left_month, int right_year, int right_month);
 static void advance_month(int32_t *year, int32_t *month);
 static void update_history_telemetry(void);
+static void history_dump_cache_clear(void);
+static bool history_dump_cache_is_usable(int32_t current_records);
 
 static int64_t uptime_ms(void)
 {
@@ -3510,6 +3531,13 @@ static size_t collect_reconcile_window(
     return count;
 }
 
+static void reconcile_dump_release(uint8_t *data)
+{
+    if (data != NULL && data != g_history_dump_cache) {
+        free(data);
+    }
+}
+
 static bool reconcile_attendance_dump(
     int sock,
     zk_context_t *ctx,
@@ -3533,6 +3561,7 @@ static bool reconcile_attendance_dump(
     if (ords_gate_deferred_out) *ords_gate_deferred_out = false;
     uint8_t *data = NULL;
     size_t len = 0;
+    uint32_t record_size = 0;
     if (records <= 0) {
         if (historical) {
             if (history_exhausted_out) *history_exhausted_out = true;
@@ -3580,7 +3609,9 @@ static bool reconcile_attendance_dump(
     truth_ords_gate_reserve_until(0);
     int32_t refreshed_users = 0;
     int32_t refreshed_records = 0;
-    if (zk_get_counts(sock, ctx, &refreshed_users, &refreshed_records) && refreshed_records > 0) {
+    bool counts_refreshed =
+        zk_get_counts(sock, ctx, &refreshed_users, &refreshed_records);
+    if (counts_refreshed && refreshed_records > 0) {
         records = refreshed_records;
         ESP_LOGI(
             TAG,
@@ -3588,56 +3619,100 @@ static bool reconcile_attendance_dump(
             (long)refreshed_users,
             (long)refreshed_records);
     }
-    ESP_LOGI(TAG, "Requesting attendance dump records=%ld capturetype=%s", (long)records, capturetype);
-    uint32_t attendance_chunk_bytes = g_truth_use_recovery_chunks
-        ? ZKT_BUFFER_RECOVERY_CHUNK_BYTES
-        : ZKT_BUFFER_CHUNK_BYTES;
-    if (!zk_read_buffer(
-            sock,
-            ctx,
-            CMD_ATTLOG_RRQ,
-            0,
-            attendance_chunk_bytes,
-            &data,
-            &len) ||
-        len < 4) {
-        ESP_LOGW(TAG, "Could not read attendance dump");
-        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
-        free(data);
-        xSemaphoreGive(g_ords_outbox_gate);
-        return false;
+    if (!historical) {
+        // Current truth must always observe a fresh terminal snapshot and is
+        // more important than retaining an overnight history cache.
+        history_dump_cache_clear();
     }
-    uint32_t total_size = read_le32(data);
-    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
-    uint32_t record_size = choose_zk_record_size(
-        total_size,
-        (uint32_t)records,
-        attendance_record_sizes,
-        sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
-    if (record_size == 0) {
-        ESP_LOGW(TAG, "Unsupported ZKT attendance table size total=%lu records=%ld", (unsigned long)total_size, (long)records);
-        free(data);
-        xSemaphoreGive(g_ords_outbox_gate);
-        return false;
-    }
-    uint32_t parsed_records = total_size / record_size;
-    int32_t verified_users = 0;
-    int32_t verified_records = 0;
-    if (!zk_get_counts(sock, ctx, &verified_users, &verified_records) ||
-        verified_users != (int32_t)users->count ||
-        verified_records != records ||
-        parsed_records != (uint32_t)records) {
-        ESP_LOGW(
-            TAG,
-            "ZKT attendance snapshot changed during read before=%ld parsed=%lu after=%ld; authoritative replacement aborted",
+    bool using_history_cache = historical &&
+        counts_refreshed &&
+        refreshed_users == (int32_t)users->count &&
+        history_dump_cache_is_usable(records);
+    if (using_history_cache) {
+        data = g_history_dump_cache;
+        len = g_history_dump_cache_len;
+        record_size = g_history_dump_cache_record_size;
+        records = g_history_dump_cache_records;
+        char cache_message[224];
+        snprintf(
+            cache_message,
+            sizeof(cache_message),
+            "Reusing verified historical ZKT snapshot records=%ld bytes=%u age_seconds=%lld; no terminal flash reread was requested",
             (long)records,
-            (unsigned long)parsed_records,
-            (long)verified_records);
-        if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
-        free(data);
-        xSemaphoreGive(g_ords_outbox_gate);
-        led_status_fault(LED_STATUS_TRUTH_REPAIR);
-        return false;
+            (unsigned)len,
+            (long long)((uptime_ms() - g_history_dump_cache_captured_ms) / 1000));
+        (void)add_connector_log(
+            "INFO",
+            "reconcile",
+            "HISTORY_DUMP_CACHE_REUSED",
+            cache_message);
+    } else {
+        if (historical && g_history_dump_cache != NULL) {
+            history_dump_cache_clear();
+        }
+        ESP_LOGI(TAG, "Requesting attendance dump records=%ld capturetype=%s", (long)records, capturetype);
+        uint32_t attendance_chunk_bytes = g_truth_use_recovery_chunks
+            ? ZKT_BUFFER_RECOVERY_CHUNK_BYTES
+            : ZKT_BUFFER_CHUNK_BYTES;
+        if (!zk_read_buffer(
+                sock,
+                ctx,
+                CMD_ATTLOG_RRQ,
+                0,
+                attendance_chunk_bytes,
+                &data,
+                &len) ||
+            len < 4) {
+            ESP_LOGW(TAG, "Could not read attendance dump");
+            if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
+            reconcile_dump_release(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            return false;
+        }
+        uint32_t total_size = read_le32(data);
+        static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+        record_size = choose_zk_record_size(
+            total_size,
+            (uint32_t)records,
+            attendance_record_sizes,
+            sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
+        if (record_size == 0) {
+            ESP_LOGW(TAG, "Unsupported ZKT attendance table size total=%lu records=%ld", (unsigned long)total_size, (long)records);
+            reconcile_dump_release(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            return false;
+        }
+        uint32_t parsed_records = total_size / record_size;
+        int32_t verified_users = 0;
+        int32_t verified_records = 0;
+        if (!zk_get_counts(sock, ctx, &verified_users, &verified_records) ||
+            verified_users != (int32_t)users->count ||
+            verified_records != records ||
+            parsed_records != (uint32_t)records) {
+            ESP_LOGW(
+                TAG,
+                "ZKT attendance snapshot changed during read before=%ld parsed=%lu after=%ld; authoritative replacement aborted",
+                (long)records,
+                (unsigned long)parsed_records,
+                (long)verified_records);
+            if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
+            reconcile_dump_release(data);
+            xSemaphoreGive(g_ords_outbox_gate);
+            led_status_fault(LED_STATUS_TRUTH_REPAIR);
+            return false;
+        }
+        if (historical) {
+            g_history_dump_cache = data;
+            g_history_dump_cache_len = len;
+            g_history_dump_cache_record_size = record_size;
+            g_history_dump_cache_records = records;
+            g_history_dump_cache_captured_ms = uptime_ms();
+            (void)add_connector_log(
+                "INFO",
+                "reconcile",
+                "HISTORY_DUMP_CACHE_VERIFIED",
+                "Verified append-only ZKT attendance snapshot retained in bounded PSRAM for this overnight historical sweep");
+        }
     }
     if (historical) {
         int oldest_year = 0;
@@ -3650,7 +3725,7 @@ static bool reconcile_attendance_dump(
                 filter_month,
                 &oldest_year,
                 &oldest_month)) {
-            free(data);
+            reconcile_dump_release(data);
             xSemaphoreGive(g_ords_outbox_gate);
             if (history_exhausted_out) *history_exhausted_out = true;
             return true;
@@ -3685,7 +3760,7 @@ static bool reconcile_attendance_dump(
                 filter_month,
                 &next_year,
                 &next_month)) {
-            free(data);
+            reconcile_dump_release(data);
             xSemaphoreGive(g_ords_outbox_gate);
             if (history_exhausted_out) *history_exhausted_out = true;
             return true;
@@ -3717,7 +3792,7 @@ static bool reconcile_attendance_dump(
                 g_history_cursor_month,
                 filter_year,
                 filter_month) >= 0) {
-            free(data);
+            reconcile_dump_release(data);
             xSemaphoreGive(g_ords_outbox_gate);
             if (history_exhausted_out) *history_exhausted_out = true;
             return true;
@@ -3748,7 +3823,7 @@ static bool reconcile_attendance_dump(
             filter_year,
             filter_month,
             filter_day_end);
-        free(data);
+        reconcile_dump_release(data);
         xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
@@ -3768,7 +3843,7 @@ static bool reconcile_attendance_dump(
         day_end);
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGW(TAG, "Skipping reconcile because attendance storage is busy");
-        free(data);
+        reconcile_dump_release(data);
         xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
@@ -3891,7 +3966,11 @@ static bool reconcile_attendance_dump(
             "TRUTH_SNAPSHOT_IMPLAUSIBLE",
             invalid_snapshot);
         if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
-        free(data);
+        if (data == g_history_dump_cache) {
+            history_dump_cache_clear();
+        } else {
+            reconcile_dump_release(data);
+        }
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
@@ -3976,7 +4055,11 @@ static bool reconcile_attendance_dump(
             "TRUTH_WINDOW_ALLOCATION_FAILED",
             allocation_failure);
         if (fresh_session_retryable_out) *fresh_session_retryable_out = true;
-        free(data);
+        if (data == g_history_dump_cache) {
+            history_dump_cache_clear();
+        } else {
+            reconcile_dump_release(data);
+        }
         led_status_fault(LED_STATUS_TRUTH_REPAIR);
         return false;
     }
@@ -4149,7 +4232,7 @@ static bool reconcile_attendance_dump(
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
-    free(data);
+    reconcile_dump_release(data);
     free(reconcile_events);
 
     if (truth_count != identity_mapped_count) {
@@ -4978,6 +5061,41 @@ static int compare_months(int left_year, int left_month, int right_year, int rig
     return 0;
 }
 
+static void history_dump_cache_clear(void)
+{
+    free(g_history_dump_cache);
+    g_history_dump_cache = NULL;
+    g_history_dump_cache_len = 0;
+    g_history_dump_cache_record_size = 0;
+    g_history_dump_cache_records = 0;
+    g_history_dump_cache_captured_ms = 0;
+}
+
+static bool history_dump_cache_is_usable(int32_t current_records)
+{
+    if (g_history_dump_cache == NULL || g_history_dump_cache_len < 4 ||
+        g_history_dump_cache_record_size == 0 ||
+        g_history_dump_cache_records <= 0 ||
+        current_records < g_history_dump_cache_records) {
+        return false;
+    }
+    int64_t age_ms = uptime_ms() - g_history_dump_cache_captured_ms;
+    return age_ms >= 0 && age_ms <= ZONE_LITE_HISTORY_DUMP_CACHE_MAX_AGE_MS;
+}
+
+static bool history_window_is_open(int64_t current_epoch)
+{
+    if (current_epoch <= 1700000000) return false;
+    time_t current_time = (time_t)current_epoch;
+    struct tm utc = {0};
+    gmtime_r(&current_time, &utc);
+    int start = ZONE_LITE_HISTORY_WINDOW_START_HOUR_UTC;
+    int end = ZONE_LITE_HISTORY_WINDOW_END_HOUR_UTC;
+    if (start == end) return true;
+    if (start < end) return utc.tm_hour >= start && utc.tm_hour < end;
+    return utc.tm_hour >= start || utc.tm_hour < end;
+}
+
 static void advance_month(int32_t *year, int32_t *month)
 {
     if (!year || !month) return;
@@ -5021,6 +5139,7 @@ static bool history_sweep_is_due(int64_t current_epoch)
 
 static void history_start_new_sweep(void)
 {
+    history_dump_cache_clear();
     g_history_backfill_pending = true;
     g_history_backfill_had_failures = false;
     g_history_cursor_year = 0;
@@ -5034,6 +5153,7 @@ static void history_start_new_sweep(void)
 
 static void history_finish_sweep(int64_t current_epoch)
 {
+    history_dump_cache_clear();
     g_history_backfill_pending = false;
     g_history_last_sweep_epoch = current_epoch > 1700000000 ? current_epoch : epoch_now();
     update_history_telemetry();
@@ -6984,6 +7104,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 continue;
             }
             last_reconcile = now_ms;
+            bool priority_reconcile_retry_scheduled = false;
             int32_t refreshed_users = 0;
             int32_t refreshed_records = 0;
             if (!zk_get_counts(sock, &ctx, &refreshed_users, &refreshed_records)) break;
@@ -7020,9 +7141,14 @@ static int64_t gateway_run(uint32_t host_order_ip)
             if (!g_history_backfill_pending && history_sweep_is_due(current_epoch)) {
                 history_start_new_sweep();
             }
+            bool historical_window_open = history_window_is_open(current_epoch);
+            if (!historical_window_open && g_history_dump_cache != NULL) {
+                history_dump_cache_clear();
+            }
             bool historical_reconcile = !counter_mismatch &&
                 !current_truth_due &&
-                g_history_backfill_pending;
+                g_history_backfill_pending &&
+                historical_window_open;
             bool truth_due = current_truth_due || historical_reconcile;
             bool reconcile_succeeded = true;
             if (counter_mismatch || truth_due) {
@@ -7138,6 +7264,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                             last_reconcile = uptime_ms() -
                                 ZONE_LITE_RECONCILE_INTERVAL_MS +
                                 ZKT_TRUTH_ORDS_GATE_RETRY_MS;
+                            priority_reconcile_retry_scheduled = true;
                         } else {
                             bool retry_with_fresh_session =
                                 !historical_reconcile &&
@@ -7262,6 +7389,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
             if (reconcile_succeeded) g_add_zkt.last_reconcile_epoch = epoch_now();
             add_connector_set_zkt(&g_add_zkt);
             add_connector_set_activity("LIVE_CAPTURE");
+            // A multi-megabyte truth pass can outlive the nominal interval.
+            // Measure the next cycle from completion so the live event loop
+            // always receives a full recovery interval between heavy scans.
+            if (!priority_reconcile_retry_scheduled) {
+                last_reconcile = uptime_ms();
+            }
             if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
             if (truth_retry_session) {
                 break;
