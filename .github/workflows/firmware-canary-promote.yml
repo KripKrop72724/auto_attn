@@ -168,10 +168,14 @@ jobs:
               $rows = @($devices.rows)
               if ($rows.Count -eq 1) {
                 $row = $rows[0]
+                $reportedFirmwareVersion = ([string]$row.firmware_version).Trim()
+                if ($reportedFirmwareVersion.StartsWith('zone-lite-')) {
+                  $reportedFirmwareVersion = $reportedFirmwareVersion.Substring(10)
+                }
                 $stable = (
                   ([string]$row.hardware_id).ToLowerInvariant() -eq $env:EXPECTED_MAC -and
                   $row.zone_id -eq $env:EXPECTED_ZONE -and
-                  $row.firmware_version -eq "zone-lite-$env:EXPECTED_VERSION" -and
+                  $reportedFirmwareVersion -eq $env:EXPECTED_VERSION -and
                   $row.state -eq 'ONLINE' -and
                   [bool]$row.connected -and
                   [bool]$row.ota_capable -and
