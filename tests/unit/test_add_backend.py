@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import nullcontext
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -21,6 +23,7 @@ from zk_add.crypto import (
     decrypt_json,
     decrypt_text,
     encrypt_cnic,
+    encrypt_text,
 )
 from zk_add.db import Base, SessionLocal
 from zk_add.identity import build_machine_name
@@ -44,6 +47,7 @@ from zk_add.models import (
     OracleReceipt,
     OrdsOutbox,
     TemporaryAdminLease,
+    TerminalRecordManifest,
     UserDeletionItem,
 )
 from zk_add.onboarding import derive_bootstrap_secret, verify_onboarding_signature
@@ -4112,6 +4116,115 @@ def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
     response = client.get("/api/v1/attendance?cnic=not-a-cnic")
     assert response.status_code == 422
     assert "13 digits" in response.json()["detail"]
+
+
+def test_source_exception_endpoints_require_step_up_audit_and_never_cache_raw(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    raw = b"\xff\xff\xff\xff\x00\x00\x00\x00"
+    exception = TerminalRecordManifest(
+        job_id=None,
+        chunk_id=None,
+        connector_id=connector.id,
+        zkt_device_id=connector.zkt_device.id,
+        terminal_serial=SERIAL,
+        generation=1,
+        ordinal=5043,
+        source_kind="TAIL",
+        canonical_source=True,
+        record_size=8,
+        raw_record_digest=hashlib.sha256(raw).hexdigest(),
+        terminal_record_key=hashlib.sha256(b"exception-5043").hexdigest(),
+        occurrence_index=1,
+        attendance_event_id=None,
+        disposition="INVALID_TIME",
+        protected_raw_record=encrypt_text(base64.b64encode(raw).decode()),
+        error_code="ZKT_TIMESTAMP_OUT_OF_RANGE",
+        raw_timestamp=0xFFFFFFFF,
+        observed_uid="7",
+        observed_user_id="1007",
+    )
+    db.add(exception)
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    headers = {"X-CSRF-Token": admin.csrf_token}
+
+    listing = client.get("/api/v1/source-exceptions")
+    assert listing.status_code == 200
+    listed = listing.json()["rows"][0]
+    assert listed["id"] == exception.id
+    assert listed["evidence_available"] is True
+    assert "protected_raw_record" not in listed
+    assert "raw_record_b64" not in listed
+
+    denied = client.post(
+        f"/api/v1/source-exceptions/{exception.id}/review",
+        json={
+            "reason": "Audit the immutable poison record evidence.",
+            "password": "wrong-password",
+            "idempotency_key": "source-review-api-0001",
+        },
+        headers=headers,
+    )
+    assert denied.status_code == 403
+
+    reviewed = client.post(
+        f"/api/v1/source-exceptions/{exception.id}/review",
+        json={
+            "reason": "Audit the immutable poison record evidence.",
+            "password": "correct-password",
+            "idempotency_key": "source-review-api-0001",
+        },
+        headers=headers,
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_state"] == "REVIEWED"
+
+    revealed = client.post(
+        f"/api/v1/source-exceptions/{exception.id}/reveal",
+        json={
+            "reason": "Inspect the original raw terminal timestamp bytes.",
+            "password": "correct-password",
+            "idempotency_key": "source-reveal-api-0001",
+        },
+        headers=headers,
+    )
+    assert revealed.status_code == 200
+    assert revealed.headers["cache-control"] == "no-store, max-age=0"
+    assert revealed.headers["pragma"] == "no-cache"
+    assert base64.b64decode(revealed.json()["raw_record_b64"]) == raw
+    repeated_reveal = client.post(
+        f"/api/v1/source-exceptions/{exception.id}/reveal",
+        json={
+            "reason": "Inspect the original raw terminal timestamp bytes.",
+            "password": "correct-password",
+            "idempotency_key": "source-reveal-api-0001",
+        },
+        headers=headers,
+    )
+    assert repeated_reveal.status_code == 200
+    actions = db.scalars(
+        select(AuditEvent.action).where(AuditEvent.target_id == str(exception.id))
+    ).all()
+    assert len(actions) == 2
+    actions = set(actions)
+    assert actions == {
+        "TERMINAL_SOURCE_EXCEPTION_REVIEWED",
+        "TERMINAL_SOURCE_EXCEPTION_REVEALED",
+    }
 
 
 def test_firmware_control_reason_is_rejected_before_database_overflow(db: Session):

@@ -141,12 +141,82 @@ export interface ReconciliationPreflight {
 export interface ReconciliationCoverage {
   coverage_id: string
   certified_source_cursor: number
+  source_committed_cursor: number
+  source_committed_chain_digest: string
+  tail_exception_count: number
+  tail_last_committed_at: string | null
   capture_state: string
   oracle_state: string
   active: boolean
   captured_at: string
   oracle_certified_at: string | null
   invalidated_reason: string | null
+  source_ledger_count?: number
+  source_ledger_complete?: boolean
+  terminal_source_parity?: boolean
+  chain_continuous?: boolean
+}
+
+export interface SourceExceptionReview {
+  review_id: string
+  state: 'REVIEWED'
+  reason: string
+  actor: string
+  created_at: string
+}
+
+export interface SourceException {
+  id: number
+  connector_id: string | null
+  device_id: string | null
+  display_name: string | null
+  zone_id: string | null
+  terminal_serial: string
+  terminal_generation: number
+  ordinal: number
+  source_kind: 'BASELINE' | 'TAIL'
+  record_size: number | null
+  disposition: 'INVALID_TIME' | 'MALFORMED'
+  error_code: string | null
+  raw_timestamp: number | null
+  observed_uid: string | null
+  observed_user_id: string | null
+  raw_record_digest: string
+  evidence_available: boolean
+  terminal_record_key: string
+  attendance_event_id: number | null
+  observed_at: string
+  review_state: 'OPEN' | 'REVIEWED'
+  reviewed_at: string | null
+  reviewed_by: string | null
+  review_reason: string | null
+  source_committed_cursor: number
+  cursor_advanced: boolean
+  oracle_action: 'EXCLUDED_FAIL_CLOSED'
+  reviews?: SourceExceptionReview[]
+}
+
+export interface SourceExceptionTotals {
+  all: number
+  open: number
+  reviewed: number
+  invalid_time: number
+  malformed: number
+  affected_terminals: number
+}
+
+export interface SourceExceptionList {
+  totals: SourceExceptionTotals
+  rows: SourceException[]
+  next_cursor: number | null
+}
+
+export interface SourceExceptionReveal {
+  id: number
+  raw_record_b64: string
+  raw_record_hex: string
+  raw_record_digest: string
+  record_size: number | null
 }
 
 export interface ReconciliationJob {

@@ -33,6 +33,37 @@ const device = {
   },
 }
 
+const sourceException = {
+  id: 1,
+  connector_id: device.connector_id,
+  device_id: device.device_id,
+  display_name: device.display_name,
+  zone_id: device.zone_id,
+  terminal_serial: device.zkt.serial,
+  terminal_generation: 2,
+  ordinal: 5043,
+  source_kind: 'TAIL',
+  record_size: 40,
+  disposition: 'INVALID_TIME',
+  error_code: 'IMPLAUSIBLE_TERMINAL_TIME',
+  raw_timestamp: 4294967295,
+  observed_uid: '7',
+  observed_user_id: '1007',
+  raw_record_digest: 'd'.repeat(64),
+  evidence_available: true,
+  terminal_record_key: 'e'.repeat(64),
+  attendance_event_id: null,
+  observed_at: '2026-08-06T10:00:00Z',
+  review_state: 'OPEN',
+  reviewed_at: null,
+  reviewed_by: null,
+  review_reason: null,
+  source_committed_cursor: 5082,
+  cursor_advanced: true,
+  oracle_action: 'EXCLUDED_FAIL_CLOSED',
+  reviews: [],
+}
+
 async function mockDashboard(page: Page) {
   await page.route('**/events/**', (route) => route.abort())
   await page.route('**/api/**', async (route) => {
@@ -48,6 +79,12 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/attendance') json = { rows: [], next_cursor: null }
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', hil_target_mac: null }] }
     else if (url.pathname === '/api/v1/firmware/campaigns') json = { enabled: true, hil_enabled: false, rows: [] }
+    else if (url.pathname === '/api/v1/reconciliations') json = { enabled: true, scheduler: { policy: 'BOUNDED_PARALLEL_PER_DEVICE', device_concurrency: 6, active_scan_jobs: 0, waiting_scan_jobs: 0, available_scan_slots: 6 }, rows: [] }
+    else if (url.pathname.endsWith('/reconciliations/preflight')) json = { eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [], connector: { connector_id: device.connector_id, device_id: device.device_id, display_name: device.display_name, zone_id: device.zone_id, connected: true, firmware_version: device.firmware_version }, terminal: { serial: device.zkt.serial, attendance_count: 42, user_count: 1, connection_state: 'ONLINE', identity_snapshot_revision: 1, range_resume_verified: true }, coverage: null }
+    else if (url.pathname === '/api/v1/source-exceptions/1/review') json = { ...sourceException, review_state: 'REVIEWED', reviewed_at: '2026-08-06T10:10:00Z', reviewed_by: 'StateHealthAdmin', review_reason: 'Reviewed immutable source evidence.', reviews: [{ review_id: 'review-one', state: 'REVIEWED', reason: 'Reviewed immutable source evidence.', actor: 'StateHealthAdmin', created_at: '2026-08-06T10:10:00Z' }] }
+    else if (url.pathname === '/api/v1/source-exceptions/1/reveal') json = { id: 1, raw_record_b64: '//////////8=', raw_record_hex: 'ffffffffffffffff', raw_record_digest: sourceException.raw_record_digest, record_size: 40 }
+    else if (url.pathname === '/api/v1/source-exceptions/1') json = sourceException
+    else if (url.pathname === '/api/v1/source-exceptions') json = { totals: { all: 1, open: 1, reviewed: 0, invalid_time: 1, malformed: 0, affected_terminals: 1 }, rows: [sourceException], next_cursor: null }
     else if (url.pathname.includes('/historical-identities')) json = { totals: { unresolved_events: 0, blocked_identity: 0, quarantined_identity_reuse: 0, unassigned_events: 0, actionable_event_groups: 0 }, rows: [], unassigned_groups: [] }
     else if (url.pathname.includes('/identity-conflicts')) json = { raw_duplicate_groups: 0, resolved_groups: 0, unresolved_groups: 0, groups: [], evidence_scope: { add_attendance_count: 0, terminal_attendance_count: 0, attendance_coverage_percent: 0 } }
     else if (url.pathname.includes('/user-deletion-jobs/latest')) json = { job: null }
@@ -85,4 +122,26 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Alerts and exceptions' })).toBeVisible()
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
+})
+
+test('source exception inspector is responsive, keyboard-operable, and fail-closed', async ({ page }) => {
+  await page.goto('/reconciliation')
+  await expect(page.getByRole('heading', { name: 'Start-of-time reconciliation' })).toBeVisible()
+  await page.getByRole('tab', { name: /Source exceptions/ }).click()
+  await expect(page.getByRole('heading', { name: 'Terminal source exceptions' })).toBeVisible()
+  await expect(page.getByText('IMPLAUSIBLE_TERMINAL_TIME')).toBeVisible()
+  await page.getByRole('button', { name: /Inspect source exception ordinal 5043/ }).focus()
+  await page.keyboard.press('Enter')
+  const drawer = page.getByRole('dialog', { name: 'Terminal source exception' })
+  await expect(drawer).toBeVisible()
+  await expect(drawer.getByText('Excluded from attendance and Oracle')).toBeVisible()
+  await expect(drawer.getByText(/valid punches after this row can continue/)).toBeVisible()
+  await drawer.getByLabel('Audited reason').fill('Inspect immutable source bytes for incident review.')
+  await drawer.getByLabel('Administrator password').fill('not-recorded-by-test')
+  await drawer.getByRole('button', { name: 'Reveal raw evidence' }).click()
+  await expect(drawer.getByText('ffffffffffffffff')).toBeVisible()
+  const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
 })

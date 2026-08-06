@@ -819,17 +819,38 @@ class TerminalRecordManifest(Base):
         UniqueConstraint(
             "job_id", "generation", "ordinal", name="uq_add_terminal_record_ordinal"
         ),
+        Index(
+            "uq_add_terminal_source_ordinal",
+            "zkt_device_id",
+            "generation",
+            "ordinal",
+            unique=True,
+            postgresql_where=text("canonical_source = true"),
+            sqlite_where=text("canonical_source = 1"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    job_id: Mapped[int] = mapped_column(
+    job_id: Mapped[int | None] = mapped_column(
         ForeignKey("add_reconciliation_jobs.id"), index=True
     )
-    chunk_id: Mapped[int] = mapped_column(
+    chunk_id: Mapped[int | None] = mapped_column(
         ForeignKey("add_reconciliation_chunks.id"), index=True
     )
+    connector_id: Mapped[int] = mapped_column(
+        ForeignKey("add_connectors.id"), index=True
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    terminal_serial: Mapped[str] = mapped_column(String(120), index=True)
     generation: Mapped[int] = mapped_column(Integer)
     ordinal: Mapped[int] = mapped_column(Integer)
+    source_kind: Mapped[str] = mapped_column(
+        String(30), default="BASELINE", index=True
+    )
+    canonical_source: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    record_size: Mapped[int | None] = mapped_column(Integer)
     raw_record_digest: Mapped[str] = mapped_column(String(64), index=True)
     terminal_record_key: Mapped[str] = mapped_column(String(64), index=True)
     occurrence_index: Mapped[int] = mapped_column(Integer, default=1)
@@ -839,6 +860,63 @@ class TerminalRecordManifest(Base):
     disposition: Mapped[str] = mapped_column(String(50), index=True)
     protected_raw_record: Mapped[str | None] = mapped_column(Text)
     error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    raw_timestamp: Mapped[int | None] = mapped_column(BigInteger)
+    observed_uid: Mapped[str | None] = mapped_column(String(40), index=True)
+    observed_user_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class SourceTailChunk(Base):
+    __tablename__ = "add_source_tail_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "coverage_id", "generation", "start_ordinal", name="uq_add_source_tail_start"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    coverage_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_coverage.id"), index=True
+    )
+    connector_id: Mapped[int] = mapped_column(
+        ForeignKey("add_connectors.id"), index=True
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    generation: Mapped[int] = mapped_column(Integer)
+    start_ordinal: Mapped[int] = mapped_column(Integer)
+    end_ordinal: Mapped[int] = mapped_column(Integer)
+    latest_terminal_count: Mapped[int] = mapped_column(Integer)
+    record_count: Mapped[int] = mapped_column(Integer)
+    chunk_digest: Mapped[str] = mapped_column(String(64), index=True)
+    previous_chain_digest: Mapped[str] = mapped_column(String(64))
+    resulting_chain_digest: Mapped[str] = mapped_column(String(64), index=True)
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
+    exception_count: Mapped[int] = mapped_column(Integer, default=0)
+    committed_at: Mapped[datetime] = utc_column()
+
+
+class TerminalRecordReview(Base):
+    __tablename__ = "add_terminal_record_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "manifest_id", "idempotency_key", name="uq_add_terminal_record_review_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("add_terminal_record_manifest.id"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(30), default="REVIEWED", index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
     created_at: Mapped[datetime] = utc_column()
 
 
@@ -868,6 +946,14 @@ class ReconciliationCoverage(Base):
     terminal_generation: Mapped[int] = mapped_column(Integer)
     certified_source_cursor: Mapped[int] = mapped_column(Integer)
     source_chain_digest: Mapped[str] = mapped_column(String(64))
+    source_committed_cursor: Mapped[int] = mapped_column(Integer, default=0)
+    source_committed_chain_digest: Mapped[str] = mapped_column(
+        String(64), default="0" * 64
+    )
+    tail_exception_count: Mapped[int] = mapped_column(Integer, default=0)
+    tail_last_committed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     capture_state: Mapped[str] = mapped_column(String(50), index=True)
     oracle_state: Mapped[str] = mapped_column(String(50), index=True)
     capture_evidence: Mapped[dict] = mapped_column(JSON, default=dict)

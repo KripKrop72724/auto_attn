@@ -23,6 +23,7 @@ from zk_add.models import (
     ReconciliationCoverage,
     ReconciliationEvent,
     ReconciliationJob,
+    SourceTailChunk,
     TemporaryAdminLease,
     TerminalRecordManifest,
     ZKTDevice,
@@ -32,6 +33,7 @@ from zk_add.schemas import (
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
+    SourceTailChunkRequest,
 )
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
@@ -178,6 +180,44 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
                     "message": "Waiting for the temporary administrator lease to be safely revoked.",
                 }
             )
+    coverage = active_coverage(session, zkt) if zkt else None
+    coverage_payload = serialize_coverage(coverage)
+    if coverage is not None and coverage_payload is not None:
+        source_count, first_ordinal, last_ordinal = session.execute(
+            select(
+                func.count(TerminalRecordManifest.id),
+                func.min(TerminalRecordManifest.ordinal),
+                func.max(TerminalRecordManifest.ordinal),
+            ).where(
+                TerminalRecordManifest.zkt_device_id == coverage.zkt_device_id,
+                TerminalRecordManifest.generation == coverage.terminal_generation,
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.ordinal < coverage.source_committed_cursor,
+            )
+        ).one()
+        cursor = coverage.source_committed_cursor
+        ledger_complete = (
+            int(source_count or 0) == cursor
+            and (
+                cursor == 0
+                or (first_ordinal == 0 and last_ordinal == cursor - 1)
+            )
+        )
+        coverage_payload.update(
+            {
+                "source_ledger_count": int(source_count or 0),
+                "source_ledger_complete": ledger_complete,
+                "terminal_source_parity": bool(
+                    zkt is not None
+                    and zkt.attendance_count is not None
+                    and cursor == zkt.attendance_count
+                ),
+                "chain_continuous": bool(
+                    coverage.active
+                    and len(coverage.source_committed_chain_digest or "") == 64
+                ),
+            }
+        )
     return {
         "eligible": not hard,
         "ready_now": not hard and not waitable,
@@ -204,7 +244,7 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
                 (zkt.capability_profile or {}).get(RANGE_RESUME_CAPABILITY)
             ),
         },
-        "coverage": serialize_coverage(active_coverage(session, zkt)) if zkt else None,
+        "coverage": coverage_payload,
     }
 
 
@@ -432,7 +472,7 @@ def apply_reconciliation_chunk(
     *,
     connector: Connector,
     payload: ReconciliationChunkRequest,
-) -> tuple[ReconciliationJob, ReconciliationChunk, bool]:
+) -> tuple[ReconciliationJob, ReconciliationChunk | None, bool]:
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
     if job.cutoff_count is None or job.record_size is None:
@@ -506,6 +546,46 @@ def apply_reconciliation_chunk(
     if payload.resulting_chain_digest != expected_result:
         raise ValueError("Resulting chunk chain digest is invalid.")
 
+    existing_source_rows = {
+        row.ordinal: row
+        for row in session.scalars(
+            select(TerminalRecordManifest).where(
+                TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+                TerminalRecordManifest.generation == payload.generation,
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.ordinal >= payload.start_ordinal,
+                TerminalRecordManifest.ordinal < payload.end_ordinal,
+            )
+        ).all()
+    }
+    for source in payload.records:
+        prior = existing_source_rows.get(source.ordinal)
+        if prior is None:
+            continue
+        prior_parsed = prior.disposition in {
+            "EVENT",
+            "BLOCKED_IDENTITY",
+            "TERMINAL_DUPLICATE",
+        }
+        source_parsed = source.disposition in {"EVENT", "BLOCKED_IDENTITY"}
+        if (
+            prior.raw_record_digest != source.raw_record_digest
+            or prior.terminal_record_key != source.terminal_record_key
+            or prior.occurrence_index != source.occurrence_index
+            or prior_parsed != source_parsed
+            or (
+                not prior_parsed
+                and prior.disposition != source.disposition
+            )
+        ):
+            _safety_hold(
+                session,
+                job,
+                "COMMITTED_SOURCE_ORDINAL_DIVERGED",
+                "A previously committed terminal ordinal changed during a repeated full-history scan.",
+            )
+            return job, None, False
+
     from zk_add.service import ingest_attendance
 
     attendance = [row.event for row in payload.records if row.event is not None]
@@ -541,23 +621,45 @@ def apply_reconciliation_chunk(
     blocked = 0
     quarantined = 0
     terminal_duplicates = 0
+    current_terminal_keys = [row.terminal_record_key for row in payload.records]
+    seen_terminal_keys = set(
+        session.scalars(
+            select(TerminalRecordManifest.terminal_record_key).where(
+                TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+                TerminalRecordManifest.generation == payload.generation,
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.ordinal < payload.start_ordinal,
+                TerminalRecordManifest.terminal_record_key.in_(current_terminal_keys),
+            )
+        ).all()
+    )
     for source in payload.records:
         event = events_by_uid.get(source.event.event_uid) if source.event else None
         disposition = source.disposition
-        if event and event.ords_status == "BLOCKED_IDENTITY":
+        if event and source.terminal_record_key in seen_terminal_keys:
+            disposition = "TERMINAL_DUPLICATE"
+        elif event and event.ords_status == "BLOCKED_IDENTITY":
             disposition = "BLOCKED_IDENTITY"
+        seen_terminal_keys.add(source.terminal_record_key)
         if disposition == "BLOCKED_IDENTITY":
             blocked += 1
         if disposition in {"INVALID_TIME", "MALFORMED"}:
             quarantined += 1
         if disposition == "TERMINAL_DUPLICATE":
             terminal_duplicates += 1
-        session.add(
-            TerminalRecordManifest(
+        prior = existing_source_rows.get(source.ordinal)
+        if prior is None:
+            session.add(TerminalRecordManifest(
                 job_id=job.id,
                 chunk_id=chunk.id,
+                connector_id=connector.id,
+                zkt_device_id=job.zkt_device_id,
+                terminal_serial=job.terminal_serial or "unknown",
                 generation=payload.generation,
                 ordinal=source.ordinal,
+                source_kind="BASELINE",
+                canonical_source=True,
+                record_size=job.record_size,
                 raw_record_digest=source.raw_record_digest,
                 terminal_record_key=source.terminal_record_key,
                 occurrence_index=source.occurrence_index,
@@ -565,8 +667,10 @@ def apply_reconciliation_chunk(
                 disposition=disposition,
                 protected_raw_record=encrypt_text(source.raw_record_b64),
                 error_code=source.error_code,
-            )
-        )
+                raw_timestamp=source.raw_timestamp,
+                observed_uid=source.observed_uid,
+                observed_user_id=source.observed_user_id,
+            ))
     chunk.accepted_count = len(accepted_uids)
     chunk.already_present_count = len(duplicate_uids)
     chunk.blocked_identity_count = blocked
@@ -672,8 +776,10 @@ def apply_reconciliation_manifest(
         )
     manifest_count = session.scalar(
         select(func.count(TerminalRecordManifest.id)).where(
-            TerminalRecordManifest.job_id == job.id,
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
             TerminalRecordManifest.generation == payload.generation,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.ordinal < payload.cutoff_count,
         )
     ) or 0
     if manifest_count != payload.cutoff_count:
@@ -718,6 +824,9 @@ def apply_reconciliation_manifest(
         terminal_generation=job.terminal_generation,
         certified_source_cursor=payload.cutoff_count,
         source_chain_digest=payload.final_chain_digest,
+        source_committed_cursor=payload.cutoff_count,
+        source_committed_chain_digest=payload.final_chain_digest,
+        tail_exception_count=0,
         capture_state=capture_state,
         oracle_state="ORACLE_MEMBERSHIP_PENDING",
         capture_evidence=evidence,
@@ -740,11 +849,284 @@ def apply_reconciliation_manifest(
     return refresh_reconciliation_assurance(session, job)
 
 
+def _invalidate_tail_coverage(
+    session: Session,
+    *,
+    connector: Connector,
+    coverage: ReconciliationCoverage,
+    code: str,
+    message: str,
+) -> None:
+    """Persist a source-evidence divergence instead of losing it to rollback."""
+
+    now = utc_now()
+    coverage.active = False
+    coverage.capture_state = "SOURCE_COVERAGE_INVALIDATED"
+    coverage.invalidated_reason = code
+    coverage.invalidated_at = now
+    coverage.updated_at = now
+    job = session.get(ReconciliationJob, coverage.job_id)
+    if job is not None:
+        job.status = "INVALIDATED"
+        job.phase = "WAITING_FOR_SAFE_WINDOW"
+        job.wait_reason = code
+        job.error_code = code
+        job.error_message = message
+        job.updated_at = now
+        _event(session, job, "COVERAGE_INVALIDATED", {"reason": code})
+    from zk_add.service import upsert_alert
+
+    upsert_alert(
+        session,
+        connector,
+        code="ADD_SOURCE_COVERAGE_INVALIDATED",
+        severity="CRITICAL",
+        message=message,
+        details={"failure_category": code},
+    )
+
+
+def apply_source_tail_chunk(
+    session: Session,
+    *,
+    connector: Connector,
+    payload: SourceTailChunkRequest,
+) -> tuple[ReconciliationCoverage, SourceTailChunk | None, bool, str | None]:
+    """Atomically commit a contiguous terminal tail, including poison rows.
+
+    The caller must send an ACK only after the surrounding transaction commits.
+    Content dispositions never fail the batch; only evidence/cursor divergence
+    invalidates source coverage.
+    """
+
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise ValueError("Connector has no assigned ZKT terminal.")
+    coverage = session.scalar(
+        select(ReconciliationCoverage)
+        .where(
+            ReconciliationCoverage.zkt_device_id == zkt.id,
+            ReconciliationCoverage.active == True,  # noqa: E712
+        )
+        .with_for_update()
+    )
+    if coverage is None:
+        raise ValueError("Terminal has no active certified source coverage.")
+
+    def invalidate(code: str, message: str):
+        _invalidate_tail_coverage(
+            session,
+            connector=connector,
+            coverage=coverage,
+            code=code,
+            message=message,
+        )
+        return coverage, None, False, code
+
+    if (
+        payload.terminal_serial != coverage.terminal_serial
+        or payload.terminal_generation != coverage.terminal_generation
+    ):
+        return invalidate(
+            "SOURCE_TAIL_GENERATION_DIVERGED",
+            "Terminal identity changed while extending certified source coverage.",
+        )
+    committed_cursor = coverage.source_committed_cursor
+    committed_chain = coverage.source_committed_chain_digest
+    existing = session.scalar(
+        select(SourceTailChunk).where(
+            SourceTailChunk.coverage_id == coverage.id,
+            SourceTailChunk.generation == payload.terminal_generation,
+            SourceTailChunk.start_ordinal == payload.start_ordinal,
+        )
+    )
+    if existing is not None:
+        if (
+            existing.end_ordinal != payload.end_ordinal
+            or existing.chunk_digest != payload.chunk_digest
+            or existing.resulting_chain_digest != payload.resulting_chain_digest
+        ):
+            return invalidate(
+                "SOURCE_TAIL_REPLAY_DIVERGED",
+                "A replayed terminal tail range no longer matched its committed evidence.",
+            )
+        return coverage, existing, True, None
+    if payload.latest_terminal_count < committed_cursor:
+        return invalidate(
+            "SOURCE_TAIL_COUNT_REGRESSION",
+            "Terminal attendance count regressed below ADD's committed source cursor.",
+        )
+    if payload.start_ordinal != committed_cursor:
+        return invalidate(
+            "SOURCE_TAIL_CURSOR_DIVERGED",
+            "Terminal tail did not begin at ADD's exact committed source cursor.",
+        )
+    for source in payload.records:
+        try:
+            raw_record = base64.b64decode(source.raw_record_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return invalidate(
+                "SOURCE_TAIL_EVIDENCE_INVALID",
+                "Terminal tail contained invalid protected source evidence.",
+            )
+        if (
+            len(raw_record) != payload.record_size
+            or hashlib.sha256(raw_record).hexdigest() != source.raw_record_digest
+        ):
+            return invalidate(
+                "SOURCE_TAIL_EVIDENCE_INVALID",
+                "Terminal tail raw evidence did not match its declared record layout or digest.",
+            )
+    canonical_digest = reconciliation_chunk_digest(payload)
+    if canonical_digest != payload.chunk_digest:
+        return invalidate(
+            "SOURCE_TAIL_CHUNK_DIGEST_DIVERGED",
+            "Terminal tail canonical digest did not match its source records.",
+        )
+    if payload.previous_chain_digest != committed_chain:
+        return invalidate(
+            "SOURCE_TAIL_CHAIN_DIVERGED",
+            "Terminal tail did not continue from ADD's committed source chain.",
+        )
+    expected_result = reconciliation_chain_digest(
+        committed_chain,
+        start_ordinal=payload.start_ordinal,
+        end_ordinal=payload.end_ordinal,
+        chunk_digest=payload.chunk_digest,
+    )
+    if payload.resulting_chain_digest != expected_result:
+        return invalidate(
+            "SOURCE_TAIL_CHAIN_DIVERGED",
+            "Terminal tail resulting chain digest was invalid.",
+        )
+
+    from zk_add.service import ingest_attendance, upsert_alert
+
+    attendance = [row.event for row in payload.records if row.event is not None]
+    if attendance:
+        ingest_attendance(session, connector=connector, events=attendance)
+    session.flush()
+    event_uids = [row.event.event_uid for row in payload.records if row.event]
+    events_by_uid = (
+        {
+            row.event_uid: row
+            for row in session.scalars(
+                select(AttendanceEvent).where(AttendanceEvent.event_uid.in_(event_uids))
+            ).all()
+        }
+        if event_uids
+        else {}
+    )
+    chunk = SourceTailChunk(
+        coverage_id=coverage.id,
+        connector_id=connector.id,
+        zkt_device_id=zkt.id,
+        generation=payload.terminal_generation,
+        start_ordinal=payload.start_ordinal,
+        end_ordinal=payload.end_ordinal,
+        latest_terminal_count=payload.latest_terminal_count,
+        record_count=len(payload.records),
+        chunk_digest=payload.chunk_digest,
+        previous_chain_digest=payload.previous_chain_digest,
+        resulting_chain_digest=payload.resulting_chain_digest,
+    )
+    session.add(chunk)
+    session.flush()
+    blocked = 0
+    exceptions = 0
+    event_count = 0
+    current_terminal_keys = [row.terminal_record_key for row in payload.records]
+    seen_terminal_keys = set(
+        session.scalars(
+            select(TerminalRecordManifest.terminal_record_key).where(
+                TerminalRecordManifest.zkt_device_id == zkt.id,
+                TerminalRecordManifest.generation == payload.terminal_generation,
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.ordinal < payload.start_ordinal,
+                TerminalRecordManifest.terminal_record_key.in_(current_terminal_keys),
+            )
+        ).all()
+    )
+    for source in payload.records:
+        event = events_by_uid.get(source.event.event_uid) if source.event else None
+        disposition = source.disposition
+        if event is not None:
+            event_count += 1
+            if source.terminal_record_key in seen_terminal_keys:
+                disposition = "TERMINAL_DUPLICATE"
+            elif event.ords_status == "BLOCKED_IDENTITY":
+                disposition = "BLOCKED_IDENTITY"
+        seen_terminal_keys.add(source.terminal_record_key)
+        if disposition == "BLOCKED_IDENTITY":
+            blocked += 1
+        if disposition in {"INVALID_TIME", "MALFORMED"}:
+            exceptions += 1
+        session.add(
+            TerminalRecordManifest(
+                job_id=None,
+                chunk_id=None,
+                connector_id=connector.id,
+                zkt_device_id=zkt.id,
+                terminal_serial=coverage.terminal_serial,
+                generation=payload.terminal_generation,
+                ordinal=source.ordinal,
+                source_kind="TAIL",
+                canonical_source=True,
+                record_size=payload.record_size,
+                raw_record_digest=source.raw_record_digest,
+                terminal_record_key=source.terminal_record_key,
+                occurrence_index=source.occurrence_index,
+                attendance_event_id=event.id if event else None,
+                disposition=disposition,
+                protected_raw_record=encrypt_text(source.raw_record_b64),
+                error_code=source.error_code,
+                raw_timestamp=source.raw_timestamp,
+                observed_uid=source.observed_uid,
+                observed_user_id=source.observed_user_id,
+            )
+        )
+    chunk.event_count = event_count
+    chunk.blocked_identity_count = blocked
+    chunk.exception_count = exceptions
+    now = utc_now()
+    coverage.source_committed_cursor = payload.end_ordinal
+    coverage.source_committed_chain_digest = payload.resulting_chain_digest
+    coverage.tail_exception_count += exceptions
+    coverage.tail_last_committed_at = now
+    coverage.updated_at = now
+    if exceptions:
+        coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"
+        upsert_alert(
+            session,
+            connector,
+            code="TERMINAL_SOURCE_EXCEPTION",
+            severity="HIGH",
+            message=(
+                "ADD preserved invalid or malformed terminal source rows and safely "
+                "continued reconciliation."
+            ),
+            details={
+                "failure_category": "TERMINAL_SOURCE_EXCEPTION",
+                "exception_count": coverage.tail_exception_count,
+                "last_start_ordinal": payload.start_ordinal,
+                "last_end_ordinal": payload.end_ordinal,
+                "inspector_path": (
+                    "/reconciliation?tab=source-exceptions&device_id="
+                    f"{connector.connector_id}"
+                ),
+            },
+        )
+    return coverage, chunk, False, None
+
+
 def refresh_reconciliation_assurance(
     session: Session, job: ReconciliationJob
 ) -> ReconciliationJob:
     manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
-        TerminalRecordManifest.job_id == job.id,
+        TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+        TerminalRecordManifest.generation == job.terminal_generation,
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
         TerminalRecordManifest.attendance_event_id.is_not(None),
     ).distinct()
     events = session.scalars(
@@ -926,8 +1308,9 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
         if job.committed_next_ordinal > 0:
             predecessor = session.scalar(
                 select(TerminalRecordManifest).where(
-                    TerminalRecordManifest.job_id == job.id,
+                    TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
                     TerminalRecordManifest.generation == job.terminal_generation,
+                    TerminalRecordManifest.canonical_source == True,  # noqa: E712
                     TerminalRecordManifest.ordinal == job.committed_next_ordinal - 1,
                 )
             )
@@ -1126,6 +1509,10 @@ def serialize_coverage(row: ReconciliationCoverage | None) -> dict | None:
         "terminal_generation": row.terminal_generation,
         "certified_source_cursor": row.certified_source_cursor,
         "source_chain_digest": row.source_chain_digest,
+        "source_committed_cursor": row.source_committed_cursor,
+        "source_committed_chain_digest": row.source_committed_chain_digest,
+        "tail_exception_count": row.tail_exception_count,
+        "tail_last_committed_at": row.tail_last_committed_at,
         "capture_state": row.capture_state,
         "oracle_state": row.oracle_state,
         "capture_evidence": row.capture_evidence,

@@ -175,6 +175,9 @@ class ReconciliationSourceRecord(BaseModel):
     event: AttendanceEventIn | None = None
     raw_record_b64: str = Field(min_length=4, max_length=512)
     error_code: str | None = Field(default=None, max_length=120)
+    raw_timestamp: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    observed_uid: str | None = Field(default=None, max_length=40)
+    observed_user_id: str | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def validate_record_evidence(self):
@@ -221,6 +224,42 @@ class ReconciliationManifestRequest(BaseModel):
     final_chain_digest: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+
+
+class SourceTailChunkRequest(BaseModel):
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    terminal_generation: int = Field(ge=1)
+    record_size: Literal[8, 16, 40]
+    start_ordinal: int = Field(ge=0)
+    end_ordinal: int = Field(ge=1)
+    latest_terminal_count: int = Field(ge=1)
+    chunk_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    previous_chain_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    resulting_chain_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    records: list[ReconciliationSourceRecord] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_contiguous_tail(self):
+        if self.end_ordinal - self.start_ordinal != len(self.records):
+            raise ValueError("Tail range must exactly match its record count")
+        if self.end_ordinal > self.latest_terminal_count:
+            raise ValueError("Tail range cannot exceed the observed terminal count")
+        expected = list(range(self.start_ordinal, self.end_ordinal))
+        if [row.ordinal for row in self.records] != expected:
+            raise ValueError("Tail records must be ordered and contiguous")
+        return self
+
+
+class SourceExceptionActionRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
 
 
 class ReconciliationAssignmentReleaseRequest(BaseModel):

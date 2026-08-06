@@ -67,6 +67,23 @@ typedef struct {
 } add_reconcile_chunk_ack_t;
 
 typedef struct {
+    char terminal_serial[80];
+    char resulting_chain_digest[65];
+    uint32_t terminal_generation;
+    uint32_t committed_next_ordinal;
+    uint32_t exception_count;
+    bool valid;
+} add_source_tail_ack_t;
+
+typedef struct {
+    char terminal_serial[80];
+    char committed_chain_digest[65];
+    uint32_t terminal_generation;
+    uint32_t committed_next_ordinal;
+    bool active;
+} add_source_coverage_t;
+
+typedef struct {
     bool online;
     char connection_state[24];
     char ip_address[16];
@@ -113,6 +130,7 @@ void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
 bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out);
 bool add_connector_has_reconcile_assignment(void);
+bool add_connector_take_source_coverage(add_source_coverage_t *out);
 void add_connector_command_retry(const char *command_id);
 bool add_connector_command_complete(const char *command_id);
 bool add_connector_persist_command_tombstone(const add_command_t *command);
@@ -140,6 +158,10 @@ bool add_connector_send_reconcile_chunk_acknowledged(
     const char *payload_json,
     uint32_t timeout_ms,
     add_reconcile_chunk_ack_t *ack_out);
+bool add_connector_send_source_tail_acknowledged(
+    const char *payload_json,
+    uint32_t timeout_ms,
+    add_source_tail_ack_t *ack_out);
 bool add_connector_enqueue_attendance(const char *payload_json);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);

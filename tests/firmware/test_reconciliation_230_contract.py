@@ -8,10 +8,11 @@ CONNECTOR_HEADER = (ROOT / "firmware/zone_lite/main/add_connector.h").read_text(
 PROJECT = (ROOT / "firmware/zone_lite/CMakeLists.txt").read_text()
 HIL_GATE = (ROOT / "firmware/zone_lite/tools/run_ota_hil_gate.py").read_text()
 WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
+RECONCILIATION = (ROOT / "apps/add_backend/zk_add/reconciliation.py").read_text()
 
 
 def test_242_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.2)" in PROJECT
+    assert "project(zone_lite VERSION 2.4.3)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -55,6 +56,21 @@ def test_certified_baseline_switches_to_bounded_append_tail_audits():
     assert "CURRENT_TAIL_CHECKPOINT_RETRY" in ZONE
 
 
+def test_243_tail_uses_one_signed_source_protocol_and_advances_past_poison_rows():
+    assert "append_terminal_source_record" in ZONE
+    assert '"source_tail_chunk"' in CONNECTOR
+    assert '"source_tail_ack"' in CONNECTOR
+    assert '"INVALID_TIME"' in ZONE
+    assert '"MALFORMED"' in ZONE
+    assert '"TERMINAL_DUPLICATE"' in RECONCILIATION
+    assert "free(raw);" in ZONE
+    assert "add_connector_send_source_tail_acknowledged" in ZONE
+    assert "ack.committed_next_ordinal == end" in ZONE
+    assert "g_add_source_coverage_cursor = end" in ZONE
+    assert "CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED" in ZONE
+    assert "later punches remain unblocked" in ZONE
+
+
 def test_final_manifest_does_not_reopen_the_prepared_terminal_buffer():
     manifest_gate = ZONE.index(
         "assignment->committed_next_ordinal == cutoff"
@@ -80,6 +96,15 @@ def test_physical_hil_gate_requires_reconciliation_fault_and_resume_evidence():
         "reconciliation_live_punch_preserved",
         "reconciliation_full_storage_command_succeeded",
         "reconciliation_tail_audit_advanced",
+        "reconciliation_tail_invalid_first_advanced",
+        "reconciliation_tail_invalid_middle_advanced",
+        "reconciliation_tail_invalid_final_advanced",
+        "reconciliation_tail_multiple_malformed_accounted",
+        "reconciliation_tail_ack_loss_replayed_exactly",
+        "reconciliation_tail_poison_followers_preserved",
+        "reconciliation_source_exception_visible_in_add",
+        "reconciliation_source_cursor_parity_exact",
+        "reconciliation_source_chain_continuous",
         "reconciliation_no_legacy_full_scan_after_certificate",
         "reconciliation_stream_v2_advertised",
         "reconciliation_four_chunks_one_prepare",
