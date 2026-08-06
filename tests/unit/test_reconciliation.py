@@ -431,6 +431,44 @@ def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
     assert job.last_chain_digest == hashlib.sha256(b"checkpoint-100").hexdigest()
 
 
+def test_stream_v2_offers_manifest_handshake_at_committed_cutoff(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "history_chunk_max_records": 100,
+        "history_credit_max_records": 400,
+    }
+    zkt.attendance_count = 500
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify the final manifest is offered after the source cursor reaches cutoff.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="reconcile-stream-v2-manifest-0001",
+    )
+    job.status = "RUNNING"
+    job.cutoff_count = 500
+    job.record_size = 8
+    job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
+    job.committed_next_ordinal = 500
+    job.scanned_count = 500
+    job.last_chain_digest = hashlib.sha256(b"checkpoint-500").hexdigest()
+
+    assignment = assignment_rows(session)[0][1]
+
+    assert assignment["protocol"] == "history_stream_v2"
+    assert assignment["committed_next_ordinal"] == 500
+    assert assignment["cutoff_count"] == 500
+    assert assignment["credit_end_ordinal"] == 500
+    assert assignment["max_chunks"] == 1
+
+
 def test_retry_releases_transport_lease_but_preserves_source_checkpoint(
     reconciliation_db,
 ):
