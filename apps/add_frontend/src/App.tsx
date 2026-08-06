@@ -32,6 +32,10 @@ import type {
   ReconciliationJob,
   ReconciliationPreflight,
   ReconciliationScheduler,
+  SourceException,
+  SourceExceptionList,
+  SourceExceptionReveal,
+  SourceExceptionTotals,
   UserCommandResponse,
   UserDeletionJob,
   DashboardRoute,
@@ -1540,6 +1544,85 @@ function UsersView({
   )
 }
 
+function SourceExceptionDrawer({
+  seed,
+  onClose,
+  onChanged,
+  toast,
+}: {
+  seed: SourceException
+  onClose: () => void
+  onChanged: () => Promise<void>
+  toast: ReturnType<typeof useToast>
+}) {
+  const [row, setRow] = useState(seed)
+  const [reason, setReason] = useState('')
+  const [password, setPassword] = useState('')
+  const [revealed, setRevealed] = useState<SourceExceptionReveal | null>(null)
+  const [busy, setBusy] = useState(false)
+  const refresh = useCallback(async () => {
+    setRow(await api<SourceException>(`/api/v1/source-exceptions/${seed.id}`))
+  }, [seed.id])
+  useEffect(() => { void refresh() }, [refresh])
+  const act = async (action: 'review' | 'reveal') => {
+    setBusy(true)
+    try {
+      const body = JSON.stringify({
+        reason: reason.trim(),
+        password,
+        idempotency_key: idempotency(`source-exception-${action}`),
+      })
+      if (action === 'review') {
+        setRow(await api<SourceException>(`/api/v1/source-exceptions/${row.id}/review`, { method: 'POST', body }))
+        toast.notice('Source exception marked reviewed without changing terminal truth.')
+        await onChanged()
+      } else {
+        setRevealed(await api<SourceExceptionReveal>(`/api/v1/source-exceptions/${row.id}/reveal`, { method: 'POST', body }))
+        toast.notice('Protected source evidence revealed with an audit entry.')
+      }
+      setPassword('')
+      setReason('')
+    } catch (error) {
+      setPassword('')
+      toast.error(error instanceof Error ? error.message : 'Source exception action failed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const canAct = reason.trim().length >= 10 && Boolean(password) && !busy
+  return (
+    <Dialog titleId="source-exception-title" title="Terminal source exception" description={`${row.zone_id || 'Unknown zone'} · ordinal ${row.ordinal.toLocaleString()}`} onClose={onClose} className="device-drawer source-exception-drawer">
+      <div className="drawer-status"><StatusBadge state={row.disposition} /><span>{row.cursor_advanced ? `Source cursor safely advanced to ${row.source_committed_cursor.toLocaleString()}` : 'Source cursor has not advanced beyond this row'}</span></div>
+      <div className="drawer-content source-exception-detail">
+        <article className="info-copy pattern-blocked"><Icon name="shield" /><div><h3>Excluded from attendance and Oracle</h3><p>ADD preserved this terminal ordinal as immutable evidence. Review does not create, edit, or delete attendance, and valid punches after this row can continue.</p></div></article>
+        <dl className="exception-facts">
+          <div><dt>Device</dt><dd>{row.display_name || row.connector_id || 'Unknown'}</dd></div>
+          <div><dt>Terminal</dt><dd>{row.terminal_serial}</dd></div>
+          <div><dt>Generation / ordinal</dt><dd>{row.terminal_generation} / {row.ordinal.toLocaleString()}</dd></div>
+          <div><dt>Source</dt><dd>{row.source_kind}</dd></div>
+          <div><dt>Error</dt><dd>{row.error_code || row.disposition}</dd></div>
+          <div><dt>Raw timestamp</dt><dd>{row.raw_timestamp ?? 'Unavailable'}</dd></div>
+          <div><dt>Observed identity</dt><dd>UID {row.observed_uid || '—'} · User {row.observed_user_id || '—'}</dd></div>
+          <div><dt>Record size</dt><dd>{row.record_size ?? '—'} bytes</dd></div>
+          <div className="wide"><dt>SHA-256 evidence digest</dt><dd><code>{row.raw_record_digest}</code></dd></div>
+          <div className="wide"><dt>Terminal record key</dt><dd><code>{row.terminal_record_key}</code></dd></div>
+        </dl>
+        <section className="exception-review-section">
+          <div className="panel-header"><div><h3>Review history</h3><p>Review acknowledges the evidence only; the source row remains immutable and fail-closed.</p></div><StatusBadge state={row.review_state} /></div>
+          {(row.reviews || []).map((review) => <article key={review.review_id} className="exception-review"><strong>{review.actor}</strong><span>{dateTime(review.created_at)}</span><p>{review.reason}</p></article>)}
+          {!(row.reviews || []).length && <p className="muted-copy">No operator review has been recorded.</p>}
+        </section>
+        {revealed && <section className="revealed-evidence" aria-live="polite"><div className="panel-header"><div><h3>Protected raw evidence</h3><p>Visible only in this step-up response. It is not cached by ADD.</p></div><button className="button secondary" onClick={() => setRevealed(null)}>Hide</button></div><label>Hex<code>{revealed.raw_record_hex}</code></label><label>Base64<code>{revealed.raw_record_b64}</code></label></section>}
+        <section className="exception-actions">
+          <label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} placeholder="At least 10 characters" /></label>
+          <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <div className="dialog-actions"><button className="button secondary" disabled={!canAct} onClick={() => void act('reveal')}><Icon name="search" /> Reveal raw evidence</button><button className="button primary" disabled={!canAct || row.review_state === 'REVIEWED'} onClick={() => void act('review')}><Icon name="check" /> Mark reviewed</button></div>
+        </section>
+      </div>
+    </Dialog>
+  )
+}
+
 function ReconciliationView({
   devices,
   revision,
@@ -1549,6 +1632,7 @@ function ReconciliationView({
   revision: number
   toast: ReturnType<typeof useToast>
 }) {
+  const initialSourceFilters = new URLSearchParams(window.location.search)
   const [rows, setRows] = useState<ReconciliationJob[]>([])
   const [scheduler, setScheduler] = useState<ReconciliationScheduler>({
     policy: 'BOUNDED_PARALLEL_PER_DEVICE',
@@ -1565,6 +1649,21 @@ function ReconciliationView({
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
+  const [section, setSection] = useState<'jobs' | 'exceptions'>(
+    initialSourceFilters.get('tab') === 'source-exceptions' ? 'exceptions' : 'jobs',
+  )
+  const [exceptionRows, setExceptionRows] = useState<SourceException[]>([])
+  const [exceptionTotals, setExceptionTotals] = useState<SourceExceptionTotals>({ all: 0, open: 0, reviewed: 0, invalid_time: 0, malformed: 0, affected_terminals: 0 })
+  const [exceptionCursor, setExceptionCursor] = useState<number | null>(null)
+  const [exceptionLoading, setExceptionLoading] = useState(false)
+  const [exceptionDrawer, setExceptionDrawer] = useState<SourceException | null>(null)
+  const [exceptionFilters, setExceptionFilters] = useState({
+    device_id: initialSourceFilters.get('device_id') || '',
+    disposition: '',
+    error_code: '',
+    review_state: '',
+    ordinal: '',
+  })
   const selected = devices.find((device) => device.connector_id === selectedId) || null
 
   const load = useCallback(async () => {
@@ -1584,7 +1683,22 @@ function ReconciliationView({
     }
   }, [toast.error])
 
+  const loadExceptions = useCallback(async (cursor?: number, append = false) => {
+    setExceptionLoading(true)
+    try {
+      const response = await api<SourceExceptionList>(`/api/v1/source-exceptions${queryString({ ...exceptionFilters, ordinal: exceptionFilters.ordinal || undefined, cursor, limit: 100 })}`)
+      setExceptionRows((current) => append ? [...current, ...response.rows] : response.rows)
+      setExceptionTotals(response.totals)
+      setExceptionCursor(response.next_cursor)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to read terminal source exceptions.')
+    } finally {
+      setExceptionLoading(false)
+    }
+  }, [exceptionFilters, toast.error])
+
   useEffect(() => { void load() }, [load, revision])
+  useEffect(() => { void loadExceptions(undefined, false) }, [loadExceptions, revision])
   useEffect(() => {
     if (!selectedId) {
       setPreflight(null)
@@ -1665,17 +1779,19 @@ function ReconciliationView({
       <header className="page-header">
         <div>
           <p className="eyebrow">ADD-OWNED SOURCE ASSURANCE</p>
-          <h1>Start-of-time reconciliation</h1>
-          <p>Request a complete, resumable read of terminal truth. ADD commits every bounded chunk before the device advances and separately proves Oracle membership without deleting Oracle records.</p>
+          <h1>{section === 'jobs' ? 'Start-of-time reconciliation' : 'Terminal source exceptions'}</h1>
+          <p>{section === 'jobs' ? 'Request a complete, resumable read of terminal truth. ADD commits every bounded chunk before the device advances and separately proves Oracle membership without deleting Oracle records.' : 'Inspect invalid or malformed terminal rows preserved as immutable evidence without blocking valid punches that follow.'}</p>
         </div>
-        <button className="button primary" disabled={!selected || !preflight?.eligible || !enabled} onClick={() => setDialog({ mode: 'start' })}><Icon name="refresh" /> New complete reconcile</button>
+        {section === 'jobs' ? <button className="button primary" disabled={!selected || !preflight?.eligible || !enabled} onClick={() => setDialog({ mode: 'start' })}><Icon name="refresh" /> New complete reconcile</button> : <button className="button secondary" onClick={() => void loadExceptions(undefined, false)}><Icon name="refresh" /> Refresh exceptions</button>}
       </header>
-      <section className="metric-grid">
+      <div className="segmented-control reconciliation-tabs" role="tablist" aria-label="Reconciliation workspace"><button role="tab" aria-selected={section === 'jobs'} className={section === 'jobs' ? 'active' : ''} onClick={() => setSection('jobs')}>Jobs <span>{active}</span></button><button role="tab" aria-selected={section === 'exceptions'} className={section === 'exceptions' ? 'active' : ''} onClick={() => setSection('exceptions')}>Source exceptions <span>{exceptionTotals.open}</span></button></div>
+      {section === 'jobs' ? <section className="metric-grid">
         <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>{scheduler.device_concurrency} isolated terminal scan slots</small></div></article>
         <article className="metric-card metric-positive"><span className="metric-icon"><Icon name="shield" /></span><div><p>Source certificates</p><strong>{covered}</strong><small>Immutable terminal coverage</small></div></article>
         <article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>Append-only membership checks</small></div></article>
         <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? 'Request path available' : 'Awaiting controlled enablement'}</small></div></article>
-      </section>
+      </section> : <section className="metric-grid"><article className="metric-card metric-warning"><span className="metric-icon"><Icon name="alert" /></span><div><p>Open exceptions</p><strong>{exceptionTotals.open.toLocaleString()}</strong><small>Awaiting operator review</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="clock" /></span><div><p>Invalid timestamps</p><strong>{exceptionTotals.invalid_time.toLocaleString()}</strong><small>Excluded fail-closed</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="terminal" /></span><div><p>Malformed rows</p><strong>{exceptionTotals.malformed.toLocaleString()}</strong><small>Raw evidence preserved</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Affected terminals</p><strong>{exceptionTotals.affected_terminals.toLocaleString()}</strong><small>Subsequent valid punches continue</small></div></article></section>}
+      {section === 'jobs' && <>
       <section className="panel selection-panel">
         <label>Terminal to reconcile<select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value="">Select a device</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name} · {device.zone_id}</option>)}</select></label>
         <div className="selected-device-summary">
@@ -1720,6 +1836,24 @@ function ReconciliationView({
           {!rows.length && <div className="empty-state"><Icon name="refresh" /><h3>No complete reconciliation has been requested.</h3><p>Select an eligible terminal, review preflight, and create the first durable source-coverage job.</p></div>}
         </div>
       </section>
+      </>}
+      {section === 'exceptions' && <section className="panel source-exceptions-panel">
+        <div className="panel-header"><div><h2>Immutable source exception ledger</h2><p>Every row remains tied to its terminal generation and ordinal. Review never changes attendance or Oracle.</p></div><StatusBadge state={`${exceptionTotals.all} ACCOUNTED`} /></div>
+        <div className="filter-grid source-exception-filters">
+          <label>Device<select value={exceptionFilters.device_id} onChange={(event) => setExceptionFilters({ ...exceptionFilters, device_id: event.target.value })}><option value="">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label>
+          <label>Disposition<select value={exceptionFilters.disposition} onChange={(event) => setExceptionFilters({ ...exceptionFilters, disposition: event.target.value })}><option value="">All exceptions</option><option value="INVALID_TIME">Invalid timestamp</option><option value="MALFORMED">Malformed record</option></select></label>
+          <label>Review state<select value={exceptionFilters.review_state} onChange={(event) => setExceptionFilters({ ...exceptionFilters, review_state: event.target.value })}><option value="">Open and reviewed</option><option value="OPEN">Open</option><option value="REVIEWED">Reviewed</option></select></label>
+          <label>Error code<input value={exceptionFilters.error_code} onChange={(event) => setExceptionFilters({ ...exceptionFilters, error_code: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '').slice(0, 120) })} placeholder="IMPLAUSIBLE_TERMINAL_TIME" /></label>
+          <label>Exact ordinal<input inputMode="numeric" value={exceptionFilters.ordinal} onChange={(event) => setExceptionFilters({ ...exceptionFilters, ordinal: event.target.value.replace(/\D/g, '').slice(0, 10) })} /></label>
+        </div>
+        <div className="source-exception-table" aria-label="Terminal source exceptions">
+          <div className="source-exception-head" aria-hidden="true"><span>Terminal source</span><span>Exception</span><span>Observed evidence</span><span>Assurance</span><span>Review</span></div>
+          {exceptionLoading && !exceptionRows.length && <div className="empty-state compact">Loading source evidence…</div>}
+          {exceptionRows.map((row) => <button type="button" className="source-exception-row" aria-label={`Inspect source exception ordinal ${row.ordinal} on ${row.display_name || row.terminal_serial}`} key={row.id} onClick={() => setExceptionDrawer(row)}><span><strong>{row.display_name || row.terminal_serial}</strong><small>{row.zone_id || 'Unknown zone'} · generation {row.terminal_generation} · ordinal {row.ordinal.toLocaleString()}</small></span><span><StatusBadge state={row.disposition} /><small>{row.error_code || 'No error code'}</small></span><span><strong>{row.raw_timestamp ?? 'No valid timestamp'}</strong><small>UID {row.observed_uid || '—'} · User {row.observed_user_id || '—'}</small></span><span><StatusBadge state={row.cursor_advanced ? 'CURSOR ADVANCED' : 'HELD'} /><small>{row.cursor_advanced ? `Committed through ${row.source_committed_cursor.toLocaleString()}` : 'Awaiting durable commit'}</small></span><span><StatusBadge state={row.review_state} /><small>{row.reviewed_at ? dateTime(row.reviewed_at) : 'Open for review'}</small></span></button>)}
+          {!exceptionLoading && !exceptionRows.length && <div className="empty-state"><Icon name="shield" /><h3>No source exceptions match these filters.</h3><p>Valid terminal rows remain in the attendance ledger; only fail-closed evidence appears here.</p></div>}
+        </div>
+        {exceptionCursor && <div className="load-more"><button className="button secondary" disabled={exceptionLoading} onClick={() => void loadExceptions(exceptionCursor, true)}>{exceptionLoading ? 'Loading…' : 'Load older exceptions'}</button><small>{exceptionRows.length.toLocaleString()} exceptions loaded</small></div>}
+      </section>}
       {dialog && (
         <Dialog titleId="reconciliation-dialog-title" title={dialog.mode === 'start' ? 'Start complete terminal reconciliation' : `${dialog.action} reconciliation`} description={dialog.mode === 'start' ? selected?.display_name : dialog.job.connector?.display_name} onClose={closeDialog}>
           <div className="dialog-body">
@@ -1731,6 +1865,7 @@ function ReconciliationView({
           </div>
         </Dialog>
       )}
+      {exceptionDrawer && <SourceExceptionDrawer seed={exceptionDrawer} onClose={() => setExceptionDrawer(null)} onChanged={() => loadExceptions(undefined, false)} toast={toast} />}
     </>
   )
 }
@@ -2193,7 +2328,8 @@ function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: Re
       <section className="alert-list">
         {shown.map((row) => {
           const diagnostics = formatAlertDiagnostics(row.details)
-          return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div>{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</article>
+          const inspectorPath = typeof row.details.inspector_path === 'string' && /^\/reconciliation\?tab=source-exceptions&device_id=[A-Za-z0-9-]{1,100}$/.test(row.details.inspector_path) ? row.details.inspector_path : null
+          return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><span>{row.device.display_name} · {row.device.zone_id}</span></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div><div className="alert-actions">{inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</div></article>
         })}
         {!shown.length && <div className="panel empty-state"><Icon name="shield" /><h2>No alerts in this view.</h2><p>Change the queue filters or wait for the next live telemetry update.</p></div>}
       </section>

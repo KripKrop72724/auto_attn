@@ -82,6 +82,8 @@ from zk_add.schemas import (
     ReconciliationControlRequest,
     ReconciliationCreateRequest,
     ReconciliationManifestRequest,
+    SourceExceptionActionRequest,
+    SourceTailChunkRequest,
     UserCreateRequest,
     UserDeleteRequest,
     UserSnapshotRequest,
@@ -140,11 +142,21 @@ from zk_add.reconciliation import (
     apply_reconciliation_anchor,
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
+    apply_source_tail_chunk,
+    active_coverage,
     control_reconciliation_job,
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_scheduler_state,
     serialize_job,
+    serialize_coverage,
+)
+from zk_add.source_exceptions import (
+    exception_or_404_row,
+    list_source_exceptions,
+    reveal_source_exception,
+    review_source_exception,
+    source_exception_detail,
 )
 
 
@@ -613,6 +625,98 @@ def get_reconciliation_evidence(
         "policy": "APPEND_ONLY_MEMBERSHIP",
         "job": serialize_job(db, job, include_events=True),
     }
+
+
+@app.get("/api/v1/source-exceptions")
+def source_exceptions(
+    device_id: str | None = None,
+    disposition: str | None = None,
+    error_code: str | None = None,
+    review_state: str | None = None,
+    ordinal: int | None = Query(default=None, ge=0),
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector_pk = None
+    if device_id:
+        connector_pk = connector_or_404(db, device_id).id
+    if disposition and disposition not in {"INVALID_TIME", "MALFORMED"}:
+        raise HTTPException(status_code=422, detail="Unknown source exception disposition.")
+    if review_state and review_state not in {"OPEN", "REVIEWED"}:
+        raise HTTPException(status_code=422, detail="Unknown source exception review state.")
+    return list_source_exceptions(
+        db,
+        connector_id=connector_pk,
+        disposition=disposition,
+        error_code=error_code,
+        review_state=review_state,
+        ordinal=ordinal,
+        cursor=cursor,
+        limit=limit,
+    )
+
+
+@app.get("/api/v1/source-exceptions/{exception_id}")
+def source_exception(
+    exception_id: int,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    row = exception_or_404_row(db, exception_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source exception not found.")
+    return source_exception_detail(db, row)
+
+
+@app.post("/api/v1/source-exceptions/{exception_id}/review")
+def review_source_exception_endpoint(
+    exception_id: int,
+    body: SourceExceptionActionRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    row = exception_or_404_row(db, exception_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source exception not found.")
+    review_source_exception(
+        db,
+        row=row,
+        actor=context.username,
+        reason=body.reason,
+        idempotency_key=body.idempotency_key,
+    )
+    db.flush()
+    return source_exception_detail(db, row)
+
+
+@app.post("/api/v1/source-exceptions/{exception_id}/reveal")
+def reveal_source_exception_endpoint(
+    exception_id: int,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    row = exception_or_404_row(db, exception_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source exception not found.")
+    try:
+        result = reveal_source_exception(
+            db,
+            row=row,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return result
 
 
 @app.post("/api/v1/reconciliations/{job_id}/{action}")
@@ -1929,6 +2033,33 @@ async def device_stream(websocket: WebSocket):
     if not await send_identity_catalog(connector_id, catalog):
         await websocket.close(code=1011, reason="Identity catalog delivery failed")
         return
+    with session_scope() as db:
+        connector = db.get(Connector, connector_pk)
+        coverage = (
+            active_coverage(db, connector.zkt_device)
+            if connector is not None and connector.zkt_device is not None
+            else None
+        )
+        coverage_payload = serialize_coverage(coverage)
+        if coverage_payload is None and connector is not None and connector.zkt_device is not None:
+            terminal_serial = (
+                connector.zkt_device.serial or connector.zkt_device.expected_serial
+            )
+            if terminal_serial:
+                coverage_payload = {
+                    "terminal_serial": terminal_serial,
+                    "terminal_generation": max(1, connector.onboarding_generation),
+                    "source_committed_cursor": 0,
+                    "source_committed_chain_digest": "0" * 64,
+                    "active": False,
+                }
+    if coverage_payload is not None:
+        if not await connector_hub.send(
+            connector_id,
+            {"type": "source_coverage", **coverage_payload},
+        ):
+            await websocket.close(code=1011, reason="Source coverage delivery failed")
+            return
     await send_pending_commands(connector_id)
     try:
         while True:
@@ -1949,12 +2080,25 @@ async def device_stream(websocket: WebSocket):
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
-                logger.exception(
-                    "Rejected connector envelope connector_id=%s type=%s message_id=%s",
-                    connector_id,
-                    envelope.type,
-                    envelope.message_id,
-                )
+                if envelope.type == "source_tail_chunk":
+                    # Pydantic validation traces may echo rejected field input.
+                    # Source-tail records contain encrypted-at-rest raw terminal
+                    # evidence, so this path records metadata only.
+                    logger.error(
+                        "Rejected protected source envelope connector_id=%s "
+                        "type=%s message_id=%s error_type=%s",
+                        connector_id,
+                        envelope.type,
+                        envelope.message_id,
+                        type(exc).__name__,
+                    )
+                else:
+                    logger.exception(
+                        "Rejected connector envelope connector_id=%s type=%s message_id=%s",
+                        connector_id,
+                        envelope.type,
+                        envelope.message_id,
+                    )
                 record_envelope_rejection(connector_pk, envelope, exc)
                 await websocket.send_json(
                     {
@@ -2150,10 +2294,14 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "message_type": envelope.type,
                 "job_id": job.job_id,
                 "assignment_id": source_chunk.assignment_id,
-                "generation": chunk.generation,
-                "sequence": chunk.sequence,
+                "generation": chunk.generation if chunk is not None else source_chunk.generation,
+                "sequence": chunk.sequence if chunk is not None else source_chunk.sequence,
                 "committed_next_ordinal": job.committed_next_ordinal,
-                "resulting_chain_digest": chunk.resulting_chain_digest,
+                "resulting_chain_digest": (
+                    chunk.resulting_chain_digest
+                    if chunk is not None
+                    else source_chunk.resulting_chain_digest
+                ),
                 "duplicate": duplicate,
                 "continue_allowed": bool(
                     source_chunk.assignment_id
@@ -2192,6 +2340,40 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "job_id": job.job_id,
                 "status": job.status,
                 "capture_certificate": job.capture_certificate or None,
+            }
+        elif envelope.type == "source_tail_chunk":
+            tail = SourceTailChunkRequest.model_validate(envelope.payload)
+            coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
+                db,
+                connector=connector,
+                payload=tail,
+            )
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "coverage_id": coverage.coverage_id,
+                "source_committed_cursor": coverage.source_committed_cursor,
+                "tail_exception_count": coverage.tail_exception_count,
+                "error_code": error_code,
+            }
+            ack_payload = {
+                "type": "error" if error_code else "source_tail_ack",
+                "message_id": envelope.message_id,
+                "message_type": envelope.type,
+                "code": error_code,
+                "terminal_serial": coverage.terminal_serial,
+                "terminal_generation": coverage.terminal_generation,
+                "committed_next_ordinal": (
+                    chunk.end_ordinal
+                    if chunk is not None
+                    else coverage.source_committed_cursor
+                ),
+                "resulting_chain_digest": (
+                    chunk.resulting_chain_digest
+                    if chunk is not None
+                    else coverage.source_committed_chain_digest
+                ),
+                "duplicate": duplicate,
+                "exception_count": chunk.exception_count if chunk is not None else 0,
             }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}

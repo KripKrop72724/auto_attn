@@ -27,6 +27,11 @@ on:
         description: Fail closed if the canary reports fewer preserved terminal punches
         required: true
         type: number
+      minimum_source_exceptions:
+        description: Known poison rows that must be visible and safely advanced in ADD
+        required: true
+        default: 1
+        type: number
 
 permissions:
   contents: read
@@ -78,6 +83,7 @@ jobs:
       EXPECTED_CAMPAIGN: ${{ inputs.campaign_id }}
       EXPECTED_ZONE: ${{ inputs.zone_id }}
       MINIMUM_TERMINAL_ATTENDANCE: ${{ inputs.minimum_terminal_attendance }}
+      MINIMUM_SOURCE_EXCEPTIONS: ${{ inputs.minimum_source_exceptions }}
     steps:
       - name: Verify exact successful canary and stable live operation
         shell: powershell
@@ -192,6 +198,7 @@ jobs:
                   [bool]$row.zkt.snapshot_complete -and
                   [bool]$row.zkt.capabilities.history_stream_v1 -and
                   [bool]$row.zkt.capabilities.history_range_resume_verified -and
+                  [bool]$row.zkt.capabilities.source_tail_v1 -and
                   [int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE
                 )
               }
@@ -200,6 +207,47 @@ jobs:
             }
             if (-not $stable) {
               throw 'Production canary did not reach the complete stable live-operation contract.'
+            }
+            $preflight = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/devices/$($row.connector_id)/reconciliations/preflight" `
+              -WebSession $session `
+              -TimeoutSec 30
+            $sourceCoverage = $preflight.coverage
+            if (
+              $null -eq $sourceCoverage -or
+              -not [bool]$sourceCoverage.active -or
+              -not [bool]$sourceCoverage.source_ledger_complete -or
+              -not [bool]$sourceCoverage.terminal_source_parity -or
+              -not [bool]$sourceCoverage.chain_continuous -or
+              [int]$sourceCoverage.source_committed_cursor -ne [int]$row.zkt.attendance_count -or
+              [int]$sourceCoverage.source_ledger_count -ne [int]$sourceCoverage.source_committed_cursor -or
+              ([string]$sourceCoverage.source_committed_chain_digest).Length -ne 64
+            ) {
+              throw 'Canary lacks exact terminal source-cursor parity, one disposition per ordinal, or continuous source-chain evidence.'
+            }
+            $sourceExceptions = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/source-exceptions?device_id=$($row.connector_id)&limit=500" `
+              -WebSession $session `
+              -TimeoutSec 30
+            $currentExceptions = @($sourceExceptions.rows | Where-Object {
+              [int]$_.terminal_generation -eq [int]$sourceCoverage.terminal_generation
+            })
+            $unsafeExceptions = @($currentExceptions | Where-Object {
+              $_.disposition -notin @('INVALID_TIME', 'MALFORMED') -or
+              -not [bool]$_.evidence_available -or
+              -not [bool]$_.cursor_advanced -or
+              $_.oracle_action -ne 'EXCLUDED_FAIL_CLOSED'
+            })
+            if ($unsafeExceptions.Count -ne 0) {
+              throw 'One or more terminal source exceptions lack immutable evidence, cursor advancement, or fail-closed Oracle exclusion.'
+            }
+            if ($null -ne $sourceExceptions.next_cursor) {
+              throw 'Canary source-exception evidence exceeded one verification page; promotion refuses an incomplete inspection.'
+            }
+            if ($currentExceptions.Count -lt [int]$env:MINIMUM_SOURCE_EXCEPTIONS) {
+              throw 'The known canary poison record is not visible in ADD source exceptions.'
             }
             $campaignStarted = [DateTimeOffset]::Parse([string]$campaign.created_at)
             $logs = Invoke-RestMethod `
@@ -221,15 +269,28 @@ jobs:
             $catalogAppliedAt = [DateTimeOffset]::Parse(
               [string]$catalogApplied[0].received_at
             )
-            $truthDelegated = @($canaryLogs | Where-Object {
-              $_.code -eq 'ORACLE_RECONCILE_DELEGATED_TO_ADD' -and
+            $sourceCoverageApplied = @($canaryLogs | Where-Object {
+              $_.code -eq 'ADD_SOURCE_COVERAGE_APPLIED' -and
               [DateTimeOffset]::Parse([string]$_.received_at) -ge $catalogAppliedAt
             } | Select-Object -Last 1)
-            if ($truthDelegated.Count -ne 1) {
-              throw 'Canary did not durably delegate a complete truth window to ADD after catalog application.'
+            if ($sourceCoverageApplied.Count -ne 1) {
+              throw 'Canary did not consume ADD authoritative source coverage after its identity catalog.'
             }
-            $truthDelegatedAt = [DateTimeOffset]::Parse(
-              [string]$truthDelegated[0].received_at
+            $sourceCoverageAppliedAt = [DateTimeOffset]::Parse(
+              [string]$sourceCoverageApplied[0].received_at
+            )
+            $tailCommitted = @($canaryLogs | Where-Object {
+              $_.code -in @(
+                'CURRENT_TAIL_SOURCE_COMMITTED',
+                'CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED'
+              ) -and
+              [DateTimeOffset]::Parse([string]$_.received_at) -ge $sourceCoverageAppliedAt
+            } | Select-Object -Last 1)
+            if ($tailCommitted.Count -ne 1) {
+              throw 'Canary did not prove a poison-safe bounded tail commit after applying ADD source coverage.'
+            }
+            $tailCommittedAt = [DateTimeOffset]::Parse(
+              [string]$tailCommitted[0].received_at
             )
             $laterFailures = @($canaryLogs | Where-Object {
               $_.code -in @(
@@ -240,9 +301,14 @@ jobs:
                 'SOURCE_RANGE_COUNT_REGRESSION',
                 'SOURCE_FIRST_ANCHOR_DIVERGED',
                 'SOURCE_COMMITTED_BOUNDARY_DIVERGED',
-                'ADD_SOURCE_COVERAGE_INVALIDATED'
+                'ADD_SOURCE_COVERAGE_INVALIDATED',
+                'SOURCE_TAIL_REPLAY_DIVERGED',
+                'SOURCE_TAIL_COUNT_REGRESSION',
+                'SOURCE_TAIL_CURSOR_DIVERGED',
+                'SOURCE_TAIL_CHAIN_DIVERGED',
+                'CURRENT_TAIL_CHECKPOINT_RETRY'
               ) -and
-              [DateTimeOffset]::Parse([string]$_.received_at) -gt $truthDelegatedAt
+              [DateTimeOffset]::Parse([string]$_.received_at) -gt $tailCommittedAt
             })
             if ($laterFailures.Count -ne 0) {
               throw 'Canary emitted a fail-closed truth error after delegating its Oracle pass.'
@@ -295,20 +361,15 @@ jobs:
               }
               $cursor = $nextCursor
             } while ($null -ne $cursor)
-            if ($attendanceCount -ne [int]$row.zkt.attendance_count) {
-              throw "ADD/terminal attendance parity failed: ADD=$attendanceCount terminal=$($row.zkt.attendance_count)."
-            }
-            if ($attendanceCount -lt [int]$env:MINIMUM_TERMINAL_ATTENDANCE) {
-              throw 'ADD attendance ledger fell below the accepted canary baseline.'
-            }
             if ($unsafeDeliveryCount -ne 0) {
               throw "ADD still has $unsafeDeliveryCount canary attendance row(s) in an unsafe or retryable Oracle delivery state."
             }
             Write-Host (
-              'Exact production canary is stable and terminal-parity exact; ' +
+              'Exact production canary is stable and source-cursor parity is exact; ' +
               "all resolvable rows are Oracle-confirmed. Preserved fail-closed rows: " +
               "blocked_identity=$blockedIdentityCount " +
-              "quarantined_identity_reuse=$quarantinedIdentityReuseCount."
+              "quarantined_identity_reuse=$quarantinedIdentityReuseCount " +
+              "source_exceptions=$($currentExceptions.Count)."
             )
           } catch {
             $verificationFailed = $true

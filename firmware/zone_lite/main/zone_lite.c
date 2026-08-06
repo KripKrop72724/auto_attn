@@ -476,6 +476,9 @@ static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
 static bool g_add_source_coverage_certified;
 static uint32_t g_add_source_coverage_cursor;
+static uint32_t g_add_source_coverage_generation;
+static char g_add_source_coverage_chain[65] =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 static int64_t g_add_source_assignment_seen_ms;
 
 static bool oracle_send_reconcile(
@@ -556,6 +559,8 @@ static void nvs_save_runtime_state(void)
         "add_src_cert",
         g_add_source_coverage_certified ? 1 : 0);
     (void)nvs_set_u32(handle, "add_src_cur", g_add_source_coverage_cursor);
+    (void)nvs_set_u32(handle, "add_src_gen", g_add_source_coverage_generation);
+    (void)nvs_set_str(handle, "add_src_hash", g_add_source_coverage_chain);
     (void)nvs_commit(handle);
     nvs_close(handle);
 }
@@ -618,6 +623,19 @@ static void nvs_load_runtime_state(void)
     g_temp_admin_active = active != 0;
     (void)nvs_get_u8(handle, "add_src_cert", &add_source_certified);
     (void)nvs_get_u32(handle, "add_src_cur", &g_add_source_coverage_cursor);
+    (void)nvs_get_u32(handle, "add_src_gen", &g_add_source_coverage_generation);
+    size_t source_chain_size = sizeof(g_add_source_coverage_chain);
+    if (nvs_get_str(
+            handle,
+            "add_src_hash",
+            g_add_source_coverage_chain,
+            &source_chain_size) != ESP_OK ||
+        strlen(g_add_source_coverage_chain) != 64) {
+        strlcpy(
+            g_add_source_coverage_chain,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            sizeof(g_add_source_coverage_chain));
+    }
     g_add_source_coverage_certified = add_source_certified != 0;
     nvs_close(handle);
 }
@@ -3679,6 +3697,116 @@ static bool encode_record_base64(
         written < output_size && (output[written] = '\0') == '\0';
 }
 
+static bool append_terminal_source_record(
+    cJSON *records,
+    cJSON *canonical,
+    const uint8_t *record,
+    uint32_t record_size,
+    const user_table_t *users,
+    uint32_t ordinal,
+    const char *capturetype,
+    const char **disposition_out)
+{
+    if (!records || !canonical || !record || !users || !capturetype) return false;
+    char raw_digest[65];
+    char terminal_key_material[160];
+    char terminal_key[65];
+    char raw_base64[96];
+    char observed_uid[16] = "";
+    char observed_user_id[32] = "";
+    sha256_bytes_hex(record, record_size, raw_digest);
+    snprintf(
+        terminal_key_material,
+        sizeof(terminal_key_material),
+        "%s:%s",
+        g_device_serial,
+        raw_digest);
+    sha256_hex(terminal_key_material, terminal_key);
+    attendance_event_t event;
+    memset(&event, 0, sizeof(event));
+    uint32_t timestamp = 0;
+    bool has_timestamp = attendance_record_timestamp(record, record_size, &timestamp);
+    if (record_size == 8) {
+        uint16_t uid = read_le16(record);
+        snprintf(observed_uid, sizeof(observed_uid), "%u", (unsigned)uid);
+        const zkt_user_t *user = find_user_by_uid(users, uid);
+        if (user) strlcpy(observed_user_id, user->user_id, sizeof(observed_user_id));
+    } else if (record_size == 16) {
+        snprintf(
+            observed_user_id,
+            sizeof(observed_user_id),
+            "%lu",
+            (unsigned long)read_le32(record));
+    } else if (record_size == 40) {
+        snprintf(
+            observed_uid,
+            sizeof(observed_uid),
+            "%u",
+            (unsigned)read_le16(record));
+        copy_zk_string(observed_user_id, sizeof(observed_user_id), record + 2, 24);
+    }
+    bool parsed = has_timestamp && parse_attendance_record(
+        record,
+        record_size,
+        users,
+        &event,
+        &timestamp);
+    const char *disposition = parsed
+        ? "EVENT"
+        : has_timestamp && !zk_attendance_timestamp_is_plausible(timestamp)
+            ? "INVALID_TIME"
+            : "MALFORMED";
+    if (!encode_record_base64(record, record_size, raw_base64, sizeof(raw_base64))) {
+        return false;
+    }
+    cJSON *source_row = cJSON_CreateObject();
+    cJSON *canonical_row = cJSON_CreateObject();
+    if (!source_row || !canonical_row) {
+        cJSON_Delete(source_row);
+        cJSON_Delete(canonical_row);
+        return false;
+    }
+    cJSON_AddNumberToObject(source_row, "ordinal", ordinal);
+    cJSON_AddStringToObject(source_row, "raw_record_digest", raw_digest);
+    cJSON_AddStringToObject(source_row, "terminal_record_key", terminal_key);
+    cJSON_AddNumberToObject(source_row, "occurrence_index", ordinal + 1);
+    cJSON_AddStringToObject(source_row, "disposition", disposition);
+    if (has_timestamp) cJSON_AddNumberToObject(source_row, "raw_timestamp", timestamp);
+    if (observed_uid[0]) cJSON_AddStringToObject(source_row, "observed_uid", observed_uid);
+    if (observed_user_id[0]) {
+        json_add_utf8_string(source_row, "observed_user_id", observed_user_id);
+    }
+    if (parsed) {
+        cJSON *event_row = add_attendance_json_row(&event, capturetype);
+        if (!event_row) {
+            cJSON_Delete(source_row);
+            cJSON_Delete(canonical_row);
+            return false;
+        }
+        cJSON_AddItemToObject(source_row, "event", event_row);
+    } else {
+        cJSON_AddStringToObject(
+            source_row,
+            "error_code",
+            strcmp(disposition, "INVALID_TIME") == 0
+                ? "IMPLAUSIBLE_TERMINAL_TIME"
+                : "UNPARSEABLE_TERMINAL_RECORD");
+    }
+    cJSON_AddStringToObject(source_row, "raw_record_b64", raw_base64);
+    cJSON_AddItemToArray(records, source_row);
+
+    cJSON_AddStringToObject(canonical_row, "disposition", disposition);
+    if (parsed) cJSON_AddStringToObject(canonical_row, "event_uid", event.event_uid);
+    else cJSON_AddNullToObject(canonical_row, "event_uid");
+    cJSON_AddNumberToObject(canonical_row, "occurrence_index", ordinal + 1);
+    cJSON_AddNumberToObject(canonical_row, "ordinal", ordinal);
+    cJSON_AddStringToObject(canonical_row, "raw_record_digest", raw_digest);
+    cJSON_AddStringToObject(canonical_row, "terminal_record_key", terminal_key);
+    cJSON_AddItemToArray(canonical, canonical_row);
+    if (disposition_out) *disposition_out = disposition;
+    return true;
+}
+
 static void release_reconciliation_credit(
     const add_reconcile_assignment_t *assignment,
     uint32_t committed_next_ordinal,
@@ -3771,6 +3899,13 @@ static bool process_add_reconciliation_assignment(
         if (ok) {
             g_add_source_coverage_certified = true;
             g_add_source_coverage_cursor = cutoff;
+            g_add_source_coverage_generation = assignment->generation;
+            strlcpy(
+                g_add_source_coverage_chain,
+                assignment->preceding_chain_digest[0]
+                    ? assignment->preceding_chain_digest
+                    : "0000000000000000000000000000000000000000000000000000000000000000",
+                sizeof(g_add_source_coverage_chain));
             g_add_zkt.add_source_coverage_certified = true;
             g_add_zkt.add_source_coverage_cursor = cutoff;
             g_last_synced_attendance_count = latest_records;
@@ -3934,80 +4069,15 @@ static bool process_add_reconciliation_assignment(
     cJSON *canonical = cJSON_CreateArray();
     for (uint32_t ordinal = cursor; ok && ordinal < end; ordinal++) {
         const uint8_t *record = raw + (ordinal - start) * record_size;
-        char raw_digest[65];
-        char terminal_key_material[160];
-        char terminal_key[65];
-        char raw_base64[96];
-        sha256_bytes_hex(record, record_size, raw_digest);
-        snprintf(
-            terminal_key_material,
-            sizeof(terminal_key_material),
-            "%s:%s",
-            g_device_serial,
-            raw_digest);
-        sha256_hex(terminal_key_material, terminal_key);
-        attendance_event_t event;
-        uint32_t timestamp = 0;
-        bool has_timestamp = attendance_record_timestamp(record, record_size, &timestamp);
-        bool parsed = has_timestamp && parse_attendance_record(
+        ok = append_terminal_source_record(
+            records,
+            canonical,
             record,
             record_size,
             users,
-            &event,
-            &timestamp);
-        const char *disposition = parsed
-            ? "EVENT"
-            : has_timestamp && !zk_attendance_timestamp_is_plausible(timestamp)
-                ? "INVALID_TIME"
-                : "MALFORMED";
-        ok = encode_record_base64(
-            record,
-            record_size,
-            raw_base64,
-            sizeof(raw_base64));
-        cJSON *source_row = ok ? cJSON_CreateObject() : NULL;
-        cJSON *canonical_row = ok ? cJSON_CreateObject() : NULL;
-        if (!source_row || !canonical_row) ok = false;
-        if (!ok) {
-            cJSON_Delete(source_row);
-            cJSON_Delete(canonical_row);
-            break;
-        }
-        cJSON_AddNumberToObject(source_row, "ordinal", ordinal);
-        cJSON_AddStringToObject(source_row, "raw_record_digest", raw_digest);
-        cJSON_AddStringToObject(source_row, "terminal_record_key", terminal_key);
-        cJSON_AddNumberToObject(source_row, "occurrence_index", ordinal + 1);
-        cJSON_AddStringToObject(source_row, "disposition", disposition);
-        if (parsed) {
-            cJSON *event_row = add_attendance_json_row(&event, "FULL_HISTORY");
-            if (!event_row) {
-                cJSON_Delete(source_row);
-                cJSON_Delete(canonical_row);
-                ok = false;
-                break;
-            }
-            cJSON_AddItemToObject(source_row, "event", event_row);
-        } else {
-            cJSON_AddStringToObject(
-                source_row,
-                "error_code",
-                strcmp(disposition, "INVALID_TIME") == 0
-                    ? "IMPLAUSIBLE_TERMINAL_TIME"
-                    : "UNPARSEABLE_TERMINAL_RECORD");
-        }
-        cJSON_AddStringToObject(source_row, "raw_record_b64", raw_base64);
-        cJSON_AddItemToArray(records, source_row);
-
-        // This insertion order exactly matches ADD's sorted-key canonical
-        // digest contract in reconciliation_chunk_digest().
-        cJSON_AddStringToObject(canonical_row, "disposition", disposition);
-        if (parsed) cJSON_AddStringToObject(canonical_row, "event_uid", event.event_uid);
-        else cJSON_AddNullToObject(canonical_row, "event_uid");
-        cJSON_AddNumberToObject(canonical_row, "occurrence_index", ordinal + 1);
-        cJSON_AddNumberToObject(canonical_row, "ordinal", ordinal);
-        cJSON_AddStringToObject(canonical_row, "raw_record_digest", raw_digest);
-        cJSON_AddStringToObject(canonical_row, "terminal_record_key", terminal_key);
-        cJSON_AddItemToArray(canonical, canonical_row);
+            ordinal,
+            "FULL_HISTORY",
+            NULL);
     }
     char *canonical_json = ok ? cJSON_PrintUnformatted(canonical) : NULL;
     cJSON_Delete(canonical);
@@ -4151,39 +4221,75 @@ static bool process_add_incremental_tail(
         raw,
         raw_length);
     zk_close_bounded_buffer(sock, ctx, &source);
-    cJSON *events = ok ? cJSON_CreateArray() : NULL;
+    cJSON *records = ok ? cJSON_CreateArray() : NULL;
+    cJSON *canonical = ok ? cJSON_CreateArray() : NULL;
+    uint32_t exception_count = 0;
     for (uint32_t ordinal = start; ok && ordinal < end; ordinal++) {
         const uint8_t *record = raw + (ordinal - start) * record_size;
-        attendance_event_t event;
-        uint32_t timestamp = 0;
-        ok = parse_attendance_record(
+        const char *disposition = NULL;
+        ok = append_terminal_source_record(
+            records,
+            canonical,
             record,
             record_size,
             users,
-            &event,
-            &timestamp);
-        cJSON *row = ok ? add_attendance_json_row(&event, "CURRENT_RECONCILE") : NULL;
-        if (!row) {
-            ok = false;
-            break;
+            ordinal,
+            "CURRENT_RECONCILE",
+            &disposition);
+        if (ok && disposition &&
+            (strcmp(disposition, "INVALID_TIME") == 0 ||
+             strcmp(disposition, "MALFORMED") == 0)) {
+            exception_count++;
         }
-        cJSON_AddItemToArray(events, row);
     }
     free(raw);
-    char batch_material[180];
-    char batch_id[65];
+    char *canonical_json = ok ? cJSON_PrintUnformatted(canonical) : NULL;
+    cJSON_Delete(canonical);
+    char chunk_digest[65] = {0};
+    if (canonical_json) sha256_hex(canonical_json, chunk_digest);
+    free(canonical_json);
+    char chain_material[220];
+    char resulting_chain[65];
     snprintf(
-        batch_material,
-        sizeof(batch_material),
-        "%s:%lu:%lu:CURRENT_RECONCILE",
-        g_device_serial,
+        chain_material,
+        sizeof(chain_material),
+        "%s:%lu:%lu:%s",
+        g_add_source_coverage_chain,
         (unsigned long)start,
-        (unsigned long)end);
-    sha256_hex(batch_material, batch_id);
-    char *json = ok ? add_serialize_attendance_events(events, batch_id) : NULL;
-    if (!ok) cJSON_Delete(events);
-    ok = json && add_connector_deliver_attendance_acknowledged(json);
+        (unsigned long)end,
+        chunk_digest);
+    sha256_hex(chain_material, resulting_chain);
+    cJSON *tail = ok && records ? cJSON_CreateObject() : NULL;
+    if (tail) {
+        cJSON_AddStringToObject(tail, "terminal_serial", g_device_serial);
+        cJSON_AddNumberToObject(
+            tail,
+            "terminal_generation",
+            g_add_source_coverage_generation);
+        cJSON_AddNumberToObject(tail, "record_size", record_size);
+        cJSON_AddNumberToObject(tail, "start_ordinal", start);
+        cJSON_AddNumberToObject(tail, "end_ordinal", end);
+        cJSON_AddNumberToObject(tail, "latest_terminal_count", latest_records);
+        cJSON_AddStringToObject(tail, "chunk_digest", chunk_digest);
+        cJSON_AddStringToObject(
+            tail,
+            "previous_chain_digest",
+            g_add_source_coverage_chain);
+        cJSON_AddStringToObject(tail, "resulting_chain_digest", resulting_chain);
+        cJSON_AddItemToObject(tail, "records", records);
+        records = NULL;
+    }
+    cJSON_Delete(records);
+    char *json = tail ? cJSON_PrintUnformatted(tail) : NULL;
+    cJSON_Delete(tail);
+    add_source_tail_ack_t ack = {0};
+    ok = json && add_connector_send_source_tail_acknowledged(json, 30000, &ack);
     free(json);
+    ok = ok && ack.valid &&
+        strcmp(ack.terminal_serial, g_device_serial) == 0 &&
+        ack.terminal_generation == g_add_source_coverage_generation &&
+        ack.committed_next_ordinal == end &&
+        strcmp(ack.resulting_chain_digest, resulting_chain) == 0;
     if (!ok) {
         add_connector_log(
             "WARN",
@@ -4193,12 +4299,37 @@ static bool process_add_incremental_tail(
         return false;
     }
     g_add_source_coverage_cursor = end;
+    strlcpy(
+        g_add_source_coverage_chain,
+        resulting_chain,
+        sizeof(g_add_source_coverage_chain));
     g_add_zkt.add_source_coverage_cursor = end;
     if (end == (uint32_t)latest_records) {
         g_last_synced_attendance_count = latest_records;
         g_last_full_truth_reconcile_epoch = epoch_now();
     }
     nvs_save_runtime_state();
+    if (exception_count > 0) {
+        char message[192];
+        snprintf(
+            message,
+            sizeof(message),
+            "ADD committed tail ordinals %lu..%lu with %lu fail-closed source exception(s); later punches remain unblocked",
+            (unsigned long)start,
+            (unsigned long)end,
+            (unsigned long)exception_count);
+        add_connector_log(
+            "WARN",
+            "reconcile",
+            "CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED",
+            message);
+    } else {
+        add_connector_log(
+            "INFO",
+            "reconcile",
+            "CURRENT_TAIL_SOURCE_COMMITTED",
+            "ADD atomically committed the bounded append-tail source range.");
+    }
     if (more_out) *more_out = end < (uint32_t)latest_records;
     return true;
 }
@@ -7745,6 +7876,49 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 break;
             }
             add_connector_set_activity("LIVE_CAPTURE");
+        }
+        add_source_coverage_t authoritative_coverage;
+        if (add_connector_take_source_coverage(&authoritative_coverage)) {
+            if (strcmp(authoritative_coverage.terminal_serial, g_device_serial) != 0) {
+                g_add_source_coverage_certified = false;
+                add_connector_log(
+                    "CRITICAL",
+                    "reconcile",
+                    "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH",
+                    "ADD source coverage belongs to a different authenticated terminal; tail reconciliation remains disabled.");
+            } else if (!authoritative_coverage.active) {
+                g_add_source_coverage_certified = false;
+                g_add_zkt.add_source_coverage_certified = false;
+                g_add_zkt.add_source_coverage_cursor = 0;
+            } else {
+                if (g_add_source_coverage_certified &&
+                    g_add_source_coverage_cursor >
+                        authoritative_coverage.committed_next_ordinal) {
+                    add_connector_log(
+                        "WARN",
+                        "reconcile",
+                        "ADD_SOURCE_CHECKPOINT_REPLAY",
+                        "Local tail cursor was ahead of ADD; replaying from ADD's authoritative durable checkpoint.");
+                }
+                g_add_source_coverage_certified = true;
+                g_add_source_coverage_cursor =
+                    authoritative_coverage.committed_next_ordinal;
+                g_add_source_coverage_generation =
+                    authoritative_coverage.terminal_generation;
+                strlcpy(
+                    g_add_source_coverage_chain,
+                    authoritative_coverage.committed_chain_digest,
+                    sizeof(g_add_source_coverage_chain));
+                g_add_zkt.add_source_coverage_certified = true;
+                g_add_zkt.add_source_coverage_cursor =
+                    authoritative_coverage.committed_next_ordinal;
+                add_connector_log(
+                    "INFO",
+                    "reconcile",
+                    "ADD_SOURCE_COVERAGE_APPLIED",
+                    "Applied ADD's authoritative terminal source cursor and chain; bounded tail reconciliation may continue.");
+            }
+            nvs_save_runtime_state();
         }
         add_reconcile_assignment_t reconciliation_assignment;
         if (!g_temp_admin_active &&

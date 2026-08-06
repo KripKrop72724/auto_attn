@@ -6,12 +6,19 @@ import hashlib
 
 import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from zk_add.db import Base
-from zk_add.models import AttendanceEvent, ReconciliationCoverage
+from zk_add.crypto import decrypt_text
+from zk_add.models import (
+    AttendanceEvent,
+    ReconciliationCoverage,
+    SourceTailChunk,
+    TerminalRecordManifest,
+    TerminalRecordReview,
+)
 from zk_add.reconciliation import (
     _version_tuple,
     apply_reconciliation_device_fault,
@@ -19,6 +26,7 @@ from zk_add.reconciliation import (
     apply_reconciliation_assignment_release,
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
+    apply_source_tail_chunk,
     assignment_rows,
     control_reconciliation_job,
     create_reconciliation_job,
@@ -35,10 +43,17 @@ from zk_add.schemas import (
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
     ReconciliationSourceRecord,
+    SourceTailChunkRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
 )
 from zk_add.service import onboard_connector, replace_user_snapshot
+from zk_add.source_exceptions import (
+    list_source_exceptions,
+    reveal_source_exception,
+    review_source_exception,
+    source_exception_detail,
+)
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
@@ -141,6 +156,120 @@ def _source_record() -> ReconciliationSourceRecord:
             clock_quality="OK",
             raw_event={"terminal_uid": "7"},
         ),
+    )
+
+
+def _certify_one_record_baseline(session: Session, connector):
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Establish a one-row source baseline for tail protocol tests.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="tail-baseline-0001",
+    )
+    raw_digest = hashlib.sha256(RAW_RECORD).hexdigest()
+    apply_reconciliation_anchor(
+        session,
+        connector=connector,
+        payload=ReconciliationAnchorRequest(
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation,
+            cutoff_count=1,
+            latest_terminal_count=1,
+            record_size=8,
+            source_total_bytes=12,
+            first_anchor_digest=raw_digest,
+        ),
+    )
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        sequence=0,
+        start_ordinal=0,
+        end_ordinal=1,
+        chunk_digest="0" * 64,
+        previous_chain_digest=None,
+        resulting_chain_digest="0" * 64,
+        records=[_source_record()],
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    chain_digest = reconciliation_chain_digest(
+        None,
+        start_ordinal=0,
+        end_ordinal=1,
+        chunk_digest=chunk_digest,
+    )
+    apply_reconciliation_chunk(
+        session,
+        connector=connector,
+        payload=draft.model_copy(
+            update={
+                "chunk_digest": chunk_digest,
+                "resulting_chain_digest": chain_digest,
+            }
+        ),
+    )
+    apply_reconciliation_manifest(
+        session,
+        connector=connector,
+        payload=ReconciliationManifestRequest(
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation,
+            cutoff_count=1,
+            latest_terminal_count=1,
+            final_chain_digest=chain_digest,
+        ),
+    )
+    coverage = session.scalar(
+        select(ReconciliationCoverage).where(ReconciliationCoverage.active == True)  # noqa: E712
+    )
+    assert coverage is not None
+    return coverage
+
+
+def _tail_source(
+    ordinal: int,
+    disposition: str,
+    *,
+    event: bool = False,
+) -> ReconciliationSourceRecord:
+    raw = bytes([ordinal + 1]) * 8
+    attendance = None
+    if event:
+        attendance = AttendanceEventIn(
+            event_uid=hashlib.sha256(f"tail-event-{ordinal}".encode()).hexdigest(),
+            uid="7",
+            user_id="1007",
+            raw_name="Ayesha-3520212345671",
+            device_event_time=datetime(2026, 8, 6, 9, ordinal, tzinfo=timezone.utc),
+            captured_at=utc_now(),
+            source="CURRENT_RECONCILE",
+            punch=0,
+            status=0,
+            clock_quality="OK",
+            raw_event={"terminal_uid": "7"},
+        )
+    return ReconciliationSourceRecord(
+        ordinal=ordinal,
+        raw_record_digest=hashlib.sha256(raw).hexdigest(),
+        terminal_record_key=hashlib.sha256(f"tail-record-{ordinal}".encode()).hexdigest(),
+        occurrence_index=1,
+        disposition=disposition,
+        raw_record_b64=base64.b64encode(raw).decode(),
+        raw_timestamp=0xFFFFFFFF if disposition == "INVALID_TIME" else ordinal,
+        observed_uid="7",
+        observed_user_id="1007",
+        error_code=(
+            "ZKT_TIMESTAMP_OUT_OF_RANGE"
+            if disposition == "INVALID_TIME"
+            else "ZKT_RECORD_MALFORMED" if disposition == "MALFORMED" else None
+        ),
+        event=attendance,
     )
 
 
@@ -360,6 +489,172 @@ def test_source_record_digest_must_match_protected_raw_evidence(reconciliation_d
     )
     with pytest.raises(ValueError, match="digest does not match"):
         apply_reconciliation_chunk(session, connector=connector, payload=request)
+
+
+def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    connector.zkt_device.attendance_count = 4
+    records = [
+        _tail_source(1, "INVALID_TIME"),
+        _tail_source(2, "EVENT", event=True),
+        _tail_source(3, "MALFORMED"),
+    ]
+    draft = SourceTailChunkRequest(
+        terminal_serial=SERIAL,
+        terminal_generation=coverage.terminal_generation,
+        record_size=8,
+        start_ordinal=1,
+        end_ordinal=4,
+        latest_terminal_count=4,
+        chunk_digest="0" * 64,
+        previous_chain_digest=coverage.source_committed_chain_digest,
+        resulting_chain_digest="0" * 64,
+        records=records,
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    resulting_chain = reconciliation_chain_digest(
+        coverage.source_committed_chain_digest,
+        start_ordinal=1,
+        end_ordinal=4,
+        chunk_digest=chunk_digest,
+    )
+    request = draft.model_copy(
+        update={
+            "chunk_digest": chunk_digest,
+            "resulting_chain_digest": resulting_chain,
+        }
+    )
+
+    committed, chunk, duplicate, error_code = apply_source_tail_chunk(
+        session, connector=connector, payload=request
+    )
+    session.flush()
+    assert error_code is None
+    assert duplicate is False
+    assert chunk is not None
+    assert committed.source_committed_cursor == 4
+    assert committed.source_committed_chain_digest == resulting_chain
+    assert chunk.exception_count == 2
+    assert chunk.event_count == 1
+
+    manifests = session.scalars(
+        select(TerminalRecordManifest)
+        .where(TerminalRecordManifest.canonical_source == True)  # noqa: E712
+        .order_by(TerminalRecordManifest.ordinal)
+    ).all()
+    assert [row.ordinal for row in manifests] == [0, 1, 2, 3]
+    assert [row.disposition for row in manifests[1:]] == [
+        "INVALID_TIME",
+        "EVENT",
+        "MALFORMED",
+    ]
+    assert manifests[1].attendance_event_id is None
+    assert manifests[2].attendance_event_id is not None
+    assert manifests[3].attendance_event_id is None
+    assert manifests[1].protected_raw_record != records[0].raw_record_b64
+    assert decrypt_text(manifests[1].protected_raw_record) == records[0].raw_record_b64
+
+    # The same exact range is the expected retry after transport ACK loss. It
+    # must not create a second source row or attendance event.
+    replay_coverage, replay_chunk, duplicate, error_code = apply_source_tail_chunk(
+        session, connector=connector, payload=request
+    )
+    assert error_code is None
+    assert duplicate is True
+    assert replay_chunk is not None and replay_chunk.id == chunk.id
+    assert replay_chunk.end_ordinal == 4
+    assert replay_coverage.source_committed_cursor == 4
+    assert session.scalar(select(func.count(SourceTailChunk.id))) == 1
+    assert session.scalar(select(func.count(TerminalRecordManifest.id))) == 4
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == 2
+
+    report = list_source_exceptions(session)
+    assert report["totals"] == {
+        "all": 2,
+        "open": 2,
+        "reviewed": 0,
+        "invalid_time": 1,
+        "malformed": 1,
+        "affected_terminals": 1,
+    }
+    assert all(row["cursor_advanced"] for row in report["rows"])
+    assert all(row["evidence_available"] for row in report["rows"])
+
+    exception = manifests[1]
+    first_review = review_source_exception(
+        session,
+        row=exception,
+        actor="operator",
+        reason="Reviewed immutable terminal timestamp evidence.",
+        idempotency_key="review-poison-0001",
+    )
+    repeated_review = review_source_exception(
+        session,
+        row=exception,
+        actor="operator",
+        reason="Reviewed immutable terminal timestamp evidence.",
+        idempotency_key="review-poison-0001",
+    )
+    session.flush()
+    assert repeated_review.id == first_review.id
+    assert session.scalar(select(func.count(TerminalRecordReview.id))) == 1
+    detail = source_exception_detail(session, exception)
+    assert detail["review_state"] == "REVIEWED"
+    assert len(detail["reviews"]) == 1
+    revealed = reveal_source_exception(
+        session,
+        row=exception,
+        actor="operator",
+        reason="Investigate the original terminal timestamp bytes.",
+        idempotency_key="reveal-poison-0001",
+    )
+    assert revealed["raw_record_b64"] == records[0].raw_record_b64
+    assert bytes.fromhex(revealed["raw_record_hex"]) == bytes([2]) * 8
+
+
+def test_source_tail_digest_mutation_invalidates_coverage(reconciliation_db):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    connector.zkt_device.attendance_count = 2
+    record = _tail_source(1, "INVALID_TIME")
+    draft = SourceTailChunkRequest(
+        terminal_serial=SERIAL,
+        terminal_generation=coverage.terminal_generation,
+        record_size=8,
+        start_ordinal=1,
+        end_ordinal=2,
+        latest_terminal_count=2,
+        chunk_digest="0" * 64,
+        previous_chain_digest=coverage.source_committed_chain_digest,
+        resulting_chain_digest="0" * 64,
+        records=[record],
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    resulting_chain = reconciliation_chain_digest(
+        coverage.source_committed_chain_digest,
+        start_ordinal=1,
+        end_ordinal=2,
+        chunk_digest=chunk_digest,
+    )
+    request = draft.model_copy(
+        update={
+            "chunk_digest": chunk_digest,
+            "resulting_chain_digest": resulting_chain,
+        }
+    )
+    apply_source_tail_chunk(session, connector=connector, payload=request)
+    divergent = request.model_copy(update={"chunk_digest": "f" * 64})
+    held, chunk, duplicate, error_code = apply_source_tail_chunk(
+        session, connector=connector, payload=divergent
+    )
+    assert chunk is None
+    assert duplicate is False
+    assert error_code == "SOURCE_TAIL_REPLAY_DIVERGED"
+    assert held.active is False
+    assert held.capture_state == "SOURCE_COVERAGE_INVALIDATED"
 
 
 def test_scan_slot_stays_owned_during_assignment_cooldown(reconciliation_db):

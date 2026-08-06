@@ -1,4 +1,4 @@
-# ADD-owned reconciliation (Zone Lite 2.3.0)
+# ADD-owned reconciliation (Zone Lite 2.4.3)
 
 ADD schedules up to six terminal source scans in parallel. A device owns only
 one strictly serial slot, every acknowledged chunk remains restart-safe, and a
@@ -10,7 +10,7 @@ intake before downstream storage can be overloaded.
 
 - The ZKT terminal is the attendance source of truth. Oracle is append-only; this workflow never deletes or replaces Oracle rows.
 - ADD owns every job, source checkpoint, manifest row, retry, and operator action. The ESP never needs free flash to remember a command or a full-history checkpoint.
-- A source certificate proves a contiguous terminal ordinal range was durably captured by ADD. It may be issued with explicit identity-blocked or quarantined exceptions.
+- A source certificate proves a contiguous terminal ordinal range was durably captured by ADD. Every ordinal has exactly one canonical disposition: `EVENT`, `BLOCKED_IDENTITY`, `INVALID_TIME`, `MALFORMED`, or `TERMINAL_DUPLICATE`.
 - An Oracle membership certificate is separate and is issued only after every resolvable event in that source range is confirmed in Oracle. Identity-blocked rows remain fail-closed and visible.
 - Up to six isolated terminal source scans run nationwide at once, with at most one strictly serial scan per device. Live punches and current-tail delivery have priority over full history.
 
@@ -22,8 +22,9 @@ intake before downstream storage can be overloaded.
 4. ADD anchors terminal serial, generation, cutoff count, record size, source size, and first-record digest.
 5. Zone Lite reads at most the assigned bounded range. Each raw terminal row is hashed, encrypted at rest by ADD, and committed with a chained chunk digest before ADD acknowledges the next ordinal.
 6. After any disconnect, reboot, power loss, or ADD restart, ADD reoffers the same committed ordinal. Firmware rechecks the first-record anchor and the last committed raw-record boundary before reading forward.
-7. ADD seals source coverage only when every ordinal through the cutoff exists in the manifest and the final chain matches.
+7. ADD seals source coverage only when every ordinal through the cutoff exists in the unified source ledger and the final chain matches.
 8. ADD drains events to Oracle with live and current-tail priority. Membership is checked in batches and the job closes only when resolvable membership is complete.
+9. New terminal ordinals use signed, bounded `source_tail_chunk` messages. Invalid or malformed rows are committed as successful fail-closed source dispositions, so valid punches behind them continue.
 
 ## Runtime resource policy
 
@@ -32,7 +33,8 @@ intake before downstream storage can be overloaded.
 - The ADD ORDS backlog applies hysteretic backpressure: a full-history scan pauses at the high watermark and resumes below the low watermark.
 - ORDS delivery order is live, current reconcile, then full history. Full-history candidates are round-robin across connectors.
 - Once ADD acknowledges a complete source certificate, firmware persists the certified cutoff and retires legacy historical/full-dump sweeps.
-- The normal audit then examines only new append-tail ordinals in bounded groups, waits for ADD acknowledgement, and advances its NVS cursor. A terminal count regression invalidates coverage fail-closed.
+- The normal audit then examines only new append-tail ordinals in bounded groups, waits for an exact atomic ADD acknowledgement, and advances its NVS cursor. A terminal count regression invalidates coverage fail-closed.
+- ADD's active source checkpoint overrides the ESP's local cursor after every reconnect. A local-ahead cursor is safely replayed from ADD; an absent or inactive certificate disables tail advancement.
 
 ## Failure semantics
 
@@ -43,7 +45,7 @@ intake before downstream storage can be overloaded.
 | Terminal serial, count, first anchor, or committed boundary changes | Coverage/job safety hold; operator review required |
 | ORDS unavailable or backlogged | Source capture pauses or Oracle assurance waits; live delivery retains priority |
 | CNIC/identity unresolved | Attendance remains `BLOCKED_IDENTITY`; source coverage can seal with the explicit exception |
-| Raw terminal record malformed or time invalid | Encrypted raw evidence is quarantined; Oracle membership cannot be certified silently |
+| Raw terminal record malformed or time invalid | Encrypted raw evidence is committed to the source ledger, excluded from attendance/Oracle, exposed in the review-only inspector, and later ordinals continue |
 | ESP preservation storage full/unavailable | ADD commands still execute from the durable control-plane offer; storage is never auto-formatted |
 | Operator pause/cancel | Committed evidence is retained; no terminal or Oracle record is removed |
 
@@ -58,4 +60,4 @@ Firmware still rolls out one zone at a time in this order; durable source reconc
 3. Swat
 4. Peshawar
 
-For every zone, require deployment `SUCCEEDED`, exact signed 2.3.0, ESP online/connected/OTA-ready, activity `ONLINE` or `LIVE_CAPTURE`, ZKT online/certified/snapshot-complete, non-regressed terminal counts, live attendance parity, zero unsafe resolvable rows, and no post-boot truth or reconcile failure. Hold the campaign and stop before the next zone on any failed gate.
+For every zone, require deployment `SUCCEEDED`, the exact signed release, ESP online/connected/OTA-ready, activity `ONLINE` or `LIVE_CAPTURE`, ZKT online/certified/snapshot-complete, non-regressed terminal counts, exact source-cursor parity and chain continuity, zero unsafe resolvable rows, and no post-boot source or reconcile failure. Attendance-row count is intentionally not compared with the raw terminal count when evidenced source exceptions or terminal duplicates exist. Hold the campaign and stop before the next zone on any failed gate.

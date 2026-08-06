@@ -126,6 +126,7 @@ static const char *TAG = "add_connector";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
 static QueueHandle_t s_reconcile_assignments;
+static QueueHandle_t s_source_coverage;
 static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
@@ -142,6 +143,7 @@ static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
+static add_source_tail_ack_t s_source_tail_ack;
 static char s_reconcile_last_job_id[40];
 static uint32_t s_reconcile_last_generation;
 static uint32_t s_reconcile_last_committed_ordinal;
@@ -478,6 +480,31 @@ bool add_connector_send_reconcile_chunk_acknowledged(
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
         ack_out);
+}
+
+bool add_connector_send_source_tail_acknowledged(
+    const char *payload_json,
+    uint32_t timeout_ms,
+    add_source_tail_ack_t *ack_out)
+{
+    if (!ack_out) return false;
+    memset(ack_out, 0, sizeof(*ack_out));
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memset(&s_source_tail_ack, 0, sizeof(s_source_tail_ack));
+        xSemaphoreGive(s_lock);
+    }
+    bool acknowledged = send_payload_and_wait_for_ack(
+        "source_tail_chunk",
+        payload_json,
+        portMAX_DELAY,
+        pdMS_TO_TICKS(timeout_ms),
+        NULL);
+    if (!acknowledged || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    *ack_out = s_source_tail_ack;
+    xSemaphoreGive(s_lock);
+    return ack_out->valid;
 }
 
 static const char *storage_key_material(void)
@@ -1444,11 +1471,13 @@ static void parse_inbound(const char *data, size_t len)
         (strcmp(type->valuestring, "ack") == 0 ||
          strcmp(type->valuestring, "reconcile_anchor_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_chunk_ack") == 0 ||
-         strcmp(type->valuestring, "reconcile_manifest_ack") == 0)) {
+         strcmp(type->valuestring, "reconcile_manifest_ack") == 0 ||
+         strcmp(type->valuestring, "source_tail_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
                 memset(&s_reconcile_chunk_ack, 0, sizeof(s_reconcile_chunk_ack));
+                memset(&s_source_tail_ack, 0, sizeof(s_source_tail_ack));
                 if (strcmp(type->valuestring, "reconcile_chunk_ack") == 0) {
                     cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
                     cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
@@ -1480,6 +1509,32 @@ static void parse_inbound(const char *data, size_t len)
                         s_reconcile_last_committed_ordinal =
                             s_reconcile_chunk_ack.committed_next_ordinal;
                     }
+                } else if (strcmp(type->valuestring, "source_tail_ack") == 0) {
+                    cJSON *terminal_serial = cJSON_GetObjectItemCaseSensitive(root, "terminal_serial");
+                    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "terminal_generation");
+                    cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "committed_next_ordinal");
+                    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "resulting_chain_digest");
+                    cJSON *exception_count = cJSON_GetObjectItemCaseSensitive(root, "exception_count");
+                    if (cJSON_IsString(terminal_serial) && terminal_serial->valuestring[0] &&
+                        cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
+                        cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
+                        strlcpy(
+                            s_source_tail_ack.terminal_serial,
+                            terminal_serial->valuestring,
+                            sizeof(s_source_tail_ack.terminal_serial));
+                        strlcpy(
+                            s_source_tail_ack.resulting_chain_digest,
+                            chain->valuestring,
+                            sizeof(s_source_tail_ack.resulting_chain_digest));
+                        s_source_tail_ack.terminal_generation =
+                            (uint32_t)generation->valuedouble;
+                        s_source_tail_ack.committed_next_ordinal =
+                            (uint32_t)committed->valuedouble;
+                        s_source_tail_ack.exception_count = cJSON_IsNumber(exception_count)
+                            ? (uint32_t)exception_count->valuedouble
+                            : 0;
+                        s_source_tail_ack.valid = true;
+                    }
                 }
                 s_waiting_ack[0] = '\0';
                 s_ack_matched = true;
@@ -1506,6 +1561,36 @@ static void parse_inbound(const char *data, size_t len)
                 xSemaphoreGive(s_ack_sem);
             }
             xSemaphoreGive(s_lock);
+        }
+        cJSON_Delete(root);
+        return;
+    }
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "source_coverage") == 0) {
+        add_source_coverage_t coverage = {0};
+        cJSON *terminal_serial = cJSON_GetObjectItemCaseSensitive(root, "terminal_serial");
+        cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "terminal_generation");
+        cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "source_committed_cursor");
+        cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "source_committed_chain_digest");
+        cJSON *active = cJSON_GetObjectItemCaseSensitive(root, "active");
+        bool valid = cJSON_IsString(terminal_serial) && terminal_serial->valuestring[0] &&
+            cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
+            cJSON_IsString(chain) && strlen(chain->valuestring) == 64 &&
+            cJSON_IsBool(active);
+        if (valid && s_source_coverage) {
+            strlcpy(
+                coverage.terminal_serial,
+                terminal_serial->valuestring,
+                sizeof(coverage.terminal_serial));
+            strlcpy(
+                coverage.committed_chain_digest,
+                chain->valuestring,
+                sizeof(coverage.committed_chain_digest));
+            coverage.terminal_generation = (uint32_t)generation->valuedouble;
+            coverage.committed_next_ordinal = (uint32_t)committed->valuedouble;
+            coverage.active = cJSON_IsTrue(active);
+            if (xQueueOverwrite(s_source_coverage, &coverage) != pdTRUE) {
+                ESP_LOGW(TAG, "Could not queue authoritative ADD source coverage");
+            }
         }
         cJSON_Delete(root);
         return;
@@ -1846,6 +1931,7 @@ static void heartbeat_task(void *arg)
                 "reconciliation_capabilities");
             cJSON_AddBoolToObject(reconciliation, "history_stream_v1", true);
             cJSON_AddBoolToObject(reconciliation, "history_stream_v2", true);
+            cJSON_AddBoolToObject(reconciliation, "source_tail_v1", true);
             cJSON_AddBoolToObject(
                 reconciliation,
                 "history_range_resume_verified",
@@ -2805,6 +2891,7 @@ void add_connector_init(void)
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
+    s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -2819,6 +2906,7 @@ void add_connector_init(void)
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
                 s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
                 s_reconcile_assignments &&
+                s_source_coverage &&
                 s_inbound_messages;
     if (s_started &&
         xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
@@ -3237,6 +3325,12 @@ bool add_connector_has_reconcile_assignment(void)
 {
     return s_reconcile_assignments &&
         uxQueueMessagesWaiting(s_reconcile_assignments) > 0;
+}
+
+bool add_connector_take_source_coverage(add_source_coverage_t *out)
+{
+    return s_source_coverage && out &&
+        xQueueReceive(s_source_coverage, out, 0) == pdTRUE;
 }
 
 void add_connector_command_retry(const char *command_id)
