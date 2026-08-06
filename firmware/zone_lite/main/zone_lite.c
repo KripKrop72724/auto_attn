@@ -3722,6 +3722,70 @@ static bool process_add_reconciliation_assignment(
     if (!zk_get_counts(sock, ctx, &current_users, &latest_records) || latest_records < 0) {
         return false;
     }
+    uint32_t cutoff = assignment->has_cutoff
+        ? assignment->cutoff_count
+        : (uint32_t)latest_records;
+    if ((uint32_t)latest_records < cutoff ||
+        assignment->committed_next_ordinal > cutoff) {
+        add_connector_log(
+            "ERROR",
+            "reconcile",
+            "SOURCE_RANGE_COUNT_REGRESSION",
+            "Terminal attendance count regressed below ADD's durable source checkpoint.");
+        return true;
+    }
+    if (assignment->has_cutoff &&
+        assignment->committed_next_ordinal == cutoff) {
+        // Every committed range already verified the immutable first anchor,
+        // predecessor boundary, raw evidence, and chain before ADD advanced
+        // its cursor. Under the declared append-only source policy, a fresh
+        // non-regressing count is enough to seal that evidence. Reopening the
+        // terminal's prepared attendance buffer here can take minutes on
+        // uFace terminals and adds no new evidence after the final ACK.
+        cJSON *manifest = cJSON_CreateObject();
+        cJSON_AddStringToObject(manifest, "job_id", assignment->job_id);
+        cJSON_AddNumberToObject(manifest, "generation", assignment->generation);
+        cJSON_AddStringToObject(manifest, "terminal_serial", g_device_serial);
+        cJSON_AddNumberToObject(
+            manifest,
+            "terminal_generation",
+            assignment->generation);
+        cJSON_AddNumberToObject(manifest, "cutoff_count", cutoff);
+        cJSON_AddNumberToObject(
+            manifest,
+            "latest_terminal_count",
+            latest_records);
+        cJSON_AddStringToObject(
+            manifest,
+            "final_chain_digest",
+            assignment->preceding_chain_digest[0]
+                ? assignment->preceding_chain_digest
+                : "0000000000000000000000000000000000000000000000000000000000000000");
+        char *json = cJSON_PrintUnformatted(manifest);
+        cJSON_Delete(manifest);
+        bool ok = json && add_connector_send_payload_acknowledged(
+            "reconcile_source_manifest",
+            json,
+            30000);
+        free(json);
+        if (ok) {
+            g_add_source_coverage_certified = true;
+            g_add_source_coverage_cursor = cutoff;
+            g_add_zkt.add_source_coverage_certified = true;
+            g_add_zkt.add_source_coverage_cursor = cutoff;
+            g_last_synced_attendance_count = latest_records;
+            g_force_truth_reconcile = false;
+            g_history_backfill_pending = false;
+            g_history_backfill_had_failures = false;
+            nvs_save_runtime_state();
+            add_connector_log(
+                "INFO",
+                "reconcile",
+                "ADD_SOURCE_COVERAGE_CERTIFIED",
+                "ADD acknowledged complete terminal source evidence; legacy historical scans are retired in favor of bounded append-tail audits.");
+        }
+        return ok;
+    }
     zk_bounded_buffer_t source = {0};
     if (!zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source)) {
         add_connector_log(
@@ -3751,18 +3815,6 @@ static bool process_add_reconciliation_assignment(
             "SOURCE_RANGE_LAYOUT_INVALID",
             "Prepared terminal attendance source did not match its reported record count.");
         return false;
-    }
-    uint32_t cutoff = assignment->has_cutoff
-        ? assignment->cutoff_count
-        : (uint32_t)latest_records;
-    if ((uint32_t)latest_records < cutoff || assignment->committed_next_ordinal > cutoff) {
-        zk_close_bounded_buffer(sock, ctx, &source);
-        add_connector_log(
-            "ERROR",
-            "reconcile",
-            "SOURCE_RANGE_COUNT_REGRESSION",
-            "Terminal attendance count regressed below ADD's durable source checkpoint.");
-        return true;
     }
     char first_digest[65];
     if (cutoff > 0) {
@@ -3832,47 +3884,6 @@ static bool process_add_reconciliation_assignment(
             json,
             30000);
         free(json);
-        return ok;
-    }
-
-    if (assignment->committed_next_ordinal == cutoff) {
-        cJSON *manifest = cJSON_CreateObject();
-        cJSON_AddStringToObject(manifest, "job_id", assignment->job_id);
-        cJSON_AddNumberToObject(manifest, "generation", assignment->generation);
-        cJSON_AddStringToObject(manifest, "terminal_serial", g_device_serial);
-        cJSON_AddNumberToObject(manifest, "terminal_generation", assignment->generation);
-        cJSON_AddNumberToObject(manifest, "cutoff_count", cutoff);
-        cJSON_AddNumberToObject(manifest, "latest_terminal_count", latest_records);
-        cJSON_AddStringToObject(
-            manifest,
-            "final_chain_digest",
-            assignment->preceding_chain_digest[0]
-                ? assignment->preceding_chain_digest
-                : "0000000000000000000000000000000000000000000000000000000000000000");
-        char *json = cJSON_PrintUnformatted(manifest);
-        cJSON_Delete(manifest);
-        zk_close_bounded_buffer(sock, ctx, &source);
-        ok = json && add_connector_send_payload_acknowledged(
-            "reconcile_source_manifest",
-            json,
-            30000);
-        free(json);
-        if (ok) {
-            g_add_source_coverage_certified = true;
-            g_add_source_coverage_cursor = cutoff;
-            g_add_zkt.add_source_coverage_certified = true;
-            g_add_zkt.add_source_coverage_cursor = cutoff;
-            g_last_synced_attendance_count = latest_records;
-            g_force_truth_reconcile = false;
-            g_history_backfill_pending = false;
-            g_history_backfill_had_failures = false;
-            nvs_save_runtime_state();
-            add_connector_log(
-                "INFO",
-                "reconcile",
-                "ADD_SOURCE_COVERAGE_CERTIFIED",
-                "ADD acknowledged complete terminal source evidence; legacy historical scans are retired in favor of bounded append-tail audits.");
-        }
         return ok;
     }
 

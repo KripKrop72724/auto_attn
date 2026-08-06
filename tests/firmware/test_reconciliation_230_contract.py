@@ -10,8 +10,8 @@ HIL_GATE = (ROOT / "firmware/zone_lite/tools/run_ota_hil_gate.py").read_text()
 WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
 
 
-def test_241_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.1)" in PROJECT
+def test_242_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.2)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -22,7 +22,7 @@ def test_241_uses_bounded_verified_range_resume_and_add_checkpoints():
     assert "committed_predecessor_digest" in CONNECTOR
 
 
-def test_241_streams_four_durable_100_record_chunks_per_prepared_burst():
+def test_242_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert '"history_stream_v2"' in CONNECTOR
     assert '"max_chunk_records", 100' in CONNECTOR
     assert '"max_credit_records", 400' in CONNECTOR
@@ -53,6 +53,17 @@ def test_certified_baseline_switches_to_bounded_append_tail_audits():
     assert '"CURRENT_RECONCILE"' in ZONE
     assert "g_add_source_coverage_cursor = end" in ZONE
     assert "CURRENT_TAIL_CHECKPOINT_RETRY" in ZONE
+
+
+def test_final_manifest_does_not_reopen_the_prepared_terminal_buffer():
+    manifest_gate = ZONE.index(
+        "assignment->committed_next_ordinal == cutoff"
+    )
+    buffer_prepare = ZONE.index(
+        "zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source)"
+    )
+    assert manifest_gate < buffer_prepare
+    assert "adds no new evidence after the final ACK" in ZONE
 
 
 def test_admin_lease_duration_starts_after_verified_terminal_elevation():
