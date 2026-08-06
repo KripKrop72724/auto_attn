@@ -2162,7 +2162,14 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                     and job.committed_next_ordinal < job.credit_end_ordinal
                 ),
                 "credit_end_ordinal": job.credit_end_ordinal,
-                "lease_expires_at": job.assignment_expires_at,
+                # WebSocket.send_json uses the standard JSON encoder directly,
+                # unlike FastAPI HTTP responses. Keep this value JSON-native so
+                # a durable chunk commit can always receive its ACK.
+                "lease_expires_at": (
+                    job.assignment_expires_at.isoformat()
+                    if job.assignment_expires_at is not None
+                    else None
+                ),
             }
         elif envelope.type == "reconcile_source_manifest":
             manifest = ReconciliationManifestRequest.model_validate(envelope.payload)

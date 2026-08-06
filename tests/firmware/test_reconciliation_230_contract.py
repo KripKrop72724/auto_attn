@@ -4,12 +4,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ZONE = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
 CONNECTOR = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
+CONNECTOR_HEADER = (ROOT / "firmware/zone_lite/main/add_connector.h").read_text()
 PROJECT = (ROOT / "firmware/zone_lite/CMakeLists.txt").read_text()
 HIL_GATE = (ROOT / "firmware/zone_lite/tools/run_ota_hil_gate.py").read_text()
+WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
 
 
-def test_240_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.0)" in PROJECT
+def test_241_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.1)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -20,7 +22,7 @@ def test_240_uses_bounded_verified_range_resume_and_add_checkpoints():
     assert "committed_predecessor_digest" in CONNECTOR
 
 
-def test_240_streams_four_durable_100_record_chunks_per_prepared_burst():
+def test_241_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert '"history_stream_v2"' in CONNECTOR
     assert '"max_chunk_records", 100' in CONNECTOR
     assert '"max_credit_records", 400' in CONNECTOR
@@ -29,6 +31,13 @@ def test_240_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert "ack.committed_next_ordinal == end" in ZONE
     assert "zk_close_bounded_buffer(sock, ctx, &source);" in ZONE
     assert "Deferred an interleaved live event" in ZONE
+
+
+def test_stream_v2_ack_is_json_native_and_assignment_wins_truth_race():
+    assert "job.assignment_expires_at.isoformat()" in WEB
+    assert "add_connector_has_reconcile_assignment" in CONNECTOR_HEADER
+    assert "uxQueueMessagesWaiting(s_reconcile_assignments) > 0" in CONNECTOR
+    assert "if (add_connector_has_reconcile_assignment())" in ZONE
 
 
 def test_add_is_command_authority_when_optional_flash_cache_is_full():
