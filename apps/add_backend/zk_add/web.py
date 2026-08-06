@@ -141,6 +141,7 @@ from zk_add.reconciliation import (
     control_reconciliation_job,
     create_reconciliation_job,
     preflight_reconciliation,
+    reconciliation_scheduler_state,
     serialize_job,
 )
 
@@ -584,6 +585,7 @@ def list_reconciliations(
     rows = db.scalars(statement.limit(limit)).all()
     return {
         "enabled": settings.reconciliation_enabled,
+        "scheduler": reconciliation_scheduler_state(db),
         "rows": [serialize_job(db, row) for row in rows],
     }
 

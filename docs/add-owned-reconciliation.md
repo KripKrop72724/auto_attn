@@ -1,12 +1,18 @@
 # ADD-owned reconciliation (Zone Lite 2.3.0)
 
+ADD schedules up to six terminal source scans in parallel. A device owns only
+one strictly serial slot, every acknowledged chunk remains restart-safe, and a
+disconnect or device-specific safety hold releases capacity for another zone.
+The global full-history ORDS backlog gate continues to pause all new source
+intake before downstream storage can be overloaded.
+
 ## Truth and safety contract
 
 - The ZKT terminal is the attendance source of truth. Oracle is append-only; this workflow never deletes or replaces Oracle rows.
 - ADD owns every job, source checkpoint, manifest row, retry, and operator action. The ESP never needs free flash to remember a command or a full-history checkpoint.
 - A source certificate proves a contiguous terminal ordinal range was durably captured by ADD. It may be issued with explicit identity-blocked or quarantined exceptions.
 - An Oracle membership certificate is separate and is issued only after every resolvable event in that source range is confirmed in Oracle. Identity-blocked rows remain fail-closed and visible.
-- Only one terminal source scan runs nationwide at a time. Live punches and current-tail delivery have priority over full history.
+- Up to six isolated terminal source scans run nationwide at once, with at most one strictly serial scan per device. Live punches and current-tail delivery have priority over full history.
 
 ## Operator workflow
 
@@ -21,7 +27,7 @@
 
 ## Runtime resource policy
 
-- Full history is request-only and globally serialized.
+- Full history is request-only and bounded to six parallel device slots. Each terminal remains strictly serial and resumes only from its ADD-committed checkpoint.
 - Firmware does not allocate the multi-megabyte terminal dump. It reads a bounded range from `CMD_READ_BUFFER_CHUNK` and releases the prepared terminal buffer after the step.
 - The ADD ORDS backlog applies hysteretic backpressure: a full-history scan pauses at the high watermark and resumes below the low watermark.
 - ORDS delivery order is live, current reconcile, then full history. Full-history candidates are round-robin across connectors.
@@ -45,7 +51,7 @@
 
 Deploy ADD first with the feature dark, then enable the ADD feature flag only after migration, readiness, and UI verification. Firmware promotion requires a clean build, signed immutable image, exact SHA, and successful hardware-in-loop range-resume, disconnect, power-cycle, storage-pressure, live-punch, and rollback checks.
 
-Roll out one zone at a time in this order:
+Firmware still rolls out one zone at a time in this order; durable source reconciliation may run in parallel after the eligible devices are safely booted:
 
 1. SLICTOWER
 2. Karachi

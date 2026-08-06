@@ -23,6 +23,7 @@ from zk_add.reconciliation import (
     preflight_reconciliation,
     reconciliation_chain_digest,
     reconciliation_chunk_digest,
+    reconciliation_scheduler_state,
     refresh_reconciliation_assurance,
 )
 from zk_add.schemas import (
@@ -138,6 +139,58 @@ def _source_record() -> ReconciliationSourceRecord:
             raw_event={"terminal_uid": "7"},
         ),
     )
+
+
+def _add_ready_connector(session: Session, index: int):
+    serial = f"TEST-SERIAL-{index}"
+    connector, _token, _created = onboard_connector(
+        session,
+        hardware_id=f"02:00:00:00:00:{index:02x}",
+        zone_id=f"ZONE-TEST-{index}",
+        zone_name=f"ZONE-TEST-{index}",
+        device_id=str(index),
+        firmware_version="2.3.0",
+        expected_serial=serial,
+        actor="test",
+        ip_address="127.0.0.1",
+    )
+    connector.connected = True
+    connector.lifecycle_state = "ONLINE"
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.serial = serial
+    zkt.online = True
+    zkt.connection_state = "ONLINE"
+    zkt.certification_state = "CERTIFIED"
+    zkt.snapshot_complete = True
+    zkt.identity_snapshot_stable = True
+    zkt.user_count = 1
+    zkt.attendance_count = 1
+    zkt.capability_profile = {
+        "read_attendance": True,
+        "history_stream_v1": True,
+        "history_range_resume_verified": True,
+    }
+    replace_user_snapshot(
+        session,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id=f"stable-source-snapshot-{index}",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(
+                    uid=str(index),
+                    user_id=f"user-{index}",
+                    name=f"Worker {index}-3520212345{index:03d}",
+                    privilege=0,
+                )
+            ],
+        ),
+    )
+    zkt.identity_snapshot_stable = True
+    session.flush()
+    return connector
 
 
 def test_full_history_reconciliation_is_contiguous_resumable_and_separately_certified(
@@ -306,7 +359,7 @@ def test_source_record_digest_must_match_protected_raw_evidence(reconciliation_d
         apply_reconciliation_chunk(session, connector=connector, payload=request)
 
 
-def test_global_scan_slot_stays_owned_during_assignment_cooldown(reconciliation_db):
+def test_scan_slot_stays_owned_during_assignment_cooldown(reconciliation_db):
     session, connector = reconciliation_db
     job = create_reconciliation_job(
         session,
@@ -320,6 +373,46 @@ def test_global_scan_slot_stays_owned_during_assignment_cooldown(reconciliation_
     second = assignment_rows(session)
     assert first and first[0][1]["job_id"] == job.job_id
     assert second == []
+
+
+def test_six_parallel_scan_slots_are_bounded_and_device_isolated(
+    reconciliation_db,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session, first_connector = reconciliation_db
+    monkeypatch.setattr(settings, "reconciliation_device_concurrency", 6)
+    connectors = [first_connector]
+    connectors.extend(_add_ready_connector(session, index) for index in range(2, 8))
+    jobs = [
+        create_reconciliation_job(
+            session,
+            connector=connector,
+            actor="operator",
+            reason="Verify bounded parallel source scan scheduling.",
+            confirmation=f"RECONCILE {connector.device_id} FROM START",
+            idempotency_key=f"parallel-reconcile-{index}",
+        )
+        for index, connector in enumerate(connectors, start=1)
+    ]
+
+    first = assignment_rows(session)
+    assert [payload["job_id"] for _connector_id, payload in first] == [
+        job.job_id for job in jobs[:6]
+    ]
+    assert jobs[6].phase == "WAITING_FOR_CAPACITY"
+    assert jobs[6].wait_reason == "WAITING_FOR_SCAN_SLOT"
+    assert reconciliation_scheduler_state(session) == {
+        "policy": "BOUNDED_PARALLEL_PER_DEVICE",
+        "device_concurrency": 6,
+        "active_scan_jobs": 6,
+        "waiting_scan_jobs": 1,
+        "available_scan_slots": 0,
+    }
+
+    first_connector.connected = False
+    second = assignment_rows(session)
+    assert [payload["job_id"] for _connector_id, payload in second] == [jobs[6].job_id]
+    assert jobs[0].wait_reason == "WAITING_FOR_DEVICE"
 
 
 def test_firmware_source_divergence_immediately_holds_add_job(reconciliation_db):

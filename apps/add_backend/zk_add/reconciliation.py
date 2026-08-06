@@ -768,14 +768,16 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"]),
         )
     ) or 0
-    # The oldest active jobs own the global scan slots even while they are
-    # waiting for a retry interval or a safe window. This prevents a second
-    # terminal scan from starting behind a temporarily quiet first job.
-    for job in rows[: max(1, settings.reconciliation_device_concurrency)]:
+    # Each ready job owns one isolated device slot through its short assignment
+    # cooldown. A disconnected or safety-blocked device releases its slot so it
+    # cannot stall another zone; the durable checkpoint lets it resume later.
+    # The global Oracle backlog gate still stops all new source intake before
+    # ADD or ORDS can be overloaded.
+    slot_limit = settings.reconciliation_device_concurrency
+    slots_owned = 0
+    now = utc_now()
+    for job in rows:
         connector = session.get(Connector, job.connector_id)
-        now = utc_now()
-        if job.next_retry_at is not None and job.next_retry_at > now:
-            continue
         if connector is None or not connector.connected:
             job.phase = "WAITING_FOR_DEVICE"
             job.wait_reason = "WAITING_FOR_DEVICE"
@@ -802,8 +804,15 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = preflight["waitable_blockers"][0]["code"]
             continue
+        if slots_owned >= slot_limit:
+            job.phase = "WAITING_FOR_CAPACITY"
+            job.wait_reason = "WAITING_FOR_SCAN_SLOT"
+            continue
+        slots_owned += 1
         job.wait_reason = None
         job.phase = "ANCHORING" if job.cutoff_count is None else "SCANNING_TERMINAL"
+        if job.next_retry_at is not None and job.next_retry_at > now:
+            continue
         zkt = connector.zkt_device
         try:
             device_chunk_limit = int(
@@ -848,6 +857,29 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             seconds=max(2, settings.reconciliation_assignment_seconds)
         )
     return assignments
+
+
+def reconciliation_scheduler_state(session: Session) -> dict:
+    rows = session.scalars(
+        select(ReconciliationJob).where(
+            ReconciliationJob.status.in_(["QUEUED", "RUNNING"]),
+            ReconciliationJob.capture_certified_at.is_(None),
+        )
+    ).all()
+    active = sum(
+        row.phase in {"ANCHORING", "SCANNING_TERMINAL"}
+        and row.wait_reason is None
+        for row in rows
+    )
+    return {
+        "policy": "BOUNDED_PARALLEL_PER_DEVICE",
+        "device_concurrency": settings.reconciliation_device_concurrency,
+        "active_scan_jobs": active,
+        "waiting_scan_jobs": max(0, len(rows) - active),
+        "available_scan_slots": max(
+            0, settings.reconciliation_device_concurrency - active
+        ),
+    }
 
 
 def serialize_job(session: Session, job: ReconciliationJob, *, include_events: bool = False) -> dict:

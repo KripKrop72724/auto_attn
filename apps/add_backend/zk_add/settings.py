@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,7 +39,7 @@ class AddSettings(BaseSettings):
     identity_snapshot_capture_tolerance_seconds: int = 5
     identity_repair_sla_seconds: int = 60
     reconciliation_enabled: bool = False
-    reconciliation_device_concurrency: int = 1
+    reconciliation_device_concurrency: int = Field(default=6, ge=1, le=6)
     reconciliation_chunk_records: int = 100
     reconciliation_history_backlog_pause: int = 10_000
     reconciliation_history_backlog_resume: int = 5_000
