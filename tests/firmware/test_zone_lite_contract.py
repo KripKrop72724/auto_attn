@@ -264,13 +264,43 @@ def test_full_reconcile_releases_dump_and_bounds_downstream_serialization():
     )
     collect_window = reconcile.index("collect_reconcile_window(")
     oracle_send = reconcile.index("oracle_send_reconcile(", collect_window)
-    free_dump = reconcile.rindex("free(data);")
+    free_dump = reconcile.rindex("reconcile_dump_release(data);")
     assert release_gate < collect_window < oracle_send < free_dump
     assert reconcile.index("add_enqueue_reconcile_events(") < reconcile.index(
         "oracle_send_reconcile("
     )
     assert 'reconcile_complete ? "true" : "false"' in reconcile
     assert "return reconcile_complete;" in reconcile
+
+
+def test_historical_truth_reuses_one_verified_dump_only_during_quiet_hours():
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    reconcile = source[
+        source.index("static bool reconcile_attendance_dump(") :
+        source.index("static bool system_time_is_valid(")
+    ]
+    gateway = source[
+        source.index("static int64_t gateway_run(uint32_t host_order_ip)") :
+        source.index("static void event_handler(")
+    ]
+
+    assert "ZONE_LITE_HISTORY_WINDOW_START_HOUR_UTC 17" in source
+    assert "ZONE_LITE_HISTORY_WINDOW_END_HOUR_UTC 0" in source
+    assert "ZONE_LITE_HISTORY_DUMP_CACHE_MAX_AGE_MS" in source
+    assert "static bool history_window_is_open(" in source
+    assert "static bool history_dump_cache_is_usable(" in source
+    assert "current_records < g_history_dump_cache_records" in source
+    assert "data = g_history_dump_cache;" in reconcile
+    assert "counts_refreshed &&" in reconcile
+    assert "refreshed_users == (int32_t)users->count" in reconcile
+    assert '"HISTORY_DUMP_CACHE_VERIFIED"' in reconcile
+    assert '"HISTORY_DUMP_CACHE_REUSED"' in reconcile
+    assert "data != g_history_dump_cache" in source
+    assert "history_dump_cache_clear();\n    g_history_backfill_pending = true;" in source
+    assert "history_dump_cache_clear();\n    g_history_backfill_pending = false;" in source
+    assert "g_history_backfill_pending &&\n                historical_window_open" in gateway
+    assert "last_reconcile = uptime_ms();" in gateway
+    assert "priority_reconcile_retry_scheduled" in gateway
 
 
 def test_each_truth_retry_chain_has_an_independent_bounded_budget():
