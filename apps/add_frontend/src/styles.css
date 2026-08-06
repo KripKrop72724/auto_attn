@@ -319,7 +319,7 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .reconcile-job-head h3 { margin: 3px 0 5px; font-size: 19px; }
 .reconcile-job-head small, .reconcile-phase span { color: var(--muted); font-size: 12px; }
 .reconcile-phase strong { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
-.reconcile-progress { height: 10px; overflow: hidden; border: 1px solid var(--line); background: #f1f3f4; }
+.reconcile-progress { height: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--soft); }
 .reconcile-progress i { display: block; height: 100%; min-width: 2px; background: var(--blue); transition: width .35s ease; }
 .reconcile-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
 .reconcile-facts span { min-width: 0; color: var(--muted); font-size: 11px; }
