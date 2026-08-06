@@ -199,6 +199,14 @@ export interface ReconciliationJob {
   updated_at: string
 }
 
+export interface ReconciliationScheduler {
+  policy: 'BOUNDED_PARALLEL_PER_DEVICE' | string
+  device_concurrency: number
+  active_scan_jobs: number
+  waiting_scan_jobs: number
+  available_scan_slots: number
+}
+
 export interface FirmwareRelease {
   release_id: string
   version: string

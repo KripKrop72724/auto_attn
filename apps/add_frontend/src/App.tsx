@@ -31,6 +31,7 @@ import type {
   Overview,
   ReconciliationJob,
   ReconciliationPreflight,
+  ReconciliationScheduler,
   UserCommandResponse,
   UserDeletionJob,
   DashboardRoute,
@@ -1549,6 +1550,13 @@ function ReconciliationView({
   toast: ReturnType<typeof useToast>
 }) {
   const [rows, setRows] = useState<ReconciliationJob[]>([])
+  const [scheduler, setScheduler] = useState<ReconciliationScheduler>({
+    policy: 'BOUNDED_PARALLEL_PER_DEVICE',
+    device_concurrency: 1,
+    active_scan_jobs: 0,
+    waiting_scan_jobs: 0,
+    available_scan_slots: 1,
+  })
   const [enabled, setEnabled] = useState(false)
   const [selectedId, setSelectedId] = useState('')
   const [preflight, setPreflight] = useState<ReconciliationPreflight | null>(null)
@@ -1561,11 +1569,16 @@ function ReconciliationView({
 
   const load = useCallback(async () => {
     try {
-      const response = await api<{ enabled: boolean; rows: ReconciliationJob[] }>(
+      const response = await api<{
+        enabled: boolean
+        scheduler?: ReconciliationScheduler
+        rows: ReconciliationJob[]
+      }>(
         '/api/v1/reconciliations?limit=100',
       )
       setEnabled(response.enabled)
       setRows(response.rows)
+      if (response.scheduler) setScheduler(response.scheduler)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Unable to read reconciliation jobs.')
     }
@@ -1642,6 +1655,10 @@ function ReconciliationView({
     selected && enabled && preflight?.eligible && reason.trim().length >= 10 && password &&
     confirmation === `RECONCILE ${selected.device_id} FROM START`,
   )
+  const scanQueue = rows
+    .filter((job) => !job.capture_certified_at && ['QUEUED', 'RUNNING'].includes(job.status))
+    .sort((left, right) => left.requested_at.localeCompare(right.requested_at))
+  const queuePositions = new Map(scanQueue.map((job, index) => [job.job_id, index + 1]))
 
   return (
     <>
@@ -1654,7 +1671,7 @@ function ReconciliationView({
         <button className="button primary" disabled={!selected || !preflight?.eligible || !enabled} onClick={() => setDialog({ mode: 'start' })}><Icon name="refresh" /> New complete reconcile</button>
       </header>
       <section className="metric-grid">
-        <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>One terminal scan globally</small></div></article>
+        <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>{scheduler.device_concurrency} isolated terminal scan slots</small></div></article>
         <article className="metric-card metric-positive"><span className="metric-icon"><Icon name="shield" /></span><div><p>Source certificates</p><strong>{covered}</strong><small>Immutable terminal coverage</small></div></article>
         <article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>Append-only membership checks</small></div></article>
         <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? 'Request path available' : 'Awaiting controlled enablement'}</small></div></article>
@@ -1678,6 +1695,11 @@ function ReconciliationView({
           {rows.map((job) => {
             const cutoff = job.terminal.cutoff_count || 0
             const percent = cutoff ? Math.min(100, Math.round((job.progress.scanned / cutoff) * 100)) : 0
+            const queuePosition = queuePositions.get(job.job_id) || 0
+            const queueStatus = job.wait_reason === 'WAITING_FOR_SCAN_SLOT'
+              ? `Queue position ${queuePosition}; waiting for one of ${scheduler.device_concurrency} isolated scan slots`
+              : job.wait_reason?.replaceAll('_', ' ')
+                || `${job.progress.scanned.toLocaleString()} of ${cutoff ? cutoff.toLocaleString() : 'scope pending'} source rows committed`
             const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> = []
             if (['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status)) controls.push('pause')
             if (job.status === 'PAUSED') controls.push('resume')
@@ -1685,7 +1707,7 @@ function ReconciliationView({
             if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INVALIDATED'].includes(job.status)) controls.push('cancel')
             return <article key={job.job_id} className="reconcile-job">
               <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.status} live={job.status === 'RUNNING'} /></div>
-              <div className="reconcile-phase"><strong>{job.phase.replaceAll('_', ' ')}</strong><span>{job.wait_reason?.replaceAll('_', ' ') || `${job.progress.scanned.toLocaleString()} of ${cutoff ? cutoff.toLocaleString() : 'scope pending'} source rows committed`}</span></div>
+              <div className="reconcile-phase"><strong>{job.phase.replaceAll('_', ' ')}</strong><span>{queueStatus}</span></div>
               <div className="reconcile-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><i style={{ width: `${percent}%` }} /></div>
               <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span></div>
               {job.error_message && <p className="reconcile-error"><Icon name="alert" />{job.error_message}</p>}
@@ -1698,7 +1720,7 @@ function ReconciliationView({
       {dialog && (
         <Dialog titleId="reconciliation-dialog-title" title={dialog.mode === 'start' ? 'Start complete terminal reconciliation' : `${dialog.action} reconciliation`} description={dialog.mode === 'start' ? selected?.display_name : dialog.job.connector?.display_name} onClose={closeDialog}>
           <div className="dialog-body">
-            <div className={`info-copy pattern-${dialog.mode === 'start' || dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}><Icon name="shield" /><div><h3>{dialog.mode === 'start' ? 'A complete terminal scan is expensive and globally serialized.' : 'ADD preserves all committed evidence and checkpoints.'}</h3><p>Live punches keep priority. The job pauses for terminal commands, leases, disconnects, and Oracle backpressure.</p></div></div>
+            <div className={`info-copy pattern-${dialog.mode === 'start' || dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}><Icon name="shield" /><div><h3>{dialog.mode === 'start' ? `ADD runs up to ${scheduler.device_concurrency} isolated terminal scans in parallel.` : 'ADD preserves all committed evidence and checkpoints.'}</h3><p>Each device remains strictly serial. Live punches keep priority, and only the affected job pauses for commands, leases, or disconnects; global Oracle backpressure safely pauses source intake.</p></div></div>
             <label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} placeholder="At least 10 characters" /></label>
             {dialog.mode === 'start' && selected && <label>Type <code>{`RECONCILE ${selected.device_id} FROM START`}</code><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>}
             <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>

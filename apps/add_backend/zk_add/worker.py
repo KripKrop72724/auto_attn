@@ -304,6 +304,25 @@ def reconcile_ords_delivery_alerts(session: Session) -> int:
     return resolved
 
 
+async def dispatch_reconciliation_assignments(
+    assignments: list[tuple[str, dict]],
+) -> None:
+    async def offer(connector_id: str, assignment: dict) -> None:
+        if await connector_hub.send(connector_id, assignment):
+            await browser_events.publish(
+                "reconciliation",
+                {
+                    "job_id": assignment["job_id"],
+                    "phase": "ASSIGNMENT_OFFERED",
+                    "connector_id": connector_id,
+                },
+            )
+
+    await asyncio.gather(
+        *(offer(connector_id, assignment) for connector_id, assignment in assignments)
+    )
+
+
 async def maintenance_tick() -> None:
     now = utc_now()
     dispatch: list[tuple[str, dict]] = []
@@ -407,16 +426,7 @@ async def maintenance_tick() -> None:
                     command.attempt_count += 1
     for update in connector_updates:
         await browser_events.publish("device", update)
-    for connector_id, assignment in reconciliation_dispatch:
-        if await connector_hub.send(connector_id, assignment):
-            await browser_events.publish(
-                "reconciliation",
-                {
-                    "job_id": assignment["job_id"],
-                    "phase": "ASSIGNMENT_OFFERED",
-                    "connector_id": connector_id,
-                },
-            )
+    await dispatch_reconciliation_assignments(reconciliation_dispatch)
     await asyncio.gather(
         audit_firmware_receipts_batch(),
         audit_confirmed_membership_batch(),
