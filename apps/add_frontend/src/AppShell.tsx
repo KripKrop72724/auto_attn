@@ -6,6 +6,7 @@ const navigation = [
   { id: 'fleet', label: 'Fleet', icon: 'grid' },
   { id: 'users', label: 'Users', icon: 'users' },
   { id: 'attendance', label: 'Attendance', icon: 'clock' },
+  { id: 'reconciliation', label: 'Reconciliation', icon: 'refresh' },
   { id: 'firmware', label: 'Firmware', icon: 'terminal' },
   { id: 'alerts', label: 'Alerts', icon: 'alert' },
 ] as const

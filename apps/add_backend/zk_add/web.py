@@ -49,6 +49,7 @@ from zk_add.models import (
     IdentityConflictResolution,
     IdentityTombstone,
     OnboardingNonce,
+    ReconciliationJob,
     TemporaryAdminLease,
     UserDeletionJob,
     ZKTDevice,
@@ -75,6 +76,11 @@ from zk_add.schemas import (
     LogBatchRequest,
     OracleReceiptBatchRequest,
     RestartRequest,
+    ReconciliationAnchorRequest,
+    ReconciliationChunkRequest,
+    ReconciliationControlRequest,
+    ReconciliationCreateRequest,
+    ReconciliationManifestRequest,
     UserCreateRequest,
     UserDeleteRequest,
     UserSnapshotRequest,
@@ -128,6 +134,15 @@ from zk_add.service import (
 from zk_add.settings import settings
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.time_utils import utc_now
+from zk_add.reconciliation import (
+    apply_reconciliation_anchor,
+    apply_reconciliation_chunk,
+    apply_reconciliation_manifest,
+    control_reconciliation_job,
+    create_reconciliation_job,
+    preflight_reconciliation,
+    serialize_job,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -500,6 +515,130 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
+
+
+def reconciliation_or_404(db: Session, job_id: str) -> ReconciliationJob:
+    row = db.scalar(
+        select(ReconciliationJob).where(ReconciliationJob.job_id == job_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Reconciliation job not found.")
+    return row
+
+
+@app.get("/api/v1/devices/{connector_id}/reconciliations/preflight")
+def reconciliation_preflight(
+    connector_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return preflight_reconciliation(db, connector_or_404(db, connector_id))
+
+
+@app.post(
+    "/api/v1/devices/{connector_id}/reconciliations/full-history",
+    status_code=201,
+)
+async def start_full_history_reconciliation(
+    connector_id: str,
+    body: ReconciliationCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        job = create_reconciliation_job(
+            db,
+            connector=connector,
+            actor=context.username,
+            reason=body.reason,
+            confirmation=body.confirmation,
+            idempotency_key=body.idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status}
+    )
+    return serialize_job(db, job, include_events=True)
+
+
+@app.get("/api/v1/reconciliations")
+def list_reconciliations(
+    connector_id: str | None = None,
+    status: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    statement = select(ReconciliationJob).order_by(
+        ReconciliationJob.requested_at.desc()
+    )
+    if connector_id:
+        connector = connector_or_404(db, connector_id)
+        statement = statement.where(ReconciliationJob.connector_id == connector.id)
+    if status:
+        statement = statement.where(ReconciliationJob.status == status.upper())
+    rows = db.scalars(statement.limit(limit)).all()
+    return {
+        "enabled": settings.reconciliation_enabled,
+        "rows": [serialize_job(db, row) for row in rows],
+    }
+
+
+@app.get("/api/v1/reconciliations/{job_id}")
+def get_reconciliation(
+    job_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return serialize_job(db, reconciliation_or_404(db, job_id), include_events=True)
+
+
+@app.get("/api/v1/reconciliations/{job_id}/evidence")
+def get_reconciliation_evidence(
+    job_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    job = reconciliation_or_404(db, job_id)
+    return {
+        "schema_version": "1",
+        "policy": "APPEND_ONLY_MEMBERSHIP",
+        "job": serialize_job(db, job, include_events=True),
+    }
+
+
+@app.post("/api/v1/reconciliations/{job_id}/{action}")
+async def control_reconciliation(
+    job_id: str,
+    action: str,
+    body: ReconciliationControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    if action not in {"pause", "resume", "cancel", "retry"}:
+        raise HTTPException(status_code=404, detail="Unknown reconciliation action.")
+    db, context = auth
+    require_step_up(body.password, db, context)
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = control_reconciliation_job(
+            db,
+            job=job,
+            action=action,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status}
+    )
+    return serialize_job(db, job, include_events=True)
 
 
 @app.get("/api/v1/users")
@@ -1560,6 +1699,85 @@ async def device_attendance(
     }
 
 
+@app.post("/device/v2/reconciliations/anchor")
+async def device_reconciliation_anchor(
+    body: ReconciliationAnchorRequest,
+    auth: tuple[Session, Connector] = Depends(require_connector),
+):
+    db, connector = auth
+    try:
+        job = apply_reconciliation_anchor(db, connector=connector, payload=body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "phase": job.phase}
+    )
+    return {
+        "ok": job.status != "NEEDS_ATTENTION",
+        "job_id": job.job_id,
+        "status": job.status,
+        "phase": job.phase,
+        "committed_next_ordinal": job.committed_next_ordinal,
+    }
+
+
+@app.post("/device/v2/reconciliations/chunks")
+async def device_reconciliation_chunk(
+    body: ReconciliationChunkRequest,
+    auth: tuple[Session, Connector] = Depends(require_connector),
+):
+    db, connector = auth
+    try:
+        job, chunk, duplicate = apply_reconciliation_chunk(
+            db, connector=connector, payload=body
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation",
+        {
+            "job_id": job.job_id,
+            "phase": job.phase,
+            "committed_next_ordinal": job.committed_next_ordinal,
+        },
+    )
+    return {
+        "ok": job.status != "NEEDS_ATTENTION",
+        "job_id": job.job_id,
+        "generation": chunk.generation,
+        "sequence": chunk.sequence,
+        "committed_next_ordinal": job.committed_next_ordinal,
+        "resulting_chain_digest": chunk.resulting_chain_digest,
+        "duplicate": duplicate,
+    }
+
+
+@app.post("/device/v2/reconciliations/manifest")
+async def device_reconciliation_manifest(
+    body: ReconciliationManifestRequest,
+    auth: tuple[Session, Connector] = Depends(require_connector),
+):
+    db, connector = auth
+    try:
+        job = apply_reconciliation_manifest(db, connector=connector, payload=body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "phase": job.phase}
+    )
+    return {
+        "ok": job.capture_certified_at is not None,
+        "job_id": job.job_id,
+        "status": job.status,
+        "phase": job.phase,
+        "capture_certificate": job.capture_certificate or None,
+        "oracle_certificate": job.oracle_certificate or None,
+    }
+
+
 @app.post("/device/v1/user-snapshots")
 async def device_users(
     body: UserSnapshotRequest,
@@ -1797,6 +2015,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
 
 async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
     event_payload = None
+    ack_payload = None
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
         if connector is None:
@@ -1872,9 +2091,79 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "rejected": rejected,
                 "confirmation_path": receipt_batch.confirmation_path,
             }
+        elif envelope.type == "reconcile_anchor":
+            anchor = ReconciliationAnchorRequest.model_validate(envelope.payload)
+            job = apply_reconciliation_anchor(db, connector=connector, payload=anchor)
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "phase": job.phase,
+            }
+            ack_payload = {
+                "type": (
+                    "error" if job.status == "NEEDS_ATTENTION" else "reconcile_anchor_ack"
+                ),
+                "message_id": envelope.message_id,
+                "code": job.error_code,
+                "message_type": envelope.type,
+                "job_id": job.job_id,
+                "status": job.status,
+                "committed_next_ordinal": job.committed_next_ordinal,
+            }
+        elif envelope.type == "reconcile_chunk":
+            source_chunk = ReconciliationChunkRequest.model_validate(envelope.payload)
+            job, chunk, duplicate = apply_reconciliation_chunk(
+                db, connector=connector, payload=source_chunk
+            )
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "job_id": job.job_id,
+                "phase": job.phase,
+                "committed_next_ordinal": job.committed_next_ordinal,
+            }
+            ack_payload = {
+                "type": (
+                    "error" if job.status == "NEEDS_ATTENTION" else "reconcile_chunk_ack"
+                ),
+                "message_id": envelope.message_id,
+                "code": job.error_code,
+                "message_type": envelope.type,
+                "job_id": job.job_id,
+                "generation": chunk.generation,
+                "sequence": chunk.sequence,
+                "committed_next_ordinal": job.committed_next_ordinal,
+                "resulting_chain_digest": chunk.resulting_chain_digest,
+                "duplicate": duplicate,
+            }
+        elif envelope.type == "reconcile_source_manifest":
+            manifest = ReconciliationManifestRequest.model_validate(envelope.payload)
+            job = apply_reconciliation_manifest(db, connector=connector, payload=manifest)
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "phase": job.phase,
+            }
+            ack_payload = {
+                "type": (
+                    "error"
+                    if job.capture_certified_at is None
+                    else "reconcile_manifest_ack"
+                ),
+                "message_id": envelope.message_id,
+                "code": job.error_code,
+                "message_type": envelope.type,
+                "job_id": job.job_id,
+                "status": job.status,
+                "capture_certificate": job.capture_certificate or None,
+            }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
-    await websocket.send_json({"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq})
+    await websocket.send_json(
+        ack_payload
+        or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq}
+    )
     await browser_events.publish(envelope.type, event_payload or {})
 
 

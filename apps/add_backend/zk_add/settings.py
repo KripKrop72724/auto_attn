@@ -37,6 +37,13 @@ class AddSettings(BaseSettings):
     identity_snapshot_gate_enabled: bool = False
     identity_snapshot_capture_tolerance_seconds: int = 5
     identity_repair_sla_seconds: int = 60
+    reconciliation_enabled: bool = False
+    reconciliation_device_concurrency: int = 1
+    reconciliation_chunk_records: int = 100
+    reconciliation_history_backlog_pause: int = 10_000
+    reconciliation_history_backlog_resume: int = 5_000
+    reconciliation_assignment_seconds: int = 5
+    reconciliation_stale_seconds: int = 45
     log_retention_days: int = 14
     telemetry_retention_days: int = 30
     session_retention_days: int = 90

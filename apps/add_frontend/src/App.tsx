@@ -29,6 +29,8 @@ import type {
   IdentityConflictReport,
   IdentityIntegrity,
   Overview,
+  ReconciliationJob,
+  ReconciliationPreflight,
   UserCommandResponse,
   UserDeletionJob,
   DashboardRoute,
@@ -50,6 +52,10 @@ type IdentityResolutionDialogState = {
 type HistoricalIdentityDialogState = {
   candidate: HistoricalIdentityCandidate
 } | null
+type ReconciliationDialogState =
+  | { mode: 'start' }
+  | { mode: 'control'; job: ReconciliationJob; action: 'pause' | 'resume' | 'cancel' | 'retry' }
+  | null
 
 const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
 const drawerTabs: DrawerTab[] = ['overview', 'logs', 'control']
@@ -148,7 +154,7 @@ const statusPattern = (state: unknown) => {
   )
     return 'confirmed'
   if (
-    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'EXPIRED', 'QUARANTINED', 'BLOCKED_IDENTITY'].some(
+    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'EXPIRED', 'INVALIDATED', 'QUARANTINED', 'BLOCKED_IDENTITY'].some(
       (item) => normalized.includes(item),
     )
   )
@@ -1533,6 +1539,177 @@ function UsersView({
   )
 }
 
+function ReconciliationView({
+  devices,
+  revision,
+  toast,
+}: {
+  devices: Device[]
+  revision: number
+  toast: ReturnType<typeof useToast>
+}) {
+  const [rows, setRows] = useState<ReconciliationJob[]>([])
+  const [enabled, setEnabled] = useState(false)
+  const [selectedId, setSelectedId] = useState('')
+  const [preflight, setPreflight] = useState<ReconciliationPreflight | null>(null)
+  const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
+  const [reason, setReason] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const selected = devices.find((device) => device.connector_id === selectedId) || null
+
+  const load = useCallback(async () => {
+    try {
+      const response = await api<{ enabled: boolean; rows: ReconciliationJob[] }>(
+        '/api/v1/reconciliations?limit=100',
+      )
+      setEnabled(response.enabled)
+      setRows(response.rows)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to read reconciliation jobs.')
+    }
+  }, [toast.error])
+
+  useEffect(() => { void load() }, [load, revision])
+  useEffect(() => {
+    if (!selectedId) {
+      setPreflight(null)
+      return
+    }
+    api<ReconciliationPreflight>(`/api/v1/devices/${selectedId}/reconciliations/preflight`)
+      .then(setPreflight)
+      .catch((error) => toast.error(error instanceof Error ? error.message : 'Preflight failed.'))
+  }, [selectedId, revision, toast.error])
+
+  const closeDialog = () => {
+    setDialog(null)
+    setReason('')
+    setConfirmation('')
+    setPassword('')
+  }
+
+  const start = async () => {
+    if (!selected) return
+    setBusy(true)
+    try {
+      await api(`/api/v1/devices/${selected.connector_id}/reconciliations/full-history`, {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: reason.trim(),
+          confirmation,
+          password,
+          idempotency_key: idempotency('full-history'),
+        }),
+      })
+      closeDialog()
+      toast.notice('Durable start-of-time reconciliation queued. ADD now owns its checkpoint.')
+      await load()
+    } catch (error) {
+      setPassword('')
+      toast.error(error instanceof Error ? error.message : 'Could not start reconciliation.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const control = async (job: ReconciliationJob, action: 'pause' | 'resume' | 'cancel' | 'retry') => {
+    setBusy(true)
+    try {
+      await api(`/api/v1/reconciliations/${job.job_id}/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: reason.trim(),
+          password,
+          idempotency_key: idempotency(`reconcile-${action}`),
+        }),
+      })
+      closeDialog()
+      toast.notice(`Reconciliation ${action} recorded in the audit trail.`)
+      await load()
+    } catch (error) {
+      setPassword('')
+      toast.error(error instanceof Error ? error.message : 'Reconciliation control failed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const active = rows.filter((job) => !['COMPLETED', 'FAILED', 'CANCELLED', 'INVALIDATED'].includes(job.status)).length
+  const covered = rows.filter((job) => Boolean(job.capture_certified_at)).length
+  const pendingOracle = rows.reduce((total, job) => total + job.progress.oracle_pending, 0)
+  const canStart = Boolean(
+    selected && enabled && preflight?.eligible && reason.trim().length >= 10 && password &&
+    confirmation === `RECONCILE ${selected.device_id} FROM START`,
+  )
+
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">ADD-OWNED SOURCE ASSURANCE</p>
+          <h1>Start-of-time reconciliation</h1>
+          <p>Request a complete, resumable read of terminal truth. ADD commits every bounded chunk before the device advances and separately proves Oracle membership without deleting Oracle records.</p>
+        </div>
+        <button className="button primary" disabled={!selected || !preflight?.eligible || !enabled} onClick={() => setDialog({ mode: 'start' })}><Icon name="refresh" /> New complete reconcile</button>
+      </header>
+      <section className="metric-grid">
+        <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>One terminal scan globally</small></div></article>
+        <article className="metric-card metric-positive"><span className="metric-icon"><Icon name="shield" /></span><div><p>Source certificates</p><strong>{covered}</strong><small>Immutable terminal coverage</small></div></article>
+        <article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>Append-only membership checks</small></div></article>
+        <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? 'Request path available' : 'Awaiting controlled enablement'}</small></div></article>
+      </section>
+      <section className="panel selection-panel">
+        <label>Terminal to reconcile<select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value="">Select a device</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name} · {device.zone_id}</option>)}</select></label>
+        <div className="selected-device-summary">
+          {selected && <><StatusBadge state={selected.connected ? 'ESP ONLINE' : 'ESP OFFLINE'} /><StatusBadge state={selected.zkt?.connection_state || 'NO ZKT'} /><span>{selected.zkt?.attendance_count?.toLocaleString() || '—'} terminal records</span></>}
+        </div>
+      </section>
+      {selected && preflight && (
+        <article className={`capability-banner pattern-${preflight.eligible ? preflight.ready_now ? 'confirmed' : 'waiting' : 'blocked'}`}>
+          <Icon name={preflight.eligible ? 'shield' : 'alert'} />
+          <div><strong>{preflight.ready_now ? 'Preflight ready' : preflight.eligible ? 'Eligible; waiting for a safe window' : 'Preflight blocked'}</strong><span>{[...preflight.hard_blockers, ...preflight.waitable_blockers].map((row) => row.message).join(' ') || 'Signed range-resume firmware, stable identity snapshot, and terminal connectivity are verified.'}</span></div>
+          <StatusBadge state={preflight.ready_now ? 'READY' : preflight.eligible ? 'WAITING' : 'BLOCKED'} />
+        </article>
+      )}
+      <section className="panel reconcile-panel">
+        <div className="panel-header"><div><h2>Durable reconciliation ledger</h2><p>Progress is ADD-committed; disconnects and restarts resume from the last acknowledged ordinal.</p></div><button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></div>
+        <div className="reconcile-list">
+          {rows.map((job) => {
+            const cutoff = job.terminal.cutoff_count || 0
+            const percent = cutoff ? Math.min(100, Math.round((job.progress.scanned / cutoff) * 100)) : 0
+            const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> = []
+            if (['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status)) controls.push('pause')
+            if (job.status === 'PAUSED') controls.push('resume')
+            if (job.status === 'NEEDS_ATTENTION') controls.push('retry')
+            if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INVALIDATED'].includes(job.status)) controls.push('cancel')
+            return <article key={job.job_id} className="reconcile-job">
+              <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.status} live={job.status === 'RUNNING'} /></div>
+              <div className="reconcile-phase"><strong>{job.phase.replaceAll('_', ' ')}</strong><span>{job.wait_reason?.replaceAll('_', ' ') || `${job.progress.scanned.toLocaleString()} of ${cutoff ? cutoff.toLocaleString() : 'scope pending'} source rows committed`}</span></div>
+              <div className="reconcile-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><i style={{ width: `${percent}%` }} /></div>
+              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span></div>
+              {job.error_message && <p className="reconcile-error"><Icon name="alert" />{job.error_message}</p>}
+              <div className="reconcile-actions"><a className="button text-button" href={`/api/v1/reconciliations/${job.job_id}/evidence`} target="_blank" rel="noreferrer"><Icon name="shield" /> Evidence</a>{controls.map((action) => <button key={action} className={`button ${action === 'cancel' ? 'destructive' : 'secondary'}`} onClick={() => setDialog({ mode: 'control', job, action })}>{action}</button>)}</div>
+            </article>
+          })}
+          {!rows.length && <div className="empty-state"><Icon name="refresh" /><h3>No complete reconciliation has been requested.</h3><p>Select an eligible terminal, review preflight, and create the first durable source-coverage job.</p></div>}
+        </div>
+      </section>
+      {dialog && (
+        <Dialog titleId="reconciliation-dialog-title" title={dialog.mode === 'start' ? 'Start complete terminal reconciliation' : `${dialog.action} reconciliation`} description={dialog.mode === 'start' ? selected?.display_name : dialog.job.connector?.display_name} onClose={closeDialog}>
+          <div className="dialog-body">
+            <div className={`info-copy pattern-${dialog.mode === 'start' || dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}><Icon name="shield" /><div><h3>{dialog.mode === 'start' ? 'A complete terminal scan is expensive and globally serialized.' : 'ADD preserves all committed evidence and checkpoints.'}</h3><p>Live punches keep priority. The job pauses for terminal commands, leases, disconnects, and Oracle backpressure.</p></div></div>
+            <label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} placeholder="At least 10 characters" /></label>
+            {dialog.mode === 'start' && selected && <label>Type <code>{`RECONCILE ${selected.device_id} FROM START`}</code><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>}
+            <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <div className="dialog-actions"><button className="button secondary" onClick={closeDialog}>Keep current state</button>{dialog.mode === 'start' ? <button className="button primary" disabled={!canStart || busy} onClick={() => void start()}>{busy ? 'Verifying…' : 'Queue durable reconcile'}</button> : <button className={dialog.action === 'cancel' ? 'button destructive' : 'button primary'} disabled={reason.trim().length < 10 || !password || busy} onClick={() => void control(dialog.job, dialog.action)}>{busy ? 'Verifying…' : `Confirm ${dialog.action}`}</button>}</div>
+          </div>
+        </Dialog>
+      )}
+    </>
+  )
+}
+
 type FirmwareListResponse<T> = {
   rows: T[]
   enabled: boolean
@@ -2171,7 +2348,7 @@ function DashboardApp() {
 
   useEffect(() => {
     const legacy = window.location.hash.replace(/^#/, '') as View
-    if (legacy && ['fleet', 'users', 'attendance', 'firmware', 'alerts'].includes(legacy)) {
+    if (legacy && ['fleet', 'users', 'attendance', 'reconciliation', 'firmware', 'alerts'].includes(legacy)) {
       navigate(routePath(legacy), { replace: true })
       window.history.replaceState(null, '', routePath(legacy))
       return
@@ -2296,6 +2473,7 @@ function DashboardApp() {
         {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} />}
         {view === 'users' && <UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revision} toast={toast} refreshFleet={refreshFleet} />}
         {view === 'attendance' && <AttendanceView devices={devices} revision={revision} />}
+        {view === 'reconciliation' && <ReconciliationView devices={devices} revision={revision} toast={toast} />}
         {view === 'firmware' && <FirmwareView devices={devices} revision={revision} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}
         {view === 'alerts' && <AlertsView devices={devices} toast={toast} revision={revision} />}
       </AppShell>

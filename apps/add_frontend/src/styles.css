@@ -313,6 +313,21 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .attendance-table strong { margin-bottom: 5px; font-size: 14px; }
 .attendance-table small { color: var(--muted); }
 
+.reconcile-list { display: grid; gap: 1px; background: var(--line); }
+.reconcile-job { display: grid; gap: 16px; padding: 22px 24px; background: #ffffff; }
+.reconcile-job-head, .reconcile-phase, .reconcile-actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.reconcile-job-head h3 { margin: 3px 0 5px; font-size: 19px; }
+.reconcile-job-head small, .reconcile-phase span { color: var(--muted); font-size: 12px; }
+.reconcile-phase strong { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+.reconcile-progress { height: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--soft); }
+.reconcile-progress i { display: block; height: 100%; min-width: 2px; background: var(--blue); transition: width .35s ease; }
+.reconcile-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+.reconcile-facts span { min-width: 0; color: var(--muted); font-size: 11px; }
+.reconcile-facts strong { display: block; overflow: hidden; margin-bottom: 3px; color: var(--ink); font-size: 16px; text-overflow: ellipsis; }
+.reconcile-error { display: flex; align-items: center; gap: 8px; margin: 0; padding: 10px 12px; border: 2px dashed #737373; color: var(--ink); font-size: 13px; }
+.reconcile-error svg { width: 18px; color: var(--critical); }
+.reconcile-actions { justify-content: flex-end; flex-wrap: wrap; }
+
 .firmware-mode-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 14px; margin-bottom: 18px; }
 .firmware-mode { min-height: 86px; display: flex; align-items: center; gap: 15px; padding: 17px 20px; background: #ffffff; }
 .firmware-mode > svg { width: 27px; height: 27px; color: var(--blue); }
@@ -551,6 +566,8 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
   .app-header nav button { min-width: 0; flex: 1; padding: 0 4px; }
   .operator-area { gap: 7px; }
   .metric-grid, .form-grid, .filter-grid, .firmware-mode-grid { grid-template-columns: 1fr; }
+  .reconcile-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .reconcile-job-head, .reconcile-phase { align-items: flex-start; flex-direction: column; }
   .firmware-release dl { grid-template-columns: 1fr; }
   .firmware-release, .firmware-campaign, .firmware-start-form { padding-left: 16px; padding-right: 16px; }
   .firmware-release-title { align-items: flex-start; flex-direction: column; }

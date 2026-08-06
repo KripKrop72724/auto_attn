@@ -1,6 +1,13 @@
 import type { DashboardRoute, FirmwareSection } from './types'
 
-const routes = new Set<DashboardRoute>(['fleet', 'users', 'attendance', 'firmware', 'alerts'])
+const routes = new Set<DashboardRoute>([
+  'fleet',
+  'users',
+  'attendance',
+  'reconciliation',
+  'firmware',
+  'alerts',
+])
 const firmwareSections = new Set<FirmwareSection>(['overview', 'releases', 'campaigns'])
 
 export function dashboardRoute(pathname: string): DashboardRoute {

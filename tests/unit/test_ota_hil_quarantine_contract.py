@@ -24,6 +24,14 @@ def test_deployment_can_explicitly_switch_from_hil_to_national_ota() -> None:
         '$environment["ADD_FIRMWARE_OTA_ENABLED"] = '
         "$env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED" in deploy
     )
+    assert (
+        "ADD_DEPLOY_RECONCILIATION_ENABLED: "
+        "${{ vars.ADD_RECONCILIATION_ENABLED }}" in workflow
+    )
+    assert (
+        '$environment["ADD_RECONCILIATION_ENABLED"] = '
+        "$env:ADD_DEPLOY_RECONCILIATION_ENABLED" in deploy
+    )
 
 
 def test_add_deployment_uses_the_validated_internal_ords_route() -> None:
@@ -72,12 +80,16 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         "@('ONLINE', 'LIVE_CAPTURE') -contains [string]$row.current_activity",
         "$row.zkt.connection_state -eq 'ONLINE'",
         "$row.zkt.certification_state -eq 'CERTIFIED'",
+        "$row.zkt.capabilities.history_stream_v1",
+        "$row.zkt.capabilities.history_range_resume_verified",
         "[int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE",
         "/logs?limit=1000",
         "IDENTITY_CATALOG_APPLIED",
         "ORACLE_RECONCILE_DELEGATED_TO_ADD",
         "TRUTH_IDENTITY_INCOMPLETE",
         "FULL_RECONCILE_FAILED",
+        "SOURCE_COMMITTED_BOUNDARY_DIVERGED",
+        "ADD_SOURCE_COVERAGE_INVALIDATED",
         "/api/v1/attendance?device_id=$($row.connector_id)&limit=500",
         "$attendanceCount -ne [int]$row.zkt.attendance_count",
         "$unsafeDeliveryCount -ne 0",

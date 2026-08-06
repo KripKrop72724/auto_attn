@@ -23,6 +23,15 @@ REQUIRED_CHECKS = (
     "wifi_setup_success_persisted_after_reboot",
     "wifi_setup_surface_isolated",
     "wifi_setup_attendance_regression_free",
+    "reconciliation_nonzero_offset_verified",
+    "reconciliation_disconnect_resumed",
+    "reconciliation_power_cycle_resumed",
+    "reconciliation_boundary_divergence_blocked",
+    "reconciliation_live_punch_preserved",
+    "reconciliation_full_storage_command_succeeded",
+    "reconciliation_tail_audit_advanced",
+    "reconciliation_no_legacy_full_scan_after_certificate",
+    "admin_lease_duration_started_after_grant",
 )
 
 
@@ -44,7 +53,10 @@ def main() -> int:
         raise SystemExit("HIL evidence is missing passing checks: " + ", ".join(missing))
     if not evidence.get("device_serial") or not evidence.get("firmware_sha256"):
         raise SystemExit("HIL evidence must identify the device and tested firmware hash")
-    print("OTA and Wi-Fi setup hardware gate passed with complete power-loss, isolation, and regression evidence")
+    print(
+        "OTA, Wi-Fi setup, and ADD-owned reconciliation hardware gates passed "
+        "with complete power-loss, isolation, resume, and regression evidence"
+    )
     return 0
 
 

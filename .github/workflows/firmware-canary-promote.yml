@@ -186,6 +186,8 @@ jobs:
                   $row.zkt.connection_state -eq 'ONLINE' -and
                   $row.zkt.certification_state -eq 'CERTIFIED' -and
                   [bool]$row.zkt.snapshot_complete -and
+                  [bool]$row.zkt.capabilities.history_stream_v1 -and
+                  [bool]$row.zkt.capabilities.history_range_resume_verified -and
                   [int]$row.zkt.attendance_count -ge [int]$env:MINIMUM_TERMINAL_ATTENDANCE
                 )
               }
@@ -226,7 +228,16 @@ jobs:
               [string]$truthDelegated[0].received_at
             )
             $laterFailures = @($canaryLogs | Where-Object {
-              $_.code -in @('TRUTH_IDENTITY_INCOMPLETE', 'FULL_RECONCILE_FAILED') -and
+              $_.code -in @(
+                'TRUTH_IDENTITY_INCOMPLETE',
+                'FULL_RECONCILE_FAILED',
+                'SOURCE_RANGE_PREPARE_FAILED',
+                'SOURCE_RANGE_LAYOUT_INVALID',
+                'SOURCE_RANGE_COUNT_REGRESSION',
+                'SOURCE_FIRST_ANCHOR_DIVERGED',
+                'SOURCE_COMMITTED_BOUNDARY_DIVERGED',
+                'ADD_SOURCE_COVERAGE_INVALIDATED'
+              ) -and
               [DateTimeOffset]::Parse([string]$_.received_at) -gt $truthDelegatedAt
             })
             if ($laterFailures.Count -ne 0) {

@@ -339,6 +339,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) {
     $environment["ADD_FIRMWARE_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_ENABLED)) {
+    $environment["ADD_RECONCILIATION_ENABLED"] = $env:ADD_DEPLOY_RECONCILIATION_ENABLED
+}
 # These deployment coordinates are locked product requirements, not operator
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
