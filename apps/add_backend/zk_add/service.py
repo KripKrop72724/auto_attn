@@ -399,14 +399,25 @@ def update_heartbeat(
                 )
             except (TypeError, ValueError):
                 source_coverage_cursor = 0
+            try:
+                max_credit_records = int(
+                    capabilities.get("max_credit_records") or 100
+                )
+            except (TypeError, ValueError):
+                max_credit_records = 100
             zkt.capability_profile = {
                 **(zkt.capability_profile or {}),
                 "history_stream_v1": bool(capabilities.get("history_stream_v1")),
+                "history_stream_v2": bool(capabilities.get("history_stream_v2")),
                 "history_range_resume_verified": bool(
                     capabilities.get("history_range_resume_verified")
                 ),
                 "history_chunk_max_records": max(
                     1, min(100, max_chunk_records)
+                ),
+                "history_credit_max_records": max(
+                    100,
+                    min(2000, max_credit_records),
                 ),
                 "source_coverage_certified": bool(
                     capabilities.get("source_coverage_certified")

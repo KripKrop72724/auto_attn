@@ -184,6 +184,7 @@ class ReconciliationSourceRecord(BaseModel):
 
 
 class ReconciliationChunkRequest(BaseModel):
+    assignment_id: str | None = Field(default=None, min_length=36, max_length=36)
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)
     sequence: int = Field(ge=0)
@@ -220,6 +221,19 @@ class ReconciliationManifestRequest(BaseModel):
     final_chain_digest: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+
+
+class ReconciliationAssignmentReleaseRequest(BaseModel):
+    assignment_id: str = Field(min_length=36, max_length=36)
+    job_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    committed_next_ordinal: int = Field(ge=0)
+    reason: Literal[
+        "COMMAND_PENDING",
+        "LEASE_EXPIRING",
+        "HEAP_PRESSURE",
+        "DISCONNECTING",
+    ]
 
 
 class OracleReceiptBatchRequest(BaseModel):

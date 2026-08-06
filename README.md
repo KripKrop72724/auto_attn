@@ -55,18 +55,19 @@ hash in the protected server environment; plaintext credentials are never commit
 
 ## Current Zone Lite release
 
-The current firmware candidate is **Zone Lite 2.3.0**. It moves request-based start-of-time
-reconciliation checkpoints and evidence to ADD, reads only bounded terminal ranges, resumes from the
-last ADD-committed ordinal, and replaces certified legacy full scans with lightweight append-tail
-audits. ADD commands no longer depend on free ESP flash, and preservation storage is never
-auto-formatted. Identity-blocked attendance remains fail-closed without changing event UIDs or
-deleting terminal/Oracle history.
+The current firmware candidate is **Zone Lite 2.4.0**. It preserves the ADD-owned start-of-time
+checkpoint and digest chain while replacing 25-row stop-and-wait scans with leased, bounded
+stream-v2 credits: one prepared terminal read can supply four separately committed 100-row chunks.
+Slow Oracle delivery is isolated from source scheduling, commands can release unused scan credit at
+a committed boundary, and interleaved live-event frames are acknowledged and recovered through the
+certified append tail. Identity-blocked attendance remains fail-closed without changing event UIDs
+or deleting terminal/Oracle history.
 Heartbeat and onboarding versions are derived from the built application descriptor so ADD always
 reports the actual image version.
 
 See [the ADD-owned reconciliation runbook](docs/add-owned-reconciliation.md) and
 [the remote firmware update runbook](docs/zone-lite-remote-firmware-updates.md) for bootstrap, release,
-campaign, rollback, and recovery procedures. See [the Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md) for identity-snapshot upgrade notes,
+campaign, rollback, and recovery procedures. See [the Zone Lite 2.4.0 release record](docs/zone-lite-2.4.0-release.md) for stream-v2 acceptance gates and [the Zone Lite 2.1.11 release record](docs/zone-lite-2.1.11-release.md) for identity-snapshot upgrade notes,
 validation evidence, and the required `complete=true` acceptance markers.
 
 ## Repository layout

@@ -44,6 +44,9 @@ class AddSettings(BaseSettings):
     reconciliation_history_backlog_pause: int = 10_000
     reconciliation_history_backlog_resume: int = 5_000
     reconciliation_assignment_seconds: int = 5
+    reconciliation_v2_assignment_seconds: int = Field(default=180, ge=30, le=600)
+    reconciliation_v2_credit_records: int = Field(default=400, ge=100, le=2000)
+    reconciliation_v2_max_chunks: int = Field(default=4, ge=1, le=20)
     reconciliation_stale_seconds: int = 45
     log_retention_days: int = 14
     telemetry_retention_days: int = 30

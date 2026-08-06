@@ -1696,6 +1696,9 @@ function ReconciliationView({
             const cutoff = job.terminal.cutoff_count || 0
             const percent = cutoff ? Math.min(100, Math.round((job.progress.scanned / cutoff) * 100)) : 0
             const queuePosition = queuePositions.get(job.job_id) || 0
+            const creditRemaining = job.assignment?.credit_end_ordinal == null
+              ? null
+              : Math.max(0, job.assignment.credit_end_ordinal - job.progress.scanned)
             const queueStatus = job.wait_reason === 'WAITING_FOR_SCAN_SLOT'
               ? `Queue position ${queuePosition}; waiting for one of ${scheduler.device_concurrency} isolated scan slots`
               : job.wait_reason?.replaceAll('_', ' ')
@@ -1709,7 +1712,7 @@ function ReconciliationView({
               <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.status} live={job.status === 'RUNNING'} /></div>
               <div className="reconcile-phase"><strong>{job.phase.replaceAll('_', ' ')}</strong><span>{queueStatus}</span></div>
               <div className="reconcile-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><i style={{ width: `${percent}%` }} /></div>
-              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span></div>
+              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{creditRemaining == null ? 'Legacy' : `${creditRemaining.toLocaleString()} rows`}</strong> burst credit</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span></div>
               {job.error_message && <p className="reconcile-error"><Icon name="alert" />{job.error_message}</p>}
               <div className="reconcile-actions"><a className="button text-button" href={`/api/v1/reconciliations/${job.job_id}/evidence`} target="_blank" rel="noreferrer"><Icon name="shield" /> Evidence</a>{controls.map((action) => <button key={action} className={`button ${action === 'cancel' ? 'destructive' : 'secondary'}`} onClick={() => setDialog({ mode: 'control', job, action })}>{action}</button>)}</div>
             </article>

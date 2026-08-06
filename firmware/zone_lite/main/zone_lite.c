@@ -864,6 +864,8 @@ static void configure_zkt_socket(int sock)
 #endif
 }
 
+static bool zk_send_ack_only(int sock, uint16_t session_id);
+
 static bool zk_recv_data_stream(int sock, uint8_t *out, size_t out_len, size_t *actual_len)
 {
     size_t written = 0;
@@ -902,6 +904,14 @@ static bool zk_recv_data_stream(int sock, uint8_t *out, size_t out_len, size_t *
             saw_ack = true;
             free(packet);
             break;
+        } else if (CMD_REG_EVENT == header->command) {
+            // A live punch can interleave with a prepared range response.
+            // Acknowledge it and continue waiting. The post-baseline append
+            // tail reads the durable terminal row from the certified cursor.
+            bool acknowledged = zk_send_ack_only(sock, header->session_id);
+            free(packet);
+            if (!acknowledged) return false;
+            continue;
         } else {
             ESP_LOGW(TAG, "Unexpected ZKT stream command %u", header->command);
             free(packet);
@@ -961,31 +971,42 @@ static bool zk_send_command(
         return false;
     }
 
-    zk_tcp_header_t reply_top;
-    if (!recv_exact(sock, (uint8_t *)&reply_top, sizeof(reply_top))) {
-        return false;
-    }
-    if (reply_top.marker_1 != MACHINE_PREPARE_DATA_1 ||
-        reply_top.marker_2 != MACHINE_PREPARE_DATA_2 || reply_top.length < sizeof(zk_header_t)) {
-        return false;
-    }
-    if (reply_top.length > rx_cap) {
-        ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
-        (void)drain_bytes(sock, reply_top.length);
-        return false;
-    }
-    if (!recv_exact(sock, rx, reply_top.length)) {
-        return false;
-    }
+    for (unsigned interleaved = 0; interleaved < 32; interleaved++) {
+        zk_tcp_header_t reply_top;
+        if (!recv_exact(sock, (uint8_t *)&reply_top, sizeof(reply_top))) {
+            return false;
+        }
+        if (reply_top.marker_1 != MACHINE_PREPARE_DATA_1 ||
+            reply_top.marker_2 != MACHINE_PREPARE_DATA_2 || reply_top.length < sizeof(zk_header_t)) {
+            return false;
+        }
+        if (reply_top.length > rx_cap) {
+            ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
+            (void)drain_bytes(sock, reply_top.length);
+            return false;
+        }
+        if (!recv_exact(sock, rx, reply_top.length)) {
+            return false;
+        }
 
-    zk_header_t *reply = (zk_header_t *)rx;
-    ctx->reply_id = reply->reply_id;
-    response->code = reply->command;
-    response->session_id = reply->session_id;
-    response->reply_id = reply->reply_id;
-    response->data = rx + sizeof(zk_header_t);
-    response->data_len = reply_top.length - sizeof(zk_header_t);
-    return true;
+        zk_header_t *reply = (zk_header_t *)rx;
+        if (CMD_REG_EVENT == reply->command) {
+            if (!zk_send_ack_only(sock, reply->session_id)) return false;
+            ESP_LOGI(
+                TAG,
+                "Deferred an interleaved live event to certified append-tail recovery");
+            continue;
+        }
+        ctx->reply_id = reply->reply_id;
+        response->code = reply->command;
+        response->session_id = reply->session_id;
+        response->reply_id = reply->reply_id;
+        response->data = rx + sizeof(zk_header_t);
+        response->data_len = reply_top.length - sizeof(zk_header_t);
+        return true;
+    }
+    ESP_LOGW(TAG, "ZKT command response was starved by interleaved live events");
+    return false;
 }
 
 static bool zk_send_ack_only(int sock, uint16_t session_id)
@@ -3658,6 +3679,30 @@ static bool encode_record_base64(
         written < output_size && (output[written] = '\0') == '\0';
 }
 
+static void release_reconciliation_credit(
+    const add_reconcile_assignment_t *assignment,
+    uint32_t committed_next_ordinal,
+    const char *reason)
+{
+    if (!assignment || !assignment->stream_v2 || !reason) return;
+    cJSON *release = cJSON_CreateObject();
+    if (!release) return;
+    cJSON_AddStringToObject(release, "assignment_id", assignment->assignment_id);
+    cJSON_AddStringToObject(release, "job_id", assignment->job_id);
+    cJSON_AddNumberToObject(release, "generation", assignment->generation);
+    cJSON_AddNumberToObject(
+        release,
+        "committed_next_ordinal",
+        committed_next_ordinal);
+    cJSON_AddStringToObject(release, "reason", reason);
+    char *json = cJSON_PrintUnformatted(release);
+    cJSON_Delete(release);
+    if (json) {
+        (void)add_connector_send_payload("reconcile_assignment_release", json);
+    }
+    free(json);
+}
+
 static bool process_add_reconciliation_assignment(
     int sock,
     zk_context_t *ctx,
@@ -3835,8 +3880,19 @@ static bool process_add_reconciliation_assignment(
     uint32_t chunk_records = assignment->chunk_records > 0
         ? assignment->chunk_records
         : 1;
-    uint32_t end = start + chunk_records > cutoff ? cutoff : start + chunk_records;
-    uint32_t raw_length = (end - start) * record_size;
+    uint32_t burst_end = start + chunk_records > cutoff ? cutoff : start + chunk_records;
+    if (assignment->stream_v2) {
+        uint32_t credit_end = assignment->credit_end_ordinal < cutoff
+            ? assignment->credit_end_ordinal
+            : cutoff;
+        uint32_t bounded_chunks = assignment->max_chunks > 0
+            ? assignment->max_chunks
+            : 1;
+        uint64_t proposed = (uint64_t)start +
+            (uint64_t)chunk_records * bounded_chunks;
+        burst_end = proposed < credit_end ? (uint32_t)proposed : credit_end;
+    }
+    uint32_t raw_length = (burst_end - start) * record_size;
     uint8_t *raw = heap_caps_malloc(raw_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw) raw = malloc(raw_length);
     ok = raw && zk_read_bounded_range(
@@ -3851,9 +3907,21 @@ static bool process_add_reconciliation_assignment(
         free(raw);
         return false;
     }
+    uint32_t cursor = start;
+    char previous_chain[65];
+    strlcpy(
+        previous_chain,
+        assignment->preceding_chain_digest[0]
+            ? assignment->preceding_chain_digest
+            : "0000000000000000000000000000000000000000000000000000000000000000",
+        sizeof(previous_chain));
+    while (ok && cursor < burst_end) {
+    uint32_t end = cursor + chunk_records > burst_end
+        ? burst_end
+        : cursor + chunk_records;
     cJSON *records = cJSON_CreateArray();
     cJSON *canonical = cJSON_CreateArray();
-    for (uint32_t ordinal = start; ok && ordinal < end; ordinal++) {
+    for (uint32_t ordinal = cursor; ok && ordinal < end; ordinal++) {
         const uint8_t *record = raw + (ordinal - start) * record_size;
         char raw_digest[65];
         char terminal_key_material[160];
@@ -3930,39 +3998,38 @@ static bool process_add_reconciliation_assignment(
         cJSON_AddStringToObject(canonical_row, "terminal_record_key", terminal_key);
         cJSON_AddItemToArray(canonical, canonical_row);
     }
-    free(raw);
     char *canonical_json = ok ? cJSON_PrintUnformatted(canonical) : NULL;
     cJSON_Delete(canonical);
     char chunk_digest[65] = {0};
     if (canonical_json) sha256_hex(canonical_json, chunk_digest);
     free(canonical_json);
-    const char *previous = assignment->preceding_chain_digest[0]
-        ? assignment->preceding_chain_digest
-        : "0000000000000000000000000000000000000000000000000000000000000000";
     char chain_material[220];
     char resulting_chain[65];
     snprintf(
         chain_material,
         sizeof(chain_material),
         "%s:%lu:%lu:%s",
-        previous,
-        (unsigned long)start,
+        previous_chain,
+        (unsigned long)cursor,
         (unsigned long)end,
         chunk_digest);
     sha256_hex(chain_material, resulting_chain);
     cJSON *chunk = ok && records ? cJSON_CreateObject() : NULL;
     if (chunk) {
         cJSON_AddStringToObject(chunk, "job_id", assignment->job_id);
-        cJSON_AddNumberToObject(chunk, "generation", assignment->generation);
-        cJSON_AddNumberToObject(chunk, "sequence", start);
-        cJSON_AddNumberToObject(chunk, "start_ordinal", start);
-        cJSON_AddNumberToObject(chunk, "end_ordinal", end);
-        cJSON_AddStringToObject(chunk, "chunk_digest", chunk_digest);
-        if (assignment->preceding_chain_digest[0]) {
+        if (assignment->stream_v2) {
             cJSON_AddStringToObject(
                 chunk,
-                "previous_chain_digest",
-                assignment->preceding_chain_digest);
+                "assignment_id",
+                assignment->assignment_id);
+        }
+        cJSON_AddNumberToObject(chunk, "generation", assignment->generation);
+        cJSON_AddNumberToObject(chunk, "sequence", cursor);
+        cJSON_AddNumberToObject(chunk, "start_ordinal", cursor);
+        cJSON_AddNumberToObject(chunk, "end_ordinal", end);
+        cJSON_AddStringToObject(chunk, "chunk_digest", chunk_digest);
+        if (cursor > 0) {
+            cJSON_AddStringToObject(chunk, "previous_chain_digest", previous_chain);
         } else {
             cJSON_AddNullToObject(chunk, "previous_chain_digest");
         }
@@ -3973,11 +4040,49 @@ static bool process_add_reconciliation_assignment(
     cJSON_Delete(records);
     char *json = chunk ? cJSON_PrintUnformatted(chunk) : NULL;
     cJSON_Delete(chunk);
-    ok = json && add_connector_send_payload_acknowledged(
-        "reconcile_chunk",
-        json,
-        30000);
+    if (assignment->stream_v2) {
+        add_reconcile_chunk_ack_t ack = {0};
+        ok = json && add_connector_send_reconcile_chunk_acknowledged(
+            json,
+            30000,
+            &ack);
+        ok = ok && ack.valid &&
+            strcmp(ack.assignment_id, assignment->assignment_id) == 0 &&
+            strcmp(ack.job_id, assignment->job_id) == 0 &&
+            ack.generation == assignment->generation &&
+            ack.committed_next_ordinal == end &&
+            strcmp(ack.resulting_chain_digest, resulting_chain) == 0;
+        if (ok && end < burst_end) {
+            ok = ack.continue_allowed &&
+                ack.credit_end_ordinal >= burst_end &&
+                (assignment->lease_expires_epoch <= 0 ||
+                 epoch_now() < assignment->lease_expires_epoch);
+        }
+    } else {
+        ok = json && add_connector_send_payload_acknowledged(
+            "reconcile_chunk",
+            json,
+            30000);
+    }
     free(json);
+    if (ok) {
+        strlcpy(previous_chain, resulting_chain, sizeof(previous_chain));
+        cursor = end;
+        if (cursor < burst_end && add_connector_begin_pending_command_activity()) {
+            release_reconciliation_credit(
+                assignment,
+                cursor,
+                "COMMAND_PENDING");
+            add_connector_log(
+                "INFO",
+                "reconcile",
+                "ASSIGNMENT_RELEASED_FOR_COMMAND",
+                "Released unused source credit at a committed chunk boundary so the pending command can run immediately.");
+            break;
+        }
+    }
+    }
+    free(raw);
     return ok;
 }
 
@@ -4021,9 +4126,9 @@ static bool process_add_incremental_tail(
         return false;
     }
     uint32_t start = g_add_source_coverage_cursor;
-    uint32_t end = start + 25 > (uint32_t)latest_records
+    uint32_t end = start + 100 > (uint32_t)latest_records
         ? (uint32_t)latest_records
-        : start + 25;
+        : start + 100;
     uint32_t raw_length = (end - start) * record_size;
     uint8_t *raw = heap_caps_malloc(raw_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw) raw = malloc(raw_length);

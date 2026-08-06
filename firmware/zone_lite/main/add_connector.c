@@ -141,6 +141,10 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
+static char s_reconcile_last_job_id[40];
+static uint32_t s_reconcile_last_generation;
+static uint32_t s_reconcile_last_committed_ordinal;
 static bool s_onboarding_task_started;
 static bool s_command_inbox_restored;
 static char s_waiting_ack[80];
@@ -416,7 +420,8 @@ static bool send_payload_and_wait_for_ack(
     const char *type,
     const char *payload_json,
     TickType_t lock_timeout,
-    TickType_t ack_timeout)
+    TickType_t ack_timeout,
+    add_reconcile_chunk_ack_t *reconcile_ack_out)
 {
     if (!s_ack_wait_lock ||
         xSemaphoreTake(s_ack_wait_lock, lock_timeout) != pdTRUE) {
@@ -428,6 +433,9 @@ static bool send_payload_and_wait_for_ack(
     bool acknowledged = false;
     if (awakened && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         acknowledged = s_ack_matched;
+        if (acknowledged && reconcile_ack_out) {
+            *reconcile_ack_out = s_reconcile_chunk_ack;
+        }
         s_ack_matched = false;
         xSemaphoreGive(s_lock);
     }
@@ -453,7 +461,23 @@ bool add_connector_send_payload_acknowledged(
         type,
         payload_json,
         portMAX_DELAY,
-        pdMS_TO_TICKS(timeout_ms));
+        pdMS_TO_TICKS(timeout_ms),
+        NULL);
+}
+
+bool add_connector_send_reconcile_chunk_acknowledged(
+    const char *payload_json,
+    uint32_t timeout_ms,
+    add_reconcile_chunk_ack_t *ack_out)
+{
+    if (!ack_out) return false;
+    memset(ack_out, 0, sizeof(*ack_out));
+    return send_payload_and_wait_for_ack(
+        "reconcile_chunk",
+        payload_json,
+        portMAX_DELAY,
+        pdMS_TO_TICKS(timeout_ms),
+        ack_out);
 }
 
 static const char *storage_key_material(void)
@@ -1216,9 +1240,41 @@ static bool parse_reconcile_assignment(
         sizeof(assignment->expected_terminal_serial));
     assignment->generation = (uint32_t)generation->valuedouble;
     assignment->committed_next_ordinal = (uint32_t)committed->valuedouble;
-    assignment->chunk_records = (uint16_t)(chunk_records->valueint > 25
-        ? 25
+    assignment->chunk_records = (uint16_t)(chunk_records->valueint > 100
+        ? 100
         : chunk_records->valueint);
+    cJSON *protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
+    assignment->stream_v2 = cJSON_IsString(protocol) &&
+        strcmp(protocol->valuestring, "history_stream_v2") == 0;
+    cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
+    if (cJSON_IsString(assignment_id) && strlen(assignment_id->valuestring) == 36) {
+        strlcpy(
+            assignment->assignment_id,
+            assignment_id->valuestring,
+            sizeof(assignment->assignment_id));
+    }
+    cJSON *credit_end = cJSON_GetObjectItemCaseSensitive(root, "credit_end_ordinal");
+    if (cJSON_IsNumber(credit_end) && credit_end->valuedouble >= committed->valuedouble) {
+        assignment->credit_end_ordinal = (uint32_t)credit_end->valuedouble;
+    }
+    cJSON *max_chunks = cJSON_GetObjectItemCaseSensitive(root, "max_chunks");
+    if (cJSON_IsNumber(max_chunks) && max_chunks->valueint > 0) {
+        assignment->max_chunks = (uint16_t)(max_chunks->valueint > 20
+            ? 20
+            : max_chunks->valueint);
+    } else {
+        assignment->max_chunks = 1;
+    }
+    cJSON *lease_epoch = cJSON_GetObjectItemCaseSensitive(root, "lease_expires_epoch");
+    if (cJSON_IsNumber(lease_epoch)) {
+        assignment->lease_expires_epoch = (int64_t)lease_epoch->valuedouble;
+    }
+    if (assignment->stream_v2 &&
+        (assignment->assignment_id[0] == '\0' ||
+         !cJSON_IsNumber(credit_end) ||
+         credit_end->valuedouble < committed->valuedouble)) {
+        return false;
+    }
     cJSON *cutoff = cJSON_GetObjectItemCaseSensitive(root, "cutoff_count");
     if (cJSON_IsNumber(cutoff) && cutoff->valuedouble >= 0) {
         assignment->has_cutoff = true;
@@ -1392,6 +1448,39 @@ static void parse_inbound(const char *data, size_t len)
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
+                memset(&s_reconcile_chunk_ack, 0, sizeof(s_reconcile_chunk_ack));
+                if (strcmp(type->valuestring, "reconcile_chunk_ack") == 0) {
+                    cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
+                    cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
+                    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
+                    cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "committed_next_ordinal");
+                    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "resulting_chain_digest");
+                    cJSON *credit_end = cJSON_GetObjectItemCaseSensitive(root, "credit_end_ordinal");
+                    cJSON *continue_allowed = cJSON_GetObjectItemCaseSensitive(root, "continue_allowed");
+                    if (cJSON_IsString(assignment_id) && strlen(assignment_id->valuestring) == 36 &&
+                        cJSON_IsString(job_id) && strlen(job_id->valuestring) == 36 &&
+                        cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
+                        cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
+                        strlcpy(s_reconcile_chunk_ack.assignment_id, assignment_id->valuestring,
+                            sizeof(s_reconcile_chunk_ack.assignment_id));
+                        strlcpy(s_reconcile_chunk_ack.job_id, job_id->valuestring,
+                            sizeof(s_reconcile_chunk_ack.job_id));
+                        strlcpy(s_reconcile_chunk_ack.resulting_chain_digest, chain->valuestring,
+                            sizeof(s_reconcile_chunk_ack.resulting_chain_digest));
+                        s_reconcile_chunk_ack.generation = (uint32_t)generation->valuedouble;
+                        s_reconcile_chunk_ack.committed_next_ordinal = (uint32_t)committed->valuedouble;
+                        s_reconcile_chunk_ack.credit_end_ordinal = cJSON_IsNumber(credit_end)
+                            ? (uint32_t)credit_end->valuedouble
+                            : 0;
+                        s_reconcile_chunk_ack.continue_allowed = cJSON_IsTrue(continue_allowed);
+                        s_reconcile_chunk_ack.valid = true;
+                        strlcpy(s_reconcile_last_job_id, job_id->valuestring,
+                            sizeof(s_reconcile_last_job_id));
+                        s_reconcile_last_generation = s_reconcile_chunk_ack.generation;
+                        s_reconcile_last_committed_ordinal =
+                            s_reconcile_chunk_ack.committed_next_ordinal;
+                    }
+                }
                 s_waiting_ack[0] = '\0';
                 s_ack_matched = true;
                 xSemaphoreGive(s_ack_sem);
@@ -1538,8 +1627,13 @@ static void parse_inbound(const char *data, size_t len)
     }
     if (cJSON_IsString(type) && strcmp(type->valuestring, "reconcile_assignment") == 0) {
         add_reconcile_assignment_t assignment;
-        if (!parse_reconcile_assignment(root, &assignment) || !s_reconcile_assignments ||
-            xQueueOverwrite(s_reconcile_assignments, &assignment) != pdTRUE) {
+        bool parsed = parse_reconcile_assignment(root, &assignment);
+        bool stale = parsed &&
+            strcmp(assignment.job_id, s_reconcile_last_job_id) == 0 &&
+            assignment.generation == s_reconcile_last_generation &&
+            assignment.committed_next_ordinal < s_reconcile_last_committed_ordinal;
+        if (!parsed || stale || !s_reconcile_assignments ||
+            (!stale && xQueueOverwrite(s_reconcile_assignments, &assignment) != pdTRUE)) {
             ESP_LOGW(TAG, "Rejected malformed or unqueueable reconciliation assignment");
         }
         cJSON_Delete(root);
@@ -1751,11 +1845,13 @@ static void heartbeat_task(void *arg)
                 zkt_json,
                 "reconciliation_capabilities");
             cJSON_AddBoolToObject(reconciliation, "history_stream_v1", true);
+            cJSON_AddBoolToObject(reconciliation, "history_stream_v2", true);
             cJSON_AddBoolToObject(
                 reconciliation,
                 "history_range_resume_verified",
                 true);
-            cJSON_AddNumberToObject(reconciliation, "max_chunk_records", 25);
+            cJSON_AddNumberToObject(reconciliation, "max_chunk_records", 100);
+            cJSON_AddNumberToObject(reconciliation, "max_credit_records", 400);
             cJSON_AddBoolToObject(
                 reconciliation,
                 "source_coverage_certified",
@@ -2236,7 +2332,8 @@ static bool deliver_attendance_payloads_acknowledged(
                 "attendance_batch",
                 payloads[i],
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
-                pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS))) {
+                pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS),
+                NULL)) {
             ok = false;
             break;
         }
@@ -2679,7 +2776,8 @@ static void outbox_task(void *arg)
             type->valuestring,
             payload_json,
             portMAX_DELAY,
-            pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS));
+            pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
+            NULL);
         cJSON_Delete(record);
         free(payload_json);
         if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {

@@ -759,6 +759,24 @@ class ReconciliationJob(Base):
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    active_assignment_id: Mapped[str | None] = mapped_column(
+        String(36), index=True
+    )
+    credit_start_ordinal: Mapped[int | None] = mapped_column(Integer)
+    credit_end_ordinal: Mapped[int | None] = mapped_column(Integer)
+    credit_committed_through: Mapped[int | None] = mapped_column(Integer)
+    assignment_granted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    assignment_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    assignment_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    assignment_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     updated_at: Mapped[datetime] = utc_column()
 
 
