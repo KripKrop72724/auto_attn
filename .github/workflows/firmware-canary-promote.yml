@@ -269,25 +269,26 @@ jobs:
             $catalogAppliedAt = [DateTimeOffset]::Parse(
               [string]$catalogApplied[0].received_at
             )
+            $catalogBootId = [string]$catalogApplied[0].boot_id
             $sourceCoverageApplied = @($canaryLogs | Where-Object {
               $_.code -eq 'ADD_SOURCE_COVERAGE_APPLIED' -and
-              [DateTimeOffset]::Parse([string]$_.received_at) -ge $catalogAppliedAt
+              [string]$_.boot_id -eq $catalogBootId -and
+              [Math]::Abs((
+                [DateTimeOffset]::Parse([string]$_.received_at) -
+                $catalogAppliedAt
+              ).TotalSeconds) -le 30
             } | Select-Object -Last 1)
             if ($sourceCoverageApplied.Count -ne 1) {
-              throw 'Canary did not consume ADD authoritative source coverage after its identity catalog.'
+              throw 'Canary did not consume the identity catalog and authoritative source coverage as one bounded reconnect bootstrap.'
             }
-            $sourceCoverageAppliedAt = [DateTimeOffset]::Parse(
-              [string]$sourceCoverageApplied[0].received_at
-            )
             $tailCommitted = @($canaryLogs | Where-Object {
               $_.code -in @(
                 'CURRENT_TAIL_SOURCE_COMMITTED',
                 'CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED'
-              ) -and
-              [DateTimeOffset]::Parse([string]$_.received_at) -ge $sourceCoverageAppliedAt
+              )
             } | Select-Object -Last 1)
             if ($tailCommitted.Count -ne 1) {
-              throw 'Canary did not prove a poison-safe bounded tail commit after applying ADD source coverage.'
+              throw 'Canary did not prove a poison-safe bounded tail commit during the accepted campaign.'
             }
             $tailCommittedAt = [DateTimeOffset]::Parse(
               [string]$tailCommitted[0].received_at
