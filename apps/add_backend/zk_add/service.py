@@ -409,6 +409,12 @@ def update_heartbeat(
                 **(zkt.capability_profile or {}),
                 "history_stream_v1": bool(capabilities.get("history_stream_v1")),
                 "history_stream_v2": bool(capabilities.get("history_stream_v2")),
+                "partial_final_chunk_v1": bool(
+                    capabilities.get("partial_final_chunk_v1")
+                ),
+                "source_divergence_probe_v1": bool(
+                    capabilities.get("source_divergence_probe_v1")
+                ),
                 "source_tail_v1": bool(capabilities.get("source_tail_v1")),
                 "history_range_resume_verified": bool(
                     capabilities.get("history_range_resume_verified")

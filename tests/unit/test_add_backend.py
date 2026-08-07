@@ -2952,6 +2952,38 @@ def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     assert alert and alert.severity == "WARNING"
 
 
+def test_heartbeat_persists_244_recovery_capabilities(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="zone-lite-2.4.4",
+        current_activity="LIVE_CAPTURE",
+        zkt={
+            "online": True,
+            "connection_state": "ONLINE",
+            "serial": SERIAL,
+            "reconciliation_capabilities": {
+                "history_stream_v1": True,
+                "history_stream_v2": True,
+                "partial_final_chunk_v1": True,
+                "source_divergence_probe_v1": True,
+                "source_tail_v1": True,
+                "history_range_resume_verified": True,
+                "max_chunk_records": 100,
+                "max_credit_records": 400,
+                "source_coverage_certified": True,
+                "source_coverage_cursor": 5138,
+            },
+        },
+    )
+    update_heartbeat(
+        db, connector=connector, boot_id="boot-244", sequence=1, payload=payload
+    )
+    capabilities = connector.zkt_device.capability_profile
+    assert capabilities["partial_final_chunk_v1"] is True
+    assert capabilities["source_divergence_probe_v1"] is True
+    assert capabilities["source_coverage_cursor"] == 5138
+
+
 def test_planned_truth_session_refresh_does_not_degrade_or_count_as_flapping(db: Session):
     connector = connector_fixture(db)
     connector.lifecycle_state = "ONLINE"
