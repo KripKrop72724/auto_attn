@@ -319,6 +319,7 @@ jobs:
             $unsafeDeliveryCount = 0
             $blockedIdentityCount = 0
             $quarantinedIdentityReuseCount = 0
+            $quarantinedInvalidDeviceTimeCount = 0
             $cursor = $null
             $seenCursors = @{}
             do {
@@ -341,6 +342,10 @@ jobs:
                 }
                 if ($deliveryState -eq 'QUARANTINED_IDENTITY_REUSE') {
                   $quarantinedIdentityReuseCount++
+                  continue
+                }
+                if ($deliveryState -eq 'QUARANTINED_INVALID_DEVICE_TIME') {
+                  $quarantinedInvalidDeviceTimeCount++
                   continue
                 }
                 if (
@@ -370,6 +375,7 @@ jobs:
               "all resolvable rows are Oracle-confirmed. Preserved fail-closed rows: " +
               "blocked_identity=$blockedIdentityCount " +
               "quarantined_identity_reuse=$quarantinedIdentityReuseCount " +
+              "quarantined_invalid_device_time=$quarantinedInvalidDeviceTimeCount " +
               "source_exceptions=$($currentExceptions.Count)."
             )
           } catch {

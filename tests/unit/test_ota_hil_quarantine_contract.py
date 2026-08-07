@@ -106,6 +106,7 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         "$unsafeDeliveryCount -ne 0",
         "$deliveryState -eq 'BLOCKED_IDENTITY'",
         "$deliveryState -eq 'QUARANTINED_IDENTITY_REUSE'",
+        "$deliveryState -eq 'QUARANTINED_INVALID_DEVICE_TIME'",
         "all resolvable rows are Oracle-confirmed",
         "'ACKED', 'ACKED_CHECK'",
         "deploy/add/promote-firmware.ps1",
