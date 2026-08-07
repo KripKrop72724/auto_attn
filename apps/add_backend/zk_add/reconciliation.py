@@ -2272,6 +2272,16 @@ def _event(
 
 
 def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, str]:
+    if job.status in {"PAUSED", "PAUSE_REQUESTED"}:
+        return (
+            "PAUSED",
+            "Reconciliation is durably paused. Its committed checkpoint is safe and will be used when an administrator resumes it.",
+        )
+    if job.status == "CANCELLED":
+        return (
+            "CANCELLED",
+            "Reconciliation was cancelled without deleting its committed source evidence.",
+        )
     if not connected or job.wait_reason == "WAITING_FOR_DEVICE":
         return (
             "WAITING_FOR_DEVICE",

@@ -37,6 +37,7 @@ from zk_add.reconciliation import (
     reconciliation_chunk_digest,
     reconciliation_scheduler_state,
     refresh_reconciliation_assurance,
+    serialize_job,
 )
 from zk_add.schemas import (
     AttendanceEventIn,
@@ -913,6 +914,29 @@ def test_unconfirmed_firmware_source_divergence_holds_add_job(
     assert job.status == "NEEDS_ATTENTION"
     assert job.error_code == fault_code
     assert assignment_rows(session) == []
+
+
+def test_paused_job_reports_its_durable_operator_state(reconciliation_db):
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify paused progress is described accurately to operators.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="reconcile-paused-operator-state",
+    )
+    job = control_reconciliation_job(
+        session,
+        job=job,
+        action="pause",
+        actor="operator",
+        reason="Pause while deploying the coordinated recovery release.",
+        idempotency_key="pause-before-coordinated-release",
+    )
+    payload = serialize_job(session, job)
+    assert payload["operator_state"] == "PAUSED"
+    assert "committed checkpoint is safe" in payload["operator_message"]
 
 
 def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
