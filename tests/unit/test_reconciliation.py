@@ -754,6 +754,24 @@ def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
     assert job.committed_next_ordinal == 100
     assert job.last_chain_digest == hashlib.sha256(b"checkpoint-100").hexdigest()
 
+    retry_assignment = assignment_rows(session)[0][1]
+    apply_reconciliation_assignment_release(
+        session,
+        connector=connector,
+        payload=ReconciliationAssignmentReleaseRequest(
+            assignment_id=retry_assignment["assignment_id"],
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            committed_next_ordinal=100,
+            reason="TRANSIENT_STEP_FAILED",
+        ),
+    )
+    assert job.active_assignment_id is None
+    assert job.committed_next_ordinal == 100
+    assert job.phase == "RECOVERING_AFTER_INTERRUPTION"
+    assert job.wait_reason == "TRANSIENT_STEP_RETRY"
+    assert job.auto_retry_count == 1
+
 
 @pytest.mark.parametrize(
     ("remaining", "expected_credit"),
