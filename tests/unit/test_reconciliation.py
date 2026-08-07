@@ -16,6 +16,7 @@ from zk_add.models import (
     AttendanceEvent,
     ReconciliationCoverage,
     ReconciliationDivergence,
+    ReconciliationJob,
     SourceTailChunk,
     TerminalRecordManifest,
     TerminalRecordReview,
@@ -494,6 +495,29 @@ def test_source_record_digest_must_match_protected_raw_evidence(reconciliation_d
     )
     with pytest.raises(ValueError, match="digest does not match"):
         apply_reconciliation_chunk(session, connector=connector, payload=request)
+
+
+def test_fail_closed_identity_does_not_leave_certified_job_running(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    event.ords_status = "BLOCKED_IDENTITY"
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "COMPLETED"
+    assert job.phase == "FINAL_ASSURANCE"
+    assert job.ords_pending_count == 0
+    assert job.ords_confirmed_count == 0
+    assert job.blocked_identity_count == 1
+    assert job.oracle_certificate["blocked_identity"] == 1
+    assert job.oracle_certificate["resolvable_event_count"] == 0
+    assert coverage.oracle_state == "ORACLE_MEMBERSHIP_CERTIFIED"
 
 
 def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
