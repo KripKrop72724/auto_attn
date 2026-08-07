@@ -21,11 +21,13 @@ from zk_add.models import (
     OrdsOutbox,
     ReconciliationChunk,
     ReconciliationCoverage,
+    ReconciliationDivergence,
     ReconciliationEvent,
     ReconciliationJob,
     SourceTailChunk,
     TemporaryAdminLease,
     TerminalRecordManifest,
+    TerminalSourceEpoch,
     ZKTDevice,
 )
 from zk_add.schemas import (
@@ -33,6 +35,7 @@ from zk_add.schemas import (
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
+    SourceProbeResultRequest,
     SourceTailChunkRequest,
 )
 from zk_add.settings import settings
@@ -56,6 +59,7 @@ ORDS_CONFIRMED_STATES = {"ACKED", "ACKED_CHECK"}
 RECONCILIATION_CAPABILITY = "history_stream_v1"
 RECONCILIATION_V2_CAPABILITY = "history_stream_v2"
 RANGE_RESUME_CAPABILITY = "history_range_resume_verified"
+SOURCE_PROBE_CAPABILITY = "source_divergence_probe_v1"
 
 
 def _release_assignment(job: ReconciliationJob) -> None:
@@ -89,6 +93,41 @@ def _request_digest(*, connector: Connector, reason: str, confirmation: str) -> 
         sort_keys=True,
     )
     return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _active_or_new_source_epoch(
+    session: Session, *, zkt_device_id: int, terminal_generation: int
+) -> TerminalSourceEpoch:
+    epoch = session.scalar(
+        select(TerminalSourceEpoch)
+        .where(
+            TerminalSourceEpoch.zkt_device_id == zkt_device_id,
+            TerminalSourceEpoch.terminal_generation == terminal_generation,
+            TerminalSourceEpoch.state.in_(["ACTIVE", "CANDIDATE"]),
+        )
+        .order_by(TerminalSourceEpoch.sequence.desc())
+    )
+    if epoch is not None:
+        return epoch
+    latest = session.scalar(
+        select(func.max(TerminalSourceEpoch.sequence)).where(
+            TerminalSourceEpoch.zkt_device_id == zkt_device_id,
+            TerminalSourceEpoch.terminal_generation == terminal_generation,
+        )
+    ) or 0
+    now = utc_now()
+    epoch = TerminalSourceEpoch(
+        zkt_device_id=zkt_device_id,
+        terminal_generation=terminal_generation,
+        sequence=latest + 1,
+        state="ACTIVE",
+        activated_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(epoch)
+    session.flush()
+    return epoch
 
 
 def preflight_reconciliation(session: Session, connector: Connector) -> dict:
@@ -191,6 +230,7 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
             ).where(
                 TerminalRecordManifest.zkt_device_id == coverage.zkt_device_id,
                 TerminalRecordManifest.generation == coverage.terminal_generation,
+                TerminalRecordManifest.source_epoch_id == coverage.source_epoch_id,
                 TerminalRecordManifest.canonical_source == True,  # noqa: E712
                 TerminalRecordManifest.ordinal < coverage.source_committed_cursor,
             )
@@ -292,6 +332,13 @@ def create_reconciliation_job(
         raise ValueError(f"Device already has active reconciliation {active.job_id}.")
     zkt = connector.zkt_device
     assert zkt is not None
+    generation = max(1, connector.onboarding_generation)
+    source_epoch = _active_or_new_source_epoch(
+        session,
+        zkt_device_id=zkt.id,
+        terminal_generation=generation,
+    )
+    operation_id = str(uuid4())
     waitable = preflight["waitable_blockers"]
     job = ReconciliationJob(
         connector_id=connector.id,
@@ -304,7 +351,9 @@ def create_reconciliation_job(
         phase=("WAITING_FOR_SAFE_WINDOW" if waitable else "PREFLIGHT"),
         wait_reason=(waitable[0]["code"] if waitable else None),
         terminal_serial=zkt.serial,
-        terminal_generation=max(1, connector.onboarding_generation),
+        terminal_generation=generation,
+        source_epoch_id=source_epoch.id,
+        operation_id=operation_id,
         firmware_version=connector.firmware_version,
         identity_snapshot_id=zkt.identity_snapshot_id,
         latest_terminal_count=zkt.attendance_count,
@@ -552,12 +601,14 @@ def apply_reconciliation_chunk(
             select(TerminalRecordManifest).where(
                 TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
                 TerminalRecordManifest.generation == payload.generation,
+                TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
                 TerminalRecordManifest.canonical_source == True,  # noqa: E712
                 TerminalRecordManifest.ordinal >= payload.start_ordinal,
                 TerminalRecordManifest.ordinal < payload.end_ordinal,
             )
         ).all()
     }
+    interpretation_drift_ordinals: set[int] = set()
     for source in payload.records:
         prior = existing_source_rows.get(source.ordinal)
         if prior is None:
@@ -568,27 +619,43 @@ def apply_reconciliation_chunk(
             "TERMINAL_DUPLICATE",
         }
         source_parsed = source.disposition in {"EVENT", "BLOCKED_IDENTITY"}
+        if prior.raw_record_digest != source.raw_record_digest:
+            _begin_source_divergence(session, job=job, prior=prior, source=source)
+            return job, None, False
         if (
-            prior.raw_record_digest != source.raw_record_digest
-            or prior.terminal_record_key != source.terminal_record_key
+            prior.terminal_record_key != source.terminal_record_key
             or prior.occurrence_index != source.occurrence_index
-            or prior_parsed != source_parsed
-            or (
-                not prior_parsed
-                and prior.disposition != source.disposition
-            )
         ):
             _safety_hold(
                 session,
                 job,
-                "COMMITTED_SOURCE_ORDINAL_DIVERGED",
-                "A previously committed terminal ordinal changed during a repeated full-history scan.",
+                "SOURCE_DERIVED_KEY_DIVERGED",
+                "Raw evidence matched but its derived source key changed; scanning stopped fail-closed.",
             )
             return job, None, False
+        if prior_parsed != source_parsed or (
+            not prior_parsed and prior.disposition != source.disposition
+        ):
+            interpretation_drift_ordinals.add(source.ordinal)
+            _event(
+                session,
+                job,
+                "SOURCE_INTERPRETATION_DRIFT",
+                {
+                    "ordinal": source.ordinal,
+                    "preserved_disposition": prior.disposition,
+                    "observed_disposition": source.disposition,
+                    "raw_record_digest": source.raw_record_digest,
+                },
+            )
 
     from zk_add.service import ingest_attendance
 
-    attendance = [row.event for row in payload.records if row.event is not None]
+    attendance = [
+        row.event
+        for row in payload.records
+        if row.event is not None and row.ordinal not in interpretation_drift_ordinals
+    ]
     accepted_uids: set[str] = set()
     duplicate_uids: set[str] = set()
     if attendance:
@@ -627,6 +694,7 @@ def apply_reconciliation_chunk(
             select(TerminalRecordManifest.terminal_record_key).where(
                 TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
                 TerminalRecordManifest.generation == payload.generation,
+                TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
                 TerminalRecordManifest.canonical_source == True,  # noqa: E712
                 TerminalRecordManifest.ordinal < payload.start_ordinal,
                 TerminalRecordManifest.terminal_record_key.in_(current_terminal_keys),
@@ -656,6 +724,7 @@ def apply_reconciliation_chunk(
                 zkt_device_id=job.zkt_device_id,
                 terminal_serial=job.terminal_serial or "unknown",
                 generation=payload.generation,
+                source_epoch_id=job.source_epoch_id,
                 ordinal=source.ordinal,
                 source_kind="BASELINE",
                 canonical_source=True,
@@ -729,7 +798,15 @@ def apply_reconciliation_assignment_release(
     if job.active_assignment_id == payload.assignment_id:
         _release_assignment(job)
         now = utc_now()
-        job.next_retry_at = now
+        if payload.reason == "TRANSIENT_STEP_FAILED":
+            delays = (5, 15, 30, 60)
+            delay = delays[min(job.auto_retry_count, len(delays) - 1)]
+            job.auto_retry_count += 1
+            job.phase = "RECOVERING_AFTER_INTERRUPTION"
+            job.wait_reason = "TRANSIENT_STEP_RETRY"
+            job.next_retry_at = now + timedelta(seconds=delay)
+        else:
+            job.next_retry_at = now
         job.updated_at = now
         _event(
             session,
@@ -778,6 +855,7 @@ def apply_reconciliation_manifest(
         select(func.count(TerminalRecordManifest.id)).where(
             TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
             TerminalRecordManifest.generation == payload.generation,
+            TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
             TerminalRecordManifest.canonical_source == True,  # noqa: E712
             TerminalRecordManifest.ordinal < payload.cutoff_count,
         )
@@ -820,6 +898,7 @@ def apply_reconciliation_manifest(
     coverage = ReconciliationCoverage(
         zkt_device_id=job.zkt_device_id,
         job_id=job.id,
+        source_epoch_id=job.source_epoch_id,
         terminal_serial=job.terminal_serial or "unknown",
         terminal_generation=job.terminal_generation,
         certified_source_cursor=payload.cutoff_count,
@@ -1041,6 +1120,7 @@ def apply_source_tail_chunk(
             select(TerminalRecordManifest.terminal_record_key).where(
                 TerminalRecordManifest.zkt_device_id == zkt.id,
                 TerminalRecordManifest.generation == payload.terminal_generation,
+                TerminalRecordManifest.source_epoch_id == coverage.source_epoch_id,
                 TerminalRecordManifest.canonical_source == True,  # noqa: E712
                 TerminalRecordManifest.ordinal < payload.start_ordinal,
                 TerminalRecordManifest.terminal_record_key.in_(current_terminal_keys),
@@ -1069,6 +1149,7 @@ def apply_source_tail_chunk(
                 zkt_device_id=zkt.id,
                 terminal_serial=coverage.terminal_serial,
                 generation=payload.terminal_generation,
+                source_epoch_id=coverage.source_epoch_id,
                 ordinal=source.ordinal,
                 source_kind="TAIL",
                 canonical_source=True,
@@ -1125,6 +1206,7 @@ def refresh_reconciliation_assurance(
     manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
         TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
         TerminalRecordManifest.generation == job.terminal_generation,
+        TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
         TerminalRecordManifest.attendance_event_id.is_not(None),
@@ -1264,17 +1346,72 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = preflight["waitable_blockers"][0]["code"]
             continue
+        if (
+            job.active_assignment_id is None
+            and job.next_retry_at is not None
+            and ensure_utc(job.next_retry_at) > now
+        ):
+            if job.phase != "VERIFYING_SOURCE_CHANGE":
+                job.phase = "RECOVERING_AFTER_INTERRUPTION"
+                job.wait_reason = job.wait_reason or "TRANSIENT_STEP_RETRY"
+            continue
         if slots_owned >= slot_limit:
             job.phase = "WAITING_FOR_CAPACITY"
             job.wait_reason = "WAITING_FOR_SCAN_SLOT"
             continue
         slots_owned += 1
         job.wait_reason = None
-        job.phase = "ANCHORING" if job.cutoff_count is None else "SCANNING_TERMINAL"
+        if job.phase != "VERIFYING_SOURCE_CHANGE":
+            job.phase = "ANCHORING" if job.cutoff_count is None else "SCANNING_TERMINAL"
         zkt = connector.zkt_device
         capabilities = (zkt.capability_profile if zkt else {}) or {}
         supports_v2 = bool(capabilities.get(RECONCILIATION_V2_CAPABILITY))
         assignment_v2 = supports_v2 and job.cutoff_count is not None
+        if job.phase == "VERIFYING_SOURCE_CHANGE":
+            divergence = session.scalar(
+                select(ReconciliationDivergence)
+                .where(
+                    ReconciliationDivergence.job_id == job.id,
+                    ReconciliationDivergence.state.in_(["OBSERVED", "PROBING"]),
+                )
+                .order_by(ReconciliationDivergence.id.desc())
+            )
+            if divergence is None:
+                _safety_hold(
+                    session,
+                    job,
+                    "SOURCE_DIVERGENCE_EVIDENCE_MISSING",
+                    "The source-recovery state had no immutable divergence evidence.",
+                )
+                continue
+            if not bool(capabilities.get(SOURCE_PROBE_CAPABILITY)):
+                _safety_hold(
+                    session,
+                    job,
+                    "SOURCE_PROBE_UNSUPPORTED",
+                    "Zone Lite 2.4.4 source-probe capability is required for automatic recovery.",
+                )
+                continue
+            if divergence.next_probe_at and ensure_utc(divergence.next_probe_at) > now:
+                job.wait_reason = "SOURCE_DIVERGENCE_PROBE_PENDING"
+                continue
+            assignments.append(
+                (
+                    connector.connector_id,
+                    {
+                        "schema_version": "1",
+                        "type": "source_probe_assignment",
+                        "job_id": job.job_id,
+                        "generation": job.terminal_generation,
+                        "expected_terminal_serial": job.terminal_serial,
+                        "ordinal": divergence.ordinal,
+                        "probe_attempt": len(divergence.observations or []),
+                    },
+                )
+            )
+            job.wait_reason = None
+            job.next_retry_at = now + timedelta(seconds=30)
+            continue
         if supports_v2 and job.active_assignment_id:
             lease_live = bool(
                 job.assignment_expires_at
@@ -1294,6 +1431,14 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                 - job.committed_next_ordinal,
             )
             _release_assignment(job)
+            job.auto_retry_count += 1
+            job.phase = "RECOVERING_AFTER_INTERRUPTION"
+            _event(
+                session,
+                job,
+                "STALE_ASSIGNMENT_RECOVERED",
+                {"committed_next_ordinal": job.committed_next_ordinal},
+            )
         if job.next_retry_at is not None and job.next_retry_at > now:
             continue
         try:
@@ -1310,6 +1455,7 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                 select(TerminalRecordManifest).where(
                     TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
                     TerminalRecordManifest.generation == job.terminal_generation,
+                    TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
                     TerminalRecordManifest.canonical_source == True,  # noqa: E712
                     TerminalRecordManifest.ordinal == job.committed_next_ordinal - 1,
                 )
@@ -1330,6 +1476,9 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                 )
             except (TypeError, ValueError):
                 device_credit_limit = chunk_records
+            remaining_records = max(
+                0, job.cutoff_count - job.committed_next_ordinal
+            )
             available_credit = max(
                 0,
                 settings.reconciliation_history_backlog_pause
@@ -1340,12 +1489,13 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                 settings.reconciliation_v2_credit_records,
                 max(chunk_records, device_credit_limit),
                 chunk_records * settings.reconciliation_v2_max_chunks,
-                max(0, job.cutoff_count - job.committed_next_ordinal),
+                remaining_records,
                 available_credit,
             )
-            if requested_credit < chunk_records and job.committed_next_ordinal < job.cutoff_count:
+            minimum_grant = min(chunk_records, remaining_records)
+            if requested_credit < minimum_grant and remaining_records > 0:
                 job.phase = "WAITING_FOR_SAFE_WINDOW"
-                job.wait_reason = "HISTORY_BACKLOG_CREDIT_EXHAUSTED"
+                job.wait_reason = "HISTORY_BACKLOG_BACKPRESSURE"
                 continue
             assignment_id = str(uuid4())
             credit_end = job.committed_next_ordinal + requested_credit
@@ -1405,9 +1555,23 @@ def reconciliation_scheduler_state(session: Session) -> dict:
         )
     ).all()
     active = sum(
-        row.phase in {"ANCHORING", "SCANNING_TERMINAL"}
+        row.phase in {"ANCHORING", "SCANNING_TERMINAL", "VERIFYING_SOURCE_CHANGE"}
         and row.wait_reason is None
         for row in rows
+    )
+    history_backlog = session.scalar(
+        select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.delivery_type == "FULL_HISTORY",
+            OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE", "IN_FLIGHT"]),
+        )
+    ) or 0
+    now = utc_now()
+    reserved_credit = sum(
+        max(0, (row.credit_end_ordinal or row.committed_next_ordinal) - row.committed_next_ordinal)
+        for row in rows
+        if row.active_assignment_id
+        and row.assignment_expires_at
+        and ensure_utc(row.assignment_expires_at) > now
     )
     return {
         "policy": "BOUNDED_PARALLEL_PER_DEVICE",
@@ -1416,6 +1580,15 @@ def reconciliation_scheduler_state(session: Session) -> dict:
         "waiting_scan_jobs": max(0, len(rows) - active),
         "available_scan_slots": max(
             0, settings.reconciliation_device_concurrency - active
+        ),
+        "history_backlog": history_backlog,
+        "history_backlog_limit": settings.reconciliation_history_backlog_pause,
+        "reserved_credit": reserved_credit,
+        "available_credit": max(
+            0,
+            settings.reconciliation_history_backlog_pause
+            - history_backlog
+            - reserved_credit,
         ),
     }
 
@@ -1427,6 +1600,13 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
     ) or 0
     eta = _eta(job, chunks=chunks, connected=bool(connector and connector.connected))
     remaining = None if job.cutoff_count is None else max(0, job.cutoff_count - job.scanned_count)
+    divergence = session.scalar(
+        select(ReconciliationDivergence)
+        .where(ReconciliationDivergence.job_id == job.id)
+        .order_by(ReconciliationDivergence.id.desc())
+    )
+    source_epoch = session.get(TerminalSourceEpoch, job.source_epoch_id)
+    operator_state, operator_message = _operator_status(job, connected=bool(connector and connector.connected))
     result = {
         "job_id": job.job_id,
         "mode": job.mode,
@@ -1435,6 +1615,10 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         "wait_reason": job.wait_reason,
         "error_code": job.error_code,
         "error_message": job.error_message,
+        "operator_state": operator_state,
+        "operator_message": operator_message,
+        "completion_outcome": job.completion_outcome,
+        "review_required": job.review_required,
         "connector": None if connector is None else {
             "connector_id": connector.connector_id,
             "device_id": connector.device_id,
@@ -1462,6 +1646,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "oracle_confirmed": job.ords_confirmed_count,
             "oracle_pending": job.ords_pending_count,
             "retry_count": job.retry_count,
+            "auto_retry_count": job.auto_retry_count,
         },
         "checkpoint": {
             "next_ordinal": job.committed_next_ordinal,
@@ -1479,6 +1664,20 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "heartbeat_at": job.assignment_heartbeat_at,
         },
         "eta": eta,
+        "recovery": {
+            "operation_id": job.operation_id or job.job_id,
+            "source_epoch": source_epoch.sequence if source_epoch else 1,
+            "source_epoch_id": source_epoch.epoch_id if source_epoch else None,
+            "divergence": None if divergence is None else {
+                "divergence_id": divergence.divergence_id,
+                "ordinal": divergence.ordinal,
+                "state": divergence.state,
+                "old_raw_digest": divergence.old_raw_digest,
+                "new_raw_digest": divergence.new_raw_digest,
+                "observation_count": len(divergence.observations or []),
+                "next_probe_at": divergence.next_probe_at,
+            },
+        },
         "capture_certificate": job.capture_certificate or None,
         "oracle_certificate": job.oracle_certificate or None,
         "requested_at": job.requested_at,
@@ -1505,6 +1704,7 @@ def serialize_coverage(row: ReconciliationCoverage | None) -> dict | None:
         return None
     return {
         "coverage_id": row.coverage_id,
+        "source_epoch_id": row.source_epoch_id,
         "terminal_serial": row.terminal_serial,
         "terminal_generation": row.terminal_generation,
         "certified_source_cursor": row.certified_source_cursor,
@@ -1727,6 +1927,318 @@ def _require_runnable(job: ReconciliationJob, generation: int) -> None:
         raise ValueError("Reconciliation generation does not match the assignment.")
 
 
+def _begin_source_divergence(
+    session: Session,
+    *,
+    job: ReconciliationJob,
+    prior: TerminalRecordManifest,
+    source,
+) -> ReconciliationDivergence:
+    """Persist the first mismatch and switch to bounded fresh-source probes."""
+
+    now = utc_now()
+    row = session.scalar(
+        select(ReconciliationDivergence).where(
+            ReconciliationDivergence.job_id == job.id,
+            ReconciliationDivergence.ordinal == source.ordinal,
+            ReconciliationDivergence.state.in_(["OBSERVED", "PROBING"]),
+        )
+    )
+    observation = {
+        "raw_record_digest": source.raw_record_digest,
+        "disposition": source.disposition,
+        "observed_at": now.isoformat(),
+        "kind": "RECONCILIATION_CHUNK",
+    }
+    if row is None:
+        row = ReconciliationDivergence(
+            job_id=job.id,
+            source_epoch_id=job.source_epoch_id,
+            ordinal=source.ordinal,
+            state="OBSERVED",
+            old_raw_digest=prior.raw_record_digest,
+            new_raw_digest=source.raw_record_digest,
+            old_disposition=prior.disposition,
+            new_disposition=source.disposition,
+            protected_new_raw_record=encrypt_text(source.raw_record_b64),
+            observations=[observation],
+            next_probe_at=now + timedelta(seconds=5),
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+    else:
+        row.observations = [*(row.observations or []), observation]
+        row.updated_at = now
+    _release_assignment(job)
+    if not settings.reconciliation_self_healing_enabled:
+        job.status = "NEEDS_ATTENTION"
+        job.phase = "WAITING_FOR_SAFE_WINDOW"
+        job.wait_reason = "SELF_HEALING_RECOVERY_DISABLED"
+        job.error_code = "SELF_HEALING_RECOVERY_DISABLED"
+        job.error_message = (
+            "A raw terminal-source change was preserved while automatic recovery is gated."
+        )
+        job.updated_at = now
+        _event(
+            session,
+            job,
+            "SOURCE_DIVERGENCE_OBSERVED",
+            {
+                "divergence_id": row.divergence_id,
+                "ordinal": row.ordinal,
+                "recovery_gated": True,
+            },
+        )
+        return row
+    job.status = "RUNNING"
+    job.phase = "VERIFYING_SOURCE_CHANGE"
+    job.wait_reason = "SOURCE_DIVERGENCE_PROBE_PENDING"
+    job.error_code = None
+    job.error_message = None
+    job.next_retry_at = row.next_probe_at
+    job.updated_at = now
+    _event(
+        session,
+        job,
+        "SOURCE_DIVERGENCE_OBSERVED",
+        {
+            "divergence_id": row.divergence_id,
+            "ordinal": row.ordinal,
+            "old_raw_digest": row.old_raw_digest,
+            "new_raw_digest": row.new_raw_digest,
+        },
+    )
+    return row
+
+
+def apply_source_probe_result(
+    session: Session,
+    *,
+    connector: Connector,
+    payload: SourceProbeResultRequest,
+) -> ReconciliationJob:
+    """Resolve a mismatch only after independent fresh terminal preparations."""
+
+    job = _device_job(session, connector, payload.job_id)
+    _require_runnable(job, payload.generation)
+    if job.terminal_serial != payload.terminal_serial:
+        return _safety_hold(
+            session,
+            job,
+            "TERMINAL_SERIAL_CHANGED",
+            "Terminal identity changed while confirming a source divergence.",
+        )
+    divergence = session.scalar(
+        select(ReconciliationDivergence)
+        .where(
+            ReconciliationDivergence.job_id == job.id,
+            ReconciliationDivergence.ordinal == payload.ordinal,
+            ReconciliationDivergence.state.in_(["OBSERVED", "PROBING"]),
+        )
+        .with_for_update()
+    )
+    if divergence is None:
+        raise ValueError("Source probe has no active divergence to verify.")
+    if payload.record.ordinal != payload.ordinal:
+        raise ValueError("Source probe record did not match its requested ordinal.")
+    try:
+        raw = base64.b64decode(payload.record.raw_record_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Source probe contains invalid base64 evidence.") from exc
+    if (
+        len(raw) != payload.record_size
+        or hashlib.sha256(raw).hexdigest() != payload.record.raw_record_digest
+    ):
+        raise ValueError("Source probe raw evidence did not match its digest or layout.")
+
+    now = utc_now()
+    observations = [*(divergence.observations or [])]
+    observations.append(
+        {
+            "raw_record_digest": payload.record.raw_record_digest,
+            "disposition": payload.record.disposition,
+            "observed_at": now.isoformat(),
+            "kind": "FRESH_SOURCE_PROBE",
+        }
+    )
+    divergence.observations = observations
+    divergence.protected_new_raw_record = encrypt_text(payload.record.raw_record_b64)
+    divergence.updated_at = now
+    recent_probe_digests = [
+        item.get("raw_record_digest")
+        for item in observations
+        if item.get("kind") == "FRESH_SOURCE_PROBE"
+    ]
+
+    if len(recent_probe_digests) >= 2 and recent_probe_digests[-2:] == [
+        divergence.old_raw_digest,
+        divergence.old_raw_digest,
+    ]:
+        divergence.state = "TRANSIENT_RECOVERED"
+        divergence.resolved_at = now
+        divergence.next_probe_at = None
+        job.status = "QUEUED"
+        job.phase = "RECOVERING_AFTER_INTERRUPTION"
+        job.wait_reason = None
+        job.next_retry_at = now
+        job.auto_retry_count += 1
+        _event(
+            session,
+            job,
+            "SOURCE_DIVERGENCE_TRANSIENT_RECOVERED",
+            {"divergence_id": divergence.divergence_id, "ordinal": divergence.ordinal},
+        )
+    elif (
+        len(observations) >= 3
+        and all(
+            item.get("raw_record_digest") == divergence.new_raw_digest
+            for item in observations[-3:]
+        )
+    ):
+        _activate_recovery_epoch(
+            session,
+            job=job,
+            divergence=divergence,
+            now=now,
+        )
+    else:
+        elapsed = (now - ensure_utc(divergence.created_at)).total_seconds()
+        if elapsed >= 15 * 60:
+            divergence.state = "UNSTABLE_REVIEW_REQUIRED"
+            divergence.next_probe_at = None
+            job.status = "NEEDS_ATTENTION"
+            job.phase = "FINAL_ASSURANCE"
+            job.wait_reason = "SOURCE_DIVERGENCE_UNSTABLE"
+            job.error_code = "SOURCE_DIVERGENCE_UNSTABLE"
+            job.error_message = (
+                "Fresh terminal reads did not converge within the protected verification window."
+            )
+        else:
+            probe_count = len(recent_probe_digests)
+            delay = (5, 15, 30, 60)[min(probe_count, 3)]
+            divergence.state = "PROBING"
+            divergence.next_probe_at = now + timedelta(seconds=delay)
+            job.status = "RUNNING"
+            job.phase = "VERIFYING_SOURCE_CHANGE"
+            job.wait_reason = "SOURCE_DIVERGENCE_PROBE_PENDING"
+            job.next_retry_at = divergence.next_probe_at
+    job.updated_at = now
+    return job
+
+
+def _activate_recovery_epoch(
+    session: Session,
+    *,
+    job: ReconciliationJob,
+    divergence: ReconciliationDivergence,
+    now,
+) -> None:
+    old_epoch = session.get(TerminalSourceEpoch, job.source_epoch_id)
+    recent_epoch_count = session.scalar(
+        select(func.count(TerminalSourceEpoch.id)).where(
+            TerminalSourceEpoch.zkt_device_id == job.zkt_device_id,
+            TerminalSourceEpoch.created_at >= now - timedelta(hours=24),
+            TerminalSourceEpoch.sequence > 1,
+        )
+    ) or 0
+    if recent_epoch_count >= 3:
+        divergence.state = "MUTATION_LIMIT_REVIEW_REQUIRED"
+        divergence.resolved_at = now
+        job.status = "NEEDS_ATTENTION"
+        job.phase = "FINAL_ASSURANCE"
+        job.wait_reason = "SOURCE_EPOCH_RECOVERY_LIMIT"
+        job.error_code = "SOURCE_EPOCH_RECOVERY_LIMIT"
+        job.error_message = "Terminal history changed repeatedly; automatic epoch recovery stopped."
+        return
+    sequence = (old_epoch.sequence if old_epoch else 0) + 1
+    new_epoch = TerminalSourceEpoch(
+        zkt_device_id=job.zkt_device_id,
+        terminal_generation=job.terminal_generation,
+        sequence=sequence,
+        state="ACTIVE",
+        parent_epoch_id=old_epoch.id if old_epoch else None,
+        activated_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(new_epoch)
+    session.flush()
+    if old_epoch is not None:
+        old_epoch.state = "SUPERSEDED"
+        old_epoch.superseded_at = now
+        old_epoch.updated_at = now
+    prefix = session.scalars(
+        select(TerminalRecordManifest).where(
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+            TerminalRecordManifest.generation == job.terminal_generation,
+            TerminalRecordManifest.source_epoch_id == divergence.source_epoch_id,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.ordinal < job.committed_next_ordinal,
+        )
+    ).all()
+    for prior in prefix:
+        session.add(
+            TerminalRecordManifest(
+                job_id=None,
+                chunk_id=None,
+                connector_id=prior.connector_id,
+                zkt_device_id=prior.zkt_device_id,
+                terminal_serial=prior.terminal_serial,
+                generation=prior.generation,
+                source_epoch_id=new_epoch.id,
+                ordinal=prior.ordinal,
+                source_kind="RECOVERY_PREFIX",
+                canonical_source=True,
+                record_size=prior.record_size,
+                raw_record_digest=prior.raw_record_digest,
+                terminal_record_key=prior.terminal_record_key,
+                occurrence_index=prior.occurrence_index,
+                attendance_event_id=prior.attendance_event_id,
+                disposition=prior.disposition,
+                protected_raw_record=prior.protected_raw_record,
+                error_code=prior.error_code,
+                raw_timestamp=prior.raw_timestamp,
+                observed_uid=prior.observed_uid,
+                observed_user_id=prior.observed_user_id,
+            )
+        )
+    for coverage in session.scalars(
+        select(ReconciliationCoverage).where(
+            ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
+            ReconciliationCoverage.active == True,  # noqa: E712
+        )
+    ).all():
+        coverage.active = False
+        coverage.invalidated_reason = "SUPERSEDED_BY_CONFIRMED_SOURCE_MUTATION"
+        coverage.invalidated_at = now
+        coverage.updated_at = now
+    job.source_epoch_id = new_epoch.id
+    job.status = "QUEUED"
+    job.phase = "RECOVERING_AFTER_SOURCE_CHANGE"
+    job.wait_reason = None
+    job.error_code = None
+    job.error_message = None
+    job.next_retry_at = now
+    job.auto_retry_count += 1
+    job.review_required = True
+    job.completion_outcome = "CURRENT_TRUTH_CERTIFIED_WITH_SOURCE_CHANGE"
+    divergence.state = "CONFIRMED_NEW_EPOCH"
+    divergence.resolved_at = now
+    divergence.next_probe_at = None
+    _event(
+        session,
+        job,
+        "SOURCE_RECOVERY_EPOCH_ACTIVATED",
+        {
+            "divergence_id": divergence.divergence_id,
+            "source_epoch_id": new_epoch.epoch_id,
+            "reused_prefix_through": job.committed_next_ordinal,
+        },
+    )
+
+
 def _safety_hold(
     session: Session, job: ReconciliationJob, code: str, message: str
 ) -> ReconciliationJob:
@@ -1756,6 +2268,47 @@ def _event(
             details=details,
             idempotency_key=idempotency_key,
         )
+    )
+
+
+def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, str]:
+    if not connected or job.wait_reason == "WAITING_FOR_DEVICE":
+        return (
+            "WAITING_FOR_DEVICE",
+            "Waiting for the device to reconnect. Committed progress is safe and will resume automatically.",
+        )
+    if job.phase == "VERIFYING_SOURCE_CHANGE":
+        return (
+            "VERIFYING_SOURCE_CHANGE",
+            "ADD is confirming a terminal-history change with independent fresh reads.",
+        )
+    if job.phase in {"RECOVERING_AFTER_INTERRUPTION", "RECOVERING_AFTER_SOURCE_CHANGE"}:
+        return (
+            "RECOVERING",
+            "Reconciliation is recovering automatically from its last durable checkpoint.",
+        )
+    if job.wait_reason in {"HISTORY_BACKLOG_BACKPRESSURE", "HISTORY_BACKLOG_CREDIT_EXHAUSTED"}:
+        return (
+            "WAITING_FOR_ORACLE_CAPACITY",
+            "Terminal capture is temporarily paused while previously committed Oracle work drains.",
+        )
+    if job.status == "NEEDS_ATTENTION":
+        return (
+            "REVIEW_REQUIRED",
+            job.error_message or "A correctness check needs administrator review; committed progress remains safe.",
+        )
+    if job.status == "COMPLETED" and job.review_required:
+        return (
+            "COMPLETED_WITH_REVIEW",
+            "Current terminal truth is certified. A preserved historical source change remains available for review.",
+        )
+    if job.status == "COMPLETED":
+        return ("COMPLETED", "Terminal source coverage and Oracle membership are certified.")
+    if job.capture_certified_at is not None:
+        return ("VERIFYING_ORACLE", "Terminal source capture is complete; ADD is proving Oracle membership.")
+    return (
+        "CAPTURING_SOURCE",
+        "ADD is committing terminal source records in bounded restart-safe chunks.",
     )
 
 

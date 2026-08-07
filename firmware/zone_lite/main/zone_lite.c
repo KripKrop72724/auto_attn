@@ -3850,6 +3850,77 @@ static bool process_add_reconciliation_assignment(
     if (!zk_get_counts(sock, ctx, &current_users, &latest_records) || latest_records < 0) {
         return false;
     }
+    if (assignment->source_probe) {
+        if (assignment->probe_ordinal >= (uint32_t)latest_records) {
+            add_connector_log(
+                "WARN",
+                "reconcile",
+                "SOURCE_PROBE_ORDINAL_UNAVAILABLE",
+                "The requested recovery ordinal is outside the current terminal source count.");
+            return false;
+        }
+        zk_bounded_buffer_t probe_source = {0};
+        if (!zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &probe_source)) {
+            return false;
+        }
+        uint8_t probe_header[4];
+        bool probe_ok = zk_read_bounded_range(
+            sock, ctx, &probe_source, 0, probe_header, sizeof(probe_header));
+        uint32_t probe_total = probe_ok ? read_le32(probe_header) : 0;
+        static const uint32_t probe_record_sizes[] = {40, 16, 8};
+        uint32_t probe_record_size = probe_ok ? choose_zk_record_size(
+            probe_total,
+            (uint32_t)latest_records,
+            probe_record_sizes,
+            sizeof(probe_record_sizes) / sizeof(probe_record_sizes[0])) : 0;
+        uint8_t probe_raw[40];
+        if (probe_record_size > 0) {
+            probe_ok = zk_read_bounded_range(
+                sock,
+                ctx,
+                &probe_source,
+                4 + assignment->probe_ordinal * probe_record_size,
+                probe_raw,
+                probe_record_size);
+        } else {
+            probe_ok = false;
+        }
+        zk_close_bounded_buffer(sock, ctx, &probe_source);
+        cJSON *records = probe_ok ? cJSON_CreateArray() : NULL;
+        cJSON *canonical = probe_ok ? cJSON_CreateArray() : NULL;
+        probe_ok = records && canonical && append_terminal_source_record(
+            records,
+            canonical,
+            probe_raw,
+            probe_record_size,
+            users,
+            assignment->probe_ordinal,
+            "FULL_HISTORY",
+            NULL);
+        cJSON_Delete(canonical);
+        cJSON *probe = probe_ok ? cJSON_CreateObject() : NULL;
+        cJSON *record = records ? cJSON_DetachItemFromArray(records, 0) : NULL;
+        cJSON_Delete(records);
+        if (probe && record) {
+            cJSON_AddStringToObject(probe, "job_id", assignment->job_id);
+            cJSON_AddNumberToObject(probe, "generation", assignment->generation);
+            cJSON_AddStringToObject(probe, "terminal_serial", g_device_serial);
+            cJSON_AddNumberToObject(probe, "latest_terminal_count", latest_records);
+            cJSON_AddNumberToObject(probe, "record_size", probe_record_size);
+            cJSON_AddNumberToObject(probe, "ordinal", assignment->probe_ordinal);
+            cJSON_AddItemToObject(probe, "record", record);
+            record = NULL;
+        }
+        cJSON_Delete(record);
+        char *probe_json = probe ? cJSON_PrintUnformatted(probe) : NULL;
+        cJSON_Delete(probe);
+        probe_ok = probe_json && add_connector_send_payload_acknowledged(
+            "source_probe_result",
+            probe_json,
+            30000);
+        free(probe_json);
+        return probe_ok;
+    }
     uint32_t cutoff = assignment->has_cutoff
         ? assignment->cutoff_count
         : (uint32_t)latest_records;
@@ -7932,6 +8003,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     &reconciliation_assignment);
                 add_connector_set_activity("LIVE_CAPTURE");
                 if (!source_ok) {
+                    release_reconciliation_credit(
+                        &reconciliation_assignment,
+                        reconciliation_assignment.committed_next_ordinal,
+                        "TRANSIENT_STEP_FAILED");
                     add_connector_log(
                         "WARN",
                         "reconcile",

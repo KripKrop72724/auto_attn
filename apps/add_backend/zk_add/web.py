@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -50,6 +52,7 @@ from zk_add.models import (
     IdentityTombstone,
     OnboardingNonce,
     ReconciliationJob,
+    ReconciliationDivergence,
     TemporaryAdminLease,
     UserDeletionJob,
     ZKTDevice,
@@ -83,6 +86,7 @@ from zk_add.schemas import (
     ReconciliationCreateRequest,
     ReconciliationManifestRequest,
     SourceExceptionActionRequest,
+    SourceProbeResultRequest,
     SourceTailChunkRequest,
     UserCreateRequest,
     UserDeleteRequest,
@@ -143,6 +147,7 @@ from zk_add.reconciliation import (
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
     apply_source_tail_chunk,
+    apply_source_probe_result,
     active_coverage,
     control_reconciliation_job,
     create_reconciliation_job,
@@ -717,6 +722,79 @@ def reveal_source_exception_endpoint(
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return result
+
+
+@app.get("/api/v1/reconciliation-divergences/{divergence_id}")
+def reconciliation_divergence_detail(
+    divergence_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    row = db.scalar(
+        select(ReconciliationDivergence).where(
+            ReconciliationDivergence.divergence_id == divergence_id
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Reconciliation divergence not found.")
+    job = db.get(ReconciliationJob, row.job_id)
+    return {
+        "divergence_id": row.divergence_id,
+        "job_id": job.job_id if job else None,
+        "ordinal": row.ordinal,
+        "state": row.state,
+        "old_raw_digest": row.old_raw_digest,
+        "new_raw_digest": row.new_raw_digest,
+        "old_disposition": row.old_disposition,
+        "new_disposition": row.new_disposition,
+        "observations": row.observations or [],
+        "evidence_available": bool(row.protected_new_raw_record),
+        "created_at": row.created_at,
+        "resolved_at": row.resolved_at,
+    }
+
+
+@app.post("/api/v1/reconciliation-divergences/{divergence_id}/reveal")
+def reveal_reconciliation_divergence(
+    divergence_id: str,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    row = db.scalar(
+        select(ReconciliationDivergence).where(
+            ReconciliationDivergence.divergence_id == divergence_id
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Reconciliation divergence not found.")
+    if not row.protected_new_raw_record:
+        raise HTTPException(status_code=409, detail="Protected divergence evidence is unavailable.")
+    raw_b64 = decrypt_text(row.protected_new_raw_record)
+    try:
+        raw = base64.b64decode(raw_b64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=409, detail="Protected divergence evidence is invalid.") from exc
+    append_audit(
+        db,
+        actor=context.username,
+        action="RECONCILIATION_DIVERGENCE_EVIDENCE_REVEALED",
+        target_type="reconciliation_divergence",
+        target_id=row.divergence_id,
+        outcome="SUCCESS",
+        after={"reason": body.reason.strip(), "ordinal": row.ordinal},
+        request_id=body.idempotency_key,
+    )
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return {
+        "divergence_id": row.divergence_id,
+        "raw_record_b64": raw_b64,
+        "raw_record_hex": raw.hex(),
+        "new_raw_digest": row.new_raw_digest,
+    }
 
 
 @app.post("/api/v1/reconciliations/{job_id}/{action}")
@@ -2164,6 +2242,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
 async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
     event_payload = None
     ack_payload = None
+    authoritative_coverage_payload = None
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
         if connector is None:
@@ -2341,6 +2420,38 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "status": job.status,
                 "capture_certificate": job.capture_certificate or None,
             }
+        elif envelope.type == "source_probe_result":
+            probe = SourceProbeResultRequest.model_validate(envelope.payload)
+            job = apply_source_probe_result(db, connector=connector, payload=probe)
+            event_payload = {
+                "connector_id": connector.connector_id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "phase": job.phase,
+            }
+            ack_payload = {
+                "type": "source_probe_ack",
+                "message_id": envelope.message_id,
+                "message_type": envelope.type,
+                "job_id": job.job_id,
+                "status": job.status,
+                "phase": job.phase,
+                "committed_next_ordinal": job.committed_next_ordinal,
+            }
+            if job.phase == "RECOVERING_AFTER_SOURCE_CHANGE":
+                # A confirmed mutation supersedes the old coverage epoch. Tell a
+                # still-connected ESP immediately so it cannot continue tail work
+                # with a locally cached certificate while the replacement epoch is
+                # rebuilt from ADD's preserved checkpoint.
+                authoritative_coverage_payload = {
+                    "type": "source_coverage",
+                    "source_epoch_id": job.source_epoch_id,
+                    "terminal_serial": job.terminal_serial,
+                    "terminal_generation": job.terminal_generation,
+                    "source_committed_cursor": 0,
+                    "source_committed_chain_digest": "0" * 64,
+                    "active": False,
+                }
         elif envelope.type == "source_tail_chunk":
             tail = SourceTailChunkRequest.model_validate(envelope.payload)
             coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
@@ -2381,6 +2492,8 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
         ack_payload
         or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq}
     )
+    if authoritative_coverage_payload is not None:
+        await websocket.send_json(authoritative_coverage_payload)
     await browser_events.publish(envelope.type, event_payload or {})
 
 

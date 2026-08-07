@@ -1,10 +1,16 @@
-# ADD-owned reconciliation (Zone Lite 2.4.3)
+# ADD-owned reconciliation (Zone Lite 2.4.4)
 
 ADD schedules up to six terminal source scans in parallel. A device owns only
 one strictly serial slot, every acknowledged chunk remains restart-safe, and a
 disconnect or device-specific safety hold releases capacity for another zone.
 The global full-history ORDS backlog gate continues to pause all new source
 intake before downstream storage can be overloaded.
+
+The final assignment may contain fewer than 100 records. ADD calculates its
+minimum safe grant from the remaining source range, so a 1–99 record tail can
+always finish without being misreported as exhausted backlog credit. Raw source
+changes enter independent fresh-buffer probes; stable changes create a new
+preserved source epoch while transient reads resume from the existing cursor.
 
 ## Truth and safety contract
 

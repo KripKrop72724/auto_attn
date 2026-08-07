@@ -716,6 +716,13 @@ class ReconciliationJob(Base):
     reason: Mapped[str] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     request_digest: Mapped[str] = mapped_column(String(64))
+    operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    recovery_parent_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    source_epoch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_source_epochs.id"), index=True
+    )
     terminal_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     terminal_generation: Mapped[int] = mapped_column(Integer, default=1)
     firmware_version: Mapped[str | None] = mapped_column(String(80))
@@ -737,6 +744,9 @@ class ReconciliationJob(Base):
     ords_confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
     ords_pending_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    auto_retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    completion_outcome: Mapped[str | None] = mapped_column(String(80), index=True)
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     first_anchor_digest: Mapped[str | None] = mapped_column(String(64))
     last_chain_digest: Mapped[str | None] = mapped_column(String(64))
     wait_reason: Mapped[str | None] = mapped_column(String(160), index=True)
@@ -777,6 +787,69 @@ class ReconciliationJob(Base):
     assignment_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class TerminalSourceEpoch(Base):
+    """An immutable interpretation of one terminal's ordinal source history."""
+
+    __tablename__ = "add_terminal_source_epochs"
+    __table_args__ = (
+        UniqueConstraint(
+            "zkt_device_id",
+            "terminal_generation",
+            "sequence",
+            name="uq_add_terminal_source_epoch_sequence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    epoch_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    terminal_generation: Mapped[int] = mapped_column(Integer, index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(40), default="ACTIVE", index=True)
+    parent_epoch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_source_epochs.id"), index=True
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class ReconciliationDivergence(Base):
+    """Encrypted, immutable evidence for a source ordinal that changed."""
+
+    __tablename__ = "add_reconciliation_divergences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    divergence_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    source_epoch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_source_epochs.id"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, index=True)
+    state: Mapped[str] = mapped_column(String(40), default="OBSERVED", index=True)
+    old_raw_digest: Mapped[str] = mapped_column(String(64), index=True)
+    new_raw_digest: Mapped[str] = mapped_column(String(64), index=True)
+    old_disposition: Mapped[str | None] = mapped_column(String(50))
+    new_disposition: Mapped[str | None] = mapped_column(String(50))
+    protected_new_raw_record: Mapped[str | None] = mapped_column(Text)
+    observations: Mapped[list] = mapped_column(JSON, default=list)
+    next_probe_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
 
 
@@ -823,6 +896,7 @@ class TerminalRecordManifest(Base):
             "uq_add_terminal_source_ordinal",
             "zkt_device_id",
             "generation",
+            "source_epoch_id",
             "ordinal",
             unique=True,
             postgresql_where=text("canonical_source = true"),
@@ -845,6 +919,9 @@ class TerminalRecordManifest(Base):
     )
     terminal_serial: Mapped[str] = mapped_column(String(120), index=True)
     generation: Mapped[int] = mapped_column(Integer)
+    source_epoch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_source_epochs.id"), index=True
+    )
     ordinal: Mapped[int] = mapped_column(Integer)
     source_kind: Mapped[str] = mapped_column(
         String(30), default="BASELINE", index=True
@@ -941,6 +1018,9 @@ class ReconciliationCoverage(Base):
     )
     job_id: Mapped[int] = mapped_column(
         ForeignKey("add_reconciliation_jobs.id"), index=True
+    )
+    source_epoch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_source_epochs.id"), index=True
     )
     terminal_serial: Mapped[str] = mapped_column(String(120), index=True)
     terminal_generation: Mapped[int] = mapped_column(Integer)
