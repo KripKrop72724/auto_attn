@@ -1230,15 +1230,11 @@ def refresh_reconciliation_assurance(
     )
     if job.capture_certified_at is None:
         return job
-    if blocked:
-        job.phase = "WAITING_FOR_IDENTITY"
-        if not job.quarantined_count:
-            job.status = "RUNNING"
-    elif job.quarantined_count:
+    if job.quarantined_count:
         job.phase = "FINAL_ASSURANCE"
         job.status = "NEEDS_ATTENTION"
         job.wait_reason = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
-    elif confirmed < target:
+    elif pending > 0:
         job.phase = "DRAINING_ORDS"
         job.status = "RUNNING"
     else:
@@ -1248,6 +1244,8 @@ def refresh_reconciliation_assurance(
             "terminal_serial": job.terminal_serial,
             "certified_source_cursor": job.committed_next_ordinal,
             "oracle_membership_confirmed": confirmed,
+            "blocked_identity": blocked,
+            "resolvable_event_count": target - blocked,
             "source_chain_digest": job.last_chain_digest,
             "certified_at": now.isoformat(),
             "policy": "APPEND_ONLY_MEMBERSHIP",
