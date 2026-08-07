@@ -186,6 +186,16 @@ class ReconciliationSourceRecord(BaseModel):
         return self
 
 
+class SourceProbeResultRequest(BaseModel):
+    job_id: str = Field(min_length=36, max_length=36)
+    generation: int = Field(ge=1)
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    latest_terminal_count: int = Field(ge=0)
+    record_size: Literal[8, 16, 40]
+    ordinal: int = Field(ge=0)
+    record: ReconciliationSourceRecord
+
+
 class ReconciliationChunkRequest(BaseModel):
     assignment_id: str | None = Field(default=None, min_length=36, max_length=36)
     job_id: str = Field(min_length=36, max_length=36)

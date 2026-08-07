@@ -1251,12 +1251,15 @@ static bool parse_reconcile_assignment(
         root,
         "committed_next_ordinal");
     cJSON *chunk_records = cJSON_GetObjectItemCaseSensitive(root, "chunk_records");
-    if (!cJSON_IsString(type) || strcmp(type->valuestring, "reconcile_assignment") != 0 ||
+    bool source_probe = cJSON_IsString(type) &&
+        strcmp(type->valuestring, "source_probe_assignment") == 0;
+    if (!cJSON_IsString(type) ||
+        (!source_probe && strcmp(type->valuestring, "reconcile_assignment") != 0) ||
         !cJSON_IsString(job_id) || strlen(job_id->valuestring) != 36 ||
         !cJSON_IsNumber(generation) || generation->valuedouble < 1 ||
         !cJSON_IsString(expected_serial) || expected_serial->valuestring[0] == '\0' ||
-        !cJSON_IsNumber(committed) || committed->valuedouble < 0 ||
-        !cJSON_IsNumber(chunk_records) || chunk_records->valuedouble < 1) {
+        (!source_probe && (!cJSON_IsNumber(committed) || committed->valuedouble < 0)) ||
+        (!source_probe && (!cJSON_IsNumber(chunk_records) || chunk_records->valuedouble < 1))) {
         return false;
     }
     memset(assignment, 0, sizeof(*assignment));
@@ -1266,10 +1269,18 @@ static bool parse_reconcile_assignment(
         expected_serial->valuestring,
         sizeof(assignment->expected_terminal_serial));
     assignment->generation = (uint32_t)generation->valuedouble;
-    assignment->committed_next_ordinal = (uint32_t)committed->valuedouble;
-    assignment->chunk_records = (uint16_t)(chunk_records->valueint > 100
-        ? 100
-        : chunk_records->valueint);
+    assignment->source_probe = source_probe;
+    if (source_probe) {
+        cJSON *ordinal = cJSON_GetObjectItemCaseSensitive(root, "ordinal");
+        if (!cJSON_IsNumber(ordinal) || ordinal->valuedouble < 0) return false;
+        assignment->probe_ordinal = (uint32_t)ordinal->valuedouble;
+        assignment->chunk_records = 1;
+    } else {
+        assignment->committed_next_ordinal = (uint32_t)committed->valuedouble;
+        assignment->chunk_records = (uint16_t)(chunk_records->valueint > 100
+            ? 100
+            : chunk_records->valueint);
+    }
     cJSON *protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
     assignment->stream_v2 = cJSON_IsString(protocol) &&
         strcmp(protocol->valuestring, "history_stream_v2") == 0;
@@ -1296,7 +1307,7 @@ static bool parse_reconcile_assignment(
     if (cJSON_IsNumber(lease_epoch)) {
         assignment->lease_expires_epoch = (int64_t)lease_epoch->valuedouble;
     }
-    if (assignment->stream_v2 &&
+    if (!assignment->source_probe && assignment->stream_v2 &&
         (assignment->assignment_id[0] == '\0' ||
          !cJSON_IsNumber(credit_end) ||
          credit_end->valuedouble < committed->valuedouble)) {
@@ -1472,6 +1483,7 @@ static void parse_inbound(const char *data, size_t len)
          strcmp(type->valuestring, "reconcile_anchor_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_chunk_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_manifest_ack") == 0 ||
+         strcmp(type->valuestring, "source_probe_ack") == 0 ||
          strcmp(type->valuestring, "source_tail_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1710,7 +1722,9 @@ static void parse_inbound(const char *data, size_t len)
         cJSON_Delete(root);
         return;
     }
-    if (cJSON_IsString(type) && strcmp(type->valuestring, "reconcile_assignment") == 0) {
+    if (cJSON_IsString(type) &&
+        (strcmp(type->valuestring, "reconcile_assignment") == 0 ||
+         strcmp(type->valuestring, "source_probe_assignment") == 0)) {
         add_reconcile_assignment_t assignment;
         bool parsed = parse_reconcile_assignment(root, &assignment);
         bool stale = parsed &&
@@ -1931,6 +1945,8 @@ static void heartbeat_task(void *arg)
                 "reconciliation_capabilities");
             cJSON_AddBoolToObject(reconciliation, "history_stream_v1", true);
             cJSON_AddBoolToObject(reconciliation, "history_stream_v2", true);
+            cJSON_AddBoolToObject(reconciliation, "partial_final_chunk_v1", true);
+            cJSON_AddBoolToObject(reconciliation, "source_divergence_probe_v1", true);
             cJSON_AddBoolToObject(reconciliation, "source_tail_v1", true);
             cJSON_AddBoolToObject(
                 reconciliation,

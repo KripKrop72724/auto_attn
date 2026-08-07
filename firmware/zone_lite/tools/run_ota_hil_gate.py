@@ -41,6 +41,13 @@ REQUIRED_CHECKS = (
     "reconciliation_source_chain_continuous",
     "reconciliation_no_legacy_full_scan_after_certificate",
     "reconciliation_stream_v2_advertised",
+    "reconciliation_partial_final_1_committed",
+    "reconciliation_partial_final_31_committed",
+    "reconciliation_partial_final_99_committed",
+    "reconciliation_source_probe_transient_resumed",
+    "reconciliation_source_probe_stable_epoch_created",
+    "reconciliation_source_probe_unstable_held",
+    "reconciliation_recovery_prefix_preserved",
     "reconciliation_four_chunks_one_prepare",
     "reconciliation_free_data_before_network_wait",
     "reconciliation_ack_cursor_chain_validated",
@@ -81,7 +88,8 @@ def main() -> int:
     print(
         "OTA, Wi-Fi setup, and ADD-owned reconciliation hardware gates passed "
         "with poison-record advancement, exact replay, complete power-loss, isolation, "
-        "resume, 24-hour stability, and >=4x Karachi evidence"
+        "partial-tail completion, source-epoch recovery, resume, 24-hour stability, "
+        "and >=4x Karachi evidence"
     )
     return 0
 

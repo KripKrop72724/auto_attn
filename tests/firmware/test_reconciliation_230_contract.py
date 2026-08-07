@@ -11,8 +11,8 @@ WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
 RECONCILIATION = (ROOT / "apps/add_backend/zk_add/reconciliation.py").read_text()
 
 
-def test_242_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.3)" in PROJECT
+def test_244_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.4)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -32,6 +32,18 @@ def test_242_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert "ack.committed_next_ordinal == end" in ZONE
     assert "zk_close_bounded_buffer(sock, ctx, &source);" in ZONE
     assert "Deferred an interleaved live event" in ZONE
+
+
+def test_244_supports_partial_final_credit_and_fresh_source_probes():
+    assert '"partial_final_chunk_v1", true' in CONNECTOR
+    assert '"source_divergence_probe_v1", true' in CONNECTOR
+    assert '"source_probe_assignment"' in CONNECTOR
+    assert '"source_probe_result"' in ZONE
+    assert '"source_probe_ack"' in CONNECTOR
+    assert '"TRANSIENT_STEP_FAILED"' in ZONE
+    assert '"type": "source_coverage"' in WEB
+    assert '"active": False' in WEB
+    assert "!authoritative_coverage.active" in ZONE
 
 
 def test_stream_v2_ack_is_json_native_and_assignment_wins_truth_race():
@@ -107,6 +119,13 @@ def test_physical_hil_gate_requires_reconciliation_fault_and_resume_evidence():
         "reconciliation_source_chain_continuous",
         "reconciliation_no_legacy_full_scan_after_certificate",
         "reconciliation_stream_v2_advertised",
+        "reconciliation_partial_final_1_committed",
+        "reconciliation_partial_final_31_committed",
+        "reconciliation_partial_final_99_committed",
+        "reconciliation_source_probe_transient_resumed",
+        "reconciliation_source_probe_stable_epoch_created",
+        "reconciliation_source_probe_unstable_held",
+        "reconciliation_recovery_prefix_preserved",
         "reconciliation_four_chunks_one_prepare",
         "reconciliation_free_data_before_network_wait",
         "reconciliation_ack_cursor_chain_validated",

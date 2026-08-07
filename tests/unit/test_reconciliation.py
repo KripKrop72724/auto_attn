@@ -15,6 +15,7 @@ from zk_add.crypto import decrypt_text
 from zk_add.models import (
     AttendanceEvent,
     ReconciliationCoverage,
+    ReconciliationDivergence,
     SourceTailChunk,
     TerminalRecordManifest,
     TerminalRecordReview,
@@ -27,6 +28,7 @@ from zk_add.reconciliation import (
     apply_reconciliation_chunk,
     apply_reconciliation_manifest,
     apply_source_tail_chunk,
+    apply_source_probe_result,
     assignment_rows,
     control_reconciliation_job,
     create_reconciliation_job,
@@ -43,6 +45,7 @@ from zk_add.schemas import (
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
     ReconciliationSourceRecord,
+    SourceProbeResultRequest,
     SourceTailChunkRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
@@ -77,6 +80,7 @@ def reconciliation_db(monkeypatch: pytest.MonkeyPatch):
         "test-fleet-root-secret-with-enough-entropy",
     )
     monkeypatch.setattr(settings, "reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "reconciliation_self_healing_enabled", True)
     monkeypatch.setattr(settings, "identity_snapshot_gate_enabled", False)
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -726,6 +730,48 @@ def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
     assert job.last_chain_digest == hashlib.sha256(b"checkpoint-100").hexdigest()
 
 
+@pytest.mark.parametrize(
+    ("remaining", "expected_credit"),
+    [(1, 1), (31, 31), (99, 99), (100, 100), (101, 101)],
+)
+def test_stream_v2_grants_final_partial_credit(
+    reconciliation_db,
+    remaining: int,
+    expected_credit: int,
+):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "history_chunk_max_records": 100,
+        "history_credit_max_records": 400,
+    }
+    cutoff = 5_100 + remaining
+    zkt.attendance_count = cutoff
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify final partial source credits remain durable.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key=f"partial-credit-{remaining:04d}",
+    )
+    job.cutoff_count = cutoff
+    job.record_size = 40
+    job.committed_next_ordinal = 5_100
+    job.scanned_count = 5_100
+    job.last_chain_digest = hashlib.sha256(b"checkpoint-5100").hexdigest()
+
+    assignment = assignment_rows(session)[0][1]
+
+    assert assignment["committed_next_ordinal"] == 5_100
+    assert assignment["credit_end_ordinal"] == 5_100 + expected_credit
+    assert assignment["chunk_records"] == 100
+    assert job.wait_reason is None
+
+
 def test_stream_v2_offers_manifest_handshake_at_committed_cutoff(
     reconciliation_db,
 ):
@@ -823,12 +869,17 @@ def test_six_parallel_scan_slots_are_bounded_and_device_isolated(
     ]
     assert jobs[6].phase == "WAITING_FOR_CAPACITY"
     assert jobs[6].wait_reason == "WAITING_FOR_SCAN_SLOT"
-    assert reconciliation_scheduler_state(session) == {
+    scheduler = reconciliation_scheduler_state(session)
+    assert scheduler == {
         "policy": "BOUNDED_PARALLEL_PER_DEVICE",
         "device_concurrency": 6,
         "active_scan_jobs": 6,
         "waiting_scan_jobs": 1,
         "available_scan_slots": 0,
+        "history_backlog": 0,
+        "history_backlog_limit": 10_000,
+        "reserved_credit": 0,
+        "available_credit": 10_000,
     }
 
     first_connector.connected = False
@@ -837,7 +888,13 @@ def test_six_parallel_scan_slots_are_bounded_and_device_isolated(
     assert jobs[0].wait_reason == "WAITING_FOR_DEVICE"
 
 
-def test_firmware_source_divergence_immediately_holds_add_job(reconciliation_db):
+@pytest.mark.parametrize(
+    "fault_code",
+    ["SOURCE_COMMITTED_BOUNDARY_DIVERGED", "SOURCE_RANGE_COUNT_REGRESSION"],
+)
+def test_unconfirmed_firmware_source_divergence_holds_add_job(
+    reconciliation_db, fault_code
+):
     session, connector = reconciliation_db
     job = create_reconciliation_job(
         session,
@@ -850,9 +907,114 @@ def test_firmware_source_divergence_immediately_holds_add_job(reconciliation_db)
     changed = apply_reconciliation_device_fault(
         session,
         connector=connector,
-        code="SOURCE_COMMITTED_BOUNDARY_DIVERGED",
+        code=fault_code,
     )
     assert changed is True
     assert job.status == "NEEDS_ATTENTION"
-    assert job.error_code == "SOURCE_COMMITTED_BOUNDARY_DIVERGED"
+    assert job.error_code == fault_code
     assert assignment_rows(session) == []
+
+
+def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "source_divergence_probe_v1": True,
+    }
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify a stable source mutation creates a preserved recovery epoch.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="source-divergence-probe-0001",
+    )
+    changed_raw = bytes.fromhex("0800000102030400")
+    changed = _source_record().model_copy(
+        update={
+            "raw_record_digest": hashlib.sha256(changed_raw).hexdigest(),
+            "terminal_record_key": hashlib.sha256(b"changed-terminal-record").hexdigest(),
+            "raw_record_b64": base64.b64encode(changed_raw).decode(),
+        }
+    )
+    job.status = "RUNNING"
+    job.cutoff_count = 1
+    job.record_size = 8
+    job.first_anchor_digest = changed.raw_record_digest
+    session.add(
+        TerminalRecordManifest(
+            job_id=None,
+            chunk_id=None,
+            connector_id=connector.id,
+            zkt_device_id=zkt.id,
+            terminal_serial=SERIAL,
+            generation=job.terminal_generation,
+            source_epoch_id=job.source_epoch_id,
+            ordinal=0,
+            source_kind="TAIL",
+            canonical_source=True,
+            record_size=8,
+            raw_record_digest=hashlib.sha256(RAW_RECORD).hexdigest(),
+            terminal_record_key=hashlib.sha256(b"terminal-record-0").hexdigest(),
+            occurrence_index=1,
+            disposition="EVENT",
+            protected_raw_record="protected-existing-evidence",
+        )
+    )
+    session.flush()
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        sequence=0,
+        start_ordinal=0,
+        end_ordinal=1,
+        chunk_digest="0" * 64,
+        previous_chain_digest=None,
+        resulting_chain_digest="0" * 64,
+        records=[changed],
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    request = draft.model_copy(
+        update={
+            "chunk_digest": chunk_digest,
+            "resulting_chain_digest": reconciliation_chain_digest(
+                None,
+                start_ordinal=0,
+                end_ordinal=1,
+                chunk_digest=chunk_digest,
+            ),
+        }
+    )
+
+    held, chunk, duplicate = apply_reconciliation_chunk(
+        session, connector=connector, payload=request
+    )
+
+    assert chunk is None and duplicate is False
+    assert held.phase == "VERIFYING_SOURCE_CHANGE"
+    divergence = session.scalar(select(ReconciliationDivergence))
+    assert divergence is not None
+    original_epoch_id = job.source_epoch_id
+    probe = SourceProbeResultRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        terminal_serial=SERIAL,
+        latest_terminal_count=1,
+        record_size=8,
+        ordinal=0,
+        record=changed,
+    )
+    apply_source_probe_result(session, connector=connector, payload=probe)
+    apply_source_probe_result(session, connector=connector, payload=probe)
+
+    assert divergence.state == "CONFIRMED_NEW_EPOCH"
+    assert job.source_epoch_id != original_epoch_id
+    assert job.status == "QUEUED"
+    assert job.committed_next_ordinal == 0
+    assert job.review_required is True
+    assert job.completion_outcome == "CURRENT_TRUTH_CERTIFIED_WITH_SOURCE_CHANGE"

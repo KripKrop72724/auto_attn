@@ -48,11 +48,13 @@ typedef struct {
     uint32_t committed_next_ordinal;
     uint32_t cutoff_count;
     uint32_t credit_end_ordinal;
+    uint32_t probe_ordinal;
     uint16_t max_chunks;
     uint16_t chunk_records;
     int64_t lease_expires_epoch;
     bool has_cutoff;
     bool stream_v2;
+    bool source_probe;
 } add_reconcile_assignment_t;
 
 typedef struct {

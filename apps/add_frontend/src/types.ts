@@ -219,6 +219,33 @@ export interface SourceExceptionReveal {
   record_size: number | null
 }
 
+export interface ReconciliationDivergenceDetail {
+  divergence_id: string
+  job_id: string | null
+  ordinal: number
+  state: string
+  old_raw_digest: string
+  new_raw_digest: string
+  old_disposition: string | null
+  new_disposition: string | null
+  observations: Array<{
+    raw_record_digest: string
+    disposition: string
+    observed_at: string
+    kind: string
+  }>
+  evidence_available: boolean
+  created_at: string
+  resolved_at: string | null
+}
+
+export interface ReconciliationDivergenceReveal {
+  divergence_id: string
+  raw_record_b64: string
+  raw_record_hex: string
+  new_raw_digest: string
+}
+
 export interface ReconciliationJob {
   job_id: string
   mode: string
@@ -227,6 +254,10 @@ export interface ReconciliationJob {
   wait_reason: string | null
   error_code: string | null
   error_message: string | null
+  operator_state?: string
+  operator_message?: string
+  completion_outcome?: string | null
+  review_required?: boolean
   connector: null | {
     connector_id: string
     device_id: string
@@ -254,6 +285,7 @@ export interface ReconciliationJob {
     oracle_confirmed: number
     oracle_pending: number
     retry_count: number
+    auto_retry_count?: number
   }
   assignment: {
     assignment_id: string | null
@@ -271,6 +303,20 @@ export interface ReconciliationJob {
     confidence: string
     unavailable_reason: string | null
   }
+  recovery?: {
+    operation_id: string
+    source_epoch: number
+    source_epoch_id: string | null
+    divergence: null | {
+      divergence_id: string
+      ordinal: number
+      state: string
+      old_raw_digest: string
+      new_raw_digest: string
+      observation_count: number
+      next_probe_at: string | null
+    }
+  }
   requested_at: string
   started_at: string | null
   capture_certified_at: string | null
@@ -285,6 +331,10 @@ export interface ReconciliationScheduler {
   active_scan_jobs: number
   waiting_scan_jobs: number
   available_scan_slots: number
+  history_backlog?: number
+  history_backlog_limit?: number
+  reserved_credit?: number
+  available_credit?: number
 }
 
 export interface FirmwareRelease {

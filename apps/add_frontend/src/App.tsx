@@ -30,6 +30,8 @@ import type {
   IdentityIntegrity,
   Overview,
   ReconciliationJob,
+  ReconciliationDivergenceDetail,
+  ReconciliationDivergenceReveal,
   ReconciliationPreflight,
   ReconciliationScheduler,
   SourceException,
@@ -1623,6 +1625,66 @@ function SourceExceptionDrawer({
   )
 }
 
+function ReconciliationDivergenceDrawer({
+  divergenceId,
+  onClose,
+  toast,
+}: {
+  divergenceId: string
+  onClose: () => void
+  toast: ReturnType<typeof useToast>
+}) {
+  const [row, setRow] = useState<ReconciliationDivergenceDetail | null>(null)
+  const [reason, setReason] = useState('')
+  const [password, setPassword] = useState('')
+  const [revealed, setRevealed] = useState<ReconciliationDivergenceReveal | null>(null)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    void api<ReconciliationDivergenceDetail>(`/api/v1/reconciliation-divergences/${divergenceId}`)
+      .then(setRow)
+      .catch((error) => toast.error(error instanceof Error ? error.message : 'Could not load source-change evidence.'))
+  }, [divergenceId, toast])
+  const reveal = async () => {
+    setBusy(true)
+    try {
+      setRevealed(await api<ReconciliationDivergenceReveal>(`/api/v1/reconciliation-divergences/${divergenceId}/reveal`, {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: reason.trim(),
+          password,
+          idempotency_key: idempotency('source-divergence-reveal'),
+        }),
+      }))
+      setPassword('')
+      setReason('')
+      toast.notice('Protected source-change evidence revealed with an audit entry.')
+    } catch (error) {
+      setPassword('')
+      toast.error(error instanceof Error ? error.message : 'Could not reveal source-change evidence.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Dialog titleId="source-divergence-title" title="Terminal-history change" description={row ? `Ordinal ${row.ordinal.toLocaleString()} · ${row.state.replaceAll('_', ' ').toLowerCase()}` : 'Loading immutable evidence'} onClose={onClose} className="device-drawer source-exception-drawer">
+      <div className="drawer-status"><StatusBadge state={row?.state || 'LOADING'} /><span>Old evidence remains immutable; recovery never overwrites Oracle.</span></div>
+      <div className="drawer-content source-exception-detail">
+        {row && <>
+          <article className="info-copy pattern-waiting"><Icon name="shield" /><div><h3>Independent fresh-buffer verification</h3><p>ADD compares raw bytes, not parser labels. A stable change creates a preserved source epoch; a transient read resumes from the existing checkpoint.</p></div></article>
+          <dl className="exception-facts">
+            <div><dt>Job</dt><dd>{row.job_id || 'Unknown'}</dd></div><div><dt>Ordinal</dt><dd>{row.ordinal.toLocaleString()}</dd></div>
+            <div><dt>Original disposition</dt><dd>{row.old_disposition || 'Unknown'}</dd></div><div><dt>Observed disposition</dt><dd>{row.new_disposition || 'Unknown'}</dd></div>
+            <div className="wide"><dt>Original SHA-256</dt><dd><code>{row.old_raw_digest}</code></dd></div><div className="wide"><dt>Observed SHA-256</dt><dd><code>{row.new_raw_digest}</code></dd></div>
+          </dl>
+          <section className="exception-review-section"><div className="panel-header"><div><h3>Observation timeline</h3><p>Each probe comes from an independently prepared terminal buffer.</p></div><StatusBadge state={`${row.observations.length} OBSERVATIONS`} /></div>{row.observations.map((item, index) => <article className="exception-review" key={`${item.observed_at}-${index}`}><strong>{item.kind.replaceAll('_', ' ')}</strong><span>{dateTime(item.observed_at)}</span><p>{item.raw_record_digest}</p></article>)}</section>
+          {revealed && <section className="revealed-evidence" aria-live="polite"><div className="panel-header"><div><h3>Protected raw evidence</h3><p>This no-store response is audited and never written to application logs.</p></div><button className="button secondary" onClick={() => setRevealed(null)}>Hide</button></div><label>Hex<code>{revealed.raw_record_hex}</code></label><label>Base64<code>{revealed.raw_record_b64}</code></label></section>}
+          {row.evidence_available && <section className="exception-actions"><label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} placeholder="At least 10 characters" /></label><label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><div className="dialog-actions"><button className="button primary" disabled={reason.trim().length < 10 || !password || busy} onClick={() => void reveal()}><Icon name="search" /> {busy ? 'Verifying…' : 'Reveal raw evidence'}</button></div></section>}
+        </>}
+      </div>
+    </Dialog>
+  )
+}
+
 function ReconciliationView({
   devices,
   revision,
@@ -1645,6 +1707,7 @@ function ReconciliationView({
   const [selectedId, setSelectedId] = useState('')
   const [preflight, setPreflight] = useState<ReconciliationPreflight | null>(null)
   const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
+  const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(null)
   const [reason, setReason] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
@@ -1789,7 +1852,7 @@ function ReconciliationView({
         <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>{scheduler.device_concurrency} isolated terminal scan slots</small></div></article>
         <article className="metric-card metric-positive"><span className="metric-icon"><Icon name="shield" /></span><div><p>Source certificates</p><strong>{covered}</strong><small>Immutable terminal coverage</small></div></article>
         <article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>Append-only membership checks</small></div></article>
-        <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? 'Request path available' : 'Awaiting controlled enablement'}</small></div></article>
+        <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? `${(scheduler.available_credit ?? 0).toLocaleString()} source credits available · ${(scheduler.history_backlog ?? 0).toLocaleString()} Oracle history queued` : 'Awaiting controlled enablement'}</small></div></article>
       </section> : <section className="metric-grid"><article className="metric-card metric-warning"><span className="metric-icon"><Icon name="alert" /></span><div><p>Open exceptions</p><strong>{exceptionTotals.open.toLocaleString()}</strong><small>Awaiting operator review</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="clock" /></span><div><p>Invalid timestamps</p><strong>{exceptionTotals.invalid_time.toLocaleString()}</strong><small>Excluded fail-closed</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="terminal" /></span><div><p>Malformed rows</p><strong>{exceptionTotals.malformed.toLocaleString()}</strong><small>Raw evidence preserved</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Affected terminals</p><strong>{exceptionTotals.affected_terminals.toLocaleString()}</strong><small>Subsequent valid punches continue</small></div></article></section>}
       {section === 'jobs' && <>
       <section className="panel selection-panel">
@@ -1815,20 +1878,22 @@ function ReconciliationView({
             const creditRemaining = job.assignment?.credit_end_ordinal == null
               ? null
               : Math.max(0, job.assignment.credit_end_ordinal - job.progress.scanned)
-            const queueStatus = job.wait_reason === 'WAITING_FOR_SCAN_SLOT'
+            const queueStatus = job.operator_message || (job.wait_reason === 'WAITING_FOR_SCAN_SLOT'
               ? `Queue position ${queuePosition}; waiting for one of ${scheduler.device_concurrency} isolated scan slots`
               : job.wait_reason?.replaceAll('_', ' ')
-                || `${job.progress.scanned.toLocaleString()} of ${cutoff ? cutoff.toLocaleString() : 'scope pending'} source rows committed`
+                || `${job.progress.scanned.toLocaleString()} of ${cutoff ? cutoff.toLocaleString() : 'scope pending'} source rows committed`)
             const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> = []
             if (['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status)) controls.push('pause')
             if (job.status === 'PAUSED') controls.push('resume')
             if (job.status === 'NEEDS_ATTENTION') controls.push('retry')
             if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INVALIDATED'].includes(job.status)) controls.push('cancel')
             return <article key={job.job_id} className="reconcile-job">
-              <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.status} live={job.status === 'RUNNING'} /></div>
-              <div className="reconcile-phase"><strong>{job.phase.replaceAll('_', ' ')}</strong><span>{queueStatus}</span></div>
+              <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.operator_state || job.status} live={job.status === 'RUNNING'} /></div>
+              <div className="reconcile-phase"><strong>{(job.operator_state || job.phase).replaceAll('_', ' ')}</strong><span>{queueStatus}</span></div>
               <div className="reconcile-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><i style={{ width: `${percent}%` }} /></div>
-              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{creditRemaining == null ? 'Legacy' : `${creditRemaining.toLocaleString()} rows`}</strong> burst credit</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span></div>
+              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{creditRemaining == null ? 'Legacy' : `${creditRemaining.toLocaleString()} rows`}</strong> burst credit</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span><span><strong>{job.recovery?.source_epoch ?? 1}</strong> source epoch</span><span><strong>{job.progress.auto_retry_count ?? 0}</strong> automatic recoveries</span></div>
+              {job.recovery?.divergence && <div className="info-copy pattern-waiting"><Icon name="shield" /><div><h3>Terminal source verification at ordinal {job.recovery.divergence.ordinal.toLocaleString()}</h3><p>{job.recovery.divergence.observation_count} independent observation(s) preserved. ADD will resume automatically when the evidence converges.</p></div></div>}
+              {job.review_required && <div className="info-copy pattern-waiting"><Icon name="alert" /><div><h3>Current truth certified with historical review</h3><p>ADD preserved a terminal-history change. Oracle remains append-only and no evidence was removed.</p></div></div>}
               {job.error_message && <p className="reconcile-error"><Icon name="alert" />{job.error_message}</p>}
               <div className="reconcile-actions"><a className="button text-button" href={`/api/v1/reconciliations/${job.job_id}/evidence`} target="_blank" rel="noreferrer"><Icon name="shield" /> Evidence</a>{controls.map((action) => <button key={action} className={`button ${action === 'cancel' ? 'destructive' : 'secondary'}`} onClick={() => setDialog({ mode: 'control', job, action })}>{action}</button>)}</div>
             </article>
@@ -1839,6 +1904,7 @@ function ReconciliationView({
       </>}
       {section === 'exceptions' && <section className="panel source-exceptions-panel">
         <div className="panel-header"><div><h2>Immutable source exception ledger</h2><p>Every row remains tied to its terminal generation and ordinal. Review never changes attendance or Oracle.</p></div><StatusBadge state={`${exceptionTotals.all} ACCOUNTED`} /></div>
+        {rows.some((job) => Boolean(job.recovery?.divergence)) && <div className="info-copy pattern-waiting"><Icon name="shield" /><div><h3>Preserved terminal-history changes</h3>{rows.filter((job) => job.recovery?.divergence).map((job) => <p key={job.job_id}><button className="button text-button" onClick={() => setDivergenceDrawerId(job.recovery?.divergence?.divergence_id || null)}><strong>{job.connector?.display_name || job.job_id}</strong> · ordinal {job.recovery?.divergence?.ordinal.toLocaleString()} · {job.recovery?.divergence?.state.replaceAll('_', ' ').toLowerCase()} · {job.recovery?.divergence?.observation_count} observation(s)</button></p>)}</div></div>}
         <div className="filter-grid source-exception-filters">
           <label>Device<select value={exceptionFilters.device_id} onChange={(event) => setExceptionFilters({ ...exceptionFilters, device_id: event.target.value })}><option value="">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label>
           <label>Disposition<select value={exceptionFilters.disposition} onChange={(event) => setExceptionFilters({ ...exceptionFilters, disposition: event.target.value })}><option value="">All exceptions</option><option value="INVALID_TIME">Invalid timestamp</option><option value="MALFORMED">Malformed record</option></select></label>
@@ -1866,6 +1932,7 @@ function ReconciliationView({
         </Dialog>
       )}
       {exceptionDrawer && <SourceExceptionDrawer seed={exceptionDrawer} onClose={() => setExceptionDrawer(null)} onChanged={() => loadExceptions(undefined, false)} toast={toast} />}
+      {divergenceDrawerId && <ReconciliationDivergenceDrawer divergenceId={divergenceDrawerId} onClose={() => setDivergenceDrawerId(null)} toast={toast} />}
     </>
   )
 }
