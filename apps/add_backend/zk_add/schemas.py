@@ -282,6 +282,7 @@ class ReconciliationAssignmentReleaseRequest(BaseModel):
         "LEASE_EXPIRING",
         "HEAP_PRESSURE",
         "DISCONNECTING",
+        "TRANSIENT_STEP_FAILED",
     ]
 
 
