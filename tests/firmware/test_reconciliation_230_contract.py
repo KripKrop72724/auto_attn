@@ -11,8 +11,8 @@ WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
 RECONCILIATION = (ROOT / "apps/add_backend/zk_add/reconciliation.py").read_text()
 
 
-def test_244_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.4)" in PROJECT
+def test_245_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.5)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
@@ -34,13 +34,14 @@ def test_242_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert "Deferred an interleaved live event" in ZONE
 
 
-def test_244_supports_partial_final_credit_and_fresh_source_probes():
+def test_245_supports_partial_final_credit_and_fresh_source_probes():
     assert '"partial_final_chunk_v1", true' in CONNECTOR
     assert '"source_divergence_probe_v1", true' in CONNECTOR
     assert '"source_probe_assignment"' in CONNECTOR
     assert '"source_probe_result"' in ZONE
     assert '"source_probe_ack"' in CONNECTOR
     assert '"TRANSIENT_STEP_FAILED"' in ZONE
+    assert "!assignment.source_probe" in CONNECTOR
     assert '"type": "source_coverage"' in WEB
     assert '"active": False' in WEB
     assert "!authoritative_coverage.active" in ZONE

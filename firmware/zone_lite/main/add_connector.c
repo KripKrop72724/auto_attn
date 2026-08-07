@@ -1728,6 +1728,7 @@ static void parse_inbound(const char *data, size_t len)
         add_reconcile_assignment_t assignment;
         bool parsed = parse_reconcile_assignment(root, &assignment);
         bool stale = parsed &&
+            !assignment.source_probe &&
             strcmp(assignment.job_id, s_reconcile_last_job_id) == 0 &&
             assignment.generation == s_reconcile_last_generation &&
             assignment.committed_next_ordinal < s_reconcile_last_committed_ordinal;
