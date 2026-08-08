@@ -242,7 +242,11 @@ jobs:
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
           bash -lc 'rm -rf build-ci && idf.py -B build-ci -D SDKCONFIG=/tmp/zone-lite-ci-sdkconfig build'
-      - name: Upload non-provisioned firmware build
+      - name: Upload non-provisioned firmware build (best effort)
+        # The build above is the release gate. Artifact retention is convenient for
+        # diagnostics, but GitHub storage exhaustion must not block an unrelated ADD
+        # production deployment; signed firmware releases use the separate vault flow.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: zone-lite-esp32s3-${{ github.sha }}
