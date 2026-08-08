@@ -23,11 +23,19 @@ export type DashboardRoute =
 export type FirmwareSection = 'overview' | 'releases' | 'campaigns'
 
 export interface FirmwareScopePreview {
-  zoneId: string
-  candidates: Device[]
-  otaReady: Device[]
-  excluded: Device[]
-  isHil: boolean
+  scope_token: string
+  expires_at: string
+  release: { release_id: string; version: string; state: string }
+  zone_id: string
+  counts: { candidates: number; eligible: number; excluded: number; offline: number }
+  eligible: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'>>
+  excluded: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'> & { reason: string }>
+}
+
+export interface AlertQueueResponse {
+  rows: Array<Alert & { device: Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id'> }>
+  next_cursor: string | null
+  totals: { all: number; open: number; acknowledged: number; resolved: number }
 }
 
 export interface ZktDevice {

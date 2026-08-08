@@ -35,6 +35,16 @@ FORBIDDEN_EXACT = {
 }
 ALLOWED_UI_COLORS = {
     "#0094da",
+    # State Life corporate navy/blue scale and accessible semantic states.
+    "#066da3", "#071a2b", "#079bdc", "#087cb7", "#0b2238", "#0c5279",
+    "#0c704d", "#12202d", "#12324f", "#164c70", "#526475", "#536675",
+    "#55c6f2", "#62cff7", "#65cef5", "#7894a6", "#8bcdb4", "#8ca0ad",
+    "#8da0ad", "#8ea8ba", "#962e38", "#96cfba", "#9a6500", "#9babb5",
+    "#9bcbdf", "#9fb3c2", "#b43b44", "#b8c5ce", "#bfd2df", "#c9d7e1",
+    "#d79a23", "#d9e9f4", "#dce4e9", "#dce9f0", "#dff3fc", "#e0a2a8",
+    "#e1a2a7", "#e5bd69", "#e7f6f0", "#eaf0f3", "#eef3f6", "#f1faff",
+    "#f2f5f7", "#f3f6f8", "#f5f8fa", "#f7fbfd", "#f8fafb", "#f8fbfc",
+    "#fbfcfd", "#ffd987", "#fff0f1", "#fff4d6",
     "#111111",
     "#171717",
     "#1c1c1c",

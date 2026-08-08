@@ -360,6 +360,8 @@ class UserUpdateRequest(BaseModel):
     expected_version: int = Field(ge=1)
     idempotency_key: str = Field(min_length=8, max_length=120)
     password: str = Field(min_length=1, max_length=512)
+    reason: str | None = Field(default=None, min_length=10, max_length=500)
+    typed_confirmation: str | None = Field(default=None, max_length=300)
 
     @field_validator("cnic")
     @classmethod

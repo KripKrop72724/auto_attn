@@ -19,10 +19,13 @@ export default defineConfig({
     timeout: 30_000,
   },
   projects: [
+    { name: 'mobile-320', use: { ...devices['Desktop Chrome'], viewport: { width: 320, height: 720 } } },
     { name: 'mobile-390', use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 } } },
     { name: 'tablet-768', use: { ...devices['Desktop Chrome'], viewport: { width: 768, height: 1024 } } },
     { name: 'desktop-1280', use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 900 } } },
     { name: 'desktop-1440', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 1000 } } },
     { name: 'wide-1600', use: { ...devices['Desktop Chrome'], viewport: { width: 1600, height: 1000 } } },
+    { name: 'firefox-1280', use: { ...devices['Desktop Firefox'], viewport: { width: 1280, height: 900 } } },
+    { name: 'webkit-1280', use: { ...devices['Desktop Safari'], viewport: { width: 1280, height: 900 } } },
   ],
 })

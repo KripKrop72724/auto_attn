@@ -4150,6 +4150,36 @@ def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
     assert "13 digits" in response.json()["detail"]
 
 
+def test_global_alert_queue_is_priority_ordered_and_cursor_safe(db: Session):
+    connector = connector_fixture(db)
+    now = utc_now()
+    db.add_all([
+        DeviceAlert(connector_id=connector.id, code="HIGH_ALERT", severity="HIGH", state="OPEN", message="High", details={}, first_seen_at=now, last_seen_at=now),
+        DeviceAlert(connector_id=connector.id, code="CRITICAL_ALERT", severity="CRITICAL", state="OPEN", message="Critical", details={}, first_seen_at=now, last_seen_at=now),
+        DeviceAlert(connector_id=connector.id, code="WARNING_ALERT", severity="WARNING", state="RESOLVED", message="Warning", details={}, first_seen_at=now, last_seen_at=now, resolved_at=now),
+    ])
+    raw_session, _admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest"
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    first = client.get("/api/v1/alerts?limit=1")
+    assert first.status_code == 200
+    assert first.json()["rows"][0]["code"] == "CRITICAL_ALERT"
+    assert first.json()["rows"][0]["device"]["connector_id"] == connector.connector_id
+    assert first.json()["totals"] == {"all": 3, "open": 2, "acknowledged": 0, "resolved": 1}
+    second = client.get("/api/v1/alerts", params={"limit": 1, "cursor": first.json()["next_cursor"]})
+    assert second.status_code == 200, second.text
+    assert second.json()["rows"][0]["code"] == "HIGH_ALERT"
+    assert client.get("/api/v1/alerts?cursor=not-a-cursor").status_code == 422
+
+
 def test_source_exception_endpoints_require_step_up_audit_and_never_cache_raw(
     db: Session,
 ):

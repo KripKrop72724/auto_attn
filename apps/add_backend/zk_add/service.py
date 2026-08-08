@@ -3604,6 +3604,7 @@ def update_device_user_command(
     expected_version: int,
     idempotency_key: str,
     actor: str,
+    reason: str | None = None,
 ) -> DeviceCommand:
     replay = find_idempotent_user_command(
         session,
@@ -3690,6 +3691,7 @@ def update_device_user_command(
             "cnic": mask_cnic(next_cnic),
             "shift_worker": next_shift,
             "privilege": next_privilege,
+            **({"privilege_change_reason": reason} if reason else {}),
         },
     )
     session.flush()

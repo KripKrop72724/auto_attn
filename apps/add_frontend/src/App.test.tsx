@@ -7,6 +7,8 @@ import App, {
   confirmationMatches,
   formatAlertDiagnostics,
   identityConflictText,
+  pktInputToUtc,
+  pktTodayBounds,
   StatusBadge,
   validateUserDraft,
 } from './App'
@@ -189,6 +191,17 @@ const fetchStub = (
         legacy_skipped: 0,
       }, 201)
     }
+    if (path.endsWith('/api/v1/firmware/campaigns/preflight')) {
+      return response({
+        scope_token: 'signed-test-scope-token-with-sufficient-length',
+        expires_at: '2026-07-27T12:05:00Z',
+        release: { release_id: 'release-2-2-4', version: '2.2.4', state: 'HIL_ONLY' },
+        zone_id: device.zone_id,
+        counts: { candidates: 1, eligible: 1, excluded: 0, offline: 0 },
+        eligible: [device],
+        excluded: [],
+      })
+    }
     if (path.endsWith('/api/v1/firmware/campaigns')) {
       return response({ enabled: false, hil_enabled: true, rows: [] })
     }
@@ -197,6 +210,16 @@ const fetchStub = (
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
+    if (path.startsWith('/api/v1/alerts') && init?.method !== 'POST') return response({
+      rows: [{ ...deliveryAlert, device: {
+        connector_id: device.connector_id,
+        display_name: device.display_name,
+        zone_id: device.zone_id,
+        hardware_id: device.hardware_id,
+      } }],
+      next_cursor: null,
+      totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 },
+    })
     if (path.includes('/alerts')) return response({ rows: [deliveryAlert] })
     if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
     if (path.includes('/api/v1/devices') && !path.includes('/users')) {
@@ -672,6 +695,24 @@ describe('State Life ADD interface', () => {
     expect(container.querySelector('[data-pattern="notice"]')).toBeTruthy()
   })
 
+  it('maps the complete operational status taxonomy without relying on color', () => {
+    const { container, rerender } = render(<StatusBadge state="COMPLETED" />)
+    expect(container.querySelector('[data-pattern="confirmed"]')).toBeTruthy()
+    rerender(<StatusBadge state="WARNING" />)
+    expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
+    rerender(<StatusBadge state="HIGH" />)
+    expect(container.querySelector('[data-pattern="blocked"]')).toBeTruthy()
+  })
+
+  it('converts PKT attendance ranges to identical UTC bounds in every browser timezone', () => {
+    expect(pktInputToUtc('2026-08-09T00:00')).toBe('2026-08-08T19:00:00.000Z')
+    expect(pktInputToUtc('2026-08-09T23:59')).toBe('2026-08-09T18:59:00.000Z')
+    expect(pktTodayBounds(new Date('2026-08-08T20:00:00.000Z'))).toEqual({
+      from: '2026-08-09T00:00',
+      to: '2026-08-09T23:59',
+    })
+  })
+
   it('starts an exact-target HIL firmware campaign with step-up confirmation', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
@@ -695,6 +736,8 @@ describe('State Life ADD interface', () => {
     })
     const password = screen.getByLabelText('Administrator password') as HTMLInputElement
     fireEvent.change(password, { target: { value: 'local-step-up-value' } })
+    fireEvent.click(screen.getByRole('button', { name: /preview exact server scope/i }))
+    expect(await screen.findByText(/1 eligible of 1 candidates/i)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /start firmware campaign/i }))
 
     expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
@@ -703,13 +746,15 @@ describe('State Life ADD interface', () => {
         String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
     )
     expect(campaignCall).toBeTruthy()
-    expect(JSON.parse(String(campaignCall?.[1]?.body))).toEqual({
+    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({
       release_id: 'release-2-2-4',
       zone_id: device.zone_id,
       reason: 'Pilot SWAT deployment validation',
       typed_confirmation: '2.2.4',
       password: 'local-step-up-value',
+      scope_token: 'signed-test-scope-token-with-sufficient-length',
     })
+    expect(JSON.parse(String(campaignCall?.[1]?.body)).idempotency_key).toMatch(/^firmware-campaign:/)
     expect(screen.queryByRole('dialog', { name: 'Create firmware campaign' })).toBeNull()
     expect(document.body.textContent).not.toContain('local-step-up-value')
   })
