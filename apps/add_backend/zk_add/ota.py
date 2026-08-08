@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -12,7 +13,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, select
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from zk_add.db import Base
@@ -52,12 +53,16 @@ class FirmwareRelease(Base):
 
 class FirmwareCampaign(Base):
     __tablename__ = "add_firmware_campaigns"
+    __table_args__ = (
+        UniqueConstraint("actor", "idempotency_key", name="uq_add_firmware_campaign_actor_idempotency"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     campaign_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     release_id: Mapped[int] = mapped_column(ForeignKey("add_firmware_releases.id"), index=True)
     zone_id: Mapped[str] = mapped_column(String(100), index=True)
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
     actor: Mapped[str] = mapped_column(String(120))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
     reason: Mapped[str] = mapped_column(Text)
     typed_confirmation: Mapped[str] = mapped_column(String(80))
     eligible_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -110,6 +115,204 @@ class FirmwareDownloadGrant(Base):
 def capability_is_eligible(connector: Connector) -> bool:
     return bool(connector.ota_capable and connector.ota_secure_boot and connector.ota_rollback_enabled
                 and connector.ota_partition_layout == OTA_LAYOUT)
+
+
+def _scope_exclusion_reason(connector: Connector, *, hil_target_mac: str = "") -> str | None:
+    if not connector.ota_capable:
+        return "OTA_NOT_CAPABLE"
+    if not connector.ota_secure_boot:
+        return "SECURE_BOOT_REQUIRED"
+    if not connector.ota_rollback_enabled:
+        return "ROLLBACK_REQUIRED"
+    if connector.ota_partition_layout != OTA_LAYOUT:
+        return "PARTITION_LAYOUT_MISMATCH"
+    if hil_target_mac and connector.hardware_id.lower() != hil_target_mac:
+        return "HIL_TARGET_MISMATCH"
+    return None
+
+
+def _scope_digest(release: FirmwareRelease, zone_id: str, connectors: list[Connector]) -> str:
+    payload = {
+        "release_id": release.release_id,
+        "release_state": release.state,
+        "version": release.version,
+        "zone_id": zone_id,
+        "connectors": [
+            {
+                "connector_id": row.connector_id,
+                "active": row.active,
+                "hardware_id": row.hardware_id.lower(),
+                "ota_capable": row.ota_capable,
+                "ota_secure_boot": row.ota_secure_boot,
+                "ota_rollback_enabled": row.ota_rollback_enabled,
+                "ota_partition_layout": row.ota_partition_layout,
+            }
+            for row in sorted(connectors, key=lambda item: item.connector_id)
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _scope_signing_key() -> bytes:
+    return settings.effective_fleet_root_secret.encode()
+
+
+def _encode_scope_token(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).rstrip(b"=")
+    signature = hmac.new(_scope_signing_key(), encoded, hashlib.sha256).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=")
+    return f"{encoded.decode()}.{encoded_signature.decode()}"
+
+
+def _decode_scope_token(token: str) -> dict[str, Any]:
+    try:
+        encoded, encoded_signature = token.split(".", 1)
+        expected = hmac.new(_scope_signing_key(), encoded.encode(), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        if not hmac.compare_digest(expected, supplied):
+            raise ValueError
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("Firmware scope preview token is invalid.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Firmware scope preview token is invalid.")
+    return payload
+
+
+def _campaign_scope(
+    session: Session,
+    *,
+    release_public_id: str,
+    zone_id: str,
+) -> tuple[FirmwareRelease, list[Connector], list[Connector], list[tuple[Connector, str]]]:
+    sync_release_store(session)
+    release = session.scalar(
+        select(FirmwareRelease).where(
+            FirmwareRelease.release_id == release_public_id,
+            FirmwareRelease.state.in_(["AVAILABLE", "HIL_ONLY"]),
+        )
+    )
+    if release is None:
+        raise ValueError("Firmware release is not available.")
+    if _application_sha256(release) is None:
+        raise ValueError("Firmware release lacks the ESP application digest required by OTA bootstraps.")
+    if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
+        raise ValueError("National firmware OTA remains disabled.")
+    hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
+    if release.state == "HIL_ONLY":
+        configured_target = (settings.firmware_hil_target_mac or "").strip().lower()
+        if not settings.firmware_hil_enabled or not configured_target:
+            raise ValueError("Firmware HIL quarantine is disabled.")
+        if hil_target_mac != configured_target:
+            raise ValueError("HIL release target does not match the configured ESP MAC.")
+    connectors = list(
+        session.scalars(
+            select(Connector)
+            .where(Connector.zone_id == zone_id, Connector.active == True)  # noqa: E712
+            .order_by(Connector.display_name.asc(), Connector.connector_id.asc())
+        ).all()
+    )
+    excluded: list[tuple[Connector, str]] = []
+    eligible: list[Connector] = []
+    for connector in connectors:
+        reason = _scope_exclusion_reason(
+            connector,
+            hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" else "",
+        )
+        if reason:
+            excluded.append((connector, reason))
+        else:
+            eligible.append(connector)
+    if release.state == "HIL_ONLY":
+        # Keep the quarantine boundary explicit even though the exclusion
+        # classifier above already rejects every non-target connector.
+        eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
+        if len(eligible) != 1:
+            raise ValueError("HIL campaign requires exactly one eligible connector with the target MAC.")
+    return release, connectors, eligible, excluded
+
+
+def preview_campaign_scope(
+    session: Session,
+    *,
+    release_public_id: str,
+    zone_id: str,
+    ttl_seconds: int = 5 * 60,
+) -> dict[str, Any]:
+    release, connectors, eligible, excluded = _campaign_scope(
+        session,
+        release_public_id=release_public_id,
+        zone_id=zone_id,
+    )
+    expires_at = utc_now() + timedelta(seconds=ttl_seconds)
+    digest = _scope_digest(release, zone_id, connectors)
+    token = _encode_scope_token(
+        {
+            "release_id": release.release_id,
+            "zone_id": zone_id,
+            "scope_digest": digest,
+            "exp": int(expires_at.timestamp()),
+            "nonce": secrets.token_urlsafe(12),
+        }
+    )
+
+    def connector_summary(row: Connector) -> dict[str, Any]:
+        return {
+            "connector_id": row.connector_id,
+            "display_name": row.display_name,
+            "zone_id": row.zone_id,
+            "hardware_id": row.hardware_id,
+            "firmware_version": row.firmware_version,
+            "connected": row.connected,
+            "ota_state": row.ota_state,
+        }
+
+    return {
+        "scope_token": token,
+        "expires_at": expires_at,
+        "release": {
+            "release_id": release.release_id,
+            "version": release.version,
+            "state": release.state,
+        },
+        "zone_id": zone_id,
+        "counts": {
+            "candidates": len(connectors),
+            "eligible": len(eligible),
+            "excluded": len(excluded),
+            "offline": sum(1 for row in connectors if not row.connected),
+        },
+        "eligible": [connector_summary(row) for row in eligible],
+        "excluded": [
+            {**connector_summary(row), "reason": reason}
+            for row, reason in excluded
+        ],
+    }
+
+
+def verify_campaign_scope_token(
+    session: Session,
+    *,
+    token: str,
+    release_public_id: str,
+    zone_id: str,
+) -> tuple[FirmwareRelease, list[Connector], list[Connector]]:
+    payload = _decode_scope_token(token)
+    if int(payload.get("exp") or 0) <= int(utc_now().timestamp()):
+        raise ValueError("Firmware scope preview expired. Refresh the preview and confirm again.")
+    if payload.get("release_id") != release_public_id or payload.get("zone_id") != zone_id:
+        raise ValueError("Firmware scope preview does not match this release and zone.")
+    release, connectors, eligible, _excluded = _campaign_scope(
+        session,
+        release_public_id=release_public_id,
+        zone_id=zone_id,
+    )
+    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors):
+        raise ValueError("Firmware scope changed. Refresh the preview before starting the campaign.")
+    return release, connectors, eligible
 
 
 def _versions_match(running: str | None, target: str) -> bool:
@@ -213,39 +416,46 @@ def sync_release_store(session: Session) -> None:
     session.flush()
 
 
-def create_campaign(session: Session, *, release_public_id: str, zone_id: str, reason: str,
-                    typed_confirmation: str, actor: str) -> FirmwareCampaign:
-    sync_release_store(session)
-    release = session.scalar(select(FirmwareRelease).where(
-        FirmwareRelease.release_id == release_public_id,
-        FirmwareRelease.state.in_(["AVAILABLE", "HIL_ONLY"])))
-    if release is None:
-        raise ValueError("Firmware release is not available.")
-    if _application_sha256(release) is None:
-        raise ValueError("Firmware release lacks the ESP application digest required by OTA bootstraps.")
-    if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
-        raise ValueError("National firmware OTA remains disabled.")
-    hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-    if release.state == "HIL_ONLY":
-        configured_target = (settings.firmware_hil_target_mac or "").strip().lower()
-        if not settings.firmware_hil_enabled or not configured_target:
-            raise ValueError("Firmware HIL quarantine is disabled.")
-        if hil_target_mac != configured_target:
-            raise ValueError("HIL release target does not match the configured ESP MAC.")
+def create_campaign(
+    session: Session,
+    *,
+    release_public_id: str,
+    zone_id: str,
+    reason: str,
+    typed_confirmation: str,
+    actor: str,
+    scope_token: str,
+    idempotency_key: str,
+) -> FirmwareCampaign:
+    replay = session.scalar(
+        select(FirmwareCampaign).where(
+            FirmwareCampaign.actor == actor,
+            FirmwareCampaign.idempotency_key == idempotency_key,
+        )
+    )
+    if replay is not None:
+        replay_release = session.get(FirmwareRelease, replay.release_id)
+        if (
+            replay.zone_id != zone_id
+            or replay_release is None
+            or replay_release.release_id != release_public_id
+        ):
+            raise ValueError("That idempotency key belongs to another firmware campaign.")
+        return replay
+    release, connectors, eligible = verify_campaign_scope_token(
+        session,
+        token=scope_token,
+        release_public_id=release_public_id,
+        zone_id=zone_id,
+    )
     if typed_confirmation != release.version:
         raise ValueError("Typed firmware version does not match the release.")
     if session.scalar(select(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == zone_id, FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         raise ValueError("This zone already has an active or paused firmware campaign.")
-    connectors = list(session.scalars(select(Connector).where(
-        Connector.zone_id == zone_id, Connector.active == True)).all())  # noqa: E712
-    eligible = [row for row in connectors if capability_is_eligible(row)]
-    if release.state == "HIL_ONLY":
-        eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
-        if len(eligible) != 1:
-            raise ValueError("HIL campaign requires exactly one eligible connector with the target MAC.")
     campaign = FirmwareCampaign(campaign_id=secrets.token_hex(16), release_id=release.id, zone_id=zone_id,
-        actor=actor, reason=reason, typed_confirmation=typed_confirmation, eligible_count=len(eligible),
+        actor=actor, idempotency_key=idempotency_key, reason=reason,
+        typed_confirmation=typed_confirmation, eligible_count=len(eligible),
         legacy_skipped_count=len(connectors) - len(eligible))
     session.add(campaign)
     session.flush()

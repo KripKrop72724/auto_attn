@@ -23,7 +23,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_, select, text
+from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -140,7 +140,7 @@ from zk_add.service import (
 )
 from zk_add.settings import settings
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import parse_datetime, utc_now
 from zk_add.reconciliation import (
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
@@ -430,8 +430,6 @@ async def onboard(
         verified = False
     if not verified:
         raise HTTPException(status_code=401, detail="Invalid or expired onboarding signature.")
-    from zk_add.time_utils import parse_datetime
-
     # Serialize onboarding for one MAC. This closes both the nonce-check race
     # and the first-onboard unique-hardware race without locking the fleet.
     if db.bind is not None and db.bind.dialect.name == "postgresql":
@@ -835,7 +833,7 @@ def list_users(
     privilege: int | None = None,
     present: bool = True,
     limit: int = Query(default=100, ge=1, le=500),
-    cursor: int | None = None,
+    cursor: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
@@ -1396,6 +1394,18 @@ async def update_user_v2(
     )
     if user is None:
         raise HTTPException(status_code=404, detail="Device user not found.")
+    if body.privilege == 14 and user.privilege != 14:
+        expected_confirmation = f"ELEVATE {user.user_id} ON {connector.device_id}"
+        if body.typed_confirmation != expected_confirmation:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Typed confirmation must exactly match: {expected_confirmation}",
+            )
+        if body.reason is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A reason is required for permanent administrator elevation.",
+            )
     try:
         command = update_device_user_command(
             db,
@@ -1408,6 +1418,7 @@ async def update_user_v2(
             expected_version=body.expected_version,
             idempotency_key=body.idempotency_key,
             actor=context.username,
+            reason=body.reason,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1673,12 +1684,8 @@ def attendance(
     if clock_quality:
         statement = statement.where(AttendanceEvent.clock_quality == clock_quality)
     if from_time:
-        from zk_add.time_utils import parse_datetime
-
         statement = statement.where(AttendanceEvent.device_event_time >= parse_datetime(from_time))
     if to_time:
-        from zk_add.time_utils import parse_datetime
-
         statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
     rows = db.scalars(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
@@ -1749,6 +1756,117 @@ def alerts(connector_id: str, auth: tuple[Session, AdminContext] = Depends(requi
         select(DeviceAlert).where(DeviceAlert.connector_id == connector.id).order_by(DeviceAlert.last_seen_at.desc())
     ).all()
     return {"rows": [serialize_alert(row) for row in rows]}
+
+
+@app.get("/api/v1/alerts")
+def global_alerts(
+    state: str | None = None,
+    severity: str | None = None,
+    connector_id: str | None = None,
+    zone_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    scope_filters = []
+    state_filter = []
+    if state:
+        state_filter.append(DeviceAlert.state == state.strip().upper())
+    if severity:
+        scope_filters.append(DeviceAlert.severity == severity.strip().upper())
+    if connector_id:
+        scope_filters.append(Connector.connector_id == connector_id)
+    if zone_id:
+        scope_filters.append(Connector.zone_id == zone_id)
+    severity_order = case(
+        (DeviceAlert.severity == "CRITICAL", 0),
+        (DeviceAlert.severity == "HIGH", 1),
+        (DeviceAlert.severity == "WARNING", 2),
+        (DeviceAlert.severity == "MEDIUM", 3),
+        (DeviceAlert.severity == "INFO", 4),
+        else_=5,
+    )
+    page_filters = [*scope_filters, *state_filter]
+    if cursor:
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            cursor_payload = json.loads(raw)
+            cursor_rank = int(cursor_payload["severity_rank"])
+            cursor_seen_at = parse_datetime(str(cursor_payload["last_seen_at"]))
+            cursor_id = int(cursor_payload["id"])
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as error:
+            raise HTTPException(status_code=422, detail="Alert cursor is invalid or expired.") from error
+        page_filters.append(
+            or_(
+                severity_order > cursor_rank,
+                and_(severity_order == cursor_rank, DeviceAlert.last_seen_at < cursor_seen_at),
+                and_(
+                    severity_order == cursor_rank,
+                    DeviceAlert.last_seen_at == cursor_seen_at,
+                    DeviceAlert.id < cursor_id,
+                ),
+            )
+        )
+    rows = db.execute(
+        select(DeviceAlert, Connector)
+        .join(Connector, Connector.id == DeviceAlert.connector_id)
+        .where(*page_filters)
+        .order_by(severity_order.asc(), DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
+        .limit(limit + 1)
+    ).all()
+    page = rows[:limit]
+    def count_for(alert_state: str | None = None) -> int:
+        state_filter = [DeviceAlert.state == alert_state] if alert_state else []
+        return int(
+            db.scalar(
+                select(func.count(DeviceAlert.id))
+                .select_from(DeviceAlert)
+                .join(Connector, Connector.id == DeviceAlert.connector_id)
+                .where(*scope_filters, *state_filter)
+            )
+            or 0
+        )
+
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1][0]
+        rank = {"CRITICAL": 0, "HIGH": 1, "WARNING": 2, "MEDIUM": 3, "INFO": 4}.get(
+            last_row.severity,
+            5,
+        )
+        next_cursor = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "severity_rank": rank,
+                    "last_seen_at": last_row.last_seen_at.isoformat(),
+                    "id": last_row.id,
+                },
+                separators=(",", ":"),
+            ).encode()
+        ).rstrip(b"=").decode()
+
+    return {
+        "rows": [
+            {
+                **serialize_alert(row),
+                "device": {
+                    "connector_id": connector.connector_id,
+                    "display_name": connector.display_name,
+                    "zone_id": connector.zone_id,
+                    "hardware_id": connector.hardware_id,
+                },
+            }
+            for row, connector in page
+        ],
+        "next_cursor": next_cursor,
+        "totals": {
+            "all": count_for(),
+            "open": count_for("OPEN"),
+            "acknowledged": count_for("ACKNOWLEDGED"),
+            "resolved": count_for("RESOLVED"),
+        },
+    }
 
 
 @app.post("/api/v1/alerts/{alert_id}/acknowledge")
@@ -2752,6 +2870,7 @@ from zk_add.ota import (  # noqa: E402
     campaign_rows as _campaign_rows,
     create_campaign as _create_firmware_campaign,
     parse_single_range as _parse_single_range,
+    preview_campaign_scope as _preview_firmware_campaign_scope,
     record_progress as _record_firmware_progress,
     release_rows as _release_rows,
     resolve_download as _resolve_firmware_download,
@@ -2788,6 +2907,13 @@ class _FirmwareCampaignIn(_BaseModel):
     reason: str = _Field(min_length=10, max_length=500)
     typed_confirmation: str = _Field(min_length=1, max_length=80)
     password: str = _Field(min_length=1, max_length=512)
+    scope_token: str = _Field(min_length=32, max_length=4096)
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+
+class _FirmwarePreflightIn(_BaseModel):
+    release_id: str = _Field(min_length=1, max_length=100)
+    zone_id: str = _Field(min_length=1, max_length=100)
 
 
 class _FirmwareControlIn(_BaseModel):
@@ -2939,8 +3065,24 @@ def list_firmware_campaigns(auth: tuple[Session, AdminContext] = Depends(require
             "hil_enabled": settings.firmware_hil_enabled}
 
 
+@app.post("/api/v1/firmware/campaigns/preflight")
+def preflight_firmware_campaign(
+    body: _FirmwarePreflightIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    try:
+        return _preview_firmware_campaign_scope(
+            db,
+            release_public_id=body.release_id,
+            zone_id=body.zone_id,
+        )
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.post("/api/v1/firmware/campaigns", status_code=201)
-def start_firmware_campaign(
+async def start_firmware_campaign(
     body: _FirmwareCampaignIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
@@ -2951,19 +3093,24 @@ def start_firmware_campaign(
     try:
         campaign = _create_firmware_campaign(
             db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
-            typed_confirmation=body.typed_confirmation, actor=context.username
+            typed_confirmation=body.typed_confirmation, actor=context.username,
+            scope_token=body.scope_token, idempotency_key=body.idempotency_key,
         )
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
                   target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id, "release_id": body.release_id})
     db.commit()
+    await browser_events.publish(
+        "firmware",
+        {"campaign_id": campaign.campaign_id, "status": campaign.status, "zone_id": body.zone_id},
+    )
     return {"campaign_id": campaign.campaign_id, "status": campaign.status,
             "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count}
 
 
 @app.post("/api/v1/firmware/campaigns/{campaign_id}/{action}")
-def control_firmware_campaign(
+async def control_firmware_campaign(
     campaign_id: str,
     action: _Literal["pause", "resume", "cancel"],
     body: _FirmwareControlIn,
@@ -2985,11 +3132,14 @@ def control_firmware_campaign(
                   target_type="firmware_campaign", target_id=campaign_id,
                   outcome=campaign.status, after={"reason": body.reason})
     db.commit()
+    await browser_events.publish(
+        "firmware", {"campaign_id": campaign_id, "status": campaign.status}
+    )
     return {"campaign_id": campaign_id, "status": campaign.status}
 
 
 @app.post("/api/v1/firmware/releases/{release_id}/revoke")
-def revoke_firmware_release(
+async def revoke_firmware_release(
     release_id: str,
     body: _FirmwareControlIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
@@ -3011,4 +3161,7 @@ def revoke_firmware_release(
                   target_type="firmware_release", target_id=release_id,
                   outcome="REVOKED", after={"reason": body.reason})
     db.commit()
+    await browser_events.publish(
+        "firmware", {"release_id": release_id, "state": release.state}
+    )
     return {"release_id": release_id, "state": release.state}

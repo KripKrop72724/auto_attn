@@ -81,6 +81,8 @@ docs/                   Architecture, security, operations, hardware acceptance
 tests/                  Backend and firmware safety contracts
 ```
 
+The modern dashboard workflow, PKT filtering rules, realtime fallback states, mobile navigation, firmware preflight/revocation, and release safeguards are documented in [`docs/add-frontend-operations.md`](docs/add-frontend-operations.md).
+
 `scripts/check_repository_contract.py` makes this product boundary a CI invariant.
 
 ## Local validation

@@ -148,6 +148,8 @@ jobs:
           rm -f /tmp/add-ci.env
       - name: Lint
         run: python -m ruff check apps/add_backend tests scripts firmware/zone_lite/tools/provision_zone_lite.py
+      - name: Verify frontend OpenAPI safety contracts
+        run: python scripts/check_frontend_openapi_contract.py
       - name: Test backend and firmware contracts
         run: python -m pytest -q tests/unit tests/firmware
       - name: Validate a fresh PostgreSQL migration and schema drift
@@ -198,8 +200,10 @@ jobs:
         run: pnpm test
       - name: Build production dashboard
         run: pnpm run build
-      - name: Install Playwright Chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Enforce frontend bundle budgets
+        run: pnpm run budget
+      - name: Install Playwright browser matrix
+        run: pnpm exec playwright install --with-deps chromium firefox webkit
       - name: Run responsive and accessibility browser tests
         run: pnpm test:e2e
       - name: Upload Playwright report on failure

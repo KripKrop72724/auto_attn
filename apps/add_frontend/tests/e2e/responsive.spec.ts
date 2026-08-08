@@ -87,7 +87,8 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === `/api/v1/devices/${device.connector_id}`) json = device
     else if (url.pathname.includes('/connectivity')) json = { rows: [] }
     else if (url.pathname.includes('/logs')) json = { rows: [], next_cursor: null }
-    else if (url.pathname.endsWith('/alerts')) json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null }] }
+    else if (url.pathname === '/api/v1/alerts') json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null, device: { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id, hardware_id: device.hardware_id } }], next_cursor: null, totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 } }
+    else if (url.pathname.endsWith('/alerts')) json = { rows: [] }
     else if (url.pathname === '/api/v1/attendance') json = { rows: [], next_cursor: null }
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', hil_target_mac: null }] }
     else if (url.pathname === '/api/v1/firmware/campaigns') json = { enabled: true, hil_enabled: false, rows: [] }
@@ -130,7 +131,12 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
   await primaryNav.getByRole('button', { name: 'Attendance', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Attendance events' })).toBeVisible()
-  await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
+  if ((page.viewportSize()?.width || 0) <= 760) {
+    await page.getByRole('button', { name: 'More', exact: true }).click()
+    await page.getByRole('dialog', { name: 'More operations' }).getByRole('button', { name: /Firmware/ }).click()
+  } else {
+    await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
+  }
   await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
   await primaryNav.getByRole('button', { name: /Alerts/ }).click()
   await expect(page.getByRole('heading', { name: 'Alerts and exceptions' })).toBeVisible()
