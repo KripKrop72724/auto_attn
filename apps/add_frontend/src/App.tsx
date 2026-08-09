@@ -488,6 +488,7 @@ const UsersView = lazy(() => import('./features/Users').then((module) => ({ defa
 
 const ReconciliationView = lazy(() => import('./features/Operations').then((module) => ({ default: module.ReconciliationView })))
 const FirmwareView = lazy(() => import('./features/Operations').then((module) => ({ default: module.FirmwareView })))
+const FirmwareProvisioning = lazy(() => import('./features/FirmwareProvisioning'))
 
 const AttendanceView = lazy(() => import('./features/Monitoring').then((module) => ({ default: module.AttendanceView })))
 const AlertsView = lazy(() => import('./features/Monitoring').then((module) => ({ default: module.AlertsView })))
@@ -525,7 +526,7 @@ function DashboardApp() {
   const [loading, setLoading] = useState(true)
   const [revisions, setRevisions] = useState<Record<RealtimeTopic, number>>({
     attendance: 0, alert: 0, users: 0, reconciliation: 0, command: 0, log: 0,
-    identity: 0, firmware: 0, device: 0, backend_error: 0, resync: 0,
+    identity: 0, firmware: 0, provisioning: 0, device: 0, backend_error: 0, resync: 0,
   })
   const [selectedDeviceId, setSelectedDeviceId] = useState('')
   const [drawer, setDrawer] = useState<Device | null>(null)
@@ -589,7 +590,7 @@ function DashboardApp() {
       topics.forEach((topic) => {
         next[topic] += 1
         if (topic === 'resync') {
-          ;(['attendance', 'alert', 'users', 'reconciliation', 'command', 'log', 'identity', 'firmware', 'device'] as RealtimeTopic[])
+          ;(['attendance', 'alert', 'users', 'reconciliation', 'command', 'log', 'identity', 'firmware', 'provisioning', 'device'] as RealtimeTopic[])
             .forEach((name) => { next[name] += 1 })
         }
       })
@@ -676,7 +677,7 @@ function DashboardApp() {
         {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
-        {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}><FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} /></Suspense>}
+        {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
         {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
       {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} toast={toast} /></Suspense>}

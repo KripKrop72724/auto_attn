@@ -7,6 +7,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,11 @@ from provision_zone_lite import (
 from provisioning_envelope import REQUEST_ID_PATTERN, encrypt_for_recipient
 
 
-ZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+HEX_PSK_PATTERN = re.compile(r"^[0-9A-Fa-f]{64}$")
+RFC1918_NETWORKS = tuple(
+    ipaddress.IPv4Network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 def required_text(values: dict, key: str, maximum: int) -> str:
@@ -37,19 +42,28 @@ def required_text(values: dict, key: str, maximum: int) -> str:
     return value
 
 
-def load_request(path: Path) -> dict:
-    values = json.loads(path.read_text(encoding="utf-8"))
+def validate_request(values: dict) -> dict:
     if not isinstance(values, dict):
         raise ValueError("Provisioning request must be a JSON object")
+    values = dict(values)
     request_id = required_text(values, "request_id", 96)
     if not REQUEST_ID_PATTERN.fullmatch(request_id):
         raise ValueError("Invalid provisioning request ID")
     values["target_mac"] = normalize_mac(required_text(values, "target_mac", 32))
-    for key in ("zone_device_id", "zone_id", "zone_name"):
-        if not ZONE_PATTERN.fullmatch(required_text(values, key, 64)):
-            raise ValueError(f"Invalid provisioning field: {key}")
+    zone_device_id = required_text(values, "zone_device_id", 31)
+    zone_id = required_text(values, "zone_id", 64)
+    if not IDENTIFIER_PATTERN.fullmatch(zone_device_id):
+        raise ValueError("Invalid provisioning field: zone_device_id")
+    if not IDENTIFIER_PATTERN.fullmatch(zone_id):
+        raise ValueError("Invalid provisioning field: zone_id")
+    zone_name = required_text(values, "zone_name", 120)
+    if zone_name != zone_name.strip() or any(ord(char) < 32 or ord(char) == 127 for char in zone_name):
+        raise ValueError("Invalid provisioning field: zone_name")
     required_text(values, "wifi_ssid", 32)
-    required_text(values, "wifi_password", 64)
+    wifi_password = required_text(values, "wifi_password", 64)
+    password_bytes = len(wifi_password.encode("utf-8"))
+    if not HEX_PSK_PATTERN.fullmatch(wifi_password) and not 8 <= password_bytes <= 63:
+        raise ValueError("Invalid Wi-Fi password")
     required_text(values, "recipient_public_key_b64", 128)
     port = int(values.get("zkt_port", 4370))
     comm_key = int(values.get("zkt_comm_key", 0))
@@ -59,10 +73,22 @@ def load_request(path: Path) -> dict:
         raise ValueError("Invalid ZKT communication key")
     values["zkt_port"] = port
     values["zkt_comm_key"] = comm_key
-    required_text(values, "zkt_preferred_ip", 45)
+    preferred_ip = required_text(values, "zkt_preferred_ip", 15)
+    if preferred_ip != "0.0.0.0":
+        try:
+            address = ipaddress.IPv4Address(preferred_ip)
+        except ipaddress.AddressValueError as exc:
+            raise ValueError("Invalid ZKT preferred IP") from exc
+        if not any(address in network for network in RFC1918_NETWORKS):
+            raise ValueError("ZKT preferred IP must be RFC1918 unicast")
+        values["zkt_preferred_ip"] = str(address)
     if values.get("zkt_expected_serial"):
         required_text(values, "zkt_expected_serial", 64)
     return values
+
+
+def load_request(path: Path) -> dict:
+    return validate_request(json.loads(path.read_text(encoding="utf-8")))
 
 
 def main() -> None:

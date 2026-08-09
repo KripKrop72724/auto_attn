@@ -71,6 +71,24 @@ class AddSettings(BaseSettings):
     firmware_download_grant_seconds: int = 15 * 60
     firmware_signing_public_key_pem_b64: str | None = None
 
+    # Physical ESP32-S3 preparation is deliberately independent from OTA. It
+    # stays dark until the companion, factory catalog and protected worker are
+    # all configured. Secrets in this section never have a fallback.
+    provisioning_enabled: bool = False
+    provisioning_pairing_secret: str | None = None
+    provisioning_internal_token: str | None = None
+    provisioning_artifact_path: str = "/provisioning-artifacts"
+    provisioning_worker_url: str = "http://add-provisioner:8097"
+    provisioning_session_seconds: int = 30 * 60
+    provisioning_pairing_seconds: int = 5 * 60
+    provisioning_artifact_seconds: int = 15 * 60
+    provisioning_companion_min_version: str = "1.0.0"
+    provisioning_companion_release_path: str = "/companion-releases"
+    provisioning_companion_release_public_key_b64: str | None = None
+    provisioning_factory_store_path: str = "/factory-firmware"
+    provisioning_public_ws_url: str = "wss://autoattn.slichealth.com/companion/v1/stream"
+    provisioning_hardware_profile: str = "esp32s3-16mb-zone-lite-v1"
+
     @property
     def sqlite_path(self) -> Path:
         return self.data_dir / "add.db"
@@ -92,6 +110,17 @@ class AddSettings(BaseSettings):
             missing.append("ADD_PII_FERNET_KEY")
         if not self.pii_lookup_key:
             missing.append("ADD_PII_LOOKUP_KEY")
+        if self.provisioning_enabled:
+            if not self.fleet_root_secret:
+                missing.append("ADD_FLEET_ROOT_SECRET")
+            if not self.provisioning_pairing_secret:
+                missing.append("ADD_PROVISIONING_PAIRING_SECRET")
+            if not self.provisioning_internal_token:
+                missing.append("ADD_PROVISIONING_INTERNAL_TOKEN")
+            if not self.provisioning_companion_release_public_key_b64:
+                missing.append("ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64")
+            if not self.firmware_signing_public_key_pem_b64:
+                missing.append("ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64")
         if missing:
             raise RuntimeError(f"Missing required ADD secrets: {', '.join(missing)}")
 
@@ -104,6 +133,15 @@ class AddSettings(BaseSettings):
         if not value:
             raise RuntimeError("ADD_FLEET_ROOT_SECRET is required for ESP onboarding.")
         return value
+
+    @property
+    def provisioning_fleet_root_secret(self) -> str:
+        """Return the explicit root allowed to create new device packages."""
+        if not self.provisioning_enabled or not self.fleet_root_secret:
+            raise RuntimeError(
+                "Physical provisioning is disabled or ADD_FLEET_ROOT_SECRET is not explicit."
+            )
+        return self.fleet_root_secret
 
 
 settings = AddSettings()

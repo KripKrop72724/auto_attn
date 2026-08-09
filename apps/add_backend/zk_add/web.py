@@ -10,6 +10,7 @@ import secrets
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -22,7 +23,8 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -235,6 +237,23 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def sanitized_validation_error(_request: Request, error: RequestValidationError):
+    # Pydantic's default response includes the rejected input value. That is
+    # useful for ordinary APIs but would reflect Wi-Fi/terminal credentials on
+    # a failed provisioning request. Preserve field/type/message without ever
+    # echoing request values or validation context.
+    detail = [
+        {
+            "type": item.get("type", "value_error"),
+            "loc": list(item.get("loc", ())),
+            "msg": item.get("msg", "Invalid value"),
+        }
+        for item in error.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id") or str(uuid4())
@@ -303,7 +322,26 @@ def health_ready(db: Session = Depends(get_db)):
     except Exception as exc:
         logger.exception("ADD database readiness check failed")
         raise HTTPException(status_code=503, detail="Database unavailable.") from exc
-    return {"ok": True, "database": True, "server_utc": utc_now()}
+    provisioner_ready = not settings.provisioning_enabled
+    if settings.provisioning_enabled:
+        try:
+            response = httpx.get(
+                f"{settings.provisioning_worker_url.rstrip('/')}/health/ready",
+                timeout=2,
+            )
+            response.raise_for_status()
+            provisioner_ready = True
+        except httpx.HTTPError as exc:
+            logger.warning("Protected provisioner readiness check failed")
+            raise HTTPException(
+                status_code=503, detail="Protected provisioner unavailable."
+            ) from exc
+    return {
+        "ok": True,
+        "database": True,
+        "provisioner": provisioner_ready,
+        "server_utc": utc_now(),
+    }
 
 
 @app.post("/api/v1/auth/login")
@@ -463,12 +501,20 @@ async def onboard(
         actor=f"esp:{header_mac}",
         ip_address=client_ip(request),
     )
+    from zk_add.provisioning_api import correlate_onboarding
+
+    provisioning_session = correlate_onboarding(db, connector)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="Onboarding replay or conflict rejected.") from exc
     ws_url = f"{settings.public_device_ws_url}?connector_id={connector.connector_id}"
+    if provisioning_session:
+        await browser_events.publish(
+            "provisioning",
+            {"session_id": provisioning_session.session_id, "state": provisioning_session.state},
+        )
     return {
         "ok": True,
         "created": created,
@@ -2381,6 +2427,17 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 sequence=envelope.seq,
                 payload=payload,
             )
+            from zk_add.provisioning_api import correlate_onboarding
+
+            provisioning_session = correlate_onboarding(db, connector)
+            if provisioning_session:
+                await browser_events.publish(
+                    "provisioning",
+                    {
+                        "session_id": provisioning_session.session_id,
+                        "state": provisioning_session.state,
+                    },
+                )
         elif envelope.type == "command_update":
             update = CommandUpdate.model_validate(envelope.payload)
             command = apply_command_update(
@@ -3165,3 +3222,10 @@ async def revoke_firmware_release(
         "firmware", {"release_id": release_id, "state": release.state}
     )
     return {"release_id": release_id, "state": release.state}
+
+
+# Physical provisioning is isolated in an additive router so the existing
+# device, attendance and OTA paths remain unchanged when the feature is dark.
+from zk_add.provisioning_api import router as provisioning_router  # noqa: E402
+
+app.router.routes.extend(provisioning_router.routes)

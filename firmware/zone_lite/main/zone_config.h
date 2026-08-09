@@ -44,3 +44,4 @@ esp_err_t zone_config_save_connector(
     const char *device_token,
     const char *ws_url);
 esp_err_t zone_config_save_wifi(const char *ssid, const char *password);
+esp_err_t zone_config_save_zkt_serial(const char *serial);
