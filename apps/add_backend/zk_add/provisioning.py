@@ -145,7 +145,7 @@ class FactoryFirmwareBundle(Base):
     version: Mapped[str] = mapped_column(String(80), index=True)
     git_sha: Mapped[str] = mapped_column(String(64), index=True)
     partition_layout: Mapped[str] = mapped_column(String(80))
-    manifest_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     manifest: Mapped[dict] = mapped_column(JSON)
     manifest_signature: Mapped[str] = mapped_column(Text)
     signing_key_ids: Mapped[list] = mapped_column(JSON, default=list)
