@@ -10,12 +10,13 @@ export type RealtimeTopic =
   | 'log'
   | 'identity'
   | 'firmware'
+  | 'provisioning'
   | 'device'
   | 'backend_error'
   | 'resync'
 
 const serverEvents = [
-  'attendance', 'alert', 'users', 'reconciliation', 'command', 'log', 'firmware', 'device',
+  'attendance', 'alert', 'users', 'reconciliation', 'command', 'log', 'firmware', 'provisioning', 'device',
   'identity_snapshot', 'identity_conflict', 'historical_identity',
   'historical_event_group_identity', 'backend_error',
 ] as const

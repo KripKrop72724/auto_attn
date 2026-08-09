@@ -125,6 +125,12 @@ class ZKTDevice(Base):
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
     serial: Mapped[str | None] = mapped_column(String(120), index=True)
     expected_serial: Mapped[str | None] = mapped_column(String(120), index=True)
+    terminal_binding_state: Mapped[str] = mapped_column(
+        String(40), default="SERIAL_CONFIRMATION_REQUIRED", index=True
+    )
+    confirmed_serial: Mapped[str | None] = mapped_column(String(120), index=True)
+    serial_confirmed_by: Mapped[str | None] = mapped_column(String(120))
+    serial_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ip_address: Mapped[str | None] = mapped_column(String(64))
     mac_address: Mapped[str | None] = mapped_column(String(32))
     port: Mapped[int] = mapped_column(Integer, default=4370)
@@ -1093,3 +1099,4 @@ class IdentityTombstone(Base):
 # Import additive OTA tables after Connector is defined so Alembic and schema
 # drift checks always see the complete production metadata.
 from zk_add import ota as _ota_models  # noqa: E402,F401
+from zk_add import provisioning as _provisioning_models  # noqa: E402,F401

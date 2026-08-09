@@ -28,6 +28,13 @@ from zk_add.models import (
     ZKTDevice,
 )
 from zk_add.realtime import browser_events, connector_hub
+from zk_add.provisioning import (
+    TERMINAL_STATES as PROVISIONING_TERMINAL_STATES,
+    ProvisioningCompanionNonce,
+    ProvisioningSession,
+    ProvisioningState,
+    append_provisioning_event,
+)
 from zk_add.service import (
     ACTIVE_COMMAND_STATES,
     MUTATING_COMMANDS,
@@ -377,6 +384,7 @@ async def maintenance_tick() -> None:
     dispatch: list[tuple[str, dict]] = []
     connector_updates: list[dict] = []
     reconciliation_dispatch: list[tuple[str, dict]] = []
+    provisioning_updates: list[dict] = []
     with session_scope() as session:
         for connector in session.scalars(select(Connector).where(Connector.active == True)):  # noqa: E712
             if connector.last_seen_at and connector.last_seen_at + timedelta(seconds=settings.offline_after_seconds) < now:
@@ -398,6 +406,41 @@ async def maintenance_tick() -> None:
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
         refresh_all_reconciliation_assurance(session)
+        for provisioning in session.scalars(
+            select(ProvisioningSession).where(
+                ProvisioningSession.expires_at <= now,
+                ProvisioningSession.state.not_in(
+                    [state.value for state in PROVISIONING_TERMINAL_STATES]
+                ),
+            )
+        ).all():
+            locally_safe = provisioning.state in {
+                ProvisioningState.LOCAL_VERIFIED.value,
+                ProvisioningState.BOOT_VERIFYING.value,
+                ProvisioningState.WAITING_FOR_ONBOARDING.value,
+                ProvisioningState.WAITING_FOR_TERMINAL_CONFIRMATION.value,
+                ProvisioningState.VERIFYING_SITE.value,
+            }
+            target = (
+                ProvisioningState.SITE_VALIDATION_PENDING
+                if locally_safe
+                else ProvisioningState.EXPIRED
+            )
+            append_provisioning_event(
+                session,
+                provisioning,
+                state=target.value,
+                progress=provisioning.progress,
+                source="SERVER",
+                details={
+                    "reason": "Destination validation did not complete before session expiry."
+                    if locally_safe
+                    else "Provisioning authorization expired before local verification."
+                },
+            )
+            provisioning_updates.append(
+                {"session_id": provisioning.session_id, "state": provisioning.state}
+            )
         for command in session.scalars(
             select(DeviceCommand)
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
@@ -475,6 +518,8 @@ async def maintenance_tick() -> None:
                     command.attempt_count += 1
     for update in connector_updates:
         await browser_events.publish("device", update)
+    for update in provisioning_updates:
+        await browser_events.publish("provisioning", update)
     await dispatch_reconciliation_assignments(reconciliation_dispatch)
 
 
@@ -1418,6 +1463,9 @@ def retention_tick() -> None:
         ).delete(synchronize_session=False)
         session.query(OnboardingNonce).filter(
             OnboardingNonce.created_at < now - timedelta(minutes=10)
+        ).delete(synchronize_session=False)
+        session.query(ProvisioningCompanionNonce).filter(
+            ProvisioningCompanionNonce.created_at < now - timedelta(minutes=10)
         ).delete(synchronize_session=False)
         session.query(ConnectorCredential).filter(
             ConnectorCredential.active == True,  # noqa: E712

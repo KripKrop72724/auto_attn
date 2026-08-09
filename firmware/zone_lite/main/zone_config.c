@@ -201,6 +201,28 @@ esp_err_t zone_config_save_connector(
     return err;
 }
 
+esp_err_t zone_config_save_zkt_serial(const char *serial)
+{
+    if (!serial || serial[0] == '\0' || strlen(serial) >= sizeof(s_config.zkt_expected_serial)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(handle, "zkt_serial", serial)) == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        copy_default(
+            s_config.zkt_expected_serial,
+            sizeof(s_config.zkt_expected_serial),
+            serial);
+        ESP_LOGI(TAG, "Pinned authenticated ZKT serial in encrypted configuration");
+    }
+    return err;
+}
+
 esp_err_t zone_config_save_wifi(const char *ssid, const char *password)
 {
     if (!ssid || !password) return ESP_ERR_INVALID_ARG;

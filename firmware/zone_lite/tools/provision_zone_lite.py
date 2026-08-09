@@ -184,7 +184,7 @@ def nvs_rows(config: dict, bootstrap_secret: str) -> list[list[object]]:
         ("ords_url", "data", "string", config["ords_base_url"]),
         ("ords_user", "data", "string", config["ords_username"]),
         ("ords_pass", "data", "string", config["ords_password"]),
-        ("rec_enable", "data", "u8", int(bool(config.get("zkt_recovery_enabled", True)))),
+        ("rec_enable", "data", "u8", int(bool(config.get("zkt_recovery_enabled", False)))),
         ("rec_fails", "data", "u32", int(config.get("zkt_recovery_failures", 2))),
         ("rec_cool", "data", "u32", int(config.get("zkt_recovery_cooldown_ms", 1_800_000))),
         ("reboot_wait", "data", "u32", int(config.get("zkt_reboot_wait_ms", 90_000))),

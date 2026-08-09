@@ -87,6 +87,7 @@ MUTATING_COMMANDS = {
     "REVOKE_TEMP_ADMIN",
     "RESTART_ZKT",
     "APPLY_CONFIG",
+    "PIN_TERMINAL_SERIAL",
 }
 ORACLE_ALLOWED_CAPTURE_TYPES = {
     "LIVE",
@@ -181,6 +182,12 @@ def onboard_connector(
                 connector_id=connector.id,
                 expected_serial=expected_serial,
                 serial=expected_serial,
+                terminal_binding_state=(
+                    "CONFIRMED" if expected_serial else "SERIAL_CONFIRMATION_REQUIRED"
+                ),
+                confirmed_serial=expected_serial,
+                serial_confirmed_by=("AUTO_ONBOARD_EXPECTED_SERIAL" if expected_serial else None),
+                serial_confirmed_at=(utc_now() if expected_serial else None),
                 certification_state="READ_ONLY",
                 capability_profile={
                     "read_users": True,
@@ -204,6 +211,10 @@ def onboard_connector(
         connector.firmware_version = firmware_version
         if connector.zkt_device and expected_serial and not connector.zkt_device.expected_serial:
             connector.zkt_device.expected_serial = expected_serial
+            connector.zkt_device.confirmed_serial = expected_serial
+            connector.zkt_device.terminal_binding_state = "CONFIRMED"
+            connector.zkt_device.serial_confirmed_by = "AUTO_ONBOARD_EXPECTED_SERIAL"
+            connector.zkt_device.serial_confirmed_at = utc_now()
 
     now = utc_now()
     overlap_until = now + timedelta(seconds=settings.onboarding_token_overlap_seconds)
@@ -289,6 +300,24 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
                 message=claimant.last_error_message,
                 details={"serial": zkt.serial},
             )
+        return
+
+    if (
+        zkt.terminal_binding_state != "CONFIRMED"
+        or not zkt.confirmed_serial
+        or zkt.confirmed_serial != zkt.serial
+    ):
+        zkt.certification_state = "READ_ONLY"
+        zkt.writes_disabled_reason = "TERMINAL_SERIAL_CONFIRMATION_REQUIRED"
+        zkt.capability_profile = {
+            **(zkt.capability_profile or {}),
+            "user_write": False,
+            "create_user": False,
+            "delete_user": False,
+            "admin_lease": False,
+            "protocol_restart": False,
+            "telnet_recovery": False,
+        }
         return
 
     record_size = int((zkt.capability_profile or {}).get("observed_user_record_bytes", 0))
@@ -4503,6 +4532,17 @@ def apply_command_update(
         command.result = result
         command.error_code = error_code
         command.error_message = error_message
+        if command.command_type == "PIN_TERMINAL_SERIAL":
+            zkt = connector.zkt_device
+            if zkt and status == "SUCCEEDED" and result.get("expected_serial") == zkt.serial:
+                zkt.expected_serial = zkt.serial
+                zkt.confirmed_serial = zkt.serial
+                zkt.terminal_binding_state = "CONFIRMED"
+                zkt.writes_disabled_reason = "STABILITY_CERTIFICATION_PENDING"
+            elif zkt:
+                zkt.terminal_binding_state = "SERIAL_CONFIRMATION_REQUIRED"
+                zkt.certification_state = "READ_ONLY"
+                zkt.writes_disabled_reason = "TERMINAL_SERIAL_PIN_FAILED"
     session.add(
         DeviceCommandEvent(
             command_id=command.id,

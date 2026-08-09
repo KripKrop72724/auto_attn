@@ -222,6 +222,34 @@ try {
         application_sha256 = (Get-FileHash (Join-Path $output 'zone-lite-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
     } | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $output 'bootstrap-manifest.json'), $package, (New-Object Text.UTF8Encoding($false)))
+    if ($env:ADD_FACTORY_VERSION) {
+        & python scripts/build_factory_manifest.py `
+            --bundle $output `
+            --version $env:ADD_FACTORY_VERSION `
+            --git-sha $env:GITHUB_SHA.ToLowerInvariant() `
+            --vault-manifest (Join-Path $output 'vault-manifest.json')
+        if ($LASTEXITCODE -ne 0) { throw 'Factory manifest generation failed' }
+        $signatureBinary = Join-Path $output 'manifest.sig.bin'
+        Invoke-DockerText @(
+            'run', '--rm',
+            '-v', "${output}:/bundle",
+            '-v', "${work}:/work:ro",
+            'espressif/idf:v5.5.3',
+            'openssl', 'dgst', '-sha256',
+            '-sigopt', 'rsa_padding_mode:pss',
+            '-sigopt', 'rsa_pss_saltlen:32',
+            '-sign', '/work/key-1.pem',
+            '-out', '/bundle/manifest.sig.bin',
+            '/bundle/manifest.json'
+        ) | Out-Null
+        $encodedSignature = [Convert]::ToBase64String([IO.File]::ReadAllBytes($signatureBinary))
+        [IO.File]::WriteAllText(
+            (Join-Path $output 'manifest.sig'),
+            $encodedSignature,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        Remove-Item -LiteralPath $signatureBinary -Force
+    }
 }
 finally {
     foreach ($number in 1..3) { Clear-PlaintextFile (Join-Path $work "key-$number.pem") }

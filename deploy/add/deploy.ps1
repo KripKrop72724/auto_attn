@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 $compose = @("compose", "--env-file", ".env.add", "-f", "docker-compose.add.yml")
 $apiImage = "state-life/add-api:production"
 $webImage = "state-life/add-web:production"
+$provisionerImage = "state-life/add-provisioner:production"
 $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
 $applicationStarted = $false
 $environmentPromoted = $false
@@ -68,7 +69,8 @@ function Write-DockerFailureDiagnostics {
         $material = (($diagnostics | ForEach-Object { "$_" }) -join "`n")
         foreach ($name in @(
             "ADD_POSTGRES_PASSWORD", "ADD_ADMIN_PASSWORD_HASH", "ADD_PII_FERNET_KEY",
-            "ADD_PII_LOOKUP_KEY", "ADD_FLEET_ROOT_SECRET", "ADD_ORDS_PASSWORD"
+            "ADD_PII_LOOKUP_KEY", "ADD_FLEET_ROOT_SECRET", "ADD_ORDS_PASSWORD",
+            "ADD_PROVISIONING_PAIRING_SECRET", "ADD_PROVISIONING_INTERNAL_TOKEN"
         )) {
             if ($Environment.ContainsKey($name) -and $Environment[$name]) {
                 $material = $material.Replace([string]$Environment[$name], "***")
@@ -348,10 +350,28 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALIN
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY)) {
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
+$environment["ADD_PROVISIONING_ENABLED"] = if ($env:ADD_DEPLOY_PROVISIONING_ENABLED -eq "true") { "true" } else { "false" }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_PROVISIONING_PAIRING_SECRET)) {
+    $environment["ADD_PROVISIONING_PAIRING_SECRET"] = $env:ADD_DEPLOY_PROVISIONING_PAIRING_SECRET
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_PROVISIONING_INTERNAL_TOKEN)) {
+    $environment["ADD_PROVISIONING_INTERNAL_TOKEN"] = $env:ADD_DEPLOY_PROVISIONING_INTERNAL_TOKEN
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64)) {
+    $environment["ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64"] = $env:ADD_DEPLOY_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_FACTORY_FIRMWARE_STORE_HOST_PATH)) {
+    $environment["ADD_FACTORY_FIRMWARE_STORE_HOST_PATH"] = $env:ADD_FACTORY_FIRMWARE_STORE_HOST_PATH
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_COMPANION_RELEASE_STORE_HOST_PATH)) {
+    $environment["ADD_COMPANION_RELEASE_STORE_HOST_PATH"] = $env:ADD_COMPANION_RELEASE_STORE_HOST_PATH
+}
 # These deployment coordinates are locked product requirements, not operator
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
 $environment["ADD_PUBLIC_DEVICE_WS_URL"] = "wss://autoattn.slichealth.com/device/v2/stream"
+$environment["ADD_PROVISIONING_PUBLIC_WS_URL"] = "wss://autoattn.slichealth.com/companion/v1/stream"
+$environment["ADD_PROVISIONING_WORKER_URL"] = "http://add-provisioner:8097"
 $environment["ADD_ORDS_BASE_URL"] = "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
 if ($environment.ContainsKey("ADD_ADMIN_PASSWORD_HASH") -and
     $environment["ADD_ADMIN_PASSWORD_HASH"].StartsWith('$$argon2id$$')) {
@@ -398,6 +418,34 @@ if ($environment["ADD_FLEET_ROOT_SECRET"].Length -lt 32) {
 }
 if ($environment["ADD_POSTGRES_PASSWORD"].Length -lt 24) {
     throw "ADD_POSTGRES_PASSWORD must contain at least 24 characters."
+}
+if ($environment["ADD_PROVISIONING_ENABLED"] -eq "true") {
+    foreach ($name in @(
+        "ADD_PROVISIONING_PAIRING_SECRET",
+        "ADD_PROVISIONING_INTERNAL_TOKEN",
+        "ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64",
+        "ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64",
+        "ADD_FACTORY_FIRMWARE_STORE_HOST_PATH",
+        "ADD_COMPANION_RELEASE_STORE_HOST_PATH"
+    )) {
+        [void](Require-EnvironmentValue -Map $environment -Name $name)
+    }
+    if ($environment["ADD_PROVISIONING_PAIRING_SECRET"].Length -lt 32 -or
+        $environment["ADD_PROVISIONING_INTERNAL_TOKEN"].Length -lt 32) {
+        throw "Provisioning pairing and internal secrets must contain at least 32 characters."
+    }
+    if ($environment["ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64"] -notmatch '^[A-Za-z0-9+/]{43}=$') {
+        throw "The companion release Ed25519 public key must be a raw 32-byte base64 value."
+    }
+    foreach ($pathName in @(
+        "ADD_FACTORY_FIRMWARE_STORE_HOST_PATH",
+        "ADD_COMPANION_RELEASE_STORE_HOST_PATH"
+    )) {
+        $path = $environment[$pathName]
+        if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Container)) {
+            throw "Production provisioning store $pathName must be an existing absolute directory."
+        }
+    }
 }
 if ($environment["ADD_PUBLIC_DEVICE_WS_URL"] -ne "wss://autoattn.slichealth.com/device/v2/stream") {
     throw "ADD_PUBLIC_DEVICE_WS_URL must use the production TLS device stream."
@@ -454,13 +502,25 @@ try {
         Select-Object -Last 1
     $preApiImage = if ($previousRelease) { Get-ImageId -Image $apiImage } else { $null }
     $preWebImage = if ($previousRelease) { Get-ImageId -Image $webImage } else { $null }
+    $preProvisionerImage = if ($previousRelease) { Get-ImageId -Image $provisionerImage } else { $null }
+    $previousProvisioningEnabled = $false
+    if ($previousRelease -and (Test-Path -LiteralPath $protectedEnvironment -PathType Leaf)) {
+        $previousSettings = Get-EnvironmentMap -Path $protectedEnvironment
+        $previousProvisioningEnabled = $previousSettings.ContainsKey("ADD_PROVISIONING_ENABLED") -and
+            $previousSettings["ADD_PROVISIONING_ENABLED"] -eq "true"
+    }
     if ($previousRelease -and (-not $preApiImage -or -not $preWebImage)) {
         throw "A completed release marker exists, but its rollback image set is incomplete."
     }
+    if ($previousProvisioningEnabled -and -not $preProvisionerImage) {
+        throw "Provisioning was enabled in the prior release, but its rollback image is missing."
+    }
     $rollbackApiTag = "state-life/add-api:rollback-$stamp"
     $rollbackWebTag = "state-life/add-web:rollback-$stamp"
+    $rollbackProvisionerTag = "state-life/add-provisioner:rollback-$stamp"
     if ($preApiImage) { Invoke-Docker -Arguments @("tag", $preApiImage, $rollbackApiTag) }
     if ($preWebImage) { Invoke-Docker -Arguments @("tag", $preWebImage, $rollbackWebTag) }
+    if ($preProvisionerImage) { Invoke-Docker -Arguments @("tag", $preProvisionerImage, $rollbackProvisionerTag) }
 
     # Bring only durable dependencies online first, then take a binary-safe logical backup.
     Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"))
@@ -500,6 +560,7 @@ try {
             database_backup = $databaseBackup
             previous_api_image = $preApiImage
             previous_web_image = $preWebImage
+            previous_provisioner_image = $preProvisionerImage
             environment_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $protectedEnvironment).Hash
         }
         $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $releaseRoot "$stamp.json") -Encoding UTF8
@@ -533,7 +594,7 @@ try {
                     $rollbackEnvironment["ADD_POSTGRES_DB"]
                 } else { "attendance_devices" }
             }
-            Invoke-Docker -Arguments ($compose + @("stop", "add-api", "add-web"))
+            Invoke-Docker -Arguments ($compose + @("stop", "add-api", "add-web", "add-provisioner"))
             $postFailureRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
             $schemaMayHaveChanged = $applicationStarted -and (
                 -not $preRevision -or -not $postFailureRevision -or $postFailureRevision -ne $preRevision
@@ -560,11 +621,17 @@ try {
                 Invoke-Docker -Arguments ($compose + @("down", "--remove-orphans"))
                 [void](Invoke-DockerProbe -Arguments @("image", "rm", $apiImage))
                 [void](Invoke-DockerProbe -Arguments @("image", "rm", $webImage))
+                [void](Invoke-DockerProbe -Arguments @("image", "rm", $provisionerImage))
                 throw "Deployment failed; the first release was stopped cleanly: $deploymentError"
             }
             Invoke-Docker -Arguments @("tag", $rollbackApiTag, $apiImage)
             Invoke-Docker -Arguments @("tag", $rollbackWebTag, $webImage)
-            Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans"))
+            if ($preProvisionerImage) {
+                Invoke-Docker -Arguments @("tag", $rollbackProvisionerTag, $provisionerImage)
+            }
+            $rollbackServices = @("postgres", "redis", "add-api", "add-web")
+            if ($previousProvisioningEnabled) { $rollbackServices += "add-provisioner" }
+            Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans") + $rollbackServices)
             Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
             Wait-Endpoint -Uri "http://127.0.0.1:8095/"
             throw "Deployment failed and the previous release was restored: $deploymentError"

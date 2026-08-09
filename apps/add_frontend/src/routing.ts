@@ -8,7 +8,7 @@ const routes = new Set<DashboardRoute>([
   'firmware',
   'alerts',
 ])
-const firmwareSections = new Set<FirmwareSection>(['overview', 'releases', 'campaigns'])
+const firmwareSections = new Set<FirmwareSection>(['overview', 'prepare', 'releases', 'campaigns'])
 
 export function dashboardRoute(pathname: string): DashboardRoute {
   const segment = pathname.split('/').filter(Boolean)[0] as DashboardRoute | undefined

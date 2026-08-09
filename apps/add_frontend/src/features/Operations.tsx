@@ -4,7 +4,7 @@ import { api, queryString } from '../api'
 import { Dialog, PageHeader, StatusBadge, dateTime, idempotency, relativeTime, statusPattern, useToast, type ReconciliationDialogState } from '../App'
 import { Icon } from '../Icon'
 import type {
-  Device, FirmwareCampaign, FirmwareRelease, FirmwareScopePreview,
+  Device, FirmwareCampaign, FirmwareRelease, FirmwareScopePreview, FirmwareSection,
   ReconciliationDivergenceDetail, ReconciliationDivergenceReveal,
   ReconciliationJob, ReconciliationPreflight, ReconciliationScheduler,
   SourceException, SourceExceptionList, SourceExceptionReveal, SourceExceptionTotals,
@@ -517,8 +517,8 @@ export function FirmwareView({
   devices: Device[]
   revision: number
   toast: ReturnType<typeof useToast>
-  section: 'overview' | 'releases' | 'campaigns'
-  onSection: (section: 'overview' | 'releases' | 'campaigns') => void
+  section: FirmwareSection
+  onSection: (section: FirmwareSection) => void
 }) {
   const [releases, setReleases] = useState<FirmwareRelease[]>([])
   const [campaigns, setCampaigns] = useState<FirmwareCampaign[]>([])
@@ -700,11 +700,11 @@ export function FirmwareView({
       </div>
 
       <nav className="section-tabs" aria-label="Firmware sections">
-        {(['overview', 'releases', 'campaigns'] as const).map((value) => <button key={value} className={section === value ? 'active' : ''} aria-current={section === value ? 'page' : undefined} onClick={() => onSection(value)}>{value === 'overview' ? 'Overview' : value === 'releases' ? `Signed releases (${releases.length})` : `Campaigns (${campaigns.length})`}</button>)}
+        {(['overview', 'prepare', 'releases', 'campaigns'] as const).map((value) => <button key={value} className={section === value ? 'active' : ''} aria-current={section === value ? 'page' : undefined} onClick={() => onSection(value)}>{value === 'overview' ? 'Overview' : value === 'prepare' ? 'Prepare device' : value === 'releases' ? `Signed releases (${releases.length})` : `Campaigns (${campaigns.length})`}</button>)}
       </nav>
 
       {section === 'overview' && <section className="firmware-overview-grid">
-        <article className="overview-hero"><p className="eyebrow">RELEASE POSTURE</p><h2>{newestRelease ? `Zone Lite ${newestRelease.version}` : 'No deployable release'}</h2><p>{newestRelease ? `Published ${dateTime(newestRelease.published_at)} · ${newestRelease.partition_layout}` : 'Publish a signed release before creating a production campaign.'}</p><button className="text-button" onClick={() => onSection('releases')}>Review release inventory <Icon name="chevron" /></button></article>
+        <article className="overview-hero"><p className="eyebrow">RELEASE POSTURE</p><h2>{newestRelease ? `Zone Lite ${newestRelease.version}` : 'No deployable release'}</h2><p>{newestRelease ? `Published ${dateTime(newestRelease.published_at)} · ${newestRelease.partition_layout}` : 'Publish a signed release before creating a production campaign.'}</p><div className="page-actions"><button className="button primary" onClick={() => onSection('prepare')}><Icon name="plus" /> Prepare ESP32</button><button className="text-button" onClick={() => onSection('releases')}>Review release inventory <Icon name="chevron" /></button></div></article>
         <article><span className="overview-icon"><Icon name="pulse" /></span><div><p>Active campaigns</p><strong>{activeCampaigns.length}</strong><small>{activeCampaigns.filter((campaign) => campaign.status === 'PAUSED').length} paused</small></div></article>
         <article><span className="overview-icon"><Icon name="server" /></span><div><p>OTA-ready fleet</p><strong>{devices.filter((device) => device.ota_capable).length}/{devices.length}</strong><small>{devices.filter((device) => !device.ota_capable).length} legacy or blocked</small></div></article>
       </section>}

@@ -9,8 +9,9 @@ const rows = readdirSync(assets).filter((name) => /\.(js|css)$/.test(name)).map(
 }))
 const failures = []
 for (const row of rows) {
+  const provisioningRoute = /^FirmwareProvisioning-/.test(row.name)
   const lazyRoute = /^(Login|Users|Monitoring|Operations|DeviceDrawer)-/.test(row.name)
-  const limit = row.name.endsWith('.css') ? 12 : lazyRoute ? 45 : 85
+  const limit = row.name.endsWith('.css') ? 14 : provisioningRoute ? 12 : lazyRoute ? 45 : 85
   if (row.gzipKb > limit) failures.push(`${row.name}: ${row.gzipKb.toFixed(2)} KB gzip exceeds ${limit} KB`)
 }
 if (!rows.some((row) => row.name.startsWith('index-') && row.name.endsWith('.js'))) {

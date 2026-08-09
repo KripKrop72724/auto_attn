@@ -99,7 +99,13 @@ def main() -> int:
         for name in files
         if name.startswith("apps/") and len(name.split("/", 2)) >= 3
     }
-    unexpected_apps = sorted(app_products - {"add_backend", "add_frontend"})
+    expected_apps = {
+        "add_backend",
+        "add_frontend",
+        "add_provisioner",
+        "provisioning_companion",
+    }
+    unexpected_apps = sorted(app_products - expected_apps)
     if unexpected_apps:
         problems.append(f"unexpected applications: {', '.join(unexpected_apps)}")
 
@@ -121,6 +127,9 @@ def main() -> int:
         ".github/workflows/firmware-key-bootstrap.yml",
         ".github/workflows/firmware-nationwide-rollout.yml",
         ".github/workflows/firmware-release.yml",
+        ".github/workflows/factory-firmware-hil-candidate.yml",
+        ".github/workflows/factory-firmware-promote.yml",
+        ".github/workflows/provisioning-companion-release.yml",
         ".github/workflows/zone-lite-device-provisioning.yml",
     }
     if workflow_files != expected_workflows:

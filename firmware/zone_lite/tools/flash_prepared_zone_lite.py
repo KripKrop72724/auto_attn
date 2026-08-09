@@ -13,9 +13,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
+from typing import Callable
 
 from provision_zone_lite import ensure_nvs_hmac_key, normalize_mac, read_mac
 
@@ -28,16 +30,40 @@ FLASH_LAYOUT = (
     ("zone-lite-signed.bin", 0x20000),
 )
 
+FlashProgress = Callable[[str, int, int], None]
 
-def run(command: list[str]) -> str:
-    completed = subprocess.run(
+
+def run(
+    command: list[str], line_callback: Callable[[str], None] | None = None
+) -> str:
+    if line_callback is None:
+        completed = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return completed.stdout
+    process = subprocess.Popen(
         command,
-        check=True,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        bufsize=1,
     )
-    return completed.stdout
+    output: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        output.append(line)
+        line_callback(line)
+    return_code = process.wait()
+    rendered = "".join(output)
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command, output=rendered)
+    return rendered
 
 
 def sha256(path: Path) -> str:
@@ -92,6 +118,7 @@ def flash_and_verify(
     port: str,
     signed_package: Path,
     provision_nvs: Path,
+    progress: FlashProgress | None = None,
 ) -> None:
     sources = {
         "bootloader-signed.bin": signed_package / "bootloader-signed.bin",
@@ -100,6 +127,25 @@ def flash_and_verify(
         "ota_data_initial.bin": signed_package / "ota_data_initial.bin",
         "zone-lite-signed.bin": signed_package / "zone-lite-signed.bin",
     }
+    flash_sources_and_verify(
+        esptool=esptool,
+        port=port,
+        sources=sources,
+        layout=FLASH_LAYOUT,
+        progress=progress,
+    )
+
+
+def flash_sources_and_verify(
+    *,
+    esptool: str,
+    port: str,
+    sources: dict[str, Path],
+    layout: tuple[tuple[str, int], ...],
+    progress: FlashProgress | None = None,
+) -> None:
+    image_bytes = sum(sources[name].stat().st_size for name, _offset in layout)
+    total_bytes = image_bytes * 2
     command = [
         esptool,
         "--chip",
@@ -119,13 +165,44 @@ def flash_and_verify(
         "--flash_freq",
         "80m",
     ]
-    for name, offset in FLASH_LAYOUT:
+    for name, offset in layout:
         command.extend([hex(offset), str(sources[name])])
-    run(command)
+    last_streamed_bytes = 0
+    ordered_ranges = [
+        (offset, offset + sources[name].stat().st_size, sources[name].stat().st_size)
+        for name, offset in layout
+    ]
+
+    def write_line(line: str) -> None:
+        nonlocal last_streamed_bytes
+        match = re.search(r"Writing at 0x([0-9A-Fa-f]+)", line, re.IGNORECASE)
+        if not match:
+            return
+        address = int(match.group(1), 16)
+        completed = 0
+        for start, end, size in ordered_ranges:
+            if address >= end:
+                completed += size
+            elif address >= start:
+                completed += address - start
+                break
+            else:
+                break
+        completed = min(image_bytes, max(0, completed))
+        # Bound event/audit volume while retaining smooth, measured progress.
+        threshold = max(256 * 1024, image_bytes // 50)
+        if progress and completed - last_streamed_bytes >= threshold:
+            last_streamed_bytes = completed
+            progress("FLASHING", completed, total_bytes)
+
+    run(command, line_callback=write_line)
+    completed_bytes = image_bytes
+    if progress:
+        progress("FLASHING", completed_bytes, total_bytes)
 
     with tempfile.TemporaryDirectory(prefix="zone-lite-flash-readback-") as directory:
         temporary = Path(directory)
-        for name, offset in FLASH_LAYOUT:
+        for name, offset in layout:
             source = sources[name]
             readback = temporary / name
             run(
@@ -148,6 +225,35 @@ def flash_and_verify(
             )
             if sha256(readback) != sha256(source):
                 raise RuntimeError(f"Flash readback verification failed for {name}")
+            completed_bytes += source.stat().st_size
+            if progress:
+                progress("READBACK_VERIFYING", completed_bytes, total_bytes)
+
+
+def flash_managed_and_verify(
+    *,
+    esptool: str,
+    port: str,
+    signed_package: Path,
+    provision_nvs: Path,
+    progress: FlashProgress | None = None,
+) -> None:
+    """Reprovision only NVS and the signed factory recovery app.
+
+    Storage/outbox, OTA slots, bootloader, partition table and security fuses
+    are deliberately not erased or rewritten for a known managed device.
+    """
+    layout = (("provision.bin", 0x11000), ("zone-lite-signed.bin", 0x20000))
+    flash_sources_and_verify(
+        esptool=esptool,
+        port=port,
+        sources={
+            "provision.bin": provision_nvs,
+            "zone-lite-signed.bin": signed_package / "zone-lite-signed.bin",
+        },
+        layout=layout,
+        progress=progress,
+    )
 
 
 def main() -> None:

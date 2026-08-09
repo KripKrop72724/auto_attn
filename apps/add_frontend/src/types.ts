@@ -20,7 +20,7 @@ export type DashboardRoute =
   | 'firmware'
   | 'alerts'
 
-export type FirmwareSection = 'overview' | 'releases' | 'campaigns'
+export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
 
 export interface FirmwareScopePreview {
   scope_token: string

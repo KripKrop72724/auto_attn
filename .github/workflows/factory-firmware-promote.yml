@@ -1,0 +1,69 @@
+name: Promote exact HIL-tested factory bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Immutable factory bundle ID
+        required: true
+        type: string
+      hil_receipt_sha256:
+        description: SHA-256 of the destructive HIL acceptance receipt
+        required: true
+        type: string
+      confirmation:
+        description: Type PROMOTE EXACT FACTORY BYTES
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    if: inputs.confirmation == 'PROMOTE EXACT FACTORY BYTES'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify HIL receipt and remove only the quarantine marker
+        shell: powershell
+        env:
+          ADD_FACTORY_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FACTORY_FIRMWARE_STORE_HOST_PATH }}
+          ADD_FACTORY_HIL_RECEIPT_PATH: ${{ vars.ADD_FACTORY_HIL_RECEIPT_PATH }}
+        run: |
+          if ('${{ inputs.bundle_id }}' -notmatch '^zone-lite-[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$') { throw 'Invalid bundle ID' }
+          if ('${{ inputs.hil_receipt_sha256 }}' -notmatch '^[0-9a-f]{64}$') { throw 'Invalid receipt digest' }
+          $receipt = Join-Path $env:ADD_FACTORY_HIL_RECEIPT_PATH ('${{ inputs.hil_receipt_sha256 }}' + '.json')
+          if (-not (Test-Path $receipt -PathType Leaf)) { throw 'HIL acceptance receipt is unavailable' }
+          if ((Get-FileHash $receipt -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ inputs.hil_receipt_sha256 }}') { throw 'HIL acceptance receipt hash mismatch' }
+          $bundle = Join-Path $env:ADD_FACTORY_FIRMWARE_STORE_HOST_PATH '${{ inputs.bundle_id }}'
+          $marker = Join-Path $bundle '.hil-only.json'
+          if (-not (Test-Path $marker -PathType Leaf)) { throw 'Factory bundle is not HIL quarantined' }
+          $manifestPath = Join-Path $bundle 'manifest.json'
+          $before = (Get-FileHash $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $evidence = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'PASSED') { throw 'HIL receipt is not a passing v1 receipt' }
+          if ($evidence.bundle_id -ne '${{ inputs.bundle_id }}') { throw 'HIL receipt belongs to another bundle' }
+          if ($evidence.manifest_sha256 -ne $before) { throw 'HIL receipt belongs to different factory bytes' }
+          $requiredChecks = @(
+            'blank_device_secure_boot',
+            'managed_device_no_efuse_reburn',
+            'foreign_root_rejected',
+            'all_ranges_readback_verified',
+            'power_loss_recovered',
+            'same_mac_resumed',
+            'different_mac_rejected',
+            'signed_onboarding_verified',
+            'terminal_binding_read_only_gate',
+            'storage_outbox_preserved'
+          )
+          foreach ($check in $requiredChecks) {
+            $property = $evidence.checks.PSObject.Properties[$check]
+            if ($null -eq $property -or $property.Value -ne $true) { throw "HIL receipt is missing required proof: $check" }
+          }
+          Remove-Item -LiteralPath $marker -Force
+          $after = (Get-FileHash $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($before -ne $after) { throw 'Factory manifest changed during promotion' }

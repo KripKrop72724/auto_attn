@@ -1,0 +1,160 @@
+name: Zone Lite immutable factory bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green commit on main
+        required: true
+        type: string
+      version:
+        description: Firmware SemVer without v prefix
+        required: true
+        type: string
+      hil_device_mac:
+        description: Exact sacrificial ESP32-S3 MAC used by HIL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: zone-lite-factory-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.exact.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${{ inputs.hil_device_mac }}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+          git fetch origin main
+          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Require successful ADD CI for the exact commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXACT_SHA: ${{ steps.exact.outputs.sha }}
+        run: |
+          set -euo pipefail
+          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXACT_SHA}/check-runs?per_page=100")"
+          for required in repository-contract backend frontend firmware containers; do
+            jq -e --arg name "$required" \
+              '[.check_runs[] | select(.name == $name and .conclusion == "success")] | length > 0' \
+              <<<"$checks" >/dev/null || {
+                echo "Required successful ADD CI check is missing: $required" >&2
+                exit 1
+              }
+          done
+
+  build:
+    needs: provenance
+    runs-on: ubuntu-latest
+    environment: firmware-signing
+    env:
+      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          persist-credentials: false
+      - name: Build exact protected full-bootstrap inputs
+        working-directory: firmware/zone_lite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ZONE_LITE_SETUP_PASSWORD"
+          test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
+          docker run --rm -e ZONE_LITE_SETUP_PASSWORD -v "$GITHUB_WORKSPACE:/project" -w /project/firmware/zone_lite espressif/idf:v5.5.3 bash -lc 'rm -rf build-factory && idf.py -B build-factory -D SDKCONFIG=/tmp/zone-lite-factory-sdkconfig build'
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          image = Path("build-factory/zone_lite.bin").read_bytes()
+          configured = os.environ["ZONE_LITE_SETUP_PASSWORD"].encode()
+          if configured not in image or b"SLIC-CI-ONLY" in image:
+              raise SystemExit("Protected setup-password build provenance is invalid")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-unsigned-${{ needs.provenance.outputs.sha }}
+          retention-days: 1
+          path: |
+            firmware/zone_lite/build-factory/bootloader/bootloader.bin
+            firmware/zone_lite/build-factory/partition_table/partition-table.bin
+            firmware/zone_lite/build-factory/ota_data_initial.bin
+            firmware/zone_lite/build-factory/zone_lite.bin
+            firmware/zone_lite/build-factory/flasher_args.json
+
+  sign:
+    needs: [provenance, build]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    env:
+      ADD_FACTORY_VERSION: ${{ inputs.version }}
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: factory-unsigned-${{ needs.provenance.outputs.sha }}
+          path: unsigned-tree
+      - name: Sign bootloader, application and canonical factory manifest
+        run: |
+          $source = Join-Path $PWD 'unsigned-tree'
+          $unsigned = Join-Path $PWD 'unsigned'
+          New-Item -ItemType Directory $unsigned | Out-Null
+          Copy-Item "$source/bootloader/bootloader.bin" "$unsigned/bootloader.bin"
+          Copy-Item "$source/partition_table/partition-table.bin" "$unsigned/partition-table.bin"
+          Copy-Item "$source/ota_data_initial.bin" "$unsigned/ota_data_initial.bin"
+          Copy-Item "$source/zone_lite.bin" "$unsigned/zone_lite.bin"
+          Copy-Item "$source/flasher_args.json" "$unsigned/flasher_args.json"
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          ./deploy/add/bootstrap-firmware-signing.ps1 -VaultDirectory $vault -UnsignedDirectory $unsigned -OutputDirectory factory-bundle -DeviceMac '${{ inputs.hil_device_mac }}'
+          Set-Content -LiteralPath 'factory-bundle/.hil-only.json' -Value '{"state":"HIL_ONLY","bytes_must_be_promoted_without_rebuild":true}' -NoNewline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-zone-lite-${{ inputs.version }}-hil-only
+          path: factory-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-hil:
+    needs: [provenance, sign]
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.provenance.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: factory-zone-lite-${{ inputs.version }}-hil-only
+          path: factory-bundle
+      - name: Atomically publish quarantined factory bytes
+        shell: powershell
+        env:
+          ADD_FACTORY_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FACTORY_FIRMWARE_STORE_HOST_PATH }}
+        run: |
+          if (-not $env:ADD_FACTORY_FIRMWARE_STORE_HOST_PATH) { throw 'Factory store is not configured' }
+          ./deploy/add/publish-factory-firmware.ps1 -SourceDirectory factory-bundle -StoreDirectory $env:ADD_FACTORY_FIRMWARE_STORE_HOST_PATH -PublicationMode HIL_ONLY

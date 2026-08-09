@@ -76,6 +76,14 @@ const reconciliationJob = {
   requested_at: '2026-08-07T05:01:32Z', started_at: '2026-08-07T05:01:36Z', capture_certified_at: null, oracle_certified_at: null, completed_at: null, updated_at: '2026-08-07T05:35:05Z',
 }
 
+const factoryBundle = {
+  bundle_id: 'zone-lite-2.4.5-6132c9b773b9', hardware_profile: 'esp32s3-16mb-zone-lite-v1',
+  version: '2.4.5', git_sha: '6132c9b773b9a4016173e9b99dfde6ccc5dc29e5',
+  partition_layout: 'zone-lite-factory-v1', manifest_sha256: 'f'.repeat(64),
+  signing_key_ids: ['active', 'reserve-1', 'reserve-2'], images: [], state: 'AVAILABLE',
+  published_at: '2026-08-09T10:00:00Z',
+}
+
 async function mockDashboard(page: Page) {
   await page.route('**/events/**', (route) => route.abort())
   await page.route('**/api/**', async (route) => {
@@ -92,6 +100,10 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/attendance') json = { rows: [], next_cursor: null }
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', hil_target_mac: null }] }
     else if (url.pathname === '/api/v1/firmware/campaigns') json = { enabled: true, hil_enabled: false, rows: [] }
+    else if (url.pathname === '/api/v1/provisioning/capabilities') json = { enabled: true, supported_platforms: ['windows-x64', 'macos-arm64'], hardware_profile: 'esp32s3-16mb-zone-lite-v1', companion_min_version: '1.0.0', latest_bundle: factoryBundle, can_start: true }
+    else if (url.pathname === '/api/v1/provisioning/companions') json = { rows: [] }
+    else if (url.pathname === '/api/v1/provisioning/sessions') json = { rows: [] }
+    else if (url.pathname === '/api/v1/provisioning/companion-releases/latest') json = { platform: url.searchParams.get('platform'), version: '1.0.0', filename: 'add-provisioning-companion-windows-x64.exe', sha256: 'c'.repeat(64), size: 123456, git_sha: factoryBundle.git_sha, download_url: '/api/v1/provisioning/companion-releases/windows-x64/download', os_signed: false }
     else if (url.pathname === '/api/v1/reconciliations') json = { enabled: true, scheduler: { policy: 'BOUNDED_PARALLEL_PER_DEVICE', device_concurrency: 6, active_scan_jobs: 1, waiting_scan_jobs: 0, available_scan_slots: 5, history_backlog: 0, history_backlog_limit: 10000, reserved_credit: 0, available_credit: 10000 }, rows: [reconciliationJob] }
     else if (url.pathname.endsWith('/reconciliations/preflight')) json = { eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [], connector: { connector_id: device.connector_id, device_id: device.device_id, display_name: device.display_name, zone_id: device.zone_id, connected: true, firmware_version: device.firmware_version }, terminal: { serial: device.zkt.serial, attendance_count: 42, user_count: 1, connection_state: 'ONLINE', identity_snapshot_revision: 1, range_resume_verified: true }, coverage: null }
     else if (url.pathname === '/api/v1/source-exceptions/1/review') json = { ...sourceException, review_state: 'REVIEWED', reviewed_at: '2026-08-06T10:10:00Z', reviewed_by: 'StateHealthAdmin', review_reason: 'Reviewed immutable source evidence.', reviews: [{ review_id: 'review-one', state: 'REVIEWED', reason: 'Reviewed immutable source evidence.', actor: 'StateHealthAdmin', created_at: '2026-08-06T10:10:00Z' }] }
@@ -113,8 +125,15 @@ test.beforeEach(async ({ page }) => mockDashboard(page))
 test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
   await page.goto('/fleet')
   await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
-  const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
-  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  const dimensions = await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    content: document.documentElement.scrollWidth,
+    offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
+      .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 1)
+      .slice(0, 8)
+      .map((element) => ({ tag: element.tagName, className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+  }))
+  expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
 })
@@ -173,4 +192,30 @@ test('source exception inspector is responsive, keyboard-operable, and fail-clos
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+})
+
+test('physical provisioning environment is responsive, explicit, and accessible', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+    })
+  })
+  await page.goto('/firmware?tab=prepare')
+  await expect(page.getByRole('heading', { name: 'Prepare a Zone Lite ESP32' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Connect the provisioning companion' })).toBeVisible()
+  await expect(page.getByText('c'.repeat(64))).toBeVisible()
+  await expect(page.getByText(/not OS code-signed/i)).toBeVisible()
+  const dimensions = await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    content: document.documentElement.scrollWidth,
+    offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
+      .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 1)
+      .slice(0, 8)
+      .map((element) => ({ tag: element.tagName, className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+  }))
+  expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
+  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+  expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })

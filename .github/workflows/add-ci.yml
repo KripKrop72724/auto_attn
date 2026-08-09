@@ -95,6 +95,23 @@ jobs:
             $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
             throw "sign-firmware-release.ps1 contains parser errors:$([Environment]::NewLine)$messages"
           }
+      - name: Parse physical-provisioning publication scripts
+        shell: pwsh
+        run: |
+          foreach ($path in @(
+            'deploy/add/publish-factory-firmware.ps1',
+            'deploy/add/bootstrap-firmware-signing.ps1'
+          )) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $path), [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
+              throw "$path contains parser errors:$([Environment]::NewLine)$messages"
+            }
+          }
       - name: Scan the committed worktree for secrets
         run: >-
           docker run --rm
@@ -147,11 +164,11 @@ jobs:
           python scripts/generate_ci_env.py /tmp/add-ci.env --github-env "$GITHUB_ENV"
           rm -f /tmp/add-ci.env
       - name: Lint
-        run: python -m ruff check apps/add_backend tests scripts firmware/zone_lite/tools/provision_zone_lite.py
+        run: python -m ruff check apps/add_backend apps/add_provisioner apps/provisioning_companion tests scripts firmware/zone_lite/tools/provision_zone_lite.py
       - name: Verify frontend OpenAPI safety contracts
         run: python scripts/check_frontend_openapi_contract.py
-      - name: Test backend and firmware contracts
-        run: python -m pytest -q tests/unit tests/firmware
+      - name: Test backend, firmware and companion contracts
+        run: python -m pytest -q tests/unit tests/firmware tests/companion
       - name: Validate a fresh PostgreSQL migration and schema drift
         run: |
           alembic -c apps/add_backend/alembic.ini upgrade head
@@ -168,6 +185,11 @@ jobs:
           assert "device_user_id" in {c["name"] for c in inspector.get_columns("add_attendance_events")}
           assert "add_onboarding_nonces" in inspector.get_table_names()
           assert "add_identity_tombstones" in inspector.get_table_names()
+          assert "add_provisioning_companions" in inspector.get_table_names()
+          assert "add_provisioning_sessions" in inspector.get_table_names()
+          assert "add_factory_firmware_bundles" in inspector.get_table_names()
+          zkt_columns = {c["name"] for c in inspector.get_columns("add_zkt_devices")}
+          assert {"terminal_binding_state", "confirmed_serial"} <= zkt_columns
           PY
       - name: Prove legacy duplicate CNIC migration preserves users and punches
         run: |

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "state-life-add-provisioning-companion"
+version = "1.0.0"
+description = "Signed-channel USB provisioning companion for Zone Lite ESP32-S3 devices."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "cryptography==49.0.0",
+  "esptool==5.1.0",
+  "httpx==0.28.1",
+  "pyserial==3.5",
+  "websockets==16.0",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller==6.19.0"]
+dev = ["pytest==9.0.2", "ruff==0.15.4"]
+
+[project.gui-scripts]
+add-provisioning-companion = "add_provisioning_companion.app:main"
+
+[tool.setuptools]
+packages = ["add_provisioning_companion"]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

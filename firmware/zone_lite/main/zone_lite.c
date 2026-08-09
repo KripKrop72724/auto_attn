@@ -7449,6 +7449,30 @@ static bool process_add_commands(
                 error_code = "ZKT_USER_READ_FAILED";
                 error_message = "The terminal user table could not be read and verified.";
             }
+        } else if (strcmp(command.command_type, "PIN_TERMINAL_SERIAL") == 0) {
+            bool serial_is_safe = command.expected_serial[0] != '\0';
+            for (const unsigned char *cursor =
+                     (const unsigned char *)command.expected_serial;
+                 *cursor && serial_is_safe;
+                 ++cursor) {
+                serial_is_safe = isalnum(*cursor) || *cursor == '.' ||
+                                 *cursor == '_' || *cursor == '-' || *cursor == ':';
+            }
+            if (!serial_is_safe ||
+                strcmp(command.expected_serial, g_device_serial) != 0) {
+                error_code = "ZKT_SERIAL_PRECONDITION_FAILED";
+                error_message = "The authenticated terminal serial changed before it could be pinned.";
+            } else if (zone_config_save_zkt_serial(command.expected_serial) != ESP_OK) {
+                error_code = "ZKT_SERIAL_PERSIST_FAILED";
+                error_message = "The authenticated terminal serial could not be saved to encrypted NVS.";
+            } else {
+                ok = true;
+                snprintf(
+                    result,
+                    sizeof(result),
+                    "{\"expected_serial\":\"%s\",\"persisted\":true}",
+                    command.expected_serial);
+            }
         } else if (strcmp(command.command_type, "CREATE_USER") == 0 ||
                    strcmp(command.command_type, "UPDATE_USER") == 0 ||
                    strcmp(command.command_type, "DELETE_USER") == 0 ||

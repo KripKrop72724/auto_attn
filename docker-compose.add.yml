@@ -51,6 +51,18 @@ services:
         source: ${ADD_FIRMWARE_STORE_HOST_PATH:-./.firmware-store}
         target: /firmware
         read_only: true
+      - type: bind
+        source: ${ADD_FACTORY_FIRMWARE_STORE_HOST_PATH:-./.factory-firmware-store}
+        target: /factory-firmware
+        read_only: true
+      - type: bind
+        source: ${ADD_COMPANION_RELEASE_STORE_HOST_PATH:-./.companion-releases}
+        target: /companion-releases
+        read_only: true
+      - type: volume
+        source: add-provisioning-artifacts
+        target: /provisioning-artifacts
+        read_only: true
     env_file: .env.add
     environment:
       ADD_DATABASE_URL: postgresql+psycopg://${ADD_POSTGRES_USER:-add_service}:${ADD_POSTGRES_PASSWORD}@postgres:5432/${ADD_POSTGRES_DB:-attendance_devices}
@@ -69,7 +81,39 @@ services:
       timeout: 4s
       retries: 12
       start_period: 30s
-    networks: [add-private]
+    networks: [add-private, provisioning-private]
+    mem_limit: 768m
+    security_opt: [no-new-privileges:true]
+
+  add-provisioner:
+    image: state-life/add-provisioner:production
+    build:
+      context: .
+      dockerfile: apps/add_provisioner/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=192m,mode=1777,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: ${ADD_FACTORY_FIRMWARE_STORE_HOST_PATH:-./.factory-firmware-store}
+        target: /factory-firmware
+        read_only: true
+      - type: volume
+        source: add-provisioning-artifacts
+        target: /artifacts
+    environment:
+      ADD_PROVISIONING_ARTIFACT_PATH: /artifacts
+      ADD_PROVISIONING_FACTORY_STORE_PATH: /factory-firmware
+      ADD_PROVISIONING_ARTIFACT_SECONDS: ${ADD_PROVISIONING_ARTIFACT_SECONDS:-900}
+      ADD_PROVISIONING_INTERNAL_TOKEN: ${ADD_PROVISIONING_INTERNAL_TOKEN:-}
+      ADD_FLEET_ROOT_SECRET: ${ADD_FLEET_ROOT_SECRET:-}
+      ADD_ORDS_BASE_URL: ${ADD_ORDS_BASE_URL:-}
+      ADD_ORDS_USERNAME: ${ADD_ORDS_USERNAME:-}
+      ADD_ORDS_PASSWORD: ${ADD_ORDS_PASSWORD:-}
+      ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64: ${ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64:-}
+    networks: [provisioning-private]
     mem_limit: 768m
     security_opt: [no-new-privileges:true]
 
@@ -95,7 +139,11 @@ services:
 networks:
   add-private:
     driver: bridge
+  provisioning-private:
+    driver: bridge
+    internal: true
 
 volumes:
   add-postgres:
   add-redis:
+  add-provisioning-artifacts:
