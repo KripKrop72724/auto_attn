@@ -23,7 +23,7 @@ jobs:
         include:
           - os: windows-2022
             platform: windows-x64
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
     runs-on: ${{ matrix.os }}
     environment: firmware-signing
