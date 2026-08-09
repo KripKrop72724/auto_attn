@@ -129,7 +129,12 @@ jobs:
           Copy-Item "$source/zone_lite.bin" "$unsigned/zone_lite.bin"
           Copy-Item "$source/flasher_args.json" "$unsigned/flasher_args.json"
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
-          ./deploy/add/bootstrap-firmware-signing.ps1 -VaultDirectory $vault -UnsignedDirectory $unsigned -OutputDirectory factory-bundle -DeviceMac '${{ inputs.hil_device_mac }}'
+          ./deploy/add/bootstrap-firmware-signing.ps1 `
+            -VaultDirectory $vault `
+            -UnsignedDirectory $unsigned `
+            -OutputDirectory factory-bundle `
+            -DeviceMac '${{ inputs.hil_device_mac }}' `
+            -GitSha '${{ needs.provenance.outputs.sha }}'
           Set-Content -LiteralPath 'factory-bundle/.hil-only.json' -Value '{"state":"HIL_ONLY","bytes_must_be_promoted_without_rebuild":true}' -NoNewline
       - uses: actions/upload-artifact@v4
         with:

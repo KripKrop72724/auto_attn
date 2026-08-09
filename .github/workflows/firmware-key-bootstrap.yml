@@ -96,7 +96,8 @@ jobs:
             -VaultDirectory $vault `
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
-            -DeviceMac '${{ inputs.device_mac }}'
+            -DeviceMac '${{ inputs.device_mac }}' `
+            -GitSha '${{ github.sha }}'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-signed-bootstrap-${{ github.sha }}
