@@ -23,7 +23,7 @@ jobs:
         include:
           - os: windows-2022
             platform: windows-x64
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
     runs-on: ${{ matrix.os }}
     environment: firmware-signing
@@ -38,10 +38,18 @@ jobs:
           python-version: "3.12"
       - name: Require the native architecture and exact package version
         shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(python -c 'import tomllib; print(tomllib.load(open("apps/provisioning_companion/pyproject.toml", "rb"))["project"]["version"])')" = "${{ inputs.version }}"
+          arch="$(python -c 'import platform; print(platform.machine().lower())')"
+          case "$TARGET_PLATFORM" in
+            windows-x64) [[ "$arch" = "amd64" || "$arch" = "x86_64" ]] ;;
+            macos-arm64) test "$arch" = "arm64" ;;
+            *) echo "Unsupported release platform: $TARGET_PLATFORM" >&2; exit 1 ;;
+          esac
           python -c 'import platform; print(platform.platform(), platform.machine())'
       - name: Install exact native build dependencies
         run: python -m pip install ./apps/provisioning_companion[build,dev]

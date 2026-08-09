@@ -51,6 +51,7 @@ jobs:
           $requiredChecks = @(
             'blank_device_secure_boot',
             'managed_device_no_efuse_reburn',
+            'legacy_root_attested',
             'foreign_root_rejected',
             'all_ranges_readback_verified',
             'power_loss_recovered',

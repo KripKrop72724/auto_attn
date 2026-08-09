@@ -2,10 +2,12 @@ param(
     [Parameter(Mandatory = $true)][string]$VaultDirectory,
     [Parameter(Mandatory = $true)][string]$UnsignedDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha
 )
 
 $ErrorActionPreference = 'Stop'
+$GitSha = $GitSha.ToLowerInvariant()
 Add-Type -AssemblyName System.Security
 
 function Invoke-DockerText {
@@ -216,7 +218,7 @@ try {
     $package = @{
         schema_version = 1
         target_mac = $DeviceMac.ToLowerInvariant()
-        git_sha = $env:GITHUB_SHA
+        git_sha = $GitSha
         created_at = [DateTime]::UtcNow.ToString('o')
         bootloader_sha256 = (Get-FileHash (Join-Path $output 'bootloader-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
         application_sha256 = (Get-FileHash (Join-Path $output 'zone-lite-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -226,7 +228,7 @@ try {
         & python scripts/build_factory_manifest.py `
             --bundle $output `
             --version $env:ADD_FACTORY_VERSION `
-            --git-sha $env:GITHUB_SHA.ToLowerInvariant() `
+            --git-sha $GitSha `
             --vault-manifest (Join-Path $output 'vault-manifest.json')
         if ($LASTEXITCODE -ne 0) { throw 'Factory manifest generation failed' }
         $signatureBinary = Join-Path $output 'manifest.sig.bin'
