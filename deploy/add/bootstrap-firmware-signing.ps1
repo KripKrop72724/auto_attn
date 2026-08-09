@@ -232,18 +232,44 @@ try {
             --vault-manifest (Join-Path $output 'vault-manifest.json')
         if ($LASTEXITCODE -ne 0) { throw 'Factory manifest generation failed' }
         $signatureBinary = Join-Path $output 'manifest.sig.bin'
-        Invoke-DockerText @(
-            'run', '--rm',
-            '-v', "${output}:/bundle",
-            '-v', "${work}:/work:ro",
-            'espressif/idf:v5.5.3',
-            'openssl', 'dgst', '-sha256',
-            '-sigopt', 'rsa_padding_mode:pss',
-            '-sigopt', 'rsa_pss_saltlen:32',
-            '-sign', '/work/key-1.pem',
-            '-out', '/bundle/manifest.sig.bin',
-            '/bundle/manifest.json'
-        ) | Out-Null
+        $manifestContainer = 'zone-lite-manifest-sign-' + [guid]::NewGuid().ToString('N')
+        try {
+            # The self-hosted runner executes as NETWORK SERVICE. Docker Desktop's
+            # daemon cannot bind-mount that identity's private TEMP directory, so
+            # copy the two inputs into an isolated container just as the image
+            # signing path above does. This keeps the plaintext key out of a
+            # daemon-readable host mount and works with the runner's protected ACL.
+            Invoke-DockerText @(
+                'create', '--name', $manifestContainer, 'espressif/idf:v5.5.3',
+                'tail', '-f', '/dev/null'
+            ) | Out-Null
+            Invoke-DockerText @('start', $manifestContainer) | Out-Null
+            Invoke-DockerText @('exec', $manifestContainer, '/bin/mkdir', '-p', '/bundle', '/work') | Out-Null
+            Invoke-DockerText @(
+                'cp', (Join-Path $output 'manifest.json'),
+                "${manifestContainer}:/bundle/manifest.json"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', (Join-Path $work 'key-1.pem'),
+                "${manifestContainer}:/work/key-1.pem"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'exec', $manifestContainer,
+                'openssl', 'dgst', '-sha256',
+                '-sigopt', 'rsa_padding_mode:pss',
+                '-sigopt', 'rsa_pss_saltlen:32',
+                '-sign', '/work/key-1.pem',
+                '-out', '/bundle/manifest.sig.bin',
+                '/bundle/manifest.json'
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', "${manifestContainer}:/bundle/manifest.sig.bin",
+                $signatureBinary
+            ) | Out-Null
+        }
+        finally {
+            & docker rm -f $manifestContainer 2>$null | Out-Null
+        }
         $encodedSignature = [Convert]::ToBase64String([IO.File]::ReadAllBytes($signatureBinary))
         [IO.File]::WriteAllText(
             (Join-Path $output 'manifest.sig'),
