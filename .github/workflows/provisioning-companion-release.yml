@@ -94,7 +94,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Create isolated release-verification environment
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           # The production runner is deliberately unprivileged. setup-python's
@@ -112,7 +112,7 @@ jobs:
           name: companion-${{ matrix.platform }}-${{ inputs.version }}
           path: companion-candidate
       - name: Verify and atomically publish immutable companion release
-        shell: pwsh
+        shell: powershell
         env:
           ADD_COMPANION_RELEASE_STORE_HOST_PATH: ${{ vars.ADD_COMPANION_RELEASE_STORE_HOST_PATH }}
           ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64: ${{ vars.ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64 }}
