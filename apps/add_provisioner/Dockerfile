@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     IDF_PATH=/opt/esp/idf \
-    PYTHONPATH=/app/firmware/zone_lite/tools
+    PYTHONPATH=/app/firmware/zone_lite/tools \
+    PATH=/opt/esp/python_env/idf5.5_py3.12_env/bin:$PATH
 
 RUN groupadd --system provisioner && useradd --system --gid provisioner provisioner \
     && mkdir -p /artifacts && chown provisioner:provisioner /artifacts
