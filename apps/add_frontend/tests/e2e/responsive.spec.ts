@@ -125,6 +125,14 @@ test.beforeEach(async ({ page }) => mockDashboard(page))
 test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
   await page.goto('/fleet')
   await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Pakistan device network map' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Map' })).toHaveAttribute('aria-pressed', 'true')
+  const islamabadMarker = page.getByRole('button', { name: /Islamabad, 1 device, All online/i })
+  await islamabadMarker.focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' })).toBeVisible()
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await expect(page.locator('.fleet-map-marker-ripple')).toHaveCSS('display', 'none')
   const dimensions = await page.evaluate(() => ({
     viewport: window.innerWidth,
     content: document.documentElement.scrollWidth,
@@ -140,6 +148,7 @@ test('adaptive shell has no horizontal overflow and meets critical accessibility
 
 test('primary routes and device deep link remain usable', async ({ page }) => {
   await page.goto('/fleet')
+  await page.getByRole('button', { name: /Islamabad, 1 device, All online/i }).click()
   await page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' }).click()
   await expect(page).toHaveURL(/\/fleet\/connector-one$/)
   await expect(page.getByRole('dialog', { name: 'SLICTOWER · 3rd Floor' })).toBeVisible()

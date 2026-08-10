@@ -461,6 +461,20 @@ describe('State Life ADD interface', () => {
     expect(await screen.findByText(/3 retrying · 2 identity blocked · 1 quarantined/i)).toBeTruthy()
   })
 
+  it('opens on the Pakistan map and preserves the complete list behind an in-memory toggle', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    expect(await screen.findByRole('region', { name: 'Pakistan device network map' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Map' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    expect(await screen.findByRole('button', { name: `Inspect ${device.display_name}` })).toBeTruthy()
+    expect(screen.queryByRole('region', { name: 'Pakistan device network map' })).toBeNull()
+    expect(window.localStorage.length).toBe(0)
+    expect(window.sessionStorage.length).toBe(0)
+  })
+
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
@@ -816,6 +830,7 @@ describe('State Life ADD interface', () => {
   it('supports semantic keyboard tabs, Escape close, and focus restoration', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(await screen.findByRole('button', { name: /Islamabad, 1 device, All online/i }))
     const inspect = await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
     inspect.focus()
     fireEvent.click(inspect)

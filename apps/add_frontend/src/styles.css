@@ -896,6 +896,11 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .panel-header { padding: 20px 22px; background: #fff; }
 .toolbar { background: var(--surface-muted); }
 .auto-onboard-note { border: 0; border-radius: 9px; color: var(--positive); background: var(--positive-soft); }
+.fleet-panel-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+.fleet-view-toggle button { min-height: 44px; display: inline-flex; align-items: center; gap: 7px; }
+.fleet-view-toggle button svg { width: 16px; height: 16px; }
+.fleet-map-fallback { min-height: 480px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); background: #071a2b; }
+.fleet-map-fallback svg { color: #55c6f2; }
 .search-field input { border-radius: 10px; }
 
 .device-list { gap: 0; background: #fff; }
@@ -1076,6 +1081,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
   .metric-card strong { font-size: 27px; }
   .metric-card small { font-size: 11px; }
   .panel-header { align-items: flex-start; flex-direction: column; }
+  .fleet-panel-actions { width: 100%; align-items: stretch; flex-direction: column; }
+  .fleet-view-toggle { width: 100%; }
+  .fleet-view-toggle button { flex: 1 1 0; justify-content: center; }
   .toolbar { align-items: stretch; flex-direction: column; }
   .device-card-main { grid-template-columns: 42px minmax(0,1fr) auto 18px; }
   .device-card-actions { padding-left: 14px; }
