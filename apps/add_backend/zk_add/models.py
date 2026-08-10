@@ -749,6 +749,7 @@ class ReconciliationJob(Base):
     ords_target_count: Mapped[int] = mapped_column(Integer, default=0)
     ords_confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
     ords_pending_count: Mapped[int] = mapped_column(Integer, default=0)
+    ords_review_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     auto_retry_count: Mapped[int] = mapped_column(Integer, default=0)
     completion_outcome: Mapped[str | None] = mapped_column(String(80), index=True)

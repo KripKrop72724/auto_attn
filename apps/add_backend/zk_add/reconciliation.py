@@ -30,6 +30,11 @@ from zk_add.models import (
     TerminalSourceEpoch,
     ZKTDevice,
 )
+from zk_add.ords_states import (
+    ORDS_IDENTITY_HELD_STATUSES,
+    classify_ords_assurance_status,
+    normalize_ords_status,
+)
 from zk_add.schemas import (
     ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
@@ -55,7 +60,6 @@ ACTIVE_COMMAND_STATES = {
     "CANCEL_REQUESTED",
 }
 ACTIVE_LEASE_STATES = {"REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"}
-ORDS_CONFIRMED_STATES = {"ACKED", "ACKED_CHECK"}
 RECONCILIATION_CAPABILITY = "history_stream_v1"
 RECONCILIATION_V2_CAPABILITY = "history_stream_v2"
 RANGE_RESUME_CAPABILITY = "history_range_resume_verified"
@@ -1203,6 +1207,8 @@ def apply_source_tail_chunk(
 def refresh_reconciliation_assurance(
     session: Session, job: ReconciliationJob
 ) -> ReconciliationJob:
+    if job.status in TERMINAL_JOB_STATES:
+        return job
     manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
         TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
         TerminalRecordManifest.generation == job.terminal_generation,
@@ -1211,17 +1217,61 @@ def refresh_reconciliation_assurance(
         TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
         TerminalRecordManifest.attendance_event_id.is_not(None),
     ).distinct()
-    events = session.scalars(
-        select(AttendanceEvent).where(AttendanceEvent.id.in_(manifest_events))
+    status_rows = session.execute(
+        select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id))
+        .where(AttendanceEvent.id.in_(manifest_events))
+        .group_by(AttendanceEvent.ords_status)
     ).all()
-    target = len(events)
-    confirmed = sum(row.ords_status in ORDS_CONFIRMED_STATES for row in events)
-    blocked = sum(row.ords_status == "BLOCKED_IDENTITY" for row in events)
-    pending = target - confirmed - blocked
+    status_counts: dict[str, int] = {}
+    for status, count in status_rows:
+        normalized = normalize_ords_status(status)
+        status_counts[normalized] = status_counts.get(normalized, 0) + int(count)
+    outcome_counts = {
+        "CONFIRMED": 0,
+        "IDENTITY_HELD": 0,
+        "PENDING": 0,
+        "REVIEW_REQUIRED": 0,
+    }
+    for status, count in status_counts.items():
+        outcome_counts[classify_ords_assurance_status(status)] += count
+    target = sum(status_counts.values())
+    confirmed = outcome_counts["CONFIRMED"]
+    blocked = outcome_counts["IDENTITY_HELD"]
+    pending = outcome_counts["PENDING"]
+    review = outcome_counts["REVIEW_REQUIRED"]
+    review_state_counts = {
+        status: count
+        for status, count in sorted(status_counts.items())
+        if classify_ords_assurance_status(status) == "REVIEW_REQUIRED"
+    }
+    identity_state_counts = {
+        status: count
+        for status, count in sorted(status_counts.items())
+        if status in ORDS_IDENTITY_HELD_STATUSES
+    }
+    previous_counts = (
+        job.ords_target_count,
+        job.ords_confirmed_count,
+        job.ords_pending_count,
+        job.ords_review_count,
+        job.blocked_identity_count,
+    )
     job.ords_target_count = target
     job.ords_confirmed_count = confirmed
-    job.ords_pending_count = max(0, pending)
+    job.ords_pending_count = pending
+    job.ords_review_count = review
     job.blocked_identity_count = blocked
+    now = utc_now()
+    counts_changed = previous_counts != (
+        target,
+        confirmed,
+        pending,
+        review,
+        blocked,
+    )
+    if counts_changed:
+        job.last_progress_at = now
+        job.updated_at = now
     coverage = session.scalar(
         select(ReconciliationCoverage).where(
             ReconciliationCoverage.job_id == job.id,
@@ -1230,21 +1280,80 @@ def refresh_reconciliation_assurance(
     )
     if job.capture_certified_at is None:
         return job
+    if job.status in PAUSED_JOB_STATES:
+        return job
+    managed_oracle_hold = (
+        job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+    )
+    if job.status == "NEEDS_ATTENTION" and not managed_oracle_hold:
+        # Reconciliation assurance must never clear an unrelated source,
+        # identity, device, or operator safety hold.
+        return job
     if job.quarantined_count:
         job.phase = "FINAL_ASSURANCE"
         job.status = "NEEDS_ATTENTION"
         job.wait_reason = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
+    elif review > 0:
+        details = _sealed_evidence({
+            "job_id": job.job_id,
+            "oracle_target": target,
+            "oracle_confirmed": confirmed,
+            "identity_held": blocked,
+            "oracle_pending": pending,
+            "oracle_review_required": review,
+            "review_state_counts": review_state_counts,
+            "observed_at": now.isoformat(),
+            "policy": "APPEND_ONLY_MEMBERSHIP",
+        })
+        state_summary = ", ".join(
+            f"{status}={count}" for status, count in review_state_counts.items()
+        )
+        entering_hold = not managed_oracle_hold or job.status != "NEEDS_ATTENTION"
+        job.phase = "FINAL_ASSURANCE"
+        job.status = "NEEDS_ATTENTION"
+        job.wait_reason = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+        job.error_code = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+        job.error_message = (
+            f"{review:,} preserved attendance event(s) reached a terminal Oracle "
+            f"outcome requiring review ({state_summary}). No attendance or Oracle "
+            "rows were deleted; resolve the recorded outcome before retrying assurance."
+        )
+        if coverage:
+            coverage.oracle_state = "ORACLE_MEMBERSHIP_REVIEW_REQUIRED"
+            if entering_hold or counts_changed or not coverage.oracle_evidence:
+                coverage.oracle_evidence = details
+                coverage.updated_at = now
+        if entering_hold or counts_changed:
+            _event(session, job, "ORACLE_MEMBERSHIP_REVIEW_REQUIRED", details)
     elif pending > 0:
         job.phase = "DRAINING_ORDS"
         job.status = "RUNNING"
+        job.wait_reason = None
+        if managed_oracle_hold:
+            job.error_code = None
+            job.error_message = None
+            _event(
+                session,
+                job,
+                "ORACLE_MEMBERSHIP_RETRYING",
+                {
+                    "oracle_pending": pending,
+                    "oracle_confirmed": confirmed,
+                    "identity_held": blocked,
+                },
+            )
+        if coverage:
+            coverage.oracle_state = "ORACLE_MEMBERSHIP_PENDING"
+            coverage.updated_at = now
     else:
-        now = utc_now()
         evidence = _sealed_evidence({
             "job_id": job.job_id,
             "terminal_serial": job.terminal_serial,
             "certified_source_cursor": job.committed_next_ordinal,
             "oracle_membership_confirmed": confirmed,
             "blocked_identity": blocked,
+            "identity_held_by_status": identity_state_counts,
+            "oracle_review_required": 0,
             "resolvable_event_count": target - blocked,
             "source_chain_digest": job.last_chain_digest,
             "certified_at": now.isoformat(),
@@ -1256,13 +1365,16 @@ def refresh_reconciliation_assurance(
         job.phase = "FINAL_ASSURANCE"
         job.status = "COMPLETED"
         job.wait_reason = None
+        if managed_oracle_hold:
+            job.error_code = None
+            job.error_message = None
         if coverage:
             coverage.oracle_state = "ORACLE_MEMBERSHIP_CERTIFIED"
             coverage.oracle_evidence = evidence
             coverage.oracle_certified_at = now
             coverage.updated_at = now
         _event(session, job, "ORACLE_MEMBERSHIP_CERTIFIED", evidence)
-    job.updated_at = utc_now()
+    job.updated_at = now
     return job
 
 
@@ -1271,6 +1383,7 @@ def refresh_all_reconciliation_assurance(session: Session) -> int:
         select(ReconciliationJob).where(
             ReconciliationJob.capture_certified_at.is_not(None),
             ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
+            ReconciliationJob.status.not_in(PAUSED_JOB_STATES),
         )
     ).all()
     for row in rows:
@@ -1643,6 +1756,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "oracle_target": job.ords_target_count,
             "oracle_confirmed": job.ords_confirmed_count,
             "oracle_pending": job.ords_pending_count,
+            "oracle_review_required": job.ords_review_count,
             "retry_count": job.retry_count,
             "auto_retry_count": job.auto_retry_count,
         },
@@ -2322,10 +2436,20 @@ def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, s
 
 def _eta(job: ReconciliationJob, *, chunks: int, connected: bool) -> dict:
     unavailable = None
-    if not connected:
-        unavailable = "WAITING_FOR_DEVICE"
+    if job.status in TERMINAL_JOB_STATES:
+        unavailable = job.status
     elif job.status in {"PAUSED", "PAUSE_REQUESTED", "NEEDS_ATTENTION"}:
         unavailable = job.wait_reason or job.status
+    elif job.capture_certified_at is not None:
+        # Source scan throughput does not measure the independent Oracle
+        # delivery/check path, so projecting it as an Oracle ETA is misleading.
+        unavailable = (
+            "ORACLE_OUTCOME_REVIEW_REQUIRED"
+            if job.ords_review_count
+            else "ORACLE_PROGRESS_RATE_UNAVAILABLE"
+        )
+    elif not connected:
+        unavailable = "WAITING_FOR_DEVICE"
     elif chunks < 5 or job.started_at is None or job.last_progress_at is None:
         unavailable = "COLLECTING_THROUGHPUT"
     elapsed = 0.0

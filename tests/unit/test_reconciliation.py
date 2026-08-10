@@ -520,6 +520,180 @@ def test_fail_closed_identity_does_not_leave_certified_job_running(
     assert coverage.oracle_state == "ORACLE_MEMBERSHIP_CERTIFIED"
 
 
+def test_identity_reuse_quarantine_is_an_explicit_fail_closed_identity_hold(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    event.ords_status = "QUARANTINED_IDENTITY_REUSE"
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "COMPLETED"
+    assert job.ords_pending_count == 0
+    assert job.ords_review_count == 0
+    assert job.blocked_identity_count == 1
+    assert job.oracle_certificate["identity_held_by_status"] == {
+        "QUARANTINED_IDENTITY_REUSE": 1
+    }
+    assert job.oracle_certificate["resolvable_event_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "ords_status",
+    [
+        "QUARANTINED_INVALID_EVENT_UID",
+        "QUARANTINED_ORDS_REJECTED",
+        "FUTURE_UNCLASSIFIED_TERMINAL_STATE",
+    ],
+)
+def test_terminal_or_unknown_oracle_outcome_requires_review(
+    reconciliation_db,
+    ords_status,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    event.ords_status = ords_status
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "NEEDS_ATTENTION"
+    assert job.phase == "FINAL_ASSURANCE"
+    assert job.wait_reason == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+    assert job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+    assert job.ords_pending_count == 0
+    assert job.ords_review_count == 1
+    assert ords_status in (job.error_message or "")
+    assert not job.oracle_certificate
+    assert coverage.oracle_state == "ORACLE_MEMBERSHIP_REVIEW_REQUIRED"
+    assert coverage.oracle_evidence["review_state_counts"] == {ords_status: 1}
+
+
+@pytest.mark.parametrize(
+    "ords_status",
+    [
+        "PENDING",
+        "FAILED_RETRYABLE",
+        "IN_FLIGHT",
+        "RETRYING",
+        "ACKED_FIRMWARE",
+        "FIRMWARE_RECEIPT_UNVERIFIED",
+        "FIRMWARE_RECEIPT_VERIFYING",
+        "MEMBERSHIP_REVERIFYING",
+        "MEMBERSHIP_REVERIFY_RETRY",
+    ],
+)
+def test_retryable_oracle_outcome_remains_pending(reconciliation_db, ords_status):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    event.ords_status = ords_status
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "RUNNING"
+    assert job.phase == "DRAINING_ORDS"
+    assert job.ords_pending_count == 1
+    assert job.ords_review_count == 0
+    assert coverage.oracle_state == "ORACLE_MEMBERSHIP_PENDING"
+
+
+def test_assurance_refresh_preserves_a_paused_job(reconciliation_db):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    job.status = "PAUSED"
+    job.wait_reason = "Operator is validating the deployment."
+    event.ords_status = "ACKED"
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "PAUSED"
+    assert job.wait_reason == "Operator is validating the deployment."
+    assert job.ords_confirmed_count == 1
+    assert not job.oracle_certificate
+
+
+def test_assurance_refresh_does_not_clear_an_unrelated_safety_hold(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    job.status = "NEEDS_ATTENTION"
+    job.phase = "WAITING_FOR_SAFE_WINDOW"
+    job.wait_reason = "TERMINAL_GENERATION_CHANGED"
+    job.error_code = "TERMINAL_GENERATION_CHANGED"
+    job.error_message = "The terminal identity changed during source capture."
+    event.ords_status = "ACKED"
+
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "NEEDS_ATTENTION"
+    assert job.phase == "WAITING_FOR_SAFE_WINDOW"
+    assert job.error_code == "TERMINAL_GENERATION_CHANGED"
+    assert job.ords_confirmed_count == 1
+    assert not job.oracle_certificate
+
+
+def test_oracle_review_hold_completes_after_the_underlying_outcome_is_resolved(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+    event = session.scalar(select(AttendanceEvent))
+    assert event is not None
+    event.ords_status = "QUARANTINED_ORDS_REJECTED"
+    refresh_reconciliation_assurance(session, job)
+    assert job.status == "NEEDS_ATTENTION"
+
+    event.ords_status = "ACKED_CHECK"
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "COMPLETED"
+    assert job.error_code is None
+    assert job.error_message is None
+    assert job.ords_confirmed_count == 1
+    assert job.ords_review_count == 0
+    assert coverage.oracle_state == "ORACLE_MEMBERSHIP_CERTIFIED"
+
+
+def test_oracle_phase_reports_no_false_source_throughput_eta(reconciliation_db):
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    assert job is not None
+
+    payload = serialize_job(session, job)
+
+    assert payload["progress"]["oracle_review_required"] == 0
+    assert payload["eta"] == {
+        "low_seconds": None,
+        "high_seconds": None,
+        "confidence": "UNAVAILABLE",
+        "unavailable_reason": "ORACLE_PROGRESS_RATE_UNAVAILABLE",
+    }
+
+
 def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
     reconciliation_db,
 ):

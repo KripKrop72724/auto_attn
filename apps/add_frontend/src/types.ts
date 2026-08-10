@@ -292,6 +292,7 @@ export interface ReconciliationJob {
     oracle_target: number
     oracle_confirmed: number
     oracle_pending: number
+    oracle_review_required?: number
     retry_count: number
     auto_retry_count?: number
   }

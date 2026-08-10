@@ -24,6 +24,16 @@ const firmwareCampaignCreatedSchema = z.object({
   campaign_id: z.string().min(1), status: z.string(), eligible: z.number().int().nonnegative(), legacy_skipped: z.number().int().nonnegative(),
 })
 
+const reconciliationEtaLabel = (job: ReconciliationJob) => {
+  if (job.eta.high_seconds != null) return `${Math.ceil(job.eta.high_seconds / 60)} min`
+  if (job.eta.unavailable_reason === 'COMPLETED') return 'Complete'
+  if (['CANCELLED', 'FAILED', 'INVALIDATED'].includes(job.eta.unavailable_reason || '')) return 'Stopped'
+  if (job.eta.unavailable_reason === 'ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW' || job.eta.unavailable_reason === 'ORACLE_OUTCOME_REVIEW_REQUIRED') return 'Review needed'
+  if (job.eta.unavailable_reason === 'ORACLE_PROGRESS_RATE_UNAVAILABLE') return 'Awaiting Oracle'
+  if (job.eta.unavailable_reason === 'WAITING_FOR_DEVICE') return 'Device wait'
+  return 'Measuring'
+}
+
 function SourceExceptionDrawer({
   seed,
   onClose,
@@ -326,6 +336,7 @@ export function ReconciliationView({
   const active = rows.filter((job) => !['COMPLETED', 'FAILED', 'CANCELLED', 'INVALIDATED'].includes(job.status)).length
   const covered = rows.filter((job) => Boolean(job.capture_certified_at)).length
   const pendingOracle = rows.reduce((total, job) => total + job.progress.oracle_pending, 0)
+  const reviewOracle = rows.reduce((total, job) => total + (job.progress.oracle_review_required ?? 0), 0)
   const canStart = Boolean(
     selected && enabled && preflight?.eligible && reason.trim().length >= 10 && password &&
     confirmation === `RECONCILE ${selected.device_id} FROM START`,
@@ -349,7 +360,7 @@ export function ReconciliationView({
       {section === 'jobs' ? <section className="metric-grid">
         <article className="metric-card"><span className="metric-icon"><Icon name="refresh" /></span><div><p>Active jobs</p><strong>{active}</strong><small>{scheduler.device_concurrency} isolated terminal scan slots</small></div></article>
         <article className="metric-card metric-positive"><span className="metric-icon"><Icon name="shield" /></span><div><p>Source certificates</p><strong>{covered}</strong><small>Immutable terminal coverage</small></div></article>
-        <article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>Append-only membership checks</small></div></article>
+        <article className={`metric-card ${reviewOracle ? 'metric-warning' : ''}`}><span className="metric-icon"><Icon name="server" /></span><div><p>Oracle pending</p><strong>{pendingOracle.toLocaleString()}</strong><small>{reviewOracle ? `${reviewOracle.toLocaleString()} terminal outcomes require review` : 'Append-only membership checks'}</small></div></article>
         <article className={`metric-card ${enabled ? 'metric-positive' : 'metric-warning'}`}><span className="metric-icon"><Icon name="power" /></span><div><p>Production gate</p><strong>{enabled ? 'Enabled' : 'Dark'}</strong><small>{enabled ? `${(scheduler.available_credit ?? 0).toLocaleString()} source credits available · ${(scheduler.history_backlog ?? 0).toLocaleString()} Oracle history queued` : 'Awaiting controlled enablement'}</small></div></article>
       </section> : <section className="metric-grid"><article className="metric-card metric-warning"><span className="metric-icon"><Icon name="alert" /></span><div><p>Open exceptions</p><strong>{exceptionTotals.open.toLocaleString()}</strong><small>Awaiting operator review</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="clock" /></span><div><p>Invalid timestamps</p><strong>{exceptionTotals.invalid_time.toLocaleString()}</strong><small>Excluded fail-closed</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="terminal" /></span><div><p>Malformed rows</p><strong>{exceptionTotals.malformed.toLocaleString()}</strong><small>Raw evidence preserved</small></div></article><article className="metric-card"><span className="metric-icon"><Icon name="server" /></span><div><p>Affected terminals</p><strong>{exceptionTotals.affected_terminals.toLocaleString()}</strong><small>Subsequent valid punches continue</small></div></article></section>}
       {section === 'jobs' && <>
@@ -389,7 +400,7 @@ export function ReconciliationView({
               <div className="reconcile-job-head"><div><p className="eyebrow">{job.connector?.zone_id || 'UNKNOWN ZONE'}</p><h3>{job.connector?.display_name || job.job_id}</h3><small>{job.job_id} · requested {dateTime(job.requested_at)}</small></div><StatusBadge state={job.operator_state || job.status} live={job.status === 'RUNNING'} /></div>
               <div className="reconcile-phase"><strong>{(job.operator_state || job.phase).replaceAll('_', ' ')}</strong><span>{queueStatus}</span></div>
               <div className="reconcile-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><i style={{ width: `${percent}%` }} /></div>
-              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> quarantined</span><span><strong>{creditRemaining == null ? 'Legacy' : `${creditRemaining.toLocaleString()} rows`}</strong> burst credit</span><span><strong>{job.eta.high_seconds == null ? 'Collecting' : `${Math.ceil(job.eta.high_seconds / 60)} min`}</strong> ETA range</span><span><strong>{job.recovery?.source_epoch ?? 1}</strong> source epoch</span><span><strong>{job.progress.auto_retry_count ?? 0}</strong> automatic recoveries</span></div>
+              <div className="reconcile-facts"><span><strong>{percent}%</strong> source scan</span><span><strong>{job.progress.add_durable.toLocaleString()}</strong> ADD durable</span><span><strong>{job.progress.oracle_confirmed.toLocaleString()}</strong> Oracle proven</span><span><strong>{job.progress.blocked_identity.toLocaleString()}</strong> identity held</span><span><strong>{(job.progress.oracle_review_required ?? 0).toLocaleString()}</strong> Oracle review</span><span><strong>{job.progress.quarantined.toLocaleString()}</strong> source quarantined</span><span><strong>{creditRemaining == null ? 'Legacy' : `${creditRemaining.toLocaleString()} rows`}</strong> burst credit</span><span><strong>{reconciliationEtaLabel(job)}</strong> ETA</span><span><strong>{job.recovery?.source_epoch ?? 1}</strong> source epoch</span><span><strong>{job.progress.auto_retry_count ?? 0}</strong> automatic recoveries</span></div>
               {job.recovery?.divergence && <div className="info-copy pattern-waiting"><Icon name="shield" /><div><h3>Terminal source verification at ordinal {job.recovery.divergence.ordinal.toLocaleString()}</h3><p>{job.recovery.divergence.observation_count} independent observation(s) preserved. ADD will resume automatically when the evidence converges.</p></div></div>}
               {job.review_required && <div className="info-copy pattern-waiting"><Icon name="alert" /><div><h3>Current truth certified with historical review</h3><p>ADD preserved a terminal-history change. Oracle remains append-only and no evidence was removed.</p></div></div>}
               {job.error_message && <p className="reconcile-error"><Icon name="alert" />{job.error_message}</p>}
