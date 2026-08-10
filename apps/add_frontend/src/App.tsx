@@ -17,6 +17,7 @@ import { AppShell } from './AppShell'
 import { Icon } from './Icon'
 import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
 import { useRealtime, type RealtimeTopic } from './realtime'
+import { normalizedStatus, statusPattern } from './status'
 import type {
   Alert,
   AlertQueueResponse,
@@ -72,6 +73,7 @@ export type ReconciliationDialogState =
 
 export const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
 export const drawerTabs: DrawerTab[] = ['overview', 'logs', 'control']
+export { statusPattern } from './status'
 
 export const dateTime = (value?: string | null) =>
   value
@@ -166,31 +168,6 @@ export const confirmationMatches = (value: string, user: DeviceUser) =>
 
 export const bulkDeletionConfirmation = (count: number, deviceId: string) =>
   `DELETE ${count} USERS FROM ${deviceId}`
-
-const normalizedStatus = (state: unknown) =>
-  typeof state === 'string' && state.trim() ? state.trim() : 'UNKNOWN'
-
-export const statusPattern = (state: unknown) => {
-  const normalized = normalizedStatus(state).toUpperCase()
-  if (
-    ['ONLINE', 'SUCCEEDED', 'CERTIFIED', 'ACTIVE', 'OK', 'RESOLVED', 'COMPLETE', 'COMPLETED', 'AVAILABLE', 'ACKNOWLEDGED'].includes(normalized) ||
-    normalized.includes('ACKED')
-  )
-    return 'confirmed'
-  if (
-    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'HIGH', 'EXPIRED', 'INVALIDATED', 'QUARANTINED', 'BLOCKED_IDENTITY', 'REVOKED'].some(
-      (item) => normalized.includes(item),
-    )
-  )
-    return 'blocked'
-  if (
-    ['WAITING', 'RETRYING', 'DEGRADED', 'FLAPPING', 'PENDING', 'RUNNING', 'WARNING', 'PAUSED', 'CANCEL_REQUESTED'].some((item) =>
-      normalized.includes(item),
-    )
-  )
-    return 'waiting'
-  return 'notice'
-}
 
 export function StatusBadge({
   state,
@@ -310,6 +287,7 @@ export function Dialog({
 }
 
 const Login = lazy(() => import('./features/Login'))
+const FleetMap = lazy(() => import('./features/FleetMap').then((module) => ({ default: module.FleetMap })))
 
 export function PageHeader({
   eyebrow,
@@ -362,6 +340,7 @@ function FleetView({
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('ALL')
   const [sort, setSort] = useState<'name' | 'last-contact' | 'state'>('last-contact')
+  const [mode, setMode] = useState<'map' | 'list'>('map')
   const shown = devices.filter(
     (device) =>
       (filter === 'ALL' || device.state === filter) &&
@@ -404,7 +383,13 @@ function FleetView({
       <section className="panel">
         <header className="panel-header">
           <div><h2>Live fleet</h2><p>State labels and border patterns remain readable without color.</p></div>
-          <div className="auto-onboard-note"><Icon name="shield" /> Secure auto-onboarding enabled</div>
+          <div className="fleet-panel-actions">
+            <div className="segmented-control fleet-view-toggle" role="group" aria-label="Fleet view">
+              <button type="button" className={mode === 'map' ? 'active' : ''} aria-pressed={mode === 'map'} onClick={() => setMode('map')}><Icon name="map" /> Map</button>
+              <button type="button" className={mode === 'list' ? 'active' : ''} aria-pressed={mode === 'list'} onClick={() => setMode('list')}><Icon name="list" /> List</button>
+            </div>
+            <div className="auto-onboard-note"><Icon name="shield" /> Secure auto-onboarding enabled</div>
+          </div>
         </header>
         <div className="toolbar">
           <label className="search-field">
@@ -430,32 +415,44 @@ function FleetView({
           </label>
           <label><span className="sr-only">Sort fleet</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="last-contact">Newest contact first</option><option value="name">Device name</option><option value="state">Operational state</option></select></label>
         </div>
-        <div className="device-list" aria-busy={loading}>
-          {loading && <div className="empty-state"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
-          {!loading && shown.map((device) => (
-            <article className={`device-card pattern-${statusPattern(device.state)}`} key={device.connector_id}>
-              <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
-                <span className="device-symbol"><Icon name="server" /></span>
-                <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
-                <span className="device-terminal"><strong>{device.zkt?.model || 'Awaiting terminal identity'}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
-                <span className="device-activity"><strong>{device.current_activity || 'Idle'}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
-                <StatusBadge state={device.state} live={device.connected} />
-                <Icon name="chevron" />
-              </button>
-              <div className="device-card-actions">
-                <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
-                <span>FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
+        {mode === 'map' ? (
+          <Suspense fallback={<div className="fleet-map-fallback" role="status"><Icon name="refresh" /> Preparing national map…</div>}>
+            <FleetMap
+              devices={shown}
+              loading={loading}
+              onInspect={onInspect}
+              onManageUsers={onManageUsers}
+              formatRelativeTime={relativeTime}
+            />
+          </Suspense>
+        ) : (
+          <div className="device-list" aria-busy={loading}>
+            {loading && <div className="empty-state"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
+            {!loading && shown.map((device) => (
+              <article className={`device-card pattern-${statusPattern(device.state)}`} key={device.connector_id}>
+                <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
+                  <span className="device-symbol"><Icon name="server" /></span>
+                  <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
+                  <span className="device-terminal"><strong>{device.zkt?.model || 'Awaiting terminal identity'}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
+                  <span className="device-activity"><strong>{device.current_activity || 'Idle'}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <StatusBadge state={device.state} live={device.connected} />
+                  <Icon name="chevron" />
+                </button>
+                <div className="device-card-actions">
+                  <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
+                  <span>FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
+                </div>
+              </article>
+            ))}
+            {!loading && !shown.length && (
+              <div className="empty-state">
+                <Icon name="server" />
+                <h3>{devices.length ? 'No devices match these filters.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
+                <p>{devices.length ? 'Change the search or state filter.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
               </div>
-            </article>
-          ))}
-          {!loading && !shown.length && (
-            <div className="empty-state">
-              <Icon name="server" />
-              <h3>{devices.length ? 'No devices match these filters.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
-              <p>{devices.length ? 'Change the search or state filter.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </section>
     </>
   )
