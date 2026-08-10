@@ -11,11 +11,11 @@
   overflow: hidden;
   display: grid;
   grid-template-rows: auto 1fr auto;
-  color: #e9f7fd;
+  color: #f1faff;
   background:
     radial-gradient(circle at 74% 22%, rgba(24, 169, 222, .18), transparent 25%),
     radial-gradient(circle at 20% 84%, rgba(19, 126, 165, .16), transparent 29%),
-    linear-gradient(145deg, #071a2b 0%, #092a40 58%, #071f32 100%);
+    linear-gradient(145deg, #071a2b 0%, #0b2238 58%, #12324f 100%);
 }
 
 .fleet-map-surface::before {
@@ -46,9 +46,9 @@
 
 .fleet-map-surface-head { border-bottom: 1px solid rgba(137, 210, 239, .13); }
 .fleet-map-surface-head span { display: flex; align-items: center; gap: 8px; }
-.fleet-map-surface-head span:first-child { color: #ccecf8; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
-.fleet-map-surface-head span:last-child { color: #759aae; }
-.fleet-map-surface-head svg { width: 16px; color: #5ed4ff; }
+.fleet-map-surface-head span:first-child { color: #dff3fc; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.fleet-map-surface-head span:last-child { color: #7894a6; }
+.fleet-map-surface-head svg { width: 16px; color: #55c6f2; }
 
 .fleet-map-stage {
   position: relative;
@@ -98,18 +98,18 @@
   height: 38px;
   display: grid;
   place-items: center;
-  border: 2px solid #a9bfd0;
+  border: 2px solid #bfd2df;
   border-radius: 50% 50% 50% 8px;
   color: #fff;
-  background: #536c7c;
+  background: #526475;
   box-shadow: 0 10px 24px rgba(0, 0, 0, .34), 0 0 0 5px rgba(255, 255, 255, .07);
   transform: rotate(-45deg);
 }
 
 .fleet-map-marker-dot svg { width: 16px; transform: rotate(45deg); }
-.fleet-map-marker.pattern-confirmed .fleet-map-marker-dot { border-color: #9ce4c9; background: #07845c; }
-.fleet-map-marker.pattern-waiting .fleet-map-marker-dot { border-color: #f2d58c; background: #ba7a13; }
-.fleet-map-marker.pattern-blocked .fleet-map-marker-dot { border-color: #ffc4c8; background: #b83d48; }
+.fleet-map-marker.pattern-confirmed .fleet-map-marker-dot { border-color: #96cfba; background: #0c704d; }
+.fleet-map-marker.pattern-waiting .fleet-map-marker-dot { border-color: #ffd987; background: #9a6500; }
+.fleet-map-marker.pattern-blocked .fleet-map-marker-dot { border-color: #fff0f1; background: #b43b44; }
 .fleet-map-marker.selected .fleet-map-marker-dot { box-shadow: 0 12px 30px rgba(0,0,0,.38), 0 0 0 7px rgba(93, 211, 255, .2); }
 
 .fleet-map-marker-ripple {
@@ -134,7 +134,7 @@
   padding: 8px 10px;
   border: 1px solid rgba(132, 211, 240, .2);
   border-radius: 8px;
-  color: #f0faff;
+  color: #f1faff;
   background: rgba(5, 27, 43, .88);
   box-shadow: 0 9px 24px rgba(0,0,0,.24);
   backdrop-filter: blur(8px);
@@ -146,8 +146,8 @@
 .fleet-map-marker.label-left .fleet-map-marker-label { left: auto; right: 50%; transform: translate(-21px, -50%); text-align: right; }
 .fleet-map-marker.location-swat .fleet-map-marker-label { transform: translate(21px, -88%); }
 .fleet-map-marker.location-islamabad .fleet-map-marker-label { transform: translate(21px, 2%); }
-.fleet-map-marker-label strong { color: #f0faff; font-size: 12px; }
-.fleet-map-marker-label small { color: #86a9ba; font-size: 9px; white-space: nowrap; }
+.fleet-map-marker-label strong { color: #f1faff; font-size: 12px; }
+.fleet-map-marker-label small { color: #8ea8ba; font-size: 9px; white-space: nowrap; }
 
 @keyframes fleet-marker-pulse {
   0% { opacity: .8; transform: scale(.75); }
@@ -167,7 +167,7 @@
   padding: 14px 17px;
   border: 1px solid rgba(127, 209, 239, .22);
   border-radius: 10px;
-  color: #c9e9f6;
+  color: #d9e9f4;
   background: rgba(4, 24, 39, .92);
   box-shadow: 0 14px 35px rgba(0,0,0,.3);
   transform: translate(-50%, -50%);
@@ -175,25 +175,25 @@
   font-weight: 700;
 }
 
-.fleet-map-loading svg { width: 18px; color: #5ed4ff; }
+.fleet-map-loading svg { width: 18px; color: #55c6f2; }
 
-.fleet-map-legend { justify-content: flex-start; flex-wrap: wrap; border-top: 1px solid rgba(137, 210, 239, .13); color: #8cabb9; }
+.fleet-map-legend { justify-content: flex-start; flex-wrap: wrap; border-top: 1px solid rgba(137, 210, 239, .13); color: #8ea8ba; }
 .fleet-map-legend > span { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0 !important; font-size: 10px; }
 .fleet-map-surface .fleet-map-legend > span.pattern-confirmed,
 .fleet-map-surface .fleet-map-legend > span.pattern-waiting,
 .fleet-map-surface .fleet-map-legend > span.pattern-blocked { border: 0 !important; }
-.fleet-map-legend i { width: 7px; height: 7px; border-radius: 50%; background: #7f98a5; }
-.fleet-map-legend .pattern-confirmed i { background: #43d39b; }
-.fleet-map-legend .pattern-waiting i { background: #f0b544; }
-.fleet-map-legend .pattern-blocked i { background: #f06670; }
-.fleet-map-legend small { margin-left: auto; color: #5f8192; }
+.fleet-map-legend i { width: 7px; height: 7px; border-radius: 50%; background: #8da0ad; }
+.fleet-map-legend .pattern-confirmed i { background: #8bcdb4; }
+.fleet-map-legend .pattern-waiting i { background: #d79a23; }
+.fleet-map-legend .pattern-blocked i { background: #e0a2a8; }
+.fleet-map-legend small { margin-left: auto; color: #7894a6; }
 
 .fleet-location-panel {
   min-width: 0;
   max-height: 720px;
   overflow: auto;
   border-left: 1px solid var(--line);
-  background: #f6f9fb;
+  background: #f8fafb;
 }
 
 .fleet-location-panel-head { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 23px 22px 18px; border-bottom: 1px solid var(--line); background: #fff; }
@@ -300,7 +300,7 @@
 }
 
 .fleet-location-device-main:hover { background: #f8fbfc; }
-.fleet-location-device-main > svg { width: 15px; color: #8b9da8; }
+.fleet-location-device-main > svg { width: 15px; color: #8da0ad; }
 .fleet-location-device-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; color: var(--brand-700); background: var(--brand-50); }
 .fleet-location-device-icon svg { width: 16px; }
 .fleet-location-device-copy { min-width: 0; display: grid; gap: 3px; }
@@ -308,7 +308,7 @@
 .fleet-location-device-copy small,
 .fleet-location-device-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fleet-location-device-copy strong { font-size: 12px; }
-.fleet-location-device-copy small { color: #50636e; font-size: 9px; }
+.fleet-location-device-copy small { color: #526475; font-size: 9px; }
 .fleet-location-device-copy > span { color: var(--muted); font-size: 9px; }
 .fleet-location-device-actions { min-height: 49px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 13px 0 59px; border-top: 1px solid var(--line); background: #fbfcfd; }
 .fleet-location-device-actions .text-button { min-height: 44px; padding: 0; border: 0; background: transparent; font-size: 10px; }
@@ -321,7 +321,7 @@
 .fleet-unmapped > header strong,
 .fleet-unmapped > header span { display: block; }
 .fleet-unmapped > header strong { margin-bottom: 3px; font-size: 11px; }
-.fleet-unmapped > header span { color: #7d673e; font-size: 9px; }
+.fleet-unmapped > header span { color: #9a6500; font-size: 9px; }
 .fleet-unmapped .fleet-location-devices { padding: 10px; }
 
 @media (max-width: 1120px) {

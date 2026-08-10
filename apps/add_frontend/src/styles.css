@@ -899,8 +899,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .fleet-panel-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .fleet-view-toggle button { min-height: 44px; display: inline-flex; align-items: center; gap: 7px; }
 .fleet-view-toggle button svg { width: 16px; height: 16px; }
-.fleet-map-fallback { min-height: 480px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); background: #071f32; }
-.fleet-map-fallback svg { color: #5ed4ff; }
+.fleet-map-fallback { min-height: 480px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); background: #071a2b; }
+.fleet-map-fallback svg { color: #55c6f2; }
 .search-field input { border-radius: 10px; }
 
 .device-list { gap: 0; background: #fff; }
