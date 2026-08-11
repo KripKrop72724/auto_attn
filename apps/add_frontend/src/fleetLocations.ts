@@ -28,10 +28,10 @@ export interface FleetLocationResult {
 }
 
 export const fleetLocationDefinitions: FleetLocationDefinition[] = [
-  { id: 'swat', city: 'Swat', region: 'Khyber Pakhtunkhwa', mapX: 69.2, mapY: 26.1, labelSide: 'right' },
-  { id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', mapX: 64.5, mapY: 30.2, labelSide: 'left' },
-  { id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', mapX: 73.1, mapY: 32, labelSide: 'right' },
-  { id: 'karachi', city: 'Karachi', region: 'Sindh', mapX: 39, mapY: 80, labelSide: 'right' },
+  { id: 'swat', city: 'Swat', region: 'Khyber Pakhtunkhwa', mapX: 66, mapY: 17, labelSide: 'right' },
+  { id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', mapX: 55, mapY: 27, labelSide: 'left' },
+  { id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', mapX: 79, mapY: 31, labelSide: 'left' },
+  { id: 'karachi', city: 'Karachi', region: 'Sindh', mapX: 39, mapY: 87, labelSide: 'right' },
 ]
 
 const definitionById = new Map(fleetLocationDefinitions.map((definition) => [definition.id, definition]))

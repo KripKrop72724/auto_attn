@@ -33,6 +33,15 @@ const device = {
   },
 }
 
+const nationwideDevices = [
+  { ...device, connector_id: 'karachi-one', zone_id: 'ZONE-KARACHI-01', zone_name: 'Karachi', display_name: 'Karachi · Main Office', zkt: { ...device.zkt, id: 11, serial: 'KHI-0001' } },
+  { ...device, connector_id: 'peshawar-one', zone_id: 'ZONE-PESHAWAR-01', zone_name: 'Peshawar', display_name: 'Peshawar · Ground Floor', zkt: { ...device.zkt, id: 21, serial: 'PEW-0001' } },
+  { ...device, connector_id: 'peshawar-two', zone_id: 'ZONE-PESH-02', zone_name: 'Peshawar', display_name: 'Peshawar · First Floor', state: 'DEGRADED', zkt: { ...device.zkt, id: 22, serial: 'PEW-0002' } },
+  { ...device, connector_id: 'swat-one', zone_id: 'ZONE-SWAT-01', zone_name: 'Swat', display_name: 'Swat · Regional Office', zkt: { ...device.zkt, id: 31, serial: 'SWT-0001' } },
+  { ...device, connector_id: 'tower-three', zone_id: 'ZONE-SLICTOWER-3FL', zone_name: 'SLICTOWER', display_name: 'SLICTOWER · 3rd Floor', zkt: { ...device.zkt, id: 41, serial: 'ISB-0003' } },
+  { ...device, connector_id: 'tower-thirteen', zone_id: 'ZONE-SLICTOWER-13FL', zone_name: 'SLIC-TOWER', display_name: 'SLICTOWER · 13th Floor', zkt: { ...device.zkt, id: 42, serial: 'ISB-0013' } },
+]
+
 const sourceException = {
   id: 1,
   connector_id: device.connector_id,
@@ -144,6 +153,55 @@ test('adaptive shell has no horizontal overflow and meets critical accessibility
   expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+})
+
+test('nationwide fleet keeps clustered city beacons stable and location details contextual', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/devices*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ rows: nationwideDevices }),
+  }))
+  await page.route('**/api/v1/overview*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ total: 6, online: 5, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
+  }))
+
+  await page.goto('/fleet')
+  const markers = page.locator('.fleet-map-marker')
+  await expect(markers).toHaveCount(4)
+  const centers = await markers.evaluateAll((nodes) => nodes.map((node) => {
+    const box = node.getBoundingClientRect()
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  }))
+  const closestPair = Math.min(...centers.flatMap((left, index) => centers.slice(index + 1).map((right) => Math.hypot(left.x - right.x, left.y - right.y))))
+  expect(closestPair).toBeGreaterThan(40)
+
+  const peshawar = page.getByRole('button', { name: /Peshawar, 2 devices, Needs attention/i })
+  const beforeSelection = await peshawar.evaluate((node) => {
+    const box = node.getBoundingClientRect()
+    return { x: box.x + window.scrollX, y: box.y + window.scrollY }
+  })
+  await peshawar.click()
+  await expect(page.getByRole('heading', { name: 'Peshawar' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Inspect Peshawar/ })).toHaveCount(2)
+  const afterSelection = await peshawar.evaluate((node) => {
+    const box = node.getBoundingClientRect()
+    return { x: box.x + window.scrollX, y: box.y + window.scrollY }
+  })
+  expect(Math.abs(afterSelection.x - beforeSelection.x)).toBeLessThan(1)
+  expect(Math.abs(afterSelection.y - beforeSelection.y)).toBeLessThan(1)
+
+  await page.getByRole('button', { name: /Islamabad, 2 devices, All online/i }).click()
+  await expect(page.getByRole('heading', { name: 'Islamabad' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Inspect SLICTOWER/ })).toHaveCount(2)
+  if ((page.viewportSize()?.width || 0) > 920) {
+    const canvasBox = await page.locator('.fleet-map-canvas').boundingBox()
+    const sheetBox = await page.locator('.fleet-location-sheet').boundingBox()
+    expect((sheetBox?.width || 0)).toBeLessThanOrEqual(400)
+    expect((sheetBox?.height || 0)).toBeLessThan(canvasBox?.height || 0)
+  }
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('nationwide-map.png'), fullPage: true })
 })
 
 test('primary routes and device deep link remain usable', async ({ page }) => {
