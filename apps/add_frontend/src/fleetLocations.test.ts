@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { groupFleetLocations, resolveFleetLocation } from './fleetLocations'
+import { fleetLocationDefinitions, groupFleetLocations, projectFleetCoordinates, resolveFleetLocation } from './fleetLocations'
 import type { Device } from './types'
 
 const device = (overrides: Partial<Device> = {}): Device => ({
@@ -36,6 +36,20 @@ describe('fleet location resolution', () => {
 
   it('keeps unknown locations explicit', () => {
     expect(resolveFleetLocation({ zone_id: 'ZONE-LAHORE-01', zone_name: 'Punjab', display_name: 'Branch 1' })).toBeNull()
+  })
+
+  it('projects the actual city centers onto the bundled Pakistan vector', () => {
+    const expected = {
+      swat: { mapX: 69.21, mapY: 20.98 },
+      peshawar: { mapX: 64.50, mapY: 25.91 },
+      islamabad: { mapX: 73.09, mapY: 28.07 },
+      karachi: { mapX: 39.00, mapY: 85.67 },
+    }
+    for (const definition of fleetLocationDefinitions) {
+      expect(definition.mapX).toBeCloseTo(expected[definition.id].mapX, 1)
+      expect(definition.mapY).toBeCloseTo(expected[definition.id].mapY, 1)
+      expect(projectFleetCoordinates(definition.latitude, definition.longitude)).toEqual({ mapX: definition.mapX, mapY: definition.mapY })
+    }
   })
 })
 
