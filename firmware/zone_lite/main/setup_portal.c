@@ -44,6 +44,8 @@
 #define PORTAL_BUTTON_HOLD_MS  5000
 #define PORTAL_STA_RETRY_MS    5000
 #define PORTAL_ACTIVE_STA_RETRY_MS (60 * 1000)
+#define PORTAL_HTTP_MAX_OPEN_SOCKETS 7
+#define PORTAL_HTTP_MAX_URI_HANDLERS 16
 #define PORTAL_PENDING_ROLLBACK_MS (15 * 60 * 1000)
 #define VALIDATION_TIMEOUT_MS  30000
 #define VALIDATION_OK_BIT      BIT0
@@ -76,8 +78,6 @@ static int64_t s_disconnected_since_ms;
 static int64_t s_connected_since_ms;
 static int64_t s_last_sta_retry_ms;
 static int64_t s_last_activity_ms;
-static int64_t s_lockout_until_ms;
-static uint8_t s_failed_passwords;
 static bool s_pending_rollback_attempted;
 static char s_csrf[33];
 static portal_result_t s_result = PORTAL_RESULT_IDLE;
@@ -117,11 +117,8 @@ static bool constant_time_equal(const char *left, const char *right)
     return diff == 0;
 }
 
-static void wipe_json_credentials(cJSON *setup_password, cJSON *wifi_password)
+static void wipe_json_password(cJSON *wifi_password)
 {
-    if (cJSON_IsString(setup_password) && setup_password->valuestring) {
-        secure_zero(setup_password->valuestring, strlen(setup_password->valuestring));
-    }
     if (cJSON_IsString(wifi_password) && wifi_password->valuestring) {
         secure_zero(wifi_password->valuestring, strlen(wifi_password->valuestring));
     }
@@ -170,6 +167,10 @@ static esp_err_t begin_response(httpd_req_t *request, const char *content_type)
     httpd_resp_set_hdr(request, "X-Frame-Options", "DENY");
     httpd_resp_set_hdr(request, "Referrer-Policy", "no-referrer");
     httpd_resp_set_hdr(request, "Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    // Captive-network probes and browsers often retain idle HTTP/1.1
+    // connections. The portal is stateless, so close every response and keep
+    // admission capacity available for the actual setup page and API calls.
+    httpd_resp_set_hdr(request, "Connection", "close");
     return ESP_OK;
 }
 
@@ -212,8 +213,16 @@ static esp_err_t js_handler(httpd_req_t *request)
 
 static bool compatible_auth(wifi_auth_mode_t mode)
 {
-    return mode == WIFI_AUTH_WPA2_PSK || mode == WIFI_AUTH_WPA2_WPA3_PSK ||
-           mode == WIFI_AUTH_WPA3_PSK;
+    return mode == WIFI_AUTH_WPA_WPA2_PSK || mode == WIFI_AUTH_WPA2_PSK ||
+           mode == WIFI_AUTH_WPA2_WPA3_PSK || mode == WIFI_AUTH_WPA3_PSK;
+}
+
+static const char *auth_label(wifi_auth_mode_t mode)
+{
+    if (mode == WIFI_AUTH_WPA3_PSK) return "WPA3";
+    if (mode == WIFI_AUTH_WPA2_WPA3_PSK) return "WPA2/WPA3";
+    if (mode == WIFI_AUTH_WPA_WPA2_PSK) return "WPA/WPA2";
+    return "WPA2";
 }
 
 static int compare_access_points(const void *left, const void *right)
@@ -233,7 +242,21 @@ static esp_err_t networks_handler(httpd_req_t *request)
         return send_json(request, "409 Conflict", payload);
     }
 
-    wifi_scan_config_t scan = {.show_hidden = true};
+    // A bounded background recovery probe may still be associating when the
+    // user asks for a scan. Cancel only that disconnected probe and restart
+    // its one-minute clock; an already healthy station link is left intact.
+    if (s_disconnected_since_ms) {
+        s_last_sta_retry_ms = now_ms();
+        (void)esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    wifi_scan_config_t scan = {
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {.min = 0, .max = 120},
+        .home_chan_dwell_time = 30,
+        .coex_background_scan = true,
+    };
     esp_err_t err = esp_wifi_scan_start(&scan, true);
     uint16_t count = 0;
     if (err == ESP_OK) err = esp_wifi_scan_get_ap_num(&count);
@@ -266,6 +289,7 @@ static esp_err_t networks_handler(httpd_req_t *request)
         cJSON *network = cJSON_CreateObject();
         cJSON_AddStringToObject(network, "ssid", (char *)records[index].ssid);
         cJSON_AddNumberToObject(network, "rssi", records[index].rssi);
+        cJSON_AddStringToObject(network, "security", auth_label(records[index].authmode));
         cJSON_AddItemToArray(networks, network);
         if (cJSON_GetArraySize(networks) >= 20) break;
     }
@@ -375,11 +399,6 @@ static esp_err_t network_post_handler(httpd_req_t *request)
     if (begin_response(request, "application/json") != ESP_OK) return ESP_OK;
     s_last_activity_ms = now_ms();
     cJSON *payload = cJSON_CreateObject();
-    int64_t current = now_ms();
-    if (current < s_lockout_until_ms) {
-        cJSON_AddStringToObject(payload, "message", "Too many incorrect setup passwords. Try again in one minute.");
-        return send_json(request, "429 Too Many Requests", payload);
-    }
     if (s_station_owned || ota_manager_busy()) {
         cJSON_AddStringToObject(payload, "message", "The device is busy. Try again shortly.");
         return send_json(request, "409 Conflict", payload);
@@ -402,45 +421,39 @@ static esp_err_t network_post_handler(httpd_req_t *request)
     cJSON *input = cJSON_ParseWithLength(body, received);
     secure_zero(body, sizeof(body));
     cJSON *csrf = input ? cJSON_GetObjectItemCaseSensitive(input, "csrf") : NULL;
-    cJSON *setup_password = input ? cJSON_GetObjectItemCaseSensitive(input, "setup_password") : NULL;
     cJSON *ssid = input ? cJSON_GetObjectItemCaseSensitive(input, "ssid") : NULL;
     cJSON *password = input ? cJSON_GetObjectItemCaseSensitive(input, "password") : NULL;
-    bool valid_fields = cJSON_IsString(csrf) && cJSON_IsString(setup_password) &&
-                        cJSON_IsString(ssid) && cJSON_IsString(password);
-    bool authorized = valid_fields && constant_time_equal(csrf->valuestring, s_csrf) &&
-                      constant_time_equal(setup_password->valuestring, ZONE_LITE_SETUP_PASSWORD);
+    bool valid_fields = cJSON_IsString(csrf) && cJSON_IsString(ssid) &&
+                        cJSON_IsString(password);
+    // WPA2 admission to the one-client setup AP is the authentication
+    // boundary. The unpredictable per-boot token prevents cross-origin
+    // submission, and begin_response() restricts every request to the AP
+    // interface and subnet.
+    bool authorized = valid_fields && constant_time_equal(csrf->valuestring, s_csrf);
     if (!authorized) {
-        if (valid_fields && constant_time_equal(csrf->valuestring, s_csrf)) {
-            s_failed_passwords++;
-            if (s_failed_passwords >= 5) {
-                s_failed_passwords = 0;
-                s_lockout_until_ms = current + 60000;
-            }
-        }
-        wipe_json_credentials(setup_password, password);
+        wipe_json_password(password);
         cJSON_Delete(input);
-        cJSON_AddStringToObject(payload, "message", "The setup password is incorrect.");
+        cJSON_AddStringToObject(payload, "message", "The setup session is invalid. Reload the page and try again.");
         return send_json(request, "403 Forbidden", payload);
     }
-    s_failed_passwords = 0;
     size_t ssid_length = strlen(ssid->valuestring);
     size_t password_length = strlen(password->valuestring);
     if (ssid_length == 0 || ssid_length > 32 || password_length < 8 || password_length > 63) {
-        wipe_json_credentials(setup_password, password);
+        wipe_json_password(password);
         cJSON_Delete(input);
         cJSON_AddStringToObject(payload, "message", "Use a valid SSID and an 8–63 character WPA2/WPA3 password.");
         return send_json(request, "400 Bad Request", payload);
     }
     validation_request_t *candidate = calloc(1, sizeof(*candidate));
     if (!candidate) {
-        wipe_json_credentials(setup_password, password);
+        wipe_json_password(password);
         cJSON_Delete(input);
         cJSON_AddStringToObject(payload, "message", "The device is temporarily busy.");
         return send_json(request, "503 Service Unavailable", payload);
     }
     strlcpy(candidate->ssid, ssid->valuestring, sizeof(candidate->ssid));
     strlcpy(candidate->password, password->valuestring, sizeof(candidate->password));
-    wipe_json_credentials(setup_password, password);
+    wipe_json_password(password);
     cJSON_Delete(input);
     set_result(PORTAL_RESULT_TESTING, "Testing the new network for up to 30 seconds…");
     if (xTaskCreate(validation_task, "wifi_validate", 6144, candidate, 3, NULL) != pdPASS) {
@@ -511,9 +524,11 @@ finished:
 static esp_err_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
-    config.max_open_sockets = 2;
+    config.max_uri_handlers = PORTAL_HTTP_MAX_URI_HANDLERS;
+    config.max_open_sockets = PORTAL_HTTP_MAX_OPEN_SOCKETS;
     config.lru_purge_enable = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
     config.uri_match_fn = httpd_uri_match_wildcard;
     esp_err_t err = httpd_start(&s_httpd, &config);
     if (err != ESP_OK) return err;
@@ -524,6 +539,12 @@ static esp_err_t start_http_server(void)
         {.uri = "/api/networks", .method = HTTP_GET, .handler = networks_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/network", .method = HTTP_POST, .handler = network_post_handler},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/gen_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = redirect_handler},
         {.uri = "/*", .method = HTTP_GET, .handler = redirect_handler},
     };
     for (size_t index = 0; index < sizeof(routes) / sizeof(routes[0]); ++index) {
@@ -576,6 +597,10 @@ static esp_err_t portal_start(bool recovery)
     // discovery window before the first bounded recovery probe.
     s_last_sta_retry_ms = s_last_activity_ms;
     s_active = true;
+    // Stop any in-flight association inherited from the normal retry loop.
+    // Disconnect events are now owned by the active portal, so this cannot
+    // restart the rapid retry storm and the first user scan is deterministic.
+    (void)esp_wifi_disconnect();
     esp_err_t err = start_http_server();
     if (err != ESP_OK) {
         s_active = false;

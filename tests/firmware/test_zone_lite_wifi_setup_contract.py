@@ -7,7 +7,7 @@ PORTAL = (FIRMWARE / "main" / "setup_portal.c").read_text(encoding="utf-8")
 ASSETS = (FIRMWARE / "main" / "setup_portal_assets.c").read_text(encoding="utf-8")
 
 
-def test_setup_credential_is_build_injected_and_portal_fails_closed_without_it() -> None:
+def test_setup_ap_credential_is_build_injected_and_portal_fails_closed_without_it() -> None:
     cmake = (FIRMWARE / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
     template = (FIRMWARE / "main" / "setup_password.h.in").read_text(encoding="utf-8")
     assert '"$ENV{ZONE_LITE_SETUP_PASSWORD}"' in cmake
@@ -16,9 +16,11 @@ def test_setup_credential_is_build_injected_and_portal_fails_closed_without_it()
     assert "@ZONE_LITE_SETUP_PASSWORD@" in template
     assert "if (!ZONE_LITE_SETUP_PASSWORD_IS_PRODUCTION)" in PORTAL
     assert "ZONE_LITE_SETUP_PASSWORD" in PORTAL
+    assert "strlcpy((char *)ap.ap.password, ZONE_LITE_SETUP_PASSWORD" in PORTAL
     assert "constant_time_equal" in PORTAL
-    assert "s_failed_passwords >= 5" in PORTAL
-    assert "s_lockout_until_ms = current + 60000" in PORTAL
+    assert "constant_time_equal(csrf->valuestring, s_csrf)" in PORTAL
+    assert 'GetObjectItemCaseSensitive(input, "setup_password")' not in PORTAL
+    assert "setup-password" not in ASSETS
 
 
 def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> None:
@@ -32,6 +34,18 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "local_ip == 0xC0A8FE01UL" in PORTAL
     assert "(peer_ip & PORTAL_MASK) == PORTAL_NET" in PORTAL
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
+    assert "PORTAL_HTTP_MAX_OPEN_SOCKETS 7" in PORTAL
+    assert "config.max_open_sockets = PORTAL_HTTP_MAX_OPEN_SOCKETS" in PORTAL
+    assert 'httpd_resp_set_hdr(request, "Connection", "close")' in PORTAL
+    for captive_path in (
+        "/hotspot-detect.html",
+        "/library/test/success.html",
+        "/generate_204",
+        "/gen_204",
+        "/connecttest.txt",
+        "/ncsi.txt",
+    ):
+        assert f'.uri = "{captive_path}"' in PORTAL
     prepare = PORTAL[
         PORTAL.index("esp_err_t setup_portal_prepare") :
         PORTAL.index("esp_err_t setup_portal_start_controller")
@@ -81,12 +95,43 @@ def test_active_portal_preserves_softap_beacon_airtime():
     assert "if (s_active) return true;" in disconnect
 
 
+def test_user_scan_preempts_only_a_disconnected_recovery_probe() -> None:
+    networks = PORTAL[
+        PORTAL.index("static esp_err_t networks_handler") :
+        PORTAL.index("static esp_err_t status_handler")
+    ]
+    assert "if (s_disconnected_since_ms)" in networks
+    assert "s_last_sta_retry_ms = now_ms()" in networks
+    assert "esp_wifi_disconnect()" in networks
+    assert "esp_wifi_scan_start(&scan, true)" in networks
+    assert 'cJSON_AddStringToObject(network, "security"' in networks
+    assert "WIFI_AUTH_WPA_WPA2_PSK" in PORTAL
+
+
+def test_state_life_portal_exposes_complete_single_password_flow() -> None:
+    for text in (
+        "STATE LIFE INSURANCE CORPORATION OF PAKISTAN",
+        "Zone Lite Wi-Fi setup",
+        "Choose Wi-Fi",
+        "Test &amp; save",
+        "Scan again",
+        "Hidden network",
+        "Wi-Fi password",
+        "Test connection and save",
+    ):
+        assert text in ASSETS
+    assert "toggle-password" in ASSETS
+    assert "setup-password" not in ASSETS
+    assert "setup_password:" not in ASSETS
+    assert "JSON.stringify({csrf:$('#csrf').value,ssid,password})" in ASSETS
+
+
 def test_only_network_selection_routes_are_exposed() -> None:
     for route in ("/api/networks", "/api/status", "/api/network"):
         assert f'.uri = "{route}"' in PORTAL
     for forbidden in ("/api/log", "/api/user", "/api/attendance", "/api/ota", "/api/file", "/api/zkt"):
         assert forbidden not in PORTAL
-    assert "No attendance, device, or update controls are exposed" in ASSETS
+    assert "No attendance, user, device-control, or update functions are exposed" in ASSETS
     assert "http://" not in ASSETS
     assert "https://" not in ASSETS
     assert "Content-Security-Policy" in PORTAL
@@ -103,7 +148,7 @@ def test_candidate_network_is_tested_before_one_atomic_encrypted_nvs_commit() ->
     assert 'nvs_set_str(handle, "wifi_pass", password)' in save_wifi
     assert save_wifi.count("nvs_commit(handle)") == 1
     assert "secure_zero(candidate" in PORTAL
-    assert "wipe_json_credentials" in PORTAL
+    assert "wipe_json_password" in PORTAL
 
 
 def test_ota_and_local_network_change_are_mutually_exclusive() -> None:
