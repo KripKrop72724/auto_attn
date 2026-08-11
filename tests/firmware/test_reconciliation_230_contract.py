@@ -11,8 +11,8 @@ WEB = (ROOT / "apps/add_backend/zk_add/web.py").read_text()
 RECONCILIATION = (ROOT / "apps/add_backend/zk_add/reconciliation.py").read_text()
 
 
-def test_249_uses_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.4.9)" in PROJECT
+def test_2410_uses_bounded_verified_range_resume_and_add_checkpoints():
+    assert "project(zone_lite VERSION 2.4.10)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE

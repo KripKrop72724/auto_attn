@@ -1,4 +1,4 @@
-# Zone Lite 2.4.9 deterministic captive portal client authorization
+# Zone Lite 2.4.9 deterministic captive portal client authorization (rejected before HIL)
 
 Zone Lite 2.4.9 supersedes the rejected, never-promoted 2.4.8 canary. Physical
 acceptance testing showed that querying ESP-IDF's associated-station and DHCP
@@ -21,9 +21,8 @@ current DHCP assignment. The protected one-client WPA2 setup AP, per-boot CSRF
 token, dormant-by-default lifecycle, test-before-save flow, encrypted atomic
 NVS storage, OTA exclusion, and rollback safeguards remain unchanged.
 
-The authorization state machine has host-executed lifecycle coverage for event
-ordering, stale leases, renewals, replacement clients, and disconnects. Release
-2.4.9 only as exact-MAC `HIL_ONLY` first. It may move to the Swat canary and then
-the existing gated nationwide rollout only after repeated physical page loads,
-asset/API requests, concurrent captive probes, credential rollback, reboot,
-and normal attendance operation all pass on the attached board.
+Post-merge review found two event-order defects before any signing, HIL
+publication, or device flash. A DHCP assignment delivered before the association
+callback could be erased by that later callback, while an assignment delivered
+after disconnect could recreate stale authorization. This version therefore
+remained unpublished and must not be used. Zone Lite 2.4.10 supersedes it.
