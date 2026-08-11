@@ -1,9 +1,13 @@
+import subprocess
+import textwrap
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 FIRMWARE = ROOT / "firmware" / "zone_lite"
 PORTAL = (FIRMWARE / "main" / "setup_portal.c").read_text(encoding="utf-8")
+PORTAL_HEADER = (FIRMWARE / "main" / "setup_portal.h").read_text(encoding="utf-8")
+ZONE = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 ASSETS = (FIRMWARE / "main" / "setup_portal_assets.c").read_text(encoding="utf-8")
 
 
@@ -32,9 +36,15 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "esp_wifi_set_mode(WIFI_MODE_STA)" in PORTAL
     assert "request_from_ap" in PORTAL
     assert "(peer_ip & PORTAL_MASK) != PORTAL_NET" in PORTAL
-    assert "esp_wifi_ap_get_sta_list(&wifi_stations)" in PORTAL
-    assert "esp_wifi_ap_get_sta_list_with_ip(&wifi_stations, &ip_stations)" in PORTAL
-    assert "ip_stations.sta[index].ip.addr == peer.sin_addr.s_addr" in PORTAL
+    assert "esp_wifi_ap_get_sta_list(&" not in PORTAL
+    assert '#include "esp_wifi_ap_get_sta_list.h"' not in PORTAL
+    assert "setup_portal_client_auth_allows" in PORTAL
+    assert "IP_EVENT_AP_STAIPASSIGNED" in ZONE
+    assert "setup_portal_handle_ap_station_ip_assigned" in ZONE
+    assert "setup_portal_handle_ap_station_connected" in ZONE
+    assert "setup_portal_handle_ap_station_disconnected" in ZONE
+    assert "PORTAL_CLIENT_AUTH_WAIT_MS 1500" in PORTAL
+    assert "xEventGroupWaitBits" in PORTAL
     assert "getsockname(fd" not in PORTAL
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
     assert "PORTAL_HTTP_MAX_OPEN_SOCKETS 7" in PORTAL
@@ -66,6 +76,83 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "esp_netif_dhcps_stop(s_ap_netif)" in stop
     assert "CONFIG_LWIP_IP_FORWARD=n" in defaults
     assert "ip_napt_enable" not in PORTAL
+
+
+def test_setup_client_authorization_survives_event_order_and_rejects_stale_leases(
+    tmp_path: Path,
+) -> None:
+    auth_source = FIRMWARE / "main" / "setup_portal_client_auth.c"
+    harness = tmp_path / "portal_auth_harness.c"
+    executable = tmp_path / "portal_auth_harness"
+    harness.write_text(
+        textwrap.dedent(
+            """
+            #include <assert.h>
+            #include <stdint.h>
+            #include "setup_portal_client_auth.h"
+
+            int main(void) {
+                const uint8_t mac_a[6] = {0, 1, 2, 3, 4, 5};
+                const uint8_t mac_b[6] = {6, 7, 8, 9, 10, 11};
+                const uint32_t ip_a = UINT32_C(0x02fea8c0);
+                const uint32_t ip_b = UINT32_C(0x03fea8c0);
+                setup_portal_client_auth_t state;
+
+                setup_portal_client_auth_reset(&state);
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+
+                setup_portal_client_auth_connected(&state, mac_a);
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+                assert(!setup_portal_client_auth_ip_assigned(&state, mac_b, ip_b));
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a));
+                assert(setup_portal_client_auth_allows(&state, ip_a));
+                assert(!setup_portal_client_auth_allows(&state, ip_b));
+
+                /* A DHCP renewal atomically replaces the prior address. */
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_b));
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+                assert(setup_portal_client_auth_allows(&state, ip_b));
+                assert(!setup_portal_client_auth_disconnected(&state, mac_b));
+                assert(setup_portal_client_auth_allows(&state, ip_b));
+                assert(setup_portal_client_auth_disconnected(&state, mac_a));
+                assert(!setup_portal_client_auth_allows(&state, ip_b));
+
+                /* DHCP may be delivered before the association callback. */
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a));
+                assert(setup_portal_client_auth_allows(&state, ip_a));
+
+                /* A new association invalidates the old lease immediately. */
+                setup_portal_client_auth_connected(&state, mac_b);
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+                assert(!setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a));
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_b, ip_b));
+                assert(setup_portal_client_auth_allows(&state, ip_b));
+                return 0;
+            }
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "cc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(FIRMWARE / "main"),
+            str(auth_source),
+            str(harness),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
+
+    assert "IP_EVENT_AP_STAIPASSIGNED" in ZONE
+    assert "setup_portal_handle_ap_station_ip_assigned" in PORTAL_HEADER
 
 
 def test_recovery_and_manual_activation_windows_match_the_operating_contract() -> None:

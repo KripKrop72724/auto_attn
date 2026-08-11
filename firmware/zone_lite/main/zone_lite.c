@@ -8521,8 +8521,16 @@ static int64_t gateway_run(uint32_t host_order_ip)
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
-    (void)event_data;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        setup_portal_handle_ap_station_connected(event->mac);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+        setup_portal_handle_ap_station_disconnected(event->mac);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+        ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+        setup_portal_handle_ap_station_ip_assigned(event->mac, event->ip.addr);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         led_status_set(LED_STATUS_WIFI_CONNECTING);
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -8570,8 +8578,10 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_t instance_ap_sta_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, &event_handler, NULL, &instance_ap_sta_ip));
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, ZONE_LITE_WIFI_SSID, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, ZONE_LITE_WIFI_PASSWORD, sizeof(wifi_config.sta.password));

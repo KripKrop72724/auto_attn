@@ -24,7 +24,6 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "esp_wifi_ap_get_sta_list.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -32,6 +31,7 @@
 
 #include "ota_manager.h"
 #include "setup_password.h"
+#include "setup_portal_client_auth.h"
 #include "setup_portal_assets.h"
 #include "zone_config.h"
 
@@ -51,6 +51,8 @@
 #define VALIDATION_TIMEOUT_MS  30000
 #define VALIDATION_OK_BIT      BIT0
 #define VALIDATION_FAIL_BIT    BIT1
+#define PORTAL_CLIENT_AUTH_WAIT_MS 1500
+#define PORTAL_CLIENT_IP_READY_BIT BIT0
 
 typedef enum {
     PORTAL_RESULT_IDLE,
@@ -69,6 +71,7 @@ static esp_netif_t *s_ap_netif;
 static setup_portal_station_visibility_cb_t s_visibility_cb;
 static httpd_handle_t s_httpd;
 static EventGroupHandle_t s_validation_events;
+static EventGroupHandle_t s_ap_client_events;
 static TaskHandle_t s_dns_task;
 static volatile bool s_active;
 static volatile bool s_recovery_mode;
@@ -83,6 +86,8 @@ static bool s_pending_rollback_attempted;
 static char s_csrf[33];
 static portal_result_t s_result = PORTAL_RESULT_IDLE;
 static char s_result_message[128] = "Ready to select a network.";
+static setup_portal_client_auth_t s_ap_client_auth;
+static bool s_ap_auth_tracking;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static int64_t now_ms(void)
@@ -152,25 +157,44 @@ static bool request_from_ap(httpd_req_t *request)
     uint32_t peer_ip = ntohl(peer.sin_addr.s_addr);
     if ((peer_ip & PORTAL_MASK) != PORTAL_NET) return false;
 
-    // ESP-IDF's HTTP server listens on INADDR_ANY.  On lwIP an accepted
-    // socket may therefore retain 0.0.0.0 as its local address, so using
-    // getsockname() to prove that a request arrived through the SoftAP rejects
-    // legitimate captive-portal clients.  Authorize only an IP currently
-    // leased to a station associated with this protected, one-client SoftAP.
-    // This preserves the interface boundary even if the STA-side network also
-    // happens to use 192.168.254.0/24.
-    wifi_sta_list_t wifi_stations = {0};
-    wifi_sta_mac_ip_list_t ip_stations = {0};
-    if (esp_wifi_ap_get_sta_list(&wifi_stations) != ESP_OK || wifi_stations.num < 1) {
-        return false;
+    // The live esp_wifi_ap_get_sta_list_with_ip() snapshot can report an
+    // associated station before lwIP has published its DHCP lease. Polling
+    // that race on every request made valid clients intermittently receive a
+    // permanent 404. Instead, cache the authoritative DHCP assignment event
+    // until the matching station disconnects. A first captive request may
+    // arrive just ahead of the event-loop callback, so allow it one short,
+    // bounded wait before checking the cache again.
+    bool allowed;
+    portENTER_CRITICAL(&s_lock);
+    allowed = s_ap_auth_tracking &&
+              setup_portal_client_auth_allows(&s_ap_client_auth, peer.sin_addr.s_addr);
+    portEXIT_CRITICAL(&s_lock);
+    if (allowed) return true;
+
+    if (s_ap_client_events) {
+        (void)xEventGroupWaitBits(
+            s_ap_client_events,
+            PORTAL_CLIENT_IP_READY_BIT,
+            pdFALSE,
+            pdFALSE,
+            pdMS_TO_TICKS(PORTAL_CLIENT_AUTH_WAIT_MS));
     }
-    if (esp_wifi_ap_get_sta_list_with_ip(&wifi_stations, &ip_stations) != ESP_OK) {
-        return false;
+    portENTER_CRITICAL(&s_lock);
+    allowed = s_ap_auth_tracking &&
+              setup_portal_client_auth_allows(&s_ap_client_auth, peer.sin_addr.s_addr);
+    portEXIT_CRITICAL(&s_lock);
+    return allowed;
+}
+
+static void set_ap_auth_tracking(bool enabled)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_ap_auth_tracking = enabled;
+    setup_portal_client_auth_reset(&s_ap_client_auth);
+    portEXIT_CRITICAL(&s_lock);
+    if (s_ap_client_events) {
+        xEventGroupClearBits(s_ap_client_events, PORTAL_CLIENT_IP_READY_BIT);
     }
-    for (int index = 0; index < ip_stations.num; ++index) {
-        if (ip_stations.sta[index].ip.addr == peer.sin_addr.s_addr) return true;
-    }
-    return false;
 }
 
 static esp_err_t begin_response(httpd_req_t *request, const char *content_type)
@@ -600,8 +624,10 @@ static esp_err_t portal_start(bool recovery)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "enable APSTA");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "configure setup AP");
     secure_zero(&ap, sizeof(ap));
+    set_ap_auth_tracking(true);
     esp_err_t dhcp = esp_netif_dhcps_start(s_ap_netif);
     if (dhcp != ESP_OK) {
+        set_ap_auth_tracking(false);
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         return dhcp;
     }
@@ -621,6 +647,7 @@ static esp_err_t portal_start(bool recovery)
     esp_err_t err = start_http_server();
     if (err != ESP_OK) {
         s_active = false;
+        set_ap_auth_tracking(false);
         (void)esp_netif_dhcps_stop(s_ap_netif);
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         return err;
@@ -631,6 +658,7 @@ static esp_err_t portal_start(bool recovery)
         httpd_stop(s_httpd);
         s_httpd = NULL;
         s_active = false;
+        set_ap_auth_tracking(false);
         (void)esp_netif_dhcps_stop(s_ap_netif);
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         return ESP_ERR_NO_MEM;
@@ -643,6 +671,7 @@ static void portal_stop(void)
 {
     if (!s_active || s_station_owned) return;
     s_active = false;
+    set_ap_auth_tracking(false);
     s_dns_running = false;
     if (s_httpd) {
         httpd_stop(s_httpd);
@@ -713,6 +742,12 @@ esp_err_t setup_portal_prepare(setup_portal_station_visibility_cb_t visibility_c
     s_visibility_cb = visibility_cb;
     s_validation_events = xEventGroupCreate();
     if (!s_validation_events) return ESP_ERR_NO_MEM;
+    s_ap_client_events = xEventGroupCreate();
+    if (!s_ap_client_events) {
+        vEventGroupDelete(s_validation_events);
+        s_validation_events = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     s_ap_netif = esp_netif_create_default_wifi_ap();
     if (!s_ap_netif) return ESP_ERR_NO_MEM;
     esp_netif_ip_info_t ip = {0};
@@ -772,6 +807,49 @@ bool setup_portal_handle_sta_got_ip(void)
     s_pending_rollback_attempted = false;
     if (!s_connected_since_ms) s_connected_since_ms = now_ms();
     return false;
+}
+
+void setup_portal_handle_ap_station_connected(const uint8_t mac[6])
+{
+    bool tracked = false;
+    portENTER_CRITICAL(&s_lock);
+    if (s_ap_auth_tracking) {
+        setup_portal_client_auth_connected(&s_ap_client_auth, mac);
+        tracked = true;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (tracked && s_ap_client_events) {
+        xEventGroupClearBits(s_ap_client_events, PORTAL_CLIENT_IP_READY_BIT);
+    }
+}
+
+void setup_portal_handle_ap_station_disconnected(const uint8_t mac[6])
+{
+    bool cleared = false;
+    portENTER_CRITICAL(&s_lock);
+    if (s_ap_auth_tracking) {
+        cleared = setup_portal_client_auth_disconnected(&s_ap_client_auth, mac);
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (cleared && s_ap_client_events) {
+        xEventGroupClearBits(s_ap_client_events, PORTAL_CLIENT_IP_READY_BIT);
+    }
+}
+
+void setup_portal_handle_ap_station_ip_assigned(
+    const uint8_t mac[6],
+    uint32_t ip_addr)
+{
+    bool assigned = false;
+    portENTER_CRITICAL(&s_lock);
+    if (s_ap_auth_tracking) {
+        assigned = setup_portal_client_auth_ip_assigned(
+            &s_ap_client_auth, mac, ip_addr);
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (assigned && s_ap_client_events) {
+        xEventGroupSetBits(s_ap_client_events, PORTAL_CLIENT_IP_READY_BIT);
+    }
 }
 
 bool setup_portal_active(void)
