@@ -7,6 +7,8 @@ export interface FleetLocationDefinition {
   id: FleetLocationId
   city: string
   region: string
+  latitude: number
+  longitude: number
   mapX: number
   mapY: number
   labelSide: 'left' | 'right'
@@ -27,11 +29,46 @@ export interface FleetLocationResult {
   unmapped: Device[]
 }
 
+// The Natural Earth geometry was projected into a 600 × 720 source plane. The
+// displayed SVG crops that plane to `0 72 600 580`, then fits it into a square
+// stage. Model both transforms so markers remain tied to latitude/longitude.
+const fleetMapSourceProjection = {
+  west: 60.083741,
+  east: 77.821388,
+  north: 39.568396,
+  south: 21.183557,
+  width: 600,
+  height: 720,
+} as const
+
+const fleetMapDisplayViewBox = {
+  x: 0,
+  y: 72,
+  width: 600,
+  height: 580,
+} as const
+
+export function projectFleetCoordinates(latitude: number, longitude: number) {
+  const svgX = ((longitude - fleetMapSourceProjection.west) / (fleetMapSourceProjection.east - fleetMapSourceProjection.west)) * fleetMapSourceProjection.width
+  const svgY = ((fleetMapSourceProjection.north - latitude) / (fleetMapSourceProjection.north - fleetMapSourceProjection.south)) * fleetMapSourceProjection.height
+  const displayScale = Math.min(1 / fleetMapDisplayViewBox.width, 1 / fleetMapDisplayViewBox.height)
+  const displayOffsetX = (1 - fleetMapDisplayViewBox.width * displayScale) / 2
+  const displayOffsetY = (1 - fleetMapDisplayViewBox.height * displayScale) / 2
+  return {
+    mapX: (displayOffsetX + (svgX - fleetMapDisplayViewBox.x) * displayScale) * 100,
+    mapY: (displayOffsetY + (svgY - fleetMapDisplayViewBox.y) * displayScale) * 100,
+  }
+}
+
+const defineFleetLocation = (
+  definition: Omit<FleetLocationDefinition, 'mapX' | 'mapY'>,
+): FleetLocationDefinition => ({ ...definition, ...projectFleetCoordinates(definition.latitude, definition.longitude) })
+
 export const fleetLocationDefinitions: FleetLocationDefinition[] = [
-  { id: 'swat', city: 'Swat', region: 'Khyber Pakhtunkhwa', mapX: 66, mapY: 17, labelSide: 'right' },
-  { id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', mapX: 55, mapY: 27, labelSide: 'left' },
-  { id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', mapX: 79, mapY: 31, labelSide: 'left' },
-  { id: 'karachi', city: 'Karachi', region: 'Sindh', mapX: 39, mapY: 87, labelSide: 'right' },
+  defineFleetLocation({ id: 'swat', city: 'Swat', region: 'Khyber Pakhtunkhwa', latitude: 34.7717, longitude: 72.3602, labelSide: 'right' }),
+  defineFleetLocation({ id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', latitude: 34.0151, longitude: 71.5249, labelSide: 'left' }),
+  defineFleetLocation({ id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', latitude: 33.6844, longitude: 73.0479, labelSide: 'left' }),
+  defineFleetLocation({ id: 'karachi', city: 'Karachi', region: 'Sindh', latitude: 24.8607, longitude: 67.0011, labelSide: 'right' }),
 ]
 
 const definitionById = new Map(fleetLocationDefinitions.map((definition) => [definition.id, definition]))

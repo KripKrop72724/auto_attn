@@ -168,14 +168,36 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   }))
 
   await page.goto('/fleet')
+  await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
   const markers = page.locator('.fleet-map-marker')
-  await expect(markers).toHaveCount(4)
-  const centers = await markers.evaluateAll((nodes) => nodes.map((node) => {
+  await expect(markers).toHaveCount(4, { timeout: 10_000 })
+  const projectedCoordinates = await markers.evaluateAll((nodes) => Object.fromEntries(nodes.map((node) => {
+    const location = Array.from(node.classList).find((name) => name.startsWith('location-'))?.replace('location-', '') || ''
+    const style = (node as HTMLElement).style
+    return [location, {
+      x: Number.parseFloat(style.getPropertyValue('--marker-x')),
+      y: Number.parseFloat(style.getPropertyValue('--marker-y')),
+    }]
+  })))
+  const expectedCoordinates = {
+    swat: { x: 69.21, y: 20.98 },
+    peshawar: { x: 64.50, y: 25.91 },
+    islamabad: { x: 73.09, y: 28.07 },
+    karachi: { x: 39.00, y: 85.67 },
+  }
+  for (const [location, expected] of Object.entries(expectedCoordinates)) {
+    expect(projectedCoordinates[location].x).toBeCloseTo(expected.x, 1)
+    expect(projectedCoordinates[location].y).toBeCloseTo(expected.y, 1)
+  }
+
+  const markerCores = await page.locator('.fleet-map-marker-core').evaluateAll((nodes) => nodes.map((node) => {
     const box = node.getBoundingClientRect()
-    return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2, radius: box.width / 2 }
   }))
-  const closestPair = Math.min(...centers.flatMap((left, index) => centers.slice(index + 1).map((right) => Math.hypot(left.x - right.x, left.y - right.y))))
-  expect(closestPair).toBeGreaterThan(40)
+  const closestVisibleGap = Math.min(...markerCores.flatMap((left, index) => markerCores.slice(index + 1).map((right) => (
+    Math.hypot(left.x - right.x, left.y - right.y) - left.radius - right.radius
+  ))))
+  expect(closestVisibleGap).toBeGreaterThanOrEqual(-1)
 
   const peshawar = page.getByRole('button', { name: /Peshawar, 2 devices, Needs attention/i })
   const beforeSelection = await peshawar.evaluate((node) => {
