@@ -24,6 +24,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -145,15 +146,31 @@ static void generate_csrf(void)
 static bool request_from_ap(httpd_req_t *request)
 {
     int fd = httpd_req_to_sockfd(request);
-    struct sockaddr_in local = {0};
     struct sockaddr_in peer = {0};
-    socklen_t length = sizeof(local);
-    if (getsockname(fd, (struct sockaddr *)&local, &length) != 0) return false;
-    length = sizeof(peer);
+    socklen_t length = sizeof(peer);
     if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0) return false;
-    uint32_t local_ip = ntohl(local.sin_addr.s_addr);
     uint32_t peer_ip = ntohl(peer.sin_addr.s_addr);
-    return local_ip == 0xC0A8FE01UL && (peer_ip & PORTAL_MASK) == PORTAL_NET;
+    if ((peer_ip & PORTAL_MASK) != PORTAL_NET) return false;
+
+    // ESP-IDF's HTTP server listens on INADDR_ANY.  On lwIP an accepted
+    // socket may therefore retain 0.0.0.0 as its local address, so using
+    // getsockname() to prove that a request arrived through the SoftAP rejects
+    // legitimate captive-portal clients.  Authorize only an IP currently
+    // leased to a station associated with this protected, one-client SoftAP.
+    // This preserves the interface boundary even if the STA-side network also
+    // happens to use 192.168.254.0/24.
+    wifi_sta_list_t wifi_stations = {0};
+    wifi_sta_mac_ip_list_t ip_stations = {0};
+    if (esp_wifi_ap_get_sta_list(&wifi_stations) != ESP_OK || wifi_stations.num < 1) {
+        return false;
+    }
+    if (esp_wifi_ap_get_sta_list_with_ip(&wifi_stations, &ip_stations) != ESP_OK) {
+        return false;
+    }
+    for (int index = 0; index < ip_stations.num; ++index) {
+        if (ip_stations.sta[index].ip.addr == peer.sin_addr.s_addr) return true;
+    }
+    return false;
 }
 
 static esp_err_t begin_response(httpd_req_t *request, const char *content_type)

@@ -31,8 +31,11 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "esp_wifi_set_mode(WIFI_MODE_APSTA)" in PORTAL
     assert "esp_wifi_set_mode(WIFI_MODE_STA)" in PORTAL
     assert "request_from_ap" in PORTAL
-    assert "local_ip == 0xC0A8FE01UL" in PORTAL
-    assert "(peer_ip & PORTAL_MASK) == PORTAL_NET" in PORTAL
+    assert "(peer_ip & PORTAL_MASK) != PORTAL_NET" in PORTAL
+    assert "esp_wifi_ap_get_sta_list(&wifi_stations)" in PORTAL
+    assert "esp_wifi_ap_get_sta_list_with_ip(&wifi_stations, &ip_stations)" in PORTAL
+    assert "ip_stations.sta[index].ip.addr == peer.sin_addr.s_addr" in PORTAL
+    assert "getsockname(fd" not in PORTAL
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
     assert "PORTAL_HTTP_MAX_OPEN_SOCKETS 7" in PORTAL
     assert "config.max_open_sockets = PORTAL_HTTP_MAX_OPEN_SOCKETS" in PORTAL
