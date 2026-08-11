@@ -43,6 +43,7 @@
 #define PORTAL_BUTTON_GPIO     GPIO_NUM_0
 #define PORTAL_BUTTON_HOLD_MS  5000
 #define PORTAL_STA_RETRY_MS    5000
+#define PORTAL_ACTIVE_STA_RETRY_MS (60 * 1000)
 #define PORTAL_PENDING_ROLLBACK_MS (15 * 60 * 1000)
 #define VALIDATION_TIMEOUT_MS  30000
 #define VALIDATION_OK_BIT      BIT0
@@ -570,6 +571,10 @@ static esp_err_t portal_start(bool recovery)
     set_result(PORTAL_RESULT_IDLE, "Ready to select a network.");
     s_recovery_mode = recovery;
     s_last_activity_ms = now_ms();
+    // A disconnected station scan uses the same radio as the SoftAP.  Reset
+    // the retry clock when the portal opens so clients get a full, quiet
+    // discovery window before the first bounded recovery probe.
+    s_last_sta_retry_ms = s_last_activity_ms;
     s_active = true;
     esp_err_t err = start_http_server();
     if (err != ESP_OK) {
@@ -603,6 +608,10 @@ static void portal_stop(void)
     }
     (void)esp_netif_dhcps_stop(s_ap_netif);
     (void)esp_wifi_set_mode(WIFI_MODE_STA);
+    if (s_disconnected_since_ms) {
+        s_last_sta_retry_ms = now_ms();
+        (void)esp_wifi_connect();
+    }
     secure_zero(s_csrf, sizeof(s_csrf));
     ESP_LOGI(TAG, "Wi-Fi setup access point disabled; station-only operation restored");
 }
@@ -623,8 +632,11 @@ static void controller_task(void *argument)
             button_latched = true;
             (void)portal_start(false);
         }
+        int64_t retry_interval = s_active
+            ? PORTAL_ACTIVE_STA_RETRY_MS
+            : PORTAL_STA_RETRY_MS;
         if (!s_station_owned && s_disconnected_since_ms &&
-            current - s_last_sta_retry_ms >= PORTAL_STA_RETRY_MS) {
+            current - s_last_sta_retry_ms >= retry_interval) {
             s_last_sta_retry_ms = current;
             esp_err_t retry = esp_wifi_connect();
             if (retry != ESP_OK) {
@@ -700,6 +712,10 @@ bool setup_portal_handle_sta_disconnected(void)
         if (s_validation_connecting) xEventGroupSetBits(s_validation_events, VALIDATION_FAIL_BIT);
         return true;
     }
+    // Suppress the main event handler's immediate reconnect loop while the
+    // SoftAP is visible.  The controller performs one bounded station probe
+    // per minute instead, preventing scans from starving AP beacons.
+    if (s_active) return true;
     return false;
 }
 

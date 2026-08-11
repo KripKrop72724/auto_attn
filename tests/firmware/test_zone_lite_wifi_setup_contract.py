@@ -57,12 +57,28 @@ def test_recovery_and_manual_activation_windows_match_the_operating_contract() -
     assert "PORTAL_MANUAL_IDLE_MS  (10 * 60 * 1000)" in PORTAL
     assert "PORTAL_STABLE_CLOSE_MS (30 * 1000)" in PORTAL
     assert "PORTAL_STA_RETRY_MS    5000" in PORTAL
+    assert "PORTAL_ACTIVE_STA_RETRY_MS (60 * 1000)" in PORTAL
     assert "PORTAL_PENDING_ROLLBACK_MS (15 * 60 * 1000)" in PORTAL
     assert "esp_wifi_connect()" in PORTAL
     assert "esp_ota_mark_app_invalid_rollback_and_reboot()" in PORTAL
     assert "running_app_pending_verify()" in PORTAL
     assert "GPIO_NUM_0" in PORTAL
     assert "ota_manager_busy()" in PORTAL
+
+
+def test_active_portal_preserves_softap_beacon_airtime():
+    controller = PORTAL[
+        PORTAL.index("static void controller_task") :
+        PORTAL.index("esp_err_t setup_portal_prepare")
+    ]
+    disconnect = PORTAL[
+        PORTAL.index("bool setup_portal_handle_sta_disconnected") :
+        PORTAL.index("bool setup_portal_handle_sta_got_ip")
+    ]
+    assert "s_last_sta_retry_ms = s_last_activity_ms" in PORTAL
+    assert "s_active\n            ? PORTAL_ACTIVE_STA_RETRY_MS" in controller
+    assert "current - s_last_sta_retry_ms >= retry_interval" in controller
+    assert "if (s_active) return true;" in disconnect
 
 
 def test_only_network_selection_routes_are_exposed() -> None:
