@@ -4,14 +4,16 @@ Zone Lite 2.4.10 supersedes the reviewed-but-unpublished 2.4.9 candidate. It
 retains event-driven client authorization while closing both possible ordering
 edges between the Wi-Fi association callbacks and the DHCP assignment callback.
 
-When DHCP is delivered before the queued connect callback, the handler confirms
-the exact MAC against the Wi-Fi driver's current SoftAP association list and
-caches the lease. The later same-MAC connect callback preserves that lease.
-When DHCP is delivered after a disconnect, the same driver check finds no
-current association and the event is rejected without mutating authorization.
-A queued connect delivered after departure is ignored, and a queued disconnect
-delivered after a same-MAC reconnect cannot erase the live lease. A replacement
-client clears the prior lease immediately.
+Each physical association has an explicit generation, and an IP lease is usable
+only when tagged with that same generation. When DHCP is delivered before the
+queued connect callback, the handler confirms the exact MAC against the Wi-Fi
+driver's current SoftAP association list, begins the generation, and caches the
+lease; the matching connect callback then pairs with it. Every disconnect is a
+generation boundary even if the driver already shows a fast same-MAC reconnect,
+and any unpaired same-MAC connect also begins a new generation. Thus neither a
+missing/delayed disconnect nor a delayed DHCP/connect callback can carry the
+previous connection's address forward. A replacement client likewise clears
+the prior lease immediately.
 
 The association lookup occurs only once for a DHCP event. No associated-station
 or DHCP table is queried by an HTTP request, so the intermittent 2.4.8 request

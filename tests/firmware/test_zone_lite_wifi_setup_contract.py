@@ -106,12 +106,15 @@ def test_setup_client_authorization_survives_event_order_and_rejects_stale_lease
                 setup_portal_client_auth_t state;
 
                 setup_portal_client_auth_reset(&state);
+                assert(state.association_generation == 0);
                 assert(!setup_portal_client_auth_allows(&state, ip_a));
 
                 setup_portal_client_auth_connected(&state, mac_a, true);
+                assert(state.association_generation == 1);
                 assert(!setup_portal_client_auth_allows(&state, ip_a));
                 assert(!setup_portal_client_auth_ip_assigned(&state, mac_b, ip_b, false));
                 assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, true));
+                assert(state.lease_generation == state.association_generation);
                 assert(setup_portal_client_auth_allows(&state, ip_a));
                 assert(!setup_portal_client_auth_allows(&state, ip_b));
 
@@ -122,16 +125,20 @@ def test_setup_client_authorization_survives_event_order_and_rejects_stale_lease
                 assert(!setup_portal_client_auth_disconnected(&state, mac_b, false));
                 assert(setup_portal_client_auth_allows(&state, ip_b));
                 assert(setup_portal_client_auth_disconnected(&state, mac_a, false));
+                assert(state.association_generation == 2);
                 assert(!setup_portal_client_auth_allows(&state, ip_b));
 
                 /* DHCP may be delivered before the association callback. */
                 assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, true));
+                assert(state.association_generation == 3);
                 assert(setup_portal_client_auth_allows(&state, ip_a));
                 setup_portal_client_auth_connected(&state, mac_a, true);
+                assert(state.association_generation == 3);
                 assert(setup_portal_client_auth_allows(&state, ip_a));
 
                 /* A delayed DHCP event cannot resurrect a disconnected client. */
                 assert(setup_portal_client_auth_disconnected(&state, mac_a, false));
+                assert(state.association_generation == 4);
                 assert(!setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, false));
                 assert(!setup_portal_client_auth_allows(&state, ip_a));
 
@@ -141,15 +148,31 @@ def test_setup_client_authorization_survives_event_order_and_rejects_stale_lease
 
                 /* A real reconnect is accepted even if DHCP is observed first. */
                 assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, true));
+                assert(state.association_generation == 5);
                 setup_portal_client_auth_connected(&state, mac_a, true);
                 assert(setup_portal_client_auth_allows(&state, ip_a));
 
-                /* A delayed disconnect cannot erase that live reconnect. */
-                assert(!setup_portal_client_auth_disconnected(&state, mac_a, true));
+                /* A queued disconnect observed after physical re-association
+                   starts a fresh generation and cannot retain the old lease. */
+                assert(setup_portal_client_auth_disconnected(&state, mac_a, true));
+                assert(state.association_generation == 6);
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, true));
+                assert(setup_portal_client_auth_allows(&state, ip_a));
+                setup_portal_client_auth_connected(&state, mac_a, true);
+                assert(setup_portal_client_auth_allows(&state, ip_a));
+
+                /* Even if a disconnect callback is lost, the next same-MAC
+                   connect callback cannot reuse the preceding generation. */
+                setup_portal_client_auth_connected(&state, mac_a, true);
+                assert(state.association_generation == 7);
+                assert(!setup_portal_client_auth_allows(&state, ip_a));
+                assert(setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, true));
                 assert(setup_portal_client_auth_allows(&state, ip_a));
 
                 /* A new association invalidates the old lease immediately. */
                 setup_portal_client_auth_connected(&state, mac_b, true);
+                assert(state.association_generation == 8);
                 assert(!setup_portal_client_auth_allows(&state, ip_a));
                 assert(!setup_portal_client_auth_ip_assigned(&state, mac_a, ip_a, false));
                 assert(setup_portal_client_auth_ip_assigned(&state, mac_b, ip_b, true));

@@ -6,7 +6,10 @@
 typedef struct {
     uint8_t mac[6];
     uint32_t ip_addr;
+    uint32_t association_generation;
+    uint32_t lease_generation;
     bool associated;
+    bool connect_event_seen;
     bool ip_assigned;
 } setup_portal_client_auth_t;
 
