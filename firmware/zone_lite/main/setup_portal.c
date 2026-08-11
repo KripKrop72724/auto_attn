@@ -809,26 +809,40 @@ bool setup_portal_handle_sta_got_ip(void)
     return false;
 }
 
+static bool ap_station_is_currently_associated(const uint8_t mac[6])
+{
+    wifi_sta_list_t stations = {0};
+    if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK) return false;
+    for (int index = 0; index < stations.num; ++index) {
+        if (memcmp(stations.sta[index].mac, mac, 6) == 0) return true;
+    }
+    return false;
+}
+
 void setup_portal_handle_ap_station_connected(const uint8_t mac[6])
 {
-    bool tracked = false;
+    bool currently_associated = ap_station_is_currently_associated(mac);
+    bool clear_ready = false;
     portENTER_CRITICAL(&s_lock);
     if (s_ap_auth_tracking) {
-        setup_portal_client_auth_connected(&s_ap_client_auth, mac);
-        tracked = true;
+        setup_portal_client_auth_connected(
+            &s_ap_client_auth, mac, currently_associated);
+        clear_ready = currently_associated && !s_ap_client_auth.ip_assigned;
     }
     portEXIT_CRITICAL(&s_lock);
-    if (tracked && s_ap_client_events) {
+    if (clear_ready && s_ap_client_events) {
         xEventGroupClearBits(s_ap_client_events, PORTAL_CLIENT_IP_READY_BIT);
     }
 }
 
 void setup_portal_handle_ap_station_disconnected(const uint8_t mac[6])
 {
+    bool currently_associated = ap_station_is_currently_associated(mac);
     bool cleared = false;
     portENTER_CRITICAL(&s_lock);
     if (s_ap_auth_tracking) {
-        cleared = setup_portal_client_auth_disconnected(&s_ap_client_auth, mac);
+        cleared = setup_portal_client_auth_disconnected(
+            &s_ap_client_auth, mac, currently_associated);
     }
     portEXIT_CRITICAL(&s_lock);
     if (cleared && s_ap_client_events) {
@@ -840,11 +854,16 @@ void setup_portal_handle_ap_station_ip_assigned(
     const uint8_t mac[6],
     uint32_t ip_addr)
 {
+    // Association state is stable at the Wi-Fi driver even if its event-loop
+    // callback is queued behind DHCP. This one-time event check accepts an
+    // early lease, rejects a late post-disconnect lease, and avoids the
+    // non-atomic DHCP table polling that previously ran on every HTTP request.
+    bool currently_associated = ap_station_is_currently_associated(mac);
     bool assigned = false;
     portENTER_CRITICAL(&s_lock);
     if (s_ap_auth_tracking) {
         assigned = setup_portal_client_auth_ip_assigned(
-            &s_ap_client_auth, mac, ip_addr);
+            &s_ap_client_auth, mac, ip_addr, currently_associated);
     }
     portEXIT_CRITICAL(&s_lock);
     if (assigned && s_ap_client_events) {
