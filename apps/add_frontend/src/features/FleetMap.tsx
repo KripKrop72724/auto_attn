@@ -62,12 +62,16 @@ function DeviceRows({
 }
 
 function LocationSummary({ group, onSelect, selected = false }: { group: FleetLocationGroup; onSelect: () => void; selected?: boolean }) {
-  return <button className={`fleet-map-location-summary pattern-${group.pattern} ${selected ? 'selected' : ''}`} onClick={onSelect} aria-pressed={selected}>
-    <span className="fleet-map-location-icon"><Icon name="map" /></span>
-    <span><strong>{group.definition.city}</strong><small>{group.definition.region}</small></span>
+  return <button
+    className={`fleet-map-location-summary pattern-${group.pattern} ${selected ? 'selected' : ''}`}
+    onClick={onSelect}
+    aria-label={`Open ${group.definition.city} location, ${group.total} device${group.total === 1 ? '' : 's'}`}
+    aria-pressed={selected}
+  >
+    <span className="fleet-map-location-signal" aria-hidden="true"><i /></span>
+    <span className="fleet-map-location-copy"><strong>{group.definition.city}</strong><small>{group.definition.region}</small></span>
     <span className="fleet-map-location-count"><strong>{group.total}</strong><small>device{group.total === 1 ? '' : 's'}</small></span>
-    <MapStatus pattern={group.pattern} />
-    <Icon name="chevron" />
+    <span className="fleet-map-location-health"><Icon name={patternIcon[group.pattern]} />{patternLabel[group.pattern]}</span>
   </button>
 }
 
@@ -75,44 +79,89 @@ export function FleetMap({ devices, loading, onInspect, onManageUsers, formatRel
   const { groups, unmapped } = useMemo(() => groupFleetLocations(devices), [devices])
   const [selectedId, setSelectedId] = useState<FleetLocationId | null>(null)
   const selected = groups.find((group) => group.definition.id === selectedId) || null
+
   useEffect(() => {
     if (selectedId && !groups.some((group) => group.definition.id === selectedId)) setSelectedId(null)
   }, [groups, selectedId])
 
   const online = groups.reduce((sum, group) => sum + group.online, 0)
   const attention = groups.reduce((sum, group) => sum + group.attention, 0)
+  const nationalPattern: StatusPattern = attention ? 'waiting' : devices.length ? 'confirmed' : 'notice'
   const markerStyle = (group: FleetLocationGroup) => ({
     '--marker-x': `${group.definition.mapX}%`,
     '--marker-y': `${group.definition.mapY}%`,
   }) as CSSProperties
 
-  return <section className="fleet-map-layout" aria-label="Pakistan device network map" aria-busy={loading}>
+  return <section className={`fleet-map-layout ${selected ? 'has-selection' : ''}`} aria-label="Pakistan device network map" aria-busy={loading}>
     <div className="fleet-map-surface">
-      <header className="fleet-map-surface-head">
-        <span><Icon name="pulse" /> Live national footprint</span>
-        <span>{groups.length} mapped location{groups.length === 1 ? '' : 's'} · PKT</span>
+      <header className="fleet-map-commandbar">
+        <div className="fleet-map-command-copy">
+          <span className="fleet-map-live"><i /> Live national network <small>PKT</small></span>
+          <h3>{groups.length} operating location{groups.length === 1 ? '' : 's'}</h3>
+          <p>Every authorized attendance terminal, placed in its operational city.</p>
+        </div>
+        <div className="fleet-map-command-stats" aria-label="Visible national fleet summary">
+          <span><strong>{devices.length}</strong><small>Visible devices</small></span>
+          <span><strong>{online}</strong><small>Online</small></span>
+          <span className={attention ? 'needs-attention' : ''}><strong>{attention}</strong><small>Attention</small></span>
+          <MapStatus pattern={nationalPattern} label={attention ? `${attention} need attention` : devices.length ? 'Network healthy' : 'Awaiting devices'} />
+        </div>
       </header>
-      <div className="fleet-map-stage">
-        <img src={pakistanMapUrl} alt="" aria-hidden="true" />
-        {groups.map((group) => {
-          const selectedMarker = selectedId === group.definition.id
-          return <button
-            key={group.definition.id}
-            className={`fleet-map-marker location-${group.definition.id} label-${group.definition.labelSide} pattern-${group.pattern} ${selectedMarker ? 'selected' : ''}`}
-            style={markerStyle(group)}
-            onClick={() => setSelectedId(group.definition.id)}
-            aria-label={`${group.definition.city}, ${group.total} device${group.total === 1 ? '' : 's'}, ${patternLabel[group.pattern]}`}
-            aria-pressed={selectedMarker}
-            aria-controls="fleet-location-panel"
-          >
-            <span className="fleet-map-marker-ripple" aria-hidden="true" />
-            <span className="fleet-map-marker-dot"><Icon name="server" /></span>
-            <span className="fleet-map-marker-label"><strong>{group.definition.city}</strong><small>{group.total} device{group.total === 1 ? '' : 's'} · {patternLabel[group.pattern]}</small></span>
-          </button>
-        })}
-        {loading && <div className="fleet-map-loading"><Icon name="refresh" /> Synchronizing national fleet…</div>}
+
+      <div className="fleet-map-canvas">
+        <div className="fleet-map-compass" aria-hidden="true"><span>N</span><i /></div>
+        <div className="fleet-map-stage">
+          <img src={pakistanMapUrl} alt="" aria-hidden="true" />
+          {groups.map((group) => {
+            const selectedMarker = selectedId === group.definition.id
+            return <button
+              key={group.definition.id}
+              className={`fleet-map-marker location-${group.definition.id} pattern-${group.pattern} ${selectedMarker ? 'selected' : ''}`}
+              style={markerStyle(group)}
+              onClick={() => setSelectedId(group.definition.id)}
+              aria-label={`${group.definition.city}, ${group.total} device${group.total === 1 ? '' : 's'}, ${patternLabel[group.pattern]}`}
+              aria-pressed={selectedMarker}
+              aria-controls={selectedMarker ? 'fleet-location-panel' : undefined}
+            >
+              <span className="fleet-map-marker-ripple" aria-hidden="true" />
+              <span className="fleet-map-marker-core" aria-hidden="true"><i /><strong>{group.total}</strong></span>
+              <span className="fleet-map-marker-label" aria-hidden="true"><strong>{group.definition.city}</strong><small>{patternLabel[group.pattern]}</small></span>
+            </button>
+          })}
+        </div>
+
+        {loading && <div className="fleet-map-loading" role="status"><Icon name="refresh" /> Synchronizing national fleet…</div>}
         {!loading && !groups.length && <div className="fleet-map-loading"><Icon name="map" /> No mapped devices match this view.</div>}
+
+        {selected && <aside className="fleet-location-sheet" id="fleet-location-panel" key={selected.definition.id} aria-live="polite">
+          <header className="fleet-location-sheet-head">
+            <div>
+              <p className="eyebrow">LIVE LOCATION</p>
+              <h3>{selected.definition.city}</h3>
+              <span>{selected.definition.region}</span>
+            </div>
+            <button className="icon-button" onClick={() => setSelectedId(null)} aria-label={`Close ${selected.definition.city} details`}><Icon name="x" /></button>
+          </header>
+          <div className="fleet-location-sheet-summary">
+            <MapStatus pattern={selected.pattern} />
+            <span><strong>{formatRelativeTime(selected.lastSeenAt)}</strong><small>Latest contact</small></span>
+          </div>
+          <div className="fleet-location-metrics">
+            <span><strong>{selected.total}</strong><small>Devices</small></span>
+            <span><strong>{selected.online}</strong><small>Online</small></span>
+            <span><strong>{selected.attention}</strong><small>Attention</small></span>
+          </div>
+          <DeviceRows devices={selected.devices} onInspect={onInspect} onManageUsers={onManageUsers} formatRelativeTime={formatRelativeTime} />
+        </aside>}
       </div>
+
+      <nav className="fleet-map-location-index" aria-label="Mapped location index">
+        <div className="fleet-map-index-intro"><strong>Location index</strong><span>Select a city to inspect its terminals</span></div>
+        <div className="fleet-map-location-list">
+          {groups.map((group) => <LocationSummary key={group.definition.id} group={group} onSelect={() => setSelectedId(group.definition.id)} selected={selectedId === group.definition.id} />)}
+        </div>
+      </nav>
+
       <footer className="fleet-map-legend" aria-label="Map health legend">
         <span className="pattern-confirmed"><i />Online</span>
         <span className="pattern-waiting"><i />Attention</span>
@@ -121,39 +170,9 @@ export function FleetMap({ devices, loading, onInspect, onManageUsers, formatRel
       </footer>
     </div>
 
-    <aside className="fleet-location-panel" id="fleet-location-panel" aria-live="polite">
-      {selected ? <>
-        <header className="fleet-location-panel-head">
-          <button className="fleet-map-back" onClick={() => setSelectedId(null)}><Icon name="chevron" /> National overview</button>
-          <div><p className="eyebrow">SELECTED LOCATION</p><h3>{selected.definition.city}</h3><span>{selected.definition.region}</span></div>
-          <MapStatus pattern={selected.pattern} />
-        </header>
-        <div className="fleet-location-metrics">
-          <span><strong>{selected.total}</strong><small>Devices</small></span>
-          <span><strong>{selected.online}</strong><small>Online</small></span>
-          <span><strong>{selected.attention}</strong><small>Attention</small></span>
-          <span><strong>{formatRelativeTime(selected.lastSeenAt)}</strong><small>Latest contact</small></span>
-        </div>
-        <DeviceRows devices={selected.devices} onInspect={onInspect} onManageUsers={onManageUsers} formatRelativeTime={formatRelativeTime} />
-      </> : <>
-        <header className="fleet-location-panel-head national">
-          <div><p className="eyebrow">NATIONAL OVERVIEW</p><h3>{groups.length} operating location{groups.length === 1 ? '' : 's'}</h3><span>Select a city to inspect its live device pairs.</span></div>
-          <MapStatus pattern={attention ? 'waiting' : devices.length ? 'confirmed' : 'notice'} label={attention ? `${attention} need attention` : devices.length ? 'Fleet live' : 'Awaiting devices'} />
-        </header>
-        <div className="fleet-location-metrics national">
-          <span><strong>{devices.length}</strong><small>Visible devices</small></span>
-          <span><strong>{online}</strong><small>Online</small></span>
-          <span><strong>{attention}</strong><small>Attention</small></span>
-        </div>
-        <div className="fleet-map-location-list">
-          {groups.map((group) => <LocationSummary key={group.definition.id} group={group} onSelect={() => setSelectedId(group.definition.id)} />)}
-        </div>
-      </>}
-
-      {unmapped.length > 0 && <section className="fleet-unmapped">
-        <header><Icon name="alert" /><div><strong>Location not mapped</strong><span>{unmapped.length} device{unmapped.length === 1 ? '' : 's'} remain fully available below.</span></div></header>
-        <DeviceRows devices={unmapped} onInspect={onInspect} onManageUsers={onManageUsers} formatRelativeTime={formatRelativeTime} />
-      </section>}
-    </aside>
+    {unmapped.length > 0 && <section className="fleet-unmapped">
+      <header><Icon name="alert" /><div><strong>Location not mapped</strong><span>{unmapped.length} device{unmapped.length === 1 ? '' : 's'} remain fully available.</span></div></header>
+      <DeviceRows devices={unmapped} onInspect={onInspect} onManageUsers={onManageUsers} formatRelativeTime={formatRelativeTime} />
+    </section>}
   </section>
 }

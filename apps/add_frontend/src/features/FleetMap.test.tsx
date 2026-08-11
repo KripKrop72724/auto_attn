@@ -49,6 +49,7 @@ describe('FleetMap', () => {
 
     expect(screen.getByRole('heading', { name: '1 operating location' })).toBeTruthy()
     expect(screen.getByText('Location not mapped')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open Islamabad location, 1 device' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i }))
     expect(screen.getByRole('heading', { name: 'Islamabad' })).toBeTruthy()
 
@@ -56,6 +57,8 @@ describe('FleetMap', () => {
     expect(inspect).toHaveBeenCalledWith(tower)
     fireEvent.click(screen.getAllByRole('button', { name: 'Manage users' })[0])
     expect(manageUsers).toHaveBeenCalledWith(tower)
+    fireEvent.click(screen.getByRole('button', { name: 'Close Islamabad details' }))
+    expect(screen.queryByRole('heading', { name: 'Islamabad' })).toBeNull()
   })
 
   it('renders safe loading and empty states', () => {
