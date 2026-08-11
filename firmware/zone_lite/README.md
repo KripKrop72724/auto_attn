@@ -144,7 +144,7 @@ The production target is ESP32-S3, 16 MiB flash, octal PSRAM, custom OTA partiti
 bundle, and HMAC-protected encrypted NVS. CI publishes only non-provisioned binaries for seven days;
 site secrets are never Actions artifacts.
 
-The current firmware version is `2.4.8`. ADD onboarding and heartbeat version fields are generated
+The current firmware version is `2.4.9`. ADD onboarding and heartbeat version fields are generated
 from the ESP-IDF application descriptor, not a separately maintained string. The main task stack is
 8 KiB so rebuilding thousands of persisted event UIDs cannot overflow during boot.
 
