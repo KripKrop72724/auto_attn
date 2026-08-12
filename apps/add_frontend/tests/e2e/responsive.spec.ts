@@ -218,6 +218,9 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   expect(closestVisibleGap).toBeGreaterThanOrEqual(-1)
 
   const peshawar = page.getByRole('button', { name: /Peshawar, 2 devices, Needs attention/i })
+  await page.locator('.page-content > section.panel').evaluate(async (node) => {
+    await Promise.all(node.getAnimations().map((animation) => animation.finished.catch(() => undefined)))
+  })
   const beforeSelection = await peshawar.evaluate((node) => {
     const box = node.getBoundingClientRect()
     return { x: box.x + window.scrollX, y: box.y + window.scrollY }
