@@ -27,10 +27,28 @@ const device = {
     consecutive_failures: 0, consecutive_successes: 10, flap_count_15m: 0, last_transition_at: null,
     last_online_at: null, offline_since: null, stability_since: null, backoff_until: null, probe_latency_ms: 12,
     certification_state: 'CERTIFIED', certification_observations: 2,
-    capabilities: { user_write: true, create_user: true, delete_user: true }, snapshot_complete: true,
+    capabilities: { user_write: true, create_user: true, delete_user: true, admin_lease: true }, snapshot_complete: true,
     writes_disabled_reason: null, user_count: 1, attendance_count: 42, device_time: '2026-08-01T18:00:00Z',
     device_time_sampled_at: '2026-08-01T18:00:00Z', drift_seconds: 0, last_reconcile_at: '2026-08-01T17:50:00Z', next_restart_at: null,
   },
+}
+
+const representativeUser = {
+  id: 1, user_key: 'user-one', uid: '7', user_id: '1007', display_name: 'Ayesha Khan',
+  cnic_masked: '*****-****567-1', cnic_available: true, identity_complete: true,
+  identity_conflict_code: null, identity_conflict_members: [], identity_conflict_resolved: false,
+  identity_resolution_id: null, shift_worker: false, privilege: 0, present: true, lifecycle_state: 'ACTIVE',
+  row_version: 3, observed_at: '2026-08-12T08:00:00Z', machine_name_preview: 'Ayesha-*****-****567-1',
+  current_command_state: null, read_only: false,
+}
+
+const representativeAttendance = {
+  id: 1, event_uid: 'event-one', device_serial: device.zkt.serial, uid: '7', user_id: '1007',
+  display_name: 'Ayesha Khan', cnic_masked: '*****-****567-1', device_event_time: '2026-08-12T08:00:00Z',
+  captured_at: '2026-08-12T08:00:01Z', received_at: '2026-08-12T08:00:02Z', source: 'LIVE',
+  status: 'CAPTURED', punch: '0', clock_quality: 'OK', clock_drift_seconds: 2, ords_status: 'ACKNOWLEDGED',
+  oracle_confirmed_at: '2026-08-12T08:00:05Z', oracle_confirmation_path: 'ADD_EVENT_UID',
+  identity_resolution_id: null,
 }
 
 const nationwideDevices = [
@@ -106,7 +124,7 @@ async function mockDashboard(page: Page) {
     else if (url.pathname.includes('/logs')) json = { rows: [], next_cursor: null }
     else if (url.pathname === '/api/v1/alerts') json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null, device: { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id, hardware_id: device.hardware_id } }], next_cursor: null, totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 } }
     else if (url.pathname.endsWith('/alerts')) json = { rows: [] }
-    else if (url.pathname === '/api/v1/attendance') json = { rows: [], next_cursor: null }
+    else if (url.pathname === '/api/v1/attendance') json = { rows: [representativeAttendance], next_cursor: null }
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', hil_target_mac: null }] }
     else if (url.pathname === '/api/v1/firmware/campaigns') json = { enabled: true, hil_enabled: false, rows: [] }
     else if (url.pathname === '/api/v1/provisioning/capabilities') json = { enabled: true, supported_platforms: ['windows-x64', 'macos-arm64'], hardware_profile: 'esp32s3-16mb-zone-lite-v1', companion_min_version: '1.0.0', latest_bundle: factoryBundle, can_start: true }
@@ -124,7 +142,7 @@ async function mockDashboard(page: Page) {
     else if (url.pathname.includes('/historical-identities')) json = { totals: { unresolved_events: 0, blocked_identity: 0, quarantined_identity_reuse: 0, unassigned_events: 0, actionable_event_groups: 0 }, rows: [], unassigned_groups: [] }
     else if (url.pathname.includes('/identity-conflicts')) json = { raw_duplicate_groups: 0, resolved_groups: 0, unresolved_groups: 0, groups: [], evidence_scope: { add_attendance_count: 0, terminal_attendance_count: 0, attendance_coverage_percent: 0 } }
     else if (url.pathname.includes('/user-deletion-jobs/latest')) json = { job: null }
-    else if (url.pathname.includes('/users')) json = { rows: [], next_cursor: null, identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 0, with_cnic: 0, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }
+    else if (url.pathname.includes('/users')) json = { rows: [representativeUser], next_cursor: null, device, identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 1, with_cnic: 1, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(json) })
   })
 }
@@ -238,7 +256,7 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
   await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
   await primaryNav.getByRole('button', { name: 'Attendance', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Attendance events' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Live attendance' })).toBeVisible()
   if ((page.viewportSize()?.width || 0) <= 760) {
     await page.getByRole('button', { name: 'More', exact: true }).click()
     await page.getByRole('dialog', { name: 'More operations' }).getByRole('button', { name: /Firmware/ }).click()
@@ -248,6 +266,45 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
   await primaryNav.getByRole('button', { name: /Alerts/ }).click()
   await expect(page.getByRole('heading', { name: 'Alerts and exceptions' })).toBeVisible()
+  expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
+  expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
+})
+
+test('populated Users and Attendance workspaces are responsive, keyboard-operable, and accessible', async ({ page }) => {
+  await page.goto('/users/connector-one')
+  await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
+  await expect(page.getByRole('article', { name: /Ayesha Khan, user 1007/i })).toBeVisible()
+  await expect(page.getByRole('tab', { name: /Directory/i })).toHaveAttribute('aria-selected', 'true')
+  const more = page.getByLabel('More actions for Ayesha Khan')
+  await more.focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('group', { name: 'Actions for Ayesha Khan' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(more).toBeFocused()
+  let dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  let results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+
+  await page.goto('/attendance')
+  await expect(page.getByRole('heading', { name: 'Live attendance' })).toBeVisible()
+  const attendance = page.getByRole('article', { name: /Ayesha Khan, Check in/i })
+  await expect(attendance).toBeVisible()
+  const details = attendance.getByLabel(/View event details/i)
+  await details.focus()
+  await page.keyboard.press('Enter')
+  const eventUid = attendance.getByText('event-one')
+  await expect(eventUid).toBeVisible()
+  await eventUid.scrollIntoViewIfNeeded()
+  dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  if ((page.viewportSize()?.width || 0) <= 760) {
+    const eventBox = await eventUid.boundingBox()
+    const navigationBox = await page.locator('.app-sidebar').boundingBox()
+    expect((eventBox?.y || 0) + (eventBox?.height || 0)).toBeLessThanOrEqual((navigationBox?.y || page.viewportSize()?.height || 0) + 1)
+  }
+  results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })

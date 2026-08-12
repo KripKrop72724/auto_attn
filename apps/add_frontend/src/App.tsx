@@ -312,7 +312,7 @@ export function PageHeader({
   )
 }
 
-function Metric({ label, value, detail, icon, tone = 'neutral', onClick }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: 'neutral' | 'positive' | 'warning' | 'critical'; onClick?: () => void }) {
+export function Metric({ label, value, detail, icon, tone = 'neutral', onClick }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: 'neutral' | 'positive' | 'warning' | 'critical'; onClick?: () => void }) {
   const content = <>
       <span className="metric-icon"><Icon name={icon} /></span>
       <div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div>
@@ -481,13 +481,13 @@ export function CommandProgress({
   )
 }
 
-const UsersView = lazy(() => import('./features/Users').then((module) => ({ default: module.UsersView })))
+const UsersView = lazy(() => import('./features/UsersWorkspace').then((module) => ({ default: module.UsersView })))
 
 const ReconciliationView = lazy(() => import('./features/Operations').then((module) => ({ default: module.ReconciliationView })))
 const FirmwareView = lazy(() => import('./features/Operations').then((module) => ({ default: module.FirmwareView })))
 const FirmwareProvisioning = lazy(() => import('./features/FirmwareProvisioning'))
 
-const AttendanceView = lazy(() => import('./features/Monitoring').then((module) => ({ default: module.AttendanceView })))
+const AttendanceView = lazy(() => import('./features/Attendance').then((module) => ({ default: module.AttendanceView })))
 const AlertsView = lazy(() => import('./features/Monitoring').then((module) => ({ default: module.AlertsView })))
 
 export function formatAlertDiagnostics(details: Record<string, unknown>): string {
@@ -672,7 +672,7 @@ function DashboardApp() {
       <AppShell username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
         {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} />}
         {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
-        {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} /></Suspense>}
+        {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
         {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
         {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices} toast={toast} revision={revisions.alert} /></Suspense>}

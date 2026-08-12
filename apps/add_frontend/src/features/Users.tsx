@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { api, queryString } from '../api'
+import { api, ApiError, queryString } from '../api'
 import {
-  CommandProgress, Dialog, PageHeader, StatusBadge, buildMachinePreview,
+  CommandProgress, Dialog, Metric, PageHeader, StatusBadge, buildMachinePreview,
   bulkDeletionConfirmation, confirmationMatches, dateTime, idempotency,
   identityConflictText, relativeTime, statusPattern, terminalCommandStates,
   useToast, utf8Length, validateUserDraft,
@@ -16,7 +16,7 @@ import type {
   UserCommandResponse, UserDeletionJob,
 } from '../types'
 
-function UserOperationDialog({
+export function UserOperationDialog({
   state,
   device,
   onClose,
@@ -40,6 +40,7 @@ function UserOperationDialog({
   const [elevationReason, setElevationReason] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({})
   const conflictRequiresCnic = Boolean(
     state.mode === 'edit' && user?.identity_conflict_code && !user.identity_conflict_resolved,
   )
@@ -50,10 +51,28 @@ function UserOperationDialog({
     : conflictRequiresCnic
       ? 'Enter the corrected CNIC to generate a safe terminal preview.'
       : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
+  const hasEditChange = Boolean(
+    user && (
+      displayName.trim() !== user.display_name ||
+      shiftWorker !== user.shift_worker ||
+      privilege !== user.privilege ||
+      Boolean(cnic)
+    ),
+  )
+  const canSubmit = !busy && Boolean(password) && (
+    state.mode === 'create'
+      ? Boolean(displayName.trim()) && /^\d{13}$/.test(cnic) && (!userIdOverride || /^\d+$/.test(userIdOverride))
+      : state.mode === 'edit'
+        ? hasEditChange && Boolean(displayName.trim()) && (!cnic || /^\d{13}$/.test(cnic)) && (!conflictRequiresCnic || /^\d{13}$/.test(cnic)) && (!permanentElevation || (elevationReason.trim().length >= 10 && confirmation === elevationConfirmation))
+        : state.mode === 'delete'
+          ? confirmationMatches(confirmation, state.user)
+          : true
+  )
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     setError('')
+    setFieldErrors({})
     if (state.mode === 'create') {
       const validation = validateUserDraft({ displayName, cnic, password, userIdOverride })
       if (validation) return setError(validation)
@@ -139,6 +158,7 @@ function UserOperationDialog({
       }
       onClose()
     } catch (reason) {
+      if (reason instanceof ApiError) setFieldErrors(reason.fieldErrors)
       setError(reason instanceof Error ? reason.message : 'The operation could not be queued.')
     } finally {
       setBusy(false)
@@ -158,9 +178,9 @@ function UserOperationDialog({
         {(state.mode === 'create' || state.mode === 'edit') && (
           <>
             <div className="form-grid">
-              <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} /></label>
-              <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={conflictRequiresCnic} /></label>
-              {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, 24))} /></label>}
+              <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} aria-invalid={Boolean(fieldErrors.display_name)} />{fieldErrors.display_name?.[0] && <small className="field-error">{fieldErrors.display_name[0]}</small>}</label>
+              <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={conflictRequiresCnic} aria-invalid={Boolean(fieldErrors.cnic)} />{fieldErrors.cnic?.[0] && <small className="field-error">{fieldErrors.cnic[0]}</small>}</label>
+              {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, 24))} aria-invalid={Boolean(fieldErrors.user_id_override)} />{fieldErrors.user_id_override?.[0] && <small className="field-error">{fieldErrors.user_id_override[0]}</small>}</label>}
               {state.mode === 'edit' && <label>Terminal role<select value={privilege} onChange={(event) => { setPrivilege(Number(event.target.value) as 0 | 14); setConfirmation(''); setElevationReason('') }}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select><small>Prefer the separate 10-minute enrollment lease for routine fingerprint enrollment.</small></label>}
             </div>
             <label className="check-field"><input type="checkbox" checked={shiftWorker} onChange={(event) => setShiftWorker(event.target.checked)} /><span><strong>Shift worker</strong><small>Adds the -S- identity marker used for raw-punch handling.</small></span></label>
@@ -182,14 +202,14 @@ function UserOperationDialog({
         {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
         <footer className="dialog-actions">
           <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
-          <button className={`button ${state.mode === 'delete' ? 'destructive' : 'primary'}`} disabled={busy}>{busy ? 'Queuing…' : state.mode === 'delete' ? 'Delete user safely' : state.mode === 'lease' ? 'Grant 10-minute access' : 'Confirm operation'}</button>
+          <button className={`button ${state.mode === 'delete' ? 'destructive' : 'primary'}`} disabled={!canSubmit}>{busy ? 'Queuing…' : state.mode === 'delete' ? 'Delete user safely' : state.mode === 'lease' ? 'Grant 10-minute access' : 'Confirm operation'}</button>
         </footer>
       </form>
     </Dialog>
   )
 }
 
-function IdentityResolutionDialog({
+export function IdentityResolutionDialog({
   state,
   device,
   onClose,
@@ -291,7 +311,7 @@ function IdentityResolutionDialog({
   )
 }
 
-function HistoricalIdentityResolutionDialog({
+export function HistoricalIdentityResolutionDialog({
   state,
   device,
   onClose,
@@ -467,7 +487,7 @@ function HistoricalIdentityResolutionDialog({
   )
 }
 
-function BulkDeletionDialog({
+export function BulkDeletionDialog({
   users,
   device,
   onClose,
@@ -552,7 +572,7 @@ function BulkDeletionDialog({
   )
 }
 
-function BulkDeletionProgress({
+export function BulkDeletionProgress({
   job,
   onCancel,
 }: {

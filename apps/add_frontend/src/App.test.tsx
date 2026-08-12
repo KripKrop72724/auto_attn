@@ -432,6 +432,22 @@ const fetchStub = (
     return response({ rows: [] })
   })
 
+const selectUserTerminal = async () => {
+  let option = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
+  if (!option) {
+    const trigger = await screen.findByRole('button', { name: /select terminal/i })
+    if (trigger.getAttribute('aria-expanded') !== 'true') fireEvent.click(trigger)
+    option = await waitFor(() => {
+      const found = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
+      expect(found).toBeTruthy()
+      return found
+    })
+  }
+  fireEvent.click(option as HTMLButtonElement)
+  await screen.findByRole('heading', { name: /terminal directory/i })
+  await screen.findByRole('button', { name: /^edit /i })
+}
+
 describe('State Life ADD interface', () => {
   beforeEach(() => {
     window.history.replaceState({}, '', '/fleet')
@@ -479,13 +495,11 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await screen.findByRole('option', { name: /SLICTOWER · 3rd Floor · ADZV211860253/i })
-    fireEvent.change(screen.getByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
+    await selectUserTerminal()
     expect(await screen.findByText(maskedCnic)).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(screen.getByRole('button', { name: /edit ayesha fatima/i })).toBeTruthy()
+    fireEvent.click(screen.getByLabelText(/more actions for ayesha fatima/i))
     expect(screen.getByRole('button', { name: /delete ayesha fatima/i })).toBeTruthy()
   })
 
@@ -494,21 +508,21 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
+    await selectUserTerminal()
     const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
     expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
-    expect(screen.getByText(/2 unresolved users across 1 exact-cnic groups/i)).toBeTruthy()
+    expect(screen.getByRole('tab', { name: /identity review/i })).toBeTruthy()
     expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(identityConflictText(conflictedUser)).toContain('1008 (UID 8)')
+    fireEvent.click(screen.getByRole('tab', { name: /identity review/i }))
     fireEvent.click(screen.getByRole('button', { name: /review same-employee alias/i }))
     expect(screen.getByRole('heading', { name: /verify same employee/i })).toBeTruthy()
     expect(screen.getByText(/no zkt user, fingerprint template, uid, or attendance event is merged/i)).toBeTruthy()
     expect(screen.getByLabelText(/type “same employee”/i)).toBeTruthy()
     expect(screen.getByLabelText(/confirm administrator password/i)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /close dialog/i }))
+    fireEvent.click(screen.getByRole('tab', { name: /directory/i }))
     fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
     expect(
       screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),
@@ -521,9 +535,8 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
+    await selectUserTerminal()
+    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     expect(await screen.findByRole('heading', { name: /historical identity backlog/i })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
     fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
@@ -569,10 +582,9 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
-    expect(await screen.findByText(/1 exact cohorts can accept guarded hr evidence/i)).toBeTruthy()
+    await selectUserTerminal()
+    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
+    expect(await screen.findByText(/exact event cohort/i)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
     fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
       target: { value: fullCnic },
@@ -623,11 +635,10 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
+    await selectUserTerminal()
+    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
-    expect(screen.getByRole('heading', { name: /edit device user/i })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: /edit device user/i })).toBeTruthy()
     expect(screen.getByLabelText(/replacement cnic/i)).toBeTruthy()
   })
 
@@ -643,9 +654,8 @@ describe('State Life ADD interface', () => {
     render(<App />)
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    fireEvent.change(await screen.findByLabelText('Selected terminal'), {
-      target: { value: device.connector_id },
-    })
+    await selectUserTerminal()
+    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     fireEvent.click(
       await screen.findByRole('button', { name: /verify against current identity/i }),
     )
