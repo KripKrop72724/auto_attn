@@ -9,6 +9,7 @@ PORTAL = (FIRMWARE / "main" / "setup_portal.c").read_text(encoding="utf-8")
 PORTAL_HEADER = (FIRMWARE / "main" / "setup_portal.h").read_text(encoding="utf-8")
 ZONE = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 ASSETS = (FIRMWARE / "main" / "setup_portal_assets.c").read_text(encoding="utf-8")
+SDKCONFIG = (FIRMWARE / "sdkconfig").read_text(encoding="utf-8")
 
 
 def test_setup_ap_credential_is_build_injected_and_portal_fails_closed_without_it() -> None:
@@ -35,7 +36,6 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "esp_wifi_set_mode(WIFI_MODE_APSTA)" in PORTAL
     assert "esp_wifi_set_mode(WIFI_MODE_STA)" in PORTAL
     assert "request_from_ap" in PORTAL
-    assert "(peer_ip & PORTAL_MASK) != PORTAL_NET" in PORTAL
     request_guard = PORTAL[
         PORTAL.index("static bool request_from_ap") :
         PORTAL.index("static void set_ap_auth_tracking")
@@ -52,7 +52,11 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "setup_portal_handle_ap_station_disconnected" in ZONE
     assert "PORTAL_CLIENT_AUTH_WAIT_MS 1500" in PORTAL
     assert "xEventGroupWaitBits" in PORTAL
-    assert "getsockname(fd" not in PORTAL
+    assert "struct sockaddr_storage local" in request_guard
+    assert "struct sockaddr_storage peer" in request_guard
+    assert "getsockname(fd" in request_guard
+    assert "setup_portal_socket_guard_allows" in request_guard
+    assert "CONFIG_LWIP_IPV6=y" in SDKCONFIG
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
     assert "PORTAL_HTTP_MAX_OPEN_SOCKETS 7" in PORTAL
     assert "config.max_open_sockets = PORTAL_HTTP_MAX_OPEN_SOCKETS" in PORTAL
@@ -203,6 +207,103 @@ def test_setup_client_authorization_survives_event_order_and_rejects_stale_lease
 
     assert "IP_EVENT_AP_STAIPASSIGNED" in ZONE
     assert "setup_portal_handle_ap_station_ip_assigned" in PORTAL_HEADER
+
+
+def test_setup_socket_guard_handles_ipv4_and_dual_stack_without_cross_interface_access(
+    tmp_path: Path,
+) -> None:
+    guard_source = FIRMWARE / "main" / "setup_portal_socket_guard.c"
+    harness = tmp_path / "portal_socket_guard_harness.c"
+    executable = tmp_path / "portal_socket_guard_harness"
+    harness.write_text(
+        textwrap.dedent(
+            """
+            #include <arpa/inet.h>
+            #include <assert.h>
+            #include <stdint.h>
+            #include <string.h>
+            #include "setup_portal_socket_guard.h"
+
+            static struct sockaddr_in ipv4(const char *text) {
+                struct sockaddr_in address = {0};
+                address.sin_family = AF_INET;
+                assert(inet_pton(AF_INET, text, &address.sin_addr) == 1);
+                return address;
+            }
+
+            static struct sockaddr_in6 ipv6(const char *text) {
+                struct sockaddr_in6 address = {0};
+                address.sin6_family = AF_INET6;
+                assert(inet_pton(AF_INET6, text, &address.sin6_addr) == 1);
+                return address;
+            }
+
+            int main(void) {
+                struct sockaddr_in local4 = ipv4("192.168.254.1");
+                struct sockaddr_in peer4 = ipv4("192.168.254.2");
+                struct sockaddr_in wrong_local4 = ipv4("192.168.100.21");
+                struct sockaddr_in wrong_peer4 = ipv4("192.168.253.2");
+                struct sockaddr_in6 local6 = ipv6("::ffff:192.168.254.1");
+                struct sockaddr_in6 peer6 = ipv6("::ffff:192.168.254.2");
+                struct sockaddr_in6 pure6 = ipv6("fd00::2");
+                uint32_t peer_ip = 0;
+
+                assert(setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local4, sizeof(local4),
+                    (struct sockaddr *)&peer4, sizeof(peer4), &peer_ip));
+                assert(peer_ip == peer4.sin_addr.s_addr);
+
+                peer_ip = 0;
+                assert(setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local6, sizeof(local6),
+                    (struct sockaddr *)&peer6, sizeof(peer6), &peer_ip));
+                assert(peer_ip == peer4.sin_addr.s_addr);
+
+                assert(setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local4, sizeof(local4),
+                    (struct sockaddr *)&peer6, sizeof(peer6), NULL));
+                assert(!setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&wrong_local4, sizeof(wrong_local4),
+                    (struct sockaddr *)&peer4, sizeof(peer4), NULL));
+                peer_ip = UINT32_MAX;
+                assert(!setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&wrong_local4, sizeof(wrong_local4),
+                    (struct sockaddr *)&peer4, sizeof(peer4), &peer_ip));
+                assert(peer_ip == 0);
+                assert(!setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local4, sizeof(local4),
+                    (struct sockaddr *)&wrong_peer4, sizeof(wrong_peer4), NULL));
+                assert(!setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local6, sizeof(local6),
+                    (struct sockaddr *)&pure6, sizeof(pure6), NULL));
+                assert(!setup_portal_socket_guard_allows(
+                    (struct sockaddr *)&local4, sizeof(local4) - 1,
+                    (struct sockaddr *)&peer4, sizeof(peer4), NULL));
+                assert(!setup_portal_socket_guard_allows(
+                    NULL, 0, (struct sockaddr *)&peer4, sizeof(peer4), NULL));
+                return 0;
+            }
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "cc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(FIRMWARE / "main"),
+            str(guard_source),
+            str(harness),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
 
 
 def test_recovery_and_manual_activation_windows_match_the_operating_contract() -> None:
