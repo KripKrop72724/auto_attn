@@ -59,6 +59,108 @@ function Test-ReportedFirmwareVersion {
     return $normalized -eq $ExpectedVersion
 }
 
+function Get-OrdsDeliveryAssurance {
+    $overview = Invoke-AddApi -Method GET -Path '/api/v1/overview'
+    $delivery = $overview.ords_delivery
+    if ($null -eq $delivery) {
+        return [pscustomobject]@{
+            ok = $false
+            detail = 'ADD omitted Oracle delivery metrics.'
+        }
+    }
+    $requiredFields = @(
+        'pending',
+        'retrying',
+        'in_flight',
+        'firmware_unverified',
+        'membership_reverify',
+        'blocked_identity',
+        'quarantined'
+    )
+    $missingFields = @($requiredFields | Where-Object {
+        $_ -notin @($delivery.PSObject.Properties.Name)
+    })
+    if ($missingFields.Count -gt 0) {
+        return [pscustomobject]@{
+            ok = $false
+            quarantined = -1
+            detail = "ADD omitted Oracle delivery fields: $($missingFields -join ', ')."
+        }
+    }
+    $active = [ordered]@{
+        pending = [int]$delivery.pending
+        retrying = [int]$delivery.retrying
+        in_flight = [int]$delivery.in_flight
+        firmware_unverified = [int]$delivery.firmware_unverified
+        membership_reverify = [int]$delivery.membership_reverify
+    }
+    $activeCount = 0
+    foreach ($value in $active.Values) { $activeCount += [int]$value }
+    $detail = ($active.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '
+    return [pscustomobject]@{
+        ok = $activeCount -eq 0
+        quarantined = [int]$delivery.quarantined
+        detail = "$detail blocked_identity=$([int]$delivery.blocked_identity) quarantined=$([int]$delivery.quarantined)"
+    }
+}
+
+function Get-ZoneSourceAssurance {
+    param(
+        [Parameter(Mandatory = $true)][string]$ZoneId,
+        [string]$ExpectedVersion = ''
+    )
+    $devices = @((Invoke-AddApi -Method GET -Path '/api/v1/devices').rows | Where-Object {
+        [bool]$_.ota_capable -and $_.zone_id -eq $ZoneId
+    })
+    if ($devices.Count -lt 1) {
+        return [pscustomobject]@{ ok = $false; detail = "zone=$ZoneId devices=0" }
+    }
+    $failures = @()
+    foreach ($device in $devices) {
+        $identity = "$ZoneId/$($device.hardware_id)"
+        if ($ExpectedVersion -and -not (
+            Test-ReportedFirmwareVersion `
+                -ReportedVersion ([string]$device.firmware_version) `
+                -ExpectedVersion $ExpectedVersion
+        )) {
+            $failures += "$identity version=$($device.firmware_version)"
+        }
+        $preflight = Invoke-AddApi -Method GET `
+            -Path "/api/v1/devices/$($device.connector_id)/reconciliations/preflight"
+        $coverage = $preflight.coverage
+        if ($null -eq $coverage) {
+            $failures += "$identity source_coverage=missing"
+            continue
+        }
+        $cursor = [long]$coverage.source_committed_cursor
+        $ledgerCount = [long]$coverage.source_ledger_count
+        $terminalCount = [long]$preflight.terminal.attendance_count
+        if (-not [bool]$coverage.active) {
+            $failures += "$identity source_coverage=inactive"
+        }
+        if (-not [bool]$coverage.source_ledger_complete -or $ledgerCount -ne $cursor) {
+            $failures += "$identity source_ledger=$ledgerCount/$cursor"
+        }
+        if (-not [bool]$coverage.terminal_source_parity -or $cursor -ne $terminalCount) {
+            $failures += "$identity terminal_parity=$cursor/$terminalCount"
+        }
+        if (-not [bool]$coverage.chain_continuous) {
+            $failures += "$identity source_chain=discontinuous"
+        }
+        if ([string]$coverage.oracle_state -ne 'ORACLE_MEMBERSHIP_CERTIFIED') {
+            $failures += "$identity oracle_state=$($coverage.oracle_state)"
+        }
+    }
+    return [pscustomobject]@{
+        ok = $failures.Count -eq 0
+        detail = if ($failures.Count -eq 0) {
+            "zone=$ZoneId devices=$($devices.Count) source_and_oracle_certified=true"
+        } else {
+            $failures -join '; '
+        }
+    }
+}
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be SemVer without a v prefix.' }
 if ($GitSha -notmatch '^[0-9a-f]{40}$') { throw 'GitSha must be an exact lowercase commit SHA.' }
 if ($CanaryCampaignId -notmatch '^[0-9a-f]{32}$') { throw 'CanaryCampaignId is invalid.' }
@@ -124,8 +226,21 @@ try {
         $batch = @($pendingZones[$offset..$last])
         $created = @()
         $batchAccepted = $false
+        $batchQuarantineBaseline = $null
         try {
             foreach ($zoneId in $batch) {
+                $sourceAssurance = Get-ZoneSourceAssurance -ZoneId $zoneId
+                if (-not $sourceAssurance.ok) {
+                    throw "Zone $zoneId failed source assurance before OTA: $($sourceAssurance.detail)."
+                }
+                $deliveryAssurance = Get-OrdsDeliveryAssurance
+                if (-not $deliveryAssurance.ok) {
+                    throw "Oracle delivery was not quiescent before zone $zoneId: $($deliveryAssurance.detail)."
+                }
+                if ($null -eq $batchQuarantineBaseline) {
+                    $batchQuarantineBaseline = [int]$deliveryAssurance.quarantined
+                }
+                Write-Host "Pre-OTA assurance accepted: $($sourceAssurance.detail); $($deliveryAssurance.detail)."
                 $scope = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns/preflight' -Body @{
                     release_id = $release.release_id
                     zone_id = $zoneId
@@ -174,6 +289,33 @@ try {
                     [int]$_.eligible -gt 0 -and [int]$_.counts.SUCCEEDED -eq [int]$_.eligible
                 })
                 if ($complete.Count -eq $created.Count) {
+                    $sourceAssuranceFailures = @()
+                    foreach ($row in $rows) {
+                        $sourceAssurance = Get-ZoneSourceAssurance `
+                            -ZoneId ([string]$row.zone_id) `
+                            -ExpectedVersion $Version
+                        if (-not $sourceAssurance.ok) {
+                            $sourceAssuranceFailures += $sourceAssurance.detail
+                        }
+                    }
+                    $deliveryAssurance = Get-OrdsDeliveryAssurance
+                    if (
+                        $null -ne $batchQuarantineBaseline -and
+                        [int]$deliveryAssurance.quarantined -gt [int]$batchQuarantineBaseline
+                    ) {
+                        throw (
+                            'Oracle quarantine increased during the OTA batch: ' +
+                            "$batchQuarantineBaseline->$($deliveryAssurance.quarantined)."
+                        )
+                    }
+                    if ($sourceAssuranceFailures.Count -gt 0 -or -not $deliveryAssurance.ok) {
+                        $pendingDetail = @($sourceAssuranceFailures)
+                        if (-not $deliveryAssurance.ok) {
+                            $pendingDetail += "Oracle delivery: $($deliveryAssurance.detail)"
+                        }
+                        Write-Host "Waiting for post-OTA source and Oracle assurance: $($pendingDetail -join '; ')."
+                        continue
+                    }
                     foreach ($row in $rows) {
                         Invoke-AddApi -Method POST -Path "/api/v1/firmware/campaigns/$($row.campaign_id)/cancel" -Body @{
                             reason = "NATIONWIDE_ACCEPTED: version $Version stable in zone $($row.zone_id)."
@@ -209,6 +351,18 @@ try {
     if ($unstable.Count -gt 0) {
         $identities = ($unstable | ForEach-Object { "$($_.zone_id)/$($_.hardware_id)" }) -join ', '
         throw "Post-rollout stability verification failed for: $identities"
+    }
+    $finalSourceFailures = @()
+    foreach ($zoneId in $allZones) {
+        $sourceAssurance = Get-ZoneSourceAssurance -ZoneId $zoneId -ExpectedVersion $Version
+        if (-not $sourceAssurance.ok) { $finalSourceFailures += $sourceAssurance.detail }
+    }
+    if ($finalSourceFailures.Count -gt 0) {
+        throw "Final source and Oracle certification failed: $($finalSourceFailures -join '; ')."
+    }
+    $finalDeliveryAssurance = Get-OrdsDeliveryAssurance
+    if (-not $finalDeliveryAssurance.ok) {
+        throw "Final Oracle delivery queue was not quiescent: $($finalDeliveryAssurance.detail)."
     }
     Write-Host "Nationwide OTA succeeded: version=$Version devices=$($finalDevices.Count) zones=$($allZones.Count)."
 } finally {

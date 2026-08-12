@@ -423,6 +423,18 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "idempotency_key = \"nationwide-$Version-$zoneId-" in rollout
     assert "[int]$scope.counts.offline -ne 0" in rollout
     assert rollout.index("'/api/v1/firmware/campaigns/preflight'") < rollout.index("'/api/v1/firmware/campaigns' -Body")
+    assert "function Get-ZoneSourceAssurance" in rollout
+    assert "source_ledger_complete" in rollout
+    assert "terminal_source_parity" in rollout
+    assert "chain_continuous" in rollout
+    assert "ORACLE_MEMBERSHIP_CERTIFIED" in rollout
+    assert "function Get-OrdsDeliveryAssurance" in rollout
+    assert "firmware_unverified" in rollout
+    assert "membership_reverify" in rollout
+    assert "Oracle quarantine increased during the OTA batch" in rollout
+    assert "failed source assurance before OTA" in rollout
+    assert "Waiting for post-OTA source and Oracle assurance" in rollout
+    assert "Final source and Oracle certification failed" in rollout
     assert "Invoke-WebRequest -UseBasicParsing -Method Post" in rollout
     assert "'(?:^|[,\\s])add_admin=([^;,\\s]+)'" in rollout
     assert "$adminCookie.Secure = $false" in rollout
