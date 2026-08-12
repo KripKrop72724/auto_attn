@@ -126,12 +126,32 @@ try {
         $batchAccepted = $false
         try {
             foreach ($zoneId in $batch) {
+                $scope = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns/preflight' -Body @{
+                    release_id = $release.release_id
+                    zone_id = $zoneId
+                }
+                if (
+                    [string]::IsNullOrWhiteSpace([string]$scope.scope_token) -or
+                    [int]$scope.counts.candidates -lt 1 -or
+                    [int]$scope.counts.eligible -lt 1 -or
+                    [int]$scope.counts.offline -ne 0
+                ) {
+                    throw (
+                        "Zone $zoneId failed the server-authoritative rollout preview: " +
+                        "candidates=$($scope.counts.candidates) " +
+                        "eligible=$($scope.counts.eligible) " +
+                        "excluded=$($scope.counts.excluded) " +
+                        "offline=$($scope.counts.offline)."
+                    )
+                }
                 $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body @{
                     release_id = $release.release_id
                     zone_id = $zoneId
                     reason = "Nationwide Wi-Fi setup portal rollout $Version; batch $([int]($offset / $BatchSize) + 1)."
                     typed_confirmation = $Version
                     password = $AdminPassword
+                    scope_token = [string]$scope.scope_token
+                    idempotency_key = "nationwide-$Version-$zoneId-$([guid]::NewGuid().ToString('N'))"
                 }
                 if ([int]$createdCampaign.eligible -lt 1) { throw "Zone $zoneId has no eligible deployment." }
                 $created += [pscustomobject]@{ campaign_id = $createdCampaign.campaign_id; zone_id = $zoneId; status = 'ACTIVE' }

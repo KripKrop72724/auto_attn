@@ -418,6 +418,11 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "ROLLED_BACK" in rollout
     assert "NATIONWIDE_ACCEPTED:" in rollout
     assert "Post-rollout stability verification failed" in rollout
+    assert "'/api/v1/firmware/campaigns/preflight'" in rollout
+    assert "scope_token = [string]$scope.scope_token" in rollout
+    assert "idempotency_key = \"nationwide-$Version-$zoneId-" in rollout
+    assert "[int]$scope.counts.offline -ne 0" in rollout
+    assert rollout.index("'/api/v1/firmware/campaigns/preflight'") < rollout.index("'/api/v1/firmware/campaigns' -Body")
     assert "Invoke-WebRequest -UseBasicParsing -Method Post" in rollout
     assert "'(?:^|[,\\s])add_admin=([^;,\\s]+)'" in rollout
     assert "$adminCookie.Secure = $false" in rollout
