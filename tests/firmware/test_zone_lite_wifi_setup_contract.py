@@ -9,7 +9,6 @@ PORTAL = (FIRMWARE / "main" / "setup_portal.c").read_text(encoding="utf-8")
 PORTAL_HEADER = (FIRMWARE / "main" / "setup_portal.h").read_text(encoding="utf-8")
 ZONE = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 ASSETS = (FIRMWARE / "main" / "setup_portal_assets.c").read_text(encoding="utf-8")
-SDKCONFIG = (FIRMWARE / "sdkconfig").read_text(encoding="utf-8")
 
 
 def test_setup_ap_credential_is_build_injected_and_portal_fails_closed_without_it() -> None:
@@ -56,7 +55,7 @@ def test_setup_ap_is_bounded_isolated_and_dormant_during_normal_operation() -> N
     assert "struct sockaddr_storage peer" in request_guard
     assert "getsockname(fd" in request_guard
     assert "setup_portal_socket_guard_allows" in request_guard
-    assert "CONFIG_LWIP_IPV6=y" in SDKCONFIG
+    assert "CONFIG_LWIP_IPV6=y" in defaults
     assert "ESP_NETIF_CAPTIVEPORTAL_URI" in PORTAL
     assert "PORTAL_HTTP_MAX_OPEN_SOCKETS 7" in PORTAL
     assert "config.max_open_sockets = PORTAL_HTTP_MAX_OPEN_SOCKETS" in PORTAL
