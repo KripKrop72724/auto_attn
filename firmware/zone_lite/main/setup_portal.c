@@ -33,11 +33,12 @@
 #include "setup_password.h"
 #include "setup_portal_client_auth.h"
 #include "setup_portal_assets.h"
+#include "setup_portal_socket_guard.h"
 #include "zone_config.h"
 
 #define PORTAL_IP              "192.168.254.1"
-#define PORTAL_NET             0xC0A8FE00UL
-#define PORTAL_MASK            0xFFFFFF00UL
+#define PORTAL_NET             UINT32_C(0xC0A8FE00)
+#define PORTAL_MASK            UINT32_C(0xFFFFFF00)
 #define PORTAL_RECOVERY_MS     (2 * 60 * 1000)
 #define PORTAL_MANUAL_IDLE_MS  (10 * 60 * 1000)
 #define PORTAL_STABLE_CLOSE_MS (30 * 1000)
@@ -151,11 +152,23 @@ static void generate_csrf(void)
 static bool request_from_ap(httpd_req_t *request)
 {
     int fd = httpd_req_to_sockfd(request);
-    struct sockaddr_in peer = {0};
+    struct sockaddr_storage local = {0};
+    struct sockaddr_storage peer = {0};
+    socklen_t local_length = sizeof(local);
     socklen_t length = sizeof(peer);
-    if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0) return false;
-    uint32_t peer_ip = ntohl(peer.sin_addr.s_addr);
-    if ((peer_ip & PORTAL_MASK) != PORTAL_NET) return false;
+    if (getsockname(fd, (struct sockaddr *)&local, &local_length) != 0 ||
+        getpeername(fd, (struct sockaddr *)&peer, &length) != 0) {
+        return false;
+    }
+    uint32_t peer_ip = 0;
+    if (!setup_portal_socket_guard_allows(
+            (struct sockaddr *)&local,
+            local_length,
+            (struct sockaddr *)&peer,
+            length,
+            &peer_ip)) {
+        return false;
+    }
 
     // The live esp_wifi_ap_get_sta_list_with_ip() snapshot can report an
     // associated station before lwIP has published its DHCP lease. Polling
@@ -167,7 +180,7 @@ static bool request_from_ap(httpd_req_t *request)
     bool allowed;
     portENTER_CRITICAL(&s_lock);
     allowed = s_ap_auth_tracking &&
-              setup_portal_client_auth_allows(&s_ap_client_auth, peer.sin_addr.s_addr);
+              setup_portal_client_auth_allows(&s_ap_client_auth, peer_ip);
     portEXIT_CRITICAL(&s_lock);
     if (allowed) return true;
 
@@ -181,7 +194,7 @@ static bool request_from_ap(httpd_req_t *request)
     }
     portENTER_CRITICAL(&s_lock);
     allowed = s_ap_auth_tracking &&
-              setup_portal_client_auth_allows(&s_ap_client_auth, peer.sin_addr.s_addr);
+              setup_portal_client_auth_allows(&s_ap_client_auth, peer_ip);
     portEXIT_CRITICAL(&s_lock);
     return allowed;
 }

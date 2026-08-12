@@ -36,6 +36,11 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
+# ESP-IDF's HTTP server listens dual-stack when IPv6 is enabled. The captive
+# portal request guard therefore handles both native IPv4 and IPv4-mapped IPv6
+# socket addresses explicitly.
+CONFIG_LWIP_IPV6=y
+
 # The setup AP is an isolated configuration surface, never a router/NAT path.
 # Normal operation remains station-only and does not run DNS or HTTP services.
 CONFIG_LWIP_IP_FORWARD=n
