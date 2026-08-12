@@ -23,19 +23,25 @@ jobs:
           persist-credentials: false
       - name: Enforce ADD and Zone Lite consolidation
         run: python3 scripts/check_repository_contract.py
-      - name: Parse the transactional Windows deployment script
+      - name: Parse production PowerShell scripts
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'deploy/add/deploy.ps1'),
-            [ref]$tokens,
-            [ref]$errors
+          $productionScripts = @(
+            'deploy/add/deploy.ps1',
+            'deploy/add/Invoke-NationwideFirmwareRollout.ps1'
           )
-          if ($errors.Count -gt 0) {
-            $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
-            throw "deploy.ps1 contains parser errors:$([Environment]::NewLine)$messages"
+          foreach ($path in $productionScripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $messages = ($errors | ForEach-Object Message) -join [Environment]::NewLine
+              throw "$path contains parser errors:$([Environment]::NewLine)$messages"
+            }
           }
           $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
           if ($utf8NoBom.GetPreamble().Length -ne 0) {

@@ -435,6 +435,9 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "failed source assurance before OTA" in rollout
     assert "Waiting for post-OTA source and Oracle assurance" in rollout
     assert "Final source and Oracle certification failed" in rollout
+    ci = (ROOT / ".github" / "workflows" / "add-ci.yml").read_text(encoding="utf-8")
+    assert "'deploy/add/Invoke-NationwideFirmwareRollout.ps1'" in ci
+    assert "Language.Parser]::ParseFile" in ci
     assert "Invoke-WebRequest -UseBasicParsing -Method Post" in rollout
     assert "'(?:^|[,\\s])add_admin=([^;,\\s]+)'" in rollout
     assert "$adminCookie.Secure = $false" in rollout

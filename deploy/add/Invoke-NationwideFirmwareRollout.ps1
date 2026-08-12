@@ -235,7 +235,7 @@ try {
                 }
                 $deliveryAssurance = Get-OrdsDeliveryAssurance
                 if (-not $deliveryAssurance.ok) {
-                    throw "Oracle delivery was not quiescent before zone $zoneId: $($deliveryAssurance.detail)."
+                    throw "Oracle delivery was not quiescent before zone ${zoneId}: $($deliveryAssurance.detail)."
                 }
                 if ($null -eq $batchQuarantineBaseline) {
                     $batchQuarantineBaseline = [int]$deliveryAssurance.quarantined
