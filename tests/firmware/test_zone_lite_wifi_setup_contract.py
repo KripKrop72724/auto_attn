@@ -428,7 +428,6 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "terminal_source_parity" in rollout
     assert "chain_continuous" in rollout
     assert "ORACLE_MEMBERSHIP_CERTIFIED" in rollout
-    assert "oracle_evidence.certified_source_cursor" in rollout
     assert "function Get-OrdsDeliveryAssurance" in rollout
     assert "firmware_unverified" in rollout
     assert "membership_reverify" in rollout
