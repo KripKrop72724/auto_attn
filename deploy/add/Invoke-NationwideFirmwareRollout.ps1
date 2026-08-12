@@ -149,6 +149,13 @@ function Get-ZoneSourceAssurance {
         }
         if ([string]$coverage.oracle_state -ne 'ORACLE_MEMBERSHIP_CERTIFIED') {
             $failures += "$identity oracle_state=$($coverage.oracle_state)"
+        } elseif ($null -eq $coverage.oracle_evidence) {
+            $failures += "$identity oracle_certificate=missing"
+        } else {
+            $oracleCursor = [long]$coverage.oracle_evidence.certified_source_cursor
+            if ($oracleCursor -ne $cursor) {
+                $failures += "$identity oracle_certificate_cursor=$oracleCursor/$cursor"
+            }
         }
     }
     return [pscustomobject]@{
