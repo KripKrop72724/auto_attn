@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Icon } from './Icon'
 import type { DashboardRoute } from './types'
 import type { RealtimeState } from './realtime'
@@ -34,6 +34,39 @@ export function AppShell({
   lastSyncAt: Date | null
 }) {
   const [moreOpen, setMoreOpen] = useState(false)
+  const moreTriggerRef = useRef<HTMLButtonElement>(null)
+  const moreSheetRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    if (!moreOpen) return
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    const focusable = () => Array.from(moreSheetRef.current?.querySelectorAll<HTMLElement>(focusableSelector) || [])
+    focusable()[0]?.focus()
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setMoreOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const controls = focusable()
+      if (!controls.length) return
+      const first = controls[0]
+      const last = controls[controls.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      ;(previousFocus || moreTriggerRef.current)?.focus()
+    }
+  }, [moreOpen])
   const connectionLabel = {
     connecting: 'Connecting',
     live: 'Live sync',
@@ -74,7 +107,7 @@ export function AppShell({
           <span className={`live-sync connection-${realtimeState}`}><i /> {connectionLabel}</span>
           <small>{lastSyncAt ? `Last sync ${lastSyncAt.toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi' })} PKT` : 'Encrypted · audited · PKT'}</small>
         </div>
-        <button className={`mobile-more-trigger ${moreOpen ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="grid" /><span>More</span></button>
+        <button ref={moreTriggerRef} className={`mobile-more-trigger ${moreOpen ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="grid" /><span>More</span></button>
       </aside>
       <section className="app-workspace">
         <header className="app-header">
@@ -91,7 +124,7 @@ export function AppShell({
         <main className="page-content">{children}</main>
       </section>
       {moreOpen && <div className="mobile-more-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMoreOpen(false) }}>
-        <section className="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
+        <section ref={moreSheetRef} className="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
           <header><div><p className="eyebrow">ALL WORKSPACES</p><h2 id="mobile-more-title">More operations</h2></div><button className="icon-button" aria-label="Close more navigation" onClick={() => setMoreOpen(false)}><Icon name="x" /></button></header>
           {navigation.filter((item) => !mobilePrimary.has(item.id)).map((item) => <button key={item.id} className={route === item.id ? 'active' : ''} onClick={() => { onNavigate(item.id); setMoreOpen(false) }}><Icon name={item.icon} /><span><strong>{item.label}</strong><small>{item.id === 'reconciliation' ? 'Historical truth, recovery, and immutable evidence' : 'Signed releases, scope previews, and campaigns'}</small></span><Icon name="chevron" /></button>)}
         </section>

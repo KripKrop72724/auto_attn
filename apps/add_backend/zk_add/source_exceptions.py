@@ -115,8 +115,6 @@ def list_source_exceptions(
         statement = statement.where(TerminalRecordManifest.error_code == error_code)
     if ordinal is not None:
         statement = statement.where(TerminalRecordManifest.ordinal == ordinal)
-    if cursor:
-        statement = statement.where(TerminalRecordManifest.id < cursor)
     if review_state == "OPEN":
         statement = statement.where(
             ~TerminalRecordManifest.id.in_(select(TerminalRecordReview.manifest_id))
@@ -125,6 +123,11 @@ def list_source_exceptions(
         statement = statement.where(
             TerminalRecordManifest.id.in_(select(TerminalRecordReview.manifest_id))
         )
+    filtered_total = session.scalar(
+        select(func.count()).select_from(statement.order_by(None).subquery())
+    ) or 0
+    if cursor:
+        statement = statement.where(TerminalRecordManifest.id < cursor)
     rows = session.scalars(
         statement.order_by(TerminalRecordManifest.id.desc()).limit(limit + 1)
     ).all()
@@ -172,6 +175,7 @@ def list_source_exceptions(
             for row in page
         ],
         "next_cursor": page[-1].id if len(rows) > limit and page else None,
+        "filtered_total": int(filtered_total),
     }
 
 

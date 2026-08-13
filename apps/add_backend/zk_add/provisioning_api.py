@@ -31,7 +31,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
@@ -605,16 +605,48 @@ async def create_session(
 
 @router.get("/api/v1/provisioning/sessions")
 def list_sessions(
+    mine_only: bool = False,
+    q: str | None = Query(default=None, max_length=120),
+    state: str | None = Query(default=None, max_length=50),
+    cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
-    db, _context = auth
-    rows = db.scalars(
-        select(ProvisioningSession)
-        .order_by(ProvisioningSession.created_at.desc())
-        .limit(limit)
-    ).all()
-    return {"rows": [serialize_session(db, row) for row in rows]}
+    db, context = auth
+    clauses = []
+    if mine_only:
+        clauses.append(ProvisioningSession.operator == context.username)
+    if state:
+        clauses.append(ProvisioningSession.state == state.upper())
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        clauses.append(
+            or_(
+                ProvisioningSession.session_id.ilike(term),
+                ProvisioningSession.operator.ilike(term),
+                ProvisioningSession.hardware_mac.ilike(term),
+                ProvisioningSession.device_id.ilike(term),
+                ProvisioningSession.zone_id.ilike(term),
+                ProvisioningSession.zone_name.ilike(term),
+            )
+        )
+    filtered_total = db.scalar(
+        select(func.count(ProvisioningSession.id)).where(*clauses)
+    ) or 0
+    statement = select(ProvisioningSession).where(*clauses)
+    if cursor is not None:
+        statement = statement.where(ProvisioningSession.id < cursor)
+    fetched = list(
+        db.scalars(
+            statement.order_by(ProvisioningSession.id.desc()).limit(limit + 1)
+        ).all()
+    )
+    rows = fetched[:limit]
+    return {
+        "rows": [serialize_session(db, row) for row in rows],
+        "next_cursor": rows[-1].id if len(fetched) > limit and rows else None,
+        "filtered_total": int(filtered_total),
+    }
 
 
 @router.get("/api/v1/provisioning/sessions/{session_id}")
@@ -878,6 +910,8 @@ async def cancel_session(
 ):
     db, context = auth
     row = _session_or_404(db, session_id)
+    if row.operator != context.username:
+        raise HTTPException(status_code=403, detail="This session belongs to another operator.")
     if row.irreversible_started_at is not None:
         raise HTTPException(
             status_code=409,

@@ -313,94 +313,6 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .attendance-table strong { margin-bottom: 5px; font-size: 14px; }
 .attendance-table small { color: var(--muted); }
 
-.reconcile-list { display: grid; gap: 1px; background: var(--line); }
-.reconcile-job { display: grid; gap: 16px; padding: 22px 24px; background: #ffffff; }
-.reconcile-job-head, .reconcile-phase, .reconcile-actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
-.reconcile-job-head h3 { margin: 3px 0 5px; font-size: 19px; }
-.reconcile-job-head small, .reconcile-phase span { color: var(--muted); font-size: 12px; }
-.reconcile-phase strong { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
-.reconcile-progress { height: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--soft); }
-.reconcile-progress i { display: block; height: 100%; min-width: 2px; background: var(--blue); transition: width .35s ease; }
-.reconcile-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
-.reconcile-facts span { min-width: 0; color: var(--muted); font-size: 11px; }
-.reconcile-facts strong { display: block; overflow: hidden; margin-bottom: 3px; color: var(--ink); font-size: 16px; text-overflow: ellipsis; }
-.reconcile-error { display: flex; align-items: center; gap: 8px; margin: 0; padding: 10px 12px; border: 2px dashed #737373; color: var(--ink); font-size: 13px; }
-.reconcile-error svg { width: 18px; color: var(--critical); }
-.reconcile-actions { justify-content: flex-end; flex-wrap: wrap; }
-
-.firmware-mode-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 14px; margin-bottom: 18px; }
-.firmware-mode { min-height: 86px; display: flex; align-items: center; gap: 15px; padding: 17px 20px; background: #ffffff; }
-.firmware-mode > svg { width: 27px; height: 27px; color: var(--blue); }
-.firmware-mode > span { display: grid; gap: 5px; }
-.firmware-mode small { color: var(--muted); }
-.firmware-start-panel { margin-bottom: 20px; }
-.firmware-start-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 16px;
-  padding: 22px 24px 24px;
-}
-.firmware-start-form label, .firmware-controls label {
-  display: grid;
-  gap: 8px;
-  margin: 0;
-  color: #333333;
-  font-size: 14px;
-  font-weight: 650;
-}
-.firmware-reason, .firmware-quarantine { grid-column: 1 / -1; }
-.firmware-quarantine {
-  min-height: 74px;
-  display: flex;
-  align-items: flex-start;
-  gap: 13px;
-  padding: 15px;
-  background: #fafafa;
-}
-.firmware-quarantine > svg { flex: 0 0 auto; color: var(--blue); }
-.firmware-quarantine p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
-.firmware-quarantine code { overflow-wrap: anywhere; color: var(--ink); }
-.firmware-start-button { grid-column: 2; justify-self: end; min-width: 240px; }
-.firmware-section { margin-top: 20px; }
-.firmware-release-list, .firmware-campaign-list { display: grid; gap: 1px; background: var(--line); }
-.firmware-release, .firmware-campaign { padding: 22px 24px; background: #ffffff; }
-.firmware-release-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
-.firmware-release-title h3, .firmware-campaign h3 { margin: 0; font-size: 19px; }
-.firmware-release dl { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.firmware-release dd { overflow-wrap: anywhere; }
-.firmware-release code { font-size: 11px; }
-.firmware-campaign-summary {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto minmax(150px, .5fr) minmax(230px, 1fr);
-  align-items: center;
-  gap: 18px;
-}
-.firmware-campaign-summary > div { display: grid; gap: 5px; }
-.firmware-campaign-summary > div > strong { font-size: 14px; }
-.firmware-campaign-summary small { color: var(--muted); }
-.firmware-campaign-summary code { overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
-.firmware-pause-reason { display: flex; align-items: center; gap: 8px; margin: 18px 0 0; padding: 11px 13px; color: var(--ink); background: #fafafa; font-size: 13px; }
-.firmware-pause-reason svg { flex: 0 0 auto; }
-.firmware-deployment-evidence { margin-top: 14px; border: 1px solid var(--line); background: #fafafa; }
-.firmware-deployment-evidence summary { padding: 11px 13px; cursor: pointer; font-size: 13px; font-weight: 700; }
-.firmware-deployment-evidence dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; margin: 0; padding: 0 13px 13px; }
-.firmware-deployment-evidence dl div { display: grid; gap: 3px; }
-.firmware-deployment-evidence dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-.firmware-deployment-evidence dd { margin: 0; overflow-wrap: anywhere; font-size: 12px; }
-.firmware-deployment-events { display: grid; gap: 6px; margin: 0; padding: 0 13px 13px 34px; }
-.firmware-deployment-events li { display: grid; grid-template-columns: minmax(150px, auto) minmax(120px, auto) 1fr; gap: 9px; align-items: baseline; font-size: 12px; }
-.firmware-deployment-events time { color: var(--muted); }
-.firmware-controls {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto;
-  align-items: end;
-  gap: 12px;
-  margin-top: 18px;
-  padding-top: 18px;
-  border-top: 1px solid var(--line);
-}
-.firmware-control-actions { display: flex; gap: 8px; }
-
 .alert-list { display: grid; gap: 13px; }
 .alert-card { min-height: 120px; display: grid; grid-template-columns: 48px 1fr auto; align-items: center; gap: 18px; padding: 19px 22px; background: #ffffff; }
 .alert-icon { width: 44px; height: 44px; display: grid; place-items: center; color: var(--blue); background: rgba(0,148,218,.06); }
@@ -438,26 +350,6 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .tabs button { min-width: 110px; min-height: 52px; padding: 0 15px; border: 0; border-bottom: 3px solid transparent; color: var(--muted); background: #ffffff; font-size: 14px; font-weight: 700; text-transform: capitalize; }
 .tabs button.active { color: var(--blue); border-bottom-color: var(--blue); }
 .drawer-content { flex: 1; overflow: auto; padding: 22px 25px 60px; background: #f5f5f5; }
-.reconciliation-tabs { width: fit-content; margin: -6px 0 18px; }
-.source-exceptions-panel { overflow: hidden; }
-.source-exception-filters { margin: 18px 0; }
-.source-exception-table { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
-.source-exception-head, .source-exception-row { display: grid; grid-template-columns: 1.25fr 1fr 1.1fr 1fr .8fr; gap: 14px; align-items: center; }
-.source-exception-head { padding: 11px 16px; color: var(--muted); background: #f5f5f5; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
-.source-exception-row { width: 100%; padding: 15px 16px; border: 0; border-top: 1px solid var(--line); color: inherit; background: #fff; text-align: left; cursor: pointer; }
-.source-exception-row:hover, .source-exception-row:focus-visible { outline: 2px solid transparent; background: #fafafa; box-shadow: inset 3px 0 var(--blue); }
-.source-exception-row > span { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
-.source-exception-row small { overflow-wrap: anywhere; color: var(--muted); }
-.source-exception-detail { display: grid; gap: 18px; }
-.exception-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--line); }
-.exception-facts > div { min-width: 0; padding: 14px; background: #fff; }
-.exception-facts .wide { grid-column: 1 / -1; }
-.exception-facts dt { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
-.exception-facts dd { margin: 6px 0 0; overflow-wrap: anywhere; }
-.exception-facts code, .revealed-evidence code { display: block; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.exception-review-section, .revealed-evidence, .exception-actions { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
-.exception-review { display: grid; grid-template-columns: 1fr auto; gap: 5px 15px; padding: 12px 0; border-top: 1px solid var(--line); }
-.exception-review p { grid-column: 1 / -1; margin: 0; }
 .revealed-evidence { border-color: #0094da; background: #fafafa; }
 .revealed-evidence label { display: block; margin-top: 12px; font-weight: 700; }
 .exception-actions { display: grid; gap: 14px; }
@@ -510,11 +402,6 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
   .page-content { padding-bottom: 110px; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .filter-grid { grid-template-columns: repeat(3, 1fr); }
-  .firmware-release dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .firmware-campaign-summary { grid-template-columns: minmax(220px, 1fr) auto 1fr; }
-  .firmware-campaign-summary > div:last-child { grid-column: 1 / -1; }
-  .firmware-controls { grid-template-columns: 1fr 1fr; }
-  .firmware-control-actions { grid-column: 1 / -1; justify-content: flex-end; }
   .conflict-groups { grid-template-columns: 1fr; }
   .user-table-head { display: none; }
   .user-row { grid-template-columns: 1.2fr 1fr 1fr; }
@@ -566,21 +453,9 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
   .row-actions { grid-column: 2; grid-row: 1 / 5; flex-direction: column; }
   .attendance-head { display: none; }
   .attendance-table article { grid-template-columns: 1fr 1fr; }
-  .firmware-mode-grid, .firmware-start-form { grid-template-columns: 1fr; }
-  .firmware-reason, .firmware-quarantine, .firmware-start-button { grid-column: 1; }
-  .firmware-start-button { width: 100%; justify-self: stretch; }
-  .firmware-campaign-summary { grid-template-columns: 1fr auto; }
-  .firmware-campaign-summary > div:nth-child(3), .firmware-campaign-summary > div:last-child { grid-column: 1 / -1; }
-  .firmware-controls { grid-template-columns: 1fr; }
-  .firmware-control-actions { grid-column: 1; align-items: stretch; flex-direction: column; }
-  .firmware-control-actions .button { width: 100%; }
   .alert-card { grid-template-columns: 44px 1fr; }
   .alert-card > :last-child { grid-column: 2; justify-self: start; }
   .device-drawer { width: 100%; }
-  .source-exception-head { display: none; }
-  .source-exception-row { grid-template-columns: 1fr; gap: 10px; }
-  .exception-facts { grid-template-columns: 1fr; }
-  .exception-facts .wide { grid-column: auto; }
   .overview-grid { grid-template-columns: 1fr; }
   .detail-card.wide { grid-column: auto; }
   .connection-list > div { grid-template-columns: 1fr auto 16px auto; padding: 8px 0; }
@@ -595,12 +470,7 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
 @media (max-width: 520px) {
   .app-header nav button { min-width: 0; flex: 1; padding: 0 4px; }
   .operator-area { gap: 7px; }
-  .metric-grid, .form-grid, .filter-grid, .firmware-mode-grid { grid-template-columns: 1fr; }
-  .reconcile-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .reconcile-job-head, .reconcile-phase { align-items: flex-start; flex-direction: column; }
-  .firmware-release dl { grid-template-columns: 1fr; }
-  .firmware-release, .firmware-campaign, .firmware-start-form { padding-left: 16px; padding-right: 16px; }
-  .firmware-release-title { align-items: flex-start; flex-direction: column; }
+  .metric-grid, .form-grid, .filter-grid { grid-template-columns: 1fr; }
   .page-header { flex-direction: column; }
   .page-header > .button { width: 100%; }
   .metric-card { min-height: 105px; }
@@ -980,41 +850,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .section-tabs { width: 100%; max-width: 100%; display: flex; gap: 6px; margin: 0 0 20px; padding: 5px; border: 1px solid var(--line); border-radius: 12px; background: #eaf0f3; contain: inline-size; }
 .section-tabs button { min-height: 42px; padding: 0 17px; border: 0; border-radius: 9px; color: var(--muted); background: transparent; font-size: 13px; font-weight: 750; }
 .section-tabs button.active { color: var(--navy-900); background: #fff; box-shadow: 0 3px 10px rgba(7,26,43,.1); }
-.firmware-mode-grid { gap: 12px; }
-.firmware-mode { border: 1px solid var(--line) !important; border-radius: 13px; box-shadow: var(--shadow-sm); }
-.firmware-mode.pattern-confirmed { border-left: 4px solid var(--positive) !important; }
-.firmware-mode.pattern-blocked { border-left: 4px solid var(--critical) !important; }
-.firmware-overview-grid { display: grid; grid-template-columns: minmax(0, 2fr) repeat(2, minmax(190px, .7fr)); gap: 14px; }
-.firmware-overview-grid > article { min-height: 170px; display: flex; align-items: center; gap: 15px; padding: 23px; border: 1px solid var(--line); border-radius: 14px; background: #fff; box-shadow: var(--shadow-sm); }
-.firmware-overview-grid .overview-hero { display: block; color: #d9e9f4; border: 0; background: linear-gradient(135deg, var(--navy-900), #164c70); }
-.overview-hero h2 { color: #fff; font-size: 27px; }
-.overview-hero > p:not(.eyebrow) { color: #bfd2df; }
-.overview-hero .text-button { color: #65cef5; }
-.overview-icon { width: 48px; height: 48px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: var(--brand-700); background: var(--brand-50); }
-.firmware-overview-grid article > div p { margin: 0 0 7px; color: var(--muted); font-size: 13px; }
-.firmware-overview-grid article > div strong { display: block; margin-bottom: 4px; font-size: 28px; }
-.firmware-overview-grid article > div small { color: var(--muted); }
-.firmware-release, .firmware-campaign { border-top: 1px solid var(--line); }
-.firmware-release:first-child, .firmware-campaign:first-child { border-top: 0; }
-.firmware-deployment-evidence { border-radius: 9px; overflow: hidden; }
-.firmware-controls { grid-template-columns: 1fr auto; align-items: center; }
-.firmware-control-copy { display: grid; gap: 3px; }
-.firmware-control-copy small { color: var(--muted); }
-.firmware-campaign-dialog { width: min(820px, 100%); }
-.firmware-campaign-dialog .firmware-start-panel { background: #fff; }
-.firmware-campaign-dialog .panel-header { min-height: auto; margin: 0 24px; padding: 20px 0 14px; }
-.firmware-campaign-dialog .firmware-start-form { padding-top: 18px; }
-.firmware-scope-action { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; padding: 14px; border: 1px dashed var(--brand-600); border-radius: 10px; background: var(--brand-50); }
-.firmware-scope-action small { color: var(--muted); }
-.firmware-scope-preview { grid-column: 1 / -1; border: 1px solid #96cfba; border-radius: 12px; background: var(--positive-soft); overflow: hidden; }
-.firmware-scope-preview .panel-header { display: flex; justify-content: space-between; margin: 0; padding: 16px; background: transparent; }
-.firmware-scope-preview .panel-header p { margin: 0; color: var(--muted); }
-.firmware-scope-preview details { padding: 0 16px 12px; }
-.firmware-scope-preview summary { cursor: pointer; font-weight: 700; }
-.firmware-scope-preview ul { display: grid; gap: 7px; padding-left: 20px; }
-.firmware-scope-preview li { display: flex; justify-content: space-between; gap: 16px; }
-.firmware-scope-preview > .text-button { margin: 0 16px 14px; }
-.firmware-release-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 
 .dialog-panel { border: 0; border-radius: 16px; box-shadow: var(--shadow-md); }
 .dialog-backdrop { animation: backdrop-enter var(--motion-content) var(--ease-corporate) both; }
@@ -1108,15 +943,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
   .alert-card > :last-child { grid-column: 2; }
   .section-tabs { overflow-x: auto; }
   .section-tabs button { flex: 0 0 auto; }
-  .firmware-overview-grid { grid-template-columns: 1fr; }
-  .firmware-overview-grid .overview-hero { grid-column: auto; }
-  .firmware-controls { grid-template-columns: 1fr; }
-  .firmware-control-actions { justify-content: flex-start; flex-wrap: wrap; }
-  .firmware-campaign-dialog .firmware-start-form { grid-template-columns: 1fr; }
-  .firmware-campaign-dialog .firmware-reason, .firmware-campaign-dialog .firmware-quarantine, .firmware-campaign-dialog .firmware-start-button { grid-column: 1; }
-  .firmware-scope-action, .firmware-scope-preview { grid-column: 1; }
-  .firmware-scope-action { align-items: stretch; flex-direction: column; }
-  .firmware-campaign-dialog .firmware-start-button { width: 100%; }
   .device-drawer { width: 100%; border-radius: 0; }
   .device-drawer .dialog-header { border-radius: 0; }
 }
@@ -1138,7 +964,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
   .page-actions .button { width: 100%; }
   .filter-actions { flex-direction: column; }
   .attendance-table article { grid-template-columns: 1fr; }
-  .firmware-mode-grid { grid-template-columns: 1fr; }
   .dialog-backdrop { padding: 0; }
   .dialog-panel { min-height: 100vh; max-height: 100vh; border-radius: 0; }
   .dialog-header { border-radius: 0; }

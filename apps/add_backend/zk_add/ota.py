@@ -13,7 +13,19 @@ from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, select
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from zk_add.db import Base
@@ -559,36 +571,123 @@ def record_progress(session: Session, *, connector: Connector, deployment_public
     return deployment
 
 
-def release_rows(session: Session) -> list[dict[str, Any]]:
+def _serialize_release(row: FirmwareRelease) -> dict[str, Any]:
+    return {
+        "release_id": row.release_id,
+        "version": row.version,
+        "git_sha": row.git_sha,
+        "image_sha256": row.image_sha256,
+        "image_size": row.image_size,
+        "state": row.state,
+        "application_sha256": _application_sha256(row),
+        "partition_layout": row.partition_layout,
+        "signing_key_id": row.signing_key_id,
+        "published_at": row.published_at,
+        "revoked_at": row.revoked_at,
+        "revoked_by": row.revoked_by,
+        "hil_target_mac": (row.manifest or {}).get("_hil_target_mac"),
+    }
+
+
+def release_page(
+    session: Session,
+    *,
+    query: str | None = None,
+    state: str | None = None,
+    cursor: int | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return a stable newest-first release page without changing the legacy row shape."""
+
     sync_release_store(session)
-    return [{"release_id": row.release_id, "version": row.version, "git_sha": row.git_sha,
-             "image_sha256": row.image_sha256, "image_size": row.image_size, "state": row.state,
-             "application_sha256": _application_sha256(row),
-             "partition_layout": row.partition_layout, "signing_key_id": row.signing_key_id,
-             "published_at": row.published_at,
-             "hil_target_mac": (row.manifest or {}).get("_hil_target_mac")}
-            for row in session.scalars(select(FirmwareRelease).order_by(FirmwareRelease.id.desc())).all()]
+    clauses = []
+    if query and query.strip():
+        term = f"%{query.strip()}%"
+        clauses.append(
+            or_(
+                FirmwareRelease.version.ilike(term),
+                FirmwareRelease.release_id.ilike(term),
+                FirmwareRelease.git_sha.ilike(term),
+                FirmwareRelease.image_sha256.ilike(term),
+                FirmwareRelease.signing_key_id.ilike(term),
+            )
+        )
+    if state:
+        clauses.append(FirmwareRelease.state == state.upper())
+
+    filtered_total = session.scalar(
+        select(func.count(FirmwareRelease.id)).where(*clauses)
+    ) or 0
+    statement = select(FirmwareRelease).where(*clauses)
+    if cursor is not None:
+        statement = statement.where(FirmwareRelease.id < cursor)
+    statement = statement.order_by(FirmwareRelease.id.desc())
+    if limit is not None:
+        rows = list(session.scalars(statement.limit(limit + 1)).all())
+        page = rows[:limit]
+        next_cursor = page[-1].id if len(rows) > limit and page else None
+    else:
+        page = list(session.scalars(statement).all())
+        next_cursor = None
+
+    totals = {"all": 0, "available": 0, "hil_only": 0, "revoked": 0}
+    for release_state, count in session.execute(
+        select(FirmwareRelease.state, func.count(FirmwareRelease.id)).group_by(
+            FirmwareRelease.state
+        )
+    ):
+        normalized = str(release_state).lower()
+        totals[normalized] = int(count)
+        totals["all"] += int(count)
+    return {
+        "rows": [_serialize_release(row) for row in page],
+        "next_cursor": next_cursor,
+        "filtered_total": int(filtered_total),
+        "totals": totals,
+    }
 
 
-def campaign_rows(session: Session) -> list[dict[str, Any]]:
-    result = []
-    for campaign in session.scalars(select(FirmwareCampaign).order_by(FirmwareCampaign.id.desc())).all():
-        deployments = list(session.scalars(select(FirmwareDeployment).where(
-            FirmwareDeployment.campaign_id == campaign.id)).all())
-        counts: dict[str, int] = {}
-        deployment_rows = []
-        for deployment in deployments:
-            counts[deployment.status] = counts.get(deployment.status, 0) + 1
-            connector = session.get(Connector, deployment.connector_id)
-            events = list(session.scalars(
-                select(FirmwareEvent)
-                .where(FirmwareEvent.deployment_id == deployment.id)
-                .order_by(FirmwareEvent.id.desc())
-                .limit(20)
-            ).all())
-            deployment_rows.append({
+def release_rows(session: Session) -> list[dict[str, Any]]:
+    """Compatibility helper for callers that still require the complete release list."""
+
+    return release_page(session)["rows"]
+
+
+def _deployment_rows(
+    session: Session,
+    campaign: FirmwareCampaign,
+    *,
+    include_events: bool,
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    deployments = list(
+        session.scalars(
+            select(FirmwareDeployment)
+            .where(FirmwareDeployment.campaign_id == campaign.id)
+            .order_by(FirmwareDeployment.id.asc())
+        ).all()
+    )
+    counts: dict[str, int] = {}
+    rows: list[dict[str, Any]] = []
+    for deployment in deployments:
+        counts[deployment.status] = counts.get(deployment.status, 0) + 1
+        connector = session.get(Connector, deployment.connector_id)
+        events = []
+        if include_events:
+            events = list(
+                session.scalars(
+                    select(FirmwareEvent)
+                    .where(FirmwareEvent.deployment_id == deployment.id)
+                    .order_by(FirmwareEvent.id.desc())
+                    .limit(20)
+                ).all()
+            )
+        rows.append(
+            {
                 "deployment_id": deployment.deployment_id,
                 "connector_id": connector.connector_id if connector else None,
+                "display_name": connector.display_name if connector else None,
+                "hardware_id": connector.hardware_id if connector else None,
+                "zone_id": connector.zone_id if connector else None,
                 "status": deployment.status,
                 "previous_version": deployment.previous_version,
                 "target_version": deployment.target_version,
@@ -598,19 +697,163 @@ def campaign_rows(session: Session) -> list[dict[str, Any]]:
                 "error_message": deployment.error_message,
                 "offered_at": deployment.offered_at,
                 "completed_at": deployment.completed_at,
-                "events": [{
-                    "state": event.state,
-                    "details": event.details or {},
-                    "created_at": event.created_at,
-                } for event in events],
-            })
-        release = session.get(FirmwareRelease, campaign.release_id)
-        result.append({"campaign_id": campaign.campaign_id, "zone_id": campaign.zone_id,
-            "version": release.version if release else None, "status": campaign.status,
-            "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count,
-            "counts": counts, "pause_reason": campaign.pause_reason,
-            "deployments": deployment_rows, "created_at": campaign.created_at})
-    return result
+                "updated_at": deployment.updated_at,
+                "events": [
+                    {
+                        "state": event.state,
+                        "details": event.details or {},
+                        "created_at": event.created_at,
+                    }
+                    for event in events
+                ],
+            }
+        )
+    return counts, rows
+
+
+def _serialize_campaign(
+    session: Session,
+    campaign: FirmwareCampaign,
+    *,
+    include_deployments: bool,
+    include_events: bool,
+) -> dict[str, Any]:
+    counts, deployments = _deployment_rows(
+        session, campaign, include_events=include_events
+    )
+    release = session.get(FirmwareRelease, campaign.release_id)
+    zone_name = session.scalar(
+        select(Connector.zone_name)
+        .where(Connector.zone_id == campaign.zone_id)
+        .order_by(Connector.id.asc())
+        .limit(1)
+    )
+    return {
+        "campaign_id": campaign.campaign_id,
+        "release_id": release.release_id if release else None,
+        "release_state": release.state if release else None,
+        "zone_id": campaign.zone_id,
+        "zone_name": zone_name,
+        "version": release.version if release else None,
+        "status": campaign.status,
+        "eligible": campaign.eligible_count,
+        "legacy_skipped": campaign.legacy_skipped_count,
+        "counts": counts,
+        "pause_reason": campaign.pause_reason,
+        "actor": campaign.actor,
+        "reason": campaign.reason,
+        "deployments": deployments if include_deployments else [],
+        "created_at": campaign.created_at,
+        "updated_at": campaign.updated_at,
+    }
+
+
+def campaign_page(
+    session: Session,
+    *,
+    query: str | None = None,
+    status: str | None = None,
+    zone_id: str | None = None,
+    release_id: str | None = None,
+    cursor: int | None = None,
+    limit: int | None = None,
+    include_deployments: bool = False,
+) -> dict[str, Any]:
+    """Return campaign summaries with exact national and filtered counts."""
+
+    sync_release_store(session)
+    clauses = []
+    if query and query.strip():
+        term = f"%{query.strip()}%"
+        clauses.append(
+            or_(
+                FirmwareCampaign.campaign_id.ilike(term),
+                FirmwareCampaign.zone_id.ilike(term),
+                FirmwareCampaign.actor.ilike(term),
+                FirmwareRelease.release_id.ilike(term),
+                FirmwareRelease.version.ilike(term),
+            )
+        )
+    if status:
+        clauses.append(FirmwareCampaign.status == status.upper())
+    if zone_id:
+        clauses.append(FirmwareCampaign.zone_id == zone_id)
+    if release_id:
+        clauses.append(FirmwareRelease.release_id == release_id)
+
+    filtered_total = session.scalar(
+        select(func.count(FirmwareCampaign.id))
+        .join(FirmwareRelease, FirmwareCampaign.release_id == FirmwareRelease.id)
+        .where(*clauses)
+    ) or 0
+    statement = (
+        select(FirmwareCampaign)
+        .join(FirmwareRelease, FirmwareCampaign.release_id == FirmwareRelease.id)
+        .where(*clauses)
+    )
+    if cursor is not None:
+        statement = statement.where(FirmwareCampaign.id < cursor)
+    statement = statement.order_by(FirmwareCampaign.id.desc())
+    if limit is not None:
+        fetched = list(session.scalars(statement.limit(limit + 1)).all())
+        page = fetched[:limit]
+        next_cursor = page[-1].id if len(fetched) > limit and page else None
+    else:
+        page = list(session.scalars(statement).all())
+        next_cursor = None
+
+    campaign_totals: dict[str, int] = {"all": 0}
+    for campaign_state, count in session.execute(
+        select(FirmwareCampaign.status, func.count(FirmwareCampaign.id)).group_by(
+            FirmwareCampaign.status
+        )
+    ):
+        campaign_totals[str(campaign_state).lower()] = int(count)
+        campaign_totals["all"] += int(count)
+    deployment_totals: dict[str, int] = {"all": 0}
+    for deployment_state, count in session.execute(
+        select(FirmwareDeployment.status, func.count(FirmwareDeployment.id)).group_by(
+            FirmwareDeployment.status
+        )
+    ):
+        deployment_totals[str(deployment_state).lower()] = int(count)
+        deployment_totals["all"] += int(count)
+
+    return {
+        "rows": [
+            _serialize_campaign(
+                session,
+                row,
+                include_deployments=include_deployments,
+                include_events=include_deployments,
+            )
+            for row in page
+        ],
+        "next_cursor": next_cursor,
+        "filtered_total": int(filtered_total),
+        "totals": {
+            "campaigns": campaign_totals,
+            "deployments": deployment_totals,
+        },
+    }
+
+
+def campaign_detail(session: Session, campaign_id: str) -> dict[str, Any] | None:
+    sync_release_store(session)
+    campaign = session.scalar(
+        select(FirmwareCampaign).where(FirmwareCampaign.campaign_id == campaign_id)
+    )
+    if campaign is None:
+        return None
+    return _serialize_campaign(
+        session, campaign, include_deployments=True, include_events=True
+    )
+
+
+def campaign_rows(session: Session) -> list[dict[str, Any]]:
+    """Compatibility helper retaining the original detailed list response."""
+
+    return campaign_page(session, include_deployments=True)["rows"]
 
 
 def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Path]:

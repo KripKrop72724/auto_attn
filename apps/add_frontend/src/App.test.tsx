@@ -164,10 +164,13 @@ const fetchStub = (
         },
       })
     }
-    if (path.endsWith('/api/v1/firmware/releases')) {
+    if (path.startsWith('/api/v1/firmware/releases')) {
       return response({
         enabled: false,
         hil_enabled: true,
+        filtered_total: 1,
+        next_cursor: null,
+        totals: { all: 1, available: 0, hil_only: 1, revoked: 0 },
         rows: [{
           release_id: 'release-2-2-4',
           version: '2.2.4',
@@ -194,7 +197,7 @@ const fetchStub = (
     if (path.endsWith('/api/v1/firmware/campaigns/preflight')) {
       return response({
         scope_token: 'signed-test-scope-token-with-sufficient-length',
-        expires_at: '2026-07-27T12:05:00Z',
+        expires_at: '2099-07-27T12:05:00Z',
         release: { release_id: 'release-2-2-4', version: '2.2.4', state: 'HIL_ONLY' },
         zone_id: device.zone_id,
         counts: { candidates: 1, eligible: 1, excluded: 0, offline: 0 },
@@ -202,8 +205,15 @@ const fetchStub = (
         excluded: [],
       })
     }
-    if (path.endsWith('/api/v1/firmware/campaigns')) {
-      return response({ enabled: false, hil_enabled: true, rows: [] })
+    if (path.startsWith('/api/v1/firmware/campaigns') && (init?.method ?? 'GET') === 'GET') {
+      return response({
+        enabled: false,
+        hil_enabled: true,
+        rows: [],
+        filtered_total: 0,
+        next_cursor: null,
+        totals: { campaigns: { all: 0 }, deployments: { all: 0 } },
+      })
     }
     if (/\/api\/v1\/firmware\/campaigns\/[^/]+\/(pause|resume|cancel)$/.test(path)) {
       return response({ campaign_id: 'campaign-one', status: 'PAUSED' })
@@ -744,25 +754,27 @@ describe('State Life ADD interface', () => {
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
     expect(await screen.findByRole('heading', { name: 'Firmware operations' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'New campaign' }))
+    const newCampaign = screen.getByRole('button', { name: 'New campaign' }) as HTMLButtonElement
+    await waitFor(() => expect(newCampaign.disabled).toBe(false))
+    fireEvent.click(newCampaign)
 
-    fireEvent.change(screen.getByLabelText('Signed release'), {
+    fireEvent.change(screen.getByLabelText('Release channel'), {
       target: { value: 'release-2-2-4' },
     })
-    expect(await screen.findByText(device.hardware_id)).toBeTruthy()
+    expect(await screen.findByText(/Exact-MAC HIL quarantine/)).toBeTruthy()
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).value).toBe(device.zone_id)
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText('Audited reason'), {
       target: { value: 'Pilot SWAT deployment validation' },
     })
-    fireEvent.change(screen.getByLabelText('Type release version to confirm'), {
+    fireEvent.change(screen.getByLabelText(/Type exact version/), {
       target: { value: '2.2.4' },
     })
     const password = screen.getByLabelText('Administrator password') as HTMLInputElement
     fireEvent.change(password, { target: { value: 'local-step-up-value' } })
-    fireEvent.click(screen.getByRole('button', { name: /preview exact server scope/i }))
-    expect(await screen.findByText(/1 eligible of 1 candidates/i)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /start firmware campaign/i }))
+    fireEvent.click(screen.getByRole('button', { name: /preview eligible and excluded devices/i }))
+    expect(await screen.findByRole('heading', { name: 'Eligible devices' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /start sequential rollout/i }))
 
     expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
     const campaignCall = fetchMock.mock.calls.find(

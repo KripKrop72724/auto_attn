@@ -21,6 +21,8 @@ export type DashboardRoute =
   | 'alerts'
 
 export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
+export type ReconciliationSection = 'jobs' | 'exceptions'
+export type ReconciliationStatusGroup = '' | 'ACTIVE' | 'QUEUED_WAITING' | 'PAUSED' | 'ATTENTION' | 'COMPLETED' | 'CANCELLED'
 
 export interface FirmwareScopePreview {
   scope_token: string
@@ -215,6 +217,7 @@ export interface SourceExceptionTotals {
 
 export interface SourceExceptionList {
   totals: SourceExceptionTotals
+  filtered_total: number
   rows: SourceException[]
   next_cursor: number | null
 }
@@ -296,6 +299,11 @@ export interface ReconciliationJob {
     retry_count: number
     auto_retry_count?: number
   }
+  checkpoint?: {
+    next_ordinal: number
+    chain_digest: string | null
+    last_progress_at: string | null
+  }
   assignment: {
     assignment_id: string | null
     credit_start_ordinal: number | null
@@ -326,6 +334,13 @@ export interface ReconciliationJob {
       next_probe_at: string | null
     }
   }
+  capture_certificate?: Record<string, unknown> | null
+  oracle_certificate?: Record<string, unknown> | null
+  events?: Array<{
+    state: string
+    details: Record<string, unknown>
+    created_at: string
+  }>
   requested_at: string
   started_at: string | null
   capture_certified_at: string | null
@@ -346,6 +361,25 @@ export interface ReconciliationScheduler {
   available_credit?: number
 }
 
+export interface ReconciliationJobTotals {
+  all: number
+  active: number
+  queued_waiting: number
+  paused: number
+  attention: number
+  completed: number
+  cancelled: number
+}
+
+export interface ReconciliationListResponse {
+  enabled: boolean
+  scheduler: ReconciliationScheduler
+  rows: ReconciliationJob[]
+  next_cursor: number | null
+  filtered_total: number
+  totals: ReconciliationJobTotals
+}
+
 export interface FirmwareRelease {
   release_id: string
   version: string
@@ -357,20 +391,28 @@ export interface FirmwareRelease {
   partition_layout: string
   signing_key_id: string
   published_at: string
+  revoked_at?: string | null
+  revoked_by?: string | null
   hil_target_mac: string | null
 }
 
 export interface FirmwareCampaign {
   campaign_id: string
+  release_id: string | null
+  release_state: string | null
   zone_id: string
+  zone_name: string | null
   version: string | null
   status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'CANCELLED' | string
   eligible: number
   legacy_skipped: number
   counts: Record<string, number>
   pause_reason: string | null
+  actor: string
+  reason: string
   deployments: FirmwareDeployment[]
   created_at: string
+  updated_at: string
 }
 
 export interface FirmwareDeploymentEvent {
@@ -386,6 +428,9 @@ export interface FirmwareDeploymentEvent {
 export interface FirmwareDeployment {
   deployment_id: string
   connector_id: string | null
+  display_name: string | null
+  hardware_id: string | null
+  zone_id: string | null
   status: string
   previous_version: string | null
   target_version: string
@@ -395,7 +440,30 @@ export interface FirmwareDeployment {
   error_message: string | null
   offered_at: string | null
   completed_at: string | null
+  updated_at: string
   events: FirmwareDeploymentEvent[]
+}
+
+export interface FirmwareReleaseTotals {
+  all: number
+  available: number
+  hil_only: number
+  revoked: number
+  [state: string]: number
+}
+
+export interface FirmwareCampaignTotals {
+  campaigns: Record<string, number>
+  deployments: Record<string, number>
+}
+
+export interface FirmwareListResponse<T, TTotals> {
+  rows: T[]
+  enabled: boolean
+  hil_enabled: boolean
+  next_cursor: number | null
+  filtered_total: number
+  totals: TTotals
 }
 
 export interface DeviceUser {

@@ -633,23 +633,125 @@ async def start_full_history_reconciliation(
 def list_reconciliations(
     connector_id: str | None = None,
     status: str | None = None,
+    status_group: str | None = None,
+    zone_id: str | None = None,
+    q: str | None = Query(default=None, max_length=120),
+    cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    statement = select(ReconciliationJob).order_by(
-        ReconciliationJob.requested_at.desc()
-    )
+    clauses = []
     if connector_id:
         connector = connector_or_404(db, connector_id)
-        statement = statement.where(ReconciliationJob.connector_id == connector.id)
+        clauses.append(ReconciliationJob.connector_id == connector.id)
     if status:
-        statement = statement.where(ReconciliationJob.status == status.upper())
-    rows = db.scalars(statement.limit(limit)).all()
+        clauses.append(ReconciliationJob.status == status.upper())
+    if zone_id:
+        clauses.append(Connector.zone_id == zone_id)
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        clauses.append(
+            or_(
+                ReconciliationJob.job_id.ilike(term),
+                Connector.connector_id.ilike(term),
+                Connector.device_id.ilike(term),
+                Connector.display_name.ilike(term),
+                Connector.zone_id.ilike(term),
+                Connector.hardware_id.ilike(term),
+            )
+        )
+    status_groups = {
+        "ACTIVE": ReconciliationJob.status == "RUNNING",
+        "QUEUED_WAITING": ReconciliationJob.status == "QUEUED",
+        "PAUSED": ReconciliationJob.status.in_(
+            ["PAUSED", "PAUSE_REQUESTED", "CANCEL_REQUESTED"]
+        ),
+        "ATTENTION": ReconciliationJob.status.in_(
+            ["NEEDS_ATTENTION", "FAILED", "INVALIDATED"]
+        ),
+        "COMPLETED": ReconciliationJob.status == "COMPLETED",
+        "CANCELLED": ReconciliationJob.status == "CANCELLED",
+    }
+    if status_group:
+        normalized_group = status_group.upper()
+        if normalized_group not in status_groups:
+            raise HTTPException(status_code=422, detail="Unknown reconciliation status group.")
+        clauses.append(status_groups[normalized_group])
+
+    filtered_total = db.scalar(
+        select(func.count(ReconciliationJob.id))
+        .join(Connector, ReconciliationJob.connector_id == Connector.id)
+        .where(*clauses)
+    ) or 0
+    statement = (
+        select(ReconciliationJob)
+        .join(Connector, ReconciliationJob.connector_id == Connector.id)
+        .where(*clauses)
+    )
+    if cursor is not None:
+        statement = statement.where(ReconciliationJob.id < cursor)
+    fetched = list(
+        db.scalars(
+            statement.order_by(ReconciliationJob.id.desc()).limit(limit + 1)
+        ).all()
+    )
+    rows = fetched[:limit]
+    next_cursor = rows[-1].id if len(fetched) > limit and rows else None
+    totals = {
+        "all": int(db.scalar(select(func.count(ReconciliationJob.id))) or 0),
+        "active": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"])
+            )
+            or 0
+        ),
+        "queued_waiting": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(
+                    status_groups["QUEUED_WAITING"]
+                )
+            )
+            or 0
+        ),
+        "paused": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"])
+            )
+            or 0
+        ),
+        "attention": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(
+                    status_groups["ATTENTION"]
+                )
+            )
+            or 0
+        ),
+        "completed": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(
+                    status_groups["COMPLETED"]
+                )
+            )
+            or 0
+        ),
+        "cancelled": int(
+            db.scalar(
+                select(func.count(ReconciliationJob.id)).where(
+                    status_groups["CANCELLED"]
+                )
+            )
+            or 0
+        ),
+    }
     return {
         "enabled": settings.reconciliation_enabled,
         "scheduler": reconciliation_scheduler_state(db),
         "rows": [serialize_job(db, row) for row in rows],
+        "next_cursor": next_cursor,
+        "filtered_total": int(filtered_total),
+        "totals": totals,
     }
 
 
@@ -2924,12 +3026,13 @@ from zk_add.ota import (  # noqa: E402
     FirmwareDeployment as _FirmwareDeployment,
     FirmwareRelease as _FirmwareRelease,
     assignment_for_connector as _assignment_for_connector,
-    campaign_rows as _campaign_rows,
+    campaign_detail as _campaign_detail,
+    campaign_page as _campaign_page,
     create_campaign as _create_firmware_campaign,
     parse_single_range as _parse_single_range,
     preview_campaign_scope as _preview_firmware_campaign_scope,
     record_progress as _record_firmware_progress,
-    release_rows as _release_rows,
+    release_page as _release_page,
     resolve_download as _resolve_firmware_download,
 )
 from zk_add.time_utils import utc_now as _ota_utc_now  # noqa: E402
@@ -3109,17 +3212,61 @@ def download_firmware(token: str, request: Request, db: Session = Depends(get_db
 
 
 @app.get("/api/v1/firmware/releases")
-def list_firmware_releases(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+def list_firmware_releases(
+    q: str | None = Query(default=None, max_length=120),
+    state: str | None = Query(default=None, max_length=30),
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
     db, _ = auth
-    return {"rows": _release_rows(db), "enabled": settings.firmware_ota_enabled,
-            "hil_enabled": settings.firmware_hil_enabled}
+    result = _release_page(db, query=q, state=state, cursor=cursor, limit=limit)
+    return {
+        **result,
+        "enabled": settings.firmware_ota_enabled,
+        "hil_enabled": settings.firmware_hil_enabled,
+    }
 
 
 @app.get("/api/v1/firmware/campaigns")
-def list_firmware_campaigns(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+def list_firmware_campaigns(
+    view: _Literal["full", "summary"] = "full",
+    q: str | None = Query(default=None, max_length=120),
+    status: str | None = Query(default=None, max_length=30),
+    zone_id: str | None = Query(default=None, max_length=100),
+    release_id: str | None = Query(default=None, max_length=100),
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
     db, _ = auth
-    return {"rows": _campaign_rows(db), "enabled": settings.firmware_ota_enabled,
-            "hil_enabled": settings.firmware_hil_enabled}
+    result = _campaign_page(
+        db,
+        query=q,
+        status=status,
+        zone_id=zone_id,
+        release_id=release_id,
+        cursor=cursor,
+        limit=limit,
+        include_deployments=view == "full",
+    )
+    return {
+        **result,
+        "enabled": settings.firmware_ota_enabled,
+        "hil_enabled": settings.firmware_hil_enabled,
+    }
+
+
+@app.get("/api/v1/firmware/campaigns/{campaign_id}")
+def get_firmware_campaign(
+    campaign_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _ = auth
+    row = _campaign_detail(db, campaign_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Firmware campaign not found.")
+    return row
 
 
 @app.post("/api/v1/firmware/campaigns/preflight")
@@ -3178,6 +3325,13 @@ async def control_firmware_campaign(
     campaign = db.scalar(_select(_FirmwareCampaign).where(_FirmwareCampaign.campaign_id == campaign_id))
     if campaign is None:
         raise HTTPException(status_code=404, detail="Firmware campaign not found.")
+    if action == "resume":
+        release = db.get(_FirmwareRelease, campaign.release_id)
+        if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
+            raise HTTPException(
+                status_code=409,
+                detail="This campaign cannot resume because its signed release is unavailable.",
+            )
     campaign.status = {"pause": "PAUSED", "resume": "ACTIVE", "cancel": "CANCELLED"}[action]
     campaign.pause_reason = body.reason if action != "resume" else None
     if action == "cancel":

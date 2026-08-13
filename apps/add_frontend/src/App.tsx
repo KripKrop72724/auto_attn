@@ -483,8 +483,8 @@ export function CommandProgress({
 
 const UsersView = lazy(() => import('./features/UsersWorkspace').then((module) => ({ default: module.UsersView })))
 
-const ReconciliationView = lazy(() => import('./features/Operations').then((module) => ({ default: module.ReconciliationView })))
-const FirmwareView = lazy(() => import('./features/Operations').then((module) => ({ default: module.FirmwareView })))
+const ReconciliationView = lazy(() => import('./features/Reconciliation').then((module) => ({ default: module.ReconciliationView })))
+const FirmwareView = lazy(() => import('./features/Firmware').then((module) => ({ default: module.FirmwareView })))
 const FirmwareProvisioning = lazy(() => import('./features/FirmwareProvisioning'))
 
 const AttendanceView = lazy(() => import('./features/Attendance').then((module) => ({ default: module.AttendanceView })))
@@ -674,7 +674,7 @@ function DashboardApp() {
         {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
-        {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
+        {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
         {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
       {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} toast={toast} /></Suspense>}
