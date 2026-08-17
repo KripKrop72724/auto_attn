@@ -40,7 +40,8 @@
 .firmware-workspace-tabs {
   position: sticky;
   z-index: 18;
-  top: 76px;
+  top: var(--app-header-height);
+  scroll-margin-top: var(--app-header-height);
   display: flex;
   gap: 5px;
   width: fit-content;
@@ -98,7 +99,7 @@
   min-height: 280px;
   position: relative;
   display: grid;
-  grid-template-columns: 1fr 120px;
+  grid-template-columns: minmax(0, 1fr) 120px;
   align-items: center;
   overflow: hidden;
   padding: 30px;
@@ -121,8 +122,10 @@
   bottom: -150px;
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 50%;
+  pointer-events: none;
 }
 .firmware-release-hero > div {
+  min-width: 0;
   position: relative;
   z-index: 1;
 }
@@ -142,11 +145,14 @@
   letter-spacing: -0.04em;
 }
 .firmware-release-hero p:not(.eyebrow) {
+  min-width: 0;
   max-width: 630px;
   margin: 0;
   color: #c8dbe6;
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
+.firmware-release-hero p code { color: inherit; font-size: .9em; overflow-wrap: anywhere; word-break: break-all; }
 .firmware-release-hero .page-actions {
   margin-top: 22px;
 }
@@ -502,7 +508,7 @@
 .firmware-action-menu {
   position: relative;
 }
-.firmware-action-menu > summary {
+.firmware-action-menu > button {
   min-height: 44px;
   display: flex;
   align-items: center;
@@ -511,22 +517,14 @@
   border: 1px solid var(--line-strong);
   border-radius: 9px;
   background: #fff;
-  cursor: pointer;
-  list-style: none;
   font-size: 12px;
   font-weight: 750;
 }
-.firmware-action-menu > summary::-webkit-details-marker {
-  display: none;
-}
-.firmware-action-menu > summary svg {
+.firmware-action-menu > button svg {
   width: 17px;
 }
-.firmware-action-menu > div {
-  position: absolute;
-  z-index: 20;
-  right: 0;
-  bottom: calc(100% + 7px);
+.firmware-action-menu > button[aria-expanded="true"] { border-color: var(--brand-600); color: var(--brand-700); background: var(--brand-50); }
+.firmware-action-panel {
   width: 310px;
   padding: 6px;
   border: 1px solid var(--line);
@@ -534,7 +532,7 @@
   background: #fff;
   box-shadow: var(--shadow-md);
 }
-.firmware-action-menu button {
+.firmware-action-panel button {
   width: 100%;
   min-height: 58px;
   display: grid;
@@ -548,14 +546,14 @@
   background: transparent;
   text-align: left;
 }
-.firmware-action-menu button svg {
+.firmware-action-panel button svg {
   width: 18px;
 }
-.firmware-action-menu button span {
+.firmware-action-panel button span {
   display: grid;
   gap: 3px;
 }
-.firmware-action-menu button small {
+.firmware-action-panel button small {
   color: var(--muted);
   font-size: 10px;
 }
@@ -1130,7 +1128,7 @@
     grid-template-columns: 1fr;
   }
   .firmware-workspace-tabs {
-    top: 68px;
+    top: var(--app-header-height);
     width: 100%;
     overflow-x: auto;
   }
@@ -1185,14 +1183,10 @@
   .firmware-action-menu {
     width: 100%;
   }
-  .firmware-action-menu > summary {
+  .firmware-action-menu > button {
     justify-content: center;
   }
-  .firmware-action-menu > div {
-    right: 0;
-    left: 0;
-    width: 100%;
-  }
+  .firmware-action-panel { width: auto; border-radius: 18px 18px 0 0; box-shadow: 0 -18px 52px rgba(7,26,43,.24); }
   .firmware-campaign-dialog {
     width: 100%;
   }
