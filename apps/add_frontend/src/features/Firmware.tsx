@@ -22,6 +22,7 @@ import {
   useToast,
 } from '../App'
 import { Icon } from '../Icon'
+import { AnchoredLayer } from '../AnchoredLayer'
 import type {
   Device,
   FirmwareCampaign,
@@ -931,6 +932,21 @@ function CampaignCreator({
   )
 }
 
+function FirmwareCancelMenu({ onCancel }: { onCancel: () => void }) {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  return (
+    <div className="firmware-action-menu">
+      <button ref={triggerRef} className="button secondary" type="button" aria-label="More firmware campaign actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
+      {open && <AnchoredLayer anchorRef={triggerRef} className="firmware-action-layer" mobileSheet preferredWidth={310} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
+        <div className="firmware-action-panel" role="group" aria-label="Firmware campaign actions">
+          <button type="button" className="danger-action" onClick={() => { setOpen(false); onCancel() }}><Icon name="x" /><span><strong>Cancel campaign</strong><small>Signed evidence and device state remain durable.</small></span></button>
+        </div>
+      </AnchoredLayer>}
+    </div>
+  )
+}
+
 export function FirmwareView({
   devices,
   revision,
@@ -1336,7 +1352,7 @@ export function FirmwareView({
                 </h2>
                 <p>
                   {productionRelease
-                    ? `Signed by ${productionRelease.signing_key_id} · ${productionRelease.partition_layout} · ${dateTime(productionRelease.published_at)}`
+                    ? <>Signed by <code>{productionRelease.signing_key_id}</code> · {productionRelease.partition_layout} · {dateTime(productionRelease.published_at)}</>
                     : 'Production rollout remains blocked until a protected workflow publishes and promotes signed bytes.'}
                 </p>
                 <div className="page-actions">
@@ -1918,27 +1934,7 @@ export function FirmwareView({
                       </button>
                     )}
                     {['ACTIVE', 'PAUSED'].includes(campaign.status) && (
-                      <details className="firmware-action-menu">
-                        <summary>
-                          <Icon name="menu" /> More
-                        </summary>
-                        <div>
-                          <button
-                            className="danger-action"
-                            onClick={() =>
-                              setCampaignControl({ campaign, action: 'cancel' })
-                            }
-                          >
-                            <Icon name="x" />
-                            <span>
-                              <strong>Cancel campaign</strong>
-                              <small>
-                                Signed evidence and device state remain durable.
-                              </small>
-                            </span>
-                          </button>
-                        </div>
-                      </details>
+                      <FirmwareCancelMenu onCancel={() => setCampaignControl({ campaign, action: 'cancel' })} />
                     )}
                   </footer>
                 </article>

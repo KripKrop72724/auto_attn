@@ -10,6 +10,7 @@ import {
   type HistoricalIdentityDialogState, type IdentityResolutionDialogState, type UserDialogState,
 } from '../App'
 import { Icon } from '../Icon'
+import { AnchoredLayer } from '../AnchoredLayer'
 import type {
   Command, Device, DeviceUser, HistoricalIdentityReport, IdentityConflictReport,
   IdentityIntegrity, UserDeletionJob,
@@ -66,10 +67,10 @@ function TerminalPicker({
     else setQuery('')
   }, [open])
 
-  const closePicker = () => {
+  const closePicker = useCallback((restoreFocus = true) => {
     onOpenChange(false)
-    window.setTimeout(() => triggerRef.current?.focus(), 0)
-  }
+    if (restoreFocus) window.setTimeout(() => triggerRef.current?.focus(), 0)
+  }, [onOpenChange])
 
   const moveOptionFocus = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const options = Array.from(resultsRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') || [])
@@ -97,7 +98,15 @@ function TerminalPicker({
         <button ref={triggerRef} className="button secondary" type="button" aria-expanded={open} onClick={() => onOpenChange(!open)}><Icon name="search" /> {selected ? 'Change terminal' : 'Select terminal'}</button>
       </div>
       {open && (
-        <div className="terminal-picker-popover">
+        <AnchoredLayer
+          anchorRef={triggerRef}
+          className="terminal-picker-layer"
+          matchAnchor
+          mobileSheet
+          preferredWidth={720}
+          onDismiss={(reason) => closePicker(reason === 'escape')}
+        >
+          <div className="terminal-picker-popover">
           <label className="search-field"><span className="sr-only">Search terminals</span><Icon name="search" /><input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'ArrowDown') { event.preventDefault(); resultsRef.current?.querySelector<HTMLButtonElement>('[role="option"]')?.focus() } else if (event.key === 'Escape') closePicker() }} placeholder="Search terminal, zone, or serial" /></label>
           <div ref={resultsRef} className="terminal-picker-results" role="listbox" aria-label="Authorized terminals">
             {shown.map((device, index) => (
@@ -107,7 +116,7 @@ function TerminalPicker({
                 role="option"
                 aria-selected={device.connector_id === selectedDeviceId}
                 onKeyDown={(event) => moveOptionFocus(event, index)}
-                onClick={() => { onSelect(device.connector_id); closePicker() }}
+                onClick={() => { onSelect(device.connector_id); closePicker(false) }}
               >
                 <span className="terminal-result-symbol"><Icon name="server" /></span>
                 <span><strong>{device.display_name}</strong><small>{device.zone_name} · {device.zkt?.serial || 'serial pending'}</small></span>
@@ -117,7 +126,8 @@ function TerminalPicker({
             ))}
             {!shown.length && <div className="empty-state compact"><Icon name="search" /><p>No authorized terminals match this search.</p></div>}
           </div>
-        </div>
+          </div>
+        </AnchoredLayer>
       )}
     </section>
   )
@@ -146,23 +156,23 @@ function UserActionMenu({
   onLease: () => void
   onDelete: () => void
 }) {
-  const menuRef = useRef<HTMLDetailsElement>(null)
-  const summaryRef = useRef<HTMLElement>(null)
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const runAction = (action: () => void) => {
-    if (menuRef.current) menuRef.current.open = false
-    summaryRef.current?.focus()
+    setOpen(false)
+    triggerRef.current?.focus()
     action()
   }
   return (
     <div className="user-row-actions">
       <button className="button secondary user-edit-action" type="button" aria-label={`Edit ${user.display_name}`} disabled={!canEdit} title={!canEdit ? editReason : undefined} onClick={onEdit}><Icon name="edit" /> Edit</button>
-      <details ref={menuRef} className="user-action-menu" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); if (menuRef.current) menuRef.current.open = false; summaryRef.current?.focus() } }}>
-        <summary ref={summaryRef} aria-label={`More actions for ${user.display_name}`}><Icon name="menu" /> More</summary>
-        <div role="group" aria-label={`Actions for ${user.display_name}`}>
+      <button ref={triggerRef} className="button secondary user-more-action" type="button" aria-label={`More actions for ${user.display_name}`} aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
+      {open && <AnchoredLayer anchorRef={triggerRef} className="user-action-layer" mobileSheet preferredWidth={290} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
+        <div className="user-action-menu-panel" role="group" aria-label={`Actions for ${user.display_name}`}>
           <button type="button" aria-label={`Enrollment access for ${user.display_name}`} disabled={!canLease} onClick={() => runAction(onLease)}><Icon name="shield" /><span><strong>Enrollment access</strong><small>{canLease ? 'Grant a 10-minute administrator lease' : leaseReason}</small></span></button>
           <button type="button" className="danger-action" aria-label={`Delete ${user.display_name}`} disabled={!canDelete} onClick={() => runAction(onDelete)}><Icon name="trash" /><span><strong>Delete user</strong><small>{canDelete ? 'Preserves attendance and identity history' : deleteReason}</small></span></button>
         </div>
-      </details>
+      </AnchoredLayer>}
     </div>
   )
 }
@@ -262,7 +272,7 @@ export function UsersView({
     getScrollElement: () => userTableRef.current,
     estimateSize: () => 92,
     overscan: 10,
-    enabled: rows.length > 200,
+    enabled: rows.length >= 200,
   })
 
   const cnicError = cnicQuery && !/^\d{13}$/.test(cnicQuery) ? 'Exact CNIC must contain 13 digits.' : ''
@@ -508,6 +518,13 @@ export function UsersView({
     tabs[next]?.click()
   }
 
+  const selectSection = (nextSection: UsersSection) => {
+    setSection(nextSection)
+    window.requestAnimationFrame(() => {
+      if (typeof tabsRef.current?.scrollIntoView === 'function') tabsRef.current.scrollIntoView({ block: 'start' })
+    })
+  }
+
   const renderUserRow = (user: DeviceUser, style?: CSSProperties, virtualIndex?: number) => {
     const rowBusy = Boolean(user.current_command_state)
     const editReason = rowBusy ? `Operation ${user.current_command_state} is already active.` : user.read_only ? 'This record is read-only.' : editCapabilityReason
@@ -546,11 +563,11 @@ export function UsersView({
         <label className="check-field"><input type="checkbox" checked={eligibleRows.length > 0 && selectedUsers.length === eligibleRows.length} disabled={!canDeleteProfile || activeDeletionJob || !eligibleRows.length} onChange={(event) => setSelectedUserKeys(event.target.checked ? new Set(eligibleRows.map((user) => user.user_key)) : new Set())} /><span><strong>Select eligible loaded users</strong><small>{selectedUsers.length} selected of {eligibleRows.length} eligible</small></span></label>
         <span>Administrators, read-only rows, and active operations are always excluded.</span>
       </div>
-      <div ref={userTableRef} className={`user-directory-table ${rows.length > 200 ? 'is-virtualized' : ''}`} aria-busy={loadingDirectory} aria-label="Selected terminal users">
+      <div ref={userTableRef} className={`user-directory-table ${rows.length >= 200 ? 'is-virtualized' : ''}`} aria-busy={loadingDirectory} aria-label="Selected terminal users">
         <div className="user-directory-head" aria-hidden="true"><span>Identity</span><span>Terminal record</span><span>Role & state</span><span>Last synchronized</span><span>Actions</span></div>
         {loadingDirectory && !rows.length && <div className="users-loading-list" role="status">{Array.from({ length: 5 }, (_, index) => <span key={index}><i /><i /><i /></span>)}</div>}
-        {rows.length <= 200 && rows.map((user) => renderUserRow(user))}
-        {rows.length > 200 && <div className="virtual-user-rows" style={{ height: userVirtualizer.getTotalSize() }}>{userVirtualizer.getVirtualItems().map((item) => renderUserRow(rows[item.index], { position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }, item.index))}</div>}
+        {rows.length < 200 && rows.map((user) => renderUserRow(user))}
+        {rows.length >= 200 && <div className="virtual-user-rows" style={{ height: userVirtualizer.getTotalSize() }}>{userVirtualizer.getVirtualItems().map((item) => renderUserRow(rows[item.index], { position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }, item.index))}</div>}
         {!loadingDirectory && !rows.length && !directoryError && <div className="empty-state"><Icon name="users" /><h3>No users match this directory view.</h3><p>{activeFilters.length ? 'Clear filters or search another identity.' : 'The selected terminal has no ADD-managed users.'}</p>{activeFilters.length > 0 && <button className="button secondary" type="button" onClick={clearFilters}>Clear filters</button>}</div>}
       </div>
       {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadDirectory(nextCursor, true)}>{loadingMore ? 'Loading more users…' : 'Load more terminal users'}</button><small>{rows.length.toLocaleString()} users loaded · selection applies only to loaded rows</small></div>}
@@ -592,7 +609,7 @@ export function UsersView({
         {trackedCommand && <CommandProgress command={trackedCommand} onCancel={cancelCommand} />}
         {deletionJob && <BulkDeletionProgress job={deletionJob} onCancel={cancelDeletionJob} />}
 
-        <div ref={tabsRef} className="section-tabs users-section-tabs" role="tablist" aria-label="User workspace sections">{userSections.map((item) => { const count = item.id === 'directory' ? identityTotal : item.id === 'identity' ? identityCount : historyCount; return <button key={item.id} id={`users-tab-${item.id}`} role="tab" type="button" aria-selected={section === item.id} aria-controls={`users-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? 'active' : ''} onClick={() => setSection(item.id)} onKeyDown={handleTabKey}><Icon name={item.icon} /><span>{item.label}</span><strong>{count.toLocaleString()}</strong></button> })}</div>
+        <div ref={tabsRef} className="section-tabs users-section-tabs" role="tablist" aria-label="User workspace sections">{userSections.map((item) => { const count = item.id === 'directory' ? identityTotal : item.id === 'identity' ? identityCount : historyCount; return <button key={item.id} id={`users-tab-${item.id}`} role="tab" type="button" aria-selected={section === item.id} aria-controls={`users-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? 'active' : ''} onClick={() => selectSection(item.id)} onKeyDown={handleTabKey}><Icon name={item.icon} /><span>{item.label}</span><strong>{count.toLocaleString()}</strong></button> })}</div>
         <div id={`users-panel-${section}`} role="tabpanel" aria-labelledby={`users-tab-${section}`}>{section === 'directory' ? directoryPanel : section === 'identity' ? identityPanel : historicalPanel}</div>
 
         {selectedUsers.length > 0 && <aside className="bulk-selection-bar" aria-live="polite"><div><span className="bulk-selection-count">{selectedUsers.length}</span><span><strong>{selectedUsers.length} user{selectedUsers.length === 1 ? '' : 's'} selected</strong><small>Only eligible loaded regular users · attendance remains immutable</small></span></div><div><button className="button secondary" type="button" onClick={() => setSelectedUserKeys(new Set())}>Clear selection</button><button className="button destructive" type="button" disabled={!canDeleteProfile || activeDeletionJob} onClick={() => setBulkDialogOpen(true)}><Icon name="trash" /> Delete selected</button></div></aside>}

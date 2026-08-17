@@ -6,11 +6,14 @@ import {
   lazy,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type RefObject,
 } from 'react'
-import { createBrowserRouter, RouterProvider, useLocation, useNavigate, useRouteError } from 'react-router-dom'
+import { createPortal } from 'react-dom'
+import { createBrowserRouter, RouterProvider, useLocation, useNavigate, useNavigationType, useRouteError } from 'react-router-dom'
 import { api, ApiError, queryString, setCsrfToken } from './api'
 import { queryClient } from './data'
 import { AppShell } from './AppShell'
@@ -207,6 +210,44 @@ export function useToast() {
   return useMemo(() => ({ toast, notice, error }), [error, notice, toast])
 }
 
+let modalLockDepth = 0
+let lockedWorkspace: HTMLElement | null = null
+let lockedWorkspaceOverflow = ''
+let lockedWorkspaceScrollTop = 0
+let rootAriaHidden: string | null = null
+let rootWasInert = false
+
+function lockApplicationForModal() {
+  const root = document.getElementById('root')
+  if (modalLockDepth === 0) {
+    lockedWorkspace = document.querySelector<HTMLElement>('.app-workspace')
+    lockedWorkspaceOverflow = lockedWorkspace?.style.overflow || ''
+    lockedWorkspaceScrollTop = lockedWorkspace?.scrollTop || 0
+    if (lockedWorkspace) lockedWorkspace.style.overflow = 'hidden'
+    if (root) {
+      rootAriaHidden = root.getAttribute('aria-hidden')
+      rootWasInert = root.hasAttribute('inert')
+      root.setAttribute('aria-hidden', 'true')
+      root.setAttribute('inert', '')
+    }
+  }
+  modalLockDepth += 1
+  return () => {
+    modalLockDepth = Math.max(0, modalLockDepth - 1)
+    if (modalLockDepth > 0) return
+    if (lockedWorkspace) {
+      lockedWorkspace.style.overflow = lockedWorkspaceOverflow
+      lockedWorkspace.scrollTop = lockedWorkspaceScrollTop
+    }
+    if (root) {
+      if (rootAriaHidden === null) root.removeAttribute('aria-hidden')
+      else root.setAttribute('aria-hidden', rootAriaHidden)
+      if (!rootWasInert) root.removeAttribute('inert')
+    }
+    lockedWorkspace = null
+  }
+}
+
 export function Dialog({
   titleId,
   title,
@@ -214,6 +255,7 @@ export function Dialog({
   onClose,
   children,
   className = '',
+  returnFocusRef,
 }: {
   titleId: string
   title: string
@@ -221,12 +263,14 @@ export function Dialog({
   onClose: () => void
   children: ReactNode
   className?: string
+  returnFocusRef?: RefObject<HTMLElement | null>
 }) {
   const panel = useRef<HTMLDivElement>(null)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
+    const releaseModalLock = lockApplicationForModal()
     const node = panel.current
     const focusable = () =>
       Array.from(
@@ -234,7 +278,7 @@ export function Dialog({
           'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
         ) || [],
       )
-    focusable()[0]?.focus()
+    const focusFrame = window.requestAnimationFrame(() => focusable()[0]?.focus())
     const handle = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -256,12 +300,14 @@ export function Dialog({
     }
     document.addEventListener('keydown', handle)
     return () => {
+      window.cancelAnimationFrame(focusFrame)
       document.removeEventListener('keydown', handle)
-      previous?.focus()
+      releaseModalLock()
+      ;(returnFocusRef?.current || previous)?.focus()
     }
-  }, [])
-  return (
-    <div className="dialog-backdrop" role="presentation">
+  }, [returnFocusRef])
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <div
         ref={panel}
         className={`dialog-panel ${className}`}
@@ -282,7 +328,8 @@ export function Dialog({
         </header>
         {children}
       </div>
-    </div>
+    </div>,
+    document.getElementById('overlay-root') || document.body,
   )
 }
 
@@ -516,6 +563,10 @@ const DeviceDrawer = lazy(() => import('./features/DeviceDrawer').then((module) 
 function DashboardApp() {
   const location = useLocation()
   const navigate = useNavigate()
+  const navigationType = useNavigationType()
+  const workspaceRef = useRef<HTMLElement>(null)
+  const workspaceScrollPositions = useRef(new Map<string, number>())
+  const previousScrollContext = useRef<{ key: string; context: string } | null>(null)
   const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
   const [username, setUsername] = useState('')
   const [devices, setDevices] = useState<Device[]>([])
@@ -529,7 +580,74 @@ function DashboardApp() {
   const [drawer, setDrawer] = useState<Device | null>(null)
   const toast = useToast()
   const view = dashboardRoute(location.pathname)
-  const setView = useCallback((next: View) => navigate(routePath(next)), [navigate])
+  const rememberWorkspaceScroll = useCallback(() => {
+    const workspace = workspaceRef.current
+    if (workspace) workspaceScrollPositions.current.set(location.key, workspace.scrollTop)
+  }, [location.key])
+  const setView = useCallback((next: View) => {
+    rememberWorkspaceScroll()
+    navigate(routePath(next))
+  }, [navigate, rememberWorkspaceScroll])
+  const scrollContext = useMemo(() => {
+    if (view === 'fleet') return 'fleet'
+    if (view === 'users') return `users:${routeDeviceId(location.pathname, 'users') || 'picker'}`
+    if (view === 'firmware') return `firmware:${firmwareSection(location.search)}`
+    if (view === 'reconciliation') {
+      return `reconciliation:${new URLSearchParams(location.search).get('tab') || 'jobs'}`
+    }
+    return view
+  }, [location.pathname, location.search, view])
+
+  useLayoutEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    const previous = previousScrollContext.current
+    const sameFleetCanvas = previous?.context === 'fleet' && scrollContext === 'fleet'
+    const contextChanged = previous !== null && previous.context !== scrollContext
+    let target = workspace.scrollTop
+    let shouldRestore = false
+    if (!sameFleetCanvas && navigationType === 'POP') {
+      target = workspaceScrollPositions.current.get(location.key) || 0
+      shouldRestore = true
+    } else if (!sameFleetCanvas && (previous === null || contextChanged)) {
+      target = 0
+      shouldRestore = true
+    }
+
+    let restorationComplete = !shouldRestore
+    let resizeObserver: ResizeObserver | null = null
+    const delayed: number[] = []
+    const applyTarget = (finalAttempt = false) => {
+      if (restorationComplete) return
+      const maximum = Math.max(0, workspace.scrollHeight - workspace.clientHeight)
+      workspace.scrollTop = Math.min(target, maximum)
+      if (maximum >= target || finalAttempt) {
+        restorationComplete = true
+        resizeObserver?.disconnect()
+      }
+    }
+    applyTarget()
+    const frame = window.requestAnimationFrame(() => applyTarget())
+    if (!restorationComplete) {
+      ;[80, 250, 600].forEach((delay, index) => {
+        delayed.push(window.setTimeout(() => applyTarget(index === 2), delay))
+      })
+    }
+    const content = workspace.querySelector<HTMLElement>('.page-content')
+    resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => applyTarget())
+    if (!restorationComplete && content) resizeObserver?.observe(content)
+    previousScrollContext.current = { key: location.key, context: scrollContext }
+
+    const remember = () => workspaceScrollPositions.current.set(location.key, workspace.scrollTop)
+    workspace.addEventListener('scroll', remember, { passive: true })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      delayed.forEach((timer) => window.clearTimeout(timer))
+      resizeObserver?.disconnect()
+      remember()
+      workspace.removeEventListener('scroll', remember)
+    }
+  }, [location.key, navigationType, scrollContext])
 
   useEffect(() => {
     const timer = window.setInterval(() => setRevisions((current) => ({ ...current })), 60_000)
@@ -669,7 +787,7 @@ function DashboardApp() {
 
   return (
     <>
-      <AppShell username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
+      <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
         {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} />}
         {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} /></Suspense>}

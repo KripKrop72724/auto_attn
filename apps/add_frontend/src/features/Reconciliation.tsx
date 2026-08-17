@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type RefObject,
 } from 'react'
 import './Reconciliation.css'
 import { api, queryString } from '../api'
@@ -21,6 +22,7 @@ import {
   type ReconciliationDialogState,
 } from '../App'
 import { Icon } from '../Icon'
+import { AnchoredLayer } from '../AnchoredLayer'
 import type {
   Device,
   ReconciliationDivergenceDetail,
@@ -200,10 +202,10 @@ function TerminalPicker({
     if (open) window.setTimeout(() => searchRef.current?.focus(), 0)
     else setQuery('')
   }, [open])
-  const close = () => {
+  const close = useCallback((restoreFocus = true) => {
     onOpenChange(false)
-    window.setTimeout(() => triggerRef.current?.focus(), 0)
-  }
+    if (restoreFocus) window.setTimeout(() => triggerRef.current?.focus(), 0)
+  }, [onOpenChange])
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const options = Array.from(
       optionsRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -259,7 +261,8 @@ function TerminalPicker({
         </button>
       </div>
       {open && (
-        <div className="reconciliation-terminal-popover">
+        <AnchoredLayer anchorRef={triggerRef} className="reconciliation-terminal-layer" matchAnchor mobileSheet preferredWidth={760} onDismiss={(reason) => close(reason === 'escape')}>
+          <div className="reconciliation-terminal-popover">
           <label className="search-field">
             <span className="sr-only">Search authorized terminals</span>
             <Icon name="search" />
@@ -293,7 +296,7 @@ function TerminalPicker({
                 onKeyDown={(event) => move(event, index)}
                 onClick={() => {
                   onSelect(device.connector_id)
-                  close()
+                  close(false)
                 }}
               >
                 <span className="reconciliation-terminal-symbol">
@@ -323,9 +326,25 @@ function TerminalPicker({
               </div>
             )}
           </div>
-        </div>
+          </div>
+        </AnchoredLayer>
       )}
     </section>
+  )
+}
+
+function ReconciliationCancelMenu({ onCancel }: { onCancel: () => void }) {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  return (
+    <div className="reconciliation-action-menu">
+      <button ref={triggerRef} className="button secondary" type="button" aria-label="More reconciliation actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
+      {open && <AnchoredLayer anchorRef={triggerRef} className="reconciliation-action-layer" mobileSheet preferredWidth={310} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
+        <div className="reconciliation-action-panel" role="group" aria-label="Reconciliation actions">
+          <button type="button" className="danger-action" onClick={() => { setOpen(false); onCancel() }}><Icon name="x" /><span><strong>Cancel reconciliation</strong><small>Committed checkpoints and evidence remain preserved.</small></span></button>
+        </div>
+      </AnchoredLayer>}
+    </div>
   )
 }
 
@@ -334,22 +353,26 @@ function JobDetailDrawer({
   onClose,
   toast,
   onDivergence,
+  returnFocusRef,
 }: {
   seed: ReconciliationJob
   onClose: () => void
   toast: Toast
   onDivergence: (id: string) => void
+  returnFocusRef: RefObject<HTMLButtonElement | null>
 }) {
   const [job, setJob] = useState<ReconciliationJob | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [visibleEventCount, setVisibleEventCount] = useState(25)
+  const [expandedEvent, setExpandedEvent] = useState<string | null>(null)
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      setJob(
-        await api<ReconciliationJob>(`/api/v1/reconciliations/${seed.job_id}`),
-      )
+      setJob(await api<ReconciliationJob>(`/api/v1/reconciliations/${seed.job_id}`))
+      setVisibleEventCount(25)
+      setExpandedEvent(null)
     } catch (reason) {
       setError(
         reason instanceof Error
@@ -363,6 +386,11 @@ function JobDetailDrawer({
   useEffect(() => {
     void load()
   }, [load])
+  const orderedEvents = useMemo(
+    () => (job?.events || []).slice().reverse(),
+    [job?.events],
+  )
+  const shownEvents = orderedEvents.slice(0, visibleEventCount)
   return (
     <Dialog
       titleId="reconciliation-job-detail-title"
@@ -370,6 +398,7 @@ function JobDetailDrawer({
       description={`${seed.connector?.display_name || seed.job_id} · ${seed.job_id}`}
       onClose={onClose}
       className="device-drawer reconciliation-detail-drawer"
+      returnFocusRef={returnFocusRef}
     >
       <div className="drawer-status">
         <StatusBadge
@@ -523,25 +552,32 @@ function JobDetailDrawer({
                     job.
                   </p>
                 </div>
-                <StatusBadge state={`${job.events?.length || 0} EVENTS`} />
+                <div className="reconciliation-ledger-count">
+                  <StatusBadge state={`${orderedEvents.length} EVENTS`} />
+                  {orderedEvents.length > 0 && <small>Showing {Math.min(visibleEventCount, orderedEvents.length)} newest</small>}
+                </div>
               </div>
-              {(job.events || [])
-                .slice()
-                .reverse()
-                .map((event, index) => (
-                  <article key={`${event.created_at}-${index}`}>
-                    <span>
-                      <StatusBadge state={event.state} />
-                      <small>{dateTime(event.created_at)}</small>
-                    </span>
-                    <pre>{JSON.stringify(event.details, null, 2)}</pre>
+              {shownEvents.map((event, index) => {
+                const eventKey = `${event.created_at}-${index}`
+                const detailKeys = Object.keys(event.details || {})
+                const expanded = expandedEvent === eventKey
+                return (
+                  <article key={eventKey}>
+                    <button className="reconciliation-event-summary" type="button" aria-expanded={expanded} onClick={() => setExpandedEvent(expanded ? null : eventKey)}>
+                      <span><StatusBadge state={event.state} /><small>{dateTime(event.created_at)}</small></span>
+                      <span><strong>{humanize(event.state)}</strong><small>{detailKeys.length ? detailKeys.slice(0, 3).map(humanize).join(' · ') : 'No additional fields'}</small></span>
+                      <Icon name="chevron" />
+                    </button>
+                    {expanded && <pre>{JSON.stringify(event.details, null, 2)}</pre>}
                   </article>
-                ))}
-              {!job.events?.length && (
+                )
+              })}
+              {!orderedEvents.length && (
                 <p className="muted-copy">
                   No detailed event records are available yet.
                 </p>
               )}
+              {visibleEventCount < orderedEvents.length && <div className="reconciliation-ledger-more"><button className="button secondary" type="button" onClick={() => setVisibleEventCount((count) => Math.min(count + 25, orderedEvents.length))}>Load 25 older events</button><small>{(orderedEvents.length - visibleEventCount).toLocaleString()} older event{orderedEvents.length - visibleEventCount === 1 ? '' : 's'} remain</small></div>}
             </section>
             <a
               className="button secondary"
@@ -1112,6 +1148,7 @@ export function ReconciliationView({
   const [preflightError, setPreflightError] = useState('')
   const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
   const [jobDrawer, setJobDrawer] = useState<ReconciliationJob | null>(null)
+  const jobDrawerReturnFocusRef = useRef<HTMLButtonElement>(null)
   const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(
     null,
   )
@@ -1964,7 +2001,10 @@ export function ReconciliationView({
                     <footer>
                       <button
                         className="button secondary"
-                        onClick={() => setJobDrawer(job)}
+                        onClick={(event) => {
+                          jobDrawerReturnFocusRef.current = event.currentTarget
+                          setJobDrawer(job)
+                        }}
                       >
                         <Icon name="shield" /> Inspect evidence
                       </button>
@@ -1983,46 +2023,7 @@ export function ReconciliationView({
                         </button>
                       )}
                       {controls.includes('cancel') && (
-                        <details
-                          className="reconciliation-action-menu"
-                          onKeyDown={(event) => {
-                            if (event.key === 'Escape') {
-                              event.currentTarget.open = false
-                              event.currentTarget
-                                .querySelector<HTMLElement>('summary')
-                                ?.focus()
-                            }
-                          }}
-                        >
-                          <summary>
-                            <Icon name="menu" /> More
-                          </summary>
-                          <div>
-                            <button
-                              type="button"
-                              className="danger-action"
-                              onClick={() => {
-                                setDialog({
-                                  mode: 'control',
-                                  job,
-                                  action: 'cancel',
-                                })
-                                ;(
-                                  document.activeElement as HTMLElement | null
-                                )?.blur()
-                              }}
-                            >
-                              <Icon name="x" />
-                              <span>
-                                <strong>Cancel reconciliation</strong>
-                                <small>
-                                  Committed checkpoints and evidence remain
-                                  preserved.
-                                </small>
-                              </span>
-                            </button>
-                          </div>
-                        </details>
+                        <ReconciliationCancelMenu onCancel={() => setDialog({ mode: 'control', job, action: 'cancel' })} />
                       )}
                     </footer>
                   </article>
@@ -2535,6 +2536,7 @@ export function ReconciliationView({
           seed={jobDrawer}
           onClose={() => setJobDrawer(null)}
           toast={toast}
+          returnFocusRef={jobDrawerReturnFocusRef}
           onDivergence={(id) => {
             setJobDrawer(null)
             setDivergenceDrawerId(id)

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { Icon } from './Icon'
 import type { DashboardRoute } from './types'
 import type { RealtimeState } from './realtime'
@@ -23,6 +23,7 @@ export function AppShell({
   onLogout,
   realtimeState,
   lastSyncAt,
+  workspaceRef,
 }: {
   children: ReactNode
   username: string
@@ -32,6 +33,7 @@ export function AppShell({
   onLogout: () => void
   realtimeState: RealtimeState
   lastSyncAt: Date | null
+  workspaceRef: RefObject<HTMLElement | null>
 }) {
   const [moreOpen, setMoreOpen] = useState(false)
   const moreTriggerRef = useRef<HTMLButtonElement>(null)
@@ -109,7 +111,7 @@ export function AppShell({
         </div>
         <button ref={moreTriggerRef} className={`mobile-more-trigger ${moreOpen ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="grid" /><span>More</span></button>
       </aside>
-      <section className="app-workspace">
+      <section ref={workspaceRef} className="app-workspace">
         <header className="app-header">
           <div className="mobile-brand">
             <img src="/state-life-logo.png" alt="" />

@@ -30,7 +30,7 @@
 .attendance-advanced-grid label { display: grid; gap: 7px; margin: 0; color: var(--ink); font-size: 12px; font-weight: 700; }
 .attendance-advanced-body > footer { display: flex; justify-content: flex-end; gap: 9px; padding: 12px 16px; border-top: 1px solid var(--line); }
 .attendance-top-sentinel { height: 1px; }
-.attendance-new-events { position: sticky; z-index: 8; top: 132px; min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto; padding: 0 16px; border: 1px solid var(--brand-600); border-radius: 999px; color: #fff; background: var(--brand-700); box-shadow: 0 8px 20px rgba(6,109,163,.25); font-size: 12px; font-weight: 750; }
+.attendance-new-events { position: sticky; z-index: 8; top: calc(var(--app-header-height) + 64px); min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto; padding: 0 16px; border: 1px solid var(--brand-600); border-radius: 999px; color: #fff; background: var(--brand-700); box-shadow: 0 8px 20px rgba(6,109,163,.25); font-size: 12px; font-weight: 750; }
 .attendance-event-head, .attendance-event { display: grid; grid-template-columns: minmax(220px,1.15fr) minmax(230px,1.15fr) minmax(190px,1fr) minmax(145px,.75fr) minmax(170px,.85fr) 44px; align-items: center; gap: 15px; }
 .attendance-event-head { min-height: 45px; padding: 0 18px; color: var(--muted); background: #fafcfd; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
 .attendance-event { min-height: 94px; position: relative; padding: 13px 18px; border-top: 1px solid var(--line); border-left: 4px solid transparent; background: #fff; transition: background .14s ease; }
@@ -82,10 +82,10 @@
   .attendance-primary-filters { grid-template-columns: 1fr; }
   .attendance-advanced > summary { width: 100%; }
   .attendance-advanced[open]::before { content: ""; position: fixed; z-index: 70; inset: 0; background: rgba(7,26,43,.55); }
-  .attendance-advanced-body { position: fixed; z-index: 71; top: auto; left: 0; right: 0; bottom: 0; width: 100%; max-height: min(82vh,720px); overflow: auto; border-radius: 18px 18px 0 0; }
+  .attendance-advanced-body { position: fixed; z-index: 71; top: auto; left: 0; right: 0; bottom: calc(var(--app-bottom-nav-height) + env(safe-area-inset-bottom)); width: 100%; max-height: min(82dvh,720px); overflow: auto; border-radius: 18px 18px 0 0; }
   .attendance-advanced-grid { grid-template-columns: 1fr; }
   .attendance-advanced-body > footer { position: sticky; bottom: 0; background: #fff; }
-  .attendance-new-events { top: 82px; }
+  .attendance-new-events { top: calc(var(--app-header-height) + 20px); }
   .attendance-event { scroll-margin-bottom: 92px; }
   .attendance-event-details > div > :last-child { scroll-margin-bottom: 92px; }
 }

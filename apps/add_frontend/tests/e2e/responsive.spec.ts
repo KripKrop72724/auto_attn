@@ -91,6 +91,17 @@ const sourceException = {
   reviews: [],
 }
 
+const reconciliationEvents = Array.from({ length: 899 }, (_, index) => ({
+  state: index % 9 === 0 ? 'SOURCE_CAPTURE_CERTIFIED_WITH_IMMUTABLE_CHAIN_EVIDENCE' : 'CHUNK_COMMITTED',
+  details: {
+    start_ordinal: 89_200 - index,
+    end_ordinal: 89_246 - index,
+    chain_digest: `${index.toString(16).padStart(4, '0')}${'f'.repeat(60)}`,
+    source_chain_digest: '9e4efdd76c75638aa3e82b0aa774ebe8093f41784091feb8840d3602037b0fae',
+  },
+  created_at: new Date(Date.UTC(2026, 7, 13, 7, 45, 53) - index * 1_000).toISOString(),
+}))
+
 const reconciliationJob = {
   job_id: '11111111-1111-4111-8111-111111111111', mode: 'FULL_HISTORY_BASELINE', status: 'RUNNING', phase: 'VERIFYING_SOURCE_CHANGE', wait_reason: 'SOURCE_DIVERGENCE_PROBE_PENDING', error_code: null, error_message: null,
   operator_state: 'VERIFYING_SOURCE_CHANGE', operator_message: 'ADD is confirming a terminal-history change with independent fresh reads.', completion_outcome: null, review_required: false,
@@ -100,6 +111,7 @@ const reconciliationJob = {
   assignment: { assignment_id: null, credit_start_ordinal: null, credit_end_ordinal: null, credit_committed_through: 5100, granted_at: null, expires_at: null, accepted_at: null, heartbeat_at: null },
   eta: { low_seconds: null, high_seconds: null, confidence: 'UNAVAILABLE', unavailable_reason: 'SOURCE_DIVERGENCE_PROBE_PENDING' },
   recovery: { operation_id: '22222222-2222-4222-8222-222222222222', source_epoch: 1, source_epoch_id: '33333333-3333-4333-8333-333333333333', divergence: { divergence_id: '44444444-4444-4444-8444-444444444444', ordinal: 5130, state: 'PROBING', old_raw_digest: 'a'.repeat(64), new_raw_digest: 'b'.repeat(64), observation_count: 2, next_probe_at: '2026-08-07T06:00:00Z' } },
+  events: reconciliationEvents,
   requested_at: '2026-08-07T05:01:32Z', started_at: '2026-08-07T05:01:36Z', capture_certified_at: null, oracle_certified_at: null, completed_at: null, updated_at: '2026-08-07T05:35:05Z',
 }
 
@@ -131,7 +143,7 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/provisioning/companions') json = { rows: [] }
     else if (url.pathname === '/api/v1/provisioning/sessions') json = { rows: [] }
     else if (url.pathname === '/api/v1/provisioning/companion-releases/latest') json = { platform: url.searchParams.get('platform'), version: '1.0.0', filename: 'add-provisioning-companion-windows-x64.exe', sha256: 'c'.repeat(64), size: 123456, git_sha: factoryBundle.git_sha, download_url: '/api/v1/provisioning/companion-releases/windows-x64/download', os_signed: false }
-    else if (url.pathname === '/api/v1/reconciliations') json = { enabled: true, scheduler: { policy: 'BOUNDED_PARALLEL_PER_DEVICE', device_concurrency: 6, active_scan_jobs: 1, waiting_scan_jobs: 0, available_scan_slots: 5, history_backlog: 0, history_backlog_limit: 10000, reserved_credit: 0, available_credit: 10000 }, rows: [reconciliationJob], next_cursor: null, filtered_total: 1, totals: { all: 1, active: 1, queued_waiting: 0, paused: 0, attention: 0, completed: 0, cancelled: 0 } }
+    else if (url.pathname === '/api/v1/reconciliations') json = { enabled: true, scheduler: { policy: 'BOUNDED_PARALLEL_PER_DEVICE', device_concurrency: 6, active_scan_jobs: 1, waiting_scan_jobs: 0, available_scan_slots: 5, history_backlog: 0, history_backlog_limit: 10000, reserved_credit: 0, available_credit: 10000 }, rows: [{ ...reconciliationJob, events: undefined }], next_cursor: null, filtered_total: 1, totals: { all: 1, active: 1, queued_waiting: 0, paused: 0, attention: 0, completed: 0, cancelled: 0 } }
     else if (url.pathname === `/api/v1/reconciliations/${reconciliationJob.job_id}`) json = reconciliationJob
     else if (url.pathname.endsWith('/reconciliations/preflight')) json = { eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [], connector: { connector_id: device.connector_id, device_id: device.device_id, display_name: device.display_name, zone_id: device.zone_id, connected: true, firmware_version: device.firmware_version }, terminal: { serial: device.zkt.serial, attendance_count: 42, user_count: 1, connection_state: 'ONLINE', identity_snapshot_revision: 1, range_resume_verified: true }, coverage: null }
     else if (url.pathname === '/api/v1/source-exceptions/1/review') json = { ...sourceException, review_state: 'REVIEWED', reviewed_at: '2026-08-06T10:10:00Z', reviewed_by: 'StateHealthAdmin', review_reason: 'Reviewed immutable source evidence.', reviews: [{ review_id: 'review-one', state: 'REVIEWED', reason: 'Reviewed immutable source evidence.', actor: 'StateHealthAdmin', created_at: '2026-08-06T10:10:00Z' }] }
@@ -224,14 +236,16 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   })
   const beforeSelection = await peshawar.evaluate((node) => {
     const box = node.getBoundingClientRect()
-    return { x: box.x + window.scrollX, y: box.y + window.scrollY }
+    const stage = node.closest('.fleet-map-stage')?.getBoundingClientRect()
+    return { x: box.x - (stage?.x || 0), y: box.y - (stage?.y || 0) }
   })
   await peshawar.click()
   await expect(page.getByRole('heading', { name: 'Peshawar' })).toBeVisible()
   await expect(page.getByRole('button', { name: /Inspect Peshawar/ })).toHaveCount(2)
   const afterSelection = await peshawar.evaluate((node) => {
     const box = node.getBoundingClientRect()
-    return { x: box.x + window.scrollX, y: box.y + window.scrollY }
+    const stage = node.closest('.fleet-map-stage')?.getBoundingClientRect()
+    return { x: box.x - (stage?.x || 0), y: box.y - (stage?.y || 0) }
   })
   expect(Math.abs(afterSelection.x - beforeSelection.x)).toBeLessThan(1)
   expect(Math.abs(afterSelection.y - beforeSelection.y)).toBeLessThan(1)
@@ -359,6 +373,128 @@ test('source exception inspector is responsive, keyboard-operable, and fail-clos
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+})
+
+test('large reconciliation evidence stays viewport-bound and progressively reveals events', async ({ page }) => {
+  await page.goto('/reconciliation')
+  const inspect = page.getByRole('button', { name: 'Inspect evidence' }).first()
+  await inspect.click()
+  const drawer = page.getByRole('dialog', { name: 'Reconciliation evidence' })
+  await expect(drawer).toBeVisible()
+  await expect(drawer.locator('.reconciliation-event-summary')).toHaveCount(25)
+  await expect(drawer.getByText('Showing 25 newest')).toBeVisible()
+
+  const geometry = await page.evaluate(() => {
+    const viewport = window.visualViewport
+    const backdrop = document.querySelector<HTMLElement>('.dialog-backdrop')?.getBoundingClientRect()
+    const dialog = document.querySelector<HTMLElement>('.reconciliation-detail-drawer')?.getBoundingClientRect()
+    const workspace = document.querySelector<HTMLElement>('.app-workspace')
+    return {
+      width: viewport?.width || window.innerWidth,
+      height: viewport?.height || window.innerHeight,
+      backdrop: backdrop && { x: backdrop.x, y: backdrop.y, right: backdrop.right, bottom: backdrop.bottom },
+      dialog: dialog && { x: dialog.x, y: dialog.y, right: dialog.right, bottom: dialog.bottom },
+      workspaceOverflow: workspace?.style.overflow,
+      rootInert: document.getElementById('root')?.hasAttribute('inert'),
+    }
+  })
+  expect(geometry.backdrop?.x).toBeGreaterThanOrEqual(-1)
+  expect(geometry.backdrop?.y).toBeGreaterThanOrEqual(-1)
+  expect(geometry.backdrop?.right).toBeLessThanOrEqual(geometry.width + 1)
+  expect(geometry.backdrop?.bottom).toBeLessThanOrEqual(geometry.height + 1)
+  expect(geometry.dialog?.x).toBeGreaterThanOrEqual(-1)
+  expect(geometry.dialog?.y).toBeGreaterThanOrEqual(-1)
+  expect(geometry.dialog?.right).toBeLessThanOrEqual(geometry.width + 1)
+  expect(geometry.dialog?.bottom).toBeLessThanOrEqual(geometry.height + 1)
+  expect(geometry.workspaceOverflow).toBe('hidden')
+  expect(geometry.rootInert).toBe(true)
+
+  await drawer.locator('.reconciliation-event-summary').first().click()
+  await expect(drawer.locator('.reconciliation-event-ledger article pre')).toHaveCount(1)
+  const expandedBox = await drawer.locator('.reconciliation-event-ledger article pre').boundingBox()
+  const drawerBox = await drawer.boundingBox()
+  expect((expandedBox?.x || 0) + (expandedBox?.width || 0)).toBeLessThanOrEqual((drawerBox?.x || 0) + (drawerBox?.width || 0) + 1)
+
+  await drawer.getByRole('button', { name: 'Load 25 older events' }).click()
+  await expect(drawer.locator('.reconciliation-event-summary')).toHaveCount(50)
+  await drawer.getByRole('button', { name: 'Close dialog' }).click()
+  await expect(inspect).toBeFocused()
+  await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
+})
+
+test('reported viewport thresholds, route scroll reset, and collision layers remain bounded', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-1280', 'Threshold matrix runs once in Chromium; Firefox and WebKit retain their dedicated projects.')
+  const sizes = [
+    { width: 320, height: 720 }, { width: 390, height: 844 },
+    { width: 759, height: 800 }, { width: 760, height: 800 }, { width: 761, height: 800 },
+    { width: 768, height: 1024 }, { width: 1024, height: 600 }, { width: 1224, height: 697 },
+    { width: 1279, height: 720 }, { width: 1280, height: 720 }, { width: 1281, height: 720 },
+    { width: 1440, height: 900 }, { width: 1600, height: 1000 },
+  ]
+  const routes = ['/fleet', '/users/connector-one', '/attendance', '/reconciliation', '/firmware', '/firmware?tab=prepare', '/alerts']
+  for (let index = 0; index < sizes.length; index += 1) {
+    await page.setViewportSize(sizes[index])
+    await page.goto(routes[index % routes.length])
+    await expect(page.locator('.app-header')).toBeVisible()
+    await page.waitForTimeout(200)
+    const bounds = await page.evaluate(() => ({
+      width: window.innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      shell: document.querySelector<HTMLElement>('.app-shell')?.getBoundingClientRect().height || 0,
+      workspace: document.querySelector<HTMLElement>('.app-workspace')?.getBoundingClientRect().height || 0,
+      viewportHeight: window.innerHeight,
+      offenders: Array.from(document.querySelectorAll<HTMLElement>('body *')).filter((element) => {
+        const rect = element.getBoundingClientRect()
+        return rect.right > window.innerWidth + 1 || rect.left < -1
+      }).slice(0, 8).map((element) => ({ tag: element.tagName, text: element.textContent?.trim().slice(0, 30), className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+    }))
+    expect(bounds.documentWidth, `${sizes[index].width}x${sizes[index].height} on ${routes[index % routes.length]} offenders=${JSON.stringify(bounds.offenders)}`).toBeLessThanOrEqual(bounds.width)
+    expect(Math.abs(bounds.shell - bounds.viewportHeight)).toBeLessThanOrEqual(1)
+    expect(Math.abs(bounds.workspace - bounds.viewportHeight)).toBeLessThanOrEqual(1)
+  }
+
+  await page.setViewportSize({ width: 1224, height: 697 })
+  await page.goto('/users/connector-one')
+  const workspace = page.locator('.app-workspace')
+  await expect(page.getByRole('article', { name: /Ayesha Khan, user 1007/i })).toBeVisible()
+  await page.waitForTimeout(120)
+  await workspace.evaluate((node) => { node.scrollTop = Math.min(360, node.scrollHeight - node.clientHeight) })
+  const savedScroll = await workspace.evaluate((node) => node.scrollTop)
+  expect(savedScroll).toBeGreaterThan(0)
+  await page.getByRole('navigation', { name: 'Primary navigation' }).getByRole('button', { name: 'Firmware', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
+  await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(0)
+  await page.goBack()
+  await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
+  await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(savedScroll)
+
+  await page.route('**/api/v1/devices*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: nationwideDevices }) }))
+  await page.goto('/users')
+  const pickerLayer = page.locator('.terminal-picker-layer')
+  await expect(pickerLayer).toBeVisible()
+  const finalOption = pickerLayer.getByRole('option').last()
+  await finalOption.scrollIntoViewIfNeeded()
+  const layerBox = await pickerLayer.boundingBox()
+  const finalOptionBox = await finalOption.boundingBox()
+  expect(layerBox?.y || 0).toBeGreaterThanOrEqual(11)
+  expect((layerBox?.y || 0) + (layerBox?.height || 0)).toBeLessThanOrEqual(697 - 11)
+  expect(finalOptionBox?.y || 0).toBeGreaterThanOrEqual((layerBox?.y || 0) - 1)
+  expect((finalOptionBox?.y || 0) + (finalOptionBox?.height || 0)).toBeLessThanOrEqual((layerBox?.y || 0) + (layerBox?.height || 0) + 1)
+
+  const directoryUsers = Array.from({ length: 43 }, (_, index) => ({ ...representativeUser, id: index + 1, user_key: `operator-${index + 1}`, uid: `${index + 1}`, user_id: `${40_000 + index}`, display_name: `Operator ${index + 1}` }))
+  await page.route('**/api/v2/devices/*/users*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: directoryUsers, next_cursor: null, device: nationwideDevices[4], identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 43, with_cnic: 43, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }) }))
+  await page.goto('/users/tower-three')
+  const finalRow = page.getByRole('article', { name: /Operator 43, user 40042/i })
+  await finalRow.scrollIntoViewIfNeeded()
+  const finalMore = finalRow.getByLabel('More actions for Operator 43')
+  await finalMore.click()
+  const actionLayer = page.locator('.user-action-layer')
+  await expect(actionLayer.getByRole('group', { name: 'Actions for Operator 43' })).toBeVisible()
+  const actionBox = await actionLayer.boundingBox()
+  expect(actionBox?.y || 0).toBeGreaterThanOrEqual(11)
+  expect((actionBox?.y || 0) + (actionBox?.height || 0)).toBeLessThanOrEqual(697 - 11)
+  await page.keyboard.press('Escape')
+  await expect(finalMore).toBeFocused()
 })
 
 test('physical provisioning environment is responsive, explicit, and accessible', async ({ page }) => {

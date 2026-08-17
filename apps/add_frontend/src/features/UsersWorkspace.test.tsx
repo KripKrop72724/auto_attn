@@ -111,6 +111,7 @@ describe('Selected-terminal users workspace', () => {
 
     fireEvent.click(screen.getByLabelText(/More actions for Ayesha/i))
     const menu = screen.getByRole('group', { name: /Actions for Ayesha/i })
+    expect(menu.closest('.panel')).toBeNull()
     expect((within(menu).getByRole('button', { name: /Enrollment access/i }) as HTMLButtonElement).disabled).toBe(true)
     expect((within(menu).getByRole('button', { name: /Delete Ayesha/i }) as HTMLButtonElement).disabled).toBe(true)
     expect(within(menu).getByText(/certified temporary enrollment access/i)).toBeTruthy()
@@ -136,6 +137,27 @@ describe('Selected-terminal users workspace', () => {
     expect(screen.getByLabelText('Active user filters').textContent).toMatch(/Exact CNIC: 3520212345671/i)
     fireEvent.click(within(screen.getByLabelText('Active user filters')).getByRole('button', { name: 'Clear all' }))
     expect((screen.getByLabelText(/Exact CNIC search/i) as HTMLInputElement).value).toBe('')
+  })
+
+  it('uses one bounded virtualized directory from the first full page through pagination', async () => {
+    const firstPage = Array.from({ length: 200 }, (_, index) => user({
+      id: index + 1,
+      user_key: `user-${index + 1}`,
+      uid: `${index + 1}`,
+      user_id: `${10_000 + index}`,
+      display_name: `Operator ${index + 1}`,
+    }))
+    const finalUser = user({ id: 201, user_key: 'user-201', uid: '201', user_id: '10200', display_name: 'Operator 201' })
+    vi.stubGlobal('fetch', workspaceFetch({ rows: firstPage, nextCursor: 200, pageRows: [finalUser] }))
+    render(<UsersHarness rows={firstPage} />)
+
+    await waitFor(() => expect(document.querySelector<HTMLElement>('.user-directory-table')?.classList.contains('is-virtualized')).toBe(true))
+    const directory = document.querySelector<HTMLElement>('.user-directory-table')
+
+    fireEvent.click(screen.getByRole('button', { name: /Load more terminal users/i }))
+    await waitFor(() => expect(document.querySelector('.user-directory-panel > .panel-header p')?.textContent).toContain('201 loaded'))
+    expect(document.querySelector<HTMLElement>('.user-directory-table')).toBe(directory)
+    expect(directory?.classList.contains('is-virtualized')).toBe(true)
   })
 
   it('resets filters, dialogs, selections, and the active section when the terminal changes', async () => {
