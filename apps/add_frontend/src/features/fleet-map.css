@@ -443,8 +443,8 @@
   /* Northern city centres are geographically close. The location index below
      remains the large touch target while these exact map anchors stay distinct. */
   .fleet-map-marker { width: 30px; height: 30px; }
-  .fleet-map-marker-core { width: 20px; height: 20px; }
-  .fleet-map-marker-core i { width: 7px; height: 7px; }
+  .fleet-map-marker-core { width: 18px; height: 18px; }
+  .fleet-map-marker-core i { width: 6px; height: 6px; }
   .fleet-map-marker-core strong { font-size: 8px; }
   .fleet-map-marker.selected .fleet-map-marker-core { box-shadow: 0 7px 18px rgba(15,54,72,.2), 0 0 0 4px #fff, 0 0 0 6px rgba(0,148,218,.24); }
   .fleet-map-marker-ripple { display: none; }
