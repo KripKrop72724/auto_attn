@@ -95,7 +95,7 @@ function TerminalPicker({
           <span>{selected ? `${selected.zone_name} · ${selected.zkt?.serial || 'serial pending'}` : 'Search the authorized national fleet'}</span>
         </div>
         {selected && <StatusBadge state={selected.state} live={selected.connected} />}
-        <button ref={triggerRef} className="button secondary" type="button" aria-expanded={open} onClick={() => onOpenChange(!open)}><Icon name="search" /> {selected ? 'Change terminal' : 'Select terminal'}</button>
+        <button ref={triggerRef} className="button secondary" type="button" aria-expanded={open} aria-haspopup="listbox" aria-controls={open ? 'authorized-terminal-options' : undefined} onClick={() => onOpenChange(!open)}><Icon name="search" /> {selected ? 'Change terminal' : 'Select terminal'}</button>
       </div>
       {open && (
         <AnchoredLayer
@@ -106,9 +106,9 @@ function TerminalPicker({
           preferredWidth={720}
           onDismiss={(reason) => closePicker(reason === 'escape')}
         >
-          <div className="terminal-picker-popover">
+          <div className="terminal-picker-popover" aria-label="Choose an authorized terminal">
           <label className="search-field"><span className="sr-only">Search terminals</span><Icon name="search" /><input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'ArrowDown') { event.preventDefault(); resultsRef.current?.querySelector<HTMLButtonElement>('[role="option"]')?.focus() } else if (event.key === 'Escape') closePicker() }} placeholder="Search terminal, zone, or serial" /></label>
-          <div ref={resultsRef} className="terminal-picker-results" role="listbox" aria-label="Authorized terminals">
+          <div id="authorized-terminal-options" ref={resultsRef} className="terminal-picker-results" role="listbox" aria-label="Authorized terminals">
             {shown.map((device, index) => (
               <button
                 key={device.connector_id}
@@ -116,7 +116,7 @@ function TerminalPicker({
                 role="option"
                 aria-selected={device.connector_id === selectedDeviceId}
                 onKeyDown={(event) => moveOptionFocus(event, index)}
-                onClick={() => { onSelect(device.connector_id); closePicker(false) }}
+                onClick={() => { closePicker(false); onSelect(device.connector_id) }}
               >
                 <span className="terminal-result-symbol"><Icon name="server" /></span>
                 <span><strong>{device.display_name}</strong><small>{device.zone_name} · {device.zkt?.serial || 'serial pending'}</small></span>
