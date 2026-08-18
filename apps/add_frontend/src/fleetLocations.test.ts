@@ -30,6 +30,7 @@ describe('fleet location resolution', () => {
     ['ZONE-SLICTOWER-13FL', 'Islamabad'],
     ['SLIC-TOWER-11-FLOOR', 'Islamabad'],
     ['Slic Tower Head Office', 'Islamabad'],
+    ['ZONE-BLD9ISB-01', 'Islamabad'],
   ])('maps %s to %s', (zoneId, city) => {
     expect(resolveFleetLocation({ zone_id: zoneId, zone_name: zoneId, display_name: zoneId })?.city).toBe(city)
   })

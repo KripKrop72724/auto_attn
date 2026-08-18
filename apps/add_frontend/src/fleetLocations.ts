@@ -83,7 +83,7 @@ export const normalizeFleetLocationText = (device: Pick<Device, 'zone_id' | 'zon
 
 export function resolveFleetLocation(device: Pick<Device, 'zone_id' | 'zone_name' | 'display_name'>): FleetLocationDefinition | null {
   const value = ` ${normalizeFleetLocationText(device)} `
-  if (/\bSLICTOWER\b|\bSLIC\s+TOWER\b/.test(value)) return definitionById.get('islamabad') || null
+  if (/\bSLICTOWER\b|\bSLIC\s+TOWER\b|\bBLD\d*ISB\b|\bISLAMABAD\b/.test(value)) return definitionById.get('islamabad') || null
   if (/\bKARACHI\b/.test(value)) return definitionById.get('karachi') || null
   if (/\bPESHAWAR\b|\bPESH\b/.test(value)) return definitionById.get('peshawar') || null
   if (/\bSWAT\b/.test(value)) return definitionById.get('swat') || null
