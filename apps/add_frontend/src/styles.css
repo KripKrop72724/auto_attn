@@ -570,6 +570,7 @@ dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; }
 .flashing-card pre { max-height: 220px; overflow: auto; padding: 12px; background: var(--navy-950); color: var(--brand-100); border-radius: 9px; font-size: 11px; }
 .completion-card { text-align: center; border-top: 4px solid var(--positive); }.completion-card > svg { width: 56px; color: var(--positive); }.completion-card .provisioning-actions { justify-content: center; }
 .provisioning-history { margin-top: 20px; }.provisioning-history > button { width: 100%; display: flex; align-items: center; justify-content: space-between; text-align: left; border: 0; border-top: 1px solid var(--line); background: white; padding: 14px 4px; }.provisioning-history > button span:first-child { display: grid; gap: 3px; }.provisioning-history small { color: var(--muted); }
+.provisioning-history-search { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; margin: 14px 0 4px; }.provisioning-history-search .search-field { margin: 0; }.awaiting-terminal-confirmations > .empty-state { margin-top: 12px; }
 
 @media (max-width: 1180px) {
   .provisioning-layout { grid-template-columns: minmax(0, 1fr) 280px; }

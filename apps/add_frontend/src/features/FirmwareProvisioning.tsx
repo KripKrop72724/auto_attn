@@ -117,6 +117,22 @@ const sessionSchema = z.object({
 })
 type ProvisioningSession = z.infer<typeof sessionSchema>
 
+const sessionListSchema = z.object({
+  rows: z.array(sessionSchema),
+  next_cursor: z.number().nullable().optional(),
+  filtered_total: z.number().optional(),
+})
+
+export function awaitingTerminalSessionsPath(query = '') {
+  const params = new URLSearchParams({
+    state: 'WAITING_FOR_TERMINAL_CONFIRMATION',
+    limit: '200',
+  })
+  const normalized = query.trim()
+  if (normalized) params.set('q', normalized)
+  return `/api/v1/provisioning/sessions?${params.toString()}`
+}
+
 const utf8 = (value: string) => new TextEncoder().encode(value).length
 const identifier = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 export const provisioningConfigurationSchema = z.object({
@@ -260,6 +276,10 @@ export default function FirmwareProvisioning({
   const [sessionCursor, setSessionCursor] = useState<number | null>(null)
   const [sessionTotal, setSessionTotal] = useState(0)
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [awaitingSessions, setAwaitingSessions] = useState<ProvisioningSession[]>([])
+  const [awaitingTotal, setAwaitingTotal] = useState(0)
+  const [awaitingQuery, setAwaitingQuery] = useState('')
+  const [awaitingLoading, setAwaitingLoading] = useState(false)
   const [zoneSuggestions, setZoneSuggestions] = useState<
     { zone_id: string; zone_name: string }[]
   >([])
@@ -305,24 +325,20 @@ export default function FirmwareProvisioning({
 
   const load = useCallback(async () => {
     try {
-      const [rawCapabilities, rawCompanions, rawSessions, rawDevices] =
+      const [rawCapabilities, rawCompanions, rawSessions, rawAwaitingSessions, rawDevices] =
         await Promise.all([
           api<unknown>('/api/v1/provisioning/capabilities'),
           api<unknown>('/api/v1/provisioning/companions'),
           api<unknown>('/api/v1/provisioning/sessions?mine_only=true&limit=25'),
+          api<unknown>(awaitingTerminalSessionsPath()),
           api<unknown>('/api/v1/devices?limit=200'),
         ])
       const nextCapabilities = capabilitiesSchema.parse(rawCapabilities)
       const nextCompanions = z
         .object({ rows: z.array(companionSchema) })
         .parse(rawCompanions).rows
-      const sessionResponse = z
-        .object({
-          rows: z.array(sessionSchema),
-          next_cursor: z.number().nullable().optional(),
-          filtered_total: z.number().optional(),
-        })
-        .parse(rawSessions)
+      const sessionResponse = sessionListSchema.parse(rawSessions)
+      const awaitingResponse = sessionListSchema.parse(rawAwaitingSessions)
       const nextSessions = sessionResponse.rows
       setCapabilities(nextCapabilities)
       setLiveRefreshFailed(false)
@@ -330,6 +346,8 @@ export default function FirmwareProvisioning({
       setSessions(nextSessions)
       setSessionCursor(sessionResponse.next_cursor ?? null)
       setSessionTotal(sessionResponse.filtered_total ?? nextSessions.length)
+      setAwaitingSessions(awaitingResponse.rows)
+      setAwaitingTotal(awaitingResponse.filtered_total ?? awaitingResponse.rows.length)
       const deviceRows = z
         .object({
           rows: z.array(
@@ -691,6 +709,26 @@ export default function FirmwareProvisioning({
       )
     } finally {
       setHistoryLoading(false)
+    }
+  }
+
+  const searchAwaitingSessions = async (event: FormEvent) => {
+    event.preventDefault()
+    setAwaitingLoading(true)
+    try {
+      const response = sessionListSchema.parse(
+        await api<unknown>(awaitingTerminalSessionsPath(awaitingQuery)),
+      )
+      setAwaitingSessions(response.rows)
+      setAwaitingTotal(response.filtered_total ?? response.rows.length)
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'Awaiting terminal confirmations could not be searched.',
+      )
+    } finally {
+      setAwaitingLoading(false)
     }
   }
 
@@ -1902,6 +1940,52 @@ export default function FirmwareProvisioning({
           </dl>
         </aside>
       </div>
+      <section className="panel provisioning-history awaiting-terminal-confirmations">
+        <div className="panel-header">
+          <div>
+            <h2>Awaiting terminal confirmation</h2>
+            <p>
+              Any ADD administrator can locate a device and confirm its authenticated ZKT serial with administrator password step-up.
+            </p>
+          </div>
+          <StatusBadge state={`${awaitingTotal} WAITING`} />
+        </div>
+        <form className="provisioning-history-search" onSubmit={(event) => void searchAwaitingSessions(event)}>
+          <label className="search-field">
+            <span className="sr-only">Search awaiting sessions by device, zone, MAC, or session</span>
+            <Icon name="search" />
+            <input
+              value={awaitingQuery}
+              onChange={(event) => setAwaitingQuery(event.target.value)}
+              placeholder="Search device, zone, MAC, or session"
+            />
+          </label>
+          <button className="button secondary" type="submit" disabled={awaitingLoading}>
+            {awaitingLoading ? 'Searching…' : 'Search'}
+          </button>
+        </form>
+        {awaitingSessions.map((row) => (
+          <button
+            key={row.session_id}
+            disabled={historyLoading || awaitingLoading}
+            onClick={() => void openHistory(row.session_id)}
+          >
+            <span>
+              <strong>{row.zone_id || row.device_id || row.hardware_mac || 'Awaiting device identity'}</strong>
+              <small>
+                {row.device_id || 'No device ID'} · {row.hardware_mac || 'MAC pending'} · Operator {row.operator}
+              </small>
+            </span>
+            <StatusBadge state={row.state} />
+          </button>
+        ))}
+        {!awaitingLoading && awaitingSessions.length === 0 && (
+          <div className="empty-state compact">
+            <Icon name="check" />
+            <p>{awaitingQuery.trim() ? 'No awaiting terminal confirmations match this search.' : 'No terminals are awaiting serial confirmation.'}</p>
+          </div>
+        )}
+      </section>
       {sessions.length > 0 && (
         <section className="panel provisioning-history">
           <div className="panel-header">
