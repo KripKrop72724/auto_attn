@@ -390,6 +390,12 @@ class UserDeleteRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class TerminalSerialConfirmRequest(BaseModel):
+    observed_serial: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,79}$")
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 class BulkUserDeleteTarget(BaseModel):
     user_key: str = Field(min_length=1, max_length=36)
     expected_version: int = Field(ge=1)

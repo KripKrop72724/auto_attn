@@ -32,6 +32,37 @@
 .page-action-stack { max-width: 320px; display: grid; justify-items: end; gap: 5px; }
 .page-action-stack small { color: var(--muted); font-size: 10px; line-height: 1.35; text-align: right; }
 
+.terminal-confirmation-card { position: relative; display: grid; grid-template-columns: 52px minmax(0,1fr) minmax(220px,auto); align-items: center; gap: 18px; overflow: hidden; margin-bottom: 18px; padding: 20px; border-radius: 14px; background: linear-gradient(120deg,#fff 0%,#fff 68%,#f3fbfe 100%); box-shadow: var(--shadow-sm); }
+.terminal-confirmation-card::after { content: ''; width: 150px; height: 150px; position: absolute; right: -62px; top: -78px; border: 24px solid rgba(0,148,218,.055); border-radius: 50%; pointer-events: none; }
+.terminal-confirmation-symbol { width: 50px; height: 50px; display: grid; place-items: center; border: 1px solid #9fd5e9; border-radius: 14px; color: var(--brand-700); background: var(--brand-50); }
+.terminal-confirmation-symbol svg { width: 23px; height: 23px; }
+.terminal-confirmation-card-copy { min-width: 0; }
+.terminal-confirmation-card-copy .eyebrow { margin: 0 0 4px; color: var(--brand-700); }
+.terminal-confirmation-card-copy h2 { margin: 0 0 6px; font-size: 19px; letter-spacing: -.01em; }
+.terminal-confirmation-card-copy > p:not(.eyebrow) { max-width: 760px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.terminal-confirmation-card-copy code { padding: 2px 6px; border-radius: 5px; color: var(--navy-900); background: #e9f4f8; font-size: 12px; font-weight: 800; }
+.terminal-confirmation-meta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; }
+.terminal-confirmation-meta span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.terminal-confirmation-meta svg { width: 14px; color: var(--brand-700); }
+.terminal-confirmation-card-action { z-index: 1; display: grid; justify-items: end; gap: 9px; }
+.terminal-confirmation-card-action .button { min-width: 210px; justify-content: center; }
+.terminal-confirmation-card-action small { max-width: 230px; color: var(--muted); font-size: 10px; line-height: 1.35; text-align: right; }
+.terminal-confirmation-card.is-pending { background: linear-gradient(120deg,#fff 0%,#fff 70%,#f8fbfc 100%); }
+
+.terminal-confirmation-dialog { gap: 16px; }
+.terminal-confirmation-evidence { display: grid; grid-template-columns: 50px minmax(0,1fr) auto; align-items: center; gap: 14px; padding: 14px; border-radius: 12px; background: #fff; }
+.terminal-confirmation-evidence h3 { margin: 0 0 3px; font-size: 17px; }
+.terminal-confirmation-evidence p { margin: 0; color: var(--muted); font-size: 12px; }
+.terminal-confirmation-evidence .eyebrow { margin-bottom: 4px; color: var(--brand-700); font-size: 9px; }
+.terminal-serial-readout { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 17px; border: 1px solid #b9dbe9; border-radius: 12px; background: linear-gradient(110deg,#f7fcfe,#fff); }
+.terminal-serial-readout span { min-width: 0; display: grid; gap: 5px; }
+.terminal-serial-readout small { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
+.terminal-serial-readout code { overflow-wrap: anywhere; color: var(--navy-900); font-size: 20px; font-weight: 850; letter-spacing: .04em; }
+.terminal-serial-readout > svg { width: 26px; flex: 0 0 auto; color: var(--positive); }
+.terminal-confirmation-copy { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border-radius: 10px; color: var(--muted); background: var(--surface-muted); }
+.terminal-confirmation-copy svg { width: 18px; flex: 0 0 auto; margin-top: 2px; color: var(--warning); }
+.terminal-confirmation-copy p { margin: 0; font-size: 12px; line-height: 1.5; }
+
 .active-lease-banner { display: grid; grid-template-columns: 44px minmax(0,1fr) auto; align-items: center; gap: 14px; margin-bottom: 18px; padding: 15px 18px; border-radius: 12px; background: #fff; box-shadow: var(--shadow-sm); }
 .active-lease-banner h3 { margin: 0 0 3px; font-size: 17px; }
 .active-lease-banner p:not(.eyebrow) { margin: 0; color: var(--muted); font-size: 13px; }
@@ -126,6 +157,9 @@
   .user-directory-head span:nth-child(4), .user-directory-row > .user-directory-cell:nth-child(4) { display: none; }
 }
 @media (max-width: 980px) {
+  .terminal-confirmation-card { grid-template-columns: 50px minmax(0,1fr); }
+  .terminal-confirmation-card-action { grid-column: 2; justify-items: start; }
+  .terminal-confirmation-card-action small { text-align: left; }
   .selected-terminal-context { flex-wrap: wrap; }
   .selected-terminal-context > div { width: 100%; }
   .historical-review-grid { grid-template-columns: 1fr; }
@@ -161,6 +195,14 @@
   .identity-review-members > div > span:last-child { grid-column: 2; }
   .active-lease-banner { grid-template-columns: 44px 1fr; }
   .active-lease-banner .button { grid-column: 1/-1; width: 100%; }
+  .terminal-confirmation-card { grid-template-columns: 44px minmax(0,1fr); align-items: start; padding: 16px; }
+  .terminal-confirmation-symbol { width: 44px; height: 44px; border-radius: 12px; }
+  .terminal-confirmation-card-action { grid-column: 1/-1; width: 100%; justify-items: stretch; }
+  .terminal-confirmation-card-action .button { width: 100%; min-width: 0; }
+  .terminal-confirmation-card-action .status-badge { justify-self: start; }
+  .terminal-confirmation-card-action small { max-width: none; }
+  .terminal-confirmation-evidence { grid-template-columns: 44px minmax(0,1fr); }
+  .terminal-confirmation-evidence .status-badge { grid-column: 1/-1; justify-self: start; }
   .bulk-selection-bar { left: 12px; right: 12px; bottom: calc(var(--app-bottom-nav-height) + env(safe-area-inset-bottom) + 12px); align-items: stretch; flex-direction: column; }
   .bulk-selection-bar > div:last-child .button { flex: 1; }
 }

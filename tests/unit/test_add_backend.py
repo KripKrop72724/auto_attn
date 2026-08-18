@@ -4354,3 +4354,72 @@ def test_device_detail_exposes_admin_command_status_not_device_wire_envelope(
     assert "payload" not in active
     assert "expected_state" not in active
     assert "desired_state" not in active
+
+
+def test_admin_can_confirm_initial_terminal_serial_without_provisioning_session(
+    db: Session,
+):
+    connector = connector_fixture(db, expected_serial=None)
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.serial = SERIAL
+    zkt.online = True
+    zkt.connection_state = "ONLINE"
+    zkt.writes_disabled_reason = "TERMINAL_SERIAL_CONFIRMATION_REQUIRED"
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    headers = {"X-CSRF-Token": admin.csrf_token}
+    body = {
+        "observed_serial": SERIAL,
+        "password": "correct-password",
+        "idempotency_key": "direct-terminal-confirmation-0001",
+    }
+
+    wrong_password = client.post(
+        f"/api/v1/devices/{connector.connector_id}/terminal-binding/confirm",
+        json={**body, "password": "wrong-password"},
+        headers=headers,
+    )
+    assert wrong_password.status_code == 403
+    assert zkt.terminal_binding_state == "SERIAL_CONFIRMATION_REQUIRED"
+
+    confirmed = client.post(
+        f"/api/v1/devices/{connector.connector_id}/terminal-binding/confirm",
+        json=body,
+        headers=headers,
+    )
+
+    assert confirmed.status_code == 202, confirmed.text
+    payload = confirmed.json()
+    assert payload["command"]["type"] == "PIN_TERMINAL_SERIAL"
+    assert payload["command"]["status"] == "WAITING_FOR_DEVICE"
+    assert payload["device"]["zkt"]["terminal_binding_state"] == "PENDING_DEVICE_ACK"
+    assert payload["device"]["zkt"]["confirmed_serial"] == SERIAL
+    command = db.scalar(
+        select(DeviceCommand).where(
+            DeviceCommand.command_id == payload["command"]["command_id"]
+        )
+    )
+    assert command is not None
+    assert decrypt_json(command.payload_encrypted) == {"serial": SERIAL}
+    assert zkt.serial_confirmed_by == "StateHealthAdmin"
+    audit = db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "TERMINAL_SERIAL_CONFIRMATION_REQUESTED",
+            AuditEvent.target_id == connector.connector_id,
+        )
+    )
+    assert audit is not None
+    assert audit.outcome == "WAITING_FOR_DEVICE"
