@@ -110,7 +110,6 @@
 .reconciliation-terminal-symbol svg {
   width: 22px;
 }
-.reconciliation-terminal-layer { min-width: min(760px, calc(100vw - 24px)); }
 .reconciliation-terminal-popover {
   max-height: inherit;
   display: flex;
@@ -920,7 +919,6 @@
     grid-column: 1/-1;
     width: 100%;
   }
-  .reconciliation-terminal-layer { min-width: 0; }
   .reconciliation-terminal-popover { border-radius: 18px 18px 0 0; box-shadow: 0 -18px 52px rgba(7,26,43,.24); }
   .reconciliation-terminal-results {
     max-height: calc(var(--anchored-max-height, 620px) - 70px);

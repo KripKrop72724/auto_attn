@@ -90,7 +90,7 @@ export function AnchoredLayer({
     const placement = below >= Math.min(320, above) || below >= above ? 'bottom' : 'top'
     const available = Math.max(180, placement === 'bottom' ? below : above)
     const width = Math.min(
-      matchAnchor ? anchorBox.width : preferredWidth,
+      Math.max(preferredWidth, matchAnchor ? anchorBox.width : 0),
       viewportWidth - margin * 2,
     )
     const naturalHeight = Math.min(layer.scrollHeight || available, available)

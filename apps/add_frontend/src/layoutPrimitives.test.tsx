@@ -18,6 +18,15 @@ function AnchoredHarness() {
   </>
 }
 
+function WideAnchoredHarness() {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  return <>
+    <button ref={triggerRef} type="button" onClick={() => setOpen(true)}>Choose terminal</button>
+    {open && <AnchoredLayer anchorRef={triggerRef} matchAnchor preferredWidth={720} onDismiss={() => setOpen(false)}><div role="listbox">Authorized terminals</div></AnchoredLayer>}
+  </>
+}
+
 function DialogHarness() {
   const [open, setOpen] = useState(false)
   return <div className="app-workspace"><button type="button" onClick={() => setOpen(true)}>Open evidence</button>{open && <Dialog titleId="evidence-title" title="Evidence" description="Immutable evidence" onClose={() => setOpen(false)}><div className="dialog-body"><button type="button">Review evidence</button></div></Dialog>}</div>
@@ -59,6 +68,24 @@ describe('viewport layout primitives', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(document.querySelector('.anchored-layer')).toBeNull())
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open actions' }))
+  })
+
+  it('uses the preferred picker width and clamps it against the horizontal viewport', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 700 })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.textContent === 'Choose terminal') return { x: 650, y: 100, top: 100, right: 790, bottom: 144, left: 650, width: 140, height: 44, toJSON: () => ({}) }
+      return { x: 0, y: 0, top: 0, right: 720, bottom: 320, left: 0, width: 720, height: 320, toJSON: () => ({}) }
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get(this: HTMLElement) { return this.classList?.contains('anchored-layer') ? 320 : 0 } })
+
+    render(<WideAnchoredHarness />, { container: document.getElementById('test-app') as HTMLElement })
+    fireEvent.click(screen.getByRole('button', { name: 'Choose terminal' }))
+    const layer = await waitFor(() => document.querySelector<HTMLElement>('.anchored-layer') as HTMLElement)
+
+    await waitFor(() => expect(Number.parseFloat(layer.style.width)).toBe(720))
+    expect(Number.parseFloat(layer.style.left)).toBe(68)
+    expect(Number.parseFloat(layer.style.left) + Number.parseFloat(layer.style.width)).toBeLessThanOrEqual(788)
   })
 
   it('portals dialogs, locks the workspace, and restores focus and scroll', async () => {
