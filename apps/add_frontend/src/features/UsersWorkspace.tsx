@@ -6,7 +6,7 @@ import './UsersWorkspace.css'
 import { api, queryString } from '../api'
 import {
   CommandProgress, Dialog, Metric, PageHeader, StatusBadge, dateTime,
-  identityConflictText, relativeTime, statusPattern, terminalCommandStates, useToast,
+  idempotency, identityConflictText, relativeTime, statusPattern, terminalCommandStates, useToast,
   type HistoricalIdentityDialogState, type IdentityResolutionDialogState, type UserDialogState,
 } from '../App'
 import { Icon } from '../Icon'
@@ -219,6 +219,84 @@ function LeaseRevokeDialog({
   )
 }
 
+function TerminalSerialConfirmationDialog({
+  device,
+  onClose,
+  onAccepted,
+  toast,
+}: {
+  device: Device
+  onClose: () => void
+  onAccepted: (device: Device, command: Command) => void
+  toast: ReturnType<typeof useToast>
+}) {
+  const serial = device.zkt?.serial || ''
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const confirm = async () => {
+    if (!serial || !password || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const response = await api<{ device: Device; command: Command }>(
+        `/api/v1/devices/${device.connector_id}/terminal-binding/confirm`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            observed_serial: serial,
+            password,
+            idempotency_key: idempotency('terminal-serial-confirmation'),
+          }),
+        },
+      )
+      onAccepted(response.device, response.command)
+      toast.notice(device.connected
+        ? 'Terminal serial confirmation is queued for authenticated device verification.'
+        : 'Terminal serial confirmation is queued and will continue when the ADD device reconnects.')
+      onClose()
+    } catch (reason) {
+      setError(requestError(reason, 'Terminal serial confirmation could not be queued.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog
+      titleId="confirm-terminal-serial-title"
+      title="Confirm physical terminal"
+      description="Authorize this one-time terminal binding with your ADD administrator password."
+      onClose={onClose}
+    >
+      <form className="dialog-body terminal-confirmation-dialog" onSubmit={(event) => { event.preventDefault(); void confirm() }}>
+        <div className="terminal-confirmation-evidence pattern-waiting">
+          <span className="terminal-confirmation-symbol"><Icon name="shield" /></span>
+          <div>
+            <p className="eyebrow">AUTHENTICATED TERMINAL EVIDENCE</p>
+            <h3>{device.display_name}</h3>
+            <p>{device.zkt?.model || 'ZKT terminal'} · {device.zkt?.ip_address || 'IP not reported'}</p>
+          </div>
+          <StatusBadge state={device.connected ? 'CONNECTED' : 'OFFLINE · WILL QUEUE'} live={device.connected} />
+        </div>
+        <div className="terminal-serial-readout">
+          <span><small>Observed ZKT serial</small><code>{serial}</code></span>
+          <Icon name="check" />
+        </div>
+        <div className="terminal-confirmation-copy">
+          <Icon name="alert" />
+          <p>Confirm only if this serial belongs to the physical terminal at <strong>{device.zone_name}</strong>. User editing unlocks after the ESP stores the serial, acknowledges it, and completes the existing safety checks.</p>
+        </div>
+        {!device.connected && <div className="message pattern-waiting"><Icon name="refresh" /><span>The ADD device is offline. Keep it powered and connected; this authorization remains queued for up to 10 minutes.</span></div>}
+        <label>ADD administrator password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" autoFocus /></label>
+        {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
+        <footer className="dialog-actions"><button className="button secondary" type="button" onClick={onClose}>Cancel</button><button className="button primary" type="submit" disabled={!password || busy}>{busy ? 'Authorizing…' : 'Confirm terminal serial'}</button></footer>
+      </form>
+    </Dialog>
+  )
+}
+
 export function UsersView({
   devices,
   selectedDeviceId,
@@ -259,6 +337,7 @@ export function UsersView({
   const [historicalDialog, setHistoricalDialog] = useState<HistoricalIdentityDialogState>(null)
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
   const [revokeLeaseOpen, setRevokeLeaseOpen] = useState(false)
+  const [serialConfirmationOpen, setSerialConfirmationOpen] = useState(false)
   const [command, setCommand] = useState<Command | null>(null)
   const [selectedUserKeys, setSelectedUserKeys] = useState<Set<string>>(new Set())
   const [, setLeaseClock] = useState(0)
@@ -370,6 +449,7 @@ export function UsersView({
     setHistoricalDialog(null)
     setBulkDialogOpen(false)
     setRevokeLeaseOpen(false)
+    setSerialConfirmationOpen(false)
     setCommand(null)
   }, [selectedDeviceId])
 
@@ -469,13 +549,34 @@ export function UsersView({
   }
 
   const baseWritable = Boolean(selected?.zkt?.certification_state === 'CERTIFIED' && selected.zkt.snapshot_complete)
+  const terminalBindingNeedsAction = Boolean(
+    selected?.zkt?.serial
+    && (selected.zkt.terminal_binding_state === 'SERIAL_CONFIRMATION_REQUIRED'
+      || ['TERMINAL_SERIAL_CONFIRMATION_REQUIRED', 'TERMINAL_SERIAL_PIN_FAILED'].includes(selected.zkt.writes_disabled_reason || '')),
+  )
+  const terminalBindingPending = Boolean(
+    selected?.zkt?.terminal_binding_state === 'PENDING_DEVICE_ACK'
+    || selected?.zkt?.writes_disabled_reason === 'TERMINAL_SERIAL_PENDING_DEVICE_ACK',
+  )
   const capabilities = selected?.zkt?.capabilities || {}
   const canCreate = baseWritable && capabilities.create_user === true
   const canEditProfile = baseWritable && capabilities.user_write === true
   const canGrantLease = baseWritable && capabilities.admin_lease === true && !selected?.active_lease
   const canDeleteProfile = baseWritable && capabilities.delete_user === true
   const activeDeletionJob = Boolean(deletionJob && ['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(deletionJob.status))
-  const actionReason = selected?.zkt?.writes_disabled_reason || 'This terminal capability is not certified or its complete snapshot is pending.'
+  const actionReasonCode = selected?.zkt?.writes_disabled_reason || ''
+  const actionReason = ({
+    TERMINAL_SERIAL_CONFIRMATION_REQUIRED: 'Confirm the physical terminal before managing its users.',
+    TERMINAL_SERIAL_PENDING_DEVICE_ACK: 'Terminal binding is waiting for verified device acknowledgement.',
+    TERMINAL_SERIAL_PIN_FAILED: 'The previous terminal confirmation was not verified. Review the serial and retry.',
+    STABILITY_CERTIFICATION_PENDING: 'Terminal binding succeeded; safety observations are still in progress.',
+    FULL_USER_SNAPSHOT_REQUIRED: 'A complete terminal user snapshot is required before user writes can begin.',
+    USER_SNAPSHOT_TRUNCATED: 'The latest terminal user snapshot was incomplete. Synchronize the terminal and retry.',
+    LEGACY_28_BYTE_RECORD: 'This terminal record format does not support certified user editing.',
+    SERIAL_MISMATCH: 'The reported terminal serial does not match the confirmed terminal binding.',
+    DUPLICATE_SERIAL: 'This terminal serial is already claimed by another authenticated device.',
+  } as Record<string, string>)[actionReasonCode]
+    || 'This terminal capability is not certified or its complete snapshot is pending.'
   const createReason = !baseWritable ? actionReason : capabilities.create_user !== true ? 'This terminal does not advertise the certified create-user capability.' : ''
   const editCapabilityReason = !baseWritable ? actionReason : capabilities.user_write !== true ? 'This terminal does not advertise the certified user-write capability.' : ''
   const leaseCapabilityReason = !baseWritable ? actionReason : capabilities.admin_lease !== true ? 'This terminal does not advertise certified temporary enrollment access.' : ''
@@ -603,7 +704,9 @@ export function UsersView({
 
         <section className="metric-grid users-metrics" aria-label="Selected terminal user indicators"><Metric label="Terminal users" value={identityTotal.toLocaleString()} detail={`${rows.length.toLocaleString()} loaded in this view`} icon="users" /><Metric label="CNIC complete" value={`${completeness}%`} detail={`${identityComplete.toLocaleString()} of ${identityTotal.toLocaleString()} identities`} icon="check" tone={completeness === 100 ? 'positive' : 'warning'} /><Metric label="Identity attention" value={identitiesNeedingAttention.toLocaleString()} detail="Missing CNIC or unresolved duplicate" icon="alert" tone={identitiesNeedingAttention ? 'warning' : 'positive'} /><Metric label="Preserved backlog" value={historyCount.toLocaleString()} detail="Events awaiting identity evidence" icon="shield" tone={historyCount ? 'warning' : 'positive'} /></section>
 
-        {!baseWritable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{actionReason}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ ONLY'} /></div>}
+        {terminalBindingNeedsAction ? <section className="terminal-confirmation-card pattern-waiting" aria-labelledby="terminal-confirmation-heading"><span className="terminal-confirmation-symbol"><Icon name="shield" /></span><div className="terminal-confirmation-card-copy"><p className="eyebrow">ONE-TIME TERMINAL SAFETY CHECK</p><h2 id="terminal-confirmation-heading">Confirm this physical terminal</h2><p>ADD has authenticated the device and observed ZKT serial <code>{selected.zkt?.serial}</code>. An administrator can bind it here with the normal ADD password—no provisioning session is required.</p><div className="terminal-confirmation-meta"><span><Icon name="server" />{selected.zkt?.model || 'ZKT terminal'}</span><span><Icon name={selected.connected ? 'check' : 'alert'} />{selected.connected ? 'Ready for verification' : 'Offline · confirmation will queue'}</span></div></div><div className="terminal-confirmation-card-action"><StatusBadge state="ACTION REQUIRED" /><button className="button primary" type="button" onClick={() => setSerialConfirmationOpen(true)}><Icon name="shield" /> Confirm terminal serial</button><small>User writes stay read-only until device acknowledgement.</small></div></section>
+          : terminalBindingPending ? <section className="terminal-confirmation-card is-pending pattern-waiting" aria-label="Terminal serial confirmation pending"><span className="terminal-confirmation-symbol"><Icon name="refresh" /></span><div className="terminal-confirmation-card-copy"><p className="eyebrow">TERMINAL BINDING IN PROGRESS</p><h2>Waiting for device acknowledgement</h2><p>Authorization was accepted. ADD will unlock user writes only after the ESP stores serial <code>{selected.zkt?.serial}</code> and the terminal passes its stability checks.</p></div><div className="terminal-confirmation-card-action"><StatusBadge state={selected.connected ? 'VERIFYING' : 'WAITING FOR DEVICE'} live={selected.connected} /><small>{selected.connected ? 'Verification is being tracked below.' : 'Keep the ADD device powered and connected.'}</small></div></section>
+            : !baseWritable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{actionReason}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ ONLY'} /></div>}
         {diagnosticErrors.device && <div className="capability-banner pattern-waiting"><Icon name="alert" /><div><strong>Live terminal status is temporarily unavailable.</strong><span>{diagnosticErrors.device}</span></div><button className="button secondary" type="button" onClick={() => void loadDiagnostics()}>Retry</button></div>}
         {selected.active_lease && <div className={`active-lease-banner pattern-${statusPattern(selected.active_lease.state)}`}><span className="command-symbol"><Icon name="shield" /></span><div><p className="eyebrow">TEMPORARY ENROLLMENT ACCESS</p><h3>{selected.active_lease.state.replaceAll('_', ' ')}</h3><p>{selected.active_lease.expires_at ? `Expires ${relativeTime(selected.active_lease.expires_at)} · ${dateTime(selected.active_lease.expires_at)}` : 'Waiting for a verified terminal expiry.'}{selected.active_lease.last_error ? ` · ${selected.active_lease.last_error}` : ''}</p></div><button className="button destructive" type="button" disabled={selected.active_lease.state === 'REVOKING'} onClick={() => setRevokeLeaseOpen(true)}>Revoke access</button></div>}
         {trackedCommand && <CommandProgress command={trackedCommand} onCancel={cancelCommand} />}
@@ -620,6 +723,7 @@ export function UsersView({
       {resolutionDialog && selected && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void refreshWorkspace() }} toast={toast} />}
       {historicalDialog && selected && <HistoricalIdentityResolutionDialog state={historicalDialog} device={selected} onClose={() => setHistoricalDialog(null)} onComplete={async () => { await Promise.all([refreshWorkspace(), refreshFleet()]) }} toast={toast} />}
       {revokeLeaseOpen && selected && <LeaseRevokeDialog device={selected} onClose={() => setRevokeLeaseOpen(false)} onCommand={setCommand} toast={toast} />}
+      {serialConfirmationOpen && selected && <TerminalSerialConfirmationDialog device={selected} onClose={() => setSerialConfirmationOpen(false)} onAccepted={(updatedDevice, nextCommand) => { setDeviceDetail(updatedDevice); setCommand(nextCommand) }} toast={toast} />}
     </div>
   )
 }

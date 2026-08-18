@@ -44,6 +44,10 @@ export interface ZktDevice {
   id: number
   serial: string | null
   expected_serial: string | null
+  confirmed_serial?: string | null
+  terminal_binding_state?: string
+  serial_confirmed_by?: string | null
+  serial_confirmed_at?: string | null
   ip_address: string | null
   model: string | null
   platform: string | null

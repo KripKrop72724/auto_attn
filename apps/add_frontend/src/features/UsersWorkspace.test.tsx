@@ -215,6 +215,66 @@ describe('Selected-terminal users workspace', () => {
     expect(await screen.findByText(/terminal user synchronization is queued/i)).toBeTruthy()
   })
 
+  it('lets an ADD administrator confirm an initial terminal serial from the selected device', async () => {
+    const awaitingDevice: Device = {
+      ...device,
+      state: 'OFFLINE',
+      connected: false,
+      zkt: {
+        ...device.zkt!,
+        serial: 'ANM4261301077',
+        expected_serial: null,
+        confirmed_serial: null,
+        terminal_binding_state: 'SERIAL_CONFIRMATION_REQUIRED',
+        certification_state: 'READ_ONLY',
+        writes_disabled_reason: 'TERMINAL_SERIAL_CONFIRMATION_REQUIRED',
+        online: false,
+        connection_state: 'OFFLINE',
+        capabilities: { create_user: false, user_write: false, admin_lease: false, delete_user: false },
+      },
+    }
+    const pendingDevice: Device = {
+      ...awaitingDevice,
+      zkt: {
+        ...awaitingDevice.zkt!,
+        expected_serial: 'ANM4261301077',
+        confirmed_serial: 'ANM4261301077',
+        terminal_binding_state: 'PENDING_DEVICE_ACK',
+        writes_disabled_reason: 'TERMINAL_SERIAL_PENDING_DEVICE_ACK',
+      },
+    }
+    const baseFetch = workspaceFetch({ selectedDevice: awaitingDevice })
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/terminal-binding/confirm') && init?.method === 'POST') {
+        return Promise.resolve(response({
+          device: pendingDevice,
+          command: { ...command, type: 'PIN_TERMINAL_SERIAL', status: 'WAITING_FOR_DEVICE' },
+        }, 202))
+      }
+      return baseFetch(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsersHarness selectedDevice={awaitingDevice} />)
+
+    expect(await screen.findByRole('heading', { name: 'Confirm this physical terminal' })).toBeTruthy()
+    expect(screen.getByText('ANM4261301077')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Confirm terminal serial/i }))
+    expect(screen.getByRole('heading', { name: 'Confirm physical terminal' })).toBeTruthy()
+    expect(screen.getByText(/authorization remains queued for up to 10 minutes/i)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('ADD administrator password'), { target: { value: 'correct-password' } })
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm terminal serial' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => {
+      if (!String(input).includes('/terminal-binding/confirm') || init?.method !== 'POST') return false
+      const body = JSON.parse(String(init.body))
+      return body.observed_serial === 'ANM4261301077'
+        && body.password === 'correct-password'
+        && String(body.idempotency_key).startsWith('terminal-serial-confirmation:')
+    })).toBe(true))
+    expect(await screen.findByRole('heading', { name: 'Waiting for device acknowledgement' })).toBeTruthy()
+    expect(screen.getByText(/will continue when the ADD device reconnects/i)).toBeTruthy()
+  })
+
   it('ignores a superseded directory response and requires an actual edit before enabling submit', async () => {
     let resolveSlow: ((value: Response) => void) | null = null
     const fetchMock = workspaceFetch()

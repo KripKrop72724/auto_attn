@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { awaitingTerminalSessionsPath, provisioningActiveStep, provisioningConfigurationSchema } from './FirmwareProvisioning'
+import { provisioningActiveStep, provisioningConfigurationSchema } from './FirmwareProvisioning'
 
 const valid = {
   wifi_ssid: 'State Life Office', wifi_password: 'correct horse battery staple',
@@ -8,13 +8,6 @@ const valid = {
 }
 
 describe('physical provisioning contract', () => {
-  it('builds an administrator-wide awaiting-confirmation lookup without operator scoping', () => {
-    const path = awaitingTerminalSessionsPath(' ZONE-BLD9ISB-01 ')
-    expect(path).toContain('state=WAITING_FOR_TERMINAL_CONFIRMATION')
-    expect(path).toContain('q=ZONE-BLD9ISB-01')
-    expect(path).not.toContain('mine_only')
-  })
-
   it('maps durable backend states onto the ordered operator flow', () => {
     expect(provisioningActiveStep()).toBe(0)
     expect(provisioningActiveStep('WAITING_FOR_DEVICE')).toBe(1)

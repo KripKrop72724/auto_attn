@@ -90,6 +90,7 @@ from zk_add.schemas import (
     SourceExceptionActionRequest,
     SourceProbeResultRequest,
     SourceTailChunkRequest,
+    TerminalSerialConfirmRequest,
     UserCreateRequest,
     UserDeleteRequest,
     UserSnapshotRequest,
@@ -578,6 +579,94 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         **serialize_connector(connector),
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
+    }
+
+
+@app.post(
+    "/api/v1/devices/{connector_id}/terminal-binding/confirm",
+    status_code=202,
+)
+async def confirm_device_terminal_binding(
+    request: Request,
+    connector_id: str,
+    body: TerminalSerialConfirmRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None or not zkt.serial:
+        raise HTTPException(
+            status_code=409,
+            detail="The authenticated connector has not reported a terminal serial.",
+        )
+    if zkt.terminal_binding_state != "SERIAL_CONFIRMATION_REQUIRED":
+        raise HTTPException(
+            status_code=409,
+            detail="This terminal is not awaiting initial serial confirmation.",
+        )
+    if body.observed_serial != zkt.serial:
+        raise HTTPException(
+            status_code=409,
+            detail="Observed terminal serial changed; refresh the authenticated terminal evidence.",
+        )
+    collision = db.scalar(
+        select(ZKTDevice).where(
+            ZKTDevice.confirmed_serial == body.observed_serial,
+            ZKTDevice.id != zkt.id,
+        )
+    )
+    if collision:
+        raise HTTPException(status_code=409, detail="That terminal serial is already pinned.")
+
+    zkt.expected_serial = body.observed_serial
+    zkt.confirmed_serial = body.observed_serial
+    zkt.terminal_binding_state = "PENDING_DEVICE_ACK"
+    zkt.serial_confirmed_by = context.username
+    zkt.serial_confirmed_at = utc_now()
+    zkt.certification_state = "READ_ONLY"
+    zkt.writes_disabled_reason = "TERMINAL_SERIAL_PENDING_DEVICE_ACK"
+    try:
+        command = create_command(
+            db,
+            connector=connector,
+            command_type="PIN_TERMINAL_SERIAL",
+            payload={"serial": body.observed_serial},
+            expected_state={"serial": body.observed_serial},
+            desired_state={"expected_serial": body.observed_serial},
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+            expires_in_seconds=10 * 60,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    append_audit(
+        db,
+        actor=context.username,
+        action="TERMINAL_SERIAL_CONFIRMATION_REQUESTED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome=command.status,
+        ip_address=client_ip(request),
+        after={
+            "hardware_mac": connector.hardware_id,
+            "terminal_serial": body.observed_serial,
+            "command_id": command.command_id,
+        },
+    )
+    db.commit()
+    await dispatch_command(connector, command)
+    await browser_events.publish(
+        "device",
+        {
+            "connector_id": connector.connector_id,
+            "terminal_binding_state": zkt.terminal_binding_state,
+        },
+    )
+    return {
+        "device": serialize_connector(connector),
+        "command": command_response(command),
     }
 
 
