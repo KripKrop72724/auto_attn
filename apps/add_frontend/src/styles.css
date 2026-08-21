@@ -284,7 +284,14 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
 .alert-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .alert-meta { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
 
-#overlay-root { position: relative; z-index: 0; }
+#overlay-root {
+  /* Portal layers must form one viewport-level stack above every page-local
+     sticky surface. A zero stack here traps even high-z-index dialogs below
+     sticky tabs and table headers rendered inside #root. */
+  position: relative;
+  z-index: var(--z-modal, 100);
+  isolation: isolate;
+}
 .dialog-backdrop {
   position: fixed;
   inset: 0;
@@ -301,6 +308,9 @@ textarea { min-height: 92px; padding: 11px 13px; resize: vertical; }
   animation: backdrop-enter var(--motion-content) var(--ease-corporate) both;
 }
 .dialog-panel {
+  position: relative;
+  z-index: 1;
+  isolation: isolate;
   width: min(680px, 100%);
   max-height: calc(100vh - 48px);
   max-height: calc(100dvh - 48px);

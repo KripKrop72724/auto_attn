@@ -56,6 +56,8 @@ const nationwideDevices = [
   { ...device, connector_id: 'peshawar-one', zone_id: 'ZONE-PESHAWAR-01', zone_name: 'Peshawar', display_name: 'Peshawar · Ground Floor', zkt: { ...device.zkt, id: 21, serial: 'PEW-0001' } },
   { ...device, connector_id: 'peshawar-two', zone_id: 'ZONE-PESH-02', zone_name: 'Peshawar', display_name: 'Peshawar · First Floor', state: 'DEGRADED', zkt: { ...device.zkt, id: 22, serial: 'PEW-0002' } },
   { ...device, connector_id: 'swat-one', zone_id: 'ZONE-SWAT-01', zone_name: 'Swat', display_name: 'Swat · Regional Office', zkt: { ...device.zkt, id: 31, serial: 'SWT-0001' } },
+  { ...device, connector_id: 'multan-one', zone_id: 'ZONE-MULTAN-01', zone_name: 'Multan', display_name: 'ZONE-MULTAN-01', zkt: { ...device.zkt, id: 35, serial: 'AF4C211861133' } },
+  { ...device, connector_id: 'multan-two', zone_id: 'ZONE-MULTAN-02', zone_name: 'Multan', display_name: 'ZONE-MULTAN-02', zkt: { ...device.zkt, id: 36, serial: 'RKQ4245100152' } },
   { ...device, connector_id: 'tower-three', zone_id: 'ZONE-SLICTOWER-3FL', zone_name: 'SLICTOWER', display_name: 'SLICTOWER · 3rd Floor', zkt: { ...device.zkt, id: 41, serial: 'ISB-0003' } },
   { ...device, connector_id: 'tower-thirteen', zone_id: 'ZONE-SLICTOWER-13FL', zone_name: 'SLIC-TOWER', display_name: 'SLICTOWER · 13th Floor', zkt: { ...device.zkt, id: 42, serial: 'ISB-0013' } },
 ]
@@ -195,13 +197,13 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   await page.route('**/api/v1/overview*', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ total: 6, online: 5, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
+    body: JSON.stringify({ total: 8, online: 7, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
   }))
 
   await page.goto('/fleet')
   await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
   const markers = page.locator('.fleet-map-marker')
-  await expect(markers).toHaveCount(4, { timeout: 10_000 })
+  await expect(markers).toHaveCount(5, { timeout: 10_000 })
   const projectedCoordinates = await markers.evaluateAll((nodes) => Object.fromEntries(nodes.map((node) => {
     const location = Array.from(node.classList).find((name) => name.startsWith('location-'))?.replace('location-', '') || ''
     const style = (node as HTMLElement).style
@@ -214,6 +216,7 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
     swat: { x: 69.21, y: 20.98 },
     peshawar: { x: 64.50, y: 25.91 },
     islamabad: { x: 73.09, y: 28.07 },
+    multan: { x: 64.50, y: 51.09 },
     karachi: { x: 39.00, y: 85.67 },
   }
   for (const [location, expected] of Object.entries(expectedCoordinates)) {
@@ -253,6 +256,9 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   await page.getByRole('button', { name: /Islamabad, 2 devices, All online/i }).click()
   await expect(page.getByRole('heading', { name: 'Islamabad' })).toBeVisible()
   await expect(page.getByRole('button', { name: /Inspect SLICTOWER/ })).toHaveCount(2)
+  await page.getByRole('button', { name: /Multan, 2 devices, All online/i }).click()
+  await expect(page.getByRole('heading', { name: 'Multan' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Inspect ZONE-MULTAN/ })).toHaveCount(2)
   if ((page.viewportSize()?.width || 0) > 920) {
     const canvasBox = await page.locator('.fleet-map-canvas').boundingBox()
     const sheetBox = await page.locator('.fleet-location-sheet').boundingBox()
@@ -500,6 +506,27 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   expect((actionBox?.y || 0) + (actionBox?.height || 0)).toBeLessThanOrEqual(697 - 11)
   await page.keyboard.press('Escape')
   await expect(finalMore).toBeFocused()
+
+  const firstRow = page.getByRole('article', { name: /Operator 1, user 40000/i })
+  await firstRow.getByRole('button', { name: 'Edit Operator 1' }).click()
+  const userDialog = page.getByRole('dialog', { name: 'Edit device user' })
+  await expect(userDialog).toBeVisible()
+  const overlayOrder = await page.evaluate(() => {
+    const overlayRoot = document.querySelector<HTMLElement>('#overlay-root')
+    const stickyLayers = ['.app-header', '.users-section-tabs', '.user-directory-head']
+      .map((selector) => document.querySelector<HTMLElement>(selector))
+      .filter((node): node is HTMLElement => Boolean(node))
+    const overlayZ = Number.parseInt(getComputedStyle(overlayRoot as HTMLElement).zIndex, 10)
+    return {
+      overlayZ,
+      highestStickyZ: Math.max(...stickyLayers.map((node) => Number.parseInt(getComputedStyle(node).zIndex, 10) || 0)),
+      dialogInsideOverlay: Boolean(document.querySelector('.dialog-backdrop')?.closest('#overlay-root')),
+    }
+  })
+  expect(overlayOrder.dialogInsideOverlay).toBe(true)
+  expect(overlayOrder.overlayZ).toBeGreaterThan(overlayOrder.highestStickyZ)
+  await expect(page.locator('#root')).toHaveAttribute('inert', '')
+  await page.getByRole('button', { name: 'Close dialog' }).click()
 })
 
 test('physical provisioning environment is responsive, explicit, and accessible', async ({ page }) => {

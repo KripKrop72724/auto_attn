@@ -29,6 +29,12 @@ describe('FleetMap', () => {
     const inspect = vi.fn()
     const manageUsers = vi.fn()
     const tower = makeDevice()
+    const multan = makeDevice({
+      connector_id: 'multan-one',
+      zone_id: 'ZONE-MULTAN-01',
+      zone_name: 'Multan',
+      display_name: 'ZONE-MULTAN-01',
+    })
     const unknown = makeDevice({
       connector_id: 'unknown-location',
       zone_id: 'ZONE-UNKNOWN-01',
@@ -39,7 +45,7 @@ describe('FleetMap', () => {
     })
     render(
       <FleetMap
-        devices={[tower, unknown]}
+        devices={[tower, multan, unknown]}
         loading={false}
         onInspect={inspect}
         onManageUsers={manageUsers}
@@ -47,9 +53,10 @@ describe('FleetMap', () => {
       />,
     )
 
-    expect(screen.getByRole('heading', { name: '1 operating location' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '2 operating locations' })).toBeTruthy()
     expect(screen.getByText('Location not mapped')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Open Islamabad location, 1 device' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open Multan location, 1 device' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i }))
     expect(screen.getByRole('heading', { name: 'Islamabad' })).toBeTruthy()
 

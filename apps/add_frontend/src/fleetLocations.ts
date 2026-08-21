@@ -1,7 +1,7 @@
 import { statusPattern, type StatusPattern } from './status'
 import type { Device } from './types'
 
-export type FleetLocationId = 'islamabad' | 'peshawar' | 'swat' | 'karachi'
+export type FleetLocationId = 'islamabad' | 'peshawar' | 'swat' | 'multan' | 'karachi'
 
 export interface FleetLocationDefinition {
   id: FleetLocationId
@@ -68,6 +68,7 @@ export const fleetLocationDefinitions: FleetLocationDefinition[] = [
   defineFleetLocation({ id: 'swat', city: 'Swat', region: 'Khyber Pakhtunkhwa', latitude: 34.7717, longitude: 72.3602, labelSide: 'right' }),
   defineFleetLocation({ id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', latitude: 34.0151, longitude: 71.5249, labelSide: 'left' }),
   defineFleetLocation({ id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', latitude: 33.6844, longitude: 73.0479, labelSide: 'left' }),
+  defineFleetLocation({ id: 'multan', city: 'Multan', region: 'Punjab', latitude: 30.1575, longitude: 71.5249, labelSide: 'right' }),
   defineFleetLocation({ id: 'karachi', city: 'Karachi', region: 'Sindh', latitude: 24.8607, longitude: 67.0011, labelSide: 'right' }),
 ]
 
@@ -87,6 +88,7 @@ export function resolveFleetLocation(device: Pick<Device, 'zone_id' | 'zone_name
   if (/\bKARACHI\b/.test(value)) return definitionById.get('karachi') || null
   if (/\bPESHAWAR\b|\bPESH\b/.test(value)) return definitionById.get('peshawar') || null
   if (/\bSWAT\b/.test(value)) return definitionById.get('swat') || null
+  if (/\bMULTAN\b/.test(value)) return definitionById.get('multan') || null
   return null
 }
 

@@ -340,7 +340,7 @@
 .fleet-map-index-intro { display: grid; align-content: center; gap: 4px; padding: 16px 20px; border-right: 1px solid #e1eaee; }
 .fleet-map-index-intro strong { font-size: 11px; letter-spacing: .02em; }
 .fleet-map-index-intro span { color: #526875; font-size: 9px; line-height: 1.35; }
-.fleet-map-location-list { min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(138px, 1fr)); gap: 8px; padding: 10px; }
+.fleet-map-location-list { min-width: 0; display: grid; grid-template-columns: repeat(5, minmax(138px, 1fr)); gap: 8px; padding: 10px; }
 .fleet-map-location-summary {
   width: 100%;
   min-width: 0;
