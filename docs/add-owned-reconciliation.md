@@ -32,6 +32,7 @@ preserved source epoch while transient reads resume from the existing cursor.
 7. ADD seals source coverage only when every ordinal through the cutoff exists in the unified source ledger and the final chain matches.
 8. ADD drains events to Oracle with live and current-tail priority. Membership is checked in batches and the job closes only when resolvable membership is complete.
 9. New terminal ordinals use signed, bounded `source_tail_chunk` messages. Invalid or malformed rows are committed as successful fail-closed source dispositions, so valid punches behind them continue.
+10. A certified baseline containing invalid or malformed rows remains held until every exact in-scope exception has an administrator-password-confirmed review. The final review resumes Oracle assurance automatically from the existing checkpoint; the excluded rows, capture certificate, quarantine count, and source chain never change.
 
 ## Runtime resource policy
 
@@ -53,7 +54,7 @@ preserved source epoch while transient reads resume from the existing cursor.
 | ORDS unavailable or backlogged | Source capture pauses or Oracle assurance waits; live delivery retains priority |
 | CNIC/identity unresolved | Attendance remains `BLOCKED_IDENTITY`; source coverage can seal with the explicit exception |
 | Oracle delivery reaches a terminal quarantine or an unknown state | Job enters `NEEDS_ATTENTION` with a non-PII state/count breakdown; no Oracle certificate is issued and no row is changed or deleted |
-| Raw terminal record malformed or time invalid | Encrypted raw evidence is committed to the source ledger, excluded from attendance/Oracle, exposed in the review-only inspector, and later ordinals continue |
+| Raw terminal record malformed or time invalid | Encrypted raw evidence is committed to the source ledger, excluded from attendance/Oracle, and later ordinals continue. Final assurance resumes automatically only after every exception inside the certified cutoff is reviewed; newer tail exceptions are outside that job's gate. |
 | ESP preservation storage full/unavailable | ADD commands still execute from the durable control-plane offer; storage is never auto-formatted |
 | Operator pause/cancel | Committed evidence is retained; no terminal or Oracle record is removed |
 

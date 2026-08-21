@@ -156,8 +156,10 @@ from zk_add.reconciliation import (
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_scheduler_state,
+    refresh_reconciliations_for_source_exception,
     serialize_job,
     serialize_coverage,
+    source_exception_assurance,
 )
 from zk_add.source_exceptions import (
     exception_or_404_row,
@@ -869,6 +871,7 @@ def get_reconciliation_evidence(
 
 @app.get("/api/v1/source-exceptions")
 def source_exceptions(
+    job_id: str | None = None,
     device_id: str | None = None,
     disposition: str | None = None,
     error_code: str | None = None,
@@ -879,15 +882,22 @@ def source_exceptions(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    job = reconciliation_or_404(db, job_id) if job_id else None
     connector_pk = None
     if device_id:
         connector_pk = connector_or_404(db, device_id).id
+    if job is not None and connector_pk is not None and job.connector_id != connector_pk:
+        raise HTTPException(
+            status_code=422,
+            detail="The selected device does not belong to the reconciliation job.",
+        )
     if disposition and disposition not in {"INVALID_TIME", "MALFORMED"}:
         raise HTTPException(status_code=422, detail="Unknown source exception disposition.")
     if review_state and review_state not in {"OPEN", "REVIEWED"}:
         raise HTTPException(status_code=422, detail="Unknown source exception review state.")
-    return list_source_exceptions(
+    result = list_source_exceptions(
         db,
+        job=job,
         connector_id=connector_pk,
         disposition=disposition,
         error_code=error_code,
@@ -896,6 +906,28 @@ def source_exceptions(
         cursor=cursor,
         limit=limit,
     )
+    if job is not None:
+        assurance = source_exception_assurance(db, job)
+        job_connector = db.get(Connector, job.connector_id)
+        result["scope"] = {
+            "job_id": job.job_id,
+            "device_id": job_connector.connector_id if job_connector else None,
+            "terminal_serial": job.terminal_serial,
+            "cutoff_count": job.cutoff_count,
+            "source_exception_assurance": {
+                key: assurance[key]
+                for key in (
+                    "total",
+                    "reviewed",
+                    "open",
+                    "invalid_time",
+                    "malformed",
+                    "state",
+                    "cohort_digest",
+                )
+            },
+        }
+    return result
 
 
 @app.get("/api/v1/source-exceptions/{exception_id}")
@@ -911,7 +943,7 @@ def source_exception(
 
 
 @app.post("/api/v1/source-exceptions/{exception_id}/review")
-def review_source_exception_endpoint(
+async def review_source_exception_endpoint(
     exception_id: int,
     body: SourceExceptionActionRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
@@ -929,7 +961,21 @@ def review_source_exception_endpoint(
         idempotency_key=body.idempotency_key,
     )
     db.flush()
-    return source_exception_detail(db, row)
+    affected_jobs = refresh_reconciliations_for_source_exception(db, row)
+    result = source_exception_detail(db, row)
+    db.commit()
+    for job in affected_jobs:
+        await browser_events.publish(
+            "reconciliation",
+            {
+                "job_id": job.job_id,
+                "status": job.status,
+                "source_exception_state": source_exception_assurance(db, job)[
+                    "state"
+                ],
+            },
+        )
+    return result
 
 
 @app.post("/api/v1/source-exceptions/{exception_id}/reveal")

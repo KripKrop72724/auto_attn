@@ -35,6 +35,7 @@ import type {
   ReconciliationSection,
   ReconciliationStatusGroup,
   SourceException,
+  SourceExceptionAssurance,
   SourceExceptionList,
   SourceExceptionReveal,
   SourceExceptionTotals,
@@ -42,6 +43,7 @@ import type {
 
 type Toast = ReturnType<typeof useToast>
 type ExceptionFilters = {
+  job_id: string
   device_id: string
   disposition: string
   review_state: string
@@ -73,7 +75,17 @@ const emptyExceptionTotals: SourceExceptionTotals = {
   malformed: 0,
   affected_terminals: 0,
 }
+const emptySourceAssurance: SourceExceptionAssurance = {
+  total: 0,
+  reviewed: 0,
+  open: 0,
+  invalid_time: 0,
+  malformed: 0,
+  state: 'NONE',
+  cohort_digest: null,
+}
 const defaultExceptionFilters: ExceptionFilters = {
+  job_id: '',
   device_id: '',
   disposition: '',
   review_state: '',
@@ -353,12 +365,14 @@ function JobDetailDrawer({
   onClose,
   toast,
   onDivergence,
+  onReviewExceptions,
   returnFocusRef,
 }: {
   seed: ReconciliationJob
   onClose: () => void
   toast: Toast
   onDivergence: (id: string) => void
+  onReviewExceptions: (job: ReconciliationJob) => void
   returnFocusRef: RefObject<HTMLButtonElement | null>
 }) {
   const [job, setJob] = useState<ReconciliationJob | null>(null)
@@ -498,6 +512,36 @@ function JobDetailDrawer({
                 </dd>
               </div>
             </dl>
+            {(job.source_exception_assurance?.total ?? 0) > 0 && (
+              <article
+                className={`info-copy pattern-${job.source_exception_assurance.state === 'REVIEW_REQUIRED' ? 'waiting' : job.source_exception_assurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+              >
+                <Icon name="shield" />
+                <div>
+                  <h3>
+                    {job.source_exception_assurance.state === 'REVIEW_REQUIRED'
+                      ? `${job.source_exception_assurance.open.toLocaleString()} source review${job.source_exception_assurance.open === 1 ? '' : 's'} remaining`
+                      : job.source_exception_assurance.state === 'SCOPE_MISMATCH'
+                        ? 'Source-exception evidence mismatch'
+                        : 'Reviewed exclusions are preserved'}
+                  </h3>
+                  <p>
+                    {job.source_exception_assurance.reviewed.toLocaleString()} of{' '}
+                    {job.source_exception_assurance.total.toLocaleString()} certified
+                    source exceptions reviewed. They remain immutable and excluded
+                    from attendance and Oracle.
+                  </p>
+                  {job.source_exception_assurance.state === 'REVIEW_REQUIRED' && (
+                    <button
+                      className="button secondary"
+                      onClick={() => onReviewExceptions(job)}
+                    >
+                      Review certified exceptions
+                    </button>
+                  )}
+                </div>
+              </article>
+            )}
             {job.recovery?.divergence && (
               <article className="info-copy pattern-waiting">
                 <Icon name="shield" />
@@ -661,7 +705,7 @@ function SourceExceptionDrawer({
           ),
         )
         toast.notice(
-          'Source exception marked reviewed without changing terminal truth.',
+          'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
         )
         await onChanged()
       } else {
@@ -731,7 +775,9 @@ function SourceExceptionDrawer({
                 <h3>Excluded from attendance and Oracle</h3>
                 <p>
                   ADD preserved this terminal ordinal as immutable evidence.
-                  Review never creates, edits, or deletes attendance.
+                  Review never creates, edits, or deletes attendance. Completing
+                  every review in a certified job automatically resumes assurance
+                  for its valid records.
                 </p>
               </div>
             </article>
@@ -782,7 +828,10 @@ function SourceExceptionDrawer({
               <div className="panel-header">
                 <div>
                   <h3>Review history</h3>
-                  <p>Acknowledgement changes review state only.</p>
+                  <p>
+                    Review accepts this fail-closed exclusion; the preserved source
+                    record itself never changes.
+                  </p>
                 </div>
                 <StatusBadge state={row.review_state} />
               </div>
@@ -1159,6 +1208,9 @@ export function ReconciliationView({
   const [exceptionRows, setExceptionRows] = useState<SourceException[]>([])
   const [exceptionTotals, setExceptionTotals] =
     useState<SourceExceptionTotals>(emptyExceptionTotals)
+  const [exceptionScope, setExceptionScope] = useState<
+    SourceExceptionList['scope'] | null
+  >(null)
   const [exceptionFilteredTotal, setExceptionFilteredTotal] = useState(0)
   const [exceptionCursor, setExceptionCursor] = useState<number | null>(null)
   const [exceptionLoading, setExceptionLoading] = useState(true)
@@ -1168,10 +1220,12 @@ export function ReconciliationView({
     useState<SourceException | null>(null)
   const [exceptionDraft, setExceptionDraft] = useState<ExceptionFilters>({
     ...defaultExceptionFilters,
+    job_id: initial.get('job_id') || '',
     device_id: initial.get('device_id') || '',
   })
   const [exceptionFilters, setExceptionFilters] = useState<ExceptionFilters>({
     ...defaultExceptionFilters,
+    job_id: initial.get('job_id') || '',
     device_id: initial.get('device_id') || '',
   })
   const jobAbortRef = useRef<AbortController | null>(null)
@@ -1191,11 +1245,35 @@ export function ReconciliationView({
     const params = new URLSearchParams()
     if (next === 'exceptions') params.set('tab', 'source-exceptions')
     const deviceId = next === 'exceptions' ? exceptionFilters.device_id : ''
+    const jobId = next === 'exceptions' ? exceptionFilters.job_id : ''
     if (deviceId) params.set('device_id', deviceId)
+    if (jobId) params.set('job_id', jobId)
     window.history.pushState(
       null,
       '',
       `${window.location.pathname}${params.size ? `?${params}` : ''}`,
+    )
+  }
+  const reviewJobExceptions = (job: ReconciliationJob) => {
+    const next = {
+      ...defaultExceptionFilters,
+      job_id: job.job_id,
+      device_id: job.connector?.connector_id || '',
+    }
+    setJobDrawer(null)
+    setExceptionDraft(next)
+    setExceptionFilters(next)
+    setSection('exceptions')
+    const params = new URLSearchParams({
+      tab: 'source-exceptions',
+      job_id: job.job_id,
+    })
+    if (job.connector?.connector_id)
+      params.set('device_id', job.connector.connector_id)
+    window.history.pushState(
+      null,
+      '',
+      `${window.location.pathname}?${params}`,
     )
   }
   useEffect(() => {
@@ -1206,8 +1284,17 @@ export function ReconciliationView({
       setSection(next)
       if (next === 'exceptions') {
         const deviceId = params.get('device_id') || ''
-        setExceptionDraft((current) => ({ ...current, device_id: deviceId }))
-        setExceptionFilters((current) => ({ ...current, device_id: deviceId }))
+        const jobId = params.get('job_id') || ''
+        setExceptionDraft((current) => ({
+          ...current,
+          device_id: deviceId,
+          job_id: jobId,
+        }))
+        setExceptionFilters((current) => ({
+          ...current,
+          device_id: deviceId,
+          job_id: jobId,
+        }))
       }
     }
     window.addEventListener('popstate', onPopState)
@@ -1292,6 +1379,7 @@ export function ReconciliationView({
             : response.rows,
         )
         setExceptionTotals(response.totals)
+        setExceptionScope(response.scope || null)
         setExceptionFilteredTotal(
           response.filtered_total ?? response.rows.length,
         )
@@ -1451,6 +1539,8 @@ export function ReconciliationView({
     Number(Boolean(jobStatus))
   const activeExceptionFilters =
     Object.values(exceptionFilters).filter(Boolean).length
+  const scopedAssurance =
+    exceptionScope?.source_exception_assurance || null
   const scanQueue = rows
     .filter(
       (job) =>
@@ -1865,6 +1955,11 @@ export function ReconciliationView({
                     ? 100
                     : 0
                 const queuePosition = queuePositions.get(job.job_id)
+                const sourceAssurance =
+                  job.source_exception_assurance || emptySourceAssurance
+                const sourceGateActive =
+                  sourceAssurance.state === 'REVIEW_REQUIRED' ||
+                  sourceAssurance.state === 'SCOPE_MISMATCH'
                 const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> =
                   []
                 if (
@@ -1872,7 +1967,8 @@ export function ReconciliationView({
                 )
                   controls.push('pause')
                 if (job.status === 'PAUSED') controls.push('resume')
-                if (job.status === 'NEEDS_ATTENTION') controls.push('retry')
+                if (job.status === 'NEEDS_ATTENTION' && !sourceGateActive)
+                  controls.push('retry')
                 if (!terminalJobStates.has(job.status)) controls.push('cancel')
                 const directAction = controls.find(
                   (action) => action !== 'cancel',
@@ -1989,6 +2085,25 @@ export function ReconciliationView({
                         <dd>{job.progress.auto_retry_count ?? 0}</dd>
                       </div>
                     </dl>
+                    {sourceAssurance.total > 0 && (
+                      <div
+                        className={`reconciliation-source-assurance pattern-${sourceAssurance.state === 'REVIEW_REQUIRED' ? 'waiting' : sourceAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+                      >
+                        <Icon name="shield" />
+                        <span>
+                          <strong>
+                            {sourceAssurance.state === 'REVIEW_REQUIRED'
+                              ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
+                              : sourceAssurance.state === 'SCOPE_MISMATCH'
+                                ? 'Source-exception evidence mismatch'
+                                : 'Reviewed exclusions — assurance continuing'}
+                          </strong>
+                          {sourceAssurance.reviewed.toLocaleString()} of{' '}
+                          {sourceAssurance.total.toLocaleString()} certified
+                          exceptions reviewed; all remain excluded fail-closed.
+                        </span>
+                      </div>
+                    )}
                     {job.error_message && (
                       <div className="reconciliation-row-alert">
                         <Icon name="alert" />
@@ -2008,6 +2123,15 @@ export function ReconciliationView({
                       >
                         <Icon name="shield" /> Inspect evidence
                       </button>
+                      {sourceAssurance.state === 'REVIEW_REQUIRED' && (
+                        <button
+                          className="button primary"
+                          onClick={() => reviewJobExceptions(job)}
+                        >
+                          Review {sourceAssurance.open.toLocaleString()}{' '}
+                          exception{sourceAssurance.open === 1 ? '' : 's'}
+                        </button>
+                      )}
                       {directAction && (
                         <button
                           className="button primary"
@@ -2075,33 +2199,66 @@ export function ReconciliationView({
           aria-labelledby="reconciliation-exceptions-tab"
         >
           <p className="reconciliation-metric-caption">
-            National source-exception totals
+            {exceptionScope
+              ? `Certified job cohort · ${exceptionScope.terminal_serial || 'terminal pending'} · cutoff ${(exceptionScope.cutoff_count ?? 0).toLocaleString()}`
+              : 'National source-exception totals'}
           </p>
           <section className="metric-grid reconciliation-metrics">
             <Metric
-              label="Open exceptions"
-              value={exceptionTotals.open.toLocaleString()}
-              detail="Awaiting operator review"
+              label={scopedAssurance ? 'Certified exceptions' : 'Open exceptions'}
+              value={(
+                scopedAssurance?.total ?? exceptionTotals.open
+              ).toLocaleString()}
+              detail={
+                scopedAssurance
+                  ? 'Exact immutable job cohort'
+                  : 'Awaiting operator review'
+              }
               icon="alert"
-              tone={exceptionTotals.open ? 'warning' : 'positive'}
+              tone={
+                (scopedAssurance?.open ?? exceptionTotals.open)
+                  ? 'warning'
+                  : 'positive'
+              }
             />
             <Metric
-              label="Invalid timestamps"
-              value={exceptionTotals.invalid_time.toLocaleString()}
-              detail="Excluded fail-closed"
-              icon="clock"
-              tone="warning"
+              label={scopedAssurance ? 'Reviewed exclusions' : 'Invalid timestamps'}
+              value={(
+                scopedAssurance?.reviewed ?? exceptionTotals.invalid_time
+              ).toLocaleString()}
+              detail={
+                scopedAssurance
+                  ? 'Preserved and excluded fail-closed'
+                  : 'Excluded fail-closed'
+              }
+              icon={scopedAssurance ? 'shield' : 'clock'}
+              tone={scopedAssurance ? 'positive' : 'warning'}
             />
             <Metric
-              label="Malformed rows"
-              value={exceptionTotals.malformed.toLocaleString()}
-              detail="Raw evidence preserved"
-              icon="terminal"
+              label={scopedAssurance ? 'Open reviews' : 'Malformed rows'}
+              value={(
+                scopedAssurance?.open ?? exceptionTotals.malformed
+              ).toLocaleString()}
+              detail={
+                scopedAssurance
+                  ? 'Automatic continuation when zero'
+                  : 'Raw evidence preserved'
+              }
+              icon={scopedAssurance ? 'alert' : 'terminal'}
+              tone={scopedAssurance?.open ? 'warning' : 'positive'}
             />
             <Metric
-              label="Affected terminals"
-              value={exceptionTotals.affected_terminals.toLocaleString()}
-              detail="Subsequent valid punches continue"
+              label={scopedAssurance ? 'Assurance state' : 'Affected terminals'}
+              value={
+                scopedAssurance
+                  ? humanize(scopedAssurance.state)
+                  : exceptionTotals.affected_terminals.toLocaleString()
+              }
+              detail={
+                scopedAssurance
+                  ? 'Checkpoint and source chain unchanged'
+                  : 'Subsequent valid punches continue'
+              }
               icon="server"
             />
           </section>
@@ -2110,14 +2267,38 @@ export function ReconciliationView({
               <div>
                 <h2>Immutable source exception ledger</h2>
                 <p>
-                  Review acknowledges preserved evidence only; it never changes
-                  attendance or Oracle.
+                  Review never changes a preserved record or creates attendance.
+                  Once every exception in a certified job is reviewed, ADD
+                  automatically continues assurance for its valid records.
                 </p>
               </div>
               <StatusBadge
                 state={`${exceptionFilteredTotal.toLocaleString()} MATCHING`}
               />
             </div>
+            {exceptionScope && scopedAssurance && (
+              <div
+                className={`info-copy pattern-${scopedAssurance.state === 'REVIEW_REQUIRED' ? 'waiting' : scopedAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+                aria-live="polite"
+              >
+                <Icon name="shield" />
+                <div>
+                  <h3>
+                    {scopedAssurance.state === 'REVIEW_REQUIRED'
+                      ? `${scopedAssurance.open.toLocaleString()} certified review${scopedAssurance.open === 1 ? '' : 's'} remaining`
+                      : scopedAssurance.state === 'SCOPE_MISMATCH'
+                        ? 'Certified exception scope needs investigation'
+                        : 'All certified exclusions reviewed'}
+                  </h3>
+                  <p>
+                    Valid rows have already advanced through checkpoint{' '}
+                    {(exceptionScope.cutoff_count ?? 0).toLocaleString()}. When
+                    the open count reaches zero, final assurance resumes
+                    automatically without a terminal rescan.
+                  </p>
+                </div>
+              </div>
+            )}
             <form
               className="reconciliation-exception-filters"
               onSubmit={(event) => {
@@ -2126,6 +2307,8 @@ export function ReconciliationView({
                 const params = new URLSearchParams({
                   tab: 'source-exceptions',
                 })
+                if (exceptionDraft.job_id)
+                  params.set('job_id', exceptionDraft.job_id)
                 if (exceptionDraft.device_id)
                   params.set('device_id', exceptionDraft.device_id)
                 window.history.pushState(
@@ -2142,6 +2325,7 @@ export function ReconciliationView({
                   onChange={(event) =>
                     setExceptionDraft({
                       ...exceptionDraft,
+                      job_id: '',
                       device_id: event.target.value,
                     })
                   }
@@ -2269,7 +2453,9 @@ export function ReconciliationView({
                         setExceptionDraft(next)
                       }}
                     >
-                      {humanize(key)}: {humanize(value)} <Icon name="x" />
+                      {key === 'job_id' ? 'Certified job' : humanize(key)}:{' '}
+                      {key === 'job_id' ? value.slice(0, 8) : humanize(value)}{' '}
+                      <Icon name="x" />
                     </button>
                   ))}
               </div>
@@ -2537,6 +2723,7 @@ export function ReconciliationView({
           onClose={() => setJobDrawer(null)}
           toast={toast}
           returnFocusRef={jobDrawerReturnFocusRef}
+          onReviewExceptions={reviewJobExceptions}
           onDivergence={(id) => {
             setJobDrawer(null)
             setDivergenceDrawerId(id)
@@ -2547,7 +2734,12 @@ export function ReconciliationView({
         <SourceExceptionDrawer
           seed={exceptionDrawer}
           onClose={() => setExceptionDrawer(null)}
-          onChanged={() => loadExceptions({ quiet: true })}
+          onChanged={async () => {
+            await Promise.all([
+              loadExceptions({ quiet: true }),
+              loadJobs({ quiet: true }),
+            ])
+          }}
           toast={toast}
         />
       )}

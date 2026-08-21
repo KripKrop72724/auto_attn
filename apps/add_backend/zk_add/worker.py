@@ -373,6 +373,7 @@ async def maintenance_tick() -> None:
     now = utc_now()
     dispatch: list[tuple[str, dict]] = []
     connector_updates: list[dict] = []
+    reconciliation_updates: list[dict] = []
     reconciliation_dispatch: list[tuple[str, dict]] = []
     provisioning_updates: list[dict] = []
     with session_scope() as session:
@@ -395,7 +396,7 @@ async def maintenance_tick() -> None:
         repair_verified_active_identity_backlog(session)
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
-        refresh_all_reconciliation_assurance(session)
+        reconciliation_updates = refresh_all_reconciliation_assurance(session)
         for provisioning in session.scalars(
             select(ProvisioningSession).where(
                 ProvisioningSession.expires_at <= now,
@@ -510,6 +511,8 @@ async def maintenance_tick() -> None:
         await browser_events.publish("device", update)
     for update in provisioning_updates:
         await browser_events.publish("provisioning", update)
+    for update in reconciliation_updates:
+        await browser_events.publish("reconciliation", update)
     await dispatch_reconciliation_assignments(reconciliation_dispatch)
 
 

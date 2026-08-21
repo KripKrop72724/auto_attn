@@ -11,6 +11,7 @@ from zk_add.models import (
     AuditEvent,
     Connector,
     ReconciliationCoverage,
+    ReconciliationJob,
     TerminalRecordManifest,
     TerminalRecordReview,
 )
@@ -95,6 +96,7 @@ def _serialize(
 def list_source_exceptions(
     session: Session,
     *,
+    job: ReconciliationJob | None = None,
     connector_id: int | None = None,
     disposition: str | None = None,
     error_code: str | None = None,
@@ -107,6 +109,13 @@ def list_source_exceptions(
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS)
     )
+    if job is not None:
+        statement = statement.where(
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+            TerminalRecordManifest.generation == job.terminal_generation,
+            TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
+            TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
+        )
     if connector_id is not None:
         statement = statement.where(TerminalRecordManifest.connector_id == connector_id)
     if disposition:

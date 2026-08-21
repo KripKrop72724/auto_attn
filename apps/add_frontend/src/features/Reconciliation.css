@@ -398,6 +398,31 @@
   font-size: 13px;
   font-weight: 780;
 }
+.reconciliation-source-assurance {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 9px;
+  background: var(--surface-muted);
+}
+.reconciliation-source-assurance > svg {
+  width: 18px;
+  color: var(--brand-700);
+}
+.reconciliation-source-assurance span {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.reconciliation-source-assurance strong {
+  color: var(--ink);
+  font-size: 12px;
+}
 .reconciliation-row-alert {
   display: flex;
   align-items: flex-start;

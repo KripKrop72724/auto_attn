@@ -16,6 +16,7 @@ from zk_add.models import (
     AttendanceEvent,
     ReconciliationCoverage,
     ReconciliationDivergence,
+    ReconciliationEvent,
     ReconciliationJob,
     SourceTailChunk,
     TerminalRecordManifest,
@@ -37,8 +38,10 @@ from zk_add.reconciliation import (
     reconciliation_chain_digest,
     reconciliation_chunk_digest,
     reconciliation_scheduler_state,
+    refresh_reconciliations_for_source_exception,
     refresh_reconciliation_assurance,
     serialize_job,
+    source_exception_assurance,
 )
 from zk_add.schemas import (
     AttendanceEventIn,
@@ -279,6 +282,90 @@ def _tail_source(
     )
 
 
+def _certify_baseline_with_exceptions(
+    session: Session,
+    connector,
+    dispositions: list[str],
+) -> tuple[ReconciliationJob, list[TerminalRecordManifest]]:
+    records = [_source_record()]
+    records.extend(
+        _tail_source(index, disposition, event=disposition == "EVENT")
+        for index, disposition in enumerate(dispositions, start=1)
+    )
+    cutoff = len(records)
+    connector.zkt_device.attendance_count = cutoff
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Certify a source range containing preserved fail-closed exceptions.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key=f"exception-baseline-{cutoff}-0001",
+    )
+    apply_reconciliation_anchor(
+        session,
+        connector=connector,
+        payload=ReconciliationAnchorRequest(
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation,
+            cutoff_count=cutoff,
+            latest_terminal_count=cutoff,
+            record_size=8,
+            source_total_bytes=4 + (cutoff * 8),
+            first_anchor_digest=records[0].raw_record_digest,
+        ),
+    )
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        sequence=0,
+        start_ordinal=0,
+        end_ordinal=cutoff,
+        chunk_digest="0" * 64,
+        previous_chain_digest=None,
+        resulting_chain_digest="0" * 64,
+        records=records,
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    chain_digest = reconciliation_chain_digest(
+        None,
+        start_ordinal=0,
+        end_ordinal=cutoff,
+        chunk_digest=chunk_digest,
+    )
+    apply_reconciliation_chunk(
+        session,
+        connector=connector,
+        payload=draft.model_copy(
+            update={
+                "chunk_digest": chunk_digest,
+                "resulting_chain_digest": chain_digest,
+            }
+        ),
+    )
+    apply_reconciliation_manifest(
+        session,
+        connector=connector,
+        payload=ReconciliationManifestRequest(
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation,
+            cutoff_count=cutoff,
+            latest_terminal_count=cutoff,
+            final_chain_digest=chain_digest,
+        ),
+    )
+    manifests = session.scalars(
+        select(TerminalRecordManifest)
+        .where(TerminalRecordManifest.source_epoch_id == job.source_epoch_id)
+        .order_by(TerminalRecordManifest.ordinal.asc())
+    ).all()
+    return job, manifests
+
+
 def _add_ready_connector(session: Session, index: int):
     serial = f"TEST-SERIAL-{index}"
     connector, _token, _created = onboard_connector(
@@ -451,6 +538,184 @@ def test_full_history_reconciliation_is_contiguous_resumable_and_separately_cert
     assert job.capture_certificate["evidence_signature"]
     assert job.oracle_certificate["evidence_signature"]
     assert coverage.oracle_state == "ORACLE_MEMBERSHIP_CERTIFIED"
+
+
+def test_final_source_exception_review_resumes_assurance_without_rescan(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    job, manifests = _certify_baseline_with_exceptions(
+        session, connector, ["INVALID_TIME", "EVENT"]
+    )
+    exception = manifests[1]
+    original_chain = job.last_chain_digest
+
+    assert [row.ordinal for row in manifests] == [0, 1, 2]
+    assert exception.attendance_event_id is None
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == 2
+    assert job.status == "NEEDS_ATTENTION"
+    assert job.wait_reason == "SOURCE_QUARANTINE_REQUIRES_REVIEW"
+    assert job.committed_next_ordinal == 3
+    assert job.scanned_count == 3
+    assert job.quarantined_count == 1
+    assurance = source_exception_assurance(session, job)
+    assert assurance["total"] == 1
+    assert assurance["reviewed"] == 0
+    assert assurance["open"] == 1
+    assert assurance["invalid_time"] == 1
+    assert assurance["malformed"] == 0
+    assert assurance["state"] == "REVIEW_REQUIRED"
+
+    review_source_exception(
+        session,
+        row=exception,
+        actor="operator",
+        reason="Reviewed the preserved invalid terminal timestamp evidence.",
+        idempotency_key="review-baseline-exception-0001",
+    )
+    session.flush()
+    refreshed = refresh_reconciliations_for_source_exception(session, exception)
+
+    assert refreshed == [job]
+    assert job.status == "RUNNING"
+    assert job.phase == "DRAINING_ORDS"
+    assert job.wait_reason is None
+    assert job.committed_next_ordinal == 3
+    assert job.scanned_count == 3
+    assert job.quarantined_count == 1
+    assert job.last_chain_digest == original_chain
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == 2
+    assert source_exception_assurance(session, job)["state"] == "REVIEWED_EXCLUSIONS"
+    gate_events = session.scalars(
+        select(ReconciliationEvent).where(
+            ReconciliationEvent.job_id == job.id,
+            ReconciliationEvent.state == "SOURCE_EXCEPTION_REVIEW_GATE_CLEARED",
+        )
+    ).all()
+    assert len(gate_events) == 1
+    assert gate_events[0].details["source_exception_count"] == 1
+    assert gate_events[0].details["evidence_signature"]
+
+    for event in session.scalars(select(AttendanceEvent)).all():
+        event.ords_status = "ACKED"
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "COMPLETED"
+    assert job.completion_outcome == "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS"
+    assert job.oracle_certificate["reviewed_source_exceptions"]["count"] == 1
+    assert job.oracle_certificate["reviewed_source_exceptions"]["policy"] == "EXCLUDED_FAIL_CLOSED"
+    assert job.quarantined_count == 1
+    assert exception.attendance_event_id is None
+    assert len(
+        session.scalars(
+            select(ReconciliationEvent).where(
+                ReconciliationEvent.job_id == job.id,
+                ReconciliationEvent.state
+                == "SOURCE_EXCEPTION_REVIEW_GATE_CLEARED",
+            )
+        ).all()
+    ) == 1
+
+
+def test_partial_source_exception_review_remains_held_and_tail_is_out_of_scope(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    job, manifests = _certify_baseline_with_exceptions(
+        session, connector, ["INVALID_TIME", "MALFORMED", "EVENT"]
+    )
+    first, second = manifests[1], manifests[2]
+    review_source_exception(
+        session,
+        row=first,
+        actor="operator",
+        reason="Reviewed the first immutable exception in the certified cohort.",
+        idempotency_key="review-first-exception-0001",
+    )
+    session.flush()
+    refresh_reconciliations_for_source_exception(session, first)
+
+    assurance = source_exception_assurance(session, job)
+    assert assurance["total"] == 2
+    assert assurance["reviewed"] == 1
+    assert assurance["open"] == 1
+    assert job.status == "NEEDS_ATTENTION"
+
+    review_source_exception(
+        session,
+        row=second,
+        actor="operator",
+        reason="Reviewed the second immutable exception in the certified cohort.",
+        idempotency_key="review-second-exception-0001",
+    )
+    session.flush()
+    refresh_reconciliations_for_source_exception(session, second)
+    assert job.status == "RUNNING"
+    assert source_exception_assurance(session, job)["open"] == 0
+
+    session.add(
+        TerminalRecordManifest(
+            job_id=None,
+            chunk_id=None,
+            connector_id=connector.id,
+            zkt_device_id=job.zkt_device_id,
+            terminal_serial=SERIAL,
+            generation=job.terminal_generation,
+            source_epoch_id=job.source_epoch_id,
+            ordinal=job.cutoff_count,
+            source_kind="TAIL",
+            canonical_source=True,
+            record_size=8,
+            raw_record_digest=hashlib.sha256(b"newer-tail-exception").hexdigest(),
+            terminal_record_key=hashlib.sha256(b"newer-tail-key").hexdigest(),
+            occurrence_index=1,
+            attendance_event_id=None,
+            disposition="INVALID_TIME",
+            protected_raw_record=None,
+            error_code="ZKT_TIMESTAMP_OUT_OF_RANGE",
+            raw_timestamp=0xFFFFFFFF,
+            observed_uid="7",
+            observed_user_id="1007",
+        )
+    )
+    session.flush()
+    assert source_exception_assurance(session, job)["total"] == 2
+    assert source_exception_assurance(session, job)["open"] == 0
+    scoped = list_source_exceptions(session, job=job)
+    assert scoped["filtered_total"] == 2
+    assert {row["ordinal"] for row in scoped["rows"]} == {1, 2}
+
+
+def test_source_exception_scope_mismatch_and_unrelated_hold_remain_fail_closed(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    job, manifests = _certify_baseline_with_exceptions(
+        session, connector, ["INVALID_TIME"]
+    )
+    exception = manifests[1]
+    review_source_exception(
+        session,
+        row=exception,
+        actor="operator",
+        reason="Reviewed the exact immutable exception before assurance validation.",
+        idempotency_key="review-mismatch-exception-0001",
+    )
+    session.flush()
+    job.capture_certificate = {**job.capture_certificate, "quarantined": 2}
+    refresh_reconciliation_assurance(session, job)
+
+    assert job.status == "NEEDS_ATTENTION"
+    assert job.error_code == "SOURCE_EXCEPTION_SCOPE_MISMATCH"
+    assert source_exception_assurance(session, job)["state"] == "SCOPE_MISMATCH"
+
+    job.capture_certificate = {**job.capture_certificate, "quarantined": 1}
+    job.wait_reason = "TERMINAL_GENERATION_CHANGED"
+    job.error_code = "TERMINAL_GENERATION_CHANGED"
+    job.error_message = "The terminal identity changed during source capture."
+    refresh_reconciliation_assurance(session, job)
+    assert job.status == "NEEDS_ATTENTION"
+    assert job.error_code == "TERMINAL_GENERATION_CHANGED"
 
 
 def test_source_record_digest_must_match_protected_raw_evidence(reconciliation_db):

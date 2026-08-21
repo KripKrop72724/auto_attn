@@ -27,6 +27,7 @@ from zk_add.models import (
     SourceTailChunk,
     TemporaryAdminLease,
     TerminalRecordManifest,
+    TerminalRecordReview,
     TerminalSourceEpoch,
     ZKTDevice,
 )
@@ -64,6 +65,9 @@ RECONCILIATION_CAPABILITY = "history_stream_v1"
 RECONCILIATION_V2_CAPABILITY = "history_stream_v2"
 RANGE_RESUME_CAPABILITY = "history_range_resume_verified"
 SOURCE_PROBE_CAPABILITY = "source_divergence_probe_v1"
+SOURCE_EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED"}
+SOURCE_EXCEPTION_REVIEW_HOLD = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
+SOURCE_EXCEPTION_SCOPE_MISMATCH = "SOURCE_EXCEPTION_SCOPE_MISMATCH"
 
 
 def _release_assignment(job: ReconciliationJob) -> None:
@@ -408,6 +412,18 @@ def control_reconciliation_job(
         if action == "retry" and job.status == "FAILED":
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
+    if action == "retry" and job.quarantined_count:
+        source_assurance = source_exception_assurance(session, job)
+        if source_assurance["state"] == "REVIEW_REQUIRED":
+            raise ValueError(
+                f"Review the {source_assurance['open']} remaining source exception(s); "
+                "assurance continues automatically after the certified cohort is reviewed."
+            )
+        if source_assurance["state"] == "SCOPE_MISMATCH":
+            raise ValueError(
+                "The source-exception cohort does not match its capture certificate; "
+                "generic retry cannot override this safety hold."
+            )
     before = job.status
     _release_assignment(job)
     if action == "pause":
@@ -923,7 +939,12 @@ def apply_reconciliation_manifest(
         if job.blocked_identity_count or job.quarantined_count
         else "DRAINING_ORDS"
     )
-    job.status = "NEEDS_ATTENTION" if job.quarantined_count else "RUNNING"
+    # Assurance owns the source-review hold so the first sealed response is
+    # actionable rather than inheriting a generic pre-capture wait reason.
+    job.status = "RUNNING"
+    job.wait_reason = None
+    job.error_code = None
+    job.error_message = None
     job.last_progress_at = now
     job.updated_at = now
     job.next_retry_at = None
@@ -1204,9 +1225,217 @@ def apply_source_tail_chunk(
     return coverage, chunk, False, None
 
 
+def source_exception_assurance(
+    session: Session, job: ReconciliationJob
+) -> dict:
+    """Derive the immutable source-exception review gate for one certified job."""
+    empty = {
+        "total": 0,
+        "reviewed": 0,
+        "open": 0,
+        "invalid_time": 0,
+        "malformed": 0,
+        "state": "NONE",
+        "cohort_digest": None,
+    }
+    if not job.quarantined_count:
+        return empty
+
+    cutoff = job.cutoff_count or 0
+    manifests = session.scalars(
+        select(TerminalRecordManifest)
+        .where(
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+            TerminalRecordManifest.generation == job.terminal_generation,
+            TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.ordinal < cutoff,
+            TerminalRecordManifest.disposition.in_(SOURCE_EXCEPTION_DISPOSITIONS),
+        )
+        .order_by(TerminalRecordManifest.ordinal.asc(), TerminalRecordManifest.id.asc())
+    ).all()
+    manifest_ids = [row.id for row in manifests]
+    earliest_reviews: dict[int, TerminalRecordReview] = {}
+    if manifest_ids:
+        for review in session.scalars(
+            select(TerminalRecordReview)
+            .where(
+                TerminalRecordReview.manifest_id.in_(manifest_ids),
+                TerminalRecordReview.state == "REVIEWED",
+            )
+            .order_by(TerminalRecordReview.id.asc())
+        ).all():
+            earliest_reviews.setdefault(review.manifest_id, review)
+
+    invalid_time = sum(row.disposition == "INVALID_TIME" for row in manifests)
+    malformed = sum(row.disposition == "MALFORMED" for row in manifests)
+    reviewed = len(earliest_reviews)
+    cohort_material = {
+        "job_id": job.job_id,
+        "terminal_serial": job.terminal_serial,
+        "terminal_generation": job.terminal_generation,
+        "source_epoch_id": job.source_epoch_id,
+        "cutoff_count": job.cutoff_count,
+        "source_chain_digest": job.last_chain_digest,
+        "exceptions": [
+            {
+                "manifest_id": row.id,
+                "ordinal": row.ordinal,
+                "terminal_record_key": row.terminal_record_key,
+                "raw_record_digest": row.raw_record_digest,
+                "disposition": row.disposition,
+            }
+            for row in manifests
+        ],
+    }
+    cohort_digest = hashlib.sha256(
+        json.dumps(cohort_material, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    review_material = {
+        "cohort_digest": cohort_digest,
+        "reviews": [
+            {
+                "manifest_id": row.id,
+                "review_id": earliest_reviews[row.id].review_id,
+            }
+            for row in manifests
+            if row.id in earliest_reviews
+        ],
+    }
+    review_evidence_digest = hashlib.sha256(
+        json.dumps(review_material, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    result = {
+        "total": len(manifests),
+        "reviewed": reviewed,
+        "open": max(0, len(manifests) - reviewed),
+        "invalid_time": invalid_time,
+        "malformed": malformed,
+        "state": "REVIEW_REQUIRED",
+        "cohort_digest": cohort_digest,
+        "review_evidence_digest": review_evidence_digest,
+        "review_ids": [
+            earliest_reviews[row.id].review_id
+            for row in manifests
+            if row.id in earliest_reviews
+        ],
+        "mismatch_reasons": [],
+    }
+    if job.capture_certified_at is None:
+        if not result["open"]:
+            result["state"] = "REVIEWED_EXCLUSIONS"
+        return result
+
+    mismatches: list[str] = []
+    certificate = job.capture_certificate or {}
+    if job.source_epoch_id is None:
+        mismatches.append("SOURCE_EPOCH_MISSING")
+    if job.cutoff_count is None:
+        mismatches.append("CERTIFIED_CUTOFF_MISSING")
+    if job.committed_next_ordinal != job.cutoff_count:
+        mismatches.append("CHECKPOINT_CUTOFF_MISMATCH")
+    if certificate.get("certified_source_cursor") != job.cutoff_count:
+        mismatches.append("CERTIFICATE_CUTOFF_MISMATCH")
+    if certificate.get("source_chain_digest") != job.last_chain_digest:
+        mismatches.append("CERTIFICATE_CHAIN_MISMATCH")
+    if certificate.get("quarantined") != job.quarantined_count:
+        mismatches.append("CERTIFICATE_EXCEPTION_COUNT_MISMATCH")
+    if len(manifests) != job.quarantined_count:
+        mismatches.append("MANIFEST_EXCEPTION_COUNT_MISMATCH")
+    if any(row.attendance_event_id is not None for row in manifests):
+        mismatches.append("EXCEPTION_HAS_ATTENDANCE_EVENT")
+
+    coverage = session.scalar(
+        select(ReconciliationCoverage).where(
+            ReconciliationCoverage.job_id == job.id,
+            ReconciliationCoverage.active == True,  # noqa: E712
+        )
+    )
+    if coverage is None:
+        mismatches.append("ACTIVE_COVERAGE_MISSING")
+    else:
+        if coverage.source_epoch_id != job.source_epoch_id:
+            mismatches.append("COVERAGE_EPOCH_MISMATCH")
+        if coverage.certified_source_cursor != job.cutoff_count:
+            mismatches.append("COVERAGE_CUTOFF_MISMATCH")
+        if coverage.source_chain_digest != job.last_chain_digest:
+            mismatches.append("COVERAGE_CHAIN_MISMATCH")
+
+    result["mismatch_reasons"] = mismatches
+    if mismatches:
+        result["state"] = "SCOPE_MISMATCH"
+    elif not result["open"]:
+        result["state"] = "REVIEWED_EXCLUSIONS"
+    return result
+
+
+def _source_review_gate_evidence(
+    session: Session, job: ReconciliationJob, assurance: dict
+) -> dict:
+    idempotency_key = f"source-review-gate:{assurance['cohort_digest']}"
+    existing = session.scalar(
+        select(ReconciliationEvent).where(
+            ReconciliationEvent.job_id == job.id,
+            ReconciliationEvent.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        return existing.details or {}
+    evidence = _sealed_evidence(
+        {
+            "job_id": job.job_id,
+            "terminal_serial": job.terminal_serial,
+            "terminal_generation": job.terminal_generation,
+            "certified_source_cursor": job.cutoff_count,
+            "source_chain_digest": job.last_chain_digest,
+            "source_exception_count": assurance["total"],
+            "cohort_digest": assurance["cohort_digest"],
+            "review_evidence_digest": assurance["review_evidence_digest"],
+            "review_ids": assurance["review_ids"],
+            "cleared_at": utc_now().isoformat(),
+            "policy": "REVIEWED_FAIL_CLOSED_EXCLUSIONS",
+        }
+    )
+    _event(
+        session,
+        job,
+        "SOURCE_EXCEPTION_REVIEW_GATE_CLEARED",
+        evidence,
+        idempotency_key=idempotency_key,
+    )
+    return evidence
+
+
+def refresh_reconciliations_for_source_exception(
+    session: Session, row: TerminalRecordManifest
+) -> list[ReconciliationJob]:
+    jobs = session.scalars(
+        select(ReconciliationJob)
+        .where(
+            ReconciliationJob.zkt_device_id == row.zkt_device_id,
+            ReconciliationJob.terminal_generation == row.generation,
+            ReconciliationJob.source_epoch_id == row.source_epoch_id,
+            ReconciliationJob.cutoff_count > row.ordinal,
+            ReconciliationJob.capture_certified_at.is_not(None),
+            ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
+        )
+        .order_by(ReconciliationJob.id.asc())
+        .with_for_update()
+    ).all()
+    return [refresh_reconciliation_assurance(session, job) for job in jobs]
+
+
 def refresh_reconciliation_assurance(
     session: Session, job: ReconciliationJob
 ) -> ReconciliationJob:
+    locked = session.scalar(
+        select(ReconciliationJob)
+        .where(ReconciliationJob.id == job.id)
+        .with_for_update()
+    )
+    if locked is None:
+        return job
+    job = locked
     if job.status in TERMINAL_JOB_STATES:
         return job
     manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
@@ -1282,103 +1511,164 @@ def refresh_reconciliation_assurance(
         return job
     if job.status in PAUSED_JOB_STATES:
         return job
+    source_assurance = source_exception_assurance(session, job)
     managed_oracle_hold = (
         job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
     )
-    if job.status == "NEEDS_ATTENTION" and not managed_oracle_hold:
+    managed_source_hold = (
+        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH}
+        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH}
+        or (
+            job.quarantined_count > 0
+            and job.error_code is None
+            and job.phase in {"WAITING_FOR_IDENTITY", "FINAL_ASSURANCE"}
+            and job.wait_reason in {None, SOURCE_EXCEPTION_REVIEW_HOLD}
+        )
+    )
+    if (
+        job.status == "NEEDS_ATTENTION"
+        and not managed_oracle_hold
+        and not managed_source_hold
+    ):
         # Reconciliation assurance must never clear an unrelated source,
         # identity, device, or operator safety hold.
         return job
-    if job.quarantined_count:
+    gate_evidence: dict | None = None
+    if source_assurance["state"] == "SCOPE_MISMATCH":
         job.phase = "FINAL_ASSURANCE"
         job.status = "NEEDS_ATTENTION"
-        job.wait_reason = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
-    elif review > 0:
-        details = _sealed_evidence({
-            "job_id": job.job_id,
-            "oracle_target": target,
-            "oracle_confirmed": confirmed,
-            "identity_held": blocked,
-            "oracle_pending": pending,
-            "oracle_review_required": review,
-            "review_state_counts": review_state_counts,
-            "observed_at": now.isoformat(),
-            "policy": "APPEND_ONLY_MEMBERSHIP",
-        })
-        state_summary = ", ".join(
-            f"{status}={count}" for status, count in review_state_counts.items()
-        )
-        entering_hold = not managed_oracle_hold or job.status != "NEEDS_ATTENTION"
-        job.phase = "FINAL_ASSURANCE"
-        job.status = "NEEDS_ATTENTION"
-        job.wait_reason = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
-        job.error_code = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+        job.wait_reason = SOURCE_EXCEPTION_SCOPE_MISMATCH
+        job.error_code = SOURCE_EXCEPTION_SCOPE_MISMATCH
         job.error_message = (
-            f"{review:,} preserved attendance event(s) reached a terminal Oracle "
-            f"outcome requiring review ({state_summary}). No attendance or Oracle "
-            "rows were deleted; resolve the recorded outcome before retrying assurance."
+            "The certified source-exception cohort no longer matches its immutable "
+            "capture evidence. Automatic continuation remains fail-closed; inspect "
+            "the job evidence before taking any further action."
         )
-        if coverage:
-            coverage.oracle_state = "ORACLE_MEMBERSHIP_REVIEW_REQUIRED"
-            if entering_hold or counts_changed or not coverage.oracle_evidence:
-                coverage.oracle_evidence = details
-                coverage.updated_at = now
-        if entering_hold or counts_changed:
-            _event(session, job, "ORACLE_MEMBERSHIP_REVIEW_REQUIRED", details)
-    elif pending > 0:
-        job.phase = "DRAINING_ORDS"
-        job.status = "RUNNING"
-        job.wait_reason = None
-        if managed_oracle_hold:
-            job.error_code = None
-            job.error_message = None
-            _event(
-                session,
-                job,
-                "ORACLE_MEMBERSHIP_RETRYING",
-                {
-                    "oracle_pending": pending,
-                    "oracle_confirmed": confirmed,
-                    "identity_held": blocked,
-                },
-            )
-        if coverage:
-            coverage.oracle_state = "ORACLE_MEMBERSHIP_PENDING"
-            coverage.updated_at = now
-    else:
-        evidence = _sealed_evidence({
-            "job_id": job.job_id,
-            "terminal_serial": job.terminal_serial,
-            "certified_source_cursor": job.committed_next_ordinal,
-            "oracle_membership_confirmed": confirmed,
-            "blocked_identity": blocked,
-            "identity_held_by_status": identity_state_counts,
-            "oracle_review_required": 0,
-            "resolvable_event_count": target - blocked,
-            "source_chain_digest": job.last_chain_digest,
-            "certified_at": now.isoformat(),
-            "policy": "APPEND_ONLY_MEMBERSHIP",
-        })
-        job.oracle_certificate = evidence
-        job.oracle_certified_at = now
-        job.completed_at = now
+    elif source_assurance["state"] == "REVIEW_REQUIRED":
         job.phase = "FINAL_ASSURANCE"
-        job.status = "COMPLETED"
-        job.wait_reason = None
-        if managed_oracle_hold:
-            job.error_code = None
-            job.error_message = None
-        if coverage:
-            coverage.oracle_state = "ORACLE_MEMBERSHIP_CERTIFIED"
-            coverage.oracle_evidence = evidence
-            coverage.oracle_certified_at = now
-            coverage.updated_at = now
-        _event(session, job, "ORACLE_MEMBERSHIP_CERTIFIED", evidence)
+        job.status = "NEEDS_ATTENTION"
+        job.wait_reason = SOURCE_EXCEPTION_REVIEW_HOLD
+        job.error_code = SOURCE_EXCEPTION_REVIEW_HOLD
+        job.error_message = (
+            f"{source_assurance['open']:,} of {source_assurance['total']:,} "
+            "preserved invalid or malformed source record(s) still require "
+            "administrator review. The records remain excluded from attendance and "
+            "Oracle; reviewing the complete certified cohort resumes assurance "
+            "automatically from the existing checkpoint."
+        )
+    else:
+        if source_assurance["state"] == "REVIEWED_EXCLUSIONS":
+            gate_evidence = _source_review_gate_evidence(
+                session, job, source_assurance
+            )
+            job.review_required = True
+            if managed_source_hold:
+                job.wait_reason = None
+                job.error_code = None
+                job.error_message = None
+        if review > 0:
+            details = _sealed_evidence({
+                "job_id": job.job_id,
+                "oracle_target": target,
+                "oracle_confirmed": confirmed,
+                "identity_held": blocked,
+                "oracle_pending": pending,
+                "oracle_review_required": review,
+                "review_state_counts": review_state_counts,
+                "observed_at": now.isoformat(),
+                "policy": "APPEND_ONLY_MEMBERSHIP",
+            })
+            state_summary = ", ".join(
+                f"{status}={count}" for status, count in review_state_counts.items()
+            )
+            entering_hold = not managed_oracle_hold or job.status != "NEEDS_ATTENTION"
+            job.phase = "FINAL_ASSURANCE"
+            job.status = "NEEDS_ATTENTION"
+            job.wait_reason = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+            job.error_code = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
+            job.error_message = (
+                f"{review:,} preserved attendance event(s) reached a terminal Oracle "
+                f"outcome requiring review ({state_summary}). No attendance or Oracle "
+                "rows were deleted; resolve the recorded outcome before retrying assurance."
+            )
+            if coverage:
+                coverage.oracle_state = "ORACLE_MEMBERSHIP_REVIEW_REQUIRED"
+                if entering_hold or counts_changed or not coverage.oracle_evidence:
+                    coverage.oracle_evidence = details
+                    coverage.updated_at = now
+            if entering_hold or counts_changed:
+                _event(session, job, "ORACLE_MEMBERSHIP_REVIEW_REQUIRED", details)
+        elif pending > 0:
+            job.phase = "DRAINING_ORDS"
+            job.status = "RUNNING"
+            job.wait_reason = None
+            if managed_oracle_hold:
+                job.error_code = None
+                job.error_message = None
+                _event(
+                    session,
+                    job,
+                    "ORACLE_MEMBERSHIP_RETRYING",
+                    {
+                        "oracle_pending": pending,
+                        "oracle_confirmed": confirmed,
+                        "identity_held": blocked,
+                    },
+                )
+            if coverage:
+                coverage.oracle_state = "ORACLE_MEMBERSHIP_PENDING"
+                coverage.updated_at = now
+        else:
+            evidence_body = {
+                "job_id": job.job_id,
+                "terminal_serial": job.terminal_serial,
+                "certified_source_cursor": job.committed_next_ordinal,
+                "oracle_membership_confirmed": confirmed,
+                "blocked_identity": blocked,
+                "identity_held_by_status": identity_state_counts,
+                "oracle_review_required": 0,
+                "resolvable_event_count": target - blocked,
+                "source_chain_digest": job.last_chain_digest,
+                "certified_at": now.isoformat(),
+                "policy": "APPEND_ONLY_MEMBERSHIP",
+            }
+            if gate_evidence is not None:
+                evidence_body["reviewed_source_exceptions"] = {
+                    "count": source_assurance["total"],
+                    "cohort_digest": source_assurance["cohort_digest"],
+                    "review_evidence_digest": source_assurance[
+                        "review_evidence_digest"
+                    ],
+                    "gate_evidence_signature": gate_evidence.get(
+                        "evidence_signature"
+                    ),
+                    "policy": "EXCLUDED_FAIL_CLOSED",
+                }
+            evidence = _sealed_evidence(evidence_body)
+            job.oracle_certificate = evidence
+            job.oracle_certified_at = now
+            job.completed_at = now
+            job.phase = "FINAL_ASSURANCE"
+            job.status = "COMPLETED"
+            job.wait_reason = None
+            if gate_evidence is not None:
+                job.completion_outcome = (
+                    "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS"
+                )
+            if managed_oracle_hold or managed_source_hold:
+                job.error_code = None
+                job.error_message = None
+            if coverage:
+                coverage.oracle_state = "ORACLE_MEMBERSHIP_CERTIFIED"
+                coverage.oracle_evidence = evidence
+                coverage.oracle_certified_at = now
+                coverage.updated_at = now
+            _event(session, job, "ORACLE_MEMBERSHIP_CERTIFIED", evidence)
     job.updated_at = now
     return job
 
 
-def refresh_all_reconciliation_assurance(session: Session) -> int:
+def refresh_all_reconciliation_assurance(session: Session) -> list[dict]:
     rows = session.scalars(
         select(ReconciliationJob).where(
             ReconciliationJob.capture_certified_at.is_not(None),
@@ -1386,9 +1676,37 @@ def refresh_all_reconciliation_assurance(session: Session) -> int:
             ReconciliationJob.status.not_in(PAUSED_JOB_STATES),
         )
     ).all()
+    updates: list[dict] = []
     for row in rows:
+        before = (
+            row.status,
+            row.phase,
+            row.wait_reason,
+            row.error_code,
+            row.ords_confirmed_count,
+            row.ords_pending_count,
+            row.ords_review_count,
+        )
         refresh_reconciliation_assurance(session, row)
-    return len(rows)
+        after = (
+            row.status,
+            row.phase,
+            row.wait_reason,
+            row.error_code,
+            row.ords_confirmed_count,
+            row.ords_pending_count,
+            row.ords_review_count,
+        )
+        if before != after:
+            updates.append(
+                {
+                    "job_id": row.job_id,
+                    "status": row.status,
+                    "phase": row.phase,
+                    "wait_reason": row.wait_reason,
+                }
+            )
+    return updates
 
 
 def assignment_rows(session: Session) -> list[tuple[str, dict]]:
@@ -1718,6 +2036,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
     )
     source_epoch = session.get(TerminalSourceEpoch, job.source_epoch_id)
     operator_state, operator_message = _operator_status(job, connected=bool(connector and connector.connected))
+    exception_assurance = source_exception_assurance(session, job)
     result = {
         "job_id": job.job_id,
         "mode": job.mode,
@@ -1730,6 +2049,15 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         "operator_message": operator_message,
         "completion_outcome": job.completion_outcome,
         "review_required": job.review_required,
+        "source_exception_assurance": {
+            "total": exception_assurance["total"],
+            "reviewed": exception_assurance["reviewed"],
+            "open": exception_assurance["open"],
+            "invalid_time": exception_assurance["invalid_time"],
+            "malformed": exception_assurance["malformed"],
+            "state": exception_assurance["state"],
+            "cohort_digest": exception_assurance.get("cohort_digest"),
+        },
         "connector": None if connector is None else {
             "connector_id": connector.connector_id,
             "device_id": connector.device_id,
@@ -2418,6 +2746,14 @@ def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, s
         return (
             "REVIEW_REQUIRED",
             job.error_message or "A correctness check needs administrator review; committed progress remains safe.",
+        )
+    if (
+        job.status == "COMPLETED"
+        and job.completion_outcome == "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS"
+    ):
+        return (
+            "COMPLETED_WITH_REVIEW",
+            "Terminal source coverage and Oracle membership are certified. Reviewed invalid or malformed source records remain preserved and excluded fail-closed.",
         )
     if job.status == "COMPLETED" and job.review_required:
         return (

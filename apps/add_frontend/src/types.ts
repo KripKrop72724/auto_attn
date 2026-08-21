@@ -224,6 +224,23 @@ export interface SourceExceptionList {
   filtered_total: number
   rows: SourceException[]
   next_cursor: number | null
+  scope?: {
+    job_id: string
+    device_id: string | null
+    terminal_serial: string | null
+    cutoff_count: number | null
+    source_exception_assurance: SourceExceptionAssurance
+  }
+}
+
+export interface SourceExceptionAssurance {
+  total: number
+  reviewed: number
+  open: number
+  invalid_time: number
+  malformed: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'SCOPE_MISMATCH'
+  cohort_digest: string | null
 }
 
 export interface SourceExceptionReveal {
@@ -273,6 +290,7 @@ export interface ReconciliationJob {
   operator_message?: string
   completion_outcome?: string | null
   review_required?: boolean
+  source_exception_assurance: SourceExceptionAssurance
   connector: null | {
     connector_id: string
     device_id: string
