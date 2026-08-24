@@ -396,6 +396,7 @@ class AttendanceBatchReceipt(Base):
             "connector_id",
             "batch_id",
             "payload_digest",
+            "reported_digest_key",
             name="uq_add_attendance_batch_receipt_identity",
         ),
     )
@@ -413,6 +414,7 @@ class AttendanceBatchReceipt(Base):
     batch_id: Mapped[str] = mapped_column(String(120), index=True)
     payload_digest: Mapped[str] = mapped_column(String(64), index=True)
     reported_payload_digest: Mapped[str | None] = mapped_column(String(128))
+    reported_digest_key: Mapped[str] = mapped_column(String(64))
     outcome: Mapped[str] = mapped_column(String(50), index=True)
     item_count: Mapped[int] = mapped_column(Integer)
     accepted_count: Mapped[int] = mapped_column(Integer, default=0)

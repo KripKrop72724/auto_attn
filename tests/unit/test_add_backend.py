@@ -20,6 +20,7 @@ import zk_add.worker as worker
 import zk_add.web as add_web
 from zk_add.attendance_batches import (
     attendance_quarantine_summary,
+    payload_digest,
     reveal_attendance_quarantine,
     review_attendance_quarantine,
     settle_attendance_batch,
@@ -3540,6 +3541,61 @@ def test_attendance_batch_retry_returns_same_receipt_without_reinserting(db: Ses
     assert db.scalar(select(func.count()).select_from(AttendanceBatchItem)) == 1
     assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
     assert db.scalar(select(AttendanceBatchReceipt).limit(1)).observation_count == 2
+
+
+@pytest.mark.parametrize("reported_value", ["f" * 64, "malformed-digest"])
+def test_attendance_batch_retry_with_changed_reported_digest_is_quarantined(
+    db: Session,
+    reported_value: str,
+):
+    connector = connector_fixture(db)
+    incoming = event(event_uid="d" * 64).model_dump(mode="json")
+    digest = payload_digest([incoming])
+    committed_payload = {
+        "batch_id": "reported-digest-changed-on-retry",
+        "payload_digest": digest,
+        "events": [incoming],
+    }
+    changed_report_payload = {
+        **committed_payload,
+        "payload_digest": reported_value,
+    }
+
+    committed = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload=committed_payload,
+    )
+    db.flush()
+    quarantined = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload=changed_report_payload,
+    )
+    db.flush()
+    quarantined_replay = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload=changed_report_payload,
+    )
+    committed_replay = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload=committed_payload,
+    )
+    db.flush()
+
+    assert committed.outcome == "COMMITTED"
+    assert committed_replay.receipt_id == committed.receipt_id
+    assert quarantined.outcome == "QUARANTINED"
+    assert quarantined.accepted_count == 0
+    assert quarantined.quarantined_count == 1
+    assert quarantined.rejected[0]["code"] == "ATTENDANCE_BATCH_DIGEST_MISMATCH"
+    assert quarantined_replay.duplicate_batch is True
+    assert quarantined_replay.receipt_id == quarantined.receipt_id
+    assert quarantined.receipt_id != committed.receipt_id
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 2
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
 
 
 def test_attendance_batch_id_reuse_with_changed_payload_is_durably_quarantined(

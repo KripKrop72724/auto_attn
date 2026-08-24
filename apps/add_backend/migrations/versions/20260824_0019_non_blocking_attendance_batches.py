@@ -40,6 +40,7 @@ def upgrade() -> None:
             sa.Column("batch_id", sa.String(120), nullable=False),
             sa.Column("payload_digest", sa.String(64), nullable=False),
             sa.Column("reported_payload_digest", sa.String(128)),
+            sa.Column("reported_digest_key", sa.String(64), nullable=False),
             sa.Column("outcome", sa.String(50), nullable=False),
             sa.Column("item_count", sa.Integer(), nullable=False),
             sa.Column("accepted_count", sa.Integer(), nullable=False, server_default="0"),
@@ -53,6 +54,7 @@ def upgrade() -> None:
                 "connector_id",
                 "batch_id",
                 "payload_digest",
+                "reported_digest_key",
                 name="uq_add_attendance_batch_receipt_identity",
             ),
         )

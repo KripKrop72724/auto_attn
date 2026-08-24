@@ -59,6 +59,11 @@ def _item_digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _reported_digest_key(value: object, *, valid: bool) -> str:
+    state = "ABSENT" if value is None else ("VALID" if valid else "INVALID")
+    return payload_digest({"state": state, "value": value})
+
+
 def _safe_event_uid(value: object) -> str | None:
     return value if isinstance(value, str) and _HEX_64.fullmatch(value) else None
 
@@ -185,6 +190,7 @@ def _create_receipt(
     batch_id: str,
     digest: str,
     reported_digest: str | None,
+    reported_digest_key: str,
     item_count: int,
 ) -> AttendanceBatchReceipt:
     if connector.zkt_device is None:
@@ -196,6 +202,7 @@ def _create_receipt(
         batch_id=batch_id,
         payload_digest=digest,
         reported_payload_digest=reported_digest,
+        reported_digest_key=reported_digest_key,
         outcome="PENDING",
         item_count=item_count,
         first_seen_at=now,
@@ -313,6 +320,10 @@ def settle_attendance_batch(
         isinstance(reported_value, str) and _HEX_64.fullmatch(reported_value) is not None
     )
     reported_digest = reported_value if reported_digest_valid else None
+    reported_digest_key = _reported_digest_key(
+        reported_value,
+        valid=reported_digest_valid,
+    )
     item_count = len(raw_events) if isinstance(raw_events, list) else 0
 
     existing = session.scalar(
@@ -320,6 +331,7 @@ def settle_attendance_batch(
             AttendanceBatchReceipt.connector_id == connector.id,
             AttendanceBatchReceipt.batch_id == batch_id,
             AttendanceBatchReceipt.payload_digest == digest,
+            AttendanceBatchReceipt.reported_digest_key == reported_digest_key,
         )
     )
     if existing is not None:
@@ -340,6 +352,7 @@ def settle_attendance_batch(
         batch_id=batch_id,
         digest=digest,
         reported_digest=reported_digest,
+        reported_digest_key=reported_digest_key,
         item_count=item_count,
     )
 
