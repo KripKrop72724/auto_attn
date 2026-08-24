@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -17,6 +17,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 import zk_add.worker as worker
+import zk_add.web as add_web
+from zk_add.attendance_batches import (
+    attendance_quarantine_summary,
+    reveal_attendance_quarantine,
+    review_attendance_quarantine,
+    settle_attendance_batch,
+)
 from zk_add.crypto import (
     cnic_lookup,
     decrypt_cnic,
@@ -32,6 +39,8 @@ from zk_add.identity_conflicts import (
     create_same_employee_resolution,
 )
 from zk_add.models import (
+    AttendanceBatchItem,
+    AttendanceBatchReceipt,
     AttendanceEvent,
     AuditEvent,
     Connector,
@@ -55,6 +64,7 @@ from zk_add.protocol import body_sha256, sign_request, signature_material
 from zk_add.schemas import (
     AttendanceBatchRequest,
     AttendanceEventIn,
+    Envelope,
     HeartbeatPayload,
     OracleReceiptBatchRequest,
     UserCreateRequest,
@@ -88,6 +98,7 @@ from zk_add.service import (
     repair_verified_active_identity_backlog,
     repair_verified_tombstone_backlog,
     replace_user_snapshot,
+    resolve_message_rejection,
     record_oracle_receipts,
     reconcile_admin_lease_states,
     serialize_command,
@@ -3372,6 +3383,324 @@ def test_attendance_rejects_corrupt_event_uids_and_ords_conflicts_are_idempotent
     assert ords_delivery_succeeded(409, {"message": "resource already exists"})
     assert ords_delivery_succeeded(201, {"success": True})
     assert not ords_delivery_succeeded(400, {"success": False})
+
+
+def test_attendance_batch_quarantines_one_poison_row_without_blocking_neighbors(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    first = event(event_uid="1" * 64).model_dump(mode="json")
+    poison = event(event_uid="2" * 64).model_dump(mode="json")
+    poison["event_uid"] = "2" * 31 + "?" + "2" * 32
+    last = event(event_uid="3" * 64).model_dump(mode="json")
+    payload = {"batch_id": "mixed-valid-and-poison", "events": [first, poison, last]}
+
+    settlement = settle_attendance_batch(db, connector=connector, payload=payload)
+    db.flush()
+
+    assert settlement.outcome == "COMMITTED_WITH_QUARANTINE"
+    assert settlement.accepted_event_uids == ["1" * 64, "3" * 64]
+    assert settlement.duplicate_event_uids == []
+    assert settlement.quarantined_count == 1
+    assert [row["index"] for row in settlement.rejected] == [1]
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 2
+    assert db.scalar(select(func.count()).select_from(OrdsOutbox)) == 2
+
+    receipt = db.scalar(select(AttendanceBatchReceipt))
+    assert receipt is not None
+    assert receipt.accepted_count == 2
+    assert receipt.quarantined_count == 1
+    items = db.scalars(
+        select(AttendanceBatchItem).order_by(AttendanceBatchItem.item_index)
+    ).all()
+    assert [row.disposition for row in items] == ["ACCEPTED", "QUARANTINED", "ACCEPTED"]
+    assert items[1].event_uid is None
+    assert items[1].protected_payload
+    assert decrypt_json(items[1].protected_payload)["event_uid"] == poison["event_uid"]
+    alert = db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ATTENDANCE_EVENT_QUARANTINED",
+            DeviceAlert.state == "OPEN",
+        )
+    )
+    assert alert is not None
+    assert alert.severity == "MEDIUM"
+    assert connector.lifecycle_state == "ONLINE"
+
+
+def test_attendance_batch_retry_returns_same_receipt_without_reinserting(db: Session):
+    connector = connector_fixture(db)
+    incoming = event(event_uid="4" * 64).model_dump(mode="json")
+    payload = {"batch_id": "stable-retry", "events": [incoming]}
+
+    first = settle_attendance_batch(db, connector=connector, payload=payload)
+    db.flush()
+    replay = settle_attendance_batch(db, connector=connector, payload=payload)
+    db.flush()
+
+    assert replay.duplicate_batch is True
+    assert replay.receipt_id == first.receipt_id
+    assert replay.accepted_event_uids == first.accepted_event_uids
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 1
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchItem)) == 1
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
+    assert db.scalar(select(AttendanceBatchReceipt).limit(1)).observation_count == 2
+
+
+def test_attendance_batch_id_reuse_with_changed_payload_is_durably_quarantined(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    first_payload = {
+        "batch_id": "reused-batch-id",
+        "events": [event(event_uid="5" * 64).model_dump(mode="json")],
+    }
+    changed_payload = {
+        "batch_id": "reused-batch-id",
+        "events": [event(event_uid="6" * 64).model_dump(mode="json")],
+    }
+
+    settle_attendance_batch(db, connector=connector, payload=first_payload)
+    db.flush()
+    conflict = settle_attendance_batch(db, connector=connector, payload=changed_payload)
+    db.flush()
+
+    assert conflict.outcome == "QUARANTINED"
+    assert conflict.accepted_count == 0
+    assert conflict.rejected[0]["code"] == "ATTENDANCE_BATCH_ID_CONFLICT"
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 2
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
+
+
+def test_attendance_quarantine_review_is_safe_audited_and_idempotent(db: Session):
+    connector = connector_fixture(db)
+    poison = event(event_uid="7" * 64, raw_name=f"Sensitive-{CNIC}").model_dump(
+        mode="json"
+    )
+    poison["source"] = "UNSUPPORTED"
+    settle_attendance_batch(
+        db,
+        connector=connector,
+        payload={"batch_id": "reviewable-poison", "events": [poison]},
+    )
+    db.flush()
+    item = db.scalar(select(AttendanceBatchItem))
+    assert item is not None
+
+    summary = attendance_quarantine_summary(db, connector_id=connector.id)
+    assert summary["totals"] == {"all": 1, "open": 1}
+    assert summary["rows"][0]["error_path"] == "source"
+    assert CNIC not in json.dumps(summary, default=str)
+    revealed = reveal_attendance_quarantine(
+        db,
+        item=item,
+        actor="reviewer",
+        reason="Investigating the rejected source value.",
+        idempotency_key="reveal-attendance-0001",
+    )
+    reveal_attendance_quarantine(
+        db,
+        item=item,
+        actor="reviewer",
+        reason="Investigating the rejected source value.",
+        idempotency_key="reveal-attendance-0001",
+    )
+    db.flush()
+    assert revealed["payload"]["raw_name"] == f"Sensitive-{CNIC}"
+    assert db.scalar(
+        select(func.count(AuditEvent.id)).where(
+            AuditEvent.action == "ATTENDANCE_QUARANTINE_EVIDENCE_REVEALED"
+        )
+    ) == 1
+
+    review_attendance_quarantine(
+        db,
+        item=item,
+        actor="reviewer",
+        reason="Confirmed malformed terminal source; no replay required.",
+        idempotency_key="review-attendance-0001",
+    )
+    review_attendance_quarantine(
+        db,
+        item=item,
+        actor="reviewer",
+        reason="Confirmed malformed terminal source; no replay required.",
+        idempotency_key="review-attendance-0001",
+    )
+    db.flush()
+    assert item.review_state == "REVIEWED"
+    assert attendance_quarantine_summary(db, connector_id=connector.id)["totals"] == {
+        "all": 1,
+        "open": 0,
+    }
+    assert db.scalar(
+        select(func.count(AuditEvent.id)).where(
+            AuditEvent.action == "ATTENDANCE_QUARANTINE_REVIEWED"
+        )
+    ) == 1
+    assert db.scalar(
+        select(func.count(DeviceAlert.id)).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ATTENDANCE_EVENT_QUARANTINED",
+            DeviceAlert.state == "OPEN",
+        )
+    ) == 0
+
+
+def test_attendance_batch_storage_failure_rolls_back_without_a_false_settlement(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    payload = {
+        "batch_id": "must-not-ack",
+        "events": [event(event_uid="8" * 64).model_dump(mode="json")],
+    }
+
+    def fail_flush(*_args):
+        raise RuntimeError("simulated durable storage failure")
+
+    sqlalchemy_event.listen(db, "before_flush", fail_flush)
+    try:
+        with pytest.raises(RuntimeError, match="durable storage failure"):
+            settle_attendance_batch(db, connector=connector, payload=payload)
+    finally:
+        sqlalchemy_event.remove(db, "before_flush", fail_flush)
+        db.rollback()
+
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 0
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchItem)) == 0
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 0
+
+
+def test_websocket_attendance_ack_is_emitted_only_after_durable_commit(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connector = connector_fixture(db)
+    committed = False
+
+    @contextmanager
+    def tracked_scope():
+        nonlocal committed
+        try:
+            yield db
+            db.commit()
+            committed = True
+        except Exception:
+            db.rollback()
+            raise
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages: list[dict] = []
+
+        async def send_json(self, message: dict):
+            assert committed is True
+            self.messages.append(message)
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    websocket = FakeWebSocket()
+    envelope = Envelope(
+        schema_version="2",
+        message_id="commit-before-ack-1",
+        connector_id=connector.connector_id,
+        boot_id="boot-commit-before-ack",
+        seq=1,
+        sent_at=utc_now(),
+        type="attendance_batch",
+        payload={
+            "batch_id": "commit-before-ack",
+            "events": [event(event_uid="9" * 64).model_dump(mode="json")],
+        },
+    )
+
+    asyncio.run(add_web.handle_envelope(connector.id, envelope, websocket))
+
+    assert websocket.messages[0]["type"] == "ack"
+    assert websocket.messages[0]["outcome"] == "COMMITTED"
+    assert websocket.messages[0]["accepted"] == 1
+    assert websocket.messages[0]["quarantined"] == 0
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 1
+
+
+def test_websocket_attendance_storage_failure_never_emits_ack(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connector = connector_fixture(db)
+
+    @contextmanager
+    def tracked_scope():
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages: list[dict] = []
+
+        async def send_json(self, message: dict):
+            self.messages.append(message)
+
+    def fail_settlement(*_args, **_kwargs):
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    monkeypatch.setattr(add_web, "settle_attendance_batch", fail_settlement)
+    websocket = FakeWebSocket()
+    envelope = Envelope(
+        schema_version="2",
+        message_id="no-false-ack-1",
+        connector_id=connector.connector_id,
+        boot_id="boot-no-false-ack",
+        seq=1,
+        sent_at=utc_now(),
+        type="attendance_batch",
+        payload={
+            "batch_id": "no-false-ack",
+            "events": [event(event_uid="a" * 64).model_dump(mode="json")],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="database outage"):
+        asyncio.run(add_web.handle_envelope(connector.id, envelope, websocket))
+
+    assert websocket.messages == []
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 0
+
+
+def test_successful_message_only_resolves_rejection_for_the_same_path(db: Session):
+    connector = connector_fixture(db)
+    connector.lifecycle_state = "DEGRADED"
+    connector.last_error_code = "DEVICE_MESSAGE_REJECTED"
+    connector.last_error_message = "attendance_batch message was rejected."
+    alert = upsert_alert(
+        db,
+        connector,
+        code="DEVICE_MESSAGE_REJECTED",
+        severity="HIGH",
+        message="attendance_batch message was rejected.",
+        details={"message_type": "attendance_batch", "error_type": "ValidationError"},
+    )
+    db.flush()
+
+    assert not resolve_message_rejection(
+        db, connector, message_type="user_snapshot"
+    )
+    assert alert.state == "OPEN"
+    assert connector.lifecycle_state == "DEGRADED"
+    assert resolve_message_rejection(
+        db, connector, message_type="attendance_batch"
+    )
+    assert alert.state == "RESOLVED"
+    assert connector.lifecycle_state == "ONLINE"
+    assert connector.last_error_code is None
 
 
 def test_oracle_receipts_are_durable_idempotent_and_order_independent(db: Session):

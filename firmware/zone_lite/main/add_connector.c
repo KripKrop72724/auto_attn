@@ -66,6 +66,7 @@
 #define ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS 12000
 #define ADD_PRIORITY_HOLD_MS 3000
 #define ADD_OUTBOX_RETRY_MS 5000
+#define ADD_OUTBOX_RETRY_MAX_MS 60000
 #define ADD_TRANSPORT_RECOVERY_MS 45000
 #define ADD_TRANSPORT_RESTART_GUARD_MS 45000
 #define ADD_OUTBOX_LINE_BYTES 8192
@@ -86,6 +87,8 @@
 #define ADD_LIVE_OUTBOX_CURSOR_PATH "/storage/add_live.pos"
 #define ADD_LIVE_OUTBOX_CURSOR_TMP_PATH "/storage/add_live.pos.tmp"
 #define ADD_CORRUPT_OUTBOX_PATH "/storage/add_corrupt.jsonl"
+#define ADD_CORRUPT_OUTBOX_BACKUP_PATH "/storage/add_corrupt.bak"
+#define ADD_CORRUPT_OUTBOX_MAX_BYTES (128 * 1024)
 #define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
 #define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
 #define ADD_COMMAND_LINE_BYTES 12288
@@ -108,6 +111,15 @@ typedef struct {
     const char *label;
     SemaphoreHandle_t lock;
 } add_outbox_t;
+
+typedef struct {
+    char receipt_id[40];
+    char outcome[52];
+    uint32_t accepted;
+    uint32_t duplicates;
+    uint32_t quarantined;
+    bool valid;
+} add_attendance_settlement_ack_t;
 
 typedef struct {
     char *data;
@@ -142,6 +154,7 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
 static add_source_tail_ack_t s_source_tail_ack;
 static char s_reconcile_last_job_id[40];
@@ -423,7 +436,8 @@ static bool send_payload_and_wait_for_ack(
     const char *payload_json,
     TickType_t lock_timeout,
     TickType_t ack_timeout,
-    add_reconcile_chunk_ack_t *reconcile_ack_out)
+    add_reconcile_chunk_ack_t *reconcile_ack_out,
+    add_attendance_settlement_ack_t *attendance_ack_out)
 {
     if (!s_ack_wait_lock ||
         xSemaphoreTake(s_ack_wait_lock, lock_timeout) != pdTRUE) {
@@ -437,6 +451,9 @@ static bool send_payload_and_wait_for_ack(
         acknowledged = s_ack_matched;
         if (acknowledged && reconcile_ack_out) {
             *reconcile_ack_out = s_reconcile_chunk_ack;
+        }
+        if (acknowledged && attendance_ack_out) {
+            *attendance_ack_out = s_attendance_settlement_ack;
         }
         s_ack_matched = false;
         xSemaphoreGive(s_lock);
@@ -464,6 +481,7 @@ bool add_connector_send_payload_acknowledged(
         payload_json,
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
+        NULL,
         NULL);
 }
 
@@ -479,7 +497,8 @@ bool add_connector_send_reconcile_chunk_acknowledged(
         payload_json,
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
-        ack_out);
+        ack_out,
+        NULL);
 }
 
 bool add_connector_send_source_tail_acknowledged(
@@ -498,6 +517,7 @@ bool add_connector_send_source_tail_acknowledged(
         payload_json,
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
+        NULL,
         NULL);
     if (!acknowledged || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
         return false;
@@ -1490,6 +1510,10 @@ static void parse_inbound(const char *data, size_t len)
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
                 memset(&s_reconcile_chunk_ack, 0, sizeof(s_reconcile_chunk_ack));
                 memset(&s_source_tail_ack, 0, sizeof(s_source_tail_ack));
+                memset(
+                    &s_attendance_settlement_ack,
+                    0,
+                    sizeof(s_attendance_settlement_ack));
                 if (strcmp(type->valuestring, "reconcile_chunk_ack") == 0) {
                     cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
                     cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
@@ -1546,6 +1570,41 @@ static void parse_inbound(const char *data, size_t len)
                             ? (uint32_t)exception_count->valuedouble
                             : 0;
                         s_source_tail_ack.valid = true;
+                    }
+                } else if (strcmp(type->valuestring, "ack") == 0) {
+                    cJSON *message_type = cJSON_GetObjectItemCaseSensitive(
+                        root, "message_type");
+                    if (cJSON_IsString(message_type) &&
+                        strcmp(message_type->valuestring, "attendance_batch") == 0) {
+                        cJSON *receipt_id = cJSON_GetObjectItemCaseSensitive(
+                            root, "receipt_id");
+                        cJSON *outcome = cJSON_GetObjectItemCaseSensitive(root, "outcome");
+                        cJSON *accepted = cJSON_GetObjectItemCaseSensitive(root, "accepted");
+                        cJSON *duplicates = cJSON_GetObjectItemCaseSensitive(root, "duplicates");
+                        cJSON *quarantined = cJSON_GetObjectItemCaseSensitive(
+                            root, "quarantined");
+                        if (cJSON_IsString(receipt_id) &&
+                            strlen(receipt_id->valuestring) == 36 &&
+                            cJSON_IsString(outcome) && outcome->valuestring[0] &&
+                            cJSON_IsNumber(accepted) && accepted->valuedouble >= 0 &&
+                            cJSON_IsNumber(duplicates) && duplicates->valuedouble >= 0 &&
+                            cJSON_IsNumber(quarantined) && quarantined->valuedouble >= 0) {
+                            strlcpy(
+                                s_attendance_settlement_ack.receipt_id,
+                                receipt_id->valuestring,
+                                sizeof(s_attendance_settlement_ack.receipt_id));
+                            strlcpy(
+                                s_attendance_settlement_ack.outcome,
+                                outcome->valuestring,
+                                sizeof(s_attendance_settlement_ack.outcome));
+                            s_attendance_settlement_ack.accepted =
+                                (uint32_t)accepted->valuedouble;
+                            s_attendance_settlement_ack.duplicates =
+                                (uint32_t)duplicates->valuedouble;
+                            s_attendance_settlement_ack.quarantined =
+                                (uint32_t)quarantined->valuedouble;
+                            s_attendance_settlement_ack.valid = true;
+                        }
                     }
                 }
                 s_waiting_ack[0] = '\0';
@@ -2269,30 +2328,81 @@ static bool attendance_source_is_valid(const char *value)
     return value &&
         (strcmp(value, "LIVE") == 0 || strcmp(value, "LIVE_POLL") == 0 ||
          strcmp(value, "DUMP_STARTUP") == 0 || strcmp(value, "DUMP_RECONNECT") == 0 ||
-         strcmp(value, "MANUAL_REPROCESS") == 0);
+         strcmp(value, "MANUAL_REPROCESS") == 0 ||
+         strcmp(value, "RECONCILE_15M") == 0 ||
+         strcmp(value, "FULL_HISTORY") == 0 ||
+         strcmp(value, "CURRENT_RECONCILE") == 0);
+}
+
+static bool json_optional_string(const cJSON *value)
+{
+    return !value || cJSON_IsNull(value) || cJSON_IsString(value);
+}
+
+static bool json_optional_string_or_number(const cJSON *value)
+{
+    return !value || cJSON_IsNull(value) || cJSON_IsString(value) ||
+        cJSON_IsNumber(value);
 }
 
 static bool attendance_payload_is_valid(const cJSON *payload)
 {
+    const cJSON *batch_id = cJSON_GetObjectItemCaseSensitive(payload, "batch_id");
+    const cJSON *reported_digest = cJSON_GetObjectItemCaseSensitive(
+        payload, "payload_digest");
     const cJSON *events = cJSON_GetObjectItemCaseSensitive(payload, "events");
     int count = cJSON_IsArray(events) ? cJSON_GetArraySize(events) : 0;
-    if (count < 1 || count > 100) return false;
+    if (!cJSON_IsString(batch_id) || !batch_id->valuestring[0] ||
+        strlen(batch_id->valuestring) > 120 || count < 1 || count > 100 ||
+        (reported_digest && !cJSON_IsNull(reported_digest) &&
+         (!cJSON_IsString(reported_digest) ||
+          !attendance_event_uid_is_valid(reported_digest->valuestring)))) {
+        return false;
+    }
     const cJSON *event = NULL;
     cJSON_ArrayForEach(event, events) {
         const cJSON *event_uid = cJSON_GetObjectItemCaseSensitive(event, "event_uid");
+        const cJSON *uid = cJSON_GetObjectItemCaseSensitive(event, "uid");
+        const cJSON *identity_fingerprint = cJSON_GetObjectItemCaseSensitive(
+            event, "terminal_identity_fingerprint");
         const cJSON *user_id = cJSON_GetObjectItemCaseSensitive(event, "user_id");
+        const cJSON *raw_name = cJSON_GetObjectItemCaseSensitive(event, "raw_name");
         const cJSON *device_time = cJSON_GetObjectItemCaseSensitive(event, "device_event_time");
         const cJSON *captured_at = cJSON_GetObjectItemCaseSensitive(event, "captured_at");
         const cJSON *source = cJSON_GetObjectItemCaseSensitive(event, "source");
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(event, "status");
+        const cJSON *punch = cJSON_GetObjectItemCaseSensitive(event, "punch");
+        const cJSON *raw_punch = cJSON_GetObjectItemCaseSensitive(event, "raw_punch");
+        const cJSON *clock_drift = cJSON_GetObjectItemCaseSensitive(
+            event, "clock_drift_seconds");
+        const cJSON *clock_quality = cJSON_GetObjectItemCaseSensitive(
+            event, "clock_quality");
+        const cJSON *boot_id = cJSON_GetObjectItemCaseSensitive(event, "boot_id");
+        const cJSON *sequence = cJSON_GetObjectItemCaseSensitive(event, "sequence");
+        const cJSON *raw_event = cJSON_GetObjectItemCaseSensitive(event, "raw_event");
         if (!cJSON_IsObject(event) || !cJSON_IsString(event_uid) ||
             !attendance_event_uid_is_valid(event_uid->valuestring) ||
+            !json_optional_string(uid) ||
+            (identity_fingerprint && !cJSON_IsNull(identity_fingerprint) &&
+             (!cJSON_IsString(identity_fingerprint) ||
+              !attendance_event_uid_is_valid(identity_fingerprint->valuestring))) ||
             !cJSON_IsString(user_id) || !user_id->valuestring[0] ||
             strlen(user_id->valuestring) > 100 ||
+            !json_optional_string(raw_name) ||
             !cJSON_IsString(device_time) ||
             !attendance_timestamp_is_valid(device_time->valuestring) ||
             !cJSON_IsString(captured_at) ||
             !attendance_timestamp_is_valid(captured_at->valuestring) ||
-            !cJSON_IsString(source) || !attendance_source_is_valid(source->valuestring)) {
+            !cJSON_IsString(source) || !attendance_source_is_valid(source->valuestring) ||
+            !json_optional_string_or_number(status) ||
+            !json_optional_string_or_number(punch) ||
+            (raw_punch && !cJSON_IsBool(raw_punch)) ||
+            (clock_drift && !cJSON_IsNull(clock_drift) &&
+             !cJSON_IsNumber(clock_drift)) ||
+            (clock_quality && !cJSON_IsString(clock_quality)) ||
+            !json_optional_string(boot_id) ||
+            (sequence && !cJSON_IsNull(sequence) && !cJSON_IsNumber(sequence)) ||
+            (raw_event && !cJSON_IsObject(raw_event))) {
             return false;
         }
     }
@@ -2336,14 +2446,34 @@ static bool oracle_receipt_payload_is_valid(const cJSON *payload)
     return true;
 }
 
-static void preserve_corrupt_outbox_row(const char *line)
+static bool preserve_corrupt_outbox_row(const char *line)
 {
+    if (!line) return false;
+    size_t required = strlen(line) + 1;
+    if (required > ADD_CORRUPT_OUTBOX_MAX_BYTES) return false;
+    struct stat current = {0};
+    off_t current_bytes = stat(ADD_CORRUPT_OUTBOX_PATH, &current) == 0
+        ? current.st_size
+        : 0;
+    bool rotated = false;
+    if (current_bytes + (off_t)required > ADD_CORRUPT_OUTBOX_MAX_BYTES) {
+        (void)remove(ADD_CORRUPT_OUTBOX_BACKUP_PATH);
+        if (rename(
+                ADD_CORRUPT_OUTBOX_PATH,
+                ADD_CORRUPT_OUTBOX_BACKUP_PATH) != 0) {
+            return false;
+        }
+        rotated = true;
+    }
     FILE *file = fopen(ADD_CORRUPT_OUTBOX_PATH, "a");
-    if (!file) return;
-    (void)fprintf(file, "%s\n", line);
-    (void)fflush(file);
-    (void)fsync(fileno(file));
-    fclose(file);
+    bool ok = file && fprintf(file, "%s\n", line) > 0 &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (file && fclose(file) != 0) ok = false;
+    if (!ok && rotated) {
+        (void)remove(ADD_CORRUPT_OUTBOX_PATH);
+        (void)rename(ADD_CORRUPT_OUTBOX_BACKUP_PATH, ADD_CORRUPT_OUTBOX_PATH);
+    }
+    return ok;
 }
 
 static char *outbox_record_line(
@@ -2436,6 +2566,7 @@ static bool deliver_attendance_payloads_acknowledged(
                 payloads[i],
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS),
+                NULL,
                 NULL)) {
             ok = false;
             break;
@@ -2825,6 +2956,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
 static void outbox_task(void *arg)
 {
     (void)arg;
+    uint32_t retry_ms = ADD_OUTBOX_RETRY_MS;
     char *line = allocate_outbox_line_buffer();
     if (!line) {
         ESP_LOGE(TAG, "Could not allocate ADD outbox worker buffer");
@@ -2869,27 +3001,53 @@ static void outbox_task(void *arg)
             free(payload_json);
             ESP_LOGE(TAG, "Preserving and skipping a corrupt ADD %s outbox row", outbox->label);
             if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                preserve_corrupt_outbox_row(line);
-                (void)advance_outbox_locked(outbox, row_end);
+                bool preserved = preserve_corrupt_outbox_row(line);
+                if (!preserved) {
+                    ESP_LOGE(
+                        TAG,
+                        "Bounded corrupt-row evidence storage was unavailable; skipping the unusable %s row to protect newer attendance",
+                        outbox->label);
+                }
+                if (!advance_outbox_locked(outbox, row_end)) {
+                    ESP_LOGE(TAG, "Could not skip corrupt ADD %s outbox row", outbox->label);
+                }
                 xSemaphoreGive(outbox->lock);
             }
+            retry_ms = ADD_OUTBOX_RETRY_MS;
             continue;
         }
+        add_attendance_settlement_ack_t attendance_ack = {0};
         bool acknowledged = send_payload_and_wait_for_ack(
             type->valuestring,
             payload_json,
             portMAX_DELAY,
             pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
-            NULL);
+            NULL,
+            &attendance_ack);
         cJSON_Delete(record);
         free(payload_json);
+        if (acknowledged && attendance_ack.valid && attendance_ack.quarantined > 0) {
+            ESP_LOGW(
+                TAG,
+                "ADD durably quarantined %lu attendance row(s) without blocking receipt=%s outcome=%s accepted=%lu duplicates=%lu",
+                (unsigned long)attendance_ack.quarantined,
+                attendance_ack.receipt_id,
+                attendance_ack.outcome,
+                (unsigned long)attendance_ack.accepted,
+                (unsigned long)attendance_ack.duplicates);
+        }
         if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
             if (!advance_outbox_locked(outbox, row_end)) {
                 ESP_LOGE(TAG, "Could not advance acknowledged ADD %s attendance outbox", outbox->label);
             }
             xSemaphoreGive(outbox->lock);
+            retry_ms = ADD_OUTBOX_RETRY_MS;
         } else {
-            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
+            uint32_t delay_ms = retry_ms + (esp_random() % 1000U);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            retry_ms = retry_ms >= ADD_OUTBOX_RETRY_MAX_MS / 2
+                ? ADD_OUTBOX_RETRY_MAX_MS
+                : retry_ms * 2;
         }
     }
 }

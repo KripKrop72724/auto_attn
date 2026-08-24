@@ -6,7 +6,7 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import { routePath } from '../routing'
-import type { Alert, AlertQueueResponse, Device } from '../types'
+import type { Alert, AlertQueueResponse, AttendanceQuarantineResponse, Device } from '../types'
 
 export function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: ReturnType<typeof useToast>; revision: number }) {
   const [rows, setRows] = useState<AlertQueueResponse['rows']>([])
@@ -17,6 +17,8 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [quarantine, setQuarantine] = useState<AttendanceQuarantineResponse | null>(null)
+  const [quarantineError, setQuarantineError] = useState('')
   const requestRef = useRef<AbortController | null>(null)
   const load = useCallback(async (cursor?: string, append = false) => {
     requestRef.current?.abort()
@@ -42,10 +44,29 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
       if (requestRef.current === controller) setLoading(false)
     }
   }, [deviceId, queue, severity])
+  const loadQuarantine = useCallback(async () => {
+    setQuarantineError('')
+    try {
+      const response = await api<AttendanceQuarantineResponse>(`/api/v1/attendance-quarantine${queryString({
+        device_id: deviceId === 'ALL' ? undefined : deviceId,
+        review_state: 'OPEN',
+        limit: 10,
+      })}`)
+      if (!response?.totals || !Array.isArray(response.rows)) {
+        throw new Error('Attendance quarantine diagnostics returned an invalid response.')
+      }
+      setQuarantine(response)
+    } catch (reason) {
+      setQuarantineError(reason instanceof Error ? reason.message : 'Unable to load attendance quarantine diagnostics.')
+    }
+  }, [deviceId])
   useEffect(() => {
     void load()
     return () => requestRef.current?.abort()
   }, [load, revision])
+  useEffect(() => {
+    void loadQuarantine()
+  }, [loadQuarantine, revision])
   const acknowledge = async (row: Alert) => {
     try {
       await api(`/api/v1/alerts/${row.id}/acknowledge`, { method: 'POST', body: '{}' })
@@ -66,6 +87,16 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
           <button className={queue === 'ALL' ? 'active' : ''} onClick={() => setQueue('ALL')}>All <span>{totals.all}</span></button>
         </div>
         <div className="queue-selects"><label><span>Severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="WARNING">Warning</option></select></label><label><span>Device</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)}><option value="ALL">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label></div>
+      </section>
+      <section className="panel attendance-quarantine-panel" aria-labelledby="attendance-quarantine-title">
+        <div className="panel-header">
+          <div><span className="eyebrow">NON-BLOCKING INGESTION</span><h2 id="attendance-quarantine-title">Attendance quarantine</h2><p>Malformed rows are preserved for review after a durable receipt; valid and newer punches continue through the delivery pipeline.</p></div>
+          <button className="button secondary" onClick={() => void loadQuarantine()}><Icon name="refresh" /> Refresh</button>
+        </div>
+        {quarantineError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{quarantineError}</span></div>}
+        {quarantine && <div className="quarantine-summary"><StatusBadge state={quarantine.totals.open ? 'WARNING' : 'HEALTHY'} /><strong>{quarantine.totals.open.toLocaleString()} open</strong><span>{quarantine.totals.all.toLocaleString()} retained in total</span></div>}
+        {quarantine?.rows.map((row) => <article className="quarantine-row" key={row.id}><div><strong>{row.display_name} · {row.zone_id}</strong><p>{row.error_code || 'VALIDATION_ERROR'}{row.error_path ? ` · ${row.error_path}` : ''} · Batch item {row.item_index}</p></div><div><StatusBadge state="QUARANTINED" /><small>{relativeTime(row.observed_at)} · Receipt {row.receipt_id.slice(0, 8)}</small></div></article>)}
+        {quarantine && !quarantine.rows.length && !quarantineError && <div className="empty-state compact"><Icon name="shield" /><p>No attendance rows are waiting for review in this scope.</p></div>}
       </section>
       <section className="alert-list">
         {error && <div className="panel message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{error}</span><button className="button secondary" onClick={() => void load()}>Retry queue</button></div>}

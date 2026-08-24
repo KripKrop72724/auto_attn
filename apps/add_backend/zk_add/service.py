@@ -4360,6 +4360,36 @@ def resolve_alert(session: Session, connector: Connector, *, code: str) -> None:
         row.last_seen_at = now
 
 
+def resolve_message_rejection(
+    session: Session,
+    connector: Connector,
+    *,
+    message_type: str,
+) -> bool:
+    """Resolve only the rejection proven healthy by the same message path."""
+
+    now = utc_now()
+    resolved = False
+    for row in session.scalars(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "DEVICE_MESSAGE_REJECTED",
+            DeviceAlert.state == "OPEN",
+        )
+    ).all():
+        if (row.details or {}).get("message_type") != message_type:
+            continue
+        row.state = "RESOLVED"
+        row.resolved_at = now
+        row.last_seen_at = now
+        resolved = True
+    if resolved and connector.last_error_code == "DEVICE_MESSAGE_REJECTED":
+        connector.last_error_code = None
+        connector.last_error_message = None
+        connector.lifecycle_state = "ONLINE"
+    return resolved
+
+
 def fleet_counts(session: Session) -> dict:
     rows = session.execute(
         select(Connector.lifecycle_state, func.count(Connector.id)).group_by(

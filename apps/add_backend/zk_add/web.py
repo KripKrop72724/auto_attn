@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
-import secrets
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     Header,
@@ -31,6 +30,13 @@ from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add.audit import append_audit
+from zk_add.attendance_batches import (
+    attendance_quarantine_item,
+    attendance_quarantine_summary,
+    reveal_attendance_quarantine,
+    review_attendance_quarantine,
+    settle_attendance_batch,
+)
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
 from zk_add.identity_conflicts import (
     build_identity_conflict_report,
@@ -63,7 +69,6 @@ from zk_add.realtime import browser_events, connector_hub, sse_encode
 from zk_add.schemas import (
     AdminLeaseRequest,
     AlertAcknowledgeRequest,
-    AttendanceBatchRequest,
     BulkUserDeleteCancelRequest,
     BulkUserDeleteRequest,
     CommandUpdate,
@@ -124,14 +129,13 @@ from zk_add.service import (
     create_user_deletion_job,
     delete_device_user_command,
     fleet_counts,
-    ingest_attendance,
     ingest_logs,
     replace_user_snapshot,
     record_oracle_receipts,
     reconcile_device_user_identity_conflicts,
     reconcile_admin_lease_command,
     resolve_historical_event_group_to_current_identity,
-    resolve_alert,
+    resolve_message_rejection,
     onboard_connector,
     serialize_command,
     serialize_connector,
@@ -927,6 +931,85 @@ def source_exceptions(
                 )
             },
         }
+    return result
+
+
+@app.get("/api/v1/attendance-quarantine")
+def attendance_quarantine(
+    device_id: str | None = None,
+    review_state: str | None = None,
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector_pk = connector_or_404(db, device_id).id if device_id else None
+    if review_state and review_state not in {"OPEN", "REVIEWED"}:
+        raise HTTPException(
+            status_code=422, detail="Unknown attendance quarantine review state."
+        )
+    return attendance_quarantine_summary(
+        db,
+        connector_id=connector_pk,
+        review_state=review_state,
+        cursor=cursor,
+        limit=limit,
+    )
+
+
+@app.post("/api/v1/attendance-quarantine/{item_id}/review")
+def review_attendance_quarantine_endpoint(
+    item_id: int,
+    body: SourceExceptionActionRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    item = attendance_quarantine_item(db, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Attendance quarantine item not found.")
+    try:
+        review_attendance_quarantine(
+            db,
+            item=item,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {
+        "id": item.id,
+        "review_state": item.review_state,
+        "reviewed_by": item.reviewed_by,
+        "review_reason": item.review_reason,
+        "reviewed_at": item.reviewed_at,
+    }
+
+
+@app.post("/api/v1/attendance-quarantine/{item_id}/reveal")
+def reveal_attendance_quarantine_endpoint(
+    item_id: int,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    item = attendance_quarantine_item(db, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Attendance quarantine item not found.")
+    result = reveal_attendance_quarantine(
+        db,
+        item=item,
+        actor=context.username,
+        reason=body.reason,
+        idempotency_key=body.idempotency_key,
+    )
+    db.commit()
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return result
 
 
@@ -2263,27 +2346,15 @@ async def browser_stream(
 
 @app.post("/device/v1/attendance/batches")
 async def device_attendance(
-    body: AttendanceBatchRequest,
+    body: object = Body(...),
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
     db, connector = auth
-    digest = hashlib.sha256(
-        json.dumps([row.model_dump(mode="json") for row in body.events], separators=(",", ":"), sort_keys=True).encode()
-    ).hexdigest()
-    if body.payload_digest and not secrets.compare_digest(digest, body.payload_digest):
-        raise HTTPException(status_code=400, detail="Attendance batch digest mismatch.")
-    accepted, duplicates = ingest_attendance(db, connector=connector, events=body.events)
+    settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
-    for event_uid in accepted:
+    for event_uid in settlement.accepted_event_uids:
         await browser_events.publish("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid})
-    return {
-        "ok": True,
-        "batch_id": body.batch_id,
-        "payload_digest": digest,
-        "accepted_event_uids": accepted,
-        "duplicate_event_uids": duplicates,
-        "rejected": [],
-    }
+    return settlement.response()
 
 
 @app.post("/device/v2/reconciliations/anchor")
@@ -2703,19 +2774,25 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
         elif envelope.type == "user_snapshot":
             snapshot = UserSnapshotRequest.model_validate(envelope.payload)
             count = replace_user_snapshot(db, connector=connector, snapshot=snapshot)
-            resolve_alert(db, connector, code="DEVICE_MESSAGE_REJECTED")
-            if connector.last_error_code == "DEVICE_MESSAGE_REJECTED":
-                connector.last_error_code = None
-                connector.last_error_message = None
+            resolve_message_rejection(
+                db, connector, message_type="user_snapshot"
+            )
             event_payload = {"connector_id": connector.connector_id, "count": count}
         elif envelope.type == "attendance_batch":
-            batch = AttendanceBatchRequest.model_validate(envelope.payload)
-            accepted, duplicates = ingest_attendance(db, connector=connector, events=batch.events)
+            settlement = settle_attendance_batch(
+                db, connector=connector, payload=envelope.payload
+            )
             event_payload = {
                 "connector_id": connector.connector_id,
-                "accepted": len(accepted),
-                "duplicates": len(duplicates),
+                "receipt_id": settlement.receipt_id,
+                "outcome": settlement.outcome,
+                "accepted": settlement.accepted_count,
+                "duplicates": settlement.duplicate_count,
+                "quarantined": settlement.quarantined_count,
             }
+            ack_payload = settlement.ack(
+                message_id=envelope.message_id, sequence=envelope.seq
+            )
         elif envelope.type == "oracle_receipt_batch":
             receipt_batch = OracleReceiptBatchRequest.model_validate(envelope.payload)
             applied, awaiting_event, rejected = record_oracle_receipts(

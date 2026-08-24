@@ -124,7 +124,12 @@ class AttendanceEventIn(BaseModel):
 
 class AttendanceBatchRequest(BaseModel):
     batch_id: str = Field(min_length=1, max_length=120)
-    payload_digest: str | None = None
+    payload_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     events: list[AttendanceEventIn] = Field(min_length=1, max_length=100)
 
 

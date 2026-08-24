@@ -220,6 +220,31 @@ const fetchStub = (
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
+    if (path.startsWith('/api/v1/attendance-quarantine')) return response({
+      totals: { all: 1, open: 1 },
+      filtered_total: 1,
+      next_cursor: null,
+      rows: [{
+        id: 91,
+        receipt_id: '11111111-2222-3333-4444-555555555555',
+        connector_id: device.connector_id,
+        device_id: device.device_id,
+        display_name: device.display_name,
+        zone_id: device.zone_id,
+        batch_id: 'safe-batch-id',
+        item_index: 1,
+        error_code: 'ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH',
+        error_path: 'event_uid',
+        payload_digest: 'a'.repeat(64),
+        review_state: 'OPEN',
+        reviewed_by: null,
+        review_reason: null,
+        reviewed_at: null,
+        observed_at: '2026-07-13T12:05:00Z',
+        evidence_available: true,
+        handling: 'QUARANTINED_NON_BLOCKING',
+      }],
+    })
     if (path.startsWith('/api/v1/alerts') && init?.method !== 'POST') return response({
       rows: [{ ...deliveryAlert, device: {
         connector_id: device.connector_id,
@@ -825,6 +850,9 @@ describe('State Life ADD interface', () => {
     await screen.findByRole('heading', { name: /attendance device command center/i })
     fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
     expect(await screen.findByText(/Category HTTP_503 · HTTP 503 · Attempt 4/i)).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: /attendance quarantine/i })).toBeTruthy()
+    expect(screen.getByText(/ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH · event_uid/i)).toBeTruthy()
+    expect(screen.getByText(/valid and newer punches continue/i)).toBeTruthy()
     expect(document.body.textContent).not.toContain('must-not-render')
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(formatAlertDiagnostics({ failure_category: 'unsafe detail!', secret: 'x' })).toBe('')
