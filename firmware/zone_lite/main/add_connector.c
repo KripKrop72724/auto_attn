@@ -2464,10 +2464,16 @@ static bool attendance_settlement_matches_payload(
     } else if (ack->duplicates > 0) {
         expected_outcome = "COMMITTED_WITH_DUPLICATES";
     }
+    // A reported digest mismatch is itself a durable batch-level poison. ADD
+    // returns its computed digest with an all-QUARANTINED settlement, so the
+    // stale device-reported value must not keep that settled row at the head
+    // of the outbox. Committed outcomes still require exact digest equality.
+    bool digest_matches = !cJSON_IsString(reported_digest) ||
+        strcmp(reported_digest->valuestring, ack->payload_digest) == 0 ||
+        strcmp(ack->outcome, "QUARANTINED") == 0;
     bool matches = strcmp(batch_id->valuestring, ack->batch_id) == 0 &&
         settled == count && strcmp(ack->outcome, expected_outcome) == 0 &&
-        (!cJSON_IsString(reported_digest) ||
-         strcmp(reported_digest->valuestring, ack->payload_digest) == 0);
+        digest_matches;
     cJSON_Delete(payload);
     return matches;
 }

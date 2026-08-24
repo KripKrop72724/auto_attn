@@ -1491,6 +1491,8 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "acknowledged = attendance_ack_out->valid" in connector
     assert "settled == count" in connector
     assert "strcmp(batch_id->valuestring, ack->batch_id) == 0" in connector
+    assert 'strcmp(ack->outcome, "QUARANTINED") == 0' in connector
+    assert "Committed outcomes still require exact digest equality" in connector
     assert "is_attendance ? &attendance_ack : NULL" in connector
     assert "ADD durably quarantined %lu attendance row(s) without blocking" in connector
     assert "ADD_OUTBOX_RETRY_MAX_MS" in connector
