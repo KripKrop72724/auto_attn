@@ -220,6 +220,24 @@ const fetchStub = (
     }
     if (path.includes('/logs?')) return response({ rows: [] })
     if (path.includes('/connectivity?')) return response({ rows: [] })
+    if (/\/api\/v1\/attendance-quarantine\/\d+\/review$/.test(path) && init?.method === 'POST') {
+      return response({
+        id: 91,
+        review_state: 'REVIEWED',
+        reviewed_by: 'StateHealthAdmin',
+        review_reason: 'Confirmed malformed source evidence.',
+        reviewed_at: '2026-07-13T12:06:00Z',
+      })
+    }
+    if (/\/api\/v1\/attendance-quarantine\/\d+\/reveal$/.test(path) && init?.method === 'POST') {
+      return response({
+        id: 91,
+        payload_digest: 'a'.repeat(64),
+        error_code: 'ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH',
+        error_path: 'event_uid',
+        payload: { terminal_value: 'protected-attendance-evidence' },
+      })
+    }
     if (path.startsWith('/api/v1/attendance-quarantine')) return response({
       totals: { all: 1, open: 1 },
       filtered_total: 1,
@@ -856,6 +874,38 @@ describe('State Life ADD interface', () => {
     expect(document.body.textContent).not.toContain('must-not-render')
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(formatAlertDiagnostics({ failure_category: 'unsafe detail!', secret: 'x' })).toBe('')
+  })
+
+  it('requires audited step-up to reveal and review attendance quarantine', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /^review$/i }))
+    expect(await screen.findByRole('heading', { name: /review quarantined attendance/i })).toBeTruthy()
+
+    const reason = screen.getByLabelText(/audited reason/i)
+    const password = screen.getByLabelText(/administrator password/i)
+    fireEvent.change(reason, { target: { value: 'Inspect retained malformed source evidence.' } })
+    fireEvent.change(password, { target: { value: 'local-quarantine-step-up' } })
+    fireEvent.click(screen.getByRole('button', { name: /reveal evidence/i }))
+    expect(await screen.findByText(/protected-attendance-evidence/i)).toBeTruthy()
+    const revealCall = vi.mocked(fetch).mock.calls.find(([path, init]) =>
+      String(path).endsWith('/api/v1/attendance-quarantine/91/reveal') && init?.method === 'POST')
+    expect(revealCall).toBeTruthy()
+    expect(JSON.parse(String(revealCall?.[1]?.body)).idempotency_key).toMatch(/^attendance-quarantine-reveal:/)
+    expect(document.body.textContent).not.toContain('local-quarantine-step-up')
+    fireEvent.click(screen.getByRole('button', { name: /hide now/i }))
+    expect(screen.queryByText(/protected-attendance-evidence/i)).toBeNull()
+
+    fireEvent.change(reason, { target: { value: 'Confirmed malformed source evidence.' } })
+    fireEvent.change(password, { target: { value: 'local-quarantine-step-up' } })
+    fireEvent.click(screen.getByRole('button', { name: /mark reviewed/i }))
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([path, init]) =>
+      String(path).endsWith('/api/v1/attendance-quarantine/91/review') && init?.method === 'POST')).toBe(true))
+    const reviewCall = vi.mocked(fetch).mock.calls.find(([path, init]) =>
+      String(path).endsWith('/api/v1/attendance-quarantine/91/review') && init?.method === 'POST')
+    expect(JSON.parse(String(reviewCall?.[1]?.body)).idempotency_key).toMatch(/^attendance-quarantine-review:/)
+    expect(screen.queryByRole('heading', { name: /review quarantined attendance/i })).toBeNull()
   })
 
   it('shows durable command progress without relying on hue', () => {

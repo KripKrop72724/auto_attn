@@ -68,6 +68,14 @@ export interface AttendanceQuarantineResponse {
   next_cursor: number | null
 }
 
+export interface AttendanceQuarantineReveal {
+  id: number
+  payload_digest: string
+  error_code: string | null
+  error_path: string | null
+  payload: unknown
+}
+
 export interface ZktDevice {
   id: number
   serial: string | null
