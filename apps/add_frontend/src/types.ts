@@ -47,7 +47,6 @@ export interface AttendanceQuarantineItem {
   device_id: string
   display_name: string
   zone_id: string
-  batch_id: string
   item_index: number
   error_code: string | null
   error_path: string | null

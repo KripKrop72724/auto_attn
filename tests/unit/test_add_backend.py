@@ -3598,6 +3598,45 @@ def test_attendance_batch_retry_with_changed_reported_digest_is_quarantined(
     assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
 
 
+def test_batch_level_failure_persists_one_quarantine_disposition_per_input(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    events = [
+        event(event_uid=character * 64).model_dump(mode="json")
+        for character in ("1", "2", "3")
+    ]
+    settlement = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload={
+            "batch_id": "multi-row-digest-mismatch",
+            "payload_digest": "f" * 64,
+            "events": events,
+        },
+    )
+    db.flush()
+
+    assert settlement.outcome == "QUARANTINED"
+    assert settlement.quarantined_count == 3
+    assert [row["index"] for row in settlement.rejected] == [0, 1, 2]
+    receipt = db.scalar(select(AttendanceBatchReceipt))
+    assert receipt is not None
+    assert receipt.item_count == 3
+    items = db.scalars(
+        select(AttendanceBatchItem).order_by(AttendanceBatchItem.item_index)
+    ).all()
+    assert len(items) == 3
+    assert [row.item_index for row in items] == [0, 1, 2]
+    assert all(row.disposition == "QUARANTINED" for row in items)
+    assert all(row.error_code == "ATTENDANCE_BATCH_DIGEST_MISMATCH" for row in items)
+    assert all(
+        decrypt_json(row.protected_payload)["__batch_context"]["batch_id"]
+        == "multi-row-digest-mismatch"
+        for row in items
+    )
+
+
 def test_attendance_batch_id_reuse_with_changed_payload_is_durably_quarantined(
     db: Session,
 ):
@@ -3632,7 +3671,7 @@ def test_attendance_quarantine_review_is_safe_audited_and_idempotent(db: Session
     settle_attendance_batch(
         db,
         connector=connector,
-        payload={"batch_id": "reviewable-poison", "events": [poison]},
+        payload={"batch_id": f"Sensitive-batch-{CNIC}", "events": [poison]},
     )
     db.flush()
     item = db.scalar(select(AttendanceBatchItem))
@@ -3641,7 +3680,16 @@ def test_attendance_quarantine_review_is_safe_audited_and_idempotent(db: Session
     summary = attendance_quarantine_summary(db, connector_id=connector.id)
     assert summary["totals"] == {"all": 1, "open": 1}
     assert summary["rows"][0]["error_path"] == "source"
+    assert "batch_id" not in summary["rows"][0]
     assert CNIC not in json.dumps(summary, default=str)
+    alert = db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ATTENDANCE_EVENT_QUARANTINED",
+        )
+    )
+    assert alert is not None
+    assert CNIC not in json.dumps(alert.details, default=str)
     revealed = reveal_attendance_quarantine(
         db,
         item=item,
@@ -3658,6 +3706,9 @@ def test_attendance_quarantine_review_is_safe_audited_and_idempotent(db: Session
     )
     db.flush()
     assert revealed["payload"]["raw_name"] == f"Sensitive-{CNIC}"
+    assert revealed["payload"]["__batch_context"]["batch_id"] == (
+        f"Sensitive-batch-{CNIC}"
+    )
     assert db.scalar(
         select(func.count(AuditEvent.id)).where(
             AuditEvent.action == "ATTENDANCE_QUARANTINE_EVIDENCE_REVEALED"
@@ -3696,6 +3747,44 @@ def test_attendance_quarantine_review_is_safe_audited_and_idempotent(db: Session
             DeviceAlert.state == "OPEN",
         )
     ) == 0
+
+
+def test_attendance_quarantine_review_locks_connector_boundary(
+    db: Session,
+    monkeypatch,
+):
+    connector = connector_fixture(db)
+    poison = event(event_uid="e" * 64).model_dump(mode="json")
+    poison["source"] = "UNSUPPORTED"
+    settle_attendance_batch(
+        db,
+        connector=connector,
+        payload={"batch_id": "connector-review-lock", "events": [poison]},
+    )
+    db.flush()
+    item = db.scalar(select(AttendanceBatchItem))
+    assert item is not None
+    original_scalar = db.scalar
+    lock_observed = False
+
+    def record_scalar(statement, *args, **kwargs):
+        nonlocal lock_observed
+        if getattr(statement, "_for_update_arg", None) is not None:
+            lock_observed = True
+        return original_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "scalar", record_scalar)
+    review_attendance_quarantine(
+        db,
+        item=item,
+        actor="reviewer",
+        reason="Confirm connector-scoped review serialization.",
+        idempotency_key="review-lock-boundary-0001",
+    )
+    db.flush()
+
+    assert lock_observed is True
+    assert item.review_state == "REVIEWED"
 
 
 def test_attendance_batch_storage_failure_rolls_back_without_a_false_settlement(

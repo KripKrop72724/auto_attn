@@ -223,8 +223,12 @@ def _quarantine_item(
     error_code: str,
     error_path: str | None = None,
     validation_summary: list[dict[str, str]] | None = None,
+    evidence_context: dict[str, object] | None = None,
 ) -> AttendanceBatchItem:
     wrapped = raw if isinstance(raw, dict) else {"value": raw}
+    protected = dict(wrapped)
+    if evidence_context:
+        protected["__batch_context"] = evidence_context
     item = AttendanceBatchItem(
         receipt_id=receipt.id,
         item_index=item_index,
@@ -234,7 +238,7 @@ def _quarantine_item(
         error_code=error_code,
         error_path=error_path,
         validation_summary=validation_summary or [],
-        protected_payload=encrypt_json(wrapped),
+        protected_payload=encrypt_json(protected),
         review_state="OPEN",
     )
     session.add(item)
@@ -250,6 +254,21 @@ def _finish_receipt(
     duplicates: int,
     quarantined: int,
 ) -> AttendanceBatchSettlement:
+    session.flush()
+    disposition_count = session.scalar(
+        select(func.count(AttendanceBatchItem.id)).where(
+            AttendanceBatchItem.receipt_id == receipt.id
+        )
+    ) or 0
+    settlement_count = accepted + duplicates + quarantined
+    if disposition_count != settlement_count:
+        raise RuntimeError(
+            "Attendance batch settlement totals do not match durable item dispositions."
+        )
+    if 1 <= receipt.item_count <= MAX_BATCH_EVENTS and settlement_count != receipt.item_count:
+        raise RuntimeError(
+            "Attendance batch settlement does not cover every bounded input row."
+        )
     receipt.accepted_count = accepted
     receipt.duplicate_count = duplicates
     receipt.quarantined_count = quarantined
@@ -280,7 +299,6 @@ def _finish_receipt(
             ),
             details={
                 "receipt_id": receipt.receipt_id,
-                "batch_id": receipt.batch_id,
                 "quarantined": quarantined,
                 "accepted": accepted,
                 "duplicates": duplicates,
@@ -372,26 +390,54 @@ def settle_attendance_batch(
         batch_error = ("ATTENDANCE_BATCH_DIGEST_MISMATCH", "payload_digest")
 
     if batch_error is not None:
-        _quarantine_item(
-            session,
-            receipt=receipt,
-            item_index=-1,
-            raw={"batch": payload},
-            error_code=batch_error[0],
-            error_path=batch_error[1],
+        bounded_events = (
+            raw_events
+            if isinstance(raw_events, list)
+            and 1 <= len(raw_events) <= MAX_BATCH_EVENTS
+            else None
         )
+        if bounded_events is not None:
+            batch_context = {
+                "batch_id": raw_batch_id,
+                "payload_digest": reported_value,
+            }
+            for index, raw in enumerate(bounded_events):
+                _quarantine_item(
+                    session,
+                    receipt=receipt,
+                    item_index=index,
+                    raw=raw,
+                    error_code=batch_error[0],
+                    error_path=batch_error[1],
+                    evidence_context=batch_context,
+                )
+            quarantined_count = len(bounded_events)
+        else:
+            _quarantine_item(
+                session,
+                receipt=receipt,
+                item_index=-1,
+                raw={"batch": payload},
+                error_code=batch_error[0],
+                error_path=batch_error[1],
+            )
+            quarantined_count = 1
         return _finish_receipt(
             session,
             connector=connector,
             receipt=receipt,
             accepted=0,
             duplicates=0,
-            quarantined=max(1, item_count),
+            quarantined=quarantined_count,
         )
 
     valid: list[tuple[int, AttendanceEventIn, object]] = []
     quarantined = 0
     assert isinstance(raw_events, list)
+    evidence_context = {
+        "batch_id": raw_batch_id,
+        "payload_digest": reported_value,
+    }
     for index, raw in enumerate(raw_events):
         try:
             parsed = AttendanceEventIn.model_validate(raw)
@@ -406,6 +452,7 @@ def settle_attendance_batch(
                 error_code=_error_code(first["type"]),
                 error_path=first["path"] or None,
                 validation_summary=summary,
+                evidence_context=evidence_context,
             )
             quarantined += 1
             continue
@@ -519,7 +566,6 @@ def attendance_quarantine_summary(
                 "device_id": connector.device_id,
                 "display_name": connector.display_name,
                 "zone_id": connector.zone_id,
-                "batch_id": receipt.batch_id,
                 "item_index": item.item_index,
                 "error_code": item.error_code,
                 "error_path": item.error_path,
@@ -557,6 +603,15 @@ def review_attendance_quarantine(
     reason: str,
     idempotency_key: str,
 ) -> None:
+    receipt = session.get(AttendanceBatchReceipt, item.receipt_id)
+    connector = None
+    if receipt is not None:
+        connector = session.scalar(
+            select(Connector)
+            .where(Connector.id == receipt.connector_id)
+            .with_for_update()
+        )
+        session.refresh(item)
     if item.review_idempotency_key == idempotency_key:
         return
     if item.review_state == "REVIEWED":
@@ -589,7 +644,6 @@ def review_attendance_quarantine(
         outcome="REVIEWED",
         request_id=idempotency_key,
     )
-    receipt = session.get(AttendanceBatchReceipt, item.receipt_id)
     if receipt is not None:
         remaining = session.scalar(
             select(func.count(AttendanceBatchItem.id))
@@ -603,12 +657,10 @@ def review_attendance_quarantine(
                 AttendanceBatchItem.review_state == "OPEN",
             )
         ) or 0
-        if remaining == 0:
-            connector = session.get(Connector, receipt.connector_id)
-            if connector is not None:
-                resolve_alert(
-                    session, connector, code="ATTENDANCE_EVENT_QUARANTINED"
-                )
+        if remaining == 0 and connector is not None:
+            resolve_alert(
+                session, connector, code="ATTENDANCE_EVENT_QUARANTINED"
+            )
 
 
 def reveal_attendance_quarantine(
