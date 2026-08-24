@@ -1487,6 +1487,11 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "add_attendance_settlement_ack_t" in connector
     assert 'strcmp(message_type->valuestring, "attendance_batch") == 0' in connector
     assert 'root, "quarantined")' in connector
+    assert "attendance_settlement_matches_payload" in connector
+    assert "acknowledged = attendance_ack_out->valid" in connector
+    assert "settled == count" in connector
+    assert "strcmp(batch_id->valuestring, ack->batch_id) == 0" in connector
+    assert "is_attendance ? &attendance_ack : NULL" in connector
     assert "ADD durably quarantined %lu attendance row(s) without blocking" in connector
     assert "ADD_OUTBOX_RETRY_MAX_MS" in connector
     assert "esp_random() % 1000U" in connector

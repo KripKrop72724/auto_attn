@@ -114,6 +114,8 @@ typedef struct {
 
 typedef struct {
     char receipt_id[40];
+    char batch_id[121];
+    char payload_digest[65];
     char outcome[52];
     uint32_t accepted;
     uint32_t duplicates;
@@ -201,6 +203,8 @@ static add_outbox_t s_live_outbox = {
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
 static volatile uint32_t s_priority_delivery_until_ms;
+
+static bool attendance_event_uid_is_valid(const char *value);
 
 static int64_t monotonic_ms(void)
 {
@@ -454,6 +458,7 @@ static bool send_payload_and_wait_for_ack(
         }
         if (acknowledged && attendance_ack_out) {
             *attendance_ack_out = s_attendance_settlement_ack;
+            acknowledged = attendance_ack_out->valid;
         }
         s_ack_matched = false;
         xSemaphoreGive(s_lock);
@@ -1578,6 +1583,10 @@ static void parse_inbound(const char *data, size_t len)
                         strcmp(message_type->valuestring, "attendance_batch") == 0) {
                         cJSON *receipt_id = cJSON_GetObjectItemCaseSensitive(
                             root, "receipt_id");
+                        cJSON *batch_id = cJSON_GetObjectItemCaseSensitive(
+                            root, "batch_id");
+                        cJSON *payload_digest = cJSON_GetObjectItemCaseSensitive(
+                            root, "payload_digest");
                         cJSON *outcome = cJSON_GetObjectItemCaseSensitive(root, "outcome");
                         cJSON *accepted = cJSON_GetObjectItemCaseSensitive(root, "accepted");
                         cJSON *duplicates = cJSON_GetObjectItemCaseSensitive(root, "duplicates");
@@ -1585,14 +1594,36 @@ static void parse_inbound(const char *data, size_t len)
                             root, "quarantined");
                         if (cJSON_IsString(receipt_id) &&
                             strlen(receipt_id->valuestring) == 36 &&
-                            cJSON_IsString(outcome) && outcome->valuestring[0] &&
+                            cJSON_IsString(batch_id) && batch_id->valuestring[0] &&
+                            strlen(batch_id->valuestring) <= 120 &&
+                            cJSON_IsString(payload_digest) &&
+                            attendance_event_uid_is_valid(payload_digest->valuestring) &&
+                            cJSON_IsString(outcome) &&
+                            (strcmp(outcome->valuestring, "COMMITTED") == 0 ||
+                             strcmp(outcome->valuestring, "COMMITTED_WITH_DUPLICATES") == 0 ||
+                             strcmp(outcome->valuestring, "COMMITTED_WITH_QUARANTINE") == 0 ||
+                             strcmp(outcome->valuestring, "QUARANTINED") == 0) &&
                             cJSON_IsNumber(accepted) && accepted->valuedouble >= 0 &&
+                            accepted->valuedouble <= 100 &&
+                            (double)(uint32_t)accepted->valuedouble == accepted->valuedouble &&
                             cJSON_IsNumber(duplicates) && duplicates->valuedouble >= 0 &&
-                            cJSON_IsNumber(quarantined) && quarantined->valuedouble >= 0) {
+                            duplicates->valuedouble <= 100 &&
+                            (double)(uint32_t)duplicates->valuedouble == duplicates->valuedouble &&
+                            cJSON_IsNumber(quarantined) && quarantined->valuedouble >= 0 &&
+                            quarantined->valuedouble <= 100 &&
+                            (double)(uint32_t)quarantined->valuedouble == quarantined->valuedouble) {
                             strlcpy(
                                 s_attendance_settlement_ack.receipt_id,
                                 receipt_id->valuestring,
                                 sizeof(s_attendance_settlement_ack.receipt_id));
+                            strlcpy(
+                                s_attendance_settlement_ack.batch_id,
+                                batch_id->valuestring,
+                                sizeof(s_attendance_settlement_ack.batch_id));
+                            strlcpy(
+                                s_attendance_settlement_ack.payload_digest,
+                                payload_digest->valuestring,
+                                sizeof(s_attendance_settlement_ack.payload_digest));
                             strlcpy(
                                 s_attendance_settlement_ack.outcome,
                                 outcome->valuestring,
@@ -2409,6 +2440,38 @@ static bool attendance_payload_is_valid(const cJSON *payload)
     return true;
 }
 
+static bool attendance_settlement_matches_payload(
+    const char *payload_json,
+    const add_attendance_settlement_ack_t *ack)
+{
+    if (!payload_json || !ack || !ack->valid) return false;
+    cJSON *payload = cJSON_Parse(payload_json);
+    if (!payload || !attendance_payload_is_valid(payload)) {
+        cJSON_Delete(payload);
+        return false;
+    }
+    const cJSON *batch_id = cJSON_GetObjectItemCaseSensitive(payload, "batch_id");
+    const cJSON *reported_digest = cJSON_GetObjectItemCaseSensitive(
+        payload, "payload_digest");
+    const cJSON *events = cJSON_GetObjectItemCaseSensitive(payload, "events");
+    uint32_t count = (uint32_t)cJSON_GetArraySize(events);
+    uint32_t settled = ack->accepted + ack->duplicates + ack->quarantined;
+    const char *expected_outcome = "COMMITTED";
+    if (ack->quarantined > 0 && ack->accepted == 0 && ack->duplicates == 0) {
+        expected_outcome = "QUARANTINED";
+    } else if (ack->quarantined > 0) {
+        expected_outcome = "COMMITTED_WITH_QUARANTINE";
+    } else if (ack->duplicates > 0) {
+        expected_outcome = "COMMITTED_WITH_DUPLICATES";
+    }
+    bool matches = strcmp(batch_id->valuestring, ack->batch_id) == 0 &&
+        settled == count && strcmp(ack->outcome, expected_outcome) == 0 &&
+        (!cJSON_IsString(reported_digest) ||
+         strcmp(reported_digest->valuestring, ack->payload_digest) == 0);
+    cJSON_Delete(payload);
+    return matches;
+}
+
 static bool oracle_confirmation_path_is_valid(const char *value)
 {
     return value &&
@@ -2561,13 +2624,15 @@ static bool deliver_attendance_payloads_acknowledged(
             break;
         }
         free(line);
+        add_attendance_settlement_ack_t attendance_ack = {0};
         if (!send_payload_and_wait_for_ack(
                 "attendance_batch",
                 payloads[i],
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS),
                 NULL,
-                NULL)) {
+                &attendance_ack) ||
+            !attendance_settlement_matches_payload(payloads[i], &attendance_ack)) {
             ok = false;
             break;
         }
@@ -3017,13 +3082,18 @@ static void outbox_task(void *arg)
             continue;
         }
         add_attendance_settlement_ack_t attendance_ack = {0};
+        bool is_attendance = strcmp(type->valuestring, "attendance_batch") == 0;
         bool acknowledged = send_payload_and_wait_for_ack(
             type->valuestring,
             payload_json,
             portMAX_DELAY,
             pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
             NULL,
-            &attendance_ack);
+            is_attendance ? &attendance_ack : NULL);
+        if (acknowledged && is_attendance &&
+            !attendance_settlement_matches_payload(payload_json, &attendance_ack)) {
+            acknowledged = false;
+        }
         cJSON_Delete(record);
         free(payload_json);
         if (acknowledged && attendance_ack.valid && attendance_ack.quarantined > 0) {
