@@ -383,6 +383,84 @@ class AttendanceEvent(Base):
 Index("ix_add_attendance_device_time_id", AttendanceEvent.zkt_device_id, AttendanceEvent.device_event_time, AttendanceEvent.id)
 
 
+class AttendanceBatchReceipt(Base):
+    """Durable acknowledgement boundary for one connector attendance batch.
+
+    An ACK is sent only after this receipt, all item dispositions, attendance
+    rows, and their Oracle outbox rows have committed in one transaction.
+    """
+
+    __tablename__ = "add_attendance_batch_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_id",
+            "batch_id",
+            "payload_digest",
+            "reported_digest_key",
+            name="uq_add_attendance_batch_receipt_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    connector_id: Mapped[int] = mapped_column(
+        ForeignKey("add_connectors.id"), index=True
+    )
+    zkt_device_id: Mapped[int] = mapped_column(
+        ForeignKey("add_zkt_devices.id"), index=True
+    )
+    batch_id: Mapped[str] = mapped_column(String(120), index=True)
+    payload_digest: Mapped[str] = mapped_column(String(64), index=True)
+    reported_payload_digest: Mapped[str | None] = mapped_column(String(128))
+    reported_digest_key: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(String(50), index=True)
+    item_count: Mapped[int] = mapped_column(Integer)
+    accepted_count: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    observation_count: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = utc_column()
+    last_seen_at: Mapped[datetime] = utc_column()
+    committed_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceBatchItem(Base):
+    """Immutable per-input settlement, including encrypted poison evidence."""
+
+    __tablename__ = "add_attendance_batch_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "receipt_id", "item_index", name="uq_add_attendance_batch_item_index"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_batch_receipts.id"), index=True
+    )
+    item_index: Mapped[int] = mapped_column(Integer)
+    disposition: Mapped[str] = mapped_column(String(30), index=True)
+    event_uid: Mapped[str | None] = mapped_column(String(128), index=True)
+    attendance_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_attendance_events.id"), index=True
+    )
+    payload_digest: Mapped[str] = mapped_column(String(64), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    error_path: Mapped[str | None] = mapped_column(String(255))
+    validation_summary: Mapped[list] = mapped_column(JSON, default=list)
+    protected_payload: Mapped[str | None] = mapped_column(Text)
+    review_state: Mapped[str] = mapped_column(String(30), default="NOT_REQUIRED", index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(120), index=True)
+    review_reason: Mapped[str | None] = mapped_column(Text)
+    review_idempotency_key: Mapped[str | None] = mapped_column(
+        String(120), unique=True, index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+
+
 class HistoricalCurrentIdentityResolution(Base):
     __tablename__ = "add_historical_current_identity_resolutions"
     __table_args__ = (

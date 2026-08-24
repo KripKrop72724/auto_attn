@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 import re
 from typing import Any, Literal
 
@@ -91,7 +92,7 @@ class UserSnapshotRequest(BaseModel):
 
 class AttendanceEventIn(BaseModel):
     event_uid: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    uid: str | None = None
+    uid: str | None = Field(default=None, max_length=40)
     terminal_identity_fingerprint: str | None = Field(
         default=None,
         min_length=64,
@@ -99,7 +100,7 @@ class AttendanceEventIn(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     user_id: str = Field(min_length=1, max_length=100)
-    raw_name: str | None = None
+    raw_name: str | None = Field(default=None, max_length=255)
     device_event_time: datetime
     captured_at: datetime
     source: Literal[
@@ -116,16 +117,84 @@ class AttendanceEventIn(BaseModel):
     punch: str | int | None = None
     raw_punch: bool = False
     clock_drift_seconds: float | None = None
-    clock_quality: str = "UNKNOWN"
-    boot_id: str | None = None
-    sequence: int | None = None
+    clock_quality: str = Field(default="UNKNOWN", max_length=40)
+    boot_id: str | None = Field(default=None, max_length=100)
+    sequence: int | None = Field(
+        default=None,
+        ge=-(2**63),
+        le=2**63 - 1,
+    )
     raw_event: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("uid", "user_id", "raw_name", "clock_quality", "boot_id")
+    @classmethod
+    def validate_persisted_text(cls, value: str | None) -> str | None:
+        if value is not None and "\x00" in value:
+            raise ValueError("Value contains a database-unsafe null character")
+        return value
+
+    @field_validator("status", "punch")
+    @classmethod
+    def validate_persisted_code(cls, value: str | int | None) -> str | int | None:
+        if value is not None:
+            rendered = str(value)
+            if len(rendered) > 40:
+                raise ValueError("Value exceeds the 40-character persistence limit")
+            if "\x00" in rendered:
+                raise ValueError("Value contains a database-unsafe null character")
+        return value
+
+    @field_validator("clock_drift_seconds")
+    @classmethod
+    def validate_clock_drift(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("Clock drift must be a finite number")
+        return value
+
+    @field_validator("raw_event")
+    @classmethod
+    def validate_raw_event_storage(cls, value: dict[str, Any]) -> dict[str, Any]:
+        def safe(item: object) -> bool:
+            if item is None or isinstance(item, bool):
+                return True
+            if isinstance(item, str):
+                return "\x00" not in item
+            if isinstance(item, int):
+                return -(2**63) <= item <= 2**63 - 1
+            if isinstance(item, float):
+                return math.isfinite(item)
+            if isinstance(item, list):
+                return all(safe(child) for child in item)
+            if isinstance(item, dict):
+                return all(
+                    isinstance(key, str)
+                    and "\x00" not in key
+                    and safe(child)
+                    for key, child in item.items()
+                )
+            return False
+
+        if not safe(value):
+            raise ValueError("Raw event contains a value that cannot be persisted as JSON")
+        return value
 
 
 class AttendanceBatchRequest(BaseModel):
     batch_id: str = Field(min_length=1, max_length=120)
-    payload_digest: str | None = None
+    payload_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     events: list[AttendanceEventIn] = Field(min_length=1, max_length=100)
+
+    @field_validator("batch_id")
+    @classmethod
+    def validate_batch_id_storage(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("Batch ID contains a database-unsafe null character")
+        return value
 
 
 class ReconciliationCreateRequest(BaseModel):

@@ -40,6 +40,41 @@ export interface AlertQueueResponse {
   totals: { all: number; open: number; acknowledged: number; resolved: number }
 }
 
+export interface AttendanceQuarantineItem {
+  id: number
+  receipt_id: string
+  connector_id: string
+  device_id: string
+  display_name: string
+  zone_id: string
+  item_index: number
+  error_code: string | null
+  error_path: string | null
+  payload_digest: string
+  review_state: 'OPEN' | 'REVIEWED'
+  reviewed_by: string | null
+  review_reason: string | null
+  reviewed_at: string | null
+  observed_at: string
+  evidence_available: boolean
+  handling: 'QUARANTINED_NON_BLOCKING'
+}
+
+export interface AttendanceQuarantineResponse {
+  totals: { all: number; open: number }
+  filtered_total: number
+  rows: AttendanceQuarantineItem[]
+  next_cursor: number | null
+}
+
+export interface AttendanceQuarantineReveal {
+  id: number
+  payload_digest: string
+  error_code: string | null
+  error_path: string | null
+  payload: unknown
+}
+
 export interface ZktDevice {
   id: number
   serial: string | null

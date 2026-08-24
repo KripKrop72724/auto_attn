@@ -1457,3 +1457,59 @@ def test_live_capture_uses_verified_snapshot_without_blocking_event_loop():
     assert 'cJSON_AddStringToObject(payload, "state_hash", state_hash);' in source
     assert 'cJSON_AddBoolToObject(payload, "stable", true);' in source
     assert "BLOCKED_IDENTITY_REPAIRED" in source
+
+
+def test_attendance_poison_rows_settle_without_head_of_line_blocking():
+    connector = (FIRMWARE / "main" / "add_connector.c").read_text(
+        encoding="utf-8"
+    )
+
+    validator = connector[
+        connector.index("static bool attendance_source_is_valid(") :
+        connector.index("static bool oracle_confirmation_path_is_valid(")
+    ]
+    assert 'cJSON_GetObjectItemCaseSensitive(payload, "batch_id")' in validator
+    assert "strlen(batch_id->valuestring) > 120" in validator
+    for source in (
+        "LIVE",
+        "LIVE_POLL",
+        "DUMP_STARTUP",
+        "DUMP_RECONNECT",
+        "MANUAL_REPROCESS",
+        "RECONCILE_15M",
+        "FULL_HISTORY",
+        "CURRENT_RECONCILE",
+    ):
+        assert f'"{source}"' in validator
+    assert "terminal_identity_fingerprint" in validator
+    assert "json_optional_string_or_number" in validator
+
+    assert "add_attendance_settlement_ack_t" in connector
+    assert 'strcmp(message_type->valuestring, "attendance_batch") == 0' in connector
+    assert 'root, "quarantined")' in connector
+    assert "attendance_settlement_matches_payload" in connector
+    assert "acknowledged = attendance_ack_out->valid" in connector
+    assert "settled == count" in connector
+    assert "strcmp(batch_id->valuestring, ack->batch_id) == 0" in connector
+    assert 'strcmp(ack->outcome, "QUARANTINED") == 0' in connector
+    assert "Committed outcomes still require exact digest equality" in connector
+    assert "is_attendance ? &attendance_ack : NULL" in connector
+    assert "ADD durably quarantined %lu attendance row(s) without blocking" in connector
+    assert "ADD_OUTBOX_RETRY_MAX_MS" in connector
+    assert "esp_random() % 1000U" in connector
+
+    corrupt = connector[
+        connector.index("static bool preserve_corrupt_outbox_row(") :
+        connector.index("static char *outbox_record_line(")
+    ]
+    assert "ADD_CORRUPT_OUTBOX_MAX_BYTES" in corrupt
+    assert "ADD_CORRUPT_OUTBOX_BACKUP_PATH" in corrupt
+    assert "fsync(fileno(file)) == 0" in corrupt
+    worker = connector[
+        connector.index("static void outbox_task(") :
+        connector.index("void add_connector_init(")
+    ]
+    assert worker.index("preserve_corrupt_outbox_row(line)") < worker.index(
+        "advance_outbox_locked(outbox, row_end)"
+    )
+    assert "protect newer attendance" in worker
