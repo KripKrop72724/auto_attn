@@ -303,7 +303,9 @@ def settle_attendance_batch(
     digest = payload_digest(digest_material)
     raw_batch_id = mapping.get("batch_id")
     batch_id_valid = (
-        isinstance(raw_batch_id, str) and 1 <= len(raw_batch_id) <= 120
+        isinstance(raw_batch_id, str)
+        and 1 <= len(raw_batch_id) <= 120
+        and "\x00" not in raw_batch_id
     )
     batch_id = raw_batch_id if batch_id_valid else f"invalid-{digest[:32]}"
     reported_value = mapping.get("payload_digest")

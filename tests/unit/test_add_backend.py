@@ -3431,6 +3431,98 @@ def test_attendance_batch_quarantines_one_poison_row_without_blocking_neighbors(
     assert connector.lifecycle_state == "ONLINE"
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("uid", "u" * 41),
+        ("uid", "unsafe\x00uid"),
+        ("user_id", "u" * 101),
+        ("user_id", "unsafe\x00user"),
+        ("raw_name", "n" * 256),
+        ("status", "s" * 41),
+        ("status", 10**40),
+        ("punch", "p" * 41),
+        ("clock_quality", "q" * 41),
+        ("boot_id", "b" * 101),
+        ("sequence", 2**63),
+        ("clock_drift_seconds", float("inf")),
+        ("raw_event", {"nested": {"value": "unsafe\x00json"}}),
+        ("raw_event", {"counter": 2**63}),
+    ],
+    ids=[
+        "uid-length",
+        "uid-null",
+        "user-id-length",
+        "user-id-null",
+        "raw-name-length",
+        "status-string-length",
+        "status-integer-length",
+        "punch-length",
+        "clock-quality-length",
+        "boot-id-length",
+        "sequence-bigint-overflow",
+        "clock-drift-non-finite",
+        "raw-event-null",
+        "raw-event-integer-overflow",
+    ],
+)
+def test_attendance_batch_quarantines_database_unsafe_values_before_ingestion(
+    db: Session,
+    field: str,
+    invalid_value: object,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    valid = event(event_uid="a" * 64).model_dump(mode="json")
+    poison = event(event_uid="b" * 64).model_dump(mode="json")
+    poison[field] = invalid_value
+
+    settlement = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload={
+            "batch_id": f"database-boundary-{field}",
+            "events": [valid, poison],
+        },
+    )
+    db.flush()
+
+    assert settlement.outcome == "COMMITTED_WITH_QUARANTINE"
+    assert settlement.accepted_event_uids == ["a" * 64]
+    assert settlement.quarantined_count == 1
+    assert settlement.rejected[0]["index"] == 1
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 1
+    assert db.scalar(select(func.count()).select_from(OrdsOutbox)) == 1
+    items = db.scalars(
+        select(AttendanceBatchItem).order_by(AttendanceBatchItem.item_index)
+    ).all()
+    assert [row.disposition for row in items] == ["ACCEPTED", "QUARANTINED"]
+
+
+def test_attendance_batch_quarantines_database_unsafe_batch_id(db: Session):
+    connector = connector_fixture(db)
+    settlement = settle_attendance_batch(
+        db,
+        connector=connector,
+        payload={
+            "batch_id": "unsafe\x00batch",
+            "events": [event(event_uid="c" * 64).model_dump(mode="json")],
+        },
+    )
+    db.flush()
+
+    assert settlement.outcome == "QUARANTINED"
+    assert settlement.accepted_count == 0
+    assert settlement.quarantined_count == 1
+    assert settlement.rejected[0]["code"] == "ATTENDANCE_BATCH_ID_INVALID"
+    receipt = db.scalar(select(AttendanceBatchReceipt))
+    assert receipt is not None
+    assert receipt.batch_id.startswith("invalid-")
+    assert "\x00" not in receipt.batch_id
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 0
+
+
 def test_attendance_batch_retry_returns_same_receipt_without_reinserting(db: Session):
     connector = connector_fixture(db)
     incoming = event(event_uid="4" * 64).model_dump(mode="json")
