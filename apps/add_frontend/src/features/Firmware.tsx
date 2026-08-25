@@ -486,6 +486,94 @@ function CampaignDetailDrawer({
                           </dd>
                         </div>
                       )}
+                      {deployment.transport_diagnostics && (
+                        <>
+                          <div className="wide">
+                            <dt>Download endpoint</dt>
+                            <dd>
+                              {deployment.transport_diagnostics.download_grants
+                                .endpoint_reached
+                                ? `Reached ADD${
+                                    deployment.transport_diagnostics
+                                      .download_grants.last_reached_at
+                                      ? ` · ${dateTime(
+                                          deployment.transport_diagnostics
+                                            .download_grants.last_reached_at,
+                                        )}`
+                                      : ''
+                                  }`
+                                : deployment.transport_diagnostics
+                                      .download_grants.issued_count > 0
+                                  ? 'Not reached by the ESP'
+                                  : 'No download grant issued'}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Signed grants</dt>
+                            <dd>
+                              {
+                                deployment.transport_diagnostics.download_grants
+                                  .reached_count
+                              }{' '}
+                              reached /{' '}
+                              {
+                                deployment.transport_diagnostics.download_grants
+                                  .issued_count
+                              }{' '}
+                              issued
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Attempt telemetry</dt>
+                            <dd>
+                              {
+                                deployment.transport_diagnostics.telemetry
+                                  .sample_count
+                              }{' '}
+                              samples
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Minimum free heap</dt>
+                            <dd>
+                              {deployment.transport_diagnostics.telemetry
+                                .minimum_free_heap === null
+                                ? 'Unavailable'
+                                : `${deployment.transport_diagnostics.telemetry.minimum_free_heap.toLocaleString()} bytes`}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Weakest Wi-Fi</dt>
+                            <dd>
+                              {deployment.transport_diagnostics.telemetry
+                                .weakest_rssi === null
+                                ? 'Unavailable'
+                                : `${deployment.transport_diagnostics.telemetry.weakest_rssi} dBm`}
+                            </dd>
+                          </div>
+                          <div className="wide">
+                            <dt>Latest ESP telemetry</dt>
+                            <dd>
+                              {deployment.transport_diagnostics.telemetry.latest
+                                ? `${
+                                    deployment.transport_diagnostics.telemetry
+                                      .latest.free_heap === null
+                                      ? 'heap unavailable'
+                                      : `${deployment.transport_diagnostics.telemetry.latest.free_heap.toLocaleString()} bytes free`
+                                  } · ${
+                                    deployment.transport_diagnostics.telemetry
+                                      .latest.rssi === null
+                                      ? 'RSSI unavailable'
+                                      : `${deployment.transport_diagnostics.telemetry.latest.rssi} dBm`
+                                  } · ${dateTime(
+                                    deployment.transport_diagnostics.telemetry
+                                      .latest.created_at,
+                                  )}`
+                                : 'Unavailable'}
+                            </dd>
+                          </div>
+                        </>
+                      )}
                     </dl>
                     {deployment.events.length > 0 && (
                       <ol>
