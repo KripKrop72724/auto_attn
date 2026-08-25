@@ -69,6 +69,53 @@
 static const char *TAG = "zone_config";
 static zone_config_t s_config;
 
+static esp_err_t recover_pending_comm_key(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    uint8_t phase = 0;
+    (void)nvs_get_u8(handle, "zkt_key_phase", &phase);
+    nvs_close(handle);
+    if (phase != 1) {
+        return ESP_OK;
+    }
+    err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    uint32_t pending_key = 0;
+    uint32_t pending_revision = 0;
+    uint32_t active_key = 0;
+    uint32_t active_revision = 0;
+    char pending_operation_id[40] = {0};
+    size_t operation_id_size = sizeof(pending_operation_id);
+    if (nvs_get_u32(handle, "zkt_key_pending", &pending_key) != ESP_OK ||
+        nvs_get_u32(handle, "zkt_rev_pending", &pending_revision) != ESP_OK ||
+        nvs_get_str(handle, "zkt_op_pending", pending_operation_id, &operation_id_size) != ESP_OK ||
+        pending_operation_id[0] == '\0' ||
+        pending_revision == 0) {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_STATE;
+    }
+    (void)nvs_get_u32(handle, "zkt_key", &active_key);
+    (void)nvs_get_u32(handle, "zkt_key_rev", &active_revision);
+    err = nvs_set_u32(handle, "zkt_key_prev", active_key);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_rev_prev", active_revision);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_key", pending_key);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_key_rev", pending_revision);
+    if (err == ESP_OK) err = nvs_set_str(handle, "zkt_op_applied", pending_operation_id);
+    if (err == ESP_OK) err = nvs_erase_key(handle, "zkt_key_pending");
+    if (err == ESP_OK) err = nvs_erase_key(handle, "zkt_rev_pending");
+    if (err == ESP_OK) (void)nvs_erase_key(handle, "zkt_op_pending");
+    if (err == ESP_OK) err = nvs_set_u8(handle, "zkt_key_phase", 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "Completed an authenticated COMM Key commit interrupted by reset");
+    }
+    return err;
+}
+
 static void copy_default(char *target, size_t size, const char *value)
 {
     strlcpy(target, value ? value : "", size);
@@ -118,6 +165,11 @@ static void load_defaults(void)
 esp_err_t zone_config_init(void)
 {
     load_defaults();
+    esp_err_t recovery = recover_pending_comm_key();
+    if (recovery != ESP_OK) {
+        ESP_LOGE(TAG, "Could not recover pending COMM Key transaction: %s", esp_err_to_name(recovery));
+        return recovery;
+    }
     nvs_handle_t handle;
     esp_err_t err = nvs_open("zone_cfg", NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -135,6 +187,12 @@ esp_err_t zone_config_init(void)
     read_string(handle, "wifi_pass", s_config.wifi_password, sizeof(s_config.wifi_password));
     (void)nvs_get_u16(handle, "zkt_port", &s_config.zkt_port);
     (void)nvs_get_u32(handle, "zkt_key", &s_config.zkt_comm_key);
+    (void)nvs_get_u32(handle, "zkt_key_rev", &s_config.zkt_comm_key_revision);
+    read_string(
+        handle,
+        "zkt_op_applied",
+        s_config.zkt_comm_key_operation_id,
+        sizeof(s_config.zkt_comm_key_operation_id));
     read_string(handle, "zkt_ip", s_config.zkt_preferred_ip, sizeof(s_config.zkt_preferred_ip));
     read_string(handle, "zkt_serial", s_config.zkt_expected_serial, sizeof(s_config.zkt_expected_serial));
     read_string(handle, "zone_dev", s_config.zone_device_id, sizeof(s_config.zone_device_id));
@@ -243,6 +301,49 @@ esp_err_t zone_config_save_wifi(const char *ssid, const char *password)
         copy_default(s_config.wifi_ssid, sizeof(s_config.wifi_ssid), ssid);
         copy_default(s_config.wifi_password, sizeof(s_config.wifi_password), password);
         ESP_LOGI(TAG, "Updated encrypted Wi-Fi configuration for SSID=%s", ssid);
+    }
+    return err;
+}
+
+esp_err_t zone_config_save_zkt_comm_key(
+    uint32_t comm_key,
+    uint32_t revision,
+    const char *operation_id)
+{
+    if (!operation_id || operation_id[0] == '\0' || strlen(operation_id) >= 40 ||
+        revision == 0 || revision != s_config.zkt_comm_key_revision + 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_u32(handle, "zkt_key_pending", comm_key)) == ESP_OK &&
+        (err = nvs_set_u32(handle, "zkt_rev_pending", revision)) == ESP_OK &&
+        (err = nvs_set_str(handle, "zkt_op_pending", operation_id)) == ESP_OK &&
+        (err = nvs_set_u8(handle, "zkt_key_phase", 1)) == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_key_prev", s_config.zkt_comm_key);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(handle, "zkt_rev_prev", s_config.zkt_comm_key_revision);
+    }
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_key", comm_key);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "zkt_key_rev", revision);
+    if (err == ESP_OK) err = nvs_set_str(handle, "zkt_op_applied", operation_id);
+    if (err == ESP_OK) err = nvs_erase_key(handle, "zkt_key_pending");
+    if (err == ESP_OK) err = nvs_erase_key(handle, "zkt_rev_pending");
+    if (err == ESP_OK) (void)nvs_erase_key(handle, "zkt_op_pending");
+    if (err == ESP_OK) err = nvs_set_u8(handle, "zkt_key_phase", 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        s_config.zkt_comm_key = comm_key;
+        s_config.zkt_comm_key_revision = revision;
+        copy_default(
+            s_config.zkt_comm_key_operation_id,
+            sizeof(s_config.zkt_comm_key_operation_id),
+            operation_id);
+        ESP_LOGI(TAG, "Committed authenticated ZKT COMM Key revision %lu", (unsigned long)revision);
     }
     return err;
 }

@@ -60,6 +60,8 @@ class Connector(Base):
     ota_image_sha256: Mapped[str | None] = mapped_column(String(64))
     ota_signing_key_id: Mapped[str | None] = mapped_column(String(80))
     config_version: Mapped[int] = mapped_column(Integer, default=1)
+    comm_key_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    comm_key_revision: Mapped[int] = mapped_column(Integer, default=0)
     lifecycle_state: Mapped[str] = mapped_column(String(40), default="ONBOARDING", index=True)
     connected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     boot_id: Mapped[str | None] = mapped_column(String(100), index=True)
@@ -535,6 +537,57 @@ class DeviceCommandEvent(Base):
     status: Mapped[str] = mapped_column(String(40), index=True)
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = utc_column()
+
+
+class ConnectorCommKeyState(Base):
+    __tablename__ = "add_connector_comm_key_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connector_id: Mapped[int] = mapped_column(
+        ForeignKey("add_connectors.id"), unique=True, index=True
+    )
+    applied_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    pending_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    applied_revision: Mapped[int] = mapped_column(Integer, default=0)
+    desired_revision: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(40), default="UNKNOWN", index=True)
+    mode: Mapped[str | None] = mapped_column(String(40))
+    expected_terminal_serial: Mapped[str | None] = mapped_column(String(120))
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class CommKeyOperation(Base):
+    __tablename__ = "add_comm_key_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_id", "idempotency_key", name="uq_add_comm_key_operation_idempotency"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    operation_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    command_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_device_commands.id"), unique=True, index=True
+    )
+    mode: Mapped[str] = mapped_column(String(40), index=True)
+    requested_revision: Mapped[int] = mapped_column(Integer)
+    expected_terminal_serial: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UserDeletionJob(Base):

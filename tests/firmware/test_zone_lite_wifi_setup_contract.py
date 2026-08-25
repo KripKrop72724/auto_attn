@@ -383,7 +383,10 @@ def test_candidate_network_is_tested_before_one_atomic_encrypted_nvs_commit() ->
     assert "esp_wifi_get_config(WIFI_IF_STA, &old_configuration)" in PORTAL
     assert "restore_station(&old_configuration)" in PORTAL
     assert PORTAL.index("VALIDATION_OK_BIT") < PORTAL.index("zone_config_save_wifi(candidate->ssid")
-    save_wifi = config[config.index("esp_err_t zone_config_save_wifi"):]
+    save_wifi = config[
+        config.index("esp_err_t zone_config_save_wifi") :
+        config.index("esp_err_t zone_config_save_zkt_comm_key")
+    ]
     assert 'nvs_set_str(handle, "wifi_ssid", ssid)' in save_wifi
     assert 'nvs_set_str(handle, "wifi_pass", password)' in save_wifi
     assert save_wifi.count("nvs_commit(handle)") == 1

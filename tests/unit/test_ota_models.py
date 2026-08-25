@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -9,7 +10,9 @@ from zk_add.ota import (
     _versions_match,
     campaign_detail,
     campaign_page,
+    record_progress,
     release_page,
+    version_at_least,
 )
 from zk_add.settings import settings
 
@@ -35,6 +38,125 @@ def test_ota_version_matching_accepts_connector_and_app_formats() -> None:
     assert _versions_match("2.2.7", "zone-lite-2.2.7")
     assert not _versions_match("2.2.6", "2.2.7")
     assert not _versions_match(None, "2.2.7")
+    assert not _versions_match("2.2.7-rc1", "2.2.7")
+    assert version_at_least("2.10.0", "2.2.0")
+    assert not version_at_least("2.1.99", "2.2.0")
+
+
+def test_ota_progress_requires_legal_monotonic_signed_boot_evidence() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        release = FirmwareRelease(
+            release_id="release-2-5-0",
+            version="2.5.0",
+            git_sha="a" * 40,
+            image_sha256="b" * 64,
+            image_size=1024,
+            signing_key_id="production-key",
+            partition_layout="zone-lite-ota-v1",
+            minimum_bootstrap_version="2.2.0",
+            storage_name="2.5.0/firmware.bin",
+            manifest={"application_sha256": "c" * 64},
+            manifest_signature="test-signature",
+            state="AVAILABLE",
+        )
+        connector = Connector(
+            connector_id="connector-progress",
+            hardware_id="00:11:22:33:44:66",
+            zone_id="ZONE-PROGRESS",
+            zone_name="Progress",
+            device_id="1",
+            display_name="Progress terminal",
+            firmware_version="2.4.13",
+        )
+        session.add_all([release, connector])
+        session.flush()
+        campaign = FirmwareCampaign(
+            campaign_id="campaign-progress",
+            release_id=release.id,
+            zone_id=connector.zone_id,
+            status="ACTIVE",
+            actor="StateHealthAdmin",
+            idempotency_key="campaign-progress-key",
+            reason="Verify signed progress transitions",
+            typed_confirmation="2.5.0",
+            eligible_count=1,
+            legacy_skipped_count=0,
+        )
+        session.add(campaign)
+        session.flush()
+        deployment = FirmwareDeployment(
+            deployment_id="deployment-progress",
+            campaign_id=campaign.id,
+            release_id=release.id,
+            connector_id=connector.id,
+            status="OFFERED",
+            previous_version="2.4.13",
+            target_version="2.5.0",
+        )
+        session.add(deployment)
+        session.flush()
+
+        with pytest.raises(ValueError, match="Illegal firmware transition"):
+            record_progress(
+                session,
+                connector=connector,
+                deployment_public_id=deployment.deployment_id,
+                state="VERIFYING",
+                bytes_written=1024,
+            )
+        record_progress(
+            session,
+            connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="DOWNLOADING",
+            bytes_written=512,
+        )
+        with pytest.raises(ValueError, match="artifact bounds"):
+            record_progress(
+                session,
+                connector=connector,
+                deployment_public_id=deployment.deployment_id,
+                state="DOWNLOADING",
+                bytes_written=511,
+            )
+        record_progress(
+            session,
+            connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="VERIFYING",
+            bytes_written=1024,
+        )
+        record_progress(
+            session,
+            connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="READY_TO_BOOT",
+            bytes_written=1024,
+        )
+        with pytest.raises(ValueError, match="digest"):
+            record_progress(
+                session,
+                connector=connector,
+                deployment_public_id=deployment.deployment_id,
+                state="BOOTED_PENDING",
+                bytes_written=1024,
+                running_version="2.5.0",
+                running_partition="ota_0",
+                image_sha256="d" * 64,
+            )
+        record_progress(
+            session,
+            connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="BOOTED_PENDING",
+            bytes_written=1024,
+            running_version="zone-lite-2.5.0",
+            running_partition="ota_1",
+            image_sha256="c" * 64,
+        )
+        assert deployment.status == "BOOTED_PENDING"
 
 
 def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypatch) -> None:
@@ -79,7 +201,7 @@ def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypa
             FirmwareCampaign(
                 campaign_id=f"campaign-{index}",
                 release_id=releases[index - 1].id,
-                zone_id="ZONE-ONE",
+                zone_id="ZONE-ONE" if index == 1 else "ZONE-TWO",
                 status=status,
                 actor="StateHealthAdmin",
                 idempotency_key=f"campaign-key-{index}",

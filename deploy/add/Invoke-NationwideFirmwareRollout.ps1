@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$AdminPassword,
     [string]$BaseUrl = 'http://127.0.0.1:8096',
     [string]$AdminUsername = 'StateHealthAdmin',
-    [ValidateRange(1, 5)][int]$BatchSize = 5,
+    [ValidateRange(1, 5)][int]$BatchSize = 1,
     [ValidateRange(15, 240)][int]$BatchTimeoutMinutes = 90
 )
 
@@ -262,7 +262,7 @@ try {
                 $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body @{
                     release_id = $release.release_id
                     zone_id = $zoneId
-                    reason = "Nationwide Wi-Fi setup portal rollout $Version; batch $([int]($offset / $BatchSize) + 1)."
+                    reason = "Nationwide COMM Key recovery rollout $Version; batch $([int]($offset / $BatchSize) + 1)."
                     typed_confirmation = $Version
                     password = $AdminPassword
                     scope_token = [string]$scope.scope_token
@@ -342,6 +342,7 @@ try {
     })
     $unstable = @($finalDevices | Where-Object {
         -not (Test-ReportedFirmwareVersion -ReportedVersion ([string]$_.firmware_version) -ExpectedVersion $Version) -or
+        ($Version -eq '2.5.0' -and -not [bool]$_.comm_key_capable) -or
         -not [bool]$_.connected -or
         $_.state -ne 'ONLINE' -or $_.ota_state -ne 'OTA_READY' -or
         -not [bool]$_.zkt.online -or $_.zkt.certification_state -ne 'CERTIFIED' -or

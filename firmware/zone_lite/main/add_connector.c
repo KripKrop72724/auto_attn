@@ -139,6 +139,7 @@ typedef struct {
 static const char *TAG = "add_connector";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
+static QueueHandle_t s_config_commands;
 static QueueHandle_t s_reconcile_assignments;
 static QueueHandle_t s_source_coverage;
 static QueueHandle_t s_inbound_messages;
@@ -1184,6 +1185,43 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
         command->expected_attendance_count = value->valueint;
         command->has_expected_attendance_count = true;
     }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "config_field");
+    if (cJSON_IsString(value)) {
+        strlcpy(command->config_field, value->valuestring, sizeof(command->config_field));
+    }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "operation_id");
+    if (cJSON_IsString(value)) {
+        strlcpy(
+            command->config_operation_id,
+            value->valuestring,
+            sizeof(command->config_operation_id));
+    }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "mode");
+    if (cJSON_IsString(value)) {
+        strlcpy(command->config_mode, value->valuestring, sizeof(command->config_mode));
+    }
+    value = cJSON_GetObjectItemCaseSensitive(payload, "revision");
+    if (cJSON_IsNumber(value) && value->valuedouble >= 1 && value->valuedouble <= UINT32_MAX) {
+        command->config_revision = (uint32_t)value->valuedouble;
+    }
+    cJSON *sealed = cJSON_GetObjectItemCaseSensitive(payload, "sealed_value");
+    if (cJSON_IsObject(sealed)) {
+        value = cJSON_GetObjectItemCaseSensitive(sealed, "version");
+        if (cJSON_IsNumber(value) && value->valueint >= 0 && value->valueint <= UINT8_MAX) {
+            command->sealed_version = (uint8_t)value->valueint;
+        }
+        value = cJSON_GetObjectItemCaseSensitive(sealed, "nonce");
+        if (cJSON_IsString(value)) {
+            strlcpy(command->sealed_nonce, value->valuestring, sizeof(command->sealed_nonce));
+        }
+        value = cJSON_GetObjectItemCaseSensitive(sealed, "ciphertext");
+        if (cJSON_IsString(value)) {
+            strlcpy(
+                command->sealed_ciphertext,
+                value->valuestring,
+                sizeof(command->sealed_ciphertext));
+        }
+    }
     value = cJSON_IsObject(expected)
                 ? cJSON_GetObjectItemCaseSensitive(expected, "serial")
                 : NULL;
@@ -1457,7 +1495,10 @@ static bool queue_command_if_idle(const add_command_t *command)
         xSemaphoreGive(s_command_lock);
         return true;
     }
-    bool queued = xQueueSend(s_commands, command, 0) == pdTRUE;
+    QueueHandle_t target = strcmp(command->command_type, "APPLY_CONFIG") == 0
+        ? s_config_commands
+        : s_commands;
+    bool queued = target && xQueueSend(target, command, 0) == pdTRUE;
     if (queued) command_mark_queued_locked(command->command_id);
     xSemaphoreGive(s_command_lock);
     return queued;
@@ -1475,9 +1516,13 @@ static void restore_command_inbox(void)
     while (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
-        add_command_t command;
-        if (root && parse_command_object(root, &command) &&
-            xQueueSend(s_commands, &command, 0) == pdTRUE) {
+        add_command_t command = {0};
+        bool parsed = root && parse_command_object(root, &command);
+        QueueHandle_t target = parsed && strcmp(command.command_type, "APPLY_CONFIG") == 0
+            ? s_config_commands
+            : s_commands;
+        if (parsed && target && command.command_id[0] &&
+            xQueueSend(target, &command, 0) == pdTRUE) {
             command_mark_queued_locked(command.command_id);
             restored++;
         }
@@ -2003,6 +2048,11 @@ static void heartbeat_task(void *arg)
             cJSON *payload = cJSON_CreateObject();
             cJSON_AddStringToObject(payload, "firmware_version", firmware_version());
             cJSON_AddNumberToObject(payload, "config_version", 3);
+            cJSON_AddBoolToObject(payload, "comm_key_management", true);
+            cJSON_AddNumberToObject(
+                payload,
+                "comm_key_revision",
+                zone_config_get()->zkt_comm_key_revision);
             cJSON_AddNumberToObject(payload, "uptime_seconds", (double)(esp_timer_get_time() / 1000000));
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
@@ -2017,6 +2067,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddStringToObject(zkt_json, "serial", zkt.serial);
             cJSON_AddStringToObject(zkt_json, "model", zkt.model);
             cJSON_AddStringToObject(zkt_json, "platform", zkt.platform);
+            cJSON_AddBoolToObject(zkt_json, "comm_key_write_v1", false);
             if (zkt.device_time[0]) cJSON_AddStringToObject(zkt_json, "device_time", zkt.device_time);
             if (zkt.device_time_sampled_epoch > 0) {
                 char sampled[32];
@@ -3141,6 +3192,7 @@ void add_connector_init(void)
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_config_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
     s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
@@ -3156,6 +3208,7 @@ void add_connector_init(void)
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
                 s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
+                s_config_commands &&
                 s_reconcile_assignments &&
                 s_source_coverage &&
                 s_inbound_messages;
@@ -3544,6 +3597,37 @@ bool add_connector_begin_pending_command_activity(void)
         xSemaphoreGive(s_lock);
     }
     return started;
+}
+
+bool add_connector_begin_pending_config_activity(void)
+{
+    if (!s_lock || !s_config_commands) return false;
+    bool started = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (!s_ota_restart_claimed && uxQueueMessagesWaiting(s_config_commands) > 0) {
+            strlcpy(s_activity, "APPLYING_CONFIG", sizeof(s_activity));
+            started = true;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return started;
+}
+
+bool add_connector_has_pending_config_command(void)
+{
+    return s_config_commands && uxQueueMessagesWaiting(s_config_commands) > 0;
+}
+
+bool add_connector_take_config_command(add_command_t *out)
+{
+    if (!s_config_commands || !out ||
+        xQueueReceive(s_config_commands, out, 0) != pdTRUE) return false;
+    if (s_command_lock && xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        command_unmark_queued_locked(out->command_id);
+        strlcpy(s_running_command_id, out->command_id, sizeof(s_running_command_id));
+        xSemaphoreGive(s_command_lock);
+    }
+    return true;
 }
 
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry)
