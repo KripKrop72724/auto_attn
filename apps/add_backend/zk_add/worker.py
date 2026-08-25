@@ -396,6 +396,9 @@ async def maintenance_tick() -> None:
         repair_verified_active_identity_backlog(session)
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
+        from zk_add.comm_keys import expire_staged_comm_key_operations
+
+        expire_staged_comm_key_operations(session)
         reconciliation_updates = refresh_all_reconciliation_assurance(session)
         for provisioning in session.scalars(
             select(ProvisioningSession).where(
@@ -437,13 +440,26 @@ async def maintenance_tick() -> None:
             .where(DeviceCommand.status.in_(ACTIVE_COMMAND_STATES))
             .order_by(DeviceCommand.created_at.asc())
         ):
+            connector = session.get(Connector, command.connector_id)
             if command.expires_at and command.expires_at <= now:
                 command.status = "EXPIRED"
                 command.completed_at = now
+                command.error_code = "COMMAND_EXPIRED"
+                command.error_message = "Command expired before verified completion."
+                if command.command_type == "APPLY_CONFIG" and connector is not None:
+                    from zk_add.comm_keys import reconcile_comm_key_command
+
+                    reconcile_comm_key_command(
+                        session,
+                        connector=connector,
+                        command=command,
+                        status="EXPIRED",
+                        result={},
+                        error_code=command.error_code,
+                    )
                 apply_user_command_terminal_state(session, command=command, status="EXPIRED")
                 reconcile_admin_lease_command(session, command=command, now=now)
                 continue
-            connector = session.get(Connector, command.connector_id)
             if connector is None:
                 continue
             if command.status == "CANCEL_REQUESTED":

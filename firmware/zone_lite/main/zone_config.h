@@ -11,6 +11,8 @@ typedef struct {
     char wifi_password[65];
     uint16_t zkt_port;
     uint32_t zkt_comm_key;
+    uint32_t zkt_comm_key_revision;
+    char zkt_comm_key_operation_id[40];
     char zkt_preferred_ip[16];
     char zkt_expected_serial[80];
     char zone_device_id[32];
@@ -45,3 +47,7 @@ esp_err_t zone_config_save_connector(
     const char *ws_url);
 esp_err_t zone_config_save_wifi(const char *ssid, const char *password);
 esp_err_t zone_config_save_zkt_serial(const char *serial);
+esp_err_t zone_config_save_zkt_comm_key(
+    uint32_t comm_key,
+    uint32_t revision,
+    const char *operation_id);

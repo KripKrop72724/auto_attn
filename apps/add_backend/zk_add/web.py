@@ -50,6 +50,7 @@ from zk_add.models import (
     AdminSession,
     AttendanceEvent,
     Connector,
+    CommKeyOperation,
     DeviceAlert,
     DeviceCommand,
     DeviceCommandEvent,
@@ -72,6 +73,8 @@ from zk_add.schemas import (
     BulkUserDeleteCancelRequest,
     BulkUserDeleteRequest,
     CommandUpdate,
+    CommKeyChangeRequest,
+    CommKeyRevealRequest,
     Envelope,
     HeartbeatPayload,
     HistoricalCurrentIdentityRequest,
@@ -104,6 +107,7 @@ from zk_add.schemas import (
 from zk_add.security import (
     ADMIN_COOKIE,
     AdminContext,
+    LoginRateLimiter,
     admin_context,
     authenticate_connector_request,
     authenticate_websocket_token,
@@ -146,6 +150,13 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.settings import settings
+from zk_add.comm_keys import (
+    cancel_comm_key_operation,
+    create_comm_key_change,
+    reveal_comm_key,
+    serialize_comm_key_state,
+    serialize_operation as serialize_comm_key_operation,
+)
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.time_utils import parse_datetime, utc_now
 from zk_add.reconciliation import (
@@ -175,6 +186,9 @@ from zk_add.source_exceptions import (
 
 
 logger = logging.getLogger(__name__)
+comm_key_reveal_rate_limiter = LoginRateLimiter(
+    attempts=3, window_seconds=5 * 60, lock_seconds=15 * 60
+)
 
 
 def get_db():
@@ -585,6 +599,182 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         **serialize_connector(connector),
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
+    }
+
+
+@app.get("/api/v1/devices/{connector_id}/comm-key")
+def get_device_comm_key_state(
+    connector_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    return serialize_comm_key_state(db, connector)
+
+
+@app.post("/api/v1/devices/{connector_id}/comm-key/changes", status_code=202)
+async def change_device_comm_key(
+    request: Request,
+    connector_id: str,
+    body: CommKeyChangeRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt:
+        active_lease = db.scalar(
+            select(TemporaryAdminLease).where(
+                TemporaryAdminLease.zkt_device_id == zkt.id,
+                TemporaryAdminLease.state.in_(["GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]),
+            )
+        )
+        if active_lease:
+            raise HTTPException(
+                status_code=409,
+                detail="COMM Key changes are blocked by an active enrollment lease.",
+            )
+    try:
+        operation, command = create_comm_key_change(
+            db,
+            connector=connector,
+            new_key=body.new_key.get_secret_value(),
+            mode=body.mode,
+            expected_revision=body.expected_revision,
+            expected_terminal_serial=body.expected_terminal_serial,
+            reason=body.reason,
+            typed_confirmation=body.typed_confirmation,
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="COMM Key protection is unavailable.") from exc
+    append_audit(
+        db,
+        actor=context.username,
+        action="COMM_KEY_CHANGE_STEP_UP_CONFIRMED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome=operation.status,
+        ip_address=client_ip(request),
+        after={"operation_id": operation.operation_id},
+    )
+    db.commit()
+    if command is not None:
+        await dispatch_command(connector, command)
+    response = {
+        "state": serialize_comm_key_state(db, connector),
+        "operation": serialize_comm_key_operation(operation),
+        "command": command_response(command) if command else None,
+    }
+    await browser_events.publish(
+        "device",
+        {
+            "connector_id": connector.connector_id,
+            "comm_key_state": response["state"]["management_state"],
+        },
+    )
+    return response
+
+
+@app.post("/api/v1/devices/{connector_id}/comm-key/reveal")
+def reveal_device_comm_key(
+    request: Request,
+    connector_id: str,
+    body: CommKeyRevealRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    rate_limit_key = f"{context.username}:{client_ip(request)}:{connector_id}"
+    if not comm_key_reveal_rate_limiter.allow(rate_limit_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many COMM Key reveal attempts. Try again later.",
+            headers={"Retry-After": "900"},
+        )
+    # Count every admitted attempt, including an incorrect password. The API
+    # runs one production worker, matching the existing login limiter model.
+    comm_key_reveal_rate_limiter.fail(rate_limit_key)
+    require_step_up(body.password.get_secret_value(), db, context)
+    connector = connector_or_404(db, connector_id)
+    expected_confirmation = f"REVEAL {connector.connector_id}"
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Type '{expected_confirmation}' to reveal the managed key.",
+        )
+    try:
+        comm_key, state = reveal_comm_key(db, connector=connector)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="COMM Key protection is unavailable.") from exc
+    append_audit(
+        db,
+        actor=context.username,
+        action="COMM_KEY_REVEALED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome="SUCCEEDED",
+        ip_address=client_ip(request),
+        after={
+            "revision": state.applied_revision,
+            "verified_terminal_serial": state.expected_terminal_serial,
+            "reason": body.reason,
+        },
+    )
+    db.commit()
+    return JSONResponse(
+        content={
+            "comm_key": comm_key,
+            "applied_revision": state.applied_revision,
+            "verified_terminal_serial": state.expected_terminal_serial,
+            "last_verified_at": (
+                state.last_verified_at.isoformat() if state.last_verified_at else None
+            ),
+        },
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/v1/comm-key-operations/{operation_id}/cancel")
+async def cancel_device_comm_key_operation(
+    operation_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    operation = db.scalar(
+        select(CommKeyOperation).where(CommKeyOperation.operation_id == operation_id)
+    )
+    if operation is None:
+        raise HTTPException(status_code=404, detail="COMM Key operation not found.")
+    try:
+        connector, command, remote_cancel = cancel_comm_key_operation(
+            db, operation=operation, actor=context.username
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    if remote_cancel and command is not None:
+        await connector_hub.send(
+            connector.connector_id,
+            {
+                "schema_version": "2",
+                "type": "command_cancel",
+                "command_id": command.command_id,
+            },
+        )
+    return {
+        "state": serialize_comm_key_state(db, connector),
+        "operation": serialize_comm_key_operation(operation),
     }
 
 
@@ -2715,6 +2905,8 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
     event_payload = None
     ack_payload = None
     authoritative_coverage_payload = None
+    send_commands_after_ack = False
+    connector_id_to_flush = None
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
         if connector is None:
@@ -2735,6 +2927,11 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 sequence=envelope.seq,
                 payload=payload,
             )
+            # A firmware capability heartbeat can materialize a previously staged
+            # recovery command. The initial WebSocket backlog was sent before this
+            # heartbeat, so flush the active queue again after its ACK.
+            send_commands_after_ack = True
+            connector_id_to_flush = connector.connector_id
             from zk_add.provisioning_api import correlate_onboarding
 
             provisioning_session = correlate_onboarding(db, connector)
@@ -2981,6 +3178,8 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
         ack_payload
         or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq}
     )
+    if send_commands_after_ack and connector_id_to_flush:
+        await send_pending_commands(connector_id_to_flush)
     if authoritative_coverage_payload is not None:
         await websocket.send_json(authoritative_coverage_payload)
     await browser_events.publish(envelope.type, event_payload or {})
@@ -3246,6 +3445,7 @@ from zk_add.ota import (  # noqa: E402
     record_progress as _record_firmware_progress,
     release_page as _release_page,
     resolve_download as _resolve_firmware_download,
+    version_at_least as _firmware_version_at_least,
 )
 from zk_add.time_utils import utc_now as _ota_utc_now  # noqa: E402
 
@@ -3269,6 +3469,8 @@ class _FirmwareProgressIn(_BaseModel):
     ]
     bytes_written: int = _Field(default=0, ge=0)
     running_version: str | None = _Field(default=None, max_length=80)
+    running_partition: str | None = _Field(default=None, max_length=40)
+    image_sha256: str | None = _Field(default=None, pattern=r"^[0-9a-f]{64}$")
     error_code: str | None = _Field(default=None, max_length=120)
     error_message: str | None = _Field(default=None, max_length=500)
 
@@ -3330,7 +3532,7 @@ async def report_firmware_capability(
         and body.secure_boot
         and body.rollback_enabled
         and body.partition_layout == "zone-lite-ota-v1"
-        and body.running_version >= "2.2.0"
+        and _firmware_version_at_least(body.running_version, "2.2.0")
     )
     connector.ota_capable = eligible
     connector.ota_secure_boot = body.secure_boot
@@ -3374,6 +3576,9 @@ async def firmware_progress(
             deployment_public_id=deployment_id,
             state=body.state,
             bytes_written=body.bytes_written,
+            running_version=body.running_version,
+            running_partition=body.running_partition,
+            image_sha256=body.image_sha256,
             error_code=body.error_code,
             error_message=body.error_message,
         )

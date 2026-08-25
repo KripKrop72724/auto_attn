@@ -33,6 +33,12 @@ from zk_add.crypto import (
     encrypt_cnic,
     encrypt_text,
 )
+from zk_add.comm_keys import (
+    create_comm_key_change,
+    decrypt_managed_key,
+    expire_staged_comm_key_operations,
+    serialize_comm_key_state,
+)
 from zk_add.db import Base, SessionLocal
 from zk_add.identity import build_machine_name
 from zk_add.identity_conflicts import (
@@ -46,6 +52,8 @@ from zk_add.models import (
     AuditEvent,
     Connector,
     ConnectorCredential,
+    ConnectorCommKeyState,
+    CommKeyOperation,
     DeviceAlert,
     DeviceCommand,
     DeviceConnectionEvent,
@@ -67,6 +75,7 @@ from zk_add.schemas import (
     AttendanceEventIn,
     Envelope,
     HeartbeatPayload,
+    CommKeyChangeRequest,
     OracleReceiptBatchRequest,
     UserCreateRequest,
     UserSnapshotRequest,
@@ -360,6 +369,9 @@ def db() -> Session:
     settings.admin_username = "StateHealthAdmin"
     settings.admin_password_hash = hash_admin_password("correct-password")
     settings.admin_cookie_secure = False
+    settings.comm_key_management_enabled = True
+    settings.comm_key_reveal_enabled = True
+    settings.comm_key_secret_fernet_key = Fernet.generate_key().decode()
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -4989,3 +5001,203 @@ def test_admin_can_confirm_initial_terminal_serial_without_provisioning_session(
     )
     assert audit is not None
     assert audit.outcome == "WAITING_FOR_DEVICE"
+
+
+def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    operation, command = create_comm_key_change(
+        db,
+        connector=connector,
+        new_key="1979",
+        mode="ESP_ONLY",
+        expected_revision=0,
+        expected_terminal_serial=SERIAL,
+        reason="Recover the remotely deployed Quetta connector",
+        typed_confirmation=f"CHANGE {connector.connector_id} {SERIAL}",
+        idempotency_key="comm-key-recovery-quetta-0001",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+
+    assert command is None
+    assert operation.status == "PENDING_CAPABILITY"
+    state = db.scalar(
+        select(ConnectorCommKeyState).where(
+            ConnectorCommKeyState.connector_id == connector.id
+        )
+    )
+    assert state is not None
+    assert state.pending_secret_encrypted != "1979"
+    assert decrypt_managed_key(state.pending_secret_encrypted) == "1979"
+    assert "1979" not in json.dumps(serialize_comm_key_state(db, connector), default=str)
+    assert "1979" not in json.dumps(
+        [row.after for row in db.scalars(select(AuditEvent)).all()]
+    )
+
+    connector.connected = True
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="zone-lite-250-boot",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.5.0",
+            comm_key_management=True,
+            comm_key_revision=0,
+            zkt={"serial": SERIAL, "online": False, "connection_state": "OFFLINE"},
+        ),
+    )
+    db.flush()
+
+    operation = db.scalar(
+        select(CommKeyOperation).where(CommKeyOperation.id == operation.id)
+    )
+    assert operation is not None and operation.command_id is not None
+    command = db.get(DeviceCommand, operation.command_id)
+    assert command is not None and command.command_type == "APPLY_CONFIG"
+    command_payload = decrypt_json(command.payload_encrypted)
+    assert command_payload["sealed_value"]["algorithm"] == "HKDF-SHA256-AES-256-GCM"
+    assert "1979" not in json.dumps(command_payload)
+    assert "1979" not in json.dumps(serialize_command(command))
+
+    apply_command_update(
+        db,
+        connector=connector,
+        command_id=command.command_id,
+        status="SUCCEEDED",
+        result={
+            "config_field": "zkt_comm_key",
+            "applied_revision": 1,
+            "verified_serial": SERIAL,
+            "authentication_verified": True,
+            "comm_key": "must-not-be-retained",
+        },
+        error_code=None,
+        error_message=None,
+    )
+    db.commit()
+
+    assert state.status == "APPLIED"
+    assert state.applied_revision == 1
+    assert state.pending_secret_encrypted is None
+    assert connector.comm_key_revision == 1
+    assert command.result == {
+        "config_field": "zkt_comm_key",
+        "applied_revision": 1,
+        "verified_serial": SERIAL,
+        "authentication_verified": True,
+    }
+
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    revealed = client.post(
+        f"/api/v1/devices/{connector.connector_id}/comm-key/reveal",
+        json={
+            "password": "correct-password",
+            "reason": "Verify the Quetta recovery credential in break-glass mode",
+            "typed_confirmation": f"REVEAL {connector.connector_id}",
+        },
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert revealed.status_code == 200, revealed.text
+    assert revealed.json()["comm_key"] == "1979"
+    assert revealed.headers["cache-control"] == "no-store, max-age=0"
+    reveal_audit = db.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.action == "COMM_KEY_REVEALED")
+        .order_by(AuditEvent.id.desc())
+    )
+    assert reveal_audit is not None
+    assert reveal_audit.after["reason"].startswith("Verify the Quetta")
+    assert "1979" not in json.dumps(reveal_audit.after)
+
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="rolled-back-firmware",
+        sequence=2,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.5.0",
+            comm_key_management=True,
+            comm_key_revision=0,
+            zkt={"serial": SERIAL, "online": False, "connection_state": "OFFLINE"},
+        ),
+    )
+    assert state.status == "RECONCILIATION_REQUIRED"
+    assert state.last_error_code == "COMM_KEY_REVISION_DRIFT"
+
+
+@pytest.mark.parametrize("value", ["0", "000000", "01979", "4294967296", "12x34"])
+def test_comm_key_schema_rejects_noncanonical_or_out_of_range_values(value: str):
+    with pytest.raises(ValidationError):
+        CommKeyChangeRequest(
+            new_key=value,
+            mode="ESP_ONLY",
+            expected_revision=0,
+            expected_terminal_serial=SERIAL,
+            reason="Recover the connector communication credential",
+            typed_confirmation="CHANGE connector serial",
+            password="correct-password",
+            idempotency_key="test-key",
+        )
+
+
+def test_comm_key_terminal_rotation_is_fail_closed_without_certified_adapter(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    connector.comm_key_capable = True
+    with pytest.raises(ValueError, match="not certified for remote key writes"):
+        create_comm_key_change(
+            db,
+            connector=connector,
+            new_key="1979",
+            mode="ESP_AND_TERMINAL",
+            expected_revision=0,
+            expected_terminal_serial=SERIAL,
+            reason="Rotate both authenticated communication endpoints",
+            typed_confirmation=f"CHANGE {connector.connector_id} {SERIAL}",
+            idempotency_key="comm-key-terminal-rotation-0001",
+            actor="StateHealthAdmin",
+        )
+
+
+def test_staged_comm_key_secret_is_destroyed_when_capability_window_expires(db: Session):
+    connector = connector_fixture(db)
+    operation, _command = create_comm_key_change(
+        db,
+        connector=connector,
+        new_key="1979",
+        mode="ESP_ONLY",
+        expected_revision=0,
+        expected_terminal_serial=SERIAL,
+        reason="Stage a bounded recovery credential for the connector",
+        typed_confirmation=f"CHANGE {connector.connector_id} {SERIAL}",
+        idempotency_key="test-key",
+        actor="StateHealthAdmin",
+    )
+    operation.expires_at = utc_now() - timedelta(seconds=1)
+    db.flush()
+
+    assert expire_staged_comm_key_operations(db) == 1
+    state = db.scalar(
+        select(ConnectorCommKeyState).where(
+            ConnectorCommKeyState.connector_id == connector.id
+        )
+    )
+    assert operation.status == "EXPIRED"
+    assert state is not None and state.pending_secret_encrypted is None
+    assert state.desired_revision == state.applied_revision == 0

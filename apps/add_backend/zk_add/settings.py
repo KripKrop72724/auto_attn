@@ -70,6 +70,12 @@ class AddSettings(BaseSettings):
     firmware_store_path: str = "/firmware"
     firmware_download_grant_seconds: int = 15 * 60
     firmware_signing_public_key_pem_b64: str | None = None
+    comm_key_management_enabled: bool = False
+    comm_key_reveal_enabled: bool = False
+    comm_key_secret_fernet_key: str | None = None
+    comm_key_operation_seconds: int = Field(
+        default=7 * 24 * 60 * 60, ge=900, le=7 * 24 * 60 * 60
+    )
 
     # Physical ESP32-S3 preparation is deliberately independent from OTA. It
     # stays dark until the companion, factory catalog and protected worker are
@@ -121,6 +127,11 @@ class AddSettings(BaseSettings):
                 missing.append("ADD_PROVISIONING_COMPANION_RELEASE_PUBLIC_KEY_B64")
             if not self.firmware_signing_public_key_pem_b64:
                 missing.append("ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64")
+        if self.comm_key_management_enabled or self.comm_key_reveal_enabled:
+            if not self.comm_key_secret_fernet_key:
+                missing.append("ADD_COMM_KEY_SECRET_FERNET_KEY")
+            if not self.fleet_root_secret:
+                missing.append("ADD_FLEET_ROOT_SECRET")
         if missing:
             raise RuntimeError(f"Missing required ADD secrets: {', '.join(missing)}")
 

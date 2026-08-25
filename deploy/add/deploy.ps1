@@ -341,6 +341,15 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) {
     $environment["ADD_FIRMWARE_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_COMM_KEY_MANAGEMENT_ENABLED)) {
+    $environment["ADD_COMM_KEY_MANAGEMENT_ENABLED"] = $env:ADD_DEPLOY_COMM_KEY_MANAGEMENT_ENABLED
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_COMM_KEY_REVEAL_ENABLED)) {
+    $environment["ADD_COMM_KEY_REVEAL_ENABLED"] = $env:ADD_DEPLOY_COMM_KEY_REVEAL_ENABLED
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_COMM_KEY_SECRET_FERNET_KEY)) {
+    $environment["ADD_COMM_KEY_SECRET_FERNET_KEY"] = $env:ADD_DEPLOY_COMM_KEY_SECRET_FERNET_KEY
+}
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_ENABLED)) {
     $environment["ADD_RECONCILIATION_ENABLED"] = $env:ADD_DEPLOY_RECONCILIATION_ENABLED
 }
@@ -415,6 +424,18 @@ if ($environment["ADD_PII_FERNET_KEY"] -notmatch '^[A-Za-z0-9_-]{43}=$') {
 }
 if ($environment["ADD_FLEET_ROOT_SECRET"].Length -lt 32) {
     throw "ADD_FLEET_ROOT_SECRET must contain at least 32 characters."
+}
+if (
+    $environment["ADD_COMM_KEY_MANAGEMENT_ENABLED"] -eq "true" -or
+    $environment["ADD_COMM_KEY_REVEAL_ENABLED"] -eq "true"
+) {
+    [void](Require-EnvironmentValue -Map $environment -Name "ADD_COMM_KEY_SECRET_FERNET_KEY")
+    if ($environment["ADD_COMM_KEY_SECRET_FERNET_KEY"] -notmatch '^[A-Za-z0-9_-]{43}=$') {
+        throw "ADD_COMM_KEY_SECRET_FERNET_KEY is not a valid dedicated Fernet key."
+    }
+    if ($environment["ADD_COMM_KEY_SECRET_FERNET_KEY"] -eq $environment["ADD_PII_FERNET_KEY"]) {
+        throw "ADD_COMM_KEY_SECRET_FERNET_KEY must not reuse ADD_PII_FERNET_KEY."
+    }
 }
 if ($environment["ADD_POSTGRES_PASSWORD"].Length -lt 24) {
     throw "ADD_POSTGRES_PASSWORD must contain at least 24 characters."

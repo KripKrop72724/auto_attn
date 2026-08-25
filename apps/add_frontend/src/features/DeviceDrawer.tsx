@@ -5,7 +5,9 @@ import {
   relativeTime, statusPattern, useToast, type DrawerTab,
 } from '../App'
 import { Icon } from '../Icon'
-import type { Command, ConnectionEvent, Device, DeviceLog } from '../types'
+import type {
+  Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceLog,
+} from '../types'
 
 export function DeviceDrawer({
   seed,
@@ -26,18 +28,45 @@ export function DeviceDrawer({
   const [connections, setConnections] = useState<ConnectionEvent[]>([])
   const [password, setPassword] = useState('')
   const [reason, setReason] = useState('Operator-requested terminal health refresh')
+  const [commKeyState, setCommKeyState] = useState<CommKeyState | null>(null)
+  const [commKeyMode, setCommKeyMode] = useState<'ESP_ONLY' | 'ESP_AND_TERMINAL'>('ESP_ONLY')
+  const [newCommKey, setNewCommKey] = useState('')
+  const [commKeySerial, setCommKeySerial] = useState(seed.zkt?.confirmed_serial || seed.zkt?.expected_serial || seed.zkt?.serial || '')
+  const [commKeyReason, setCommKeyReason] = useState('Recover remote connector communication access')
+  const [commKeyConfirmation, setCommKeyConfirmation] = useState('')
+  const [commKeyPassword, setCommKeyPassword] = useState('')
+  const [revealReason, setRevealReason] = useState('Authorized operational recovery inspection')
+  const [revealConfirmation, setRevealConfirmation] = useState('')
+  const [revealPassword, setRevealPassword] = useState('')
+  const [revealedKey, setRevealedKey] = useState<CommKeyReveal | null>(null)
   const [busy, setBusy] = useState(false)
   const load = useCallback(async () => {
-    const [detail, logResult, history] = await Promise.all([
+    const [detail, logResult, history, keyState] = await Promise.all([
       api<Device>(`/api/v1/devices/${seed.connector_id}`),
       api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=250`),
       api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=40`),
+      api<CommKeyState>(`/api/v1/devices/${seed.connector_id}/comm-key`),
     ])
     setDevice(detail)
     setLogs(logResult.rows)
     setConnections(history.rows)
+    setCommKeyState(keyState)
+    setCommKeySerial((current) => current || detail.zkt?.confirmed_serial || detail.zkt?.expected_serial || detail.zkt?.serial || '')
   }, [seed.connector_id])
   useEffect(() => { void load() }, [load, revision])
+  useEffect(() => {
+    if (!revealedKey) return
+    const hide = () => setRevealedKey(null)
+    const hideWhenBackgrounded = () => { if (document.visibilityState !== 'visible') hide() }
+    const timer = window.setTimeout(hide, 15_000)
+    window.addEventListener('blur', hide)
+    document.addEventListener('visibilitychange', hideWhenBackgrounded)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('blur', hide)
+      document.removeEventListener('visibilitychange', hideWhenBackgrounded)
+    }
+  }, [revealedKey])
   const restart = async () => {
     if (!password) return toast.error('Confirm the administrator password before restart.')
     setBusy(true)
@@ -67,6 +96,65 @@ export function DeviceDrawer({
       await load()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Command could not be cancelled.')
+    }
+  }
+  const changeCommKey = async () => {
+    if (!commKeyState) return
+    if (!/^[1-9][0-9]{0,9}$/.test(newCommKey) || Number(newCommKey) > 4_294_967_295) {
+      return toast.error('Enter a non-zero decimal COMM Key without leading zeros.')
+    }
+    if (!commKeyPassword) return toast.error('Confirm the administrator password for this key change.')
+    setBusy(true)
+    try {
+      await api(`/api/v1/devices/${device.connector_id}/comm-key/changes`, {
+        method: 'POST',
+        body: JSON.stringify({
+          new_key: newCommKey,
+          mode: commKeyMode,
+          expected_revision: commKeyState.applied_revision,
+          expected_terminal_serial: commKeySerial,
+          reason: commKeyReason,
+          typed_confirmation: commKeyConfirmation,
+          password: commKeyPassword,
+          idempotency_key: idempotency('comm-key'),
+        }),
+      })
+      toast.notice(commKeyState.capabilities.esp_only ? 'COMM Key recovery was securely queued.' : 'COMM Key recovery was staged for firmware 2.5.0.')
+      setNewCommKey('')
+      setCommKeyPassword('')
+      setCommKeyConfirmation('')
+      await load()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'COMM Key change could not be queued.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const revealCommKey = async () => {
+    if (!revealPassword) return toast.error('Confirm the administrator password before reveal.')
+    setBusy(true)
+    try {
+      const revealed = await api<CommKeyReveal>(`/api/v1/devices/${device.connector_id}/comm-key/reveal`, {
+        method: 'POST',
+        body: JSON.stringify({ password: revealPassword, reason: revealReason, typed_confirmation: revealConfirmation }),
+      })
+      setRevealedKey(revealed)
+      setRevealPassword('')
+      setRevealConfirmation('')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'COMM Key could not be revealed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const cancelCommKeyOperation = async () => {
+    if (!commKeyState?.active_operation) return
+    try {
+      await api(`/api/v1/comm-key-operations/${commKeyState.active_operation.operation_id}/cancel`, { method: 'POST', body: '{}' })
+      toast.notice('COMM Key operation was cancelled before mutation.')
+      await load()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'COMM Key operation could not be cancelled.')
     }
   }
   const handleTabKey = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -142,6 +230,43 @@ export function DeviceDrawer({
         {tab === 'control' && <div className="control-stack">
           <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
           <article className="control-card"><span><Icon name="refresh" /></span><div><h3>Refresh terminal users</h3><p>Request two matching terminal reads. Current verified revision: {device.zkt?.identity_snapshot_revision || 'none'} · {device.zkt?.identity_snapshot_stable ? 'stable' : 'awaiting verification'}{device.zkt?.identity_snapshot_observed_at ? ` · ${relativeTime(device.zkt.identity_snapshot_observed_at)}` : ''}.</p></div><button className="button secondary" onClick={() => void refreshUsers()}>Request verified reread</button></article>
+          <article className="control-card comm-key-card"><span><Icon name="shield" /></span><div>
+            <h3>COMM Key recovery</h3>
+            <p>
+              State <strong>{commKeyState?.management_state || 'LOADING'}</strong> · applied revision {commKeyState?.applied_revision ?? 0} · desired revision {commKeyState?.desired_revision ?? 0}
+              {commKeyState?.last_verified_at ? ` · verified ${relativeTime(commKeyState.last_verified_at)}` : ''}.
+              {commKeyState?.capabilities.recovery_staging ? ' This operation will remain staged until Zone Lite 2.5.0 connects.' : ''}
+              {commKeyState && !commKeyState.enabled ? ' Management is currently disabled by the production feature gate.' : ''}
+            </p>
+            {commKeyState?.last_error_code && <p className="pattern-blocked">Last failure: {commKeyState.last_error_code.replaceAll('_', ' ')}</p>}
+            {commKeyState?.active_operation ? <div className="comm-key-operation">
+              <StatusBadge state={commKeyState.active_operation.status} />
+              <span>Revision {commKeyState.active_operation.requested_revision} · {commKeyState.active_operation.mode} · expires {dateTime(commKeyState.active_operation.expires_at)}</span>
+              <button className="button secondary" disabled={busy || ['RUNNING', 'ACKNOWLEDGED'].includes(commKeyState.active_operation.status)} onClick={() => void cancelCommKeyOperation()}>Cancel safely</button>
+            </div> : <div className="comm-key-controls">
+              <label>Recovery mode<select value={commKeyMode} onChange={(event) => setCommKeyMode(event.target.value as 'ESP_ONLY' | 'ESP_AND_TERMINAL')}>
+                <option value="ESP_ONLY">ESP connector only</option>
+                <option value="ESP_AND_TERMINAL" disabled={!commKeyState?.capabilities.esp_and_terminal}>ESP and certified ZKT terminal</option>
+              </select></label>
+              {!commKeyState?.capabilities.esp_and_terminal && <p>Remote terminal rotation unavailable: {(commKeyState?.capabilities.esp_and_terminal_block_reason || 'CAPABILITY_NOT_AVAILABLE').replaceAll('_', ' ').toLowerCase()}.</p>}
+              <label>New COMM Key<input type="password" inputMode="numeric" autoComplete="new-password" value={newCommKey} onChange={(event) => setNewCommKey(event.target.value)} /></label>
+              <label>Expected ZKT serial<input value={commKeySerial} onChange={(event) => setCommKeySerial(event.target.value.trim())} /></label>
+              <label>Operational reason<input value={commKeyReason} onChange={(event) => setCommKeyReason(event.target.value)} /></label>
+              <label>Type <strong>CHANGE {device.connector_id} {commKeySerial || '&lt;serial&gt;'}</strong><input value={commKeyConfirmation} onChange={(event) => setCommKeyConfirmation(event.target.value)} /></label>
+              <label>Confirm administrator password<input type="password" autoComplete="current-password" value={commKeyPassword} onChange={(event) => setCommKeyPassword(event.target.value)} /></label>
+              <button className="button destructive" disabled={busy || !commKeyState?.enabled} onClick={() => void changeCommKey()}>{commKeyState?.capabilities.recovery_staging ? 'Stage secure recovery' : 'Queue secure recovery'}</button>
+            </div>}
+            {commKeyState?.managed && commKeyState.reveal_enabled && <div className="comm-key-reveal">
+              <h4>Break-glass reveal</h4>
+              <p>Requires fresh authentication and is audited. The value hides after 15 seconds, on window blur, or when this drawer closes.</p>
+              {revealedKey ? <output aria-live="assertive">COMM Key: <strong>{revealedKey.comm_key}</strong></output> : <>
+                <label>Reveal reason<input value={revealReason} onChange={(event) => setRevealReason(event.target.value)} /></label>
+                <label>Type <strong>REVEAL {device.connector_id}</strong><input value={revealConfirmation} onChange={(event) => setRevealConfirmation(event.target.value)} /></label>
+                <label>Confirm administrator password<input type="password" autoComplete="current-password" value={revealPassword} onChange={(event) => setRevealPassword(event.target.value)} /></label>
+                <button className="button secondary" disabled={busy} onClick={() => void revealCommKey()}>Reveal for 15 seconds</button>
+              </>}
+            </div>}
+          </div></article>
           <article className="control-card pattern-blocked"><span><Icon name="power" /></span><div><h3>Restart ZKT terminal</h3><p>Issues an authenticated protocol restart. Active enrollment leases block this operation.</p><label>Reason<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label></div><button className="button destructive" disabled={busy} onClick={() => void restart()}>{busy ? 'Queuing…' : 'Restart terminal'}</button></article>
           {device.active_command && <CommandProgress command={device.active_command} onCancel={cancelCommand} />}
         </div>}

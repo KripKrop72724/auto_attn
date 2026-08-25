@@ -127,6 +127,8 @@ export interface Device {
   state: DeviceState
   connected: boolean
   firmware_version: string | null
+  comm_key_capable?: boolean
+  comm_key_revision?: number
   ota_capable?: boolean
   ota_state?: 'LEGACY_MANUAL_UPDATE' | 'OTA_READY' | 'UPDATING' | 'ROLLBACK_REQUIRED' | 'OTA_BLOCKED'
   ota_partition_layout?: string | null
@@ -141,6 +143,45 @@ export interface Device {
   zkt: ZktDevice | null
   active_command?: Command | null
   active_lease?: Lease | null
+}
+
+export interface CommKeyOperation {
+  operation_id: string
+  mode: 'ESP_ONLY' | 'ESP_AND_TERMINAL'
+  requested_revision: number
+  expected_terminal_serial: string
+  status: string
+  error_code: string | null
+  created_at: string
+  updated_at: string
+  expires_at: string
+  completed_at: string | null
+}
+
+export interface CommKeyState {
+  enabled: boolean
+  reveal_enabled: boolean
+  management_state: string
+  applied_revision: number
+  desired_revision: number
+  last_verified_at: string | null
+  verified_terminal_serial: string | null
+  last_error_code: string | null
+  managed: boolean
+  capabilities: {
+    esp_only: boolean
+    esp_and_terminal: boolean
+    esp_and_terminal_block_reason: string | null
+    recovery_staging: boolean
+  }
+  active_operation: CommKeyOperation | null
+}
+
+export interface CommKeyReveal {
+  comm_key: string
+  applied_revision: number
+  verified_terminal_serial: string | null
+  last_verified_at: string | null
 }
 
 export interface Overview {

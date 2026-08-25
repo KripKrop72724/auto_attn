@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -48,6 +48,8 @@ class Envelope(BaseModel):
 class HeartbeatPayload(BaseModel):
     firmware_version: str | None = None
     config_version: int = 1
+    comm_key_management: bool = False
+    comm_key_revision: int = Field(default=0, ge=0)
     uptime_seconds: int | None = None
     rssi: int | None = None
     free_heap: int | None = None
@@ -463,6 +465,35 @@ class TerminalSerialConfirmRequest(BaseModel):
     observed_serial: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,79}$")
     password: str = Field(min_length=1, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class CommKeyChangeRequest(BaseModel):
+    new_key: SecretStr
+    mode: Literal["ESP_ONLY", "ESP_AND_TERMINAL"]
+    expected_revision: int = Field(ge=0)
+    expected_terminal_serial: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,79}$")
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: SecretStr
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("new_key")
+    @classmethod
+    def validate_new_key(cls, value: SecretStr) -> SecretStr:
+        material = value.get_secret_value()
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", material):
+            raise ValueError(
+                "COMM Key must be a canonical non-zero decimal value without leading zeros"
+            )
+        if int(material) > 4_294_967_295:
+            raise ValueError("COMM Key exceeds the ESP uint32 protocol range")
+        return value
+
+
+class CommKeyRevealRequest(BaseModel):
+    password: SecretStr
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
 
 
 class BulkUserDeleteTarget(BaseModel):

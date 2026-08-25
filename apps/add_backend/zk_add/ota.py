@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from datetime import timedelta
 from pathlib import Path
@@ -41,6 +42,16 @@ ACTIVE_DEPLOYMENT_STATES = {
 TERMINAL_DEPLOYMENT_STATES = {
     "SUCCEEDED", "FAILED", "ROLLED_BACK", "CANCELLED", "SUPERSEDED", "RELEASE_REVOKED"
 }
+DEPLOYMENT_TRANSITIONS = {
+    "PENDING": {"OFFERED", "CANCELLED", "SUPERSEDED", "RELEASE_REVOKED"},
+    "OFFERED": {"OFFERED", "DOWNLOADING", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
+    "DOWNLOADING": {"DOWNLOADING", "VERIFYING", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
+    "VERIFYING": {"VERIFYING", "READY_TO_BOOT", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
+    "READY_TO_BOOT": {"READY_TO_BOOT", "BOOTED_PENDING", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
+    "BOOTED_PENDING": {"BOOTED_PENDING", "RECONCILING", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
+    "RECONCILING": {"RECONCILING", "SUCCEEDED", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
+}
+SEMVER_PATTERN = re.compile(r"^(?:zone-lite-)?(\d+)\.(\d+)\.(\d+)$")
 
 
 class FirmwareRelease(Base):
@@ -129,7 +140,22 @@ def capability_is_eligible(connector: Connector) -> bool:
                 and connector.ota_partition_layout == OTA_LAYOUT)
 
 
-def _scope_exclusion_reason(connector: Connector, *, hil_target_mac: str = "") -> str | None:
+def semantic_version(value: str | None) -> tuple[int, int, int] | None:
+    match = SEMVER_PATTERN.fullmatch((value or "").strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def version_at_least(running: str | None, minimum: str) -> bool:
+    running_version = semantic_version(running)
+    minimum_version = semantic_version(minimum)
+    return bool(running_version and minimum_version and running_version >= minimum_version)
+
+
+def _scope_exclusion_reason(
+    connector: Connector, *, hil_target_mac: str = "", minimum_version: str = "2.2.0"
+) -> str | None:
     if not connector.ota_capable:
         return "OTA_NOT_CAPABLE"
     if not connector.ota_secure_boot:
@@ -138,6 +164,8 @@ def _scope_exclusion_reason(connector: Connector, *, hil_target_mac: str = "") -
         return "ROLLBACK_REQUIRED"
     if connector.ota_partition_layout != OTA_LAYOUT:
         return "PARTITION_LAYOUT_MISMATCH"
+    if not version_at_least(connector.firmware_version, minimum_version):
+        return "BOOTSTRAP_VERSION_TOO_OLD"
     if hil_target_mac and connector.hardware_id.lower() != hil_target_mac:
         return "HIL_TARGET_MISMATCH"
     return None
@@ -233,6 +261,7 @@ def _campaign_scope(
         reason = _scope_exclusion_reason(
             connector,
             hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" else "",
+            minimum_version=release.minimum_bootstrap_version,
         )
         if reason:
             excluded.append((connector, reason))
@@ -328,8 +357,7 @@ def verify_campaign_scope_token(
 
 
 def _versions_match(running: str | None, target: str) -> bool:
-    normalized_running = (running or "").removeprefix("zone-lite-")
-    return bool(normalized_running and normalized_running == target.removeprefix("zone-lite-"))
+    return semantic_version(running) is not None and semantic_version(running) == semantic_version(target)
 
 
 def _application_sha256(release: FirmwareRelease) -> str | None:
@@ -498,6 +526,8 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         return None
+    if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
+        return None
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         return None
     if release.state == "HIL_ONLY":
@@ -540,8 +570,19 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         "download_url": f"{public_base}/device/v2/firmware/download/{token}"}
 
 
-def record_progress(session: Session, *, connector: Connector, deployment_public_id: str, state: str,
-                    bytes_written: int, error_code: str | None, error_message: str | None) -> FirmwareDeployment:
+def record_progress(
+    session: Session,
+    *,
+    connector: Connector,
+    deployment_public_id: str,
+    state: str,
+    bytes_written: int,
+    running_version: str | None = None,
+    running_partition: str | None = None,
+    image_sha256: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> FirmwareDeployment:
     if state not in ACTIVE_DEPLOYMENT_STATES | TERMINAL_DEPLOYMENT_STATES:
         raise ValueError("Unknown firmware deployment state.")
     deployment = session.scalar(select(FirmwareDeployment).where(
@@ -551,13 +592,35 @@ def record_progress(session: Session, *, connector: Connector, deployment_public
         raise ValueError("Unknown firmware deployment.")
     if deployment.status in TERMINAL_DEPLOYMENT_STATES:
         return deployment
+    allowed = DEPLOYMENT_TRANSITIONS.get(deployment.status, set())
+    if state not in allowed:
+        raise ValueError(f"Illegal firmware transition {deployment.status} -> {state}.")
+    release = session.get(FirmwareRelease, deployment.release_id)
+    if release is None:
+        raise ValueError("Firmware release is unavailable.")
+    if bytes_written < deployment.bytes_written or bytes_written > release.image_size:
+        raise ValueError("Firmware byte progress is outside the signed artifact bounds.")
+    if state in {"BOOTED_PENDING", "RECONCILING", "SUCCEEDED"}:
+        if not _versions_match(running_version, deployment.target_version):
+            raise ValueError("Reported running firmware does not match the deployment target.")
+        if running_partition not in {"ota_0", "ota_1"}:
+            raise ValueError("Reported running partition is not an OTA application slot.")
+        expected_digest = _application_sha256(release)
+        if not expected_digest or image_sha256 != expected_digest:
+            raise ValueError("Reported running image digest does not match the signed release.")
     deployment.status = state
     deployment.bytes_written = max(deployment.bytes_written, bytes_written)
     deployment.error_code = error_code
     deployment.error_message = error_message
     deployment.updated_at = utc_now()
     session.add(FirmwareEvent(deployment_id=deployment.id, state=state,
-                              details={"bytes_written": deployment.bytes_written, "error_code": error_code}))
+                              details={
+                                  "bytes_written": deployment.bytes_written,
+                                  "error_code": error_code,
+                                  "running_version": running_version,
+                                  "running_partition": running_partition,
+                                  "image_sha256": image_sha256,
+                              }))
     if state in TERMINAL_DEPLOYMENT_STATES:
         deployment.completed_at = utc_now()
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)

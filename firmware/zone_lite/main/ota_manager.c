@@ -221,6 +221,14 @@ static bool report_state(const char *state, const char *error)
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "bytes_written", (double)s_journal.bytes_written);
     cJSON_AddStringToObject(root, "running_version", esp_app_get_description()->version);
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    cJSON_AddStringToObject(root, "running_partition", running ? running->label : "unknown");
+    unsigned char digest[32];
+    char digest_hex[65];
+    if (running && esp_partition_get_sha256(running, digest) == ESP_OK) {
+        hex_bytes(digest, sizeof(digest), digest_hex);
+        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
+    }
     if (error && error[0]) cJSON_AddStringToObject(root, "error_code", error);
     bool ok = post_json(path, root);
     cJSON_Delete(root);

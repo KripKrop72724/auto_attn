@@ -373,6 +373,8 @@ def update_heartbeat(
     connector.updated_at = now
     connector.firmware_version = payload.firmware_version or connector.firmware_version
     connector.config_version = payload.config_version
+    connector.comm_key_capable = payload.comm_key_management
+    connector.comm_key_revision = payload.comm_key_revision
     connector.current_activity = payload.current_activity
     # A valid heartbeat is the authoritative recovery signal for the ESP
     # transport.  The maintenance loop opens this alert when heartbeats go
@@ -408,6 +410,11 @@ def update_heartbeat(
                 "observed_user_record_bytes": int(observed_record_size),
                 "read_users": True,
                 "read_attendance": True,
+            }
+        if "comm_key_write_v1" in zkt_payload:
+            zkt.capability_profile = {
+                **(zkt.capability_profile or {}),
+                "comm_key_write_v1": zkt_payload.get("comm_key_write_v1") is True,
             }
         zkt.serial = zkt_payload.get("serial") or zkt.serial
         zkt.ip_address = zkt_payload.get("ip_address") or zkt.ip_address
@@ -652,6 +659,20 @@ def update_heartbeat(
             payload=redact_context(payload.model_dump(mode="json")),
         )
     )
+    if connector.comm_key_capable:
+        try:
+            from zk_add.comm_keys import (
+                dispatch_pending_comm_key_operation,
+                reconcile_comm_key_heartbeat,
+            )
+
+            dispatch_pending_comm_key_operation(session, connector=connector)
+            reconcile_comm_key_heartbeat(session, connector=connector)
+        except (RuntimeError, ValueError):
+            # Another mutually exclusive command may still be draining. The
+            # pending operation remains durable and is retried on the next heartbeat;
+            # an unavailable wrapping key never triggers an unsealed fallback.
+            pass
     return serialize_connector(connector)
 
 
@@ -3222,6 +3243,7 @@ def create_command(
     actor: str,
     expires_in_seconds: int | None = 300,
     owning_user_deletion_job_id: int | None = None,
+    command_id: str | None = None,
 ) -> DeviceCommand:
     existing = session.scalar(
         select(DeviceCommand).where(
@@ -3260,14 +3282,14 @@ def create_command(
     zkt = connector.zkt_device
     if not connector.connected:
         initial_status = "WAITING_FOR_DEVICE"
-    elif command_type in MUTATING_COMMANDS and zkt and (
+    elif command_type != "APPLY_CONFIG" and command_type in MUTATING_COMMANDS and zkt and (
         not zkt.online or zkt.connection_state in {"FLAPPING", "RETRY_WAIT", "OFFLINE"}
     ):
         initial_status = "WAITING_FOR_ZKT"
     else:
         initial_status = "QUEUED"
     command = DeviceCommand(
-        command_id=str(uuid4()),
+        command_id=command_id or str(uuid4()),
         connector_id=connector.id,
         command_type=command_type,
         payload_encrypted=encrypt_json(payload),
@@ -4250,6 +4272,8 @@ def serialize_connector(connector: Connector) -> dict:
         "ota_running_partition": connector.ota_running_partition,
         "ota_image_sha256": connector.ota_image_sha256,
         "ota_signing_key_id": connector.ota_signing_key_id,
+        "comm_key_capable": connector.comm_key_capable,
+        "comm_key_revision": connector.comm_key_revision,
         "onboarding_generation": connector.onboarding_generation,
         "last_onboarded_at": connector.last_onboarded_at,
         "last_seen_at": connector.last_seen_at,
@@ -4552,6 +4576,22 @@ def apply_command_update(
             error_message = (
                 "Delete verification did not prove user absence with unchanged attendance count."
             )
+    if command.command_type == "APPLY_CONFIG":
+        from zk_add.comm_keys import reconcile_comm_key_command, sanitize_comm_key_result
+
+        result = sanitize_comm_key_result(result)
+        status, error_code, safe_message = reconcile_comm_key_command(
+            session,
+            connector=connector,
+            command=command,
+            status=status,
+            result=result,
+            error_code=error_code,
+        )
+        if safe_message:
+            error_message = safe_message
+        elif status in TERMINAL_COMMAND_STATES and status != "SUCCEEDED":
+            error_message = "COMM Key operation did not satisfy its verified postconditions."
     now = utc_now()
     command.status = status
     if status == "ACKNOWLEDGED":

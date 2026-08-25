@@ -21,6 +21,9 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: false,
+    // These suites exercise lazy route loading and share process-wide browser
+    // stubs. Serial files keep CI timing deterministic as the control surface grows.
+    fileParallelism: false,
     exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
   },
   server: {

@@ -41,6 +41,10 @@ credentials into the protected file so a stale host copy cannot silently restore
 verifier.
 The optional `ADD_ADMIN_PASSWORD_HASH` repository secret similarly enforces the approved Argon2id
 administrator verifier without placing the password in the workflow or checkout.
+Zone Lite 2.5.0 COMM Key management additionally requires the `add-production` environment secret
+`ADD_COMM_KEY_SECRET_FERNET_KEY`. Generate and escrow it separately from `ADD_PII_FERNET_KEY`; the
+deployment rejects key reuse. Keep repository variables `ADD_COMM_KEY_MANAGEMENT_ENABLED` and
+`ADD_COMM_KEY_REVEAL_ENABLED` false until the corresponding staged release gates are approved.
 
 Required values are listed in `.env.add.example`. Generate unique random PostgreSQL, lookup, fleet,
 and ORDS secrets; generate the Fernet key using `Fernet.generate_key()`; store only an Argon2id hash
