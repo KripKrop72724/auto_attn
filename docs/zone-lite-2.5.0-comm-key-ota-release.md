@@ -1,5 +1,11 @@
 # Zone Lite 2.5.0 nationwide COMM Key recovery release
 
+> **HIL quarantine:** the immutable 2.5.0 Swat candidate downloaded completely
+> and reached `BOOTED_PENDING` on 25 August 2026, then lost connector visibility
+> before proving terminal/runtime health. It must never be promoted to Quetta or
+> a nationwide campaign. The corrected implementation is versioned 2.5.1 and
+> must pass a fresh exact-MAC Swat HIL campaign before promotion.
+
 Zone Lite 2.5.0 adds a fail-closed, audited recovery path for an ESP connector whose
 configured ZKT communication key no longer matches its assigned terminal. The release
 is intended for every OTA-capable Zone Lite ESP in ADD, including Faisalabad and Quetta.

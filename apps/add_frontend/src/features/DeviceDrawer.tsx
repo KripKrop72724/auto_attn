@@ -119,7 +119,7 @@ export function DeviceDrawer({
           idempotency_key: idempotency('comm-key'),
         }),
       })
-      toast.notice(commKeyState.capabilities.esp_only ? 'COMM Key recovery was securely queued.' : 'COMM Key recovery was staged for firmware 2.5.0.')
+      toast.notice(commKeyState.capabilities.esp_only ? 'COMM Key recovery was securely queued.' : 'COMM Key recovery was staged for COMM Key-capable firmware.')
       setNewCommKey('')
       setCommKeyPassword('')
       setCommKeyConfirmation('')
@@ -235,7 +235,7 @@ export function DeviceDrawer({
             <p>
               State <strong>{commKeyState?.management_state || 'LOADING'}</strong> · applied revision {commKeyState?.applied_revision ?? 0} · desired revision {commKeyState?.desired_revision ?? 0}
               {commKeyState?.last_verified_at ? ` · verified ${relativeTime(commKeyState.last_verified_at)}` : ''}.
-              {commKeyState?.capabilities.recovery_staging ? ' This operation will remain staged until Zone Lite 2.5.0 connects.' : ''}
+              {commKeyState?.capabilities.recovery_staging ? ' This operation will remain staged until COMM Key-capable Zone Lite firmware connects.' : ''}
               {commKeyState && !commKeyState.enabled ? ' Management is currently disabled by the production feature gate.' : ''}
             </p>
             {commKeyState?.last_error_code && <p className="pattern-blocked">Last failure: {commKeyState.last_error_code.replaceAll('_', ' ')}</p>}
