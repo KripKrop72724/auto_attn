@@ -343,11 +343,11 @@ jobs:
                 $freshCompletedAt = [DateTimeOffset]::Parse(
                   [string]$freshFullSourceJob.completed_at
                 )
-                $coverageCapturedAt = [DateTimeOffset]::Parse(
-                  [string]$sourceCoverage.captured_at
+                $coverageCaptureCertifiedAt = [DateTimeOffset]::Parse(
+                  [string]$sourceCoverage.capture_evidence.certified_at
                 )
                 $coverageOracleCertifiedAt = [DateTimeOffset]::Parse(
-                  [string]$sourceCoverage.oracle_certified_at
+                  [string]$sourceCoverage.oracle_evidence.certified_at
                 )
                 $freshFullSourceProof = (
                   $coverageCertifiedAt -ge $freshRequestedAt -and
@@ -361,7 +361,13 @@ jobs:
                   $sourceCoverage.oracle_state -eq 'ORACLE_MEMBERSHIP_CERTIFIED' -and
                   $null -ne $sourceCoverage.capture_evidence -and
                   $null -ne $sourceCoverage.oracle_evidence -and
-                  $coverageCapturedAt -eq $freshCaptureCertifiedAt -and
+                  [string]$sourceCoverage.capture_evidence.job_id -eq [string]$freshFullSourceJob.job_id -and
+                  [string]$sourceCoverage.oracle_evidence.job_id -eq [string]$freshFullSourceJob.job_id -and
+                  [int]$sourceCoverage.capture_evidence.certified_source_cursor -eq [int]$row.zkt.attendance_count -and
+                  [int]$sourceCoverage.oracle_evidence.certified_source_cursor -eq [int]$row.zkt.attendance_count -and
+                  [string]$sourceCoverage.capture_evidence.source_chain_digest -eq [string]$sourceCoverage.source_committed_chain_digest -and
+                  [string]$sourceCoverage.oracle_evidence.source_chain_digest -eq [string]$sourceCoverage.source_committed_chain_digest -and
+                  $coverageCaptureCertifiedAt -eq $freshCaptureCertifiedAt -and
                   $coverageOracleCertifiedAt -eq $freshOracleCertifiedAt
                 )
                 if ($freshFullSourceProof) {
