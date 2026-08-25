@@ -285,12 +285,94 @@ jobs:
                 'CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED'
               )
             } | Select-Object -Last 1)
-            if ($tailCommitted.Count -ne 1) {
-              throw 'Canary did not prove a poison-safe bounded tail commit during the accepted campaign.'
+            $sourceProofMode = $null
+            $sourceProofCommittedAt = $null
+            if ($tailCommitted.Count -eq 1) {
+              $sourceProofMode = 'bounded-tail'
+              $sourceProofCommittedAt = [DateTimeOffset]::Parse(
+                [string]$tailCommitted[0].received_at
+              )
+            } else {
+              # An after-hours canary may have exact certified source parity but
+              # receive no legitimate new punch. A newly requested full-source
+              # scan is a stronger substitute only when the candidate boot
+              # performed it and ADD sealed both immutable source capture and
+              # Oracle membership after this exact campaign began.
+              $coverageCertified = @($canaryLogs | Where-Object {
+                $_.code -eq 'ADD_SOURCE_COVERAGE_CERTIFIED' -and
+                [string]$_.boot_id -eq $catalogBootId
+              } | Sort-Object {
+                [DateTimeOffset]::Parse([string]$_.received_at)
+              } | Select-Object -Last 1)
+              $completedReconciliations = Invoke-RestMethod `
+                -Method Get `
+                -Uri (
+                  "$env:ADD_BASE_URL/api/v1/reconciliations" +
+                  "?connector_id=$($row.connector_id)&status_group=COMPLETED&limit=20"
+                ) `
+                -WebSession $session `
+                -TimeoutSec 30
+              $freshFullSourceJobs = @($completedReconciliations.rows | Where-Object {
+                $_.status -eq 'COMPLETED' -and
+                [int]$_.terminal_generation -eq [int]$sourceCoverage.terminal_generation -and
+                [int]$_.committed_next_ordinal -eq [int]$row.zkt.attendance_count -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.requested_at) -and
+                [DateTimeOffset]::Parse([string]$_.requested_at) -ge $campaignStarted -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.capture_certified_at) -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.oracle_certified_at) -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.completed_at) -and
+                $null -ne $_.capture_certificate -and
+                $null -ne $_.oracle_certificate
+              } | Sort-Object {
+                [DateTimeOffset]::Parse([string]$_.requested_at)
+              } | Select-Object -Last 1)
+              if ($coverageCertified.Count -eq 1 -and $freshFullSourceJobs.Count -eq 1) {
+                $coverageCertifiedAt = [DateTimeOffset]::Parse(
+                  [string]$coverageCertified[0].received_at
+                )
+                $freshFullSourceJob = $freshFullSourceJobs[0]
+                $freshRequestedAt = [DateTimeOffset]::Parse(
+                  [string]$freshFullSourceJob.requested_at
+                )
+                $freshCaptureCertifiedAt = [DateTimeOffset]::Parse(
+                  [string]$freshFullSourceJob.capture_certified_at
+                )
+                $freshOracleCertifiedAt = [DateTimeOffset]::Parse(
+                  [string]$freshFullSourceJob.oracle_certified_at
+                )
+                $freshCompletedAt = [DateTimeOffset]::Parse(
+                  [string]$freshFullSourceJob.completed_at
+                )
+                $coverageCapturedAt = [DateTimeOffset]::Parse(
+                  [string]$sourceCoverage.captured_at
+                )
+                $coverageOracleCertifiedAt = [DateTimeOffset]::Parse(
+                  [string]$sourceCoverage.oracle_certified_at
+                )
+                $freshFullSourceProof = (
+                  $coverageCertifiedAt -ge $freshRequestedAt -and
+                  $freshCaptureCertifiedAt -ge $freshRequestedAt -and
+                  $freshOracleCertifiedAt -ge $freshCaptureCertifiedAt -and
+                  $freshCompletedAt -ge $freshOracleCertifiedAt -and
+                  $sourceCoverage.capture_state -in @(
+                    'SOURCE_CAPTURE_CERTIFIED',
+                    'SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS'
+                  ) -and
+                  $sourceCoverage.oracle_state -eq 'ORACLE_MEMBERSHIP_CERTIFIED' -and
+                  $null -ne $sourceCoverage.capture_evidence -and
+                  $null -ne $sourceCoverage.oracle_evidence -and
+                  $coverageCapturedAt -eq $freshCaptureCertifiedAt -and
+                  $coverageOracleCertifiedAt -eq $freshOracleCertifiedAt
+                )
+                if ($freshFullSourceProof) {
+                  $sourceProofMode = 'fresh-full-source'
+                  $sourceProofCommittedAt = $coverageCertifiedAt
+                }
+              }
             }
-            $tailCommittedAt = [DateTimeOffset]::Parse(
-              [string]$tailCommitted[0].received_at
-            )
+            if ($null -eq $sourceProofCommittedAt) {
+              throw 'Canary proved neither a poison-safe bounded tail nor a fresh full-source and Oracle certificate from the accepted candidate boot.'
+            }
             $laterFailures = @($canaryLogs | Where-Object {
               $_.code -in @(
                 'TRUTH_IDENTITY_INCOMPLETE',
@@ -307,7 +389,7 @@ jobs:
                 'SOURCE_TAIL_CHAIN_DIVERGED',
                 'CURRENT_TAIL_CHECKPOINT_RETRY'
               ) -and
-              [DateTimeOffset]::Parse([string]$_.received_at) -gt $tailCommittedAt
+              [DateTimeOffset]::Parse([string]$_.received_at) -gt $sourceProofCommittedAt
             })
             if ($laterFailures.Count -ne 0) {
               throw 'Canary emitted a fail-closed truth error after delegating its Oracle pass.'
@@ -374,7 +456,8 @@ jobs:
               "blocked_identity=$blockedIdentityCount " +
               "quarantined_identity_reuse=$quarantinedIdentityReuseCount " +
               "quarantined_invalid_device_time=$quarantinedInvalidDeviceTimeCount " +
-              "source_exceptions=$($currentExceptions.Count)."
+              "source_exceptions=$($currentExceptions.Count) " +
+              "source_proof=$sourceProofMode."
             )
           } catch {
             $verificationFailed = $true
