@@ -141,24 +141,22 @@ jobs:
               throw 'Exact immutable HIL_ONLY release identity was not found.'
             }
 
-            $campaigns = Invoke-RestMethod `
+            $campaign = Invoke-RestMethod `
               -Method Get `
-              -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns/$env:EXPECTED_CAMPAIGN" `
               -WebSession $session `
               -TimeoutSec 30
-            $matchingCampaigns = @($campaigns.rows | Where-Object {
-              $_.campaign_id -eq $env:EXPECTED_CAMPAIGN -and
-              $_.version -eq $env:EXPECTED_VERSION -and
-              $_.zone_id -eq $env:EXPECTED_ZONE -and
-              $_.status -eq 'CANCELLED' -and
-              [int]$_.eligible -eq 1 -and
-              [int]$_.legacy_skipped -eq 0 -and
-              [int]$_.counts.SUCCEEDED -eq 1
-            })
-            if ($matchingCampaigns.Count -ne 1) {
+            if (
+              $campaign.campaign_id -ne $env:EXPECTED_CAMPAIGN -or
+              $campaign.version -ne $env:EXPECTED_VERSION -or
+              $campaign.zone_id -ne $env:EXPECTED_ZONE -or
+              $campaign.status -ne 'CANCELLED' -or
+              [int]$campaign.eligible -ne 1 -or
+              [int]$campaign.legacy_skipped -ne 0 -or
+              [int]$campaign.counts.SUCCEEDED -ne 1
+            ) {
               throw 'Exact closed production-canary campaign did not contain one successful deployment.'
             }
-            $campaign = $matchingCampaigns[0]
             if (-not ([string]$campaign.pause_reason).StartsWith('CANARY_ACCEPTED:')) {
               throw 'Canary closure does not carry the explicit CANARY_ACCEPTED audit declaration.'
             }
