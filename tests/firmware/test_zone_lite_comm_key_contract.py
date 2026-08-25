@@ -8,8 +8,8 @@ CONNECTOR = (FIRMWARE / "main" / "add_connector.c").read_text(encoding="utf-8")
 CONFIG = (FIRMWARE / "main" / "zone_config.c").read_text(encoding="utf-8")
 
 
-def test_251_advertises_esp_management_but_fail_closes_terminal_writes() -> None:
-    assert "project(zone_lite VERSION 2.5.1)" in (FIRMWARE / "CMakeLists.txt").read_text()
+def test_252_advertises_esp_management_but_fail_closes_terminal_writes() -> None:
+    assert "project(zone_lite VERSION 2.5.2)" in (FIRMWARE / "CMakeLists.txt").read_text()
     assert 'cJSON_AddBoolToObject(payload, "comm_key_management", true)' in CONNECTOR
     assert 'cJSON_AddBoolToObject(zkt_json, "comm_key_write_v1", false)' in CONNECTOR
     assert '"COMM_KEY_TERMINAL_WRITE_UNSUPPORTED"' in RUNTIME
@@ -26,7 +26,7 @@ def test_comm_key_command_is_isolated_and_bound_to_aead_context() -> None:
     assert "mbedtls_platform_zeroize(&candidate_key" in RUNTIME
 
 
-def test_comm_key_worker_preserves_internal_ram_for_attendance_runtime() -> None:
+def test_comm_key_recovery_reuses_the_proven_gateway_task_stack() -> None:
     assert "#define ADD_CONFIG_COMMAND_QUEUE_DEPTH 2" in CONNECTOR
     assert (
         "s_config_commands = xQueueCreate(\n"
@@ -36,14 +36,20 @@ def test_comm_key_worker_preserves_internal_ram_for_attendance_runtime() -> None
     app_main = RUNTIME[RUNTIME.index("void app_main(void)") :]
     uploader = app_main.index('xTaskCreate(ords_uploader_task, "ords_uploader"')
     gateway = app_main.index('xTaskCreate(gateway_task, "zone_gateway"')
-    comm_key = app_main.index("comm_key_manager_task,", gateway)
-    assert uploader < gateway < comm_key
-    assert "#define ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES 12288" in RUNTIME
+    assert uploader < gateway
+    assert '"comm_key_mgr"' not in app_main
+    assert "ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES" not in RUNTIME
+    gateway_task = RUNTIME[
+        RUNTIME.index("static void gateway_task") : RUNTIME.index("void app_main(void)")
+    ]
+    assert "process_pending_comm_key_command()" in gateway_task
     assert "heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)" in app_main
 
 
 def test_comm_key_is_committed_only_after_exact_serial_authentication() -> None:
-    authenticate = RUNTIME.index("find_zkt_with_comm_key(", RUNTIME.index("comm_key_manager_task"))
+    authenticate = RUNTIME.index(
+        "find_zkt_with_comm_key(", RUNTIME.index("process_pending_comm_key_command")
+    )
     serial_check = RUNTIME.index("COMM_KEY_TERMINAL_SERIAL_MISMATCH", authenticate)
     persist = RUNTIME.index("zone_config_save_zkt_comm_key(", serial_check)
     success = RUNTIME.index('command.command_id, "SUCCEEDED"', persist)
@@ -72,7 +78,7 @@ def test_encrypted_nvs_commit_has_recoverable_operation_journal() -> None:
 
 
 def test_duplicate_after_reset_reauthenticates_before_reporting_success() -> None:
-    manager = RUNTIME[RUNTIME.index("static void comm_key_manager_task") :]
+    manager = RUNTIME[RUNTIME.index("static bool process_pending_comm_key_command") :]
     assert "already_applied" in manager
     assert "zkt_comm_key_operation_id" in manager
     assert manager.index("already_applied") < manager.index("find_zkt_with_comm_key(")
