@@ -47,9 +47,18 @@ TERMINAL_DEPLOYMENT_STATES = {
 }
 DEPLOYMENT_TRANSITIONS = {
     "PENDING": {"OFFERED", "CANCELLED", "SUPERSEDED", "RELEASE_REVOKED"},
-    "OFFERED": {"OFFERED", "DOWNLOADING", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
-    "DOWNLOADING": {"DOWNLOADING", "VERIFYING", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
-    "VERIFYING": {"VERIFYING", "READY_TO_BOOT", "FAILED", "CANCELLED", "RELEASE_REVOKED"},
+    "OFFERED": {
+        "OFFERED", "DOWNLOADING", "READY_TO_BOOT", "BOOTED_PENDING",
+        "FAILED", "CANCELLED", "RELEASE_REVOKED",
+    },
+    "DOWNLOADING": {
+        "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING",
+        "FAILED", "CANCELLED", "RELEASE_REVOKED",
+    },
+    "VERIFYING": {
+        "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING",
+        "FAILED", "CANCELLED", "RELEASE_REVOKED",
+    },
     "READY_TO_BOOT": {"READY_TO_BOOT", "BOOTED_PENDING", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
     "BOOTED_PENDING": {"BOOTED_PENDING", "RECONCILING", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
     "RECONCILING": {"RECONCILING", "SUCCEEDED", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
@@ -633,6 +642,8 @@ def record_progress(
         raise ValueError("Firmware release is unavailable.")
     if bytes_written < deployment.bytes_written or bytes_written > release.image_size:
         raise ValueError("Firmware byte progress is outside the signed artifact bounds.")
+    if state in {"READY_TO_BOOT", "BOOTED_PENDING"} and bytes_written != release.image_size:
+        raise ValueError("Boot progress requires the complete signed firmware image.")
     if state in {"BOOTED_PENDING", "RECONCILING", "SUCCEEDED"}:
         if not _versions_match(running_version, deployment.target_version):
             raise ValueError("Reported running firmware does not match the deployment target.")

@@ -178,6 +178,89 @@ def test_ota_progress_requires_legal_monotonic_signed_boot_evidence() -> None:
         assert deployment.status == "BOOTED_PENDING"
 
 
+def test_ota_progress_recovers_a_fast_download_with_lost_checkpoints() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        release = FirmwareRelease(
+            release_id="release-fast-download",
+            version="2.5.0",
+            git_sha="a" * 40,
+            image_sha256="b" * 64,
+            image_size=1024,
+            signing_key_id="production-key",
+            partition_layout="zone-lite-ota-v1",
+            minimum_bootstrap_version="2.2.0",
+            storage_name="2.5.0/fast-firmware.bin",
+            manifest={"application_sha256": "c" * 64},
+            manifest_signature="test-signature",
+            state="HIL_ONLY",
+        )
+        connector = Connector(
+            connector_id="connector-fast-download",
+            hardware_id="00:11:22:33:44:77",
+            zone_id="ZONE-FAST-DOWNLOAD",
+            zone_name="Fast download",
+            device_id="1",
+            display_name="Fast download terminal",
+            firmware_version="2.4.12",
+        )
+        session.add_all([release, connector])
+        session.flush()
+        campaign = FirmwareCampaign(
+            campaign_id="campaign-fast-download",
+            release_id=release.id,
+            zone_id=connector.zone_id,
+            status="PAUSED",
+            actor="StateHealthAdmin",
+            idempotency_key="campaign-fast-download-key",
+            reason="Recover an attested fast OTA after intermediate progress was lost",
+            typed_confirmation="2.5.0",
+            eligible_count=1,
+            legacy_skipped_count=0,
+        )
+        session.add(campaign)
+        session.flush()
+        deployment = FirmwareDeployment(
+            deployment_id="deployment-fast-download",
+            campaign_id=campaign.id,
+            release_id=release.id,
+            connector_id=connector.id,
+            status="OFFERED",
+            previous_version="2.4.12",
+            target_version="2.5.0",
+        )
+        session.add(deployment)
+        session.flush()
+
+        with pytest.raises(ValueError, match="complete signed firmware image"):
+            record_progress(
+                session,
+                connector=connector,
+                deployment_public_id=deployment.deployment_id,
+                state="BOOTED_PENDING",
+                bytes_written=1023,
+                running_version="zone-lite-2.5.0",
+                running_partition="ota_0",
+                image_sha256="c" * 64,
+            )
+
+        recovered = record_progress(
+            session,
+            connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="BOOTED_PENDING",
+            bytes_written=1024,
+            running_version="zone-lite-2.5.0",
+            running_partition="ota_1",
+            image_sha256="c" * 64,
+        )
+
+        assert recovered.status == "BOOTED_PENDING"
+        assert recovered.bytes_written == release.image_size
+        assert campaign.status == "PAUSED"
+
+
 def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypatch) -> None:
     monkeypatch.setattr(settings, "firmware_ota_enabled", False)
     monkeypatch.setattr(settings, "firmware_hil_enabled", False)
