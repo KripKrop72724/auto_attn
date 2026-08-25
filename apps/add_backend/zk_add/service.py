@@ -110,6 +110,15 @@ ORACLE_CONFIRMATION_PATH_PRIORITY = {
 }
 MIN_PLAUSIBLE_ATTENDANCE_TIME = datetime(2010, 1, 1, tzinfo=timezone.utc)
 MAX_DEVICE_CLOCK_LEAD = timedelta(days=1)
+OTA_FAILURE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+OTA_FAILURE_MESSAGES = {
+    "IMAGE_TOO_LARGE": "The signed OTA image does not fit the inactive application slot.",
+    "DOWNLOAD_BEGIN_FAILED": "The ESP could not begin the secure OTA download.",
+    "IMAGE_DESCRIPTOR_MISMATCH": "The downloaded image descriptor does not match the assigned release.",
+    "DOWNLOAD_OR_SIGNATURE_FAILED": "The ESP could not complete and authenticate the OTA download.",
+    "PARTITION_HASH_FAILED": "The ESP could not read back the written OTA partition digest.",
+    "IMAGE_HASH_MISMATCH": "The written OTA partition digest does not match the signed release.",
+}
 
 
 def attendance_device_time_is_plausible(
@@ -121,6 +130,107 @@ def attendance_device_time_is_plausible(
     return (
         event_time >= MIN_PLAUSIBLE_ATTENDANCE_TIME
         and event_time <= capture_time + MAX_DEVICE_CLOCK_LEAD
+    )
+
+
+def apply_ota_heartbeat_diagnostics(
+    session: Session,
+    *,
+    connector: Connector,
+    payload: HeartbeatPayload,
+) -> None:
+    """Turn a legacy local-only OTA failure into durable, fail-closed evidence.
+
+    Zone Lite releases predating explicit failure reporting still include their
+    bounded OTA journal in every heartbeat. Only a matching, non-terminal
+    deployment may be changed by that evidence, so stale journal state cannot
+    fail a later release.
+    """
+
+    ota = payload.ota
+    target_version = ota.target_version.strip()
+    runtime_state = ota.state.strip().upper()
+    reported_error = ota.last_error.strip().upper()
+    if not target_version or (not runtime_state and not reported_error):
+        return
+
+    # Keep imports local: OTA models already depend on the connector model and
+    # service imports are also used by migration/bootstrap tooling.
+    from zk_add.ota import (
+        ACTIVE_DEPLOYMENT_STATES,
+        FirmwareCampaign,
+        FirmwareDeployment,
+        FirmwareRelease,
+        _versions_match,
+        record_progress,
+    )
+
+    deployment = session.scalar(
+        select(FirmwareDeployment)
+        .join(FirmwareCampaign)
+        .where(
+            FirmwareDeployment.connector_id == connector.id,
+            FirmwareDeployment.status.in_(ACTIVE_DEPLOYMENT_STATES),
+            FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]),
+        )
+        .order_by(FirmwareDeployment.id.desc())
+    )
+    if deployment is None or not _versions_match(
+        target_version, deployment.target_version
+    ):
+        return
+
+    if not reported_error:
+        if runtime_state in {
+            "DOWNLOADING",
+            "UPDATING",
+            "VERIFYING",
+            "READY_TO_BOOT",
+            "BOOTED_PENDING",
+            "RECONCILING",
+        }:
+            connector.ota_state = "UPDATING"
+        return
+
+    error_code = (
+        reported_error
+        if OTA_FAILURE_CODE_PATTERN.fullmatch(reported_error)
+        else "DEVICE_REPORTED_FAILURE"
+    )
+    release = session.get(FirmwareRelease, deployment.release_id)
+    if release is None:
+        return
+    bounded_bytes = min(
+        release.image_size,
+        max(deployment.bytes_written, ota.bytes_written),
+    )
+    error_message = OTA_FAILURE_MESSAGES.get(
+        error_code,
+        "The ESP reported a fail-closed OTA error.",
+    )
+    record_progress(
+        session,
+        connector=connector,
+        deployment_public_id=deployment.deployment_id,
+        state="FAILED",
+        bytes_written=bounded_bytes,
+        error_code=error_code,
+        error_message=error_message,
+    )
+    connector.ota_state = "OTA_BLOCKED"
+    connector.last_error_code = f"OTA_{error_code}"
+    connector.last_error_message = error_message
+    upsert_alert(
+        session,
+        connector,
+        code="OTA_DEVICE_REPORTED_FAILURE",
+        severity="HIGH",
+        message=error_message,
+        details={
+            "error_code": error_code,
+            "runtime_state": runtime_state[:40],
+            "target_version": deployment.target_version,
+        },
     )
 
 
@@ -645,6 +755,11 @@ def update_heartbeat(
         if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
             connector.last_error_code = None
             connector.last_error_message = None
+    apply_ota_heartbeat_diagnostics(
+        session,
+        connector=connector,
+        payload=payload,
+    )
     session.add(
         DeviceTelemetry(
             connector_id=connector.id,

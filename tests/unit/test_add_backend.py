@@ -69,6 +69,12 @@ from zk_add.models import (
     UserDeletionItem,
 )
 from zk_add.onboarding import derive_bootstrap_secret, verify_onboarding_signature
+from zk_add.ota import (
+    FirmwareCampaign,
+    FirmwareDeployment,
+    FirmwareEvent,
+    FirmwareRelease,
+)
 from zk_add.protocol import body_sha256, sign_request, signature_material
 from zk_add.schemas import (
     AttendanceBatchRequest,
@@ -3119,6 +3125,159 @@ def test_heartbeat_surfaces_and_resolves_real_local_led_failure(db: Session):
     assert result["state"] == "ONLINE"
     assert connector.last_error_code is None
     assert alert.state == "RESOLVED"
+
+
+def test_heartbeat_durably_fails_matching_legacy_ota_error(db: Session):
+    connector = connector_fixture(db)
+    connector.firmware_version = "zone-lite-2.4.12"
+    connector.ota_capable = True
+    connector.ota_secure_boot = True
+    connector.ota_rollback_enabled = True
+    connector.ota_partition_layout = "zone-lite-ota-v1"
+    connector.ota_state = "UPDATING"
+    release = FirmwareRelease(
+        release_id="release-heartbeat-diagnostic",
+        version="2.5.0",
+        git_sha="a" * 40,
+        image_sha256="b" * 64,
+        image_size=1024,
+        signing_key_id="production-key",
+        partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.2.0",
+        storage_name="diagnostic/firmware.bin",
+        manifest={"application_sha256": "c" * 64},
+        manifest_signature="test-signature",
+        state="HIL_ONLY",
+    )
+    db.add(release)
+    db.flush()
+    campaign = FirmwareCampaign(
+        campaign_id="campaign-heartbeat-diagnostic",
+        release_id=release.id,
+        zone_id=connector.zone_id,
+        status="PAUSED",
+        actor="StateHealthAdmin",
+        idempotency_key="test-key",
+        reason="Diagnose a legacy local-only OTA failure",
+        typed_confirmation="2.5.0",
+        eligible_count=1,
+        legacy_skipped_count=0,
+    )
+    db.add(campaign)
+    db.flush()
+    deployment = FirmwareDeployment(
+        deployment_id="deployment-heartbeat-diagnostic",
+        campaign_id=campaign.id,
+        release_id=release.id,
+        connector_id=connector.id,
+        status="OFFERED",
+        previous_version="zone-lite-2.4.12",
+        target_version="2.5.0",
+    )
+    db.add(deployment)
+    db.flush()
+
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="ota-diagnostic-boot",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.4.12",
+            ota={
+                "capable": True,
+                "secure_boot": True,
+                "rollback_enabled": True,
+                "partition_layout": "zone-lite-ota-v1",
+                "state": "DOWNLOADING",
+                "target_version": "2.5.0",
+                "bytes_written": 0,
+                "image_size": 1024,
+                "last_error": "DOWNLOAD_BEGIN_FAILED",
+            },
+        ),
+    )
+
+    assert deployment.status == "FAILED"
+    assert deployment.error_code == "DOWNLOAD_BEGIN_FAILED"
+    assert campaign.status == "PAUSED"
+    assert "DOWNLOAD_BEGIN_FAILED" in campaign.pause_reason
+    assert connector.ota_state == "OTA_BLOCKED"
+    assert connector.last_error_code == "OTA_DOWNLOAD_BEGIN_FAILED"
+    alert = db.scalar(
+        select(DeviceAlert).where(
+            DeviceAlert.code == "OTA_DEVICE_REPORTED_FAILURE"
+        )
+    )
+    assert alert and alert.state == "OPEN" and alert.severity == "HIGH"
+    event = db.scalar(
+        select(FirmwareEvent).where(FirmwareEvent.deployment_id == deployment.id)
+    )
+    assert event and event.state == "FAILED"
+
+
+def test_heartbeat_ignores_stale_ota_error_for_different_target(db: Session):
+    connector = connector_fixture(db)
+    release = FirmwareRelease(
+        release_id="release-heartbeat-stale",
+        version="2.5.1",
+        git_sha="d" * 40,
+        image_sha256="e" * 64,
+        image_size=2048,
+        signing_key_id="production-key",
+        partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.2.0",
+        storage_name="stale/firmware.bin",
+        manifest={"application_sha256": "f" * 64},
+        manifest_signature="test-signature",
+        state="HIL_ONLY",
+    )
+    db.add(release)
+    db.flush()
+    campaign = FirmwareCampaign(
+        campaign_id="campaign-heartbeat-stale",
+        release_id=release.id,
+        zone_id=connector.zone_id,
+        status="ACTIVE",
+        actor="StateHealthAdmin",
+        idempotency_key="test-key",
+        reason="Reject stale OTA diagnostics",
+        typed_confirmation="2.5.1",
+        eligible_count=1,
+        legacy_skipped_count=0,
+    )
+    db.add(campaign)
+    db.flush()
+    deployment = FirmwareDeployment(
+        deployment_id="deployment-heartbeat-stale",
+        campaign_id=campaign.id,
+        release_id=release.id,
+        connector_id=connector.id,
+        status="OFFERED",
+        previous_version="zone-lite-2.4.12",
+        target_version="2.5.1",
+    )
+    db.add(deployment)
+    db.flush()
+
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="ota-stale-boot",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.4.12",
+            ota={
+                "state": "DOWNLOADING",
+                "target_version": "2.5.0",
+                "last_error": "DOWNLOAD_BEGIN_FAILED",
+            },
+        ),
+    )
+
+    assert deployment.status == "OFFERED"
+    assert campaign.status == "ACTIVE"
+    assert connector.last_error_code is None
 
 
 def test_admin_lease_result_is_durable(db: Session):

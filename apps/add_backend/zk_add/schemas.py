@@ -45,6 +45,20 @@ class Envelope(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class OtaHeartbeatPayload(BaseModel):
+    """Bounded OTA runtime evidence emitted by Zone Lite heartbeats."""
+
+    capable: bool = False
+    secure_boot: bool = False
+    rollback_enabled: bool = False
+    partition_layout: str = Field(default="", max_length=80)
+    state: str = Field(default="", max_length=40)
+    target_version: str = Field(default="", max_length=80)
+    bytes_written: int = Field(default=0, ge=0, le=2**63 - 1)
+    image_size: int = Field(default=0, ge=0, le=2**63 - 1)
+    last_error: str = Field(default="", max_length=64)
+
+
 class HeartbeatPayload(BaseModel):
     firmware_version: str | None = None
     config_version: int = 1
@@ -56,6 +70,7 @@ class HeartbeatPayload(BaseModel):
     outbox_depth: int = 0
     current_activity: str | None = None
     led_state: str | None = None
+    ota: OtaHeartbeatPayload = Field(default_factory=OtaHeartbeatPayload)
     zkt: dict[str, Any] = Field(default_factory=dict)
 
 
