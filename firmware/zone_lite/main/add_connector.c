@@ -57,6 +57,13 @@
 #endif
 
 #define ADD_COMMAND_QUEUE_DEPTH 32
+// ADD serializes COMM Key revisions per connector and keeps the authoritative
+// encrypted command journal on flash.  A second 32-entry queue would reserve
+// roughly 35 KiB of heap for commands that can never execute in parallel and
+// needlessly increases allocation pressure during an OTA boot.
+#define ADD_CONFIG_COMMAND_QUEUE_DEPTH 2
+#define ADD_TRACKED_COMMAND_CAPACITY \
+    (ADD_COMMAND_QUEUE_DEPTH + ADD_CONFIG_COMMAND_QUEUE_DEPTH)
 #define ADD_INBOUND_QUEUE_DEPTH 96
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
@@ -167,7 +174,7 @@ static bool s_onboarding_task_started;
 static bool s_command_inbox_restored;
 static char s_waiting_ack[80];
 static char s_running_command_id[48];
-static char s_queued_command_ids[ADD_COMMAND_QUEUE_DEPTH][48];
+static char s_queued_command_ids[ADD_TRACKED_COMMAND_CAPACITY][48];
 static size_t s_queued_command_count;
 static char *s_inbound_payload;
 static size_t s_inbound_payload_expected;
@@ -1460,7 +1467,7 @@ static bool command_is_scheduled_locked(const char *command_id)
 static void command_mark_queued_locked(const char *command_id)
 {
     if (command_is_scheduled_locked(command_id) ||
-        s_queued_command_count >= ADD_COMMAND_QUEUE_DEPTH) {
+        s_queued_command_count >= ADD_TRACKED_COMMAND_CAPACITY) {
         return;
     }
     strlcpy(
@@ -3192,7 +3199,9 @@ void add_connector_init(void)
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
-    s_config_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_config_commands = xQueueCreate(
+        ADD_CONFIG_COMMAND_QUEUE_DEPTH,
+        sizeof(add_command_t));
     s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
     s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));

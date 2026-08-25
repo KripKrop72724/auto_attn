@@ -106,6 +106,9 @@
 #ifndef ZONE_LITE_MIN_VALID_UNIX_TIME
 #define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
 #endif
+#ifndef ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES
+#define ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES 12288
+#endif
 #ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
 #define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
 #endif
@@ -9113,24 +9116,46 @@ void app_main(void)
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
     bool runtime_start_failed = false;
-    if (xTaskCreate(
-            comm_key_manager_task,
-            "comm_key_mgr",
-            16384,
-            NULL,
-            6,
-            NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Could not start secure COMM Key manager task");
-        runtime_start_failed = true;
-    }
+    // Preserve the proven 2.4.x allocation order for the attendance-critical
+    // tasks.  xTaskCreate stacks live in internal RAM even when PSRAM makes the
+    // aggregate free-heap value look large, so the optional configuration
+    // worker must be allocated only after the uploader and gateway.
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Could not start ORDS outbox uploader task");
+        ESP_LOGE(
+            TAG,
+            "Could not start ORDS outbox uploader task (internal=%u largest=%u)",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         runtime_start_failed = true;
     }
     if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Could not start Zone Lite gateway task");
+        ESP_LOGE(
+            TAG,
+            "Could not start Zone Lite gateway task (internal=%u largest=%u)",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         runtime_start_failed = true;
     }
+    if (xTaskCreate(
+            comm_key_manager_task,
+            "comm_key_mgr",
+            ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES,
+            NULL,
+            6,
+            NULL) != pdPASS) {
+        ESP_LOGE(
+            TAG,
+            "Could not start secure COMM Key manager task (internal=%u largest=%u)",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        runtime_start_failed = true;
+    }
+    ESP_LOGI(
+        TAG,
+        "Runtime task allocation complete internal=%u largest=%u aggregate=%u",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)esp_get_free_heap_size());
     if (runtime_start_failed) {
         // Running with only half of the attendance pipeline is unsafe. Task
         // allocation pressure is normally transient, and a controlled reboot

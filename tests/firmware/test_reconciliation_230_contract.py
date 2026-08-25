@@ -12,7 +12,7 @@ RECONCILIATION = (ROOT / "apps/add_backend/zk_add/reconciliation.py").read_text(
 
 
 def test_250_retains_bounded_verified_range_resume_and_add_checkpoints():
-    assert "project(zone_lite VERSION 2.5.0)" in PROJECT
+    assert "project(zone_lite VERSION 2.5.1)" in PROJECT
     assert "CMD_READ_BUFFER_CHUNK" in ZONE
     assert "zk_prepare_bounded_buffer" in ZONE
     assert "zk_read_bounded_range" in ZONE
