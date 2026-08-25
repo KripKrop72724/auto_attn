@@ -18,6 +18,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -26,6 +27,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -78,6 +80,13 @@ class FirmwareCampaign(Base):
     __tablename__ = "add_firmware_campaigns"
     __table_args__ = (
         UniqueConstraint("actor", "idempotency_key", name="uq_add_firmware_campaign_actor_idempotency"),
+        Index(
+            "uq_add_firmware_campaign_active_zone",
+            "zone_id",
+            unique=True,
+            postgresql_where=text("status IN ('ACTIVE', 'PAUSED')"),
+            sqlite_where=text("status IN ('ACTIVE', 'PAUSED')"),
+        ),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     campaign_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)

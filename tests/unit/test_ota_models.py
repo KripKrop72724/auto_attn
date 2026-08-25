@@ -201,7 +201,7 @@ def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypa
             FirmwareCampaign(
                 campaign_id=f"campaign-{index}",
                 release_id=releases[index - 1].id,
-                zone_id="ZONE-ONE",
+                zone_id="ZONE-ONE" if index == 1 else "ZONE-TWO",
                 status=status,
                 actor="StateHealthAdmin",
                 idempotency_key=f"campaign-key-{index}",
