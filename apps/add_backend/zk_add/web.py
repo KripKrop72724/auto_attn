@@ -3557,12 +3557,13 @@ async def report_firmware_capability(
 
 @app.get("/device/v2/firmware/assignment")
 async def firmware_assignment(
-    request: Request,
     auth: tuple[Session, Connector] = Depends(_require_ota_connector),
 ):
     db, connector = auth
     assignment = _assignment_for_connector(
-        db, connector=connector, public_base=str(request.base_url).rstrip("/")
+        db,
+        connector=connector,
+        public_base=settings.firmware_public_base_url,
     )
     db.commit()
     if assignment is None:
