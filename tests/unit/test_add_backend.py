@@ -5141,6 +5141,124 @@ def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
     assert state.last_error_code == "COMM_KEY_REVISION_DRIFT"
 
 
+def test_comm_key_recovery_attests_unobserved_serial_without_confirming_it(db: Session):
+    connector = connector_fixture(db, expected_serial=None)
+    zkt = connector.zkt_device
+    assert zkt is not None
+
+    operation, command = create_comm_key_change(
+        db,
+        connector=connector,
+        new_key=f"{246_810:d}",
+        mode="ESP_ONLY",
+        expected_revision=0,
+        expected_terminal_serial=SERIAL,
+        reason="Recover a remote connector whose terminal cannot authenticate yet",
+        typed_confirmation=f"CHANGE {connector.connector_id} {SERIAL}",
+        idempotency_key="test-key",
+        actor="StateHealthAdmin",
+    )
+    db.flush()
+
+    assert command is None
+    assert operation.status == "PENDING_CAPABILITY"
+    assert operation.expected_terminal_serial == SERIAL
+    assert zkt.serial is None
+    assert zkt.expected_serial == SERIAL
+    assert zkt.confirmed_serial is None
+    assert zkt.serial_confirmed_by is None
+    assert zkt.serial_confirmed_at is None
+    assert zkt.terminal_binding_state == "RECOVERY_EXPECTED_SERIAL"
+    assert zkt.certification_state == "READ_ONLY"
+    assert zkt.writes_disabled_reason == "RECOVERY_SERIAL_PENDING_PROOF"
+    audit = db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "COMM_KEY_RECOVERY_SERIAL_ATTESTED",
+            AuditEvent.target_id == connector.connector_id,
+        )
+    )
+    assert audit is not None
+    assert audit.outcome == "PENDING_FIRMWARE_PROOF"
+    assert audit.after["expected_terminal_serial"] == SERIAL
+    assert audit.after["operation_id"] == operation.operation_id
+    assert f"{246_810:d}" not in json.dumps(audit.after)
+
+
+def test_comm_key_recovery_does_not_attest_serial_after_failed_confirmation(db: Session):
+    connector = connector_fixture(db, expected_serial=None)
+    zkt = connector.zkt_device
+    assert zkt is not None
+
+    with pytest.raises(ValueError, match="Type 'CHANGE"):
+        create_comm_key_change(
+            db,
+            connector=connector,
+            new_key=f"{246_810:d}",
+            mode="ESP_ONLY",
+            expected_revision=0,
+            expected_terminal_serial=SERIAL,
+            reason="Recover a remote connector whose terminal cannot authenticate yet",
+            typed_confirmation="CHANGE the wrong connector and serial",
+            idempotency_key="test-key",
+            actor="StateHealthAdmin",
+        )
+
+    assert zkt.expected_serial is None
+    assert zkt.confirmed_serial is None
+    assert zkt.terminal_binding_state == "SERIAL_CONFIRMATION_REQUIRED"
+
+
+def test_comm_key_recovery_endpoint_stages_unobserved_serial_with_step_up_audit(
+    db: Session,
+):
+    connector = connector_fixture(db, expected_serial=None)
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(
+        f"/api/v1/devices/{connector.connector_id}/comm-key/changes",
+        json={
+            "new_key": f"{246_810:d}",
+            "mode": "ESP_ONLY",
+            "expected_revision": 0,
+            "expected_terminal_serial": SERIAL,
+            "reason": "Recover a remote connector whose terminal cannot authenticate yet",
+            "typed_confirmation": f"CHANGE {connector.connector_id} {SERIAL}",
+            "password": "correct-password",
+            "idempotency_key": "test-key",
+        },
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+
+    assert response.status_code == 202, response.text
+    payload = response.json()
+    assert payload["operation"]["status"] == "PENDING_CAPABILITY"
+    assert payload["command"] is None
+    assert payload["state"]["management_state"] == "PENDING_CAPABILITY"
+    audit = db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "COMM_KEY_CHANGE_STEP_UP_CONFIRMED",
+            AuditEvent.target_id == connector.connector_id,
+        )
+    )
+    assert audit is not None
+    assert audit.after["provisional_serial_attestation"] is True
+    assert audit.after["expected_terminal_serial"] == SERIAL
+    assert audit.after["reason"].startswith("Recover a remote connector")
+    assert f"{246_810:d}" not in json.dumps(audit.after)
+
+
 @pytest.mark.parametrize("value", ["0", "000000", "01979", "4294967296", "12x34"])
 def test_comm_key_schema_rejects_noncanonical_or_out_of_range_values(value: str):
     with pytest.raises(ValidationError):

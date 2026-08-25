@@ -251,6 +251,7 @@ export function DeviceDrawer({
               {!commKeyState?.capabilities.esp_and_terminal && <p>Remote terminal rotation unavailable: {(commKeyState?.capabilities.esp_and_terminal_block_reason || 'CAPABILITY_NOT_AVAILABLE').replaceAll('_', ' ').toLowerCase()}.</p>}
               <label>New COMM Key<input type="password" inputMode="numeric" autoComplete="new-password" value={newCommKey} onChange={(event) => setNewCommKey(event.target.value)} /></label>
               <label>Expected ZKT serial<input value={commKeySerial} onChange={(event) => setCommKeySerial(event.target.value.trim())} /></label>
+              {!device.zkt?.serial && <p>The entered serial will be recorded as a provisional, read-only recovery expectation. Firmware must authenticate to the ZKT and prove this exact serial before applying the key.</p>}
               <label>Operational reason<input value={commKeyReason} onChange={(event) => setCommKeyReason(event.target.value)} /></label>
               <label>Type <strong>CHANGE {device.connector_id} {commKeySerial || '&lt;serial&gt;'}</strong><input value={commKeyConfirmation} onChange={(event) => setCommKeyConfirmation(event.target.value)} /></label>
               <label>Confirm administrator password<input type="password" autoComplete="current-password" value={commKeyPassword} onChange={(event) => setCommKeyPassword(event.target.value)} /></label>
