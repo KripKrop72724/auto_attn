@@ -116,6 +116,8 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         "ADD_SOURCE_COVERAGE_CERTIFIED",
         "/api/v1/reconciliations",
         "status_group=COMPLETED",
+        "[int]$_.terminal.generation -eq [int]$sourceCoverage.terminal_generation",
+        "[int]$_.checkpoint.next_ordinal -eq [int]$row.zkt.attendance_count",
         "$_.capture_certificate",
         "$_.oracle_certificate",
         "$sourceCoverage.capture_evidence",
