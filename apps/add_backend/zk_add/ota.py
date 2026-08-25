@@ -32,7 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from zk_add.db import Base
-from zk_add.models import Connector, utc_column
+from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
@@ -725,6 +725,82 @@ def release_rows(session: Session) -> list[dict[str, Any]]:
     return release_page(session)["rows"]
 
 
+def _transport_diagnostics(
+    session: Session,
+    deployment: FirmwareDeployment,
+) -> dict[str, Any]:
+    """Return bounded, credential-free evidence for one OTA transfer attempt."""
+
+    (
+        grants_issued,
+        grants_reached,
+        first_grant_issued_at,
+        latest_grant_issued_at,
+        latest_grant_expires_at,
+        last_endpoint_reached_at,
+    ) = session.execute(
+        select(
+            func.count(FirmwareDownloadGrant.id),
+            func.count(FirmwareDownloadGrant.last_used_at),
+            func.min(FirmwareDownloadGrant.created_at),
+            func.max(FirmwareDownloadGrant.created_at),
+            func.max(FirmwareDownloadGrant.expires_at),
+            func.max(FirmwareDownloadGrant.last_used_at),
+        ).where(FirmwareDownloadGrant.deployment_id == deployment.id)
+    ).one()
+
+    latest_telemetry = session.scalar(
+        select(DeviceTelemetry)
+        .where(DeviceTelemetry.connector_id == deployment.connector_id)
+        .order_by(DeviceTelemetry.id.desc())
+        .limit(1)
+    )
+    window_started_at = deployment.offered_at or deployment.created_at
+    window_ended_at = deployment.completed_at or utc_now()
+    telemetry_samples, minimum_free_heap, weakest_rssi = session.execute(
+        select(
+            func.count(DeviceTelemetry.id),
+            func.min(DeviceTelemetry.free_heap),
+            func.min(DeviceTelemetry.rssi),
+        ).where(
+            DeviceTelemetry.connector_id == deployment.connector_id,
+            DeviceTelemetry.created_at >= window_started_at,
+            DeviceTelemetry.created_at <= window_ended_at,
+        )
+    ).one()
+
+    return {
+        "download_grants": {
+            "issued_count": int(grants_issued or 0),
+            "reached_count": int(grants_reached or 0),
+            "endpoint_reached": bool(grants_reached),
+            "first_issued_at": first_grant_issued_at,
+            "latest_issued_at": latest_grant_issued_at,
+            "latest_expires_at": latest_grant_expires_at,
+            "last_reached_at": last_endpoint_reached_at,
+        },
+        "telemetry": {
+            "window_started_at": window_started_at,
+            "window_ended_at": window_ended_at,
+            "sample_count": int(telemetry_samples or 0),
+            "minimum_free_heap": minimum_free_heap,
+            "weakest_rssi": weakest_rssi,
+            "latest": (
+                {
+                    "free_heap": latest_telemetry.free_heap,
+                    "rssi": latest_telemetry.rssi,
+                    "uptime_seconds": latest_telemetry.uptime_seconds,
+                    "outbox_depth": latest_telemetry.outbox_depth,
+                    "current_activity": latest_telemetry.current_activity,
+                    "created_at": latest_telemetry.created_at,
+                }
+                if latest_telemetry is not None
+                else None
+            ),
+        },
+    }
+
+
 def _deployment_rows(
     session: Session,
     campaign: FirmwareCampaign,
@@ -770,6 +846,11 @@ def _deployment_rows(
                 "offered_at": deployment.offered_at,
                 "completed_at": deployment.completed_at,
                 "updated_at": deployment.updated_at,
+                "transport_diagnostics": (
+                    _transport_diagnostics(session, deployment)
+                    if include_events and deployment.offered_at is not None
+                    else None
+                ),
                 "events": [
                     {
                         "state": event.state,

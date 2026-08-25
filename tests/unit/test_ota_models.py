@@ -1,11 +1,14 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from zk_add.models import Base, Connector
+from zk_add.models import Base, Connector, DeviceTelemetry
 from zk_add.ota import (
     FirmwareCampaign,
     FirmwareDeployment,
+    FirmwareDownloadGrant,
     FirmwareRelease,
     _versions_match,
     campaign_detail,
@@ -214,16 +217,66 @@ def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypa
         ]
         session.add_all(campaigns)
         session.flush()
-        session.add(
-            FirmwareDeployment(
-                deployment_id="deployment-one",
-                campaign_id=campaigns[0].id,
-                release_id=releases[0].id,
-                connector_id=connector.id,
-                status="OFFERED",
-                previous_version="2.2.29",
-                target_version="2.2.30",
-            )
+        offered_at = datetime(2026, 8, 25, 7, 0, tzinfo=timezone.utc)
+        completed_at = offered_at + timedelta(minutes=2)
+        deployment = FirmwareDeployment(
+            deployment_id="deployment-one",
+            campaign_id=campaigns[0].id,
+            release_id=releases[0].id,
+            connector_id=connector.id,
+            status="OFFERED",
+            previous_version="2.2.29",
+            target_version="2.2.30",
+            offered_at=offered_at,
+            completed_at=completed_at,
+        )
+        session.add(deployment)
+        session.flush()
+        session.add_all(
+            [
+                FirmwareDownloadGrant(
+                    token_hash="1" * 64,
+                    deployment_id=deployment.id,
+                    connector_id=connector.id,
+                    created_at=offered_at,
+                    expires_at=offered_at + timedelta(minutes=15),
+                    last_used_at=offered_at + timedelta(seconds=2),
+                ),
+                FirmwareDownloadGrant(
+                    token_hash="2" * 64,
+                    deployment_id=deployment.id,
+                    connector_id=connector.id,
+                    created_at=offered_at + timedelta(seconds=30),
+                    expires_at=offered_at + timedelta(minutes=15, seconds=30),
+                ),
+                DeviceTelemetry(
+                    connector_id=connector.id,
+                    rssi=-70,
+                    free_heap=91_000,
+                    uptime_seconds=100,
+                    outbox_depth=0,
+                    current_activity="LIVE_CAPTURE",
+                    created_at=offered_at + timedelta(seconds=5),
+                ),
+                DeviceTelemetry(
+                    connector_id=connector.id,
+                    rssi=-81,
+                    free_heap=82_000,
+                    uptime_seconds=160,
+                    outbox_depth=1,
+                    current_activity="LIVE_CAPTURE",
+                    created_at=offered_at + timedelta(seconds=65),
+                ),
+                DeviceTelemetry(
+                    connector_id=connector.id,
+                    rssi=-65,
+                    free_heap=95_000,
+                    uptime_seconds=300,
+                    outbox_depth=0,
+                    current_activity="LIVE_CAPTURE",
+                    created_at=completed_at + timedelta(minutes=1),
+                ),
+            ]
         )
         session.commit()
 
@@ -251,3 +304,12 @@ def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypa
         detail = campaign_detail(session, "campaign-1")
         assert detail is not None
         assert detail["deployments"][0]["display_name"] == "Terminal One"
+        diagnostics = detail["deployments"][0]["transport_diagnostics"]
+        assert diagnostics["download_grants"]["issued_count"] == 2
+        assert diagnostics["download_grants"]["reached_count"] == 1
+        assert diagnostics["download_grants"]["endpoint_reached"] is True
+        assert diagnostics["telemetry"]["sample_count"] == 2
+        assert diagnostics["telemetry"]["minimum_free_heap"] == 82_000
+        assert diagnostics["telemetry"]["weakest_rssi"] == -81
+        assert diagnostics["telemetry"]["latest"]["free_heap"] == 95_000
+        assert "token_hash" not in repr(detail)

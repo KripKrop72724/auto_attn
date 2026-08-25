@@ -180,10 +180,18 @@ def apply_ota_heartbeat_diagnostics(
     ):
         return
 
+    # Releases through 2.4.12 retain the previous attempt's error in RAM. A
+    # fresh assignment for the same target therefore reports that stale error
+    # while the OTA task is actively transferring. Once an attempt actually
+    # stops, the runtime returns to the durable journal state (for example,
+    # DOWNLOADING), so only UPDATING is safe to treat as active work here.
+    if runtime_state == "UPDATING":
+        connector.ota_state = "UPDATING"
+        return
+
     if not reported_error:
         if runtime_state in {
             "DOWNLOADING",
-            "UPDATING",
             "VERIFYING",
             "READY_TO_BOOT",
             "BOOTED_PENDING",

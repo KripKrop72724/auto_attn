@@ -3280,6 +3280,75 @@ def test_heartbeat_ignores_stale_ota_error_for_different_target(db: Session):
     assert connector.last_error_code is None
 
 
+def test_heartbeat_ignores_stale_error_during_new_same_target_transfer(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    release = FirmwareRelease(
+        release_id="release-heartbeat-retry",
+        version="2.5.0",
+        git_sha="1" * 40,
+        image_sha256="2" * 64,
+        image_size=2048,
+        signing_key_id="production-key",
+        partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.2.0",
+        storage_name="retry/firmware.bin",
+        manifest={"application_sha256": "3" * 64},
+        manifest_signature="test-signature",
+        state="HIL_ONLY",
+    )
+    db.add(release)
+    db.flush()
+    campaign = FirmwareCampaign(
+        campaign_id="campaign-heartbeat-retry",
+        release_id=release.id,
+        zone_id=connector.zone_id,
+        status="ACTIVE",
+        actor="StateHealthAdmin",
+        idempotency_key="retry-key",
+        reason="Retry the exact signed HIL candidate safely",
+        typed_confirmation="2.5.0",
+        eligible_count=1,
+        legacy_skipped_count=0,
+    )
+    db.add(campaign)
+    db.flush()
+    deployment = FirmwareDeployment(
+        deployment_id="deployment-heartbeat-retry",
+        campaign_id=campaign.id,
+        release_id=release.id,
+        connector_id=connector.id,
+        status="OFFERED",
+        previous_version="zone-lite-2.4.12",
+        target_version="2.5.0",
+    )
+    db.add(deployment)
+    db.flush()
+
+    update_heartbeat(
+        db,
+        connector=connector,
+        boot_id="ota-retry-boot",
+        sequence=1,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.4.12",
+            ota={
+                "state": "UPDATING",
+                "target_version": "2.5.0",
+                "bytes_written": 0,
+                "image_size": 2048,
+                "last_error": "DOWNLOAD_BEGIN_FAILED",
+            },
+        ),
+    )
+
+    assert deployment.status == "OFFERED"
+    assert campaign.status == "ACTIVE"
+    assert connector.ota_state == "UPDATING"
+    assert connector.last_error_code is None
+
+
 def test_admin_lease_result_is_durable(db: Session):
     connector = connector_fixture(db)
     make_writable(connector)

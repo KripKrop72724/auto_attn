@@ -523,6 +523,33 @@ export interface FirmwareDeploymentEvent {
   created_at: string
 }
 
+export interface FirmwareTransportDiagnostics {
+  download_grants: {
+    issued_count: number
+    reached_count: number
+    endpoint_reached: boolean
+    first_issued_at: string | null
+    latest_issued_at: string | null
+    latest_expires_at: string | null
+    last_reached_at: string | null
+  }
+  telemetry: {
+    window_started_at: string
+    window_ended_at: string
+    sample_count: number
+    minimum_free_heap: number | null
+    weakest_rssi: number | null
+    latest: {
+      free_heap: number | null
+      rssi: number | null
+      uptime_seconds: number | null
+      outbox_depth: number
+      current_activity: string | null
+      created_at: string
+    } | null
+  }
+}
+
 export interface FirmwareDeployment {
   deployment_id: string
   connector_id: string | null
@@ -539,6 +566,7 @@ export interface FirmwareDeployment {
   offered_at: string | null
   completed_at: string | null
   updated_at: string
+  transport_diagnostics: FirmwareTransportDiagnostics | null
   events: FirmwareDeploymentEvent[]
 }
 
