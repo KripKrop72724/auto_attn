@@ -39,6 +39,7 @@ def test_encrypted_nvs_commit_has_recoverable_operation_journal() -> None:
     defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
     assert "CONFIG_NVS_ENCRYPTION=y" in defaults
     assert "CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y" in defaults
+    assert "CONFIG_MBEDTLS_HKDF_C=y" in defaults
     for key in (
         '"zkt_key_pending"',
         '"zkt_rev_pending"',

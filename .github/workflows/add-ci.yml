@@ -258,6 +258,7 @@ jobs:
           grep -qx 'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_SECURE_BOOT=y' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_SECURE_BOOT_V2_ENABLED=y' firmware/zone_lite/sdkconfig.defaults
+          grep -qx 'CONFIG_MBEDTLS_HKDF_C=y' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n' firmware/zone_lite/sdkconfig.defaults
           grep -qx 'CONFIG_PARTITION_TABLE_OFFSET=0x10000' firmware/zone_lite/sdkconfig.defaults
           grep -q 'nvs.*0x11000.*0x6000' firmware/zone_lite/partitions.csv
