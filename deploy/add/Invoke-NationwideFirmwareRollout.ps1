@@ -47,6 +47,33 @@ function Stop-CampaignsFailClosed {
     }
 }
 
+function Get-FirmwareCampaign {
+    param([Parameter(Mandatory = $true)][string]$CampaignId)
+    return Invoke-AddApi -Method GET -Path "/api/v1/firmware/campaigns/$CampaignId"
+}
+
+function Get-FirmwareCampaigns {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Campaigns
+    )
+    return @($Campaigns | ForEach-Object {
+        Get-FirmwareCampaign -CampaignId ([string]$_.campaign_id)
+    })
+}
+
+function Get-OpenFirmwareCampaigns {
+    $rows = @()
+    foreach ($status in @('ACTIVE', 'PAUSED')) {
+        $response = Invoke-AddApi -Method GET -Path (
+            "/api/v1/firmware/campaigns?view=summary&status=$status&limit=1"
+        )
+        $rows += @($response.rows)
+    }
+    return $rows
+}
+
 function Test-ReportedFirmwareVersion {
     param(
         [AllowEmptyString()][string]$ReportedVersion,
@@ -196,14 +223,17 @@ try {
     if ($releaseMatches.Count -ne 1) { throw 'Exact AVAILABLE firmware release was not found.' }
     $release = $releaseMatches[0]
 
-    $campaignResponse = Invoke-AddApi -Method GET -Path '/api/v1/firmware/campaigns'
-    $canaries = @($campaignResponse.rows | Where-Object {
-        $_.campaign_id -eq $CanaryCampaignId -and $_.version -eq $Version -and
-        $_.status -eq 'CANCELLED' -and [int]$_.counts.SUCCEEDED -ge 1 -and
-        ([string]$_.pause_reason).StartsWith('CANARY_ACCEPTED:')
-    })
-    if ($canaries.Count -ne 1) { throw 'Accepted production canary evidence was not found.' }
-    $active = @($campaignResponse.rows | Where-Object { $_.status -in @('ACTIVE', 'PAUSED') })
+    $canary = Get-FirmwareCampaign -CampaignId $CanaryCampaignId
+    if (
+        $canary.campaign_id -ne $CanaryCampaignId -or
+        $canary.version -ne $Version -or
+        $canary.status -ne 'CANCELLED' -or
+        [int]$canary.counts.SUCCEEDED -lt 1 -or
+        -not ([string]$canary.pause_reason).StartsWith('CANARY_ACCEPTED:')
+    ) {
+        throw 'Accepted production canary evidence was not found.'
+    }
+    $active = @(Get-OpenFirmwareCampaigns)
     if ($active.Count -ne 0) { throw 'An active or paused firmware campaign already exists; rollout is fail-closed.' }
 
     $devicesResponse = Invoke-AddApi -Method GET -Path '/api/v1/devices'
@@ -275,8 +305,7 @@ try {
             $deadline = (Get-Date).AddMinutes($BatchTimeoutMinutes)
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds 15
-                $latest = Invoke-AddApi -Method GET -Path '/api/v1/firmware/campaigns'
-                $rows = @($latest.rows | Where-Object { $_.campaign_id -in @($created.campaign_id) })
+                $rows = @(Get-FirmwareCampaigns -Campaigns $created)
                 if ($rows.Count -ne $created.Count) { throw 'ADD omitted a campaign during batch monitoring.' }
                 $failed = @($rows | Where-Object {
                     $_.status -eq 'PAUSED' -or [int]$_.counts.FAILED -gt 0 -or [int]$_.counts.ROLLED_BACK -gt 0
@@ -329,9 +358,7 @@ try {
             }
             if (-not $batchAccepted) { throw 'Batch timed out before every eligible deployment succeeded.' }
         } catch {
-            $currentRows = @((Invoke-AddApi -Method GET -Path '/api/v1/firmware/campaigns').rows | Where-Object {
-                $_.campaign_id -in @($created.campaign_id)
-            })
+            $currentRows = @(Get-FirmwareCampaigns -Campaigns $created)
             Stop-CampaignsFailClosed -Campaigns $currentRows -Reason "NATIONWIDE_HALTED: $($_.Exception.Message)"
             throw
         }

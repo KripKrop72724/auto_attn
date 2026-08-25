@@ -410,6 +410,12 @@ def test_release_pipeline_keeps_setup_enabled_binaries_out_of_public_releases() 
     assert "retention-days: 1" in candidate
     assert "gh release create" not in release
     assert "gh release create" not in canary
+    assert (
+        '/api/v1/firmware/campaigns/$env:EXPECTED_CAMPAIGN' in canary
+    )
+    assert (
+        '-Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns" `' not in canary
+    )
 
 
 def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
@@ -420,6 +426,11 @@ def test_nationwide_rollout_is_canary_gated_batched_and_fail_closed() -> None:
     assert "NATIONWIDE_HALTED:" in rollout
     assert "ROLLED_BACK" in rollout
     assert "NATIONWIDE_ACCEPTED:" in rollout
+    assert "function Get-FirmwareCampaign" in rollout
+    assert "function Get-OpenFirmwareCampaigns" in rollout
+    assert 'view=summary&status=$status&limit=1' in rollout
+    assert "Get-FirmwareCampaign -CampaignId $CanaryCampaignId" in rollout
+    assert "Get-FirmwareCampaigns -Campaigns $created" in rollout
     assert "Post-rollout stability verification failed" in rollout
     assert "'/api/v1/firmware/campaigns/preflight'" in rollout
     assert "scope_token = [string]$scope.scope_token" in rollout
