@@ -314,8 +314,8 @@ jobs:
                 -TimeoutSec 30
               $freshFullSourceJobs = @($completedReconciliations.rows | Where-Object {
                 $_.status -eq 'COMPLETED' -and
-                [int]$_.terminal_generation -eq [int]$sourceCoverage.terminal_generation -and
-                [int]$_.committed_next_ordinal -eq [int]$row.zkt.attendance_count -and
+                [int]$_.terminal.generation -eq [int]$sourceCoverage.terminal_generation -and
+                [int]$_.checkpoint.next_ordinal -eq [int]$row.zkt.attendance_count -and
                 -not [string]::IsNullOrWhiteSpace([string]$_.requested_at) -and
                 [DateTimeOffset]::Parse([string]$_.requested_at) -ge $campaignStarted -and
                 -not [string]::IsNullOrWhiteSpace([string]$_.capture_certified_at) -and
