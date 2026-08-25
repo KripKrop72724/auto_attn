@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_hil_quarantine_is_disabled_by_default() -> None:
     assert settings.firmware_hil_enabled is False
     assert settings.firmware_hil_target_mac is None
+    assert settings.firmware_public_base_url == "https://autoattn.slichealth.com"
 
 
 def test_deployment_can_explicitly_switch_from_hil_to_national_ota() -> None:
@@ -44,6 +45,20 @@ def test_add_deployment_uses_the_validated_internal_ords_route() -> None:
         f'if ($environment["ADD_ORDS_BASE_URL"] -ne "{expected}")'
         in deploy
     )
+
+
+def test_add_deployment_locks_firmware_downloads_to_public_https_origin() -> None:
+    deploy = (ROOT / "deploy" / "add" / "deploy.ps1").read_text(encoding="utf-8")
+    web = (ROOT / "apps" / "add_backend" / "zk_add" / "web.py").read_text(
+        encoding="utf-8"
+    )
+    expected = "https://autoattn.slichealth.com"
+    assert f'$environment["ADD_FIRMWARE_PUBLIC_BASE_URL"] = "{expected}"' in deploy
+    assert (
+        f'if ($environment["ADD_FIRMWARE_PUBLIC_BASE_URL"] -ne "{expected}")'
+        in deploy
+    )
+    assert "public_base=settings.firmware_public_base_url" in web
 
 
 def test_publication_requires_exact_hil_target_and_promotion_preserves_bytes() -> None:

@@ -68,6 +68,7 @@ class AddSettings(BaseSettings):
     firmware_hil_enabled: bool = False
     firmware_hil_target_mac: str | None = None
     firmware_store_path: str = "/firmware"
+    firmware_public_base_url: str = "https://autoattn.slichealth.com"
     firmware_download_grant_seconds: int = 15 * 60
     firmware_signing_public_key_pem_b64: str | None = None
     comm_key_management_enabled: bool = False

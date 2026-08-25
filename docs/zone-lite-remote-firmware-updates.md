@@ -53,6 +53,11 @@ The three signing private keys are generated on the trusted ADD Windows runner a
 
 ADD needs only the manifest verification public key in `ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64`. The production host path is configured through `ADD_FIRMWARE_STORE_HOST_PATH`; Docker mounts it read-only.
 
+Firmware assignments always use the explicit credential-free HTTPS origin in
+`ADD_FIRMWARE_PUBLIC_BASE_URL`. Production locks this to
+`https://autoattn.slichealth.com`; ADD never derives a device download URL from
+reverse-proxy request headers.
+
 ## Signing-key custody
 
 The authoritative key vault is created by the `Zone Lite signing key bootstrap` workflow after exact typed confirmation and protected-environment approval. It creates three independent RSA-3072 keys: key 1 is `ACTIVE`; keys 2 and 3 are `RESERVE`. The factory bootloader is signed by all three so their public digests are installed during first boot. Normal application and manifest releases are signed only by the active key.

@@ -11,6 +11,7 @@ import secrets
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -515,7 +516,30 @@ def create_campaign(
     return campaign
 
 
+def _validated_firmware_public_base(public_base: str) -> str:
+    value = public_base.strip()
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as error:
+        raise RuntimeError("Firmware public base URL is invalid.") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "Firmware public base URL must be one credential-free HTTPS origin."
+        )
+    return urlunsplit(("https", parsed.netloc, "", "", ""))
+
+
 def assignment_for_connector(session: Session, *, connector: Connector, public_base: str) -> dict[str, Any] | None:
+    public_base = _validated_firmware_public_base(public_base)
     if not capability_is_eligible(connector):
         return None
     active = session.scalar(select(FirmwareDeployment).join(FirmwareCampaign).where(

@@ -379,6 +379,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_COMPANION_RELEASE_STORE_HOST_PATH
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
 $environment["ADD_PUBLIC_DEVICE_WS_URL"] = "wss://autoattn.slichealth.com/device/v2/stream"
+$environment["ADD_FIRMWARE_PUBLIC_BASE_URL"] = "https://autoattn.slichealth.com"
 $environment["ADD_PROVISIONING_PUBLIC_WS_URL"] = "wss://autoattn.slichealth.com/companion/v1/stream"
 $environment["ADD_PROVISIONING_WORKER_URL"] = "http://add-provisioner:8097"
 $environment["ADD_ORDS_BASE_URL"] = "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
@@ -403,7 +404,7 @@ $environment = Get-EnvironmentMap -Path ".env.add"
 $required = @(
     "ADD_POSTGRES_PASSWORD", "ADD_ADMIN_USERNAME", "ADD_ADMIN_PASSWORD_HASH",
     "ADD_PII_FERNET_KEY", "ADD_PII_LOOKUP_KEY", "ADD_FLEET_ROOT_SECRET",
-    "ADD_PUBLIC_DEVICE_WS_URL", "ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME",
+    "ADD_PUBLIC_DEVICE_WS_URL", "ADD_FIRMWARE_PUBLIC_BASE_URL", "ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME",
     "ADD_ORDS_PASSWORD"
 )
 foreach ($name in $required) { [void](Require-EnvironmentValue -Map $environment -Name $name) }
@@ -470,6 +471,9 @@ if ($environment["ADD_PROVISIONING_ENABLED"] -eq "true") {
 }
 if ($environment["ADD_PUBLIC_DEVICE_WS_URL"] -ne "wss://autoattn.slichealth.com/device/v2/stream") {
     throw "ADD_PUBLIC_DEVICE_WS_URL must use the production TLS device stream."
+}
+if ($environment["ADD_FIRMWARE_PUBLIC_BASE_URL"] -ne "https://autoattn.slichealth.com") {
+    throw "ADD_FIRMWARE_PUBLIC_BASE_URL must use the production TLS device gateway."
 }
 if ($environment["ADD_ORDS_BASE_URL"] -ne "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event") {
     throw "ADD_ORDS_BASE_URL must use the validated internal production raw attendance capture endpoint."

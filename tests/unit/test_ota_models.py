@@ -10,6 +10,7 @@ from zk_add.ota import (
     FirmwareDeployment,
     FirmwareDownloadGrant,
     FirmwareRelease,
+    _validated_firmware_public_base,
     _versions_match,
     campaign_detail,
     campaign_page,
@@ -33,6 +34,21 @@ def test_ota_tables_are_registered_in_metadata() -> None:
 
 def test_ota_is_disabled_by_default() -> None:
     assert settings.firmware_ota_enabled is False
+
+
+def test_firmware_public_base_requires_one_credential_free_https_origin() -> None:
+    assert (
+        _validated_firmware_public_base("https://autoattn.slichealth.com/")
+        == "https://autoattn.slichealth.com"
+    )
+    for invalid in (
+        "http://autoattn.slichealth.com",
+        "https://user:secret@autoattn.slichealth.com",
+        "https://autoattn.slichealth.com/device/v2",
+        "https://autoattn.slichealth.com?token=unsafe",
+    ):
+        with pytest.raises(RuntimeError, match="credential-free HTTPS origin"):
+            _validated_firmware_public_base(invalid)
 
 
 def test_ota_version_matching_accepts_connector_and_app_formats() -> None:
