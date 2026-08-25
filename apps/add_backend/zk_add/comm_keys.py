@@ -215,14 +215,14 @@ def serialize_comm_key_state(session: Session, connector: Connector) -> dict:
     }
 
 
-def _validate_expected_terminal(session: Session, connector: Connector, expected_serial: str) -> None:
+def _validate_expected_terminal(
+    session: Session, connector: Connector, expected_serial: str
+) -> tuple[ZKTDevice, bool]:
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("No assigned ZKT terminal.")
     known = zkt.confirmed_serial or zkt.expected_serial or zkt.serial
-    if not known:
-        raise ValueError("An audited expected terminal serial is required before key management.")
-    if expected_serial != known:
+    if known and expected_serial != known:
         raise ValueError("Expected terminal serial does not match the connector binding evidence.")
     collision = session.scalar(
         select(ZKTDevice).where(
@@ -236,6 +236,7 @@ def _validate_expected_terminal(session: Session, connector: Connector, expected
     )
     if collision:
         raise ValueError("Expected terminal serial is already associated with another connector.")
+    return zkt, known is None
 
 
 def materialize_comm_key_command(
@@ -331,10 +332,12 @@ def create_comm_key_change(
     if duplicate:
         command = session.get(DeviceCommand, duplicate.command_id) if duplicate.command_id else None
         return duplicate, command
-    _validate_expected_terminal(session, connector, expected_terminal_serial)
     expected_confirmation = f"CHANGE {connector.connector_id} {expected_terminal_serial}"
     if typed_confirmation.strip() != expected_confirmation:
         raise ValueError(f"Type '{expected_confirmation}' to confirm this key operation.")
+    zkt, requires_serial_attestation = _validate_expected_terminal(
+        session, connector, expected_terminal_serial
+    )
     existing_active = active_operation(session, connector)
     if existing_active:
         raise ValueError(f"COMM Key operation {existing_active.operation_id} is still active.")
@@ -351,7 +354,6 @@ def create_comm_key_change(
     )
     if command_active:
         raise ValueError(f"Device already has active command {command_active.command_id}.")
-    zkt = connector.zkt_device
     if mode == "ESP_AND_TERMINAL":
         if not connector.comm_key_capable:
             raise ValueError("ESP and terminal rotation requires capable firmware first.")
@@ -364,6 +366,11 @@ def create_comm_key_change(
     if expected_revision != state.applied_revision or state.desired_revision != state.applied_revision:
         raise ValueError("COMM Key revision changed; refresh before submitting another operation.")
     now = utc_now()
+    if requires_serial_attestation:
+        zkt.expected_serial = expected_terminal_serial
+        zkt.terminal_binding_state = "RECOVERY_EXPECTED_SERIAL"
+        zkt.certification_state = "READ_ONLY"
+        zkt.writes_disabled_reason = "RECOVERY_SERIAL_PENDING_PROOF"
     revision = state.applied_revision + 1
     operation = CommKeyOperation(
         connector_id=connector.id,
@@ -405,6 +412,21 @@ def create_comm_key_change(
             "expected_terminal_serial": expected_terminal_serial,
         },
     )
+    if requires_serial_attestation:
+        append_audit(
+            session,
+            actor=actor,
+            action="COMM_KEY_RECOVERY_SERIAL_ATTESTED",
+            target_type="connector",
+            target_id=connector.connector_id,
+            outcome="PENDING_FIRMWARE_PROOF",
+            after={
+                "operation_id": operation.operation_id,
+                "expected_terminal_serial": expected_terminal_serial,
+                "reason": reason,
+                "terminal_binding_state": zkt.terminal_binding_state,
+            },
+        )
     return operation, command
 
 

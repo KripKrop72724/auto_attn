@@ -660,7 +660,15 @@ async def change_device_comm_key(
         target_id=connector.connector_id,
         outcome=operation.status,
         ip_address=client_ip(request),
-        after={"operation_id": operation.operation_id},
+        after={
+            "operation_id": operation.operation_id,
+            "mode": operation.mode,
+            "expected_terminal_serial": operation.expected_terminal_serial,
+            "reason": operation.reason,
+            "provisional_serial_attestation": bool(
+                zkt and zkt.terminal_binding_state == "RECOVERY_EXPECTED_SERIAL"
+            ),
+        },
     )
     db.commit()
     if command is not None:
