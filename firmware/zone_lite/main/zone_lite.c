@@ -106,9 +106,6 @@
 #ifndef ZONE_LITE_MIN_VALID_UNIX_TIME
 #define ZONE_LITE_MIN_VALID_UNIX_TIME 1767225600
 #endif
-#ifndef ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES
-#define ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES 12288
-#endif
 #ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
 #define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
 #endif
@@ -8833,131 +8830,130 @@ static bool find_zkt_with_comm_key(
     return false;
 }
 
-static void comm_key_manager_task(void *arg)
+static bool process_pending_comm_key_command(void)
 {
-    (void)arg;
-    while (true) {
-        if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0 ||
-            !add_connector_is_connected() ||
-            !add_connector_begin_pending_config_activity()) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        add_command_t command;
-        if (!add_connector_take_config_command(&command)) {
-            add_connector_set_activity("ONLINE");
-            continue;
-        }
-        if (command_was_cancelled(command.command_id)) {
-            (void)add_connector_command_update(
-                command.command_id,
-                "CANCELLED",
-                "COMMAND_CANCELLED",
-                "The configuration operation was cancelled before execution.",
-                "{}");
-            (void)add_connector_command_complete(command.command_id);
-            continue;
-        }
-        int64_t now = epoch_now();
-        if (command.expires_epoch > 0 && now >= ZONE_LITE_MIN_VALID_UNIX_TIME &&
-            now >= command.expires_epoch) {
-            (void)add_connector_command_update(
-                command.command_id,
-                "EXPIRED",
-                "COMMAND_EXPIRED",
-                "The configuration operation expired before execution.",
-                "{}");
-            (void)add_connector_command_complete(command.command_id);
-            continue;
-        }
-        g_comm_key_operation_active = true;
-        (void)add_connector_command_update(command.command_id, "RUNNING", NULL, NULL, "{}");
-        const char *error_code = NULL;
-        const char *error_message = NULL;
-        uint32_t candidate_key = 0;
-        uint32_t verified_ip = 0;
-        char verified_serial[80] = {0};
-        bool already_applied =
-            command.config_revision == zone_config_get()->zkt_comm_key_revision &&
-            strcmp(
-                command.config_operation_id,
-                zone_config_get()->zkt_comm_key_operation_id) == 0;
-        if (strcmp(command.config_mode, "ESP_AND_TERMINAL") == 0) {
-            error_code = "COMM_KEY_TERMINAL_WRITE_UNSUPPORTED";
-            error_message = "This terminal model is not certified for remote COMM Key writes.";
-        } else if (already_applied) {
-            candidate_key = zone_config_get()->zkt_comm_key;
-        } else if (command.config_revision != zone_config_get()->zkt_comm_key_revision + 1) {
-            error_code = "COMM_KEY_REVISION_CONFLICT";
-            error_message = "The device COMM Key revision changed before execution.";
-        } else if (!decrypt_comm_key_command(&command, &candidate_key)) {
-            error_code = "COMM_KEY_ENVELOPE_INVALID";
-            error_message = "The sealed configuration envelope failed validation.";
-        }
-        if (error_code == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(1500));
-            if (!find_zkt_with_comm_key(
-                    candidate_key,
-                    command.expected_serial,
-                    &verified_ip,
-                    verified_serial)) {
-                error_code = "COMM_KEY_CANDIDATE_AUTH_FAILED";
-                error_message = "The candidate did not authenticate the expected terminal.";
-            } else if (zone_config_get()->zkt_expected_serial[0] &&
-                       strcmp(zone_config_get()->zkt_expected_serial, verified_serial) != 0) {
-                error_code = "COMM_KEY_TERMINAL_SERIAL_MISMATCH";
-                error_message = "The authenticated terminal serial did not match the pinned serial.";
-            } else if (!zone_config_get()->zkt_expected_serial[0] &&
-                       zone_config_save_zkt_serial(verified_serial) != ESP_OK) {
-                error_code = "COMM_KEY_SERIAL_PIN_FAILED";
-                error_message = "The authenticated serial could not be pinned durably.";
-            } else if (!already_applied && zone_config_save_zkt_comm_key(
-                           candidate_key,
-                           command.config_revision,
-                           command.config_operation_id) != ESP_OK) {
-                error_code = "COMM_KEY_PERSIST_FAILED";
-                error_message = "The verified key could not be committed to encrypted storage.";
-            }
-        }
-        mbedtls_platform_zeroize(&candidate_key, sizeof(candidate_key));
-        g_comm_key_operation_active = false;
-        if (error_code == NULL) {
-            g_last_authenticated_zkt_ip = verified_ip;
-            strlcpy(g_device_serial, verified_serial, sizeof(g_device_serial));
-            mark_command_processed(command.command_id);
-            char result[256];
-            snprintf(
-                result,
-                sizeof(result),
-                "{\"config_field\":\"zkt_comm_key\",\"applied_revision\":%lu,"
-                "\"verified_serial\":\"%s\",\"authentication_verified\":true,"
-                "\"terminal_updated\":false,\"duplicate\":%s}",
-                (unsigned long)command.config_revision,
-                verified_serial,
-                already_applied ? "true" : "false");
-            (void)add_connector_command_update(
-                command.command_id, "SUCCEEDED", NULL, NULL, result);
-            (void)add_connector_command_complete(command.command_id);
-            add_connector_log(
-                "INFO",
-                "configuration",
-                "COMM_KEY_APPLIED",
-                "Authenticated COMM Key revision committed for the pinned terminal");
-        } else {
-            bool retryable = strcmp(error_code, "COMM_KEY_CANDIDATE_AUTH_FAILED") == 0 ||
-                strcmp(error_code, "COMM_KEY_PERSIST_FAILED") == 0;
-            if (retryable && (command.expires_epoch <= 0 || epoch_now() < command.expires_epoch)) {
-                (void)add_connector_command_update(
-                    command.command_id, "RETRYING", error_code, error_message, "{}");
-                add_connector_command_retry(command.command_id);
-            } else {
-                (void)add_connector_command_update(
-                    command.command_id, "FAILED", error_code, error_message, "{}");
-                (void)add_connector_command_complete(command.command_id);
-            }
-        }
-        add_connector_set_activity("ONLINE");
+    if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0 ||
+        !add_connector_is_connected() ||
+        !add_connector_begin_pending_config_activity()) {
+        return false;
     }
+    add_command_t command;
+    if (!add_connector_take_config_command(&command)) {
+        add_connector_set_activity("ONLINE");
+        return false;
+    }
+    if (command_was_cancelled(command.command_id)) {
+        (void)add_connector_command_update(
+            command.command_id,
+            "CANCELLED",
+            "COMMAND_CANCELLED",
+            "The configuration operation was cancelled before execution.",
+            "{}");
+        (void)add_connector_command_complete(command.command_id);
+        add_connector_set_activity("ONLINE");
+        return true;
+    }
+    int64_t now = epoch_now();
+    if (command.expires_epoch > 0 && now >= ZONE_LITE_MIN_VALID_UNIX_TIME &&
+        now >= command.expires_epoch) {
+        (void)add_connector_command_update(
+            command.command_id,
+            "EXPIRED",
+            "COMMAND_EXPIRED",
+            "The configuration operation expired before execution.",
+            "{}");
+        (void)add_connector_command_complete(command.command_id);
+        add_connector_set_activity("ONLINE");
+        return true;
+    }
+    g_comm_key_operation_active = true;
+    (void)add_connector_command_update(command.command_id, "RUNNING", NULL, NULL, "{}");
+    const char *error_code = NULL;
+    const char *error_message = NULL;
+    uint32_t candidate_key = 0;
+    uint32_t verified_ip = 0;
+    char verified_serial[80] = {0};
+    bool already_applied =
+        command.config_revision == zone_config_get()->zkt_comm_key_revision &&
+        strcmp(
+            command.config_operation_id,
+            zone_config_get()->zkt_comm_key_operation_id) == 0;
+    if (strcmp(command.config_mode, "ESP_AND_TERMINAL") == 0) {
+        error_code = "COMM_KEY_TERMINAL_WRITE_UNSUPPORTED";
+        error_message = "This terminal model is not certified for remote COMM Key writes.";
+    } else if (already_applied) {
+        candidate_key = zone_config_get()->zkt_comm_key;
+    } else if (command.config_revision != zone_config_get()->zkt_comm_key_revision + 1) {
+        error_code = "COMM_KEY_REVISION_CONFLICT";
+        error_message = "The device COMM Key revision changed before execution.";
+    } else if (!decrypt_comm_key_command(&command, &candidate_key)) {
+        error_code = "COMM_KEY_ENVELOPE_INVALID";
+        error_message = "The sealed configuration envelope failed validation.";
+    }
+    if (error_code == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        if (!find_zkt_with_comm_key(
+                candidate_key,
+                command.expected_serial,
+                &verified_ip,
+                verified_serial)) {
+            error_code = "COMM_KEY_CANDIDATE_AUTH_FAILED";
+            error_message = "The candidate did not authenticate the expected terminal.";
+        } else if (zone_config_get()->zkt_expected_serial[0] &&
+                   strcmp(zone_config_get()->zkt_expected_serial, verified_serial) != 0) {
+            error_code = "COMM_KEY_TERMINAL_SERIAL_MISMATCH";
+            error_message = "The authenticated terminal serial did not match the pinned serial.";
+        } else if (!zone_config_get()->zkt_expected_serial[0] &&
+                   zone_config_save_zkt_serial(verified_serial) != ESP_OK) {
+            error_code = "COMM_KEY_SERIAL_PIN_FAILED";
+            error_message = "The authenticated serial could not be pinned durably.";
+        } else if (!already_applied && zone_config_save_zkt_comm_key(
+                       candidate_key,
+                       command.config_revision,
+                       command.config_operation_id) != ESP_OK) {
+            error_code = "COMM_KEY_PERSIST_FAILED";
+            error_message = "The verified key could not be committed to encrypted storage.";
+        }
+    }
+    mbedtls_platform_zeroize(&candidate_key, sizeof(candidate_key));
+    g_comm_key_operation_active = false;
+    if (error_code == NULL) {
+        g_last_authenticated_zkt_ip = verified_ip;
+        strlcpy(g_device_serial, verified_serial, sizeof(g_device_serial));
+        mark_command_processed(command.command_id);
+        char result[256];
+        snprintf(
+            result,
+            sizeof(result),
+            "{\"config_field\":\"zkt_comm_key\",\"applied_revision\":%lu,"
+            "\"verified_serial\":\"%s\",\"authentication_verified\":true,"
+            "\"terminal_updated\":false,\"duplicate\":%s}",
+            (unsigned long)command.config_revision,
+            verified_serial,
+            already_applied ? "true" : "false");
+        (void)add_connector_command_update(
+            command.command_id, "SUCCEEDED", NULL, NULL, result);
+        (void)add_connector_command_complete(command.command_id);
+        add_connector_log(
+            "INFO",
+            "configuration",
+            "COMM_KEY_APPLIED",
+            "Authenticated COMM Key revision committed for the pinned terminal");
+    } else {
+        bool retryable = strcmp(error_code, "COMM_KEY_CANDIDATE_AUTH_FAILED") == 0 ||
+            strcmp(error_code, "COMM_KEY_PERSIST_FAILED") == 0;
+        if (retryable && (command.expires_epoch <= 0 || epoch_now() < command.expires_epoch)) {
+            (void)add_connector_command_update(
+                command.command_id, "RETRYING", error_code, error_message, "{}");
+            add_connector_command_retry(command.command_id);
+        } else {
+            (void)add_connector_command_update(
+                command.command_id, "FAILED", error_code, error_message, "{}");
+            (void)add_connector_command_complete(command.command_id);
+        }
+    }
+    add_connector_set_activity("ONLINE");
+    return true;
 }
 
 static void gateway_task(void *arg)
@@ -8967,8 +8963,10 @@ static void gateway_task(void *arg)
     int64_t last_zkt_reboot_ms = 0;
     int64_t offline_started_ms = 0;
     while (true) {
-        if (g_comm_key_operation_active || add_connector_has_pending_config_command()) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+        if (add_connector_has_pending_config_command()) {
+            if (!process_pending_comm_key_command()) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
             continue;
         }
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
@@ -9116,10 +9114,9 @@ void app_main(void)
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
     bool runtime_start_failed = false;
-    // Preserve the proven 2.4.x allocation order for the attendance-critical
-    // tasks.  xTaskCreate stacks live in internal RAM even when PSRAM makes the
-    // aggregate free-heap value look large, so the optional configuration
-    // worker must be allocated only after the uploader and gateway.
+    // Preserve the proven 2.4.x task footprint. COMM Key recovery is serialized
+    // through the gateway task so an OTA candidate never needs another internal-
+    // RAM stack before it can authenticate the staged terminal configuration.
     if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(
             TAG,
@@ -9132,20 +9129,6 @@ void app_main(void)
         ESP_LOGE(
             TAG,
             "Could not start Zone Lite gateway task (internal=%u largest=%u)",
-            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        runtime_start_failed = true;
-    }
-    if (xTaskCreate(
-            comm_key_manager_task,
-            "comm_key_mgr",
-            ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES,
-            NULL,
-            6,
-            NULL) != pdPASS) {
-        ESP_LOGE(
-            TAG,
-            "Could not start secure COMM Key manager task (internal=%u largest=%u)",
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         runtime_start_failed = true;

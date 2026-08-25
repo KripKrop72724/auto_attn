@@ -3,8 +3,10 @@
 > **HIL quarantine:** the immutable 2.5.0 Swat candidate downloaded completely
 > and reached `BOOTED_PENDING` on 25 August 2026, then lost connector visibility
 > before proving terminal/runtime health. It must never be promoted to Quetta or
-> a nationwide campaign. The corrected implementation is versioned 2.5.1 and
-> must pass a fresh exact-MAC Swat HIL campaign before promotion.
+> a nationwide campaign. Version 2.5.1 corrected that Swat failure and passed its
+> HIL, but the first staged-recovery boot in Quetta exposed a second internal-RAM
+> allocation boundary. Version 2.5.2 supersedes both candidates and must pass the
+> fresh HIL and Quetta recovery gates in `zone-lite-2.5.2-comm-key-ota-release.md`.
 
 Zone Lite 2.5.0 adds a fail-closed, audited recovery path for an ESP connector whose
 configured ZKT communication key no longer matches its assigned terminal. The release
