@@ -139,6 +139,51 @@ describe('Selected-terminal users workspace', () => {
     expect((screen.getByLabelText(/Exact CNIC search/i) as HTMLInputElement).value).toBe('')
   })
 
+  it('preserves terminal-scoped multi-selection across searches and only toggles the current view', async () => {
+    const ayesha = user()
+    const bilal = user({ id: 2, user_key: 'user-two', uid: '8', user_id: '1008', display_name: 'Bilal Ahmed' })
+    const baseFetch = workspaceFetch({ rows: [ayesha, bilal] })
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.pathname === '/api/v2/devices/connector-one/users') {
+        const visibleRows = url.searchParams.get('q') === 'Bilal' ? [bilal] : [ayesha, bilal]
+        return Promise.resolve(response({
+          rows: visibleRows,
+          next_cursor: null,
+          device,
+          identity_integrity: {
+            source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 2, with_cnic: 2, missing_cnic: 0,
+            duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0,
+            unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0,
+          },
+        }))
+      }
+      return baseFetch(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsersHarness />)
+
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    fireEvent.click(screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i))
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText(/Search user name, user ID, or UID/i), { target: { value: 'Bilal' } })
+    await waitFor(() => expect(screen.queryByRole('article', { name: /Ayesha Khan/i })).toBeNull())
+    expect(screen.getByRole('article', { name: /Bilal Ahmed/i })).toBeTruthy()
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+    expect(screen.getByText(/0 selected of 1 eligible in view · 1 total/i)).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText(/Select Bilal Ahmed for bulk deletion/i))
+    expect(screen.getByText('2 users selected')).toBeTruthy()
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select eligible users in this view/i }))
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText(/Search user name, user ID, or UID/i), { target: { value: '' } })
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect((screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByLabelText(/Select Bilal Ahmed for bulk deletion/i) as HTMLInputElement).checked).toBe(false)
+  })
+
   it('uses one bounded virtualized directory from the first full page through pagination', async () => {
     const firstPage = Array.from({ length: 200 }, (_, index) => user({
       id: index + 1,

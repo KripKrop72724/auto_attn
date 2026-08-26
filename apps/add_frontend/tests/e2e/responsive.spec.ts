@@ -58,6 +58,9 @@ const nationwideDevices = [
   { ...device, connector_id: 'swat-one', zone_id: 'ZONE-SWAT-01', zone_name: 'Swat', display_name: 'Swat · Regional Office', zkt: { ...device.zkt, id: 31, serial: 'SWT-0001' } },
   { ...device, connector_id: 'multan-one', zone_id: 'ZONE-MULTAN-01', zone_name: 'Multan', display_name: 'ZONE-MULTAN-01', zkt: { ...device.zkt, id: 35, serial: 'AF4C211861133' } },
   { ...device, connector_id: 'multan-two', zone_id: 'ZONE-MULTAN-02', zone_name: 'Multan', display_name: 'ZONE-MULTAN-02', zkt: { ...device.zkt, id: 36, serial: 'RKQ4245100152' } },
+  { ...device, connector_id: 'faisalabad-one', zone_id: 'ZONE-FAISALABAD-01', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-01', zkt: { ...device.zkt, id: 37, serial: 'FSD-0001' } },
+  { ...device, connector_id: 'faisalabad-two', zone_id: 'ZONE-FAISALABAD-02', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-02', zkt: { ...device.zkt, id: 38, serial: 'FSD-0002' } },
+  { ...device, connector_id: 'quetta-one', zone_id: 'ZONE-QUETTA-01', zone_name: 'Quetta', display_name: 'ZONE-QUETTA-01', zkt: { ...device.zkt, id: 39, serial: 'UET-0001' } },
   { ...device, connector_id: 'tower-three', zone_id: 'ZONE-SLICTOWER-3FL', zone_name: 'SLICTOWER', display_name: 'SLICTOWER · 3rd Floor', zkt: { ...device.zkt, id: 41, serial: 'ISB-0003' } },
   { ...device, connector_id: 'tower-thirteen', zone_id: 'ZONE-SLICTOWER-13FL', zone_name: 'SLIC-TOWER', display_name: 'SLICTOWER · 13th Floor', zkt: { ...device.zkt, id: 42, serial: 'ISB-0013' } },
 ]
@@ -197,13 +200,13 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   await page.route('**/api/v1/overview*', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ total: 8, online: 7, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
+    body: JSON.stringify({ total: 11, online: 10, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
   }))
 
   await page.goto('/fleet')
   await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
   const markers = page.locator('.fleet-map-marker')
-  await expect(markers).toHaveCount(5, { timeout: 10_000 })
+  await expect(markers).toHaveCount(7, { timeout: 10_000 })
   const projectedCoordinates = await markers.evaluateAll((nodes) => Object.fromEntries(nodes.map((node) => {
     const location = Array.from(node.classList).find((name) => name.startsWith('location-'))?.replace('location-', '') || ''
     const style = (node as HTMLElement).style
@@ -216,6 +219,8 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
     swat: { x: 69.21, y: 20.98 },
     peshawar: { x: 64.50, y: 25.91 },
     islamabad: { x: 73.09, y: 28.07 },
+    faisalabad: { x: 73.58, y: 42.65 },
+    quetta: { x: 38.85, y: 50.95 },
     multan: { x: 64.50, y: 51.09 },
     karachi: { x: 39.00, y: 85.67 },
   }
@@ -259,6 +264,12 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   await page.getByRole('button', { name: /Multan, 2 devices, All online/i }).click()
   await expect(page.getByRole('heading', { name: 'Multan' })).toBeVisible()
   await expect(page.getByRole('button', { name: /Inspect ZONE-MULTAN/ })).toHaveCount(2)
+  await page.getByRole('button', { name: /Faisalabad, 2 devices, All online/i }).click()
+  await expect(page.getByRole('heading', { name: 'Faisalabad' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Inspect ZONE-FAISALABAD/ })).toHaveCount(2)
+  await page.getByRole('button', { name: /Quetta, 1 device, All online/i }).click()
+  await expect(page.getByRole('heading', { name: 'Quetta' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Inspect ZONE-QUETTA-01' })).toBeVisible()
   if ((page.viewportSize()?.width || 0) > 920) {
     const canvasBox = await page.locator('.fleet-map-canvas').boundingBox()
     const sheetBox = await page.locator('.fleet-location-sheet').boundingBox()
@@ -300,6 +311,21 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
     await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
   }
   await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
+  const channelBadgeGeometry = await page.locator('.firmware-channel-strip .status-badge').first().evaluate((badge) => {
+    const icon = badge.querySelector('svg')?.getBoundingClientRect()
+    const text = badge.querySelector('span')?.getBoundingClientRect()
+    const box = badge.getBoundingClientRect()
+    return {
+      display: getComputedStyle(badge).display,
+      flexDirection: getComputedStyle(badge).flexDirection,
+      height: box.height,
+      horizontal: Boolean(icon && text && icon.right <= text.left && Math.abs((icon.top + icon.height / 2) - (text.top + text.height / 2)) <= 2),
+    }
+  })
+  expect(['flex', 'inline-flex']).toContain(channelBadgeGeometry.display)
+  expect(channelBadgeGeometry.flexDirection).toBe('row')
+  expect(channelBadgeGeometry.height).toBeLessThanOrEqual(32)
+  expect(channelBadgeGeometry.horizontal).toBe(true)
   await page.getByRole('tab', { name: /Signed releases/ }).click()
   await expect(page.getByRole('heading', { name: 'Signed release inventory' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Zone Lite 2.2.30' })).toBeVisible()
@@ -350,6 +376,43 @@ test('populated Users and Attendance workspaces are responsive, keyboard-operabl
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
 
+test('terminal multi-selection survives server-side search and current-view toggles', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-1280', 'Selection-state regression runs once in Chromium.')
+  const bilal = { ...representativeUser, id: 2, user_key: 'user-two', uid: '8', user_id: '1008', display_name: 'Bilal Ahmed' }
+  await page.route('**/api/v2/devices/connector-one/users*', async (route) => {
+    const url = new URL(route.request().url())
+    const rows = url.searchParams.get('q') === 'Bilal' ? [bilal] : [representativeUser, bilal]
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        rows,
+        next_cursor: null,
+        device,
+        identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 2, with_cnic: 2, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 },
+      }),
+    })
+  })
+  await page.goto('/users/connector-one')
+  await page.getByLabel('Select Ayesha Khan for bulk deletion').check()
+  await expect(page.getByText('1 user selected')).toBeVisible()
+
+  await page.getByLabel('Search user name, user ID, or UID').fill('Bilal')
+  await expect(page.getByRole('article', { name: /Ayesha Khan/i })).toHaveCount(0)
+  await expect(page.getByRole('article', { name: /Bilal Ahmed/i })).toBeVisible()
+  await expect(page.getByText('1 user selected')).toBeVisible()
+  await expect(page.getByText(/0 selected of 1 eligible in view · 1 total/i)).toBeVisible()
+
+  await page.getByLabel('Select Bilal Ahmed for bulk deletion').check()
+  await expect(page.getByText('2 users selected')).toBeVisible()
+  await page.getByRole('checkbox', { name: /Select eligible users in this view/i }).uncheck()
+  await expect(page.getByText('1 user selected')).toBeVisible()
+
+  await page.getByLabel('Search user name, user ID, or UID').fill('')
+  await expect(page.getByLabel('Select Ayesha Khan for bulk deletion')).toBeChecked()
+  await expect(page.getByLabel('Select Bilal Ahmed for bulk deletion')).not.toBeChecked()
+})
+
 test('source exception inspector is responsive, keyboard-operable, and fail-closed', async ({ page }) => {
   await page.goto('/reconciliation')
   await expect(page.getByRole('heading', { name: 'Terminal truth & recovery' })).toBeVisible()
@@ -389,6 +452,26 @@ test('large reconciliation evidence stays viewport-bound and progressively revea
   await expect(drawer).toBeVisible()
   await expect(drawer.locator('.reconciliation-event-summary')).toHaveCount(25)
   await expect(drawer.getByText('Showing 25 newest')).toBeVisible()
+
+  const longStatusGeometry = await drawer.getByLabel('Status: SOURCE CAPTURE CERTIFIED WITH IMMUTABLE CHAIN EVIDENCE').first().evaluate((badge) => {
+    const box = badge.getBoundingClientRect()
+    const copy = badge.parentElement?.nextElementSibling?.getBoundingClientRect()
+    const text = badge.querySelector('span')
+    return {
+      display: getComputedStyle(badge).display,
+      flexDirection: getComputedStyle(badge).flexDirection,
+      whiteSpace: text ? getComputedStyle(text).whiteSpace : '',
+      nonOverlapping: Boolean(copy && (box.right <= copy.left || copy.right <= box.left || box.bottom <= copy.top || copy.bottom <= box.top)),
+      box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+      copy: copy ? { left: copy.left, top: copy.top, right: copy.right, bottom: copy.bottom } : null,
+      title: badge.getAttribute('title'),
+    }
+  })
+  expect(['flex', 'inline-flex']).toContain(longStatusGeometry.display)
+  expect(longStatusGeometry.flexDirection).toBe('row')
+  expect(longStatusGeometry.whiteSpace).toBe('nowrap')
+  expect(longStatusGeometry.nonOverlapping, JSON.stringify(longStatusGeometry)).toBe(true)
+  expect(longStatusGeometry.title).toBe('SOURCE CAPTURE CERTIFIED WITH IMMUTABLE CHAIN EVIDENCE')
 
   const geometry = await page.evaluate(() => {
     const viewport = window.visualViewport

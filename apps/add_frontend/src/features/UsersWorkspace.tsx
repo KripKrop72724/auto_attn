@@ -35,6 +35,9 @@ const userSections: Array<{ id: UsersSection; label: string; icon: 'users' | 'al
   { id: 'history', label: 'Historical Backlog', icon: 'shield' },
 ]
 
+const isBulkSelectionEligible = (user: DeviceUser) =>
+  user.privilege !== 14 && !user.read_only && !user.current_command_state
+
 const requestError = (reason: unknown, fallback: string) =>
   reason instanceof Error ? reason.message : fallback
 
@@ -343,6 +346,8 @@ export function UsersView({
   const [, setLeaseClock] = useState(0)
   const directoryRequest = useRef<AbortController | null>(null)
   const diagnosticsRequest = useRef<AbortController | null>(null)
+  const knownUsers = useRef<Map<string, DeviceUser>>(new Map())
+  const selectEligibleRowsRef = useRef<HTMLInputElement>(null)
   const revisionRef = useRef(revision)
   const tabsRef = useRef<HTMLDivElement>(null)
   const userTableRef = useRef<HTMLDivElement>(null)
@@ -378,14 +383,16 @@ export function UsersView({
         limit: 200,
       })}`, { signal: controller.signal })
       if (controller.signal.aborted || directoryRequest.current !== controller) return
-      if (append) setRows((current) => [...current, ...response.rows.filter((row) => !current.some((item) => item.user_key === row.user_key))])
-      else {
-        setRows(response.rows)
-        setSelectedUserKeys((current) => {
-          const available = new Set(response.rows.map((row) => row.user_key))
-          return new Set([...current].filter((key) => available.has(key)))
+      response.rows.forEach((row) => knownUsers.current.set(row.user_key, row))
+      setSelectedUserKeys((current) => {
+        const next = new Set(current)
+        response.rows.forEach((row) => {
+          if (!isBulkSelectionEligible(row)) next.delete(row.user_key)
         })
-      }
+        return next.size === current.size && [...next].every((key) => current.has(key)) ? current : next
+      })
+      if (append) setRows((current) => [...current, ...response.rows.filter((row) => !current.some((item) => item.user_key === row.user_key))])
+      else setRows(response.rows)
       setNextCursor(response.next_cursor ?? null)
       if (response.identity_integrity) setIntegrity(response.identity_integrity)
       if (response.device) setDeviceDetail((current) => current?.active_lease ? current : response.device || null)
@@ -443,6 +450,7 @@ export function UsersView({
     setRole('ALL')
     setDirectoryError('')
     setDiagnosticErrors({})
+    knownUsers.current.clear()
     setSelectedUserKeys(new Set())
     setDialog(null)
     setResolutionDialog(null)
@@ -581,8 +589,22 @@ export function UsersView({
   const editCapabilityReason = !baseWritable ? actionReason : capabilities.user_write !== true ? 'This terminal does not advertise the certified user-write capability.' : ''
   const leaseCapabilityReason = !baseWritable ? actionReason : capabilities.admin_lease !== true ? 'This terminal does not advertise certified temporary enrollment access.' : ''
   const deleteCapabilityReason = !baseWritable ? actionReason : capabilities.delete_user !== true ? 'This terminal does not advertise the certified delete-user capability.' : ''
-  const eligibleRows = rows.filter((user) => user.privilege !== 14 && !user.read_only && !user.current_command_state)
-  const selectedUsers = eligibleRows.filter((user) => selectedUserKeys.has(user.user_key))
+  const eligibleRows = rows.filter(isBulkSelectionEligible)
+  const selectedVisibleUsers = eligibleRows.filter((user) => selectedUserKeys.has(user.user_key))
+  const selectedUsers = [...selectedUserKeys]
+    .map((key) => knownUsers.current.get(key))
+    .filter((user): user is DeviceUser => Boolean(user && isBulkSelectionEligible(user)))
+  const allVisibleEligibleSelected = eligibleRows.length > 0
+    && eligibleRows.every((user) => selectedUserKeys.has(user.user_key))
+  const selectionSummary = selectedUsers.length === selectedVisibleUsers.length
+    ? `${selectedVisibleUsers.length} selected of ${eligibleRows.length} eligible`
+    : `${selectedVisibleUsers.length} selected of ${eligibleRows.length} eligible in view · ${selectedUsers.length} total`
+  useEffect(() => {
+    if (selectEligibleRowsRef.current) {
+      selectEligibleRowsRef.current.indeterminate = selectedVisibleUsers.length > 0
+        && selectedVisibleUsers.length < eligibleRows.length
+    }
+  }, [eligibleRows.length, selectedVisibleUsers.length])
   const identityComplete = integrity?.with_cnic ?? rows.filter((row) => row.identity_complete).length
   const identityTotal = integrity?.total_users ?? selected?.zkt?.user_count ?? rows.length
   const completeness = identityTotal ? Math.round(identityComplete * 100 / identityTotal) : 0
@@ -606,6 +628,14 @@ export function UsersView({
   const toggleUser = (userKey: string, checked: boolean) => setSelectedUserKeys((current) => {
     const next = new Set(current)
     if (checked) next.add(userKey); else next.delete(userKey)
+    return next
+  })
+  const toggleEligibleRows = (checked: boolean) => setSelectedUserKeys((current) => {
+    const next = new Set(current)
+    eligibleRows.forEach((user) => {
+      if (checked) next.add(user.user_key)
+      else next.delete(user.user_key)
+    })
     return next
   })
 
@@ -661,7 +691,7 @@ export function UsersView({
       {activeFilters.length > 0 && <div className="active-filter-bar" aria-label="Active user filters"><span>{activeFilters.length} active</span>{activeFilters.map((filter) => <button type="button" key={filter.key} onClick={() => clearFilter(filter.key)}>{filter.label}<Icon name="x" /></button>)}<button className="text-button" type="button" onClick={clearFilters}>Clear all</button></div>}
       {directoryError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{directoryError}</span><button className="button secondary" type="button" onClick={() => void loadDirectory()}>Retry directory</button></div>}
       <div className="users-selection-row">
-        <label className="check-field"><input type="checkbox" checked={eligibleRows.length > 0 && selectedUsers.length === eligibleRows.length} disabled={!canDeleteProfile || activeDeletionJob || !eligibleRows.length} onChange={(event) => setSelectedUserKeys(event.target.checked ? new Set(eligibleRows.map((user) => user.user_key)) : new Set())} /><span><strong>Select eligible loaded users</strong><small>{selectedUsers.length} selected of {eligibleRows.length} eligible</small></span></label>
+        <label className="check-field"><input ref={selectEligibleRowsRef} type="checkbox" checked={allVisibleEligibleSelected} disabled={!canDeleteProfile || activeDeletionJob || !eligibleRows.length} onChange={(event) => toggleEligibleRows(event.target.checked)} /><span><strong>Select eligible users in this view</strong><small>{selectionSummary}</small></span></label>
         <span>Administrators, read-only rows, and active operations are always excluded.</span>
       </div>
       <div ref={userTableRef} className={`user-directory-table ${rows.length >= 200 ? 'is-virtualized' : ''}`} aria-busy={loadingDirectory} aria-label="Selected terminal users">
@@ -671,7 +701,7 @@ export function UsersView({
         {rows.length >= 200 && <div className="virtual-user-rows" style={{ height: userVirtualizer.getTotalSize() }}>{userVirtualizer.getVirtualItems().map((item) => renderUserRow(rows[item.index], { position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }, item.index))}</div>}
         {!loadingDirectory && !rows.length && !directoryError && <div className="empty-state"><Icon name="users" /><h3>No users match this directory view.</h3><p>{activeFilters.length ? 'Clear filters or search another identity.' : 'The selected terminal has no ADD-managed users.'}</p>{activeFilters.length > 0 && <button className="button secondary" type="button" onClick={clearFilters}>Clear filters</button>}</div>}
       </div>
-      {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadDirectory(nextCursor, true)}>{loadingMore ? 'Loading more users…' : 'Load more terminal users'}</button><small>{rows.length.toLocaleString()} users loaded · selection applies only to loaded rows</small></div>}
+      {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadDirectory(nextCursor, true)}>{loadingMore ? 'Loading more users…' : 'Load more terminal users'}</button><small>{rows.length.toLocaleString()} users loaded · selection persists across searches and loaded pages</small></div>}
     </section>
   )
 
