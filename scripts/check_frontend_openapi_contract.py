@@ -26,6 +26,13 @@ def main() -> None:
     assert {"reason", "typed_confirmation"}.issubset(
         request_properties(spec, "/api/v2/devices/{connector_id}/users/{user_key}", "patch")
     )
+    assert {"user_keys"}.issubset(
+        request_properties(
+            spec,
+            "/api/v2/devices/{connector_id}/users/validate-selection",
+            "post",
+        )
+    )
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 

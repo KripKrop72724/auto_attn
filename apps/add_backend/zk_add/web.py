@@ -101,6 +101,7 @@ from zk_add.schemas import (
     TerminalSerialConfirmRequest,
     UserCreateRequest,
     UserDeleteRequest,
+    UserSelectionValidationRequest,
     UserSnapshotRequest,
     UserUpdateRequest,
 )
@@ -1521,6 +1522,41 @@ def list_device_users_v2(
         "next_cursor": next_cursor,
         "device": serialize_connector(connector),
         "identity_integrity": integrity,
+    }
+
+
+@app.post("/api/v2/devices/{connector_id}/users/validate-selection")
+def validate_device_user_selection_v2(
+    connector_id: str,
+    body: UserSelectionValidationRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Return current authoritative rows for an exact, bounded selection."""
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None:
+        return {"rows": [], "missing_user_keys": body.user_keys}
+    rows = list(
+        db.scalars(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.user_key.in_(body.user_keys),
+                DeviceUser.present.is_(True),
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+        ).all()
+    )
+    rows_by_key = {row.user_key: row for row in rows}
+    return {
+        "rows": [
+            serialize_user(rows_by_key[user_key], zkt=zkt)
+            for user_key in body.user_keys
+            if user_key in rows_by_key
+        ],
+        "missing_user_keys": [
+            user_key for user_key in body.user_keys if user_key not in rows_by_key
+        ],
     }
 
 

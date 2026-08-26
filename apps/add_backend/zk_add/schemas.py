@@ -516,6 +516,22 @@ class BulkUserDeleteTarget(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class UserSelectionValidationRequest(BaseModel):
+    user_keys: list[str] = Field(min_length=1, max_length=500)
+
+    @field_validator("user_keys")
+    @classmethod
+    def validate_user_keys(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value or len(value) > 36 for value in normalized):
+            raise ValueError(
+                "Each terminal user key must contain between 1 and 36 characters"
+            )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Each terminal user may be selected only once")
+        return normalized
+
+
 class BulkUserDeleteRequest(BaseModel):
     targets: list[BulkUserDeleteTarget] = Field(min_length=1, max_length=500)
     reason: str = Field(min_length=10, max_length=500)

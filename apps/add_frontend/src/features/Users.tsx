@@ -490,11 +490,13 @@ export function HistoricalIdentityResolutionDialog({
 export function BulkDeletionDialog({
   users,
   device,
+  onRevalidate,
   onClose,
   onCreated,
 }: {
   users: DeviceUser[]
   device: Device
+  onRevalidate: () => Promise<{ users: DeviceUser[]; changed: boolean }>
   onClose: () => void
   onCreated: (job: UserDeletionJob) => void
 }) {
@@ -514,12 +516,19 @@ export function BulkDeletionDialog({
     if (!password) return setError('Password confirmation is required.')
     setBusy(true)
     try {
+      const validation = await onRevalidate()
+      if (validation.changed) {
+        setError(validation.users.length
+          ? 'The selected users changed while this confirmation was open. Review the refreshed selection and type the updated confirmation before retrying.'
+          : 'None of the selected users remain eligible for deletion. Nothing was deleted.')
+        return
+      }
       const response = await api<{ job: UserDeletionJob }>(
         `/api/v2/devices/${device.connector_id}/user-deletion-jobs`,
         {
           method: 'POST',
           body: JSON.stringify({
-            targets: users.map((user) => ({
+            targets: validation.users.map((user) => ({
               user_key: user.user_key,
               expected_version: user.row_version,
             })),
@@ -1057,6 +1066,25 @@ export function UsersView({
         <BulkDeletionDialog
           users={selectedUsers}
           device={selected}
+          onRevalidate={async () => {
+            const response = await api<{ rows: DeviceUser[] }>(
+              `/api/v2/devices/${selected.connector_id}/users/validate-selection`,
+              {
+                method: 'POST',
+                body: JSON.stringify({ user_keys: selectedUsers.map((user) => user.user_key) }),
+              },
+            )
+            const freshByKey = new Map(response.rows.map((user) => [user.user_key, user]))
+            const validated = selectedUsers
+              .map((user) => freshByKey.get(user.user_key))
+              .filter((user): user is DeviceUser => Boolean(
+                user && user.privilege !== 14 && !user.read_only && !user.current_command_state,
+              ))
+            const changed = validated.length !== selectedUsers.length
+              || selectedUsers.some((user, index) => validated[index]?.row_version !== user.row_version)
+            setSelectedUserKeys(new Set(validated.map((user) => user.user_key)))
+            return { users: validated, changed }
+          }}
           onClose={() => setBulkDialogOpen(false)}
           onCreated={(job) => {
             setDeletionJob(job)
