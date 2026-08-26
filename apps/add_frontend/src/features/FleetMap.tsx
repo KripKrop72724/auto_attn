@@ -116,7 +116,7 @@ export function FleetMap({ devices, loading, onInspect, onManageUsers, formatRel
             const selectedMarker = selectedId === group.definition.id
             return <button
               key={group.definition.id}
-              className={`fleet-map-marker location-${group.definition.id} pattern-${group.pattern} ${selectedMarker ? 'selected' : ''}`}
+              className={`fleet-map-marker location-${group.definition.id} label-${group.definition.labelSide} pattern-${group.pattern} ${selectedMarker ? 'selected' : ''}`}
               style={markerStyle(group)}
               onClick={() => setSelectedId(group.definition.id)}
               aria-label={`${group.definition.city}, ${group.total} device${group.total === 1 ? '' : 's'}, ${patternLabel[group.pattern]}`}

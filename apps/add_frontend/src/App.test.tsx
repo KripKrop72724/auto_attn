@@ -764,6 +764,15 @@ describe('State Life ADD interface', () => {
     rerender(<StatusBadge state="WAITING_FOR_ZKT" />)
     expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
     expect(screen.getByText('WAITING FOR ZKT')).toBeTruthy()
+    const badge = screen.getByLabelText('Status: WAITING FOR ZKT')
+    expect(badge.getAttribute('title')).toBe('WAITING FOR ZKT')
+  })
+
+  it('keeps the full accessible status when a long pill label must be visually truncated', () => {
+    render(<StatusBadge state="SOURCE_RECOVERY_EPOCH_ACTIVATED" />)
+    const badge = screen.getByLabelText('Status: SOURCE RECOVERY EPOCH ACTIVATED')
+    expect(badge.getAttribute('title')).toBe('SOURCE RECOVERY EPOCH ACTIVATED')
+    expect(badge.textContent).toContain('SOURCE RECOVERY EPOCH ACTIVATED')
   })
 
   it('renders an unknown status instead of crashing on a partial API response', () => {

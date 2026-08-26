@@ -24,7 +24,7 @@
   width: 24px;
   color: var(--brand-700);
 }
-.firmware-channel-strip article > span {
+.firmware-channel-strip article > span:not(.status-badge) {
   min-width: 0;
   display: grid;
   gap: 4px;
@@ -226,7 +226,7 @@
   background: #f8fbfc;
   box-shadow: inset 3px 0 var(--brand-600);
 }
-.firmware-active-rollouts > button > span {
+.firmware-active-rollouts > button > span:not(.status-badge) {
   min-width: 0;
   display: grid;
   gap: 4px;
@@ -707,7 +707,7 @@
   width: 20px;
   color: var(--brand-700);
 }
-.firmware-wizard-context > span {
+.firmware-wizard-context > span:not(.status-badge) {
   display: grid;
   gap: 4px;
 }
@@ -728,7 +728,7 @@
   padding: 10px 13px;
   background: var(--firmware-soft);
 }
-.firmware-scope-result > header > span {
+.firmware-scope-result > header > span:not(.status-badge) {
   display: grid;
   gap: 3px;
   color: var(--muted);
@@ -879,7 +879,7 @@
 .firmware-deployment > summary::-webkit-details-marker {
   display: none;
 }
-.firmware-deployment > summary > span {
+.firmware-deployment > summary > span:not(.status-badge) {
   min-width: 0;
   display: grid;
   gap: 4px;
@@ -980,7 +980,7 @@
   width: 23px;
   color: var(--brand-700);
 }
-.firmware-provisioning-readiness article > span {
+.firmware-provisioning-readiness article > span:not(.status-badge) {
   min-width: 0;
   display: grid;
   gap: 4px;
@@ -1042,7 +1042,7 @@
   width: 21px;
   color: var(--brand-700);
 }
-.firmware-companion-picker article > button > span {
+.firmware-companion-picker article > button > span:not(.status-badge) {
   min-width: 0;
   display: grid;
   gap: 4px;

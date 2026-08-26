@@ -139,6 +139,135 @@ describe('Selected-terminal users workspace', () => {
     expect((screen.getByLabelText(/Exact CNIC search/i) as HTMLInputElement).value).toBe('')
   })
 
+  it('preserves terminal-scoped multi-selection across searches and only toggles the current view', async () => {
+    const ayesha = user()
+    const bilal = user({ id: 2, user_key: 'user-two', uid: '8', user_id: '1008', display_name: 'Bilal Ahmed' })
+    const baseFetch = workspaceFetch({ rows: [ayesha, bilal] })
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.pathname === '/api/v2/devices/connector-one/users') {
+        const visibleRows = url.searchParams.get('q') === 'Bilal' ? [bilal] : [ayesha, bilal]
+        return Promise.resolve(response({
+          rows: visibleRows,
+          next_cursor: null,
+          device,
+          identity_integrity: {
+            source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 2, with_cnic: 2, missing_cnic: 0,
+            duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0,
+            unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0,
+          },
+        }))
+      }
+      return baseFetch(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsersHarness />)
+
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    fireEvent.click(screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i))
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText(/Search user name, user ID, or UID/i), { target: { value: 'Bilal' } })
+    await waitFor(() => expect(screen.queryByRole('article', { name: /Ayesha Khan/i })).toBeNull())
+    expect(screen.getByRole('article', { name: /Bilal Ahmed/i })).toBeTruthy()
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+    expect(screen.getByText(/0 selected of 1 eligible in view · 1 total/i)).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText(/Select Bilal Ahmed for bulk deletion/i))
+    expect(screen.getByText('2 users selected')).toBeTruthy()
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select eligible users in this view/i }))
+    expect(screen.getByText('1 user selected')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText(/Search user name, user ID, or UID/i), { target: { value: '' } })
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect((screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByLabelText(/Select Bilal Ahmed for bulk deletion/i) as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('revalidates the exact selection before opening and again before submitting', async () => {
+    const ayesha = user()
+    const bilal = user({ id: 2, user_key: 'user-two', uid: '8', user_id: '1008', display_name: 'Bilal Ahmed' })
+    const baseFetch = workspaceFetch({ rows: [ayesha, bilal] })
+    let validationCalls = 0
+    let creationCalls = 0
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.pathname.endsWith('/users/validate-selection')) {
+        validationCalls += 1
+        return Promise.resolve(response({
+          rows: validationCalls === 1 ? [ayesha, bilal] : [bilal],
+          missing_user_keys: validationCalls === 1 ? [] : [ayesha.user_key],
+        }))
+      }
+      if (url.pathname.endsWith('/user-deletion-jobs') && init?.method === 'POST') {
+        creationCalls += 1
+      }
+      return baseFetch(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsersHarness rows={[ayesha, bilal]} />)
+
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    fireEvent.click(screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i))
+    fireEvent.click(screen.getByLabelText(/Select Bilal Ahmed for bulk deletion/i))
+    fireEvent.click(screen.getByRole('button', { name: /Delete selected/i }))
+
+    expect(await screen.findByRole('heading', { name: /Delete 2 terminal users/i })).toBeTruthy()
+    expect(validationCalls).toBe(1)
+    fireEvent.change(screen.getByLabelText(/Audit reason/i), { target: { value: 'Remove obsolete terminal identities' } })
+    fireEvent.change(screen.getByLabelText(/Type “DELETE 2 USERS FROM 1”/i), { target: { value: 'DELETE 2 USERS FROM 1' } })
+    fireEvent.change(screen.getByLabelText(/Confirm administrator password/i), { target: { value: 'correct-password' } })
+    fireEvent.click(screen.getByRole('button', { name: /Delete 2 users safely/i }))
+
+    expect(await screen.findByText(/selected users changed while this confirmation was open/i)).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Delete 1 terminal users/i })).toBeTruthy()
+    expect(within(screen.getByRole('dialog')).queryByText(/Ayesha Khan/)).toBeNull()
+    expect(within(screen.getByRole('dialog')).getByText(/Bilal Ahmed/)).toBeTruthy()
+    expect(validationCalls).toBe(2)
+    expect(creationCalls).toBe(0)
+  })
+
+  it('submits the refreshed row version after selection validation', async () => {
+    const ayesha = user()
+    const refreshed = user({ row_version: 4, display_name: 'Ayesha Khan Updated' })
+    const baseFetch = workspaceFetch({ rows: [ayesha] })
+    const creationBodies: Array<{ targets?: Array<{ user_key: string; expected_version: number }> }> = []
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.pathname.endsWith('/users/validate-selection')) {
+        return Promise.resolve(response({ rows: [refreshed], missing_user_keys: [] }))
+      }
+      if (url.pathname.endsWith('/user-deletion-jobs') && init?.method === 'POST') {
+        creationBodies.push(JSON.parse(String(init.body)))
+        return Promise.resolve(response({
+          job: {
+            job_id: 'job-one', connector_id: device.connector_id, status: 'SUCCEEDED',
+            reason: 'Remove obsolete terminal identity',
+            counts: { requested: 1, succeeded: 1, failed: 0, canceled: 0, expired: 0, pending: 0 },
+            created_at: '2026-08-12T10:00:00Z', expires_at: '2026-08-13T10:00:00Z',
+            started_at: '2026-08-12T10:00:01Z', completed_at: '2026-08-12T10:00:02Z', items: [],
+          },
+        }, 202))
+      }
+      return baseFetch(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsersHarness rows={[ayesha]} />)
+
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    fireEvent.click(screen.getByLabelText(/Select Ayesha Khan for bulk deletion/i))
+    fireEvent.click(screen.getByRole('button', { name: /Delete selected/i }))
+    expect(await screen.findByText(/Ayesha Khan Updated/)).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText(/Audit reason/i), { target: { value: 'Remove obsolete terminal identity' } })
+    fireEvent.change(screen.getByLabelText(/Type “DELETE 1 USERS FROM 1”/i), { target: { value: 'DELETE 1 USERS FROM 1' } })
+    fireEvent.change(screen.getByLabelText(/Confirm administrator password/i), { target: { value: 'correct-password' } })
+    fireEvent.click(screen.getByRole('button', { name: /Delete 1 users safely/i }))
+
+    await waitFor(() => expect(creationBodies).toHaveLength(1))
+    expect(creationBodies[0]?.targets).toEqual([{ user_key: ayesha.user_key, expected_version: 4 }])
+  })
+
   it('uses one bounded virtualized directory from the first full page through pagination', async () => {
     const firstPage = Array.from({ length: 200 }, (_, index) => user({
       id: index + 1,

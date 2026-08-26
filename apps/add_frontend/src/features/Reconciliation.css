@@ -806,7 +806,7 @@
 }
 .reconciliation-event-summary:hover { background: var(--surface-muted); }
 .reconciliation-event-summary > span { min-width: 0; display: grid; align-content: start; justify-items: start; gap: 6px; }
-.reconciliation-event-summary .status-badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.reconciliation-event-summary .status-badge { width: 100%; max-width: 100%; }
 .reconciliation-event-summary > span:nth-child(2) strong,
 .reconciliation-event-summary > span:nth-child(2) small { max-width: 100%; overflow-wrap: anywhere; }
 .reconciliation-event-summary > span:nth-child(2) small { color: var(--muted); font-size: 10px; }

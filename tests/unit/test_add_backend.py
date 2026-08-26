@@ -4871,6 +4871,84 @@ def test_real_terminal_user_change_invalidates_selected_version(db: Session):
         )
 
 
+def test_exact_user_selection_validation_returns_current_rows_and_fails_closed(
+    db: Session,
+):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    replace_user_snapshot(
+        db,
+        connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="selection-validation",
+            complete=True,
+            observed_at=utc_now(),
+            users=[
+                UserSnapshotRow(uid="7", user_id="1007", name=f"Ayesha-{CNIC}"),
+                UserSnapshotRow(
+                    uid="8",
+                    user_id="1008",
+                    name=f"Permanent Admin-{CNIC}",
+                    privilege=14,
+                ),
+            ],
+        ),
+    )
+    db.flush()
+    users = {
+        row.user_id: row
+        for row in db.scalars(
+            select(DeviceUser).where(
+                DeviceUser.zkt_device_id == connector.zkt_device.id,
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+        ).all()
+    }
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    path = f"/api/v2/devices/{connector.connector_id}/users/validate-selection"
+    body = {
+        "user_keys": [
+            users["1008"].user_key,
+            "missing-user",
+            users["1007"].user_key,
+        ]
+    }
+
+    assert client.post(path, json=body).status_code == 403
+    validated = client.post(
+        path,
+        json=body,
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert validated.status_code == 200
+    assert [row["user_key"] for row in validated.json()["rows"]] == [
+        users["1008"].user_key,
+        users["1007"].user_key,
+    ]
+    assert validated.json()["rows"][0]["privilege"] == 14
+    assert validated.json()["missing_user_keys"] == ["missing-user"]
+
+    duplicate = client.post(
+        path,
+        json={"user_keys": [users["1007"].user_key, users["1007"].user_key]},
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert duplicate.status_code == 422
+
+
 def test_no_registration_routes_remain():
     paths = {route.path for route in app.routes}
     assert "/api/v1/connectors" not in paths

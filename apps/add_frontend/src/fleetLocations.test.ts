@@ -27,6 +27,9 @@ describe('fleet location resolution', () => {
     ['ZONE-PESHAWAR-02', 'Peshawar'],
     ['ZONE-PESH-01', 'Peshawar'],
     ['ZONE-SWAT-01', 'Swat'],
+    ['ZONE-FAISALABAD-01', 'Faisalabad'],
+    ['ZONE-FSD-02', 'Faisalabad'],
+    ['ZONE-QUETTA-01', 'Quetta'],
     ['ZONE-MULTAN-01', 'Multan'],
     ['Multan Regional Office', 'Multan'],
     ['ZONE-SLICTOWER-13FL', 'Islamabad'],
@@ -46,6 +49,8 @@ describe('fleet location resolution', () => {
       swat: { mapX: 69.21, mapY: 20.98 },
       peshawar: { mapX: 64.50, mapY: 25.91 },
       islamabad: { mapX: 73.09, mapY: 28.07 },
+      faisalabad: { mapX: 73.58, mapY: 42.65 },
+      quetta: { mapX: 38.85, mapY: 50.95 },
       multan: { mapX: 64.50, mapY: 51.09 },
       karachi: { mapX: 39.00, mapY: 85.67 },
     }
@@ -65,14 +70,21 @@ describe('fleet location aggregation', () => {
       device({ connector_id: 'peshawar', zone_id: 'ZONE-PESHAWAR-02', zone_name: 'Peshawar', display_name: 'Peshawar', state: 'OFFLINE' }),
       device({ connector_id: 'multan-one', zone_id: 'ZONE-MULTAN-01', zone_name: 'Multan', display_name: 'ZONE-MULTAN-01', state: 'ONLINE' }),
       device({ connector_id: 'multan-two', zone_id: 'ZONE-MULTAN-02', zone_name: 'Multan', display_name: 'ZONE-MULTAN-02', state: 'ONLINE' }),
+      device({ connector_id: 'faisalabad-one', zone_id: 'ZONE-FAISALABAD-01', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-01', state: 'ONLINE' }),
+      device({ connector_id: 'faisalabad-two', zone_id: 'ZONE-FAISALABAD-02', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-02', state: 'ONLINE' }),
+      device({ connector_id: 'quetta', zone_id: 'ZONE-QUETTA-01', zone_name: 'Quetta', display_name: 'ZONE-QUETTA-01', state: 'ONLINE' }),
     ])
     const islamabad = result.groups.find((group) => group.definition.id === 'islamabad')
     const peshawar = result.groups.find((group) => group.definition.id === 'peshawar')
     const multan = result.groups.find((group) => group.definition.id === 'multan')
+    const faisalabad = result.groups.find((group) => group.definition.id === 'faisalabad')
+    const quetta = result.groups.find((group) => group.definition.id === 'quetta')
     expect(islamabad).toMatchObject({ total: 2, online: 1, attention: 1, pattern: 'waiting' })
     expect(islamabad?.lastSeenAt).toBe('2026-08-10T10:00:00Z')
     expect(peshawar).toMatchObject({ total: 1, online: 0, attention: 1, pattern: 'blocked' })
     expect(multan).toMatchObject({ total: 2, online: 2, attention: 0, pattern: 'confirmed' })
+    expect(faisalabad).toMatchObject({ total: 2, online: 2, attention: 0, pattern: 'confirmed' })
+    expect(quetta).toMatchObject({ total: 1, online: 1, attention: 0, pattern: 'confirmed' })
   })
 
   it('preserves unknown and nullable device data without inventing a pin', () => {

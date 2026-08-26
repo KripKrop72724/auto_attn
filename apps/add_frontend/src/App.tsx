@@ -180,6 +180,7 @@ export function StatusBadge({
   live?: boolean
 }) {
   const status = normalizedStatus(state)
+  const label = status.replaceAll('_', ' ')
   const pattern = statusPattern(status)
   const icon =
     pattern === 'confirmed'
@@ -190,9 +191,9 @@ export function StatusBadge({
           ? 'pause'
           : 'info'
   return (
-    <span className={`status-badge pattern-${pattern}`} data-pattern={pattern}>
+    <span className={`status-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Status: ${label}`} title={label}>
       <Icon name={icon} />
-      <span>{status.replaceAll('_', ' ')}</span>
+      <span>{label}</span>
       {live && <i aria-hidden="true" />}
     </span>
   )

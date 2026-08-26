@@ -35,6 +35,24 @@ describe('FleetMap', () => {
       zone_name: 'Multan',
       display_name: 'ZONE-MULTAN-01',
     })
+    const faisalabadOne = makeDevice({
+      connector_id: 'faisalabad-one',
+      zone_id: 'ZONE-FAISALABAD-01',
+      zone_name: 'Faisalabad',
+      display_name: 'ZONE-FAISALABAD-01',
+    })
+    const faisalabadTwo = makeDevice({
+      connector_id: 'faisalabad-two',
+      zone_id: 'ZONE-FAISALABAD-02',
+      zone_name: 'Faisalabad',
+      display_name: 'ZONE-FAISALABAD-02',
+    })
+    const quetta = makeDevice({
+      connector_id: 'quetta-one',
+      zone_id: 'ZONE-QUETTA-01',
+      zone_name: 'Quetta',
+      display_name: 'ZONE-QUETTA-01',
+    })
     const unknown = makeDevice({
       connector_id: 'unknown-location',
       zone_id: 'ZONE-UNKNOWN-01',
@@ -45,7 +63,7 @@ describe('FleetMap', () => {
     })
     render(
       <FleetMap
-        devices={[tower, multan, unknown]}
+        devices={[tower, multan, faisalabadOne, faisalabadTwo, quetta, unknown]}
         loading={false}
         onInspect={inspect}
         onManageUsers={manageUsers}
@@ -53,10 +71,14 @@ describe('FleetMap', () => {
       />,
     )
 
-    expect(screen.getByRole('heading', { name: '2 operating locations' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '4 operating locations' })).toBeTruthy()
     expect(screen.getByText('Location not mapped')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Open Islamabad location, 1 device' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Open Multan location, 1 device' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open Faisalabad location, 2 devices' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open Quetta location, 1 device' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Faisalabad, 2 devices/i }).classList.contains('label-left')).toBe(true)
+    expect(screen.getByRole('button', { name: /Quetta, 1 device/i }).classList.contains('label-right')).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i }))
     expect(screen.getByRole('heading', { name: 'Islamabad' })).toBeTruthy()
 

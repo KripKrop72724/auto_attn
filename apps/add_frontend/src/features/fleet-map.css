@@ -201,8 +201,7 @@
 
 .fleet-map-marker:hover .fleet-map-marker-label,
 .fleet-map-marker:focus-visible .fleet-map-marker-label { opacity: 1; visibility: visible; }
-.fleet-map-marker.location-peshawar .fleet-map-marker-label,
-.fleet-map-marker.location-islamabad .fleet-map-marker-label { right: calc(100% + 7px); left: auto; text-align: right; }
+.fleet-map-marker.label-left .fleet-map-marker-label { right: calc(100% + 7px); left: auto; text-align: right; }
 .fleet-map-marker-label strong { color: #132f3e; font-size: 11px; }
 .fleet-map-marker-label small { color: #526875; font-size: 9px; white-space: nowrap; }
 

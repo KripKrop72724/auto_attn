@@ -27,6 +27,10 @@ type UsersDirectoryResponse = {
   device?: Device
   identity_integrity?: IdentityIntegrity
 }
+type UserSelectionValidationResponse = {
+  rows: DeviceUser[]
+  missing_user_keys: string[]
+}
 type DiagnosticKey = 'device' | 'identity' | 'history' | 'deletion'
 
 const userSections: Array<{ id: UsersSection; label: string; icon: 'users' | 'alert' | 'shield' }> = [
@@ -34,6 +38,9 @@ const userSections: Array<{ id: UsersSection; label: string; icon: 'users' | 'al
   { id: 'identity', label: 'Identity Review', icon: 'alert' },
   { id: 'history', label: 'Historical Backlog', icon: 'shield' },
 ]
+
+const isBulkSelectionEligible = (user: DeviceUser) =>
+  user.privilege !== 14 && !user.read_only && !user.current_command_state
 
 const requestError = (reason: unknown, fallback: string) =>
   reason instanceof Error ? reason.message : fallback
@@ -336,6 +343,7 @@ export function UsersView({
   const [resolutionDialog, setResolutionDialog] = useState<IdentityResolutionDialogState>(null)
   const [historicalDialog, setHistoricalDialog] = useState<HistoricalIdentityDialogState>(null)
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
+  const [validatingSelection, setValidatingSelection] = useState(false)
   const [revokeLeaseOpen, setRevokeLeaseOpen] = useState(false)
   const [serialConfirmationOpen, setSerialConfirmationOpen] = useState(false)
   const [command, setCommand] = useState<Command | null>(null)
@@ -343,6 +351,10 @@ export function UsersView({
   const [, setLeaseClock] = useState(0)
   const directoryRequest = useRef<AbortController | null>(null)
   const diagnosticsRequest = useRef<AbortController | null>(null)
+  const knownUsers = useRef<Map<string, DeviceUser>>(new Map())
+  const activeTerminalId = useRef(selectedDeviceId)
+  activeTerminalId.current = selectedDeviceId
+  const selectEligibleRowsRef = useRef<HTMLInputElement>(null)
   const revisionRef = useRef(revision)
   const tabsRef = useRef<HTMLDivElement>(null)
   const userTableRef = useRef<HTMLDivElement>(null)
@@ -378,14 +390,16 @@ export function UsersView({
         limit: 200,
       })}`, { signal: controller.signal })
       if (controller.signal.aborted || directoryRequest.current !== controller) return
-      if (append) setRows((current) => [...current, ...response.rows.filter((row) => !current.some((item) => item.user_key === row.user_key))])
-      else {
-        setRows(response.rows)
-        setSelectedUserKeys((current) => {
-          const available = new Set(response.rows.map((row) => row.user_key))
-          return new Set([...current].filter((key) => available.has(key)))
+      response.rows.forEach((row) => knownUsers.current.set(row.user_key, row))
+      setSelectedUserKeys((current) => {
+        const next = new Set(current)
+        response.rows.forEach((row) => {
+          if (!isBulkSelectionEligible(row)) next.delete(row.user_key)
         })
-      }
+        return next.size === current.size && [...next].every((key) => current.has(key)) ? current : next
+      })
+      if (append) setRows((current) => [...current, ...response.rows.filter((row) => !current.some((item) => item.user_key === row.user_key))])
+      else setRows(response.rows)
       setNextCursor(response.next_cursor ?? null)
       if (response.identity_integrity) setIntegrity(response.identity_integrity)
       if (response.device) setDeviceDetail((current) => current?.active_lease ? current : response.device || null)
@@ -443,11 +457,13 @@ export function UsersView({
     setRole('ALL')
     setDirectoryError('')
     setDiagnosticErrors({})
+    knownUsers.current.clear()
     setSelectedUserKeys(new Set())
     setDialog(null)
     setResolutionDialog(null)
     setHistoricalDialog(null)
     setBulkDialogOpen(false)
+    setValidatingSelection(false)
     setRevokeLeaseOpen(false)
     setSerialConfirmationOpen(false)
     setCommand(null)
@@ -581,8 +597,83 @@ export function UsersView({
   const editCapabilityReason = !baseWritable ? actionReason : capabilities.user_write !== true ? 'This terminal does not advertise the certified user-write capability.' : ''
   const leaseCapabilityReason = !baseWritable ? actionReason : capabilities.admin_lease !== true ? 'This terminal does not advertise certified temporary enrollment access.' : ''
   const deleteCapabilityReason = !baseWritable ? actionReason : capabilities.delete_user !== true ? 'This terminal does not advertise the certified delete-user capability.' : ''
-  const eligibleRows = rows.filter((user) => user.privilege !== 14 && !user.read_only && !user.current_command_state)
-  const selectedUsers = eligibleRows.filter((user) => selectedUserKeys.has(user.user_key))
+  const eligibleRows = rows.filter(isBulkSelectionEligible)
+  const selectedVisibleUsers = eligibleRows.filter((user) => selectedUserKeys.has(user.user_key))
+  const selectedUsers = [...selectedUserKeys]
+    .map((key) => knownUsers.current.get(key))
+    .filter((user): user is DeviceUser => Boolean(user && isBulkSelectionEligible(user)))
+  const revalidateSelection = useCallback(async (users: DeviceUser[]) => {
+    const connectorId = selectedDeviceId
+    if (!connectorId || !users.length) return { users: [] as DeviceUser[], changed: users.length > 0 }
+    const requestedKeys = users.map((user) => user.user_key)
+    const response = await api<UserSelectionValidationResponse>(
+      `/api/v2/devices/${connectorId}/users/validate-selection`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ user_keys: requestedKeys }),
+      },
+    )
+    if (activeTerminalId.current !== connectorId) {
+      throw new Error('The selected terminal changed while users were being validated.')
+    }
+    const freshByKey = new Map(response.rows.map((user) => [user.user_key, user]))
+    const eligibleUsers = requestedKeys
+      .map((key) => freshByKey.get(key))
+      .filter((user): user is DeviceUser => Boolean(user && isBulkSelectionEligible(user)))
+    const eligibleKeys = new Set(eligibleUsers.map((user) => user.user_key))
+    const changed = users.length !== eligibleUsers.length || users.some((user) => {
+      const fresh = freshByKey.get(user.user_key)
+      return !fresh
+        || !eligibleKeys.has(user.user_key)
+        || fresh.row_version !== user.row_version
+        || fresh.display_name !== user.display_name
+        || fresh.user_id !== user.user_id
+        || fresh.privilege !== user.privilege
+        || fresh.read_only !== user.read_only
+        || fresh.current_command_state !== user.current_command_state
+    })
+    response.rows.forEach((user) => knownUsers.current.set(user.user_key, user))
+    setSelectedUserKeys((current) => {
+      const next = new Set(current)
+      requestedKeys.forEach((key) => next.delete(key))
+      eligibleUsers.forEach((user) => next.add(user.user_key))
+      return next
+    })
+    return { users: eligibleUsers, changed }
+  }, [selectedDeviceId])
+  const openBulkDeletionDialog = async () => {
+    if (validatingSelection || !selectedUsers.length) return
+    setValidatingSelection(true)
+    try {
+      const validation = await revalidateSelection(selectedUsers)
+      if (!validation.users.length) {
+        toast.error('None of the selected users remain eligible for deletion. The stale selection was cleared.')
+        return
+      }
+      if (validation.changed) {
+        const removed = selectedUsers.length - validation.users.length
+        toast.notice(removed > 0
+          ? `${removed} selected user${removed === 1 ? '' : 's'} no longer eligible and was removed. Review the refreshed selection.`
+          : 'Selected users changed on the terminal. Review the refreshed details before continuing.')
+      }
+      setBulkDialogOpen(true)
+    } catch (reason) {
+      toast.error(requestError(reason, 'Selected users could not be validated. Nothing was deleted.'))
+    } finally {
+      setValidatingSelection(false)
+    }
+  }
+  const allVisibleEligibleSelected = eligibleRows.length > 0
+    && eligibleRows.every((user) => selectedUserKeys.has(user.user_key))
+  const selectionSummary = selectedUsers.length === selectedVisibleUsers.length
+    ? `${selectedVisibleUsers.length} selected of ${eligibleRows.length} eligible`
+    : `${selectedVisibleUsers.length} selected of ${eligibleRows.length} eligible in view · ${selectedUsers.length} total`
+  useEffect(() => {
+    if (selectEligibleRowsRef.current) {
+      selectEligibleRowsRef.current.indeterminate = selectedVisibleUsers.length > 0
+        && selectedVisibleUsers.length < eligibleRows.length
+    }
+  }, [eligibleRows.length, selectedVisibleUsers.length])
   const identityComplete = integrity?.with_cnic ?? rows.filter((row) => row.identity_complete).length
   const identityTotal = integrity?.total_users ?? selected?.zkt?.user_count ?? rows.length
   const completeness = identityTotal ? Math.round(identityComplete * 100 / identityTotal) : 0
@@ -606,6 +697,14 @@ export function UsersView({
   const toggleUser = (userKey: string, checked: boolean) => setSelectedUserKeys((current) => {
     const next = new Set(current)
     if (checked) next.add(userKey); else next.delete(userKey)
+    return next
+  })
+  const toggleEligibleRows = (checked: boolean) => setSelectedUserKeys((current) => {
+    const next = new Set(current)
+    eligibleRows.forEach((user) => {
+      if (checked) next.add(user.user_key)
+      else next.delete(user.user_key)
+    })
     return next
   })
 
@@ -637,7 +736,7 @@ export function UsersView({
     return (
       <article ref={virtualIndex == null ? undefined : userVirtualizer.measureElement} data-index={virtualIndex} style={style} key={user.user_key} className={`user-directory-row ${user.identity_conflict_resolved ? 'identity-resolved' : user.identity_conflict_code ? 'identity-conflict' : user.identity_complete ? '' : 'identity-missing'}`} aria-label={`${user.display_name}, user ${user.user_id}`}>
         <div className="user-directory-cell user-person" data-label="Identity">
-          <label className="user-select-hit"><input className="user-select" type="checkbox" aria-label={`Select ${user.display_name} for bulk deletion`} checked={selectedUserKeys.has(user.user_key)} disabled={!rowCanDelete} onChange={(event) => toggleUser(user.user_key, event.target.checked)} /><span className="sr-only">Select user</span></label>
+          <label className="user-select-hit"><input className="user-select" type="checkbox" aria-label={`Select ${user.display_name} for bulk deletion`} checked={selectedUserKeys.has(user.user_key)} disabled={!rowCanDelete || validatingSelection} onChange={(event) => toggleUser(user.user_key, event.target.checked)} /><span className="sr-only">Select user</span></label>
           <span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span>
           <span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span>
         </div>
@@ -661,7 +760,7 @@ export function UsersView({
       {activeFilters.length > 0 && <div className="active-filter-bar" aria-label="Active user filters"><span>{activeFilters.length} active</span>{activeFilters.map((filter) => <button type="button" key={filter.key} onClick={() => clearFilter(filter.key)}>{filter.label}<Icon name="x" /></button>)}<button className="text-button" type="button" onClick={clearFilters}>Clear all</button></div>}
       {directoryError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{directoryError}</span><button className="button secondary" type="button" onClick={() => void loadDirectory()}>Retry directory</button></div>}
       <div className="users-selection-row">
-        <label className="check-field"><input type="checkbox" checked={eligibleRows.length > 0 && selectedUsers.length === eligibleRows.length} disabled={!canDeleteProfile || activeDeletionJob || !eligibleRows.length} onChange={(event) => setSelectedUserKeys(event.target.checked ? new Set(eligibleRows.map((user) => user.user_key)) : new Set())} /><span><strong>Select eligible loaded users</strong><small>{selectedUsers.length} selected of {eligibleRows.length} eligible</small></span></label>
+        <label className="check-field"><input ref={selectEligibleRowsRef} type="checkbox" checked={allVisibleEligibleSelected} disabled={!canDeleteProfile || activeDeletionJob || validatingSelection || !eligibleRows.length} onChange={(event) => toggleEligibleRows(event.target.checked)} /><span><strong>Select eligible users in this view</strong><small>{selectionSummary}</small></span></label>
         <span>Administrators, read-only rows, and active operations are always excluded.</span>
       </div>
       <div ref={userTableRef} className={`user-directory-table ${rows.length >= 200 ? 'is-virtualized' : ''}`} aria-busy={loadingDirectory} aria-label="Selected terminal users">
@@ -671,7 +770,7 @@ export function UsersView({
         {rows.length >= 200 && <div className="virtual-user-rows" style={{ height: userVirtualizer.getTotalSize() }}>{userVirtualizer.getVirtualItems().map((item) => renderUserRow(rows[item.index], { position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }, item.index))}</div>}
         {!loadingDirectory && !rows.length && !directoryError && <div className="empty-state"><Icon name="users" /><h3>No users match this directory view.</h3><p>{activeFilters.length ? 'Clear filters or search another identity.' : 'The selected terminal has no ADD-managed users.'}</p>{activeFilters.length > 0 && <button className="button secondary" type="button" onClick={clearFilters}>Clear filters</button>}</div>}
       </div>
-      {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadDirectory(nextCursor, true)}>{loadingMore ? 'Loading more users…' : 'Load more terminal users'}</button><small>{rows.length.toLocaleString()} users loaded · selection applies only to loaded rows</small></div>}
+      {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadDirectory(nextCursor, true)}>{loadingMore ? 'Loading more users…' : 'Load more terminal users'}</button><small>{rows.length.toLocaleString()} users loaded · selection persists across searches and loaded pages</small></div>}
     </section>
   )
 
@@ -715,11 +814,18 @@ export function UsersView({
         <div ref={tabsRef} className="section-tabs users-section-tabs" role="tablist" aria-label="User workspace sections">{userSections.map((item) => { const count = item.id === 'directory' ? identityTotal : item.id === 'identity' ? identityCount : historyCount; return <button key={item.id} id={`users-tab-${item.id}`} role="tab" type="button" aria-selected={section === item.id} aria-controls={`users-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? 'active' : ''} onClick={() => selectSection(item.id)} onKeyDown={handleTabKey}><Icon name={item.icon} /><span>{item.label}</span><strong>{count.toLocaleString()}</strong></button> })}</div>
         <div id={`users-panel-${section}`} role="tabpanel" aria-labelledby={`users-tab-${section}`}>{section === 'directory' ? directoryPanel : section === 'identity' ? identityPanel : historicalPanel}</div>
 
-        {selectedUsers.length > 0 && <aside className="bulk-selection-bar" aria-live="polite"><div><span className="bulk-selection-count">{selectedUsers.length}</span><span><strong>{selectedUsers.length} user{selectedUsers.length === 1 ? '' : 's'} selected</strong><small>Only eligible loaded regular users · attendance remains immutable</small></span></div><div><button className="button secondary" type="button" onClick={() => setSelectedUserKeys(new Set())}>Clear selection</button><button className="button destructive" type="button" disabled={!canDeleteProfile || activeDeletionJob} onClick={() => setBulkDialogOpen(true)}><Icon name="trash" /> Delete selected</button></div></aside>}
+        {selectedUsers.length > 0 && <aside className="bulk-selection-bar" aria-live="polite"><div><span className="bulk-selection-count">{selectedUsers.length}</span><span><strong>{selectedUsers.length} user{selectedUsers.length === 1 ? '' : 's'} selected</strong><small>Only eligible loaded regular users · attendance remains immutable</small></span></div><div><button className="button secondary" type="button" disabled={validatingSelection} onClick={() => setSelectedUserKeys(new Set())}>Clear selection</button><button className="button destructive" type="button" disabled={!canDeleteProfile || activeDeletionJob || validatingSelection} onClick={() => void openBulkDeletionDialog()}><Icon name="trash" /> {validatingSelection ? 'Validating…' : 'Delete selected'}</button></div></aside>}
       </>}
 
       {dialog && selected && <UserOperationDialog state={dialog} device={selected} onClose={() => setDialog(null)} onCommand={setCommand} toast={toast} />}
-      {bulkDialogOpen && selected && selectedUsers.length > 0 && <BulkDeletionDialog users={selectedUsers} device={selected} onClose={() => setBulkDialogOpen(false)} onCreated={(job) => { setDeletionJob(job); toast.notice('Durable bulk deletion job created. ADD will verify one user at a time.') }} />}
+      {bulkDialogOpen && selected && selectedUsers.length > 0 && <BulkDeletionDialog users={selectedUsers} device={selected} onRevalidate={async () => {
+        const validation = await revalidateSelection(selectedUsers)
+        if (!validation.users.length) {
+          setBulkDialogOpen(false)
+          toast.error('None of the selected users remain eligible for deletion. Nothing was deleted.')
+        }
+        return validation
+      }} onClose={() => setBulkDialogOpen(false)} onCreated={(job) => { setDeletionJob(job); toast.notice('Durable bulk deletion job created. ADD will verify one user at a time.') }} />}
       {resolutionDialog && selected && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void refreshWorkspace() }} toast={toast} />}
       {historicalDialog && selected && <HistoricalIdentityResolutionDialog state={historicalDialog} device={selected} onClose={() => setHistoricalDialog(null)} onComplete={async () => { await Promise.all([refreshWorkspace(), refreshFleet()]) }} toast={toast} />}
       {revokeLeaseOpen && selected && <LeaseRevokeDialog device={selected} onClose={() => setRevokeLeaseOpen(false)} onCommand={setCommand} toast={toast} />}
