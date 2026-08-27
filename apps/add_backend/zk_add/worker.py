@@ -33,6 +33,7 @@ from zk_add.ords_states import (
     ORDS_FIRMWARE_UNVERIFIED_STATUSES,
     ORDS_MEMBERSHIP_REVERIFY_STATUSES,
 )
+from zk_add.identity_states import VERIFIED_IDENTITY_RESOLUTION_STATUSES
 from zk_add.realtime import browser_events, connector_hub
 from zk_add.provisioning import (
     TERMINAL_STATES as PROVISIONING_TERMINAL_STATES,
@@ -75,13 +76,6 @@ ORDS_FIRMWARE_AUDIT_BATCH_SIZE = max(
     min(settings.ords_firmware_audit_batch_size, 500),
 )
 ORDS_PERMANENT_REJECTION_STATUSES = {400, 413, 422}
-VERIFIED_IDENTITY_RESOLUTION_STATUSES = {
-    "RESOLVED",
-    "RESOLVED_CURRENT_SNAPSHOT",
-    "RESOLVED_DIRECTORY_EVIDENCE",
-    "RESOLVED_HISTORICAL_ALIAS",
-    "RESOLVED_TOMBSTONE",
-}
 ORDS_SAFE_TRANSPORT_ERRORS = {
     "ConnectError",
     "ConnectTimeout",
@@ -298,11 +292,43 @@ async def _ords_audit_loop(stop: asyncio.Event) -> None:
             pass
 
 
+async def _attendance_repair_loop(stop: asyncio.Event) -> None:
+    """Advance durable repair checkpoints independently of live delivery."""
+
+    from zk_add.attendance_repair import (
+        advance_attendance_repairs_once,
+        record_repair_worker_heartbeat,
+    )
+
+    while not stop.is_set():
+        try:
+            record_repair_worker_heartbeat("RUNNING")
+            await advance_attendance_repairs_once()
+            record_repair_worker_heartbeat("IDLE")
+        except Exception:
+            try:
+                record_repair_worker_heartbeat("ERROR", "UNHANDLED_EXCEPTION")
+            except Exception:
+                pass
+            await browser_events.publish(
+                "backend_error",
+                {
+                    "code": "ATTENDANCE_REPAIR_LOOP_ERROR",
+                    "message": "The durable attendance repair worker encountered an internal error.",
+                },
+            )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def maintenance_loop(stop: asyncio.Event) -> None:
     tasks = [
         asyncio.create_task(_control_plane_loop(stop)),
         asyncio.create_task(_ords_delivery_loop(stop)),
         asyncio.create_task(_ords_audit_loop(stop)),
+        asyncio.create_task(_attendance_repair_loop(stop)),
     ]
     try:
         await stop.wait()

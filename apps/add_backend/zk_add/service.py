@@ -59,6 +59,7 @@ from zk_add.schemas import (
 )
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
+from zk_add.identity_states import PINNED_IDENTITY_RESOLUTION_STATUSES
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
@@ -2426,6 +2427,12 @@ def enrich_undelivered_attendance(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.user_id == user.user_id,
             AttendanceEvent.ords_status.in_(eligible_statuses),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status.not_in(
+                    PINNED_IDENTITY_RESOLUTION_STATUSES
+                ),
+            ),
         )
     ).all()
     changed = 0
@@ -2774,6 +2781,12 @@ def block_undelivered_attendance(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.user_id == user.user_id,
             AttendanceEvent.ords_status.in_(eligible_statuses),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status.not_in(
+                    PINNED_IDENTITY_RESOLUTION_STATUSES
+                ),
+            ),
         )
     ).all()
     changed = 0

@@ -359,6 +359,18 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALIN
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY)) {
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
+$environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] = if (
+    $env:ADD_DEPLOY_ATTENDANCE_REPAIR_PREVIEW_ENABLED -eq "true"
+) { "true" } else { "false" }
+$environment["ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED"] = if (
+    $env:ADD_DEPLOY_ATTENDANCE_REPAIR_EXECUTION_ENABLED -eq "true"
+) { "true" } else { "false" }
+if (
+    $environment["ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED"] -eq "true" -and
+    $environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -ne "true"
+) {
+    throw "Attendance repair execution requires attendance repair preview to be enabled."
+}
 $environment["ADD_PROVISIONING_ENABLED"] = if ($env:ADD_DEPLOY_PROVISIONING_ENABLED -eq "true") { "true" } else { "false" }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_PROVISIONING_PAIRING_SECRET)) {
     $environment["ADD_PROVISIONING_PAIRING_SECRET"] = $env:ADD_DEPLOY_PROVISIONING_PAIRING_SECRET

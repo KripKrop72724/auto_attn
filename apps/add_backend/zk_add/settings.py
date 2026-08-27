@@ -49,6 +49,19 @@ class AddSettings(BaseSettings):
     reconciliation_v2_credit_records: int = Field(default=400, ge=100, le=2000)
     reconciliation_v2_max_chunks: int = Field(default=4, ge=1, le=20)
     reconciliation_stale_seconds: int = 45
+    # Employee attendance repair is deliberately split into preview and
+    # execution gates.  Production can validate frozen membership/evidence
+    # before the first Oracle mutation is possible.
+    attendance_repair_preview_enabled: bool = False
+    attendance_repair_execution_enabled: bool = False
+    attendance_repair_preview_seconds: int = Field(default=15 * 60, ge=60, le=60 * 60)
+    attendance_repair_max_employees: int = Field(default=500, ge=1, le=500)
+    attendance_repair_max_events: int = Field(default=250_000, ge=1, le=250_000)
+    attendance_repair_oracle_batch_size: int = Field(default=100, ge=1, le=100)
+    attendance_repair_oracle_concurrency: int = Field(default=2, ge=1, le=2)
+    attendance_repair_lease_seconds: int = Field(default=90, ge=30, le=10 * 60)
+    attendance_repair_retry_limit: int = Field(default=12, ge=1, le=50)
+    attendance_repair_source_max_age_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
     log_retention_days: int = 14
     telemetry_retention_days: int = 30
     session_retention_days: int = 90
@@ -133,6 +146,23 @@ class AddSettings(BaseSettings):
                 missing.append("ADD_COMM_KEY_SECRET_FERNET_KEY")
             if not self.fleet_root_secret:
                 missing.append("ADD_FLEET_ROOT_SECRET")
+        if self.attendance_repair_execution_enabled and not self.attendance_repair_preview_enabled:
+            raise RuntimeError(
+                "ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED requires "
+                "ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED."
+            )
+        if self.attendance_repair_preview_enabled:
+            if self.attendance_repair_lease_seconds < self.ords_timeout_seconds * 2:
+                raise RuntimeError(
+                    "ADD_ATTENDANCE_REPAIR_LEASE_SECONDS must be at least twice "
+                    "ADD_ORDS_TIMEOUT_SECONDS."
+                )
+            if not self.ords_base_url:
+                missing.append("ADD_ORDS_BASE_URL")
+            if not self.ords_username:
+                missing.append("ADD_ORDS_USERNAME")
+            if not self.ords_password:
+                missing.append("ADD_ORDS_PASSWORD")
         if missing:
             raise RuntimeError(f"Missing required ADD secrets: {', '.join(missing)}")
 

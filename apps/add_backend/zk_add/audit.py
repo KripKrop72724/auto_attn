@@ -7,7 +7,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from zk_add.models import AuditEvent
+from zk_add.models import AuditChainHead, AuditEvent
 from zk_add.time_utils import utc_now
 
 
@@ -24,8 +24,22 @@ def append_audit(
     after: dict | None = None,
     request_id: str | None = None,
 ) -> AuditEvent:
-    previous = session.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
-    previous_hash = previous.row_hash if previous else None
+    # The singleton head is the serialization point.  PostgreSQL locks it for
+    # the transaction, preventing concurrent requests from producing two rows
+    # with the same previous_hash.  The migration seeds it from the legacy
+    # tail; create_all databases are initialized lazily here.
+    head = session.scalar(select(AuditChainHead).where(AuditChainHead.id == 1).with_for_update())
+    if head is None:
+        previous = session.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
+        head = AuditChainHead(
+            id=1,
+            last_audit_event_id=previous.id if previous else None,
+            last_hash=previous.row_hash if previous else None,
+            updated_at=utc_now(),
+        )
+        session.add(head)
+        session.flush()
+    previous_hash = head.last_hash
     created_at = utc_now()
     request_id = request_id or str(uuid4())
     material = json.dumps(
@@ -59,4 +73,8 @@ def append_audit(
         created_at=created_at,
     )
     session.add(row)
+    session.flush()
+    head.last_audit_event_id = row.id
+    head.last_hash = row.row_hash
+    head.updated_at = created_at
     return row

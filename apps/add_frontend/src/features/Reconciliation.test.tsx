@@ -308,6 +308,20 @@ function reconciliationFetch() {
         },
       })
     }
+    if (url.pathname === '/api/v1/attendance-repairs')
+      return json({
+        preview_enabled: false,
+        execution_enabled: false,
+        rows: [],
+        next_cursor: null,
+        totals: { all: 0, active: 0, attention: 0 },
+        worker: {
+          active_jobs: 0,
+          review_items: 0,
+          stale_leases: 0,
+          oldest_job_age_seconds: 0,
+        },
+      })
     if (url.pathname === `/api/v1/reconciliations/${job().job_id}`)
       return json(job())
     if (url.pathname === `/api/v1/source-exceptions/${sourceException.id}/reveal`)
@@ -390,5 +404,25 @@ describe('Reviewed source-exception continuation', () => {
     )
     expect(reviewRequest?.[1]?.method).toBe('POST')
     expect(String(reviewRequest?.[1]?.body)).not.toContain(job().job_id)
+  })
+
+  it('supports the employee-repair deep link and keyboard tab navigation', async () => {
+    window.history.replaceState(null, '', '/reconciliation?tab=employee-repair')
+    vi.stubGlobal('fetch', reconciliationFetch())
+    render(<Harness />)
+
+    const repairTab = screen.getByRole('tab', { name: /Employee repair/i })
+    expect(repairTab.getAttribute('aria-selected')).toBe('true')
+    expect(
+      await screen.findByRole('heading', {
+        name: 'Repair effective attendance identity',
+      }),
+    ).toBeTruthy()
+
+    fireEvent.keyDown(repairTab, { key: 'Home' })
+    const jobsTab = screen.getByRole('tab', { name: /^Jobs/i })
+    expect(jobsTab.getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(jobsTab)
+    expect(window.location.search).toBe('')
   })
 })
