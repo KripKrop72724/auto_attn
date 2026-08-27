@@ -1243,7 +1243,13 @@ def test_source_dependency_freeze_rolls_back_partial_membership(
         job_id = job.job_id
         session.commit()
 
-    def partial_freeze(session: Session, job: AttendanceRepairJob) -> None:
+    def partial_freeze(
+        session: Session,
+        job: AttendanceRepairJob,
+        *,
+        allow_certified_snapshot_rebind: bool = False,
+    ) -> None:
+        assert allow_certified_snapshot_rebind is True
         target = session.scalar(
             select(AttendanceRepairTarget).where(AttendanceRepairTarget.job_id == job.id)
         )
@@ -1278,3 +1284,235 @@ def test_source_dependency_freeze_rolls_back_partial_membership(
         assert job.status == "NEEDS_ATTENTION"
         assert job.error_code == "COHORT_DRIFT"
         assert cohort_count == 0
+
+
+def test_source_dependency_recertifies_unchanged_target_snapshot(
+    repair_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions, connector_id, user_key, _event_uid = repair_store
+    with sessions() as session:
+        coverage = session.scalar(
+            select(ReconciliationCoverage).where(ReconciliationCoverage.active)
+        )
+        connector = session.scalar(
+            select(repair.Connector).where(repair.Connector.connector_id == connector_id)
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        assert coverage is not None and connector is not None and user is not None
+        zkt = connector.zkt_device
+        assert zkt is not None and zkt.identity_snapshot_id is not None
+        previous_snapshot_id = zkt.identity_snapshot_id
+        expected_row_version = user.row_version
+        coverage.captured_at = utc_now() - timedelta(
+            seconds=settings.attendance_repair_source_max_age_seconds + 1
+        )
+        session.flush()
+        job = repair.create_repair_job(
+            session,
+            connector=connector,
+            actor="operator",
+            selections=[
+                {
+                    "user_key": user_key,
+                    "expected_row_version": expected_row_version,
+                    "all_provable_history": True,
+                    "cohort_tokens": [],
+                }
+            ],
+            date_from=None,
+            date_to=None,
+            idempotency_key="repair-source-snapshot-recertification",
+        )
+        assert job.source_reconciliation_job_id is not None
+        replace_user_snapshot(
+            session,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="repair-refreshed-stable-snapshot",
+                complete=True,
+                stable=True,
+                observed_at=utc_now(),
+                users=[
+                    UserSnapshotRow(
+                        uid="7",
+                        user_id="1007",
+                        name=f"Correct Name-{CORRECT_CNIC}",
+                    )
+                ],
+            ),
+        )
+        session.flush()
+        assert zkt.identity_snapshot_id != previous_snapshot_id
+        assert user.row_version == expected_row_version
+        coverage.captured_at = utc_now()
+        job_id = job.job_id
+        session.commit()
+
+    classified: list[str] = []
+
+    async def record_classification(public_job_id: str, *, max_batches: int = 5):
+        classified.append(public_job_id)
+
+    monkeypatch.setattr(repair, "classify_repair_preview", record_classification)
+    asyncio.run(repair._advance_source_preparation())
+
+    with sessions() as session:
+        job = session.scalar(
+            select(AttendanceRepairJob).where(AttendanceRepairJob.job_id == job_id)
+        )
+        target = session.scalar(
+            select(AttendanceRepairTarget).where(AttendanceRepairTarget.job_id == job.id)
+        )
+        zkt = session.get(repair.ZKTDevice, job.zkt_device_id)
+        recertification = session.scalar(
+            select(AttendanceRepairEvent).where(
+                AttendanceRepairEvent.job_id == job.id,
+                AttendanceRepairEvent.state == "TARGET_SNAPSHOT_RECERTIFIED",
+            )
+        )
+        assert job is not None and target is not None and zkt is not None
+        assert recertification is not None
+        assert job.status == "PREPARING_SOURCE"
+        assert job.phase == "ORACLE_CLASSIFICATION"
+        assert target.identity_snapshot_id == zkt.identity_snapshot_id
+        assert (
+            session.scalar(
+                select(repair.func.count(AttendanceRepairItem.id)).where(
+                    AttendanceRepairItem.job_id == job.id
+                )
+            )
+            == 1
+        )
+        encoded_details = json.dumps(recertification.details)
+        assert CORRECT_CNIC not in encoded_details
+        assert "Correct Name" not in encoded_details
+    assert classified == [job_id]
+
+
+def test_snapshot_refresh_without_source_dependency_remains_target_drift(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, _event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(repair.Connector.connector_id == connector_id)
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        assert connector is not None and user is not None
+        job = repair.create_repair_job(
+            session,
+            connector=connector,
+            actor="operator",
+            selections=[
+                {
+                    "user_key": user_key,
+                    "expected_row_version": user.row_version,
+                    "all_provable_history": True,
+                    "cohort_tokens": [],
+                }
+            ],
+            date_from=None,
+            date_to=None,
+            idempotency_key="repair-no-source-snapshot-recertification",
+        )
+        assert job.source_reconciliation_job_id is None
+        replace_user_snapshot(
+            session,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="repair-unrelated-stable-snapshot",
+                complete=True,
+                stable=True,
+                observed_at=utc_now(),
+                users=[
+                    UserSnapshotRow(
+                        uid="7",
+                        user_id="1007",
+                        name=f"Correct Name-{CORRECT_CNIC}",
+                    )
+                ],
+            ),
+        )
+        with pytest.raises(repair.RepairError, match="certified current identity") as error:
+            repair._freeze_membership(session, job)
+        assert error.value.code == "TARGET_DRIFT"
+
+
+def test_source_dependency_snapshot_recertification_rejects_real_identity_change(
+    repair_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions, connector_id, user_key, _event_uid = repair_store
+    with sessions() as session:
+        coverage = session.scalar(
+            select(ReconciliationCoverage).where(ReconciliationCoverage.active)
+        )
+        connector = session.scalar(
+            select(repair.Connector).where(repair.Connector.connector_id == connector_id)
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        assert coverage is not None and connector is not None and user is not None
+        coverage.captured_at = utc_now() - timedelta(
+            seconds=settings.attendance_repair_source_max_age_seconds + 1
+        )
+        session.flush()
+        job = repair.create_repair_job(
+            session,
+            connector=connector,
+            actor="operator",
+            selections=[
+                {
+                    "user_key": user_key,
+                    "expected_row_version": user.row_version,
+                    "all_provable_history": True,
+                    "cohort_tokens": [],
+                }
+            ],
+            date_from=None,
+            date_to=None,
+            idempotency_key="repair-source-real-target-drift",
+        )
+        assert job.source_reconciliation_job_id is not None
+        replace_user_snapshot(
+            session,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="repair-changed-stable-snapshot",
+                complete=True,
+                stable=True,
+                observed_at=utc_now(),
+                users=[
+                    UserSnapshotRow(
+                        uid="7",
+                        user_id="1007",
+                        name=f"Changed Name-{CORRECT_CNIC}",
+                    )
+                ],
+            ),
+        )
+        coverage.captured_at = utc_now()
+        job_id = job.job_id
+        session.commit()
+
+    classified: list[str] = []
+
+    async def record_classification(public_job_id: str, *, max_batches: int = 5):
+        classified.append(public_job_id)
+
+    monkeypatch.setattr(repair, "classify_repair_preview", record_classification)
+    asyncio.run(repair._advance_source_preparation())
+
+    with sessions() as session:
+        job = session.scalar(
+            select(AttendanceRepairJob).where(AttendanceRepairJob.job_id == job_id)
+        )
+        item_count = session.scalar(
+            select(repair.func.count(AttendanceRepairItem.id)).where(
+                AttendanceRepairItem.job_id == job.id
+            )
+        )
+        assert job is not None
+        assert job.status == "NEEDS_ATTENTION"
+        assert job.phase == "SOURCE_REVIEW"
+        assert job.error_code == "TARGET_DRIFT"
+        assert item_count == 0
+    assert classified == []

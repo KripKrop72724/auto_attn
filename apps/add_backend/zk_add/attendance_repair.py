@@ -1133,7 +1133,12 @@ def _candidate_map_for_target(
     return result
 
 
-def _freeze_membership(session: Session, job: AttendanceRepairJob) -> None:
+def _freeze_membership(
+    session: Session,
+    job: AttendanceRepairJob,
+    *,
+    allow_certified_snapshot_rebind: bool = False,
+) -> None:
     connector = session.get(Connector, job.connector_id)
     zkt = session.get(ZKTDevice, job.zkt_device_id)
     if connector is None or zkt is None:
@@ -1183,15 +1188,20 @@ def _freeze_membership(session: Session, job: AttendanceRepairJob) -> None:
         active_user_id_owners[row.user_id].add(row.id)
     for target in targets:
         user = session.get(DeviceUser, target.device_user_id)
-        if user is None:
+        if user is None or user.user_key != target.user_key:
             raise RepairError("A target disappeared during preparation.", code="TARGET_DRIFT")
         if user.row_version != target.expected_row_version:
             raise RepairError("A target changed during source preparation.", code="TARGET_DRIFT")
         eligible, eligibility_code = _eligible_target(session, zkt=zkt, user=user)
-        if not eligible or zkt.identity_snapshot_id != target.identity_snapshot_id:
+        if not eligible:
             raise RepairError(
                 "A target is no longer part of the certified current identity snapshot.",
                 code=eligibility_code or "TARGET_DRIFT",
+            )
+        if user.terminal_identity_fingerprint != target.terminal_identity_fingerprint:
+            raise RepairError(
+                "A target identity changed during source preparation.",
+                code="TARGET_DRIFT",
             )
         try:
             current_target_cnic = decrypt_cnic(user.cnic_encrypted)
@@ -1200,10 +1210,47 @@ def _freeze_membership(session: Session, job: AttendanceRepairJob) -> None:
                 "A target's protected identity became unreadable during preparation.",
                 code="TARGET_PII_UNREADABLE",
             ) from exc
-        if _identity_digest(user.display_name, current_target_cnic) != target.desired_identity_digest:
+        if (
+            _identity_digest(user.display_name, current_target_cnic)
+            != target.desired_identity_digest
+        ):
             raise RepairError(
                 "A target identity changed during source preparation.",
                 code="TARGET_DRIFT",
+            )
+        if (
+            user.cnic_lookup_hash != target.desired_cnic_lookup_hash
+            or user.cnic_last4 != target.desired_cnic_last4
+        ):
+            raise RepairError(
+                "A target identity changed during source preparation.",
+                code="TARGET_DRIFT",
+            )
+        if zkt.identity_snapshot_id != target.identity_snapshot_id:
+            if not (
+                allow_certified_snapshot_rebind
+                and job.source_reconciliation_job_id is not None
+                and job.source_certificate_digest is not None
+            ):
+                raise RepairError(
+                    "A target is no longer part of the certified current identity snapshot.",
+                    code="TARGET_DRIFT",
+                )
+            previous_snapshot_id = target.identity_snapshot_id
+            target.identity_snapshot_id = zkt.identity_snapshot_id
+            _repair_event(
+                session,
+                job,
+                "TARGET_SNAPSHOT_RECERTIFIED",
+                details={
+                    "target_id": target.id,
+                    "previous_snapshot_id": previous_snapshot_id,
+                    "certified_snapshot_id": zkt.identity_snapshot_id,
+                    "certified_snapshot_revision": zkt.identity_snapshot_revision,
+                },
+                idempotency_key=(
+                    f"target-snapshot-recertified-{target.id}-{zkt.identity_snapshot_id}"
+                ),
             )
         candidates = _candidate_map_for_target(
             session,
@@ -2395,7 +2442,13 @@ def control_repair_job(
                 job.next_attempt_at = None
             elif source_current:
                 job.source_certificate_digest = certificate["certificate_digest"]
-                _freeze_membership(session, job)
+                _freeze_membership(
+                    session,
+                    job,
+                    allow_certified_snapshot_rebind=(
+                        job.source_reconciliation_job_id is not None
+                    ),
+                )
             else:
                 _attach_source_dependency(session, job=job, connector=connector)
         else:
@@ -4235,7 +4288,13 @@ async def _advance_source_preparation() -> None:
                     # target must never leave a partial preview behind.
                     with session.begin_nested():
                         job.source_certificate_digest = certificate["certificate_digest"]
-                        _freeze_membership(session, job)
+                        _freeze_membership(
+                            session,
+                            job,
+                            allow_certified_snapshot_rebind=(
+                                job.source_reconciliation_job_id is not None
+                            ),
+                        )
                     classify_ids.append(job.job_id)
                 except RepairError as exc:
                     job.status = "NEEDS_ATTENTION"
