@@ -62,6 +62,8 @@ preserved source epoch while transient reads resume from the existing cursor.
 
 Deploy ADD first with the feature dark, then enable the ADD feature flag only after migration, readiness, and UI verification. Firmware promotion requires a clean build, signed immutable image, exact SHA, and successful hardware-in-loop range-resume, disconnect, power-cycle, storage-pressure, live-punch, and rollback checks.
 
+Employee-scoped identity correction is a separate, explicit workflow under **Reconciliation → Employee repair**. It may depend on this full-device source scan, but it never changes this workflow's manifests, event UIDs, physical punch facts, or disabled Oracle delete paths. Oracle UID membership and repaired identity-content proof remain separate. See [Employee attendance repair and resync runbook](attendance-repair-runbook.md).
+
 Firmware still rolls out one zone at a time in this order; durable source reconciliation may run in parallel after the eligible devices are safely booted:
 
 1. SLICTOWER

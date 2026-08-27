@@ -1,0 +1,450 @@
+.employee-repair-workspace {
+  display: grid;
+  gap: 18px;
+}
+
+.employee-repair-builder,
+.employee-repair-current-job,
+.employee-repair-history {
+  padding: 20px;
+}
+
+.employee-repair-terminal {
+  max-width: 760px;
+  display: grid;
+  gap: 7px;
+  margin-bottom: 15px;
+  color: var(--navy-900);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.employee-repair-terminal select {
+  min-height: 48px;
+}
+
+.employee-repair-readiness {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+  margin: 14px 0;
+}
+
+.employee-repair-readiness > span {
+  min-height: 78px;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-soft, #f6f9fa);
+}
+
+.employee-repair-readiness small,
+.employee-repair-target-ledger small,
+.employee-repair-job-summary span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.employee-repair-blockers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 15px;
+}
+
+.employee-repair-blockers p {
+  margin: 0;
+  padding: 11px 13px;
+  border-left: 3px solid var(--warning, #b36a00);
+  border-radius: 7px;
+  color: var(--muted);
+  background: #fff8eb;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.employee-repair-blockers strong {
+  display: block;
+  color: var(--navy-900);
+}
+
+.employee-repair-selection {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-repair-selection-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.employee-repair-selection-head .search-field {
+  width: min(560px, 100%);
+}
+
+.employee-repair-selection-head > span {
+  color: var(--brand-700);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.employee-repair-user-list {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.employee-repair-user-list > label {
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.employee-repair-user-list > label:first-child {
+  border-top: 0;
+}
+
+.employee-repair-user-list > label:has(input:checked) {
+  background: var(--brand-50);
+  box-shadow: inset 3px 0 var(--brand-600);
+}
+
+.employee-repair-user-list span,
+.employee-repair-cohorts label > span,
+.employee-repair-history button > span:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.employee-repair-user-list small,
+.employee-repair-cohorts small,
+.employee-repair-history small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.employee-repair-user-list code {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.employee-repair-date-scope {
+  display: flex;
+  align-items: end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.employee-repair-date-scope label {
+  display: grid;
+  gap: 6px;
+  color: var(--navy-900);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.employee-repair-date-scope label:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.employee-repair-selection > .button {
+  justify-self: start;
+}
+
+.employee-repair-cohorts {
+  display: grid;
+  gap: 13px;
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-repair-cohorts > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.employee-repair-cohorts h3,
+.employee-repair-cohorts p {
+  margin: 0;
+}
+
+.employee-repair-cohorts p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.employee-repair-cohorts > article {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.employee-repair-cohort-target {
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #f5f8fa;
+}
+
+.employee-repair-cohort-target > span:not(.status-badge) {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.employee-repair-cohorts article > label {
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-repair-cohorts label em {
+  color: var(--danger, #a12828);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 750;
+}
+
+.employee-repair-actions,
+.employee-repair-job-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.employee-repair-job-summary {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr 0.7fr;
+  gap: 9px;
+  margin-bottom: 13px;
+}
+
+.employee-repair-job-summary > div {
+  min-height: 76px;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f7fafb;
+}
+
+.employee-repair-job-summary strong {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.employee-repair-classifications {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 13px;
+}
+
+.employee-repair-classifications > span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.employee-repair-target-ledger {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.employee-repair-target-ledger article {
+  min-height: 62px;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 190px 110px minmax(110px, 0.6fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 13px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-repair-target-ledger article:first-child {
+  border-top: 0;
+}
+
+.employee-repair-target-ledger article > div {
+  display: grid;
+  gap: 4px;
+}
+
+.employee-repair-items {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.employee-repair-items summary {
+  padding: 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.employee-repair-items article {
+  display: grid;
+  grid-template-columns: 130px minmax(150px, 1fr) 190px minmax(120px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.employee-repair-items article > span:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.employee-repair-dependency-id {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.employee-repair-approval {
+  display: grid;
+  gap: 13px;
+  max-width: 880px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-repair-approval > label {
+  display: grid;
+  gap: 7px;
+  color: var(--navy-900);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.employee-repair-approval code {
+  overflow-wrap: anywhere;
+}
+
+.employee-repair-approval > .button {
+  justify-self: start;
+}
+
+.employee-repair-history > div[role='list'] {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.employee-repair-history button[role='listitem'] {
+  width: 100%;
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) 210px 120px 140px 18px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  background: #fff;
+  text-align: left;
+}
+
+.employee-repair-history button[role='listitem']:first-child {
+  border-top: 0;
+}
+
+.employee-repair-history button[role='listitem']:hover,
+.employee-repair-history button[role='listitem']:focus-visible {
+  background: #f7fbfd;
+  box-shadow: inset 3px 0 var(--brand-600);
+}
+
+.employee-repair-history button svg {
+  width: 17px;
+}
+
+@media (max-width: 980px) {
+  .employee-repair-readiness,
+  .employee-repair-job-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .employee-repair-target-ledger article,
+  .employee-repair-items article,
+  .employee-repair-history button[role='listitem'] {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+@media (max-width: 640px) {
+  .employee-repair-builder,
+  .employee-repair-current-job,
+  .employee-repair-history {
+    padding: 14px;
+  }
+  .employee-repair-readiness,
+  .employee-repair-blockers,
+  .employee-repair-job-summary {
+    grid-template-columns: 1fr;
+  }
+  .employee-repair-selection-head,
+  .employee-repair-cohorts > header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .employee-repair-cohort-target,
+  .employee-repair-cohorts article > label,
+  .employee-repair-user-list > label {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+  .employee-repair-cohort-target {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .employee-repair-cohorts article > label > b,
+  .employee-repair-user-list > label > code {
+    grid-column: 2;
+  }
+  .employee-repair-job-actions {
+    justify-content: flex-start;
+  }
+}

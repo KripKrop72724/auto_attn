@@ -34,6 +34,12 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     try {
       const body = await response.json()
       if (typeof body.detail === 'string') message = body.detail
+      else if (
+        body.detail &&
+        typeof body.detail === 'object' &&
+        typeof body.detail.message === 'string'
+      )
+        message = body.detail.message
       else if (Array.isArray(body.detail)) {
         const grouped: Record<string, string[]> = {}
         body.detail.forEach((item: { loc?: unknown[]; msg?: string }) => {

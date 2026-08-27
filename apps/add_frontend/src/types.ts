@@ -21,7 +21,7 @@ export type DashboardRoute =
   | 'alerts'
 
 export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
-export type ReconciliationSection = 'jobs' | 'exceptions'
+export type ReconciliationSection = 'jobs' | 'exceptions' | 'employee-repair'
 export type ReconciliationStatusGroup = '' | 'ACTIVE' | 'QUEUED_WAITING' | 'PAUSED' | 'ATTENTION' | 'COMPLETED' | 'CANCELLED'
 
 export interface FirmwareScopePreview {
@@ -614,6 +614,185 @@ export interface DeviceUser {
   machine_name_preview: string | null
   current_command_state: string | null
   read_only: boolean
+}
+
+export interface AttendanceRepairCohortCandidate {
+  cohort_token: string
+  evidence_classification: 'CURRENT_USER_LINEAGE' | 'EXACT_TOMBSTONE' | string
+  selectable: boolean
+  exclusion_code: string | null
+  source_device_user_key: string
+  source_uid: string | null
+  source_user_id: string | null
+  first_event_at: string
+  last_event_at: string
+  event_count: number
+  membership_digest: string
+  masked_identity: {
+    variants: Array<{
+      display_name_masked: string | null
+      cnic_masked: string | null
+    }>
+    variant_count: number
+    truncated: boolean
+  }
+  source_evidence: {
+    terminal_manifest_events: number
+    exact_tombstone: boolean
+    source_types: string[]
+  }
+}
+
+export interface AttendanceRepairCandidateTarget {
+  user_key: string
+  row_version: number
+  display_name: string
+  cnic_masked: string | null
+  eligible: boolean
+  exclusion_code: string | null
+  cohorts: AttendanceRepairCohortCandidate[]
+}
+
+export interface AttendanceRepairCandidates {
+  connector_id: string
+  device_id: string
+  source_current: boolean
+  source_certificate: Record<string, unknown>
+  date_scope: {
+    timezone: 'Asia/Karachi'
+    start_utc: string | null
+    end_utc_exclusive: string | null
+  }
+  targets: AttendanceRepairCandidateTarget[]
+}
+
+export interface AttendanceRepairPreflight {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  eligible: boolean
+  ready_now: boolean
+  requires_source_reconciliation: boolean
+  hard_blockers: Array<{ code: string; message: string }>
+  waitable_blockers: Array<{ code: string; message: string }>
+  limits: { employees: number; events: number; oracle_batch: number }
+  source_certificate: Record<string, unknown>
+  terminal: {
+    serial: string | null
+    snapshot_complete: boolean
+    snapshot_stable: boolean
+    snapshot_revision: number
+    attendance_count: number | null
+  } | null
+  oracle: {
+    available: boolean
+    capabilities?: Record<string, unknown>
+    error_code?: string
+    message?: string
+  }
+  worker: {
+    active_jobs: number
+    review_items: number
+    stale_leases: number
+    oldest_job_age_seconds: number
+    retrying_items?: number
+    unknown_outcome_items?: number
+    waiting_downstream_items?: number
+    oldest_downstream_lag_seconds?: number
+    leased_oracle_slots?: number
+    active_worker_count?: number
+    heartbeat?: {
+      state: string
+      updated_at: string
+      last_started_at: string | null
+      last_completed_at: string | null
+      last_error_at: string | null
+      last_error_code: string | null
+    } | null
+  }
+}
+
+export interface AttendanceRepairTargetOutcome {
+  user_key: string
+  display_name: string
+  cnic_masked: string | null
+  expected_row_version: number
+  desired_identity_digest: string
+  status: string
+  event_count: number
+  completed_event_count: number
+  attention_event_count: number
+}
+
+export interface AttendanceRepairItemOutcome {
+  event_uid: string
+  user_key: string | null
+  event_time: string | null
+  state: string
+  oracle_classification: string
+  outcome: string | null
+  attempt_count: number
+  oracle_attempt_count: number
+  downstream_attempt_count: number
+  next_attempt_at: string | null
+  error_code: string | null
+}
+
+export interface AttendanceRepairJob {
+  job_id: string
+  connector_id: string
+  device_id: string
+  actor: string
+  status: string
+  phase: string
+  date_scope: {
+    timezone: 'Asia/Karachi'
+    start_utc: string | null
+    end_utc_exclusive: string | null
+  }
+  request_digest: string
+  preview_digest: string | null
+  preview_expires_at: string | null
+  source_dependency_job_id: string | null
+  totals: {
+    employees: number
+    events: number
+    excluded: number
+    completed_employees: number
+    completed_events: number
+    attention_events: number
+  }
+  wait_reason: string | null
+  error_code: string | null
+  error_message: string | null
+  cancellation_requested: boolean
+  preparation_attempt_count: number
+  next_attempt_at: string | null
+  created_at: string
+  approved_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  typed_confirmation?: string
+  downstream_impact?: {
+    timezone: 'Asia/Karachi'
+    calendar_days: number
+    employee_days: number
+    before_identity_day_groups: number
+    desired_identity_day_groups: number
+    first_date: string | null
+    last_date: string | null
+  }
+  targets: AttendanceRepairTargetOutcome[]
+  items?: AttendanceRepairItemOutcome[]
+  items_next_cursor?: number | null
+}
+
+export interface AttendanceRepairListResponse {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  rows: AttendanceRepairJob[]
+  next_cursor: number | null
+  totals: { all: number; active: number; attention: number }
+  worker: AttendanceRepairPreflight['worker']
 }
 
 export interface UserDeletionJobItem {

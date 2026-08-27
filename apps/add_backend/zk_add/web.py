@@ -159,6 +159,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
+from zk_add.attendance_repair import repair_worker_metrics
 from zk_add.time_utils import parse_datetime, utc_now
 from zk_add.reconciliation import (
     apply_reconciliation_assignment_release,
@@ -445,6 +446,7 @@ def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
     result = fleet_counts(db)
     result["ords_delivery"] = ords_delivery_metrics(db)
+    result["attendance_repair"] = repair_worker_metrics(db)
     return result
 
 
@@ -3843,5 +3845,7 @@ async def revoke_firmware_release(
 # Physical provisioning is isolated in an additive router so the existing
 # device, attendance and OTA paths remain unchanged when the feature is dark.
 from zk_add.provisioning_api import router as provisioning_router  # noqa: E402
+from zk_add.attendance_repair_api import router as attendance_repair_router  # noqa: E402
 
 app.router.routes.extend(provisioning_router.routes)
+app.router.routes.extend(attendance_repair_router.routes)
