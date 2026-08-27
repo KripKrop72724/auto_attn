@@ -805,11 +805,18 @@ def test_repair_feature_configuration_requires_preview_and_add_credentials() -> 
         "admin_password_hash": "configured",
         "pii_fernet_key": Fernet.generate_key().decode(),
         "pii_lookup_key": "configured",
+        # CI intentionally exports disposable ORDS credentials for integration
+        # tests.  Override them here so this unit test proves the fail-closed
+        # configuration contract independently of the runner environment.
+        "ords_base_url": None,
+        "ords_username": None,
+        "ords_password": None,
     }
     with pytest.raises(RuntimeError, match="requires ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"):
         AddSettings(
             _env_file=None,
             **base,
+            attendance_repair_preview_enabled=False,
             attendance_repair_execution_enabled=True,
         ).require_production_secrets()
     with pytest.raises(RuntimeError, match="ADD_ORDS_BASE_URL"):
@@ -817,12 +824,14 @@ def test_repair_feature_configuration_requires_preview_and_add_credentials() -> 
             _env_file=None,
             **base,
             attendance_repair_preview_enabled=True,
+            attendance_repair_execution_enabled=False,
         ).require_production_secrets()
     with pytest.raises(RuntimeError, match="must be at least twice"):
         AddSettings(
             _env_file=None,
             **base,
             attendance_repair_preview_enabled=True,
+            attendance_repair_execution_enabled=False,
             attendance_repair_lease_seconds=30,
             ords_timeout_seconds=20,
         ).require_production_secrets()
