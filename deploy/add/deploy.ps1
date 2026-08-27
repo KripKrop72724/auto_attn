@@ -218,6 +218,52 @@ function Assert-OrdsAuthentication {
     Write-Host "Authenticated Oracle membership probe passed from the ADD host."
 }
 
+function Assert-OrdsRepairAuthentication {
+    param(
+        [Parameter(Mandatory = $true)][string] $BaseUrl,
+        [Parameter(Mandatory = $true)][string] $Username,
+        [Parameter(Mandatory = $true)][string] $Password
+    )
+
+    $headers = @{
+        "X-API-Username" = $Username
+        "X-API-Password" = $Password
+    }
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        $response = Invoke-WebRequest `
+            -UseBasicParsing `
+            -Method Get `
+            -Uri ($BaseUrl.TrimEnd("/") + "/raw-captures/identity-repairs/capabilities") `
+            -Headers $headers `
+            -TimeoutSec 15
+    } catch {
+        $status = $null
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $status = [int]$_.Exception.Response.StatusCode
+        }
+        if ($status) {
+            throw "Oracle repair authentication failed with HTTP $status."
+        }
+        throw "Oracle repair authentication failed before an HTTP response ($($_.Exception.GetType().Name))."
+    }
+    try {
+        $result = $response.Content | ConvertFrom-Json
+    } catch {
+        throw "Oracle repair authentication returned an invalid JSON response."
+    }
+    if (
+        $response.StatusCode -ne 200 -or
+        [string]$result.contract_version -ne "1" -or
+        $result.add_only_auth -ne $true -or
+        $result.execution_ready -ne $true -or
+        [int]$result.batch_limit -ne 100
+    ) {
+        throw "Oracle repair authentication returned an invalid or unready capability contract."
+    }
+    Write-Host "Authenticated Oracle repair capability probe passed from the ADD host."
+}
+
 function Assert-OrdsContainerAuthentication {
     $probe = @'
 import json
@@ -258,6 +304,36 @@ valid = (
 if not valid:
     print("ORDS_AUTH_INVALID_RESPONSE")
     sys.exit(1)
+if os.environ.get("ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED", "false").lower() == "true":
+    repair_request = urllib.request.Request(
+        os.environ["ADD_ORDS_BASE_URL"].rstrip("/")
+        + "/raw-captures/identity-repairs/capabilities",
+        headers={
+            "X-API-Username": os.environ["ADD_ATTENDANCE_REPAIR_ORDS_USERNAME"],
+            "X-API-Password": os.environ["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"],
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(repair_request, timeout=15) as response:
+            repair_status = response.status
+            repair_payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        print(f"ORDS_REPAIR_AUTH_HTTP_{exc.code}")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ORDS_REPAIR_AUTH_ERROR_{type(exc).__name__}")
+        sys.exit(1)
+    repair_valid = (
+        repair_status == 200
+        and str(repair_payload.get("contract_version")) == "1"
+        and repair_payload.get("add_only_auth") is True
+        and repair_payload.get("execution_ready") is True
+        and repair_payload.get("batch_limit") == 100
+    )
+    if not repair_valid:
+        print("ORDS_REPAIR_AUTH_INVALID_RESPONSE")
+        sys.exit(1)
 print("ORDS_AUTH_OK")
 '@
     $probeEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
@@ -331,6 +407,12 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ORDS_USERNAME)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ORDS_PASSWORD)) {
     $environment["ADD_ORDS_PASSWORD"] = $env:ADD_DEPLOY_ORDS_PASSWORD
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_USERNAME)) {
+    $environment["ADD_ATTENDANCE_REPAIR_ORDS_USERNAME"] = $env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_USERNAME
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_PASSWORD)) {
+    $environment["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"] = $env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_PASSWORD
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED)) {
     $environment["ADD_FIRMWARE_OTA_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED
@@ -420,6 +502,20 @@ $required = @(
     "ADD_ORDS_PASSWORD"
 )
 foreach ($name in $required) { [void](Require-EnvironmentValue -Map $environment -Name $name) }
+if ($environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -eq "true") {
+    foreach ($name in @(
+        "ADD_ATTENDANCE_REPAIR_ORDS_USERNAME",
+        "ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"
+    )) {
+        [void](Require-EnvironmentValue -Map $environment -Name $name)
+    }
+    if (
+        $environment["ADD_ATTENDANCE_REPAIR_ORDS_USERNAME"] -eq $environment["ADD_ORDS_USERNAME"] -and
+        $environment["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"] -eq $environment["ADD_ORDS_PASSWORD"]
+    ) {
+        throw "Employee attendance repair must not reuse the connector/fleet Oracle credential."
+    }
+}
 
 $dbUser = if ($environment.ContainsKey("ADD_POSTGRES_USER")) { $environment["ADD_POSTGRES_USER"] } else { "add_service" }
 $dbName = if ($environment.ContainsKey("ADD_POSTGRES_DB")) { $environment["ADD_POSTGRES_DB"] } else { "attendance_devices" }
@@ -494,6 +590,12 @@ Assert-OrdsAuthentication `
     -BaseUrl $environment["ADD_ORDS_BASE_URL"] `
     -Username $environment["ADD_ORDS_USERNAME"] `
     -Password $environment["ADD_ORDS_PASSWORD"]
+if ($environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -eq "true") {
+    Assert-OrdsRepairAuthentication `
+        -BaseUrl $environment["ADD_ORDS_BASE_URL"] `
+        -Username $environment["ADD_ATTENDANCE_REPAIR_ORDS_USERNAME"] `
+        -Password $environment["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"]
+}
 
 $stateRoot = if ($env:ADD_DEPLOY_STATE_DIR) {
     $env:ADD_DEPLOY_STATE_DIR

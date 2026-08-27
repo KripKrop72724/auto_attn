@@ -811,6 +811,8 @@ def test_repair_feature_configuration_requires_preview_and_add_credentials() -> 
         "ords_base_url": None,
         "ords_username": None,
         "ords_password": None,
+        "attendance_repair_ords_username": None,
+        "attendance_repair_ords_password": None,
     }
     with pytest.raises(RuntimeError, match="requires ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"):
         AddSettings(
@@ -835,6 +837,78 @@ def test_repair_feature_configuration_requires_preview_and_add_credentials() -> 
             attendance_repair_lease_seconds=30,
             ords_timeout_seconds=20,
         ).require_production_secrets()
+    with pytest.raises(RuntimeError, match="dedicated Oracle credential"):
+        AddSettings(
+            _env_file=None,
+            **{
+                **base,
+                "attendance_repair_preview_enabled": True,
+                "ords_base_url": "https://example.invalid/ords/raw",
+                "ords_username": "shared-user",
+                "ords_password": "shared-password",
+                "attendance_repair_ords_username": "shared-user",
+                "attendance_repair_ords_password": "shared-password",
+            },
+        ).require_production_secrets()
+
+    AddSettings(
+        _env_file=None,
+        **{
+            **base,
+            "attendance_repair_preview_enabled": True,
+            "ords_base_url": "https://example.invalid/ords/raw",
+            "ords_username": "fleet-user",
+            "ords_password": "fleet-password",
+            "attendance_repair_ords_username": "repair-user",
+            "attendance_repair_ords_password": "repair-password",
+        },
+    ).require_production_secrets()
+
+
+def test_repair_ords_client_uses_only_the_dedicated_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class StubResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, bool]:
+            return {"ok": True}
+
+    class StubClient:
+        def __init__(self, *, timeout: int, headers: dict[str, str]):
+            observed["timeout"] = timeout
+            observed["headers"] = headers
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def request(self, method: str, url: str, *, json):
+            observed["method"] = method
+            observed["url"] = url
+            observed["json"] = json
+            return StubResponse()
+
+    monkeypatch.setattr(settings, "ords_base_url", "https://example.invalid/ords/raw")
+    monkeypatch.setattr(settings, "ords_username", "fleet-user")
+    monkeypatch.setattr(settings, "ords_password", "fleet-password")
+    monkeypatch.setattr(settings, "attendance_repair_ords_username", "repair-user")
+    monkeypatch.setattr(settings, "attendance_repair_ords_password", "repair-password")
+    monkeypatch.setattr(repair.httpx, "AsyncClient", StubClient)
+
+    assert asyncio.run(repair._ords_request("identity-repairs/capabilities")) == {
+        "ok": True
+    }
+    assert observed["headers"] == {
+        "X-API-Username": "repair-user",
+        "X-API-Password": "repair-password",
+    }
+    assert "fleet-user" not in observed["headers"].values()
 
 
 def test_retryable_preview_failure_uses_durable_backoff(
