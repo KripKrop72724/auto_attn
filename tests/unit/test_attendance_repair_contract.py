@@ -131,3 +131,6 @@ def test_production_deploy_controls_both_repair_feature_gates() -> None:
         )
         assert pattern.search(script)
     assert "Attendance repair execution requires attendance repair preview" in script
+    assert "ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_USERNAME" in workflow
+    assert "ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_PASSWORD" in workflow
+    assert "Assert-OrdsRepairAuthentication" in script

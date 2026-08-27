@@ -62,6 +62,8 @@ class AddSettings(BaseSettings):
     attendance_repair_lease_seconds: int = Field(default=90, ge=30, le=10 * 60)
     attendance_repair_retry_limit: int = Field(default=12, ge=1, le=50)
     attendance_repair_source_max_age_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
+    attendance_repair_ords_username: str | None = None
+    attendance_repair_ords_password: str | None = None
     log_retention_days: int = 14
     telemetry_retention_days: int = 30
     session_retention_days: int = 90
@@ -159,10 +161,20 @@ class AddSettings(BaseSettings):
                 )
             if not self.ords_base_url:
                 missing.append("ADD_ORDS_BASE_URL")
-            if not self.ords_username:
-                missing.append("ADD_ORDS_USERNAME")
-            if not self.ords_password:
-                missing.append("ADD_ORDS_PASSWORD")
+            if not self.attendance_repair_ords_username:
+                missing.append("ADD_ATTENDANCE_REPAIR_ORDS_USERNAME")
+            if not self.attendance_repair_ords_password:
+                missing.append("ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD")
+            if (
+                self.attendance_repair_ords_username
+                and self.attendance_repair_ords_password
+                and self.attendance_repair_ords_username == self.ords_username
+                and self.attendance_repair_ords_password == self.ords_password
+            ):
+                raise RuntimeError(
+                    "Employee attendance repair must use a dedicated Oracle "
+                    "credential, not the connector/fleet credential."
+                )
         if missing:
             raise RuntimeError(f"Missing required ADD secrets: {', '.join(missing)}")
 

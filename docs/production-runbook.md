@@ -39,6 +39,10 @@ preserves the existing PostgreSQL and PII secrets. Configure the `add-production
 secrets `ADD_ORDS_USERNAME` and `ADD_ORDS_PASSWORD`; every deployment injects those approved Oracle
 credentials into the protected file so a stale host copy cannot silently restore an obsolete
 verifier.
+Employee repair additionally requires the separate `add-production` environment secrets
+`ADD_ATTENDANCE_REPAIR_ORDS_USERNAME` and `ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD`. The deployment
+rejects reuse of the connector pair and probes the ADD-only capability route before preview can
+remain enabled.
 The optional `ADD_ADMIN_PASSWORD_HASH` repository secret similarly enforces the approved Argon2id
 administrator verifier without placing the password in the workflow or checkout.
 Zone Lite 2.5.0 COMM Key management additionally requires the `add-production` environment secret

@@ -30,7 +30,10 @@ ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED=false
 ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED=false
 ```
 
-Execution cannot start unless preview is enabled and the ADD ORDS URL and credentials are configured. The server enforces:
+Execution cannot start unless preview is enabled and the ADD ORDS URL plus the dedicated
+`ADD_ATTENDANCE_REPAIR_ORDS_USERNAME` / `ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD` credential are
+configured. The generic `ADD_ORDS_USERNAME` / `ADD_ORDS_PASSWORD` connector credential is never
+sent to an identity-repair route. The server enforces:
 
 - one terminal per job;
 - 1–500 current employees;
@@ -96,6 +99,11 @@ The correction endpoint intentionally commits before serializing its response. I
 3. Verify `/health/ready`, sign-in, CSRF protection, password step-up, and the employee-repair tab while the gate is dark.
 4. Confirm the repair worker heartbeat is updating and that no new Oracle operation can be claimed while execution is disabled.
 5. Set preview enabled and execution disabled. Restart through the normal deployment process; do not edit a running container.
+
+Store the dedicated identity-repair username and password as `add-production` GitHub environment
+secrets named `ADD_ATTENDANCE_REPAIR_ORDS_USERNAME` and
+`ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD`. The deployment refuses preview when either is missing, when
+the pair matches the connector credential, or when the authenticated capability probe is not ready.
 
 Never use Alembic downgrade to roll back a production database containing repair jobs or identity revisions. Restore the paired PostgreSQL backup instead.
 

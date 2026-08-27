@@ -1329,7 +1329,10 @@ def _ords_url(path: str) -> str:
 
 
 async def _ords_request(path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not settings.ords_username or not settings.ords_password:
+    if (
+        not settings.attendance_repair_ords_username
+        or not settings.attendance_repair_ords_password
+    ):
         raise OracleRepairError(
             "The ADD-only Oracle repair credential is not configured.",
             code="ORDS_AUTHENTICATION_NOT_CONFIGURED",
@@ -1340,8 +1343,8 @@ async def _ords_request(path: str, *, payload: dict[str, Any] | None = None) -> 
         async with httpx.AsyncClient(
             timeout=settings.ords_timeout_seconds,
             headers={
-                "X-API-Username": settings.ords_username,
-                "X-API-Password": settings.ords_password,
+                "X-API-Username": settings.attendance_repair_ords_username,
+                "X-API-Password": settings.attendance_repair_ords_password,
             },
         ) as client:
             response = await client.request(method, _ords_url(path), json=payload)
