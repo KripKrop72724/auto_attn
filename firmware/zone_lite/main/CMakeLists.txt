@@ -18,3 +18,9 @@ idf_component_register(
     INCLUDE_DIRS "." "${ZONE_LITE_GENERATED_DIR}"
     REQUIRES esp_wifi esp_netif esp_http_server esp_driver_gpio nvs_flash lwip esp_http_client esp_https_ota app_update esp_partition esp-tls esp_app_format json spiffs mbedtls esp_timer led_strip esp_websocket_client
 )
+
+# This definition is deliberately absent from ordinary, canary, and nationwide
+# builds.  The dedicated Quetta workflow enables it for one exact-MAC HIL image.
+if(ZONE_LITE_QUETTA_DIAGNOSTIC)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_QUETTA_DIAGNOSTIC=1)
+endif()

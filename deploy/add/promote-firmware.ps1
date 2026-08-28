@@ -9,6 +9,10 @@ $ErrorActionPreference = 'Stop'
 $store = (Resolve-Path $StoreDirectory).Path
 $release = Join-Path $store $Version
 $markerPath = Join-Path $release '.hil-only.json'
+$diagnosticMarkerPath = Join-Path $release '.diagnostic-only.json'
+if (Test-Path -LiteralPath $diagnosticMarkerPath -PathType Leaf) {
+    throw "Firmware $Version is a non-promotable diagnostic release"
+}
 if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
     throw "Firmware $Version is not an HIL_ONLY release"
 }

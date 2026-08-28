@@ -109,6 +109,9 @@
 #ifndef ZONE_LITE_ZKT_EXPECTED_SERIAL
 #define ZONE_LITE_ZKT_EXPECTED_SERIAL ""
 #endif
+#ifndef ZONE_LITE_QUETTA_DIAGNOSTIC
+#define ZONE_LITE_QUETTA_DIAGNOSTIC 0
+#endif
 
 #define CMD_OPTIONS_RRQ 11
 #define CMD_USERTEMP_RRQ 9
@@ -384,6 +387,34 @@ typedef struct {
     uint8_t *data;
     size_t data_len;
 } zk_response_t;
+
+typedef enum {
+    ZK_COMM_PROBE_TCP_UNREACHABLE = 0,
+    ZK_COMM_PROBE_CONNECT_NO_RESPONSE,
+    ZK_COMM_PROBE_CONNECT_REJECTED,
+    ZK_COMM_PROBE_AUTH_NO_RESPONSE,
+    ZK_COMM_PROBE_AUTH_REJECTED,
+    ZK_COMM_PROBE_SERIAL_READ_FAILED,
+    ZK_COMM_PROBE_SERIAL_EMPTY,
+    ZK_COMM_PROBE_SERIAL_MISMATCH,
+    ZK_COMM_PROBE_AUTH_NOT_REQUIRED,
+    ZK_COMM_PROBE_VERIFIED,
+} zk_comm_probe_stage_t;
+
+typedef struct {
+    zk_comm_probe_stage_t stage;
+    uint16_t connect_response_code;
+    uint16_t auth_response_code;
+    uint16_t hosts_attempted;
+    uint16_t tcp_reachable;
+    bool connect_response_received;
+    bool auth_challenge_received;
+    bool auth_response_received;
+    bool serial_read;
+    bool serial_match;
+    bool preferred_ip_configured;
+    bool previous_candidate_available;
+} zk_comm_probe_diagnostics_t;
 
 typedef struct {
     char uid[16];
@@ -1067,7 +1098,11 @@ static bool zk_status_ok(uint16_t code)
            code == CMD_DATA;
 }
 
-static bool zk_connect_and_auth_with_key(int sock, zk_context_t *ctx, uint32_t comm_key)
+static bool zk_connect_and_auth_with_key_diagnosed(
+    int sock,
+    zk_context_t *ctx,
+    uint32_t comm_key,
+    zk_comm_probe_diagnostics_t *diagnostics)
 {
     uint8_t rx[1024];
     zk_response_t response = {0};
@@ -1076,10 +1111,15 @@ static bool zk_connect_and_auth_with_key(int sock, zk_context_t *ctx, uint32_t c
 
     if (!zk_send_command(sock, ctx, CMD_CONNECT, NULL, 0, rx, sizeof(rx), &response)) {
         ESP_LOGW(TAG, "ZKT CMD_CONNECT did not return a valid TCP response");
+        if (diagnostics) diagnostics->stage = ZK_COMM_PROBE_CONNECT_NO_RESPONSE;
         return false;
     }
 
     ctx->session_id = response.session_id;
+    if (diagnostics) {
+        diagnostics->connect_response_received = true;
+        diagnostics->connect_response_code = response.code;
+    }
     ESP_LOGI(
         TAG,
         "ZKT CMD_CONNECT response code=%u session=%u reply=%u data_len=%u",
@@ -1088,11 +1128,17 @@ static bool zk_connect_and_auth_with_key(int sock, zk_context_t *ctx, uint32_t c
         response.reply_id,
         (unsigned)response.data_len);
     if (response.code == CMD_ACK_UNAUTH) {
+        if (diagnostics) diagnostics->auth_challenge_received = true;
         uint8_t commkey[4];
         make_commkey(comm_key, ctx->session_id, commkey);
         if (!zk_send_command(sock, ctx, CMD_AUTH, commkey, sizeof(commkey), rx, sizeof(rx), &response)) {
             ESP_LOGW(TAG, "ZKT CMD_AUTH did not return a valid TCP response");
+            if (diagnostics) diagnostics->stage = ZK_COMM_PROBE_AUTH_NO_RESPONSE;
             return false;
+        }
+        if (diagnostics) {
+            diagnostics->auth_response_received = true;
+            diagnostics->auth_response_code = response.code;
         }
         ESP_LOGI(
             TAG,
@@ -1105,10 +1151,20 @@ static bool zk_connect_and_auth_with_key(int sock, zk_context_t *ctx, uint32_t c
 
     if (!zk_status_ok(response.code)) {
         ESP_LOGW(TAG, "ZKT auth failed with response code %u", response.code);
+        if (diagnostics) {
+            diagnostics->stage = diagnostics->auth_challenge_received
+                ? ZK_COMM_PROBE_AUTH_REJECTED
+                : ZK_COMM_PROBE_CONNECT_REJECTED;
+        }
         return false;
     }
     ctx->session_id = response.session_id;
     return true;
+}
+
+static bool zk_connect_and_auth_with_key(int sock, zk_context_t *ctx, uint32_t comm_key)
+{
+    return zk_connect_and_auth_with_key_diagnosed(sock, ctx, comm_key, NULL);
 }
 
 static bool zk_connect_and_auth(int sock, zk_context_t *ctx)
@@ -8763,26 +8819,61 @@ static bool probe_comm_key_candidate(
     uint32_t host_order_ip,
     uint32_t comm_key,
     const char *expected_serial,
-    char verified_serial[80])
+    char verified_serial[80],
+    zk_comm_probe_diagnostics_t *diagnostics)
 {
+    zk_comm_probe_diagnostics_t attempt = {
+        .stage = ZK_COMM_PROBE_TCP_UNREACHABLE,
+    };
+    if (diagnostics && diagnostics->hosts_attempted < UINT16_MAX) {
+        diagnostics->hosts_attempted++;
+    }
     int sock = -1;
     if (!tcp_connect_with_timeout(
             host_order_ip,
             ZONE_LITE_ZKT_PORT,
             ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS,
             &sock)) return false;
+    if (diagnostics && diagnostics->tcp_reachable < UINT16_MAX) {
+        diagnostics->tcp_reachable++;
+    }
     bool ok = false;
     zk_context_t ctx = {0};
-    if (zk_connect_and_auth_with_key(sock, &ctx, comm_key)) {
+    if (zk_connect_and_auth_with_key_diagnosed(sock, &ctx, comm_key, &attempt)) {
         char serial[80] = {0};
-        if (zk_read_option(sock, &ctx, "~SerialNumber", serial, sizeof(serial)) &&
-            serial[0] && strcmp(serial, expected_serial) == 0) {
+        bool serial_read = zk_read_option(sock, &ctx, "~SerialNumber", serial, sizeof(serial));
+        bool serial_matches = serial_read && strcmp(serial, expected_serial) == 0;
+        if (!serial_read) {
+            attempt.stage = ZK_COMM_PROBE_SERIAL_READ_FAILED;
+        } else if (!serial[0]) {
+            attempt.serial_read = true;
+            attempt.stage = ZK_COMM_PROBE_SERIAL_EMPTY;
+        } else if (!serial_matches) {
+            attempt.serial_read = true;
+            attempt.stage = ZK_COMM_PROBE_SERIAL_MISMATCH;
+        } else {
+            attempt.serial_read = true;
+            attempt.serial_match = true;
+            attempt.stage = attempt.auth_challenge_received
+                ? ZK_COMM_PROBE_VERIFIED
+                : ZK_COMM_PROBE_AUTH_NOT_REQUIRED;
             strlcpy(verified_serial, serial, 80);
             ok = true;
         }
     }
     if (ctx.session_id != 0) zk_disconnect(sock, &ctx);
     close(sock);
+    if (diagnostics && attempt.stage > diagnostics->stage) {
+        uint16_t hosts_attempted = diagnostics->hosts_attempted;
+        uint16_t tcp_reachable = diagnostics->tcp_reachable;
+        bool preferred_ip_configured = diagnostics->preferred_ip_configured;
+        bool previous_candidate_available = diagnostics->previous_candidate_available;
+        *diagnostics = attempt;
+        diagnostics->hosts_attempted = hosts_attempted;
+        diagnostics->tcp_reachable = tcp_reachable;
+        diagnostics->preferred_ip_configured = preferred_ip_configured;
+        diagnostics->previous_candidate_available = previous_candidate_available;
+    }
     return ok;
 }
 
@@ -8790,22 +8881,29 @@ static bool find_zkt_with_comm_key(
     uint32_t comm_key,
     const char *expected_serial,
     uint32_t *verified_ip,
-    char verified_serial[80])
+    char verified_serial[80],
+    zk_comm_probe_diagnostics_t *diagnostics)
 {
+    if (diagnostics) {
+        memset(diagnostics, 0, sizeof(*diagnostics));
+        diagnostics->stage = ZK_COMM_PROBE_TCP_UNREACHABLE;
+    }
     uint32_t candidates[2] = {0};
     size_t candidate_count = 0;
     const char *preferred = zone_config_get()->zkt_preferred_ip;
     struct in_addr preferred_address;
     if (preferred[0] && inet_pton(AF_INET, preferred, &preferred_address) == 1) {
         candidates[candidate_count++] = ntohl(preferred_address.s_addr);
+        if (diagnostics) diagnostics->preferred_ip_configured = true;
     }
     if (g_last_zkt_tcp_candidate_ip &&
         (candidate_count == 0 || candidates[0] != g_last_zkt_tcp_candidate_ip)) {
         candidates[candidate_count++] = g_last_zkt_tcp_candidate_ip;
+        if (diagnostics) diagnostics->previous_candidate_available = true;
     }
     for (size_t index = 0; index < candidate_count; index++) {
         if (probe_comm_key_candidate(
-                candidates[index], comm_key, expected_serial, verified_serial)) {
+                candidates[index], comm_key, expected_serial, verified_serial, diagnostics)) {
             *verified_ip = candidates[index];
             return true;
         }
@@ -8821,7 +8919,8 @@ static bool find_zkt_with_comm_key(
         if (address == own_ip ||
             (candidate_count > 0 && address == candidates[0]) ||
             (candidate_count > 1 && address == candidates[1])) continue;
-        if (probe_comm_key_candidate(address, comm_key, expected_serial, verified_serial)) {
+        if (probe_comm_key_candidate(
+                address, comm_key, expected_serial, verified_serial, diagnostics)) {
             *verified_ip = address;
             return true;
         }
@@ -8829,6 +8928,101 @@ static bool find_zkt_with_comm_key(
     }
     return false;
 }
+
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+static const char *comm_probe_stage_name(zk_comm_probe_stage_t stage)
+{
+    switch (stage) {
+        case ZK_COMM_PROBE_CONNECT_NO_RESPONSE: return "CONNECT_NO_RESPONSE";
+        case ZK_COMM_PROBE_CONNECT_REJECTED: return "CONNECT_REJECTED";
+        case ZK_COMM_PROBE_AUTH_NO_RESPONSE: return "AUTH_NO_RESPONSE";
+        case ZK_COMM_PROBE_AUTH_REJECTED: return "AUTH_REJECTED";
+        case ZK_COMM_PROBE_SERIAL_READ_FAILED: return "SERIAL_READ_FAILED";
+        case ZK_COMM_PROBE_SERIAL_EMPTY: return "SERIAL_EMPTY";
+        case ZK_COMM_PROBE_SERIAL_MISMATCH: return "SERIAL_MISMATCH";
+        case ZK_COMM_PROBE_AUTH_NOT_REQUIRED: return "AUTH_NOT_REQUIRED";
+        case ZK_COMM_PROBE_VERIFIED: return "VERIFIED";
+        case ZK_COMM_PROBE_TCP_UNREACHABLE:
+        default: return "TCP_4370_UNREACHABLE";
+    }
+}
+
+static const char *comm_probe_error_code(zk_comm_probe_stage_t stage)
+{
+    switch (stage) {
+        case ZK_COMM_PROBE_CONNECT_NO_RESPONSE: return "ZKT_CONNECT_NO_PROTOCOL_RESPONSE";
+        case ZK_COMM_PROBE_CONNECT_REJECTED: return "ZKT_CONNECT_RESPONSE_REJECTED";
+        case ZK_COMM_PROBE_AUTH_NO_RESPONSE: return "ZKT_AUTH_NO_PROTOCOL_RESPONSE";
+        case ZK_COMM_PROBE_AUTH_REJECTED: return "ZKT_AUTH_RESPONSE_REJECTED";
+        case ZK_COMM_PROBE_SERIAL_READ_FAILED: return "ZKT_SERIAL_READ_FAILED";
+        case ZK_COMM_PROBE_SERIAL_EMPTY: return "ZKT_SERIAL_EMPTY";
+        case ZK_COMM_PROBE_SERIAL_MISMATCH: return "ZKT_SERIAL_MISMATCH";
+        case ZK_COMM_PROBE_AUTH_NOT_REQUIRED: return "ZKT_AUTH_NOT_REQUIRED";
+        case ZK_COMM_PROBE_VERIFIED: return "COMM_KEY_DIAGNOSTIC_VERIFIED_NO_COMMIT";
+        case ZK_COMM_PROBE_TCP_UNREACHABLE:
+        default: return "ZKT_TCP_4370_UNREACHABLE";
+    }
+}
+
+static const char *comm_probe_error_message(zk_comm_probe_stage_t stage)
+{
+    switch (stage) {
+        case ZK_COMM_PROBE_CONNECT_NO_RESPONSE:
+            return "TCP opened, but the terminal did not return a valid legacy CMD_CONNECT response.";
+        case ZK_COMM_PROBE_CONNECT_REJECTED:
+            return "The terminal returned a legacy connect response that the connector does not accept.";
+        case ZK_COMM_PROBE_AUTH_NO_RESPONSE:
+            return "The terminal requested a COMM Key, but did not return a valid CMD_AUTH response.";
+        case ZK_COMM_PROBE_AUTH_REJECTED:
+            return "The terminal requested a COMM Key and rejected the candidate authentication.";
+        case ZK_COMM_PROBE_SERIAL_READ_FAILED:
+            return "Authentication completed, but the legacy serial-number option could not be read.";
+        case ZK_COMM_PROBE_SERIAL_EMPTY:
+            return "Authentication completed, but the legacy serial-number option was empty.";
+        case ZK_COMM_PROBE_SERIAL_MISMATCH:
+            return "Authentication completed, but the responding terminal did not match the pinned serial.";
+        case ZK_COMM_PROBE_AUTH_NOT_REQUIRED:
+            return "The expected terminal answered on the legacy protocol without requesting COMM Key authentication.";
+        case ZK_COMM_PROBE_VERIFIED:
+            return "The candidate authenticated the pinned terminal; diagnostic mode intentionally did not commit it.";
+        case ZK_COMM_PROBE_TCP_UNREACHABLE:
+        default:
+            return "No attempted candidate accepted TCP on the configured ZKT port.";
+    }
+}
+
+static void format_comm_probe_result(
+    const zk_comm_probe_diagnostics_t *diagnostics,
+    bool probe_started,
+    char *output,
+    size_t output_size)
+{
+    snprintf(
+        output,
+        output_size,
+        "{\"diagnostic_only\":true,\"configuration_committed\":false,"
+        "\"probe_started\":%s,\"probe_stage\":\"%s\","
+        "\"hosts_attempted\":%u,\"tcp_reachable\":%u,"
+        "\"preferred_ip_configured\":%s,\"previous_candidate_available\":%s,"
+        "\"local_scan_prefix\":24,\"connect_response_received\":%s,"
+        "\"connect_response_code\":%u,\"auth_challenge_received\":%s,"
+        "\"auth_response_received\":%s,\"auth_response_code\":%u,"
+        "\"serial_read\":%s,\"serial_match\":%s}",
+        probe_started ? "true" : "false",
+        comm_probe_stage_name(diagnostics->stage),
+        diagnostics->hosts_attempted,
+        diagnostics->tcp_reachable,
+        diagnostics->preferred_ip_configured ? "true" : "false",
+        diagnostics->previous_candidate_available ? "true" : "false",
+        diagnostics->connect_response_received ? "true" : "false",
+        diagnostics->connect_response_code,
+        diagnostics->auth_challenge_received ? "true" : "false",
+        diagnostics->auth_response_received ? "true" : "false",
+        diagnostics->auth_response_code,
+        diagnostics->serial_read ? "true" : "false",
+        diagnostics->serial_match ? "true" : "false");
+}
+#endif
 
 static bool process_pending_comm_key_command(void)
 {
@@ -8873,6 +9067,12 @@ static bool process_pending_comm_key_command(void)
     uint32_t candidate_key = 0;
     uint32_t verified_ip = 0;
     char verified_serial[80] = {0};
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+    bool probe_started = false;
+#endif
+    zk_comm_probe_diagnostics_t probe_diagnostics = {
+        .stage = ZK_COMM_PROBE_TCP_UNREACHABLE,
+    };
     bool already_applied =
         command.config_revision == zone_config_get()->zkt_comm_key_revision &&
         strcmp(
@@ -8892,17 +9092,32 @@ static bool process_pending_comm_key_command(void)
     }
     if (error_code == NULL) {
         vTaskDelay(pdMS_TO_TICKS(1500));
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+        probe_started = true;
+#endif
         if (!find_zkt_with_comm_key(
                 candidate_key,
                 command.expected_serial,
                 &verified_ip,
-                verified_serial)) {
+                verified_serial,
+                &probe_diagnostics)) {
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+            error_code = comm_probe_error_code(probe_diagnostics.stage);
+            error_message = comm_probe_error_message(probe_diagnostics.stage);
+#else
             error_code = "COMM_KEY_CANDIDATE_AUTH_FAILED";
             error_message = "The candidate did not authenticate the expected terminal.";
+#endif
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+        } else if (!probe_diagnostics.auth_challenge_received) {
+            error_code = comm_probe_error_code(ZK_COMM_PROBE_AUTH_NOT_REQUIRED);
+            error_message = comm_probe_error_message(ZK_COMM_PROBE_AUTH_NOT_REQUIRED);
+#endif
         } else if (zone_config_get()->zkt_expected_serial[0] &&
                    strcmp(zone_config_get()->zkt_expected_serial, verified_serial) != 0) {
             error_code = "COMM_KEY_TERMINAL_SERIAL_MISMATCH";
             error_message = "The authenticated terminal serial did not match the pinned serial.";
+#if !ZONE_LITE_QUETTA_DIAGNOSTIC
         } else if (!zone_config_get()->zkt_expected_serial[0] &&
                    zone_config_save_zkt_serial(verified_serial) != ESP_OK) {
             error_code = "COMM_KEY_SERIAL_PIN_FAILED";
@@ -8913,10 +9128,34 @@ static bool process_pending_comm_key_command(void)
                        command.config_operation_id) != ESP_OK) {
             error_code = "COMM_KEY_PERSIST_FAILED";
             error_message = "The verified key could not be committed to encrypted storage.";
+#endif
         }
     }
     mbedtls_platform_zeroize(&candidate_key, sizeof(candidate_key));
     g_comm_key_operation_active = false;
+#if ZONE_LITE_QUETTA_DIAGNOSTIC
+    char diagnostic_result[768];
+    format_comm_probe_result(
+        &probe_diagnostics,
+        probe_started,
+        diagnostic_result,
+        sizeof(diagnostic_result));
+    if (error_code == NULL) {
+        error_code = comm_probe_error_code(ZK_COMM_PROBE_VERIFIED);
+        error_message = comm_probe_error_message(ZK_COMM_PROBE_VERIFIED);
+    }
+    mark_command_processed(command.command_id);
+    (void)add_connector_command_update(
+        command.command_id, "FAILED", error_code, error_message, diagnostic_result);
+    (void)add_connector_command_complete(command.command_id);
+    add_connector_log(
+        "INFO",
+        "zkt_diagnostic",
+        error_code,
+        "Quetta-only read-only COMM Key protocol diagnostic completed without configuration commit");
+    add_connector_set_activity("ONLINE");
+    return true;
+#endif
     if (error_code == NULL) {
         g_last_authenticated_zkt_ip = verified_ip;
         strlcpy(g_device_serial, verified_serial, sizeof(g_device_serial));
