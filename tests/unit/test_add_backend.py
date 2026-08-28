@@ -37,6 +37,7 @@ from zk_add.comm_keys import (
     create_comm_key_change,
     decrypt_managed_key,
     expire_staged_comm_key_operations,
+    sanitize_comm_key_result,
     serialize_comm_key_state,
 )
 from zk_add.db import Base, SessionLocal
@@ -5395,7 +5396,6 @@ def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
         "verified_serial": SERIAL,
         "authentication_verified": True,
     }
-
     raw_session, admin = create_admin_session(
         db,
         username="StateHealthAdmin",
@@ -5445,6 +5445,46 @@ def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
     )
     assert state.status == "RECONCILIATION_REQUIRED"
     assert state.last_error_code == "COMM_KEY_REVISION_DRIFT"
+
+
+def test_comm_key_diagnostic_evidence_is_allowlisted_without_secret_or_address():
+    sanitized = sanitize_comm_key_result(
+        {
+            "diagnostic_only": True,
+            "configuration_committed": False,
+            "probe_started": True,
+            "probe_stage": "AUTH_REJECTED",
+            "hosts_attempted": "254",
+            "tcp_reachable": 1,
+            "local_scan_prefix": 24,
+            "connect_response_received": True,
+            "connect_response_code": "2005",
+            "auth_challenge_received": True,
+            "auth_response_received": True,
+            "auth_response_code": "2001",
+            "serial_read": False,
+            "serial_match": False,
+            "comm_key": "must-never-survive",
+            "ip_address": "192.0.2.10",
+        }
+    )
+
+    assert sanitized == {
+        "diagnostic_only": True,
+        "configuration_committed": False,
+        "probe_started": True,
+        "probe_stage": "AUTH_REJECTED",
+        "hosts_attempted": 254,
+        "tcp_reachable": 1,
+        "local_scan_prefix": 24,
+        "connect_response_received": True,
+        "connect_response_code": 2005,
+        "auth_challenge_received": True,
+        "auth_response_received": True,
+        "auth_response_code": 2001,
+        "serial_read": False,
+        "serial_match": False,
+    }
 
 
 def test_comm_key_recovery_attests_unobserved_serial_without_confirming_it(db: Session):

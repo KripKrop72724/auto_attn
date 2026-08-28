@@ -599,6 +599,24 @@ def sanitize_comm_key_result(result: dict) -> dict:
         "terminal_updated",
         "duplicate",
         "recovery_resolution",
+        # Read-only exact-MAC HIL evidence.  These fields contain no COMM Key,
+        # address, token, digest, or terminal serial material.
+        "diagnostic_only",
+        "configuration_committed",
+        "probe_started",
+        "probe_stage",
+        "hosts_attempted",
+        "tcp_reachable",
+        "preferred_ip_configured",
+        "previous_candidate_available",
+        "local_scan_prefix",
+        "connect_response_received",
+        "connect_response_code",
+        "auth_challenge_received",
+        "auth_response_received",
+        "auth_response_code",
+        "serial_read",
+        "serial_match",
     }
     sanitized = {key: result[key] for key in allowed if key in result}
     if "applied_revision" in sanitized:
@@ -606,9 +624,50 @@ def sanitize_comm_key_result(result: dict) -> dict:
             sanitized["applied_revision"] = int(sanitized["applied_revision"])
         except (TypeError, ValueError):
             sanitized.pop("applied_revision", None)
-    for key in ("authentication_verified", "terminal_updated", "duplicate"):
+    for key in (
+        "authentication_verified",
+        "terminal_updated",
+        "duplicate",
+        "diagnostic_only",
+        "configuration_committed",
+        "probe_started",
+        "preferred_ip_configured",
+        "previous_candidate_available",
+        "connect_response_received",
+        "auth_challenge_received",
+        "auth_response_received",
+        "serial_read",
+        "serial_match",
+    ):
         if key in sanitized:
             sanitized[key] = sanitized[key] is True
+    for key in (
+        "hosts_attempted",
+        "tcp_reachable",
+        "local_scan_prefix",
+        "connect_response_code",
+        "auth_response_code",
+    ):
+        if key in sanitized:
+            try:
+                sanitized[key] = int(sanitized[key])
+            except (TypeError, ValueError):
+                sanitized.pop(key, None)
+    if "probe_stage" in sanitized:
+        stage = sanitized["probe_stage"]
+        if not isinstance(stage, str) or stage not in {
+            "TCP_4370_UNREACHABLE",
+            "CONNECT_NO_RESPONSE",
+            "CONNECT_REJECTED",
+            "AUTH_NO_RESPONSE",
+            "AUTH_REJECTED",
+            "SERIAL_READ_FAILED",
+            "SERIAL_EMPTY",
+            "SERIAL_MISMATCH",
+            "AUTH_NOT_REQUIRED",
+            "VERIFIED",
+        }:
+            sanitized.pop("probe_stage", None)
     return sanitized
 
 
