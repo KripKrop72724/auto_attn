@@ -120,6 +120,81 @@ const reconciliationJob = {
   requested_at: '2026-08-07T05:01:32Z', started_at: '2026-08-07T05:01:36Z', capture_certified_at: null, oracle_certified_at: null, completed_at: null, updated_at: '2026-08-07T05:35:05Z',
 }
 
+const attendanceRepairCandidates = {
+  connector_id: device.connector_id,
+  device_id: device.device_id,
+  source_current: true,
+  source_certificate: { certificate_digest: '5'.repeat(64) },
+  date_scope: { timezone: 'Asia/Karachi', start_utc: null, end_utc_exclusive: null },
+  targets: [{
+    user_key: representativeUser.user_key,
+    row_version: representativeUser.row_version,
+    display_name: representativeUser.display_name,
+    cnic_masked: representativeUser.cnic_masked,
+    eligible: true,
+    exclusion_code: null,
+    cohorts: [{
+      cohort_token: '6'.repeat(64),
+      evidence_classification: 'CURRENT_USER_LINEAGE',
+      selectable: true,
+      exclusion_code: null,
+      source_device_user_key: representativeUser.user_key,
+      source_uid: '*',
+      source_user_id: '****',
+      first_event_at: '2026-05-01T03:15:00Z',
+      last_event_at: '2026-08-20T12:15:00Z',
+      event_count: 42,
+      membership_digest: '7'.repeat(64),
+      masked_identity: { variants: [{ display_name_masked: 'A***** K***', cnic_masked: '*****-****567-1' }], variant_count: 1, truncated: false },
+      source_evidence: { terminal_manifest_events: 42, exact_tombstone: false, source_types: ['FULL_HISTORY'] },
+    }, {
+      cohort_token: '8'.repeat(64),
+      evidence_classification: 'EXACT_TOMBSTONE',
+      selectable: true,
+      exclusion_code: null,
+      source_device_user_key: representativeUser.user_key,
+      source_uid: '**',
+      source_user_id: '****',
+      first_event_at: '2026-03-12T03:15:00Z',
+      last_event_at: '2026-03-18T12:15:00Z',
+      event_count: 6,
+      membership_digest: '9'.repeat(64),
+      masked_identity: { variants: [{ display_name_masked: 'O** N***', cnic_masked: '*****-****999-1' }], variant_count: 1, truncated: false },
+      source_evidence: { terminal_manifest_events: 6, exact_tombstone: true, source_types: ['TOMBSTONE'] },
+    }],
+  }],
+}
+
+const attendanceRepairJob = {
+  job_id: '55555555-5555-4555-8555-555555555555',
+  connector_id: device.connector_id,
+  device_id: device.device_id,
+  actor: 'StateHealthAdmin',
+  status: 'AWAITING_APPROVAL',
+  phase: 'PREVIEW_FROZEN',
+  date_scope: attendanceRepairCandidates.date_scope,
+  request_digest: '1'.repeat(64),
+  preview_digest: '2'.repeat(64),
+  preview_expires_at: '2026-08-28T12:15:00Z',
+  source_dependency_job_id: null,
+  totals: { employees: 1, events: 42, excluded: 0, completed_employees: 0, completed_events: 0, attention_events: 0 },
+  wait_reason: null,
+  error_code: null,
+  error_message: null,
+  cancellation_requested: false,
+  preparation_attempt_count: 0,
+  next_attempt_at: null,
+  created_at: '2026-08-28T12:00:00Z',
+  approved_at: null,
+  started_at: null,
+  completed_at: null,
+  typed_confirmation: `REPAIR 1 EMPLOYEES / 42 EVENTS ON ${device.device_id} ${'2'.repeat(12)}`,
+  downstream_impact: { timezone: 'Asia/Karachi', calendar_days: 42, employee_days: 42, before_identity_day_groups: 42, desired_identity_day_groups: 42, first_date: '2026-05-01', last_date: '2026-08-20' },
+  targets: [{ user_key: representativeUser.user_key, display_name: representativeUser.display_name, cnic_masked: representativeUser.cnic_masked, expected_row_version: representativeUser.row_version, desired_identity_digest: '3'.repeat(64), status: 'FROZEN', event_count: 42, completed_event_count: 0, attention_event_count: 0 }],
+  items: [],
+  items_next_cursor: null,
+}
+
 const factoryBundle = {
   bundle_id: 'zone-lite-2.4.5-6132c9b773b9', hardware_profile: 'esp32s3-16mb-zone-lite-v1',
   version: '2.4.5', git_sha: '6132c9b773b9a4016173e9b99dfde6ccc5dc29e5',
@@ -148,6 +223,11 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/provisioning/companions') json = { rows: [] }
     else if (url.pathname === '/api/v1/provisioning/sessions') json = { rows: [] }
     else if (url.pathname === '/api/v1/provisioning/companion-releases/latest') json = { platform: url.searchParams.get('platform'), version: '1.0.0', filename: 'add-provisioning-companion-windows-x64.exe', sha256: 'c'.repeat(64), size: 123456, git_sha: factoryBundle.git_sha, download_url: '/api/v1/provisioning/companion-releases/windows-x64/download', os_signed: false }
+    else if (url.pathname === `/api/v1/devices/${device.connector_id}/attendance-repairs/preflight`) json = { preview_enabled: true, execution_enabled: true, eligible: true, ready_now: true, requires_source_reconciliation: false, hard_blockers: [], waitable_blockers: [], limits: { employees: 500, events: 250000, oracle_batch: 100 }, source_certificate: attendanceRepairCandidates.source_certificate, terminal: { serial: device.zkt.serial, snapshot_complete: true, snapshot_stable: true, snapshot_revision: 9, attendance_count: 42 }, oracle: { available: true, capabilities: { contract_version: '1' } }, worker: { active_jobs: 0, review_items: 0, stale_leases: 0, oldest_job_age_seconds: 0 } }
+    else if (url.pathname === `/api/v1/devices/${device.connector_id}/attendance-repair-candidates/query`) json = attendanceRepairCandidates
+    else if (url.pathname === `/api/v1/devices/${device.connector_id}/attendance-repairs/prepare`) json = attendanceRepairJob
+    else if (url.pathname === `/api/v1/attendance-repairs/${attendanceRepairJob.job_id}`) json = attendanceRepairJob
+    else if (url.pathname === '/api/v1/attendance-repairs') json = { preview_enabled: true, execution_enabled: true, rows: [], next_cursor: null, totals: { all: 0, active: 0, attention: 0 }, worker: { active_jobs: 0, review_items: 0, stale_leases: 0, oldest_job_age_seconds: 0 } }
     else if (url.pathname === '/api/v1/reconciliations') json = { enabled: true, scheduler: { policy: 'BOUNDED_PARALLEL_PER_DEVICE', device_concurrency: 6, active_scan_jobs: 1, waiting_scan_jobs: 0, available_scan_slots: 5, history_backlog: 0, history_backlog_limit: 10000, reserved_credit: 0, available_credit: 10000 }, rows: [{ ...reconciliationJob, events: undefined }], next_cursor: null, filtered_total: 1, totals: { all: 1, active: 1, queued_waiting: 0, paused: 0, attention: 0, completed: 0, cancelled: 0 } }
     else if (url.pathname === `/api/v1/reconciliations/${reconciliationJob.job_id}`) json = reconciliationJob
     else if (url.pathname.endsWith('/reconciliations/preflight')) json = { eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [], connector: { connector_id: device.connector_id, device_id: device.device_id, display_name: device.display_name, zone_id: device.zone_id, connected: true, firmware_version: device.firmware_version }, terminal: { serial: device.zkt.serial, attendance_count: 42, user_count: 1, connection_state: 'ONLINE', identity_snapshot_revision: 1, range_resume_verified: true }, coverage: null }
@@ -374,6 +454,44 @@ test('populated Users and Attendance workspaces are responsive, keyboard-operabl
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
+})
+
+test('employee repair gives a simple, safe, and responsive guided flow', async ({ page }, testInfo) => {
+  await page.goto('/reconciliation?tab=employee-repair&device_id=connector-one')
+  await expect(page.getByRole('heading', { name: 'Fix past attendance for an employee' })).toBeVisible()
+  await expect(page.getByText('People can keep punching')).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Repair steps' })).toContainText('Machine')
+  await expect(page.getByRole('navigation', { name: 'Repair steps' })).toContainText('Done')
+
+  const employee = page.getByRole('checkbox', { name: 'Select Ayesha Khan' })
+  await employee.focus()
+  await page.keyboard.press('Space')
+  await expect(employee).toBeChecked()
+  await page.getByRole('button', { name: 'Review past punches' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Review the past punches we found' })).toBeVisible()
+  await expect(page.getByText('42 punches').first()).toBeVisible()
+  await expect(page.getByText('Only the employee name and CNIC can be fixed')).toBeVisible()
+  const olderRecords = page.getByText(/Possible older employee records \(1\)/)
+  await olderRecords.click()
+  await expect(page.getByText(/Previous details O\*\* N\*\*\*/)).toBeVisible()
+  await expect(page.getByText('Not safe to include automatically')).toHaveCount(0)
+
+  let dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('employee-repair-review.png'), fullPage: true })
+
+  await page.getByRole('button', { name: 'Prepare final check' }).click()
+  await expect(page.getByRole('heading', { name: 'Waiting for approval' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Ready for your final confirmation' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Check once more, then start the repair' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Start the repair' })).toBeDisabled()
+
+  dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('employee-repair-confirm.png'), fullPage: true })
 })
 
 test('terminal multi-selection survives server-side search and current-view toggles', async ({ page }, testInfo) => {

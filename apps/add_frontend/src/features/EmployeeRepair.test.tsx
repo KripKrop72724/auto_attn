@@ -154,7 +154,7 @@ describe('Employee repair workspace', () => {
     vi.unstubAllGlobals()
   })
 
-  it('freezes only stable keys and server cohort tokens while execution is dark', async () => {
+  it('guides an operator in plain language while sending only stable repair keys', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), 'https://add.test')
       if (url.pathname.endsWith('/attendance-repairs/preflight'))
@@ -284,13 +284,32 @@ describe('Employee repair workspace', () => {
     vi.stubGlobal('fetch', fetchMock)
     render(<Harness />)
 
-    const employee = await screen.findByRole('option', { name: /Ayesha Khan/i })
+    expect(
+      await screen.findByRole('heading', {
+        name: 'Fix past attendance for an employee',
+      }),
+    ).toBeTruthy()
+    expect(
+      screen.getByRole('navigation', { name: 'Repair steps' }).textContent,
+    ).toContain('MachineChoose where the employee punches')
+    expect(
+      screen.getByRole('navigation', { name: 'Repair steps' }).textContent,
+    ).toContain('DoneWatch the repair finish')
+    expect(screen.getByText('People can keep punching')).toBeTruthy()
+
+    const employee = await screen.findByRole('checkbox', {
+      name: 'Select Ayesha Khan',
+    })
     expect(document.body.textContent).not.toContain('3520212345671')
     fireEvent.click(employee)
-    fireEvent.click(screen.getByRole('button', { name: /Build repair candidates/i }))
-    await screen.findByRole('heading', { name: 'Exact source cohorts' })
-    fireEvent.click(screen.getByRole('button', { name: 'Freeze immutable preview' }))
-    await screen.findByRole('heading', { name: 'Awaiting approval' })
+    fireEvent.click(screen.getByRole('button', { name: /Review past punches/i }))
+    await screen.findByRole('heading', { name: 'Review the past punches we found' })
+    expect(screen.getByText('Only the employee name and CNIC can be fixed')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Prepare final check' }))
+    await screen.findByRole('heading', { name: 'Waiting for approval' })
+    expect(
+      screen.getByRole('heading', { name: 'Check once more, then start the repair' }),
+    ).toBeTruthy()
 
     const prepareCall = fetchMock.mock.calls.find(([input]) =>
       String(input).endsWith('/attendance-repairs/prepare'),
@@ -307,9 +326,8 @@ describe('Employee repair workspace', () => {
     expect(String(prepareCall?.[1]?.body)).not.toContain('Ayesha Khan')
     expect(String(prepareCall?.[1]?.body)).not.toContain('3520212345671')
     expect(
-      (screen.getByRole('button', {
-        name: /Approve repair and resync/i,
-      }) as HTMLButtonElement).disabled,
+      (screen.getByRole('button', { name: /Start the repair/i }) as HTMLButtonElement)
+        .disabled,
     ).toBe(true)
     await waitFor(() => expect(window.location.search).toContain(`repair_job=${job.job_id}`))
   })

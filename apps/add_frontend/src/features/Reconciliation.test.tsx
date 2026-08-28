@@ -415,7 +415,7 @@ describe('Reviewed source-exception continuation', () => {
     expect(repairTab.getAttribute('aria-selected')).toBe('true')
     expect(
       await screen.findByRole('heading', {
-        name: 'Repair effective attendance identity',
+        name: 'Fix past attendance for an employee',
       }),
     ).toBeTruthy()
 
