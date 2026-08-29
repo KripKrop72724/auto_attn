@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useToast } from '../App'
 import type { CommKeyState, Device } from '../types'
@@ -49,10 +49,16 @@ const response = (body: unknown) => new Response(JSON.stringify(body), {
   headers: { 'Content-Type': 'application/json' },
 })
 
+let activeDevice = device
+
 describe('DeviceDrawer COMM Key controls', () => {
   beforeEach(() => {
+    activeDevice = device
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
+      if (path.endsWith('/terminal-binding/replace') && init?.method === 'POST') {
+        return response({ device: activeDevice, command: { command_id: 'replacement-command' } })
+      }
       if (path.endsWith('/comm-key/reveal') && init?.method === 'POST') {
         return response({
           comm_key: '1979',
@@ -63,7 +69,7 @@ describe('DeviceDrawer COMM Key controls', () => {
       }
       if (path.endsWith('/comm-key')) return response(state)
       if (path.includes('/logs?') || path.includes('/connectivity?')) return response({ rows: [] })
-      if (path.endsWith(`/devices/${device.connector_id}`)) return response(device)
+      if (path.endsWith(`/devices/${device.connector_id}`)) return response(activeDevice)
       throw new Error(`Unexpected request: ${path}`)
     }))
   })
@@ -101,5 +107,79 @@ describe('DeviceDrawer COMM Key controls', () => {
     expect(await screen.findByText('1979')).not.toBeNull()
     fireEvent.blur(window)
     await waitFor(() => expect(screen.queryByText('1979')).toBeNull())
+  })
+
+  it('requires exact old/new serial evidence for an authenticated terminal replacement', async () => {
+    activeDevice = {
+      ...device,
+      state: 'DEGRADED',
+      zkt: {
+        id: 7,
+        serial: 'CKPG221260408',
+        expected_serial: 'AEH2232460004',
+        confirmed_serial: 'AEH2232460004',
+        terminal_binding_state: 'CONFIRMED',
+        serial_confirmed_by: 'StateHealthAdmin',
+        serial_confirmed_at: '2026-08-27T05:00:00Z',
+        ip_address: '192.168.1.250',
+        model: 'uFace800 Plus/ID',
+        platform: 'ZMM720_TFT',
+        online: false,
+        connection_state: 'ONLINE',
+        consecutive_failures: 0,
+        consecutive_successes: 1,
+        flap_count_15m: 0,
+        last_transition_at: '2026-08-29T08:00:00Z',
+        last_online_at: '2026-08-29T08:00:00Z',
+        offline_since: null,
+        stability_since: null,
+        backoff_until: null,
+        probe_latency_ms: 5,
+        certification_state: 'READ_ONLY',
+        certification_observations: 0,
+        capabilities: {},
+        snapshot_complete: false,
+        writes_disabled_reason: 'SERIAL_MISMATCH',
+        user_count: 48,
+        attendance_count: 0,
+        device_time: null,
+        device_time_sampled_at: null,
+        drift_seconds: null,
+        last_reconcile_at: null,
+        next_restart_at: null,
+      },
+    }
+    const toast = { notice: vi.fn(), error: vi.fn() } as unknown as ReturnType<typeof useToast>
+    render(
+      <DeviceDrawer
+        seed={activeDevice}
+        revision={0}
+        onClose={vi.fn()}
+        onManageUsers={vi.fn()}
+        toast={toast}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'control' }))
+    const card = screen.getByRole('heading', { name: 'Replace terminal binding' }).closest('article')
+    expect(card).not.toBeNull()
+    const controls = within(card as HTMLElement)
+    fireEvent.change(controls.getByLabelText(/Type REPLACE connector-quetta/), {
+      target: { value: 'REPLACE connector-quetta AEH2232460004 CKPG221260408' },
+    })
+    fireEvent.change(controls.getByLabelText('Confirm administrator password'), {
+      target: { value: 'correct-password' },
+    })
+    fireEvent.click(controls.getByRole('button', { name: 'Replace binding' }))
+
+    await waitFor(() => expect(toast.notice).toHaveBeenCalled())
+    const request = vi.mocked(fetch).mock.calls.find(([input]) =>
+      String(input).endsWith('/terminal-binding/replace'))
+    expect(request).toBeTruthy()
+    expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({
+      current_serial: 'AEH2232460004',
+      observed_serial: 'CKPG221260408',
+      typed_confirmation: 'REPLACE connector-quetta AEH2232460004 CKPG221260408',
+    })
   })
 })

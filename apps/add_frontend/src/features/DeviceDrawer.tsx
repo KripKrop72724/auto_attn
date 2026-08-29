@@ -35,6 +35,9 @@ export function DeviceDrawer({
   const [commKeyReason, setCommKeyReason] = useState('Recover remote connector communication access')
   const [commKeyConfirmation, setCommKeyConfirmation] = useState('')
   const [commKeyPassword, setCommKeyPassword] = useState('')
+  const [replacementReason, setReplacementReason] = useState('Replace the connector binding with the authenticated physical terminal')
+  const [replacementConfirmation, setReplacementConfirmation] = useState('')
+  const [replacementPassword, setReplacementPassword] = useState('')
   const [revealReason, setRevealReason] = useState('Authorized operational recovery inspection')
   const [revealConfirmation, setRevealConfirmation] = useState('')
   const [revealPassword, setRevealPassword] = useState('')
@@ -157,6 +160,34 @@ export function DeviceDrawer({
       toast.error(error instanceof Error ? error.message : 'COMM Key operation could not be cancelled.')
     }
   }
+  const replaceTerminalBinding = async () => {
+    const currentSerial = device.zkt?.confirmed_serial || device.zkt?.expected_serial
+    const observedSerial = device.zkt?.serial
+    if (!currentSerial || !observedSerial || currentSerial === observedSerial) return
+    if (!replacementPassword) return toast.error('Confirm the administrator password for this terminal replacement.')
+    setBusy(true)
+    try {
+      await api(`/api/v1/devices/${device.connector_id}/terminal-binding/replace`, {
+        method: 'POST',
+        body: JSON.stringify({
+          current_serial: currentSerial,
+          observed_serial: observedSerial,
+          reason: replacementReason,
+          typed_confirmation: replacementConfirmation,
+          password: replacementPassword,
+          idempotency_key: idempotency('terminal-replacement'),
+        }),
+      })
+      toast.notice('Terminal replacement was authorized and sent for device acknowledgement.')
+      setReplacementPassword('')
+      setReplacementConfirmation('')
+      await load()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Terminal replacement could not be authorized.')
+    } finally {
+      setBusy(false)
+    }
+  }
   const handleTabKey = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
     let next = index
     if (event.key === 'ArrowRight') next = (index + 1) % drawerTabs.length
@@ -170,6 +201,11 @@ export function DeviceDrawer({
       ?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]
       ?.focus()
   }
+  const currentBindingSerial = device.zkt?.confirmed_serial || device.zkt?.expected_serial || ''
+  const observedTerminalSerial = device.zkt?.serial || ''
+  const terminalReplacementNeeded = Boolean(
+    currentBindingSerial && observedTerminalSerial && currentBindingSerial !== observedTerminalSerial,
+  )
   return (
     <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
       <div className="drawer-status"><StatusBadge state={device.state} live={device.connected} /><span>{device.current_activity || 'Idle'} · Last contact {relativeTime(device.last_seen_at)}</span></div>
@@ -230,6 +266,13 @@ export function DeviceDrawer({
         {tab === 'control' && <div className="control-stack">
           <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
           <article className="control-card"><span><Icon name="refresh" /></span><div><h3>Refresh terminal users</h3><p>Request two matching terminal reads. Current verified revision: {device.zkt?.identity_snapshot_revision || 'none'} · {device.zkt?.identity_snapshot_stable ? 'stable' : 'awaiting verification'}{device.zkt?.identity_snapshot_observed_at ? ` · ${relativeTime(device.zkt.identity_snapshot_observed_at)}` : ''}.</p></div><button className="button secondary" onClick={() => void refreshUsers()}>Request verified reread</button></article>
+          {terminalReplacementNeeded && <article className="control-card pattern-blocked"><span><Icon name="shield" /></span><div>
+            <h3>Replace terminal binding</h3>
+            <p>The authenticated physical terminal reports serial <strong>{observedTerminalSerial}</strong>, while this connector remains bound to <strong>{currentBindingSerial}</strong>. User and attendance writes remain blocked until the ESP persists the replacement serial.</p>
+            <label>Operational reason<input value={replacementReason} onChange={(event) => setReplacementReason(event.target.value)} /></label>
+            <label>Type <strong>REPLACE {device.connector_id} {currentBindingSerial} {observedTerminalSerial}</strong><input value={replacementConfirmation} onChange={(event) => setReplacementConfirmation(event.target.value)} /></label>
+            <label>Confirm administrator password<input type="password" autoComplete="current-password" value={replacementPassword} onChange={(event) => setReplacementPassword(event.target.value)} /></label>
+          </div><button className="button destructive" disabled={busy} onClick={() => void replaceTerminalBinding()}>{busy ? 'Authorizing…' : 'Replace binding'}</button></article>}
           <article className="control-card comm-key-card"><span><Icon name="shield" /></span><div>
             <h3>COMM Key recovery</h3>
             <p>

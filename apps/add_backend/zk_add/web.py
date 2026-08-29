@@ -99,6 +99,7 @@ from zk_add.schemas import (
     SourceProbeResultRequest,
     SourceTailChunkRequest,
     TerminalSerialConfirmRequest,
+    TerminalSerialReplaceRequest,
     UserCreateRequest,
     UserDeleteRequest,
     UserSelectionValidationRequest,
@@ -860,6 +861,121 @@ async def confirm_device_terminal_binding(
             "hardware_mac": connector.hardware_id,
             "terminal_serial": body.observed_serial,
             "command_id": command.command_id,
+        },
+    )
+    db.commit()
+    await dispatch_command(connector, command)
+    await browser_events.publish(
+        "device",
+        {
+            "connector_id": connector.connector_id,
+            "terminal_binding_state": zkt.terminal_binding_state,
+        },
+    )
+    return {
+        "device": serialize_connector(connector),
+        "command": command_response(command),
+    }
+
+
+@app.post(
+    "/api/v1/devices/{connector_id}/terminal-binding/replace",
+    status_code=202,
+)
+async def replace_device_terminal_binding(
+    request: Request,
+    connector_id: str,
+    body: TerminalSerialReplaceRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    zkt = connector.zkt_device
+    if zkt is None or not zkt.serial:
+        raise HTTPException(
+            status_code=409,
+            detail="The authenticated connector has not reported a replacement terminal serial.",
+        )
+    current_serial = zkt.confirmed_serial or zkt.expected_serial
+    if not current_serial or body.current_serial != current_serial:
+        raise HTTPException(
+            status_code=409,
+            detail="The current terminal binding changed; refresh before replacing it.",
+        )
+    if body.observed_serial != zkt.serial:
+        raise HTTPException(
+            status_code=409,
+            detail="Observed replacement serial changed; refresh the authenticated terminal evidence.",
+        )
+    if body.observed_serial == current_serial:
+        raise HTTPException(status_code=409, detail="The replacement serial matches the current binding.")
+    expected_confirmation = (
+        f"REPLACE {connector.connector_id} {current_serial} {body.observed_serial}"
+    )
+    if body.typed_confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Type '{expected_confirmation}' to confirm this terminal replacement.",
+        )
+    if not connector.connected or zkt.connection_state not in {"RECOVERING", "ONLINE"}:
+        raise HTTPException(
+            status_code=409,
+            detail="A current authenticated replacement-terminal observation is required.",
+        )
+    collision = db.scalar(
+        select(ZKTDevice).where(
+            ZKTDevice.id != zkt.id,
+            or_(
+                ZKTDevice.serial == body.observed_serial,
+                ZKTDevice.expected_serial == body.observed_serial,
+                ZKTDevice.confirmed_serial == body.observed_serial,
+            ),
+        )
+    )
+    if collision:
+        raise HTTPException(
+            status_code=409,
+            detail="That replacement terminal serial is already associated with another connector.",
+        )
+
+    zkt.expected_serial = body.observed_serial
+    zkt.confirmed_serial = None
+    zkt.terminal_binding_state = "PENDING_DEVICE_ACK"
+    zkt.serial_confirmed_by = context.username
+    zkt.serial_confirmed_at = utc_now()
+    zkt.certification_state = "READ_ONLY"
+    zkt.certification_fingerprint = None
+    zkt.certification_observations = 0
+    zkt.writes_disabled_reason = "TERMINAL_SERIAL_PENDING_DEVICE_ACK"
+    try:
+        command = create_command(
+            db,
+            connector=connector,
+            command_type="PIN_TERMINAL_SERIAL",
+            payload={"serial": body.observed_serial},
+            expected_state={"serial": body.observed_serial},
+            desired_state={"expected_serial": body.observed_serial},
+            idempotency_key=body.idempotency_key,
+            actor=context.username,
+            expires_in_seconds=10 * 60,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    append_audit(
+        db,
+        actor=context.username,
+        action="TERMINAL_BINDING_REPLACEMENT_REQUESTED",
+        target_type="connector",
+        target_id=connector.connector_id,
+        outcome=command.status,
+        ip_address=client_ip(request),
+        before={"terminal_serial": current_serial},
+        after={
+            "hardware_mac": connector.hardware_id,
+            "terminal_serial": body.observed_serial,
+            "command_id": command.command_id,
+            "reason": body.reason,
         },
     )
     db.commit()

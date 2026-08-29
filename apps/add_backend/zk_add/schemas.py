@@ -482,6 +482,15 @@ class TerminalSerialConfirmRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class TerminalSerialReplaceRequest(BaseModel):
+    current_serial: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,79}$")
+    observed_serial: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,79}$")
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 class CommKeyChangeRequest(BaseModel):
     new_key: SecretStr
     mode: Literal["ESP_ONLY", "ESP_AND_TERMINAL"]
