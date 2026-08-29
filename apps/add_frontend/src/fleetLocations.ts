@@ -6,6 +6,7 @@ export type FleetLocationId =
   | 'peshawar'
   | 'swat'
   | 'faisalabad'
+  | 'lahore'
   | 'quetta'
   | 'multan'
   | 'karachi'
@@ -76,6 +77,7 @@ export const fleetLocationDefinitions: FleetLocationDefinition[] = [
   defineFleetLocation({ id: 'peshawar', city: 'Peshawar', region: 'Khyber Pakhtunkhwa', latitude: 34.0151, longitude: 71.5249, labelSide: 'left' }),
   defineFleetLocation({ id: 'islamabad', city: 'Islamabad', region: 'Islamabad Capital Territory', latitude: 33.6844, longitude: 73.0479, labelSide: 'left' }),
   defineFleetLocation({ id: 'faisalabad', city: 'Faisalabad', region: 'Punjab', latitude: 31.4504, longitude: 73.1350, labelSide: 'left' }),
+  defineFleetLocation({ id: 'lahore', city: 'Lahore', region: 'Punjab', latitude: 31.5204, longitude: 74.3587, labelSide: 'left' }),
   defineFleetLocation({ id: 'quetta', city: 'Quetta', region: 'Balochistan', latitude: 30.1798, longitude: 66.9750, labelSide: 'right' }),
   defineFleetLocation({ id: 'multan', city: 'Multan', region: 'Punjab', latitude: 30.1575, longitude: 71.5249, labelSide: 'right' }),
   defineFleetLocation({ id: 'karachi', city: 'Karachi', region: 'Sindh', latitude: 24.8607, longitude: 67.0011, labelSide: 'right' }),
@@ -98,6 +100,7 @@ export function resolveFleetLocation(device: Pick<Device, 'zone_id' | 'zone_name
   if (/\bPESHAWAR\b|\bPESH\b/.test(value)) return definitionById.get('peshawar') || null
   if (/\bSWAT\b/.test(value)) return definitionById.get('swat') || null
   if (/\bFAISALABAD\b|\bFSD\b/.test(value)) return definitionById.get('faisalabad') || null
+  if (/\bLAHORE\b|\bLHE\b/.test(value)) return definitionById.get('lahore') || null
   if (/\bQUETTA\b/.test(value)) return definitionById.get('quetta') || null
   if (/\bMULTAN\b/.test(value)) return definitionById.get('multan') || null
   return null
