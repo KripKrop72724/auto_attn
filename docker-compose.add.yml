@@ -160,7 +160,7 @@ services:
       ADD_ORDS_PASSWORD: ${ADD_ORDS_PASSWORD:-}
       ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64: ${ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64:-}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/health/ready', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/health/live', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 4

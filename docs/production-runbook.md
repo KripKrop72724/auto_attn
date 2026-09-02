@@ -133,12 +133,13 @@ liveness, synchronous request-thread availability, and dependency readiness. Aft
 consecutive liveness failures it terminates the wedged API process, and the
 Compose `unless-stopped` policy starts a clean process. A database or protected-provisioner
 readiness failure marks the API unhealthy but does not create an API dependency restart loop.
-An isolated `add-watchdog` watches the Docker health state of PostgreSQL, Redis, the provisioner,
-and Nginx and restarts a service after Docker's own bounded health retries declare it unhealthy.
-API process recovery remains liveness-only inside its own probe. The watchdog has no network
-interface and no application secrets. Its Docker socket mount grants host-engine control by
-necessity; no application container receives that mount, and the Compose contract test enforces
-that boundary.
+An isolated `add-watchdog` watches the Docker health state of PostgreSQL, Redis, provisioner
+process liveness, and Nginx and restarts a service after Docker's own bounded health retries
+declare it unhealthy. Configuration readiness remains separate so a deliberately disabled
+provisioner cannot create a restart loop. API process recovery remains liveness-only inside its
+own probe. The watchdog has no network interface and no application secrets. Its Docker socket
+mount grants host-engine control by necessity; no application container receives that mount, and
+the Compose contract test enforces that boundary.
 
 Production defaults reserve 16 GB for PostgreSQL, 8 GB for ADD API, 4 GB for the protected
 provisioner, 2 GB for Redis, 1 GB for the web container, and 256 MB for the stack watchdog.

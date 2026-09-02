@@ -195,6 +195,13 @@ def _run_builder(request: dict, output: Path) -> None:
     )
 
 
+@app.get("/health/live")
+def live():
+    """Prove the protected worker process can serve requests."""
+
+    return {"ok": True, "service": "add-provisioner"}
+
+
 @app.get("/health/ready")
 def ready():
     required = (
