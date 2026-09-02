@@ -6,6 +6,10 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $compose = @("compose", "--env-file", ".env.add", "-f", "docker-compose.add.yml")
+$rollbackCompose = @(
+    "compose", "--env-file", ".env.add", "-f", "docker-compose.add.yml",
+    "-f", "deploy/add/docker-compose.rollback.yml"
+)
 $apiImage = "state-life/add-api:production"
 $webImage = "state-life/add-web:production"
 $provisionerImage = "state-life/add-provisioner:production"
@@ -65,7 +69,9 @@ function Write-DockerFailureDiagnostics {
         $ErrorActionPreference = "Continue"
         Write-Warning "Capturing bounded pre-rollback container diagnostics."
         $psArguments = $compose + @("ps", "-a")
-        $logArguments = $compose + @("logs", "--no-color", "--tail", "250", "add-api")
+        $logArguments = $compose + @(
+            "logs", "--no-color", "--tail", "250", "add-api", "add-watchdog"
+        )
         $diagnostics = @(& docker @psArguments 2>&1) + @(& docker @logArguments 2>&1)
         $material = (($diagnostics | ForEach-Object { "$_" }) -join "`n")
         foreach ($name in @(
@@ -811,7 +817,9 @@ try {
             $rollbackServices = @("postgres", "redis", "add-api", "add-web")
             if ($previousProvisioningEnabled) { $rollbackServices += "add-provisioner" }
             if ($preWatchdogImage) { $rollbackServices += "add-watchdog" }
-            Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans") + $rollbackServices)
+            Invoke-Docker -Arguments ($rollbackCompose + @(
+                "up", "-d", "--no-build", "--remove-orphans"
+            ) + $rollbackServices)
             Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
             Wait-Endpoint -Uri "http://127.0.0.1:8095/"
             throw "Deployment failed and the previous release was restored: $deploymentError"

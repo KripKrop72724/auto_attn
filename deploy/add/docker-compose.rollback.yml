@@ -1,0 +1,10 @@
+services:
+  add-api:
+    # A rollback image can predate the current image-resident healthcheck helper.
+    # Keep the rollback probe dependency-free and compatible with prior releases.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 60s
