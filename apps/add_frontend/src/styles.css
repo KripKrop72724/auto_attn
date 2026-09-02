@@ -812,6 +812,21 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .fleet-panel-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .fleet-view-toggle button { min-height: 44px; display: inline-flex; align-items: center; gap: 7px; }
 .fleet-view-toggle button svg { width: 16px; height: 16px; }
+.fleet-inventory-tabs { width: min(100%, 520px); margin-bottom: 24px; }
+.fleet-inventory-tabs button { flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.fleet-inventory-tabs button svg { width: 17px; height: 17px; }
+.fleet-inventory-tabs button span { min-width: 24px; height: 22px; display: inline-grid; place-items: center; margin-left: 2px; padding: 0 7px; border-radius: 999px; color: var(--muted); background: rgba(82,100,117,.09); font-size: 11px; }
+.fleet-inventory-tabs button.active span { color: var(--brand-700); background: var(--brand-50); }
+.spare-inventory-banner { min-height: 132px; display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(180px, auto); align-items: center; gap: 18px; margin-bottom: 24px; padding: 21px 24px; border: 1px solid var(--line); border-left: 4px solid #8da0ad; border-radius: 14px; background: linear-gradient(135deg, #fff, #f5f8fa); box-shadow: var(--shadow-sm); }
+.spare-inventory-icon { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 12px; color: #526475; background: #eaf0f3; }
+.spare-inventory-icon svg { width: 22px; }
+.spare-inventory-banner h2 { margin: 3px 0 6px; font-size: 19px; }
+.spare-inventory-banner p:not(.eyebrow) { max-width: 700px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.spare-inventory-count { min-width: 180px; display: grid; gap: 3px; padding-left: 20px; border-left: 1px solid var(--line); }
+.spare-inventory-count strong { font-size: 29px; line-height: 1; }
+.spare-inventory-count span { font-size: 13px; font-weight: 750; }
+.spare-inventory-count small { max-width: 190px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.auto-onboard-note.spare-note { color: #526475; background: #eef3f6; }
 .fleet-map-fallback { min-height: 480px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); background: linear-gradient(145deg, #f5f8fa, #eef3f6); }
 .fleet-map-fallback svg { color: var(--brand-700); }
 .search-field input { border-radius: 10px; }
@@ -827,6 +842,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .device-card-main:hover { background: #f7fbfd; }
 .device-symbol { border: 0; border-radius: 11px; background: var(--brand-50); }
 .device-card-actions { min-height: 44px; background: #fbfcfd; }
+.spare-device-card .device-symbol { color: #526475; background: #eef3f6; }
+.spare-device-card .device-card-main { background: linear-gradient(90deg, #fff, #fbfcfd); }
+.spare-device-card .device-card-main:hover { background: #f5f8fa; }
 
 .status-badge { min-height: 27px; border: 1px solid var(--line-strong) !important; border-radius: 999px; letter-spacing: .02em; }
 .status-badge.pattern-confirmed { color: var(--positive); border-color: #8bcdb4 !important; background: var(--positive-soft); }
@@ -915,6 +933,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
 .device-drawer .dialog-header { border-radius: 16px 0 0; }
 .drawer-content { background: var(--canvas); }
 .detail-card { border-color: var(--line); border-radius: 12px; box-shadow: var(--shadow-sm); }
+.inventory-assignment-card { min-height: 132px; display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: center; gap: 16px; border-left: 4px solid var(--brand-600); }
+.inventory-assignment-card.is-spare { border-left-color: #8da0ad; background: linear-gradient(135deg, #fff, #f5f8fa); }
+.inventory-assignment-icon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 11px; color: var(--brand-700); background: var(--brand-50); }
+.inventory-assignment-card.is-spare .inventory-assignment-icon { color: #526475; background: #eaf0f3; }
+.inventory-assignment-icon svg { width: 21px; }
+.inventory-assignment-card h3 { margin: 2px 0 6px; }
+.inventory-assignment-card p:not(.eyebrow) { max-width: 610px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.spare-drawer-status { background: #f5f8fa; }
 .tabs button { border-radius: 0; }
 .control-card { border-radius: 12px; box-shadow: var(--shadow-sm); }
 .toast { border-radius: 12px; }
@@ -982,6 +1008,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
   .fleet-panel-actions { width: 100%; align-items: stretch; flex-direction: column; }
   .fleet-view-toggle { width: 100%; }
   .fleet-view-toggle button { flex: 1 1 0; justify-content: center; }
+  .fleet-inventory-tabs { width: 100%; }
+  .spare-inventory-banner { grid-template-columns: 44px minmax(0, 1fr); padding: 18px; }
+  .spare-inventory-count { grid-column: 1 / -1; padding: 14px 0 0; border-top: 1px solid var(--line); border-left: 0; }
   .toolbar { align-items: stretch; flex-direction: column; }
   .device-card-main { grid-template-columns: 42px minmax(0,1fr) auto 18px; }
   .device-card-actions { padding-left: 14px; }
@@ -1008,6 +1037,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-600); box-
   .section-tabs button { flex: 0 0 auto; }
   .device-drawer { width: 100%; border-radius: 0; }
   .device-drawer .dialog-header { border-radius: 0; }
+  .inventory-assignment-card { grid-template-columns: 42px minmax(0, 1fr); }
+  .inventory-assignment-card > .button { grid-column: 1 / -1; width: 100%; }
   .anchored-layer.is-mobile-sheet {
     inset: auto 0 calc(var(--app-bottom-nav-height) + env(safe-area-inset-bottom)) 0 !important;
     width: auto !important;

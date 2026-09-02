@@ -87,6 +87,7 @@ from zk_add.schemas import (
     LoginRequest,
     OnboardRequest,
     DeviceLogIn,
+    DeviceSpareUpdateRequest,
     LogBatchRequest,
     OracleReceiptBatchRequest,
     RestartRequest,
@@ -658,6 +659,38 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
+
+
+@app.patch("/api/v1/devices/{connector_id}/spare")
+async def update_device_spare_state(
+    request: Request,
+    connector_id: str,
+    body: DeviceSpareUpdateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    connector = connector_or_404(db, connector_id)
+    previous = connector.is_spare
+    if previous != body.spare:
+        connector.is_spare = body.spare
+        connector.updated_at = utc_now()
+        append_audit(
+            db,
+            actor=context.username,
+            action="DEVICE_MARKED_SPARE" if body.spare else "DEVICE_RETURNED_TO_FLEET",
+            target_type="connector",
+            target_id=connector.connector_id,
+            outcome="SUCCESS",
+            ip_address=client_ip(request),
+            before={"is_spare": previous},
+            after={"is_spare": body.spare},
+        )
+        db.commit()
+        await browser_events.publish(
+            "device",
+            {"connector_id": connector.connector_id, "is_spare": connector.is_spare},
+        )
+    return serialize_connector(connector)
 
 
 @app.get("/api/v1/devices/{connector_id}/comm-key")
@@ -2541,7 +2574,7 @@ def global_alerts(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    scope_filters = []
+    scope_filters = [Connector.is_spare.is_(False)]
     state_filter = []
     if state:
         state_filter.append(DeviceAlert.state == state.strip().upper())

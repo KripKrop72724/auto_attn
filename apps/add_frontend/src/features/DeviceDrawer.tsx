@@ -14,12 +14,14 @@ export function DeviceDrawer({
   revision,
   onClose,
   onManageUsers,
+  onInventoryChanged,
   toast,
 }: {
   seed: Device
   revision: number
   onClose: () => void
   onManageUsers: (device: Device) => void
+  onInventoryChanged: () => Promise<void>
   toast: ReturnType<typeof useToast>
 }) {
   const [device, setDevice] = useState(seed)
@@ -80,6 +82,25 @@ export function DeviceDrawer({
       await load()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Restart could not be queued.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const updateSpareState = async () => {
+    const spare = !device.is_spare
+    setBusy(true)
+    try {
+      const updated = await api<Device>(`/api/v1/devices/${device.connector_id}/spare`, {
+        method: 'PATCH',
+        body: JSON.stringify({ spare }),
+      })
+      setDevice(updated)
+      toast.notice(spare
+        ? 'Device moved to spare inventory and removed from fleet health reporting.'
+        : 'Device returned to the active fleet and health reporting.')
+      await onInventoryChanged()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Device inventory assignment could not be updated.')
     } finally {
       setBusy(false)
     }
@@ -208,7 +229,7 @@ export function DeviceDrawer({
   )
   return (
     <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
-      <div className="drawer-status"><StatusBadge state={device.state} live={device.connected} /><span>{device.current_activity || 'Idle'} · Last contact {relativeTime(device.last_seen_at)}</span></div>
+      <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} /><span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${device.current_activity || 'Idle'} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
       <div className="tabs" role="tablist" aria-label="Device details">
         {drawerTabs.map((item, index) => (
           <button
@@ -233,6 +254,11 @@ export function DeviceDrawer({
         aria-labelledby={`device-tab-${tab}`}
       >
         {tab === 'overview' && <div className="overview-grid">
+          <article className={`detail-card wide inventory-assignment-card ${device.is_spare ? 'is-spare' : ''}`}>
+            <span className="inventory-assignment-icon"><Icon name={device.is_spare ? 'server' : 'grid'} /></span>
+            <div><p className="eyebrow">INVENTORY ASSIGNMENT</p><h3>{device.is_spare ? 'Spare device' : 'Active fleet device'}</h3><p>{device.is_spare ? 'Telemetry remains available, but this device is excluded from active fleet availability, outage counts, and the operations queue.' : 'This device contributes to active fleet health, availability, and operational alert reporting.'}</p></div>
+            <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
+          </article>
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">ZKT TERMINAL</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
@@ -259,7 +285,7 @@ export function DeviceDrawer({
               </div>
             </dl>
           </article>
-          {device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
+          {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
         </div>}
         {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${statusPattern(row.level)}`}><time>{dateTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}

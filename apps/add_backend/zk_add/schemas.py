@@ -729,6 +729,10 @@ class RestartRequest(BaseModel):
     password: str
 
 
+class DeviceSpareUpdateRequest(BaseModel):
+    spare: bool
+
+
 class CommandUpdate(BaseModel):
     command_id: str
     status: Literal[

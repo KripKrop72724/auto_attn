@@ -56,6 +56,10 @@ describe('DeviceDrawer COMM Key controls', () => {
     activeDevice = device
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
+      if (path.endsWith('/spare') && init?.method === 'PATCH') {
+        activeDevice = { ...activeDevice, is_spare: JSON.parse(String(init.body)).spare }
+        return response(activeDevice)
+      }
       if (path.endsWith('/terminal-binding/replace') && init?.method === 'POST') {
         return response({ device: activeDevice, command: { command_id: 'replacement-command' } })
       }
@@ -87,6 +91,7 @@ describe('DeviceDrawer COMM Key controls', () => {
         revision={0}
         onClose={vi.fn()}
         onManageUsers={vi.fn()}
+        onInventoryChanged={vi.fn()}
         toast={toast}
       />,
     )
@@ -156,6 +161,7 @@ describe('DeviceDrawer COMM Key controls', () => {
         revision={0}
         onClose={vi.fn()}
         onManageUsers={vi.fn()}
+        onInventoryChanged={vi.fn()}
         toast={toast}
       />,
     )
@@ -181,5 +187,30 @@ describe('DeviceDrawer COMM Key controls', () => {
       observed_serial: 'CKPG221260408',
       typed_confirmation: 'REPLACE connector-quetta AEH2232460004 CKPG221260408',
     })
+  })
+
+  it('moves a device into and out of spare inventory from the overview', async () => {
+    const toast = { notice: vi.fn(), error: vi.fn() } as unknown as ReturnType<typeof useToast>
+    const onInventoryChanged = vi.fn(async () => undefined)
+    render(
+      <DeviceDrawer
+        seed={device}
+        revision={0}
+        onClose={vi.fn()}
+        onManageUsers={vi.fn()}
+        onInventoryChanged={onInventoryChanged}
+        toast={toast}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Move to spare inventory' }))
+    await screen.findByText(/excluded from fleet health and alerts/i)
+    expect(screen.getByRole('button', { name: 'Return to active fleet' })).toBeTruthy()
+    expect(onInventoryChanged).toHaveBeenCalledTimes(1)
+    expect(toast.notice).toHaveBeenCalledWith(expect.stringMatching(/moved to spare inventory/i))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Return to active fleet' }))
+    await screen.findByRole('button', { name: 'Move to spare inventory' })
+    expect(onInventoryChanged).toHaveBeenCalledTimes(2)
   })
 })

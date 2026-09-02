@@ -140,6 +140,7 @@ export interface Device {
   last_seen_at: string | null
   current_activity: string | null
   last_error_code: string | null
+  is_spare?: boolean
   zkt: ZktDevice | null
   active_command?: Command | null
   active_lease?: Lease | null
@@ -186,6 +187,7 @@ export interface CommKeyReveal {
 
 export interface Overview {
   total: number
+  spares?: number
   online?: number
   offline?: number
   degraded?: number

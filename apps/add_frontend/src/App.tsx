@@ -389,9 +389,13 @@ function FleetView({
   const [filter, setFilter] = useState('ALL')
   const [sort, setSort] = useState<'name' | 'last-contact' | 'state'>('last-contact')
   const [mode, setMode] = useState<'map' | 'list'>('map')
-  const shown = devices.filter(
+  const [inventory, setInventory] = useState<'fleet' | 'spares'>('fleet')
+  const activeDevices = devices.filter((device) => !device.is_spare)
+  const spareDevices = devices.filter((device) => device.is_spare)
+  const inventoryDevices = inventory === 'fleet' ? activeDevices : spareDevices
+  const shown = inventoryDevices.filter(
     (device) =>
-      (filter === 'ALL' || device.state === filter) &&
+      (inventory === 'spares' || filter === 'ALL' || device.state === filter) &&
       `${device.display_name} ${device.zone_name} ${device.hardware_id} ${device.zkt?.serial || ''}`
         .toLowerCase()
         .includes(query.toLowerCase()),
@@ -411,12 +415,18 @@ function FleetView({
   return (
     <>
       <PageHeader
-        eyebrow="NATIONAL FLEET"
-        title="Attendance device command center"
-        description="Live operational state of every authorized Zone Lite ESP and its assigned ZKT terminal."
-        action={<div className="page-context"><span>National footprint</span><strong>{overview.total} authorized pairs</strong><small>Live control · PKT</small></div>}
+        eyebrow={inventory === 'fleet' ? 'NATIONAL FLEET' : 'SPARE INVENTORY'}
+        title={inventory === 'fleet' ? 'Attendance device command center' : 'Spare device inventory'}
+        description={inventory === 'fleet'
+          ? 'Live operational state of every assigned Zone Lite ESP and its ZKT terminal.'
+          : 'Unassigned backup devices kept separate from active fleet health, outages, and operational issues.'}
+        action={<div className="page-context"><span>{inventory === 'fleet' ? 'National footprint' : 'Ready reserve'}</span><strong>{inventory === 'fleet' ? `${overview.total} active pair${overview.total === 1 ? '' : 's'}` : `${overview.spares ?? spareDevices.length} spare device${(overview.spares ?? spareDevices.length) === 1 ? '' : 's'}`}</strong><small>{inventory === 'fleet' ? 'Live control · PKT' : 'Excluded from fleet health'}</small></div>}
       />
-      <section className="metric-grid" aria-label="Fleet key indicators">
+      <div className="section-tabs fleet-inventory-tabs" role="tablist" aria-label="Device inventory">
+        <button role="tab" aria-selected={inventory === 'fleet'} className={inventory === 'fleet' ? 'active' : ''} onClick={() => setInventory('fleet')}><Icon name="grid" /> Active fleet <span>{activeDevices.length}</span></button>
+        <button role="tab" aria-selected={inventory === 'spares'} className={inventory === 'spares' ? 'active' : ''} onClick={() => setInventory('spares')}><Icon name="server" /> Spares <span>{spareDevices.length}</span></button>
+      </div>
+      {inventory === 'fleet' ? <section className="metric-grid" aria-label="Fleet key indicators">
         <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" tone="positive" onClick={() => setFilter('ONLINE')} />
         <Metric label="Open operations queue" value={overview.open_alerts} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline`} icon="alert" tone={overview.open_alerts ? 'warning' : 'positive'} onClick={onNavigateAlerts} />
         <Metric
@@ -427,29 +437,33 @@ function FleetView({
           tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 ? 'warning' : 'positive'}
         />
         <Metric label="Enrollment access" value={overview.active_leases} detail="Active temporary administrator leases" icon="shield" tone={overview.active_leases ? 'warning' : 'neutral'} />
-      </section>
+      </section> : <section className="spare-inventory-banner" aria-label="Spare inventory monitoring policy">
+        <span className="spare-inventory-icon"><Icon name="shield" /></span>
+        <div><p className="eyebrow">MONITORING POLICY</p><h2>Ready when the active fleet needs a replacement</h2><p>Spare devices keep their telemetry and management access, but their offline state and alerts do not affect fleet availability or the operations queue.</p></div>
+        <div className="spare-inventory-count"><strong>{spareDevices.length}</strong><span>Spare device{spareDevices.length === 1 ? '' : 's'}</span><small>Open a device to return it to active service.</small></div>
+      </section>}
       <section className="panel">
         <header className="panel-header">
-          <div><h2>Live fleet</h2><p>State labels and border patterns remain readable without color.</p></div>
+          <div><h2>{inventory === 'fleet' ? 'Live fleet' : 'Spare devices'}</h2><p>{inventory === 'fleet' ? 'State labels and border patterns remain readable without color.' : 'Reserve hardware is isolated from active operational reporting.'}</p></div>
           <div className="fleet-panel-actions">
-            <div className="segmented-control fleet-view-toggle" role="group" aria-label="Fleet view">
+            {inventory === 'fleet' && <div className="segmented-control fleet-view-toggle" role="group" aria-label="Fleet view">
               <button type="button" className={mode === 'map' ? 'active' : ''} aria-pressed={mode === 'map'} onClick={() => setMode('map')}><Icon name="map" /> Map</button>
               <button type="button" className={mode === 'list' ? 'active' : ''} aria-pressed={mode === 'list'} onClick={() => setMode('list')}><Icon name="list" /> List</button>
-            </div>
-            <div className="auto-onboard-note"><Icon name="shield" /> Secure auto-onboarding enabled</div>
+            </div>}
+            <div className={`auto-onboard-note ${inventory === 'spares' ? 'spare-note' : ''}`}><Icon name="shield" /> {inventory === 'fleet' ? 'Secure auto-onboarding enabled' : 'Excluded from fleet health'}</div>
           </div>
         </header>
         <div className="toolbar">
           <label className="search-field">
-            <span className="sr-only">Search fleet</span>
+            <span className="sr-only">{inventory === 'fleet' ? 'Search active fleet' : 'Search spare devices'}</span>
             <Icon name="search" />
             <input
-              placeholder="Search zone, MAC, serial, or terminal"
+              placeholder={inventory === 'fleet' ? 'Search active fleet' : 'Search spare devices'}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
           </label>
-          <label>
+          {inventory === 'fleet' && <label>
             <span className="sr-only">Filter by state</span>
             <select value={filter} onChange={(event) => setFilter(event.target.value)}>
               <option value="ALL">All states</option>
@@ -460,10 +474,10 @@ function FleetView({
               <option value="ONBOARDING">Onboarding</option>
               <option value="QUARANTINED_DUPLICATE_SERIAL">Quarantined</option>
             </select>
-          </label>
+          </label>}
           <label><span className="sr-only">Sort fleet</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="last-contact">Newest contact first</option><option value="name">Device name</option><option value="state">Operational state</option></select></label>
         </div>
-        {mode === 'map' ? (
+        {inventory === 'fleet' && mode === 'map' ? (
           <Suspense fallback={<div className="fleet-map-fallback" role="status"><Icon name="refresh" /> Preparing national map…</div>}>
             <FleetMap
               devices={shown}
@@ -477,26 +491,26 @@ function FleetView({
           <div className="device-list" aria-busy={loading}>
             {loading && <div className="empty-state"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
             {!loading && shown.map((device) => (
-              <article className={`device-card pattern-${statusPattern(device.state)}`} key={device.connector_id}>
+              <article className={`device-card ${device.is_spare ? 'spare-device-card pattern-notice' : `pattern-${statusPattern(device.state)}`}`} key={device.connector_id}>
                 <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
                   <span className="device-symbol"><Icon name="server" /></span>
                   <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
                   <span className="device-terminal"><strong>{device.zkt?.model || 'Awaiting terminal identity'}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
-                  <span className="device-activity"><strong>{device.current_activity || 'Idle'}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
-                  <StatusBadge state={device.state} live={device.connected} />
+                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : (device.current_activity || 'Idle')}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
                   <Icon name="chevron" />
                 </button>
                 <div className="device-card-actions">
                   <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
-                  <span>FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
+                  <span>{device.is_spare ? 'Excluded from fleet health and operational alerts · ' : ''}FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
                 </div>
               </article>
             ))}
             {!loading && !shown.length && (
               <div className="empty-state">
                 <Icon name="server" />
-                <h3>{devices.length ? 'No devices match these filters.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
-                <p>{devices.length ? 'Change the search or state filter.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
+                <h3>{inventoryDevices.length ? 'No devices match these filters.' : inventory === 'spares' ? 'No spare devices yet.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
+                <p>{inventoryDevices.length ? 'Change the search or state filter.' : inventory === 'spares' ? 'Open any active device and move it to spare inventory when it is taken out of service.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
               </div>
             )}
           </div>
@@ -794,9 +808,9 @@ function DashboardApp() {
         {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
         {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
-        {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices} toast={toast} revision={revisions.alert} /></Suspense>}
+        {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
-      {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} toast={toast} /></Suspense>}
+      {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
       {toast.toast && <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}><Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />{toast.toast.text}</div>}
     </>
   )

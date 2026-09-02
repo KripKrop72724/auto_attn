@@ -134,6 +134,7 @@ const fetchStub = (
   includeEventGroup = false,
   includeActiveEnrichment = false,
   includeCurrentIdentity = false,
+  fleetDevices: Device[] = [device],
 ) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -144,6 +145,7 @@ const fetchStub = (
       return response({
         total: 1,
         online: 1,
+        spares: fleetDevices.filter((row) => row.is_spare).length,
         open_alerts: 1,
         active_leases: 0,
         ords_delivery: {
@@ -276,7 +278,7 @@ const fetchStub = (
     if (path.includes('/alerts')) return response({ rows: [deliveryAlert] })
     if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
     if (path.includes('/api/v1/devices') && !path.includes('/users')) {
-      return response({ rows: [device] })
+      return response({ rows: fleetDevices })
     }
     if (path.includes('/api/v2/devices/connector-one/identity-conflicts')) {
       const hasConflict = users.some((row) => row.identity_conflict_code)
@@ -542,6 +544,30 @@ describe('State Life ADD interface', () => {
     expect(screen.queryByRole('region', { name: 'Pakistan device network map' })).toBeNull()
     expect(window.localStorage.length).toBe(0)
     expect(window.sessionStorage.length).toBe(0)
+  })
+
+  it('keeps spare devices in a separate inventory view', async () => {
+    const spareDevice: Device = {
+      ...device,
+      connector_id: 'connector-spare',
+      hardware_id: 'e0:72:a1:d6:f3:29',
+      display_name: 'Islamabad reserve device',
+      state: 'OFFLINE',
+      connected: false,
+      is_spare: true,
+    }
+    vi.stubGlobal('fetch', fetchStub([user], false, false, false, false, [device, spareDevice]))
+    render(<App />)
+
+    await screen.findByRole('heading', { name: /attendance device command center/i })
+    expect(await screen.findByRole('tab', { name: /active fleet 1/i })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('tab', { name: /spares 1/i }))
+
+    expect(await screen.findByRole('heading', { name: /spare device inventory/i })).toBeTruthy()
+    expect(screen.getByText(/offline state and alerts do not affect fleet availability/i)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Inspect Islamabad reserve device' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: `Inspect ${device.display_name}` })).toBeNull()
+    expect(screen.getByText('SPARE')).toBeTruthy()
   })
 
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {

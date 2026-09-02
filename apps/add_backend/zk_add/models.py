@@ -75,6 +75,7 @@ class Connector(Base):
     onboarding_generation: Mapped[int] = mapped_column(Integer, default=0)
     last_onboarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    is_spare: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = utc_column()
     updated_at: Mapped[datetime] = utc_column()
 

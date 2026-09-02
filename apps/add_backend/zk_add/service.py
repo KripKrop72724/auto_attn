@@ -4415,6 +4415,7 @@ def serialize_connector(connector: Connector) -> dict:
         "last_seen_at": connector.last_seen_at,
         "current_activity": connector.current_activity,
         "last_error_code": connector.last_error_code,
+        "is_spare": connector.is_spare,
         "zkt": None
         if zkt is None
         else {
@@ -4552,18 +4553,30 @@ def resolve_message_rejection(
 
 def fleet_counts(session: Session) -> dict:
     rows = session.execute(
-        select(Connector.lifecycle_state, func.count(Connector.id)).group_by(
-            Connector.lifecycle_state
-        )
+        select(Connector.lifecycle_state, func.count(Connector.id))
+        .where(Connector.is_spare.is_(False))
+        .group_by(Connector.lifecycle_state)
     ).all()
     counts = {state.lower(): count for state, count in rows}
     counts["total"] = sum(counts.values())
+    counts["spares"] = (
+        session.scalar(select(func.count(Connector.id)).where(Connector.is_spare.is_(True))) or 0
+    )
     counts["open_alerts"] = (
-        session.scalar(select(func.count(DeviceAlert.id)).where(DeviceAlert.state == "OPEN")) or 0
+        session.scalar(
+            select(func.count(DeviceAlert.id))
+            .join(Connector, Connector.id == DeviceAlert.connector_id)
+            .where(DeviceAlert.state == "OPEN", Connector.is_spare.is_(False))
+        )
+        or 0
     )
     counts["active_leases"] = (
         session.scalar(
-            select(func.count(TemporaryAdminLease.id)).where(
+            select(func.count(TemporaryAdminLease.id))
+            .join(ZKTDevice, ZKTDevice.id == TemporaryAdminLease.zkt_device_id)
+            .join(Connector, Connector.id == ZKTDevice.connector_id)
+            .where(
+                Connector.is_spare.is_(False),
                 TemporaryAdminLease.state.in_(
                     ["REQUESTED", "GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]
                 )

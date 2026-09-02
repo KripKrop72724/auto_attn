@@ -5065,6 +5065,87 @@ def test_global_alert_queue_is_priority_ordered_and_cursor_safe(db: Session):
     assert client.get("/api/v1/alerts?cursor=not-a-cursor").status_code == 422
 
 
+def test_spare_device_assignment_is_audited_and_excluded_from_fleet_health(db: Session):
+    connector = connector_fixture(db)
+    connector.lifecycle_state = "OFFLINE"
+    now = utc_now()
+    db.add(
+        DeviceAlert(
+            connector_id=connector.id,
+            code="DEVICE_OFFLINE",
+            severity="WARNING",
+            state="OPEN",
+            message="Device is offline.",
+            details={},
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+    )
+    raw_session, admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest"
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    headers = {"X-CSRF-Token": admin.csrf_token}
+
+    before = client.get("/api/v1/overview")
+    assert before.status_code == 200
+    assert before.json()["total"] == 1
+    assert before.json()["offline"] == 1
+    assert before.json()["open_alerts"] == 1
+    assert before.json()["spares"] == 0
+
+    marked = client.patch(
+        f"/api/v1/devices/{connector.connector_id}/spare",
+        json={"spare": True},
+        headers=headers,
+    )
+    assert marked.status_code == 200
+    assert marked.json()["is_spare"] is True
+
+    devices = client.get("/api/v1/devices").json()["rows"]
+    assert devices[0]["is_spare"] is True
+    overview = client.get("/api/v1/overview").json()
+    assert overview["total"] == 0
+    assert overview["open_alerts"] == 0
+    assert overview["spares"] == 1
+    alerts = client.get("/api/v1/alerts").json()
+    assert alerts["rows"] == []
+    assert alerts["totals"] == {"all": 0, "open": 0, "acknowledged": 0, "resolved": 0}
+
+    marked_audit = db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "DEVICE_MARKED_SPARE",
+            AuditEvent.target_id == connector.connector_id,
+        )
+    )
+    assert marked_audit is not None
+    assert marked_audit.before == {"is_spare": False}
+    assert marked_audit.after == {"is_spare": True}
+
+    restored = client.patch(
+        f"/api/v1/devices/{connector.connector_id}/spare",
+        json={"spare": False},
+        headers=headers,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["is_spare"] is False
+    assert client.get("/api/v1/overview").json()["open_alerts"] == 1
+    assert client.get("/api/v1/alerts").json()["totals"]["open"] == 1
+    assert db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "DEVICE_RETURNED_TO_FLEET",
+            AuditEvent.target_id == connector.connector_id,
+        )
+    ) is not None
+
+
 def test_source_exception_endpoints_require_step_up_audit_and_never_cache_raw(
     db: Session,
 ):
