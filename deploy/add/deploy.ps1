@@ -9,6 +9,7 @@ $compose = @("compose", "--env-file", ".env.add", "-f", "docker-compose.add.yml"
 $apiImage = "state-life/add-api:production"
 $webImage = "state-life/add-web:production"
 $provisionerImage = "state-life/add-provisioner:production"
+$watchdogImage = "state-life/add-watchdog:production"
 $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
 $applicationStarted = $false
 $environmentPromoted = $false
@@ -133,6 +134,34 @@ function Require-EnvironmentValue {
 function Get-ImageId {
     param([Parameter(Mandatory = $true)][string] $Image)
     return Invoke-DockerProbe -Arguments @("image", "inspect", $Image, "--format", "{{.Id}}")
+}
+
+function Assert-DockerCapacity {
+    $rawInfo = Invoke-Docker -Arguments @("info", "--format", "{{json .}}") -Capture
+    $jsonLine = @($rawInfo -split "`r?`n" | Where-Object {
+        $_.TrimStart().StartsWith("{")
+    }) | Select-Object -Last 1
+    if (-not $jsonLine) {
+        throw "Docker capacity could not be read."
+    }
+    try {
+        $dockerInfo = $jsonLine | ConvertFrom-Json
+    } catch {
+        throw "Docker capacity returned invalid data."
+    }
+
+    $minimumMemoryBytes = [int64](48GB)
+    $minimumLogicalCpus = 24
+    $actualMemoryBytes = [int64]$dockerInfo.MemTotal
+    $actualLogicalCpus = [int]$dockerInfo.NCPU
+    if ($actualMemoryBytes -lt $minimumMemoryBytes -or
+        $actualLogicalCpus -lt $minimumLogicalCpus) {
+        $actualMemoryGb = [math]::Round($actualMemoryBytes / 1GB, 1)
+        throw (
+            "Docker exposes only $actualMemoryGb GB RAM and $actualLogicalCpus logical CPUs. " +
+            "Allocate at least 48 GB RAM and 24 logical CPUs to Docker before deploying ADD."
+        )
+    }
 }
 
 function Get-PostgresContainer {
@@ -631,6 +660,7 @@ try {
     Copy-Item -LiteralPath ".env.add" -Destination $pendingEnvironment
 
     Invoke-Docker -Arguments @("info") | Out-Null
+    Assert-DockerCapacity
     Invoke-Docker -Arguments ($compose + @("config", "--quiet"))
 
     # Image tags are rollback candidates only after a completed release wrote
@@ -642,6 +672,7 @@ try {
     $preApiImage = if ($previousRelease) { Get-ImageId -Image $apiImage } else { $null }
     $preWebImage = if ($previousRelease) { Get-ImageId -Image $webImage } else { $null }
     $preProvisionerImage = if ($previousRelease) { Get-ImageId -Image $provisionerImage } else { $null }
+    $preWatchdogImage = if ($previousRelease) { Get-ImageId -Image $watchdogImage } else { $null }
     $previousProvisioningEnabled = $false
     if ($previousRelease -and (Test-Path -LiteralPath $protectedEnvironment -PathType Leaf)) {
         $previousSettings = Get-EnvironmentMap -Path $protectedEnvironment
@@ -657,9 +688,11 @@ try {
     $rollbackApiTag = "state-life/add-api:rollback-$stamp"
     $rollbackWebTag = "state-life/add-web:rollback-$stamp"
     $rollbackProvisionerTag = "state-life/add-provisioner:rollback-$stamp"
+    $rollbackWatchdogTag = "state-life/add-watchdog:rollback-$stamp"
     if ($preApiImage) { Invoke-Docker -Arguments @("tag", $preApiImage, $rollbackApiTag) }
     if ($preWebImage) { Invoke-Docker -Arguments @("tag", $preWebImage, $rollbackWebTag) }
     if ($preProvisionerImage) { Invoke-Docker -Arguments @("tag", $preProvisionerImage, $rollbackProvisionerTag) }
+    if ($preWatchdogImage) { Invoke-Docker -Arguments @("tag", $preWatchdogImage, $rollbackWatchdogTag) }
 
     # Bring only durable dependencies online first, then take a binary-safe logical backup.
     Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"))
@@ -700,6 +733,7 @@ try {
             previous_api_image = $preApiImage
             previous_web_image = $preWebImage
             previous_provisioner_image = $preProvisionerImage
+            previous_watchdog_image = $preWatchdogImage
             environment_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $protectedEnvironment).Hash
         }
         $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $releaseRoot "$stamp.json") -Encoding UTF8
@@ -733,7 +767,9 @@ try {
                     $rollbackEnvironment["ADD_POSTGRES_DB"]
                 } else { "attendance_devices" }
             }
-            Invoke-Docker -Arguments ($compose + @("stop", "add-api", "add-web", "add-provisioner"))
+            Invoke-Docker -Arguments ($compose + @(
+                "stop", "add-watchdog", "add-api", "add-web", "add-provisioner"
+            ))
             $postFailureRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
             $schemaMayHaveChanged = $applicationStarted -and (
                 -not $preRevision -or -not $postFailureRevision -or $postFailureRevision -ne $preRevision
@@ -761,6 +797,7 @@ try {
                 [void](Invoke-DockerProbe -Arguments @("image", "rm", $apiImage))
                 [void](Invoke-DockerProbe -Arguments @("image", "rm", $webImage))
                 [void](Invoke-DockerProbe -Arguments @("image", "rm", $provisionerImage))
+                [void](Invoke-DockerProbe -Arguments @("image", "rm", $watchdogImage))
                 throw "Deployment failed; the first release was stopped cleanly: $deploymentError"
             }
             Invoke-Docker -Arguments @("tag", $rollbackApiTag, $apiImage)
@@ -768,8 +805,12 @@ try {
             if ($preProvisionerImage) {
                 Invoke-Docker -Arguments @("tag", $rollbackProvisionerTag, $provisionerImage)
             }
+            if ($preWatchdogImage) {
+                Invoke-Docker -Arguments @("tag", $rollbackWatchdogTag, $watchdogImage)
+            }
             $rollbackServices = @("postgres", "redis", "add-api", "add-web")
             if ($previousProvisioningEnabled) { $rollbackServices += "add-provisioner" }
+            if ($preWatchdogImage) { $rollbackServices += "add-watchdog" }
             Invoke-Docker -Arguments ($compose + @("up", "-d", "--no-build", "--remove-orphans") + $rollbackServices)
             Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
             Wait-Endpoint -Uri "http://127.0.0.1:8095/"

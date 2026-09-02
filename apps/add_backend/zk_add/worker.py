@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
 import json
 import re
@@ -244,7 +244,7 @@ async def _control_plane_loop(stop: asyncio.Event) -> None:
             retention_counter += 1
             if retention_counter >= 300:
                 retention_counter = 0
-                retention_tick()
+                await asyncio.to_thread(retention_tick)
         except Exception as exc:
             await browser_events.publish(
                 "backend_error", {"code": "MAINTENANCE_LOOP_ERROR", "message": str(exc)[:500]}
@@ -302,12 +302,16 @@ async def _attendance_repair_loop(stop: asyncio.Event) -> None:
 
     while not stop.is_set():
         try:
-            record_repair_worker_heartbeat("RUNNING")
-            await advance_attendance_repairs_once()
-            record_repair_worker_heartbeat("IDLE")
+            await asyncio.to_thread(record_repair_worker_heartbeat, "RUNNING")
+            await asyncio.to_thread(lambda: asyncio.run(advance_attendance_repairs_once()))
+            await asyncio.to_thread(record_repair_worker_heartbeat, "IDLE")
         except Exception:
             try:
-                record_repair_worker_heartbeat("ERROR", "UNHANDLED_EXCEPTION")
+                await asyncio.to_thread(
+                    record_repair_worker_heartbeat,
+                    "ERROR",
+                    "UNHANDLED_EXCEPTION",
+                )
             except Exception:
                 pass
             await browser_events.publish(
@@ -395,8 +399,11 @@ async def dispatch_reconciliation_assignments(
     )
 
 
-async def maintenance_tick() -> None:
-    now = utc_now()
+def prepare_maintenance_tick(
+    now: datetime,
+) -> tuple[list[tuple[str, dict]], list[dict], list[dict], list[tuple[str, dict]], list[dict]]:
+    """Run the control-plane database work outside the server event loop."""
+
     dispatch: list[tuple[str, dict]] = []
     connector_updates: list[dict] = []
     reconciliation_updates: list[dict] = []
@@ -529,26 +536,47 @@ async def maintenance_tick() -> None:
             if connector:
                 dispatch.append((connector.connector_id, serialize_command(command)))
         reconciliation_dispatch = assignment_rows(session)
+    return (
+        dispatch,
+        connector_updates,
+        reconciliation_updates,
+        reconciliation_dispatch,
+        provisioning_updates,
+    )
+
+
+def mark_command_dispatched(command_id: str) -> None:
+    with session_scope() as session:
+        command = session.scalar(
+            select(DeviceCommand).where(DeviceCommand.command_id == command_id)
+        )
+        if command and command.status in {
+            "QUEUED",
+            "WAITING_FOR_DEVICE",
+            "WAITING_FOR_ZKT",
+            "RETRYING",
+            "DISPATCHED",
+            "ACKNOWLEDGED",
+            "RUNNING",
+            "CANCEL_REQUESTED",
+        }:
+            if command.status != "CANCEL_REQUESTED":
+                command.status = "DISPATCHED"
+            command.dispatched_at = utc_now()
+            command.attempt_count += 1
+
+
+async def maintenance_tick() -> None:
+    (
+        dispatch,
+        connector_updates,
+        reconciliation_updates,
+        reconciliation_dispatch,
+        provisioning_updates,
+    ) = await asyncio.to_thread(prepare_maintenance_tick, utc_now())
     for connector_id, update in dispatch:
         if await connector_hub.send(connector_id, update):
-            with session_scope() as session:
-                command = session.scalar(
-                    select(DeviceCommand).where(DeviceCommand.command_id == update["command_id"])
-                )
-                if command and command.status in {
-                    "QUEUED",
-                    "WAITING_FOR_DEVICE",
-                    "WAITING_FOR_ZKT",
-                    "RETRYING",
-                    "DISPATCHED",
-                    "ACKNOWLEDGED",
-                    "RUNNING",
-                    "CANCEL_REQUESTED",
-                }:
-                    if command.status != "CANCEL_REQUESTED":
-                        command.status = "DISPATCHED"
-                    command.dispatched_at = utc_now()
-                    command.attempt_count += 1
+            await asyncio.to_thread(mark_command_dispatched, update["command_id"])
     for update in connector_updates:
         await browser_events.publish("device", update)
     for update in provisioning_updates:
@@ -909,6 +937,36 @@ def apply_firmware_receipt_missing(
         )
 
 
+def apply_firmware_receipt_audit_results(
+    claims: list[tuple[int, str, int]],
+    missing: set[str] | None,
+    *,
+    status: int | None,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    with session_scope() as session:
+        if missing is None:
+            for row_id, _event_uid, _connector_id in claims:
+                apply_firmware_receipt_audit_failure(
+                    session,
+                    claimed_id=row_id,
+                    status=status,
+                    transport_error=transport_error,
+                    response_parsed=response_parsed,
+                )
+            return
+        for row_id, event_uid, _connector_id in claims:
+            if event_uid in missing:
+                apply_firmware_receipt_missing(session, claimed_id=row_id)
+            else:
+                apply_ords_confirmation(
+                    session,
+                    claimed_id=row_id,
+                    path="FIRMWARE_RECEIPT_MEMBERSHIP_CHECK",
+                )
+
+
 async def audit_firmware_receipts_batch(
     *,
     limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
@@ -918,7 +976,10 @@ async def audit_firmware_receipts_batch(
     async with _ords_request_lock:
         if ords_circuit_is_open():
             return
-        claims = claim_firmware_receipt_audit_batch(max(1, min(limit, 500)))
+        claims = await asyncio.to_thread(
+            claim_firmware_receipt_audit_batch,
+            max(1, min(limit, 500)),
+        )
         if not claims:
             return
         check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
@@ -945,26 +1006,14 @@ async def audit_firmware_receipts_batch(
         )
     requested = {event_uid for _row_id, event_uid, _connector_id in claims}
     missing = ords_membership_missing(check_status, check_body, requested)
-    with session_scope() as session:
-        if missing is None:
-            for row_id, _event_uid, _connector_id in claims:
-                apply_firmware_receipt_audit_failure(
-                    session,
-                    claimed_id=row_id,
-                    status=check_status,
-                    transport_error=check_error,
-                    response_parsed=check_parsed,
-                )
-            return
-        for row_id, event_uid, _connector_id in claims:
-            if event_uid in missing:
-                apply_firmware_receipt_missing(session, claimed_id=row_id)
-            else:
-                apply_ords_confirmation(
-                    session,
-                    claimed_id=row_id,
-                    path="FIRMWARE_RECEIPT_MEMBERSHIP_CHECK",
-                )
+    await asyncio.to_thread(
+        apply_firmware_receipt_audit_results,
+        claims,
+        missing,
+        status=check_status,
+        transport_error=check_error,
+        response_parsed=check_parsed,
+    )
 
 
 def claim_confirmed_membership_audit_batch(
@@ -1156,6 +1205,36 @@ def apply_confirmed_membership_missing(
         )
 
 
+def apply_confirmed_membership_audit_results(
+    claims: list[tuple[int, str, int]],
+    missing: set[str] | None,
+    *,
+    status: int | None,
+    transport_error: str | None,
+    response_parsed: bool,
+) -> None:
+    with session_scope() as session:
+        if missing is None:
+            for row_id, _event_uid, _connector_id in claims:
+                apply_confirmed_membership_audit_failure(
+                    session,
+                    claimed_id=row_id,
+                    status=status,
+                    transport_error=transport_error,
+                    response_parsed=response_parsed,
+                )
+            return
+        for row_id, event_uid, _connector_id in claims:
+            if event_uid in missing:
+                apply_confirmed_membership_missing(session, claimed_id=row_id)
+            else:
+                apply_ords_confirmation(
+                    session,
+                    claimed_id=row_id,
+                    path="PERIODIC_MEMBERSHIP_REVERIFY",
+                )
+
+
 async def audit_confirmed_membership_batch(
     *,
     limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
@@ -1165,7 +1244,10 @@ async def audit_confirmed_membership_batch(
     async with _ords_request_lock:
         if ords_circuit_is_open():
             return
-        claims = claim_confirmed_membership_audit_batch(max(1, min(limit, 500)))
+        claims = await asyncio.to_thread(
+            claim_confirmed_membership_audit_batch,
+            max(1, min(limit, 500)),
+        )
         if not claims:
             return
         check_url = settings.ords_base_url.rstrip("/") + "/raw-captures/check"
@@ -1192,26 +1274,14 @@ async def audit_confirmed_membership_batch(
         )
     requested = {event_uid for _row_id, event_uid, _connector_id in claims}
     missing = ords_membership_missing(check_status, check_body, requested)
-    with session_scope() as session:
-        if missing is None:
-            for row_id, _event_uid, _connector_id in claims:
-                apply_confirmed_membership_audit_failure(
-                    session,
-                    claimed_id=row_id,
-                    status=check_status,
-                    transport_error=check_error,
-                    response_parsed=check_parsed,
-                )
-            return
-        for row_id, event_uid, _connector_id in claims:
-            if event_uid in missing:
-                apply_confirmed_membership_missing(session, claimed_id=row_id)
-            else:
-                apply_ords_confirmation(
-                    session,
-                    claimed_id=row_id,
-                    path="PERIODIC_MEMBERSHIP_REVERIFY",
-                )
+    await asyncio.to_thread(
+        apply_confirmed_membership_audit_results,
+        claims,
+        missing,
+        status=check_status,
+        transport_error=check_error,
+        response_parsed=check_parsed,
+    )
 
 
 def apply_ords_confirmation(
@@ -1384,6 +1454,40 @@ def apply_ords_delivery_result(
         )
 
 
+def apply_ords_batch_results(
+    claims: list[tuple[int, dict, int, bool]],
+    confirmed_claim_ids: list[int],
+    membership_failure: tuple[int | None, str | None, bool] | None,
+    results: list[tuple[int, int, int | None, object, str | None, bool]],
+) -> None:
+    with session_scope() as session:
+        for claimed_id in confirmed_claim_ids:
+            apply_ords_confirmation(
+                session,
+                claimed_id=claimed_id,
+                path="ORDS_MEMBERSHIP_CHECK",
+            )
+        if membership_failure is not None:
+            failure_status, failure_error, failure_parsed = membership_failure
+            for claimed_id, _payload, _connector_id, _was_retry in claims:
+                apply_ords_membership_failure(
+                    session,
+                    claimed_id=claimed_id,
+                    status=failure_status,
+                    transport_error=failure_error,
+                    response_parsed=failure_parsed,
+                )
+        for row_id, _connector_id, status, body, error, parsed in results:
+            apply_ords_delivery_result(
+                session,
+                claimed_id=row_id,
+                status=status,
+                body=body,
+                transport_error=error,
+                response_parsed=parsed,
+            )
+
+
 async def deliver_ords_batch(
     *,
     limit: int = ORDS_DELIVERY_BATCH_SIZE,
@@ -1394,7 +1498,7 @@ async def deliver_ords_batch(
     async with _ords_request_lock:
         if ords_circuit_is_open():
             return
-        claims = claim_ords_batch(max(1, limit))
+        claims = await asyncio.to_thread(claim_ords_batch, max(1, limit))
         if not claims:
             return
         base_url = settings.ords_base_url.rstrip("/")
@@ -1451,32 +1555,13 @@ async def deliver_ords_batch(
             status=responded_status,
             transport_error=transport_error,
         )
-    with session_scope() as session:
-        for claimed_id in confirmed_claim_ids:
-            apply_ords_confirmation(
-                session,
-                claimed_id=claimed_id,
-                path="ORDS_MEMBERSHIP_CHECK",
-            )
-        if membership_failure is not None:
-            failure_status, failure_error, failure_parsed = membership_failure
-            for claimed_id, _payload, _connector_id, _was_retry in claims:
-                apply_ords_membership_failure(
-                    session,
-                    claimed_id=claimed_id,
-                    status=failure_status,
-                    transport_error=failure_error,
-                    response_parsed=failure_parsed,
-                )
-        for row_id, _connector_id, status, body, error, parsed in results:
-            apply_ords_delivery_result(
-                session,
-                claimed_id=row_id,
-                status=status,
-                body=body,
-                transport_error=error,
-                response_parsed=parsed,
-            )
+    await asyncio.to_thread(
+        apply_ords_batch_results,
+        claims,
+        confirmed_claim_ids,
+        membership_failure,
+        results,
+    )
 
 
 async def deliver_ords_once() -> None:

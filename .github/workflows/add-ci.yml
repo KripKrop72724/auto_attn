@@ -28,6 +28,7 @@ jobs:
         run: |
           $productionScripts = @(
             'deploy/add/deploy.ps1',
+            'deploy/add/collect-diagnostics.ps1',
             'deploy/add/Invoke-NationwideFirmwareRollout.ps1'
           )
           foreach ($path in $productionScripts) {

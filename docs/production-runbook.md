@@ -24,6 +24,9 @@ Confirm the runner service is running as `NT AUTHORITY\NETWORK SERVICE`, that th
 member of `docker-users`, Docker Desktop/service is running, and the runner can execute
 `docker info`. Restart the runner after group membership changes.
 
+Allocate at least 48 GB RAM and 24 logical CPUs to Docker itself. The deployment preflight rejects
+a smaller Docker VM/engine allocation even when the Windows host has spare capacity.
+
 Create the production environment outside the checkout. Preferred path:
 
 ```text
@@ -90,7 +93,7 @@ The workflow intentionally does not grant itself repository-administration permi
 1. verifies checkout SHA and required production settings;
 2. makes a read-only authenticated `raw-captures/check` request from the ADD host;
 3. protects `C:\ProgramData\StateLife\AttendanceDeviceDashboard` ACLs;
-4. backs up the previous protected env and tags both current application images;
+4. backs up the previous protected env and tags all current application images;
 5. starts durable dependencies and writes a binary-safe PostgreSQL custom-format dump;
 6. validates Compose, pulls bases, and builds the exact checkout;
 7. starts the stack and waits for Compose health, API readiness, and independent UI health;
@@ -120,6 +123,49 @@ C:\ProgramData\StateLife\AttendanceDeviceDashboard\releases
 Never run Alembic downgrade for the protected-data contract revision; restore its paired backup.
 
 ## Routine verification
+
+### Availability and incident diagnostics
+
+The dashboard page is served by Nginx independently of the API. A visible login page followed by a
+slow or `504` login therefore means the API path on port `8096` is stalled or unavailable; it does
+not prove the application is healthy. The API container health probe separately checks event-loop
+liveness, synchronous request-thread availability, and dependency readiness. After three
+consecutive liveness failures it terminates the wedged API process, and the
+Compose `unless-stopped` policy starts a clean process. A database or protected-provisioner
+readiness failure marks the API unhealthy but does not create an API dependency restart loop.
+An isolated `add-watchdog` watches the Docker health state of PostgreSQL, Redis, the provisioner,
+and Nginx and restarts a service after Docker's own bounded health retries declare it unhealthy.
+API process recovery remains liveness-only inside its own probe. The watchdog has no network
+interface and no application secrets. Its Docker socket mount grants host-engine control by
+necessity; no application container receives that mount, and the Compose contract test enforces
+that boundary.
+
+Production defaults reserve 16 GB for PostgreSQL, 8 GB for ADD API, 4 GB for the protected
+provisioner, 2 GB for Redis, 1 GB for the web container, and 256 MB for the stack watchdog.
+Configure Docker Desktop/Engine with at least 48 GB RAM, 24 logical CPUs, and adequate free disk.
+The containers have no per-service CPU cap, so ADD may use the available Docker CPUs whenever it
+needs them. The Windows server's physical RAM and cores do not help ADD if Docker's own VM/resource
+ceiling is smaller. The API intentionally remains one Uvicorn worker because connector WebSocket
+ownership is process-local; do not increase `--workers` until Redis-backed connection ownership
+and event fan-out are implemented.
+
+At the first slowdown, before manually restarting containers, run this from the deployed checkout
+in an elevated PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\add\collect-diagnostics.ps1 -Hours 24
+```
+
+The command discovers the protected ProgramData environment, creates
+`add-diagnostics-<UTC timestamp>.zip`, and does not copy the environment file. It includes bounded,
+redacted container logs; restart, OOM and health state; Docker/host resource pressure; relevant
+Docker events; endpoint timing; PostgreSQL connection/wait summaries, table sizes and outbox
+counts; and the GitHub Runner/Docker/Caddy service states. Attach that ZIP to the incident. If the
+protected environment is stored elsewhere, pass its exact path with `-EnvironmentFile`.
+
+Slow HTTP requests emit `ADD slow request` with path, duration, status and request ID. Event-loop
+stalls emit `ADD event loop lag detected`. PostgreSQL logs lock waits without enabling general SQL
+statement logging; container log rotation prevents diagnostics from filling the Docker disk.
 
 After every release, verify:
 

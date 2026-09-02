@@ -13,6 +13,13 @@ class AddSettings(BaseSettings):
     port: int = 8096
     data_dir: Path = Path.cwd() / "local-data" / "add"
     database_url: str | None = None
+    database_pool_size: int = Field(default=20, ge=5, le=100)
+    database_max_overflow: int = Field(default=20, ge=0, le=100)
+    database_pool_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    database_pool_recycle_seconds: int = Field(default=30 * 60, ge=60, le=24 * 60 * 60)
+    database_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    database_statement_timeout_ms: int = Field(default=30_000, ge=1_000, le=5 * 60 * 1000)
+    database_lock_timeout_ms: int = Field(default=5_000, ge=500, le=60_000)
     redis_url: str = "redis://redis:6379/0"
     auto_create_schema: bool = False
 
@@ -22,6 +29,8 @@ class AddSettings(BaseSettings):
     admin_session_idle_seconds: int = 30 * 60
     admin_session_absolute_seconds: int = 8 * 60 * 60
     admin_step_up_seconds: int = 5 * 60
+    slow_request_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
+    event_loop_lag_warning_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
 
     pii_fernet_key: str | None = None
     pii_lookup_key: str | None = None

@@ -23,7 +23,7 @@ def main() -> int:
 
     unexpectedly_public = {
         service_name
-        for service_name in ("postgres", "redis", "add-provisioner")
+        for service_name in ("postgres", "redis", "add-provisioner", "add-watchdog")
         if services[service_name].get("ports")
     }
     if unexpectedly_public:
@@ -34,6 +34,32 @@ def main() -> int:
     mounts = provisioner.get("volumes", [])
     if any(str(mount.get("source", "")).endswith("docker.sock") for mount in mounts):
         raise SystemExit("The provisioner must never receive the Docker socket.")
+
+    api_labels = services["add-api"].get("labels", {})
+    if api_labels.get("add.selfheal") != "internal":
+        raise SystemExit(
+            "The API must use its liveness-only internal recovery to avoid dependency restart loops."
+        )
+
+    watchdog = services["add-watchdog"]
+    if watchdog.get("network_mode") != "none":
+        raise SystemExit("The self-healing watchdog must not have network access.")
+    watchdog_mounts = watchdog.get("volumes", [])
+    socket_mounts = [
+        mount
+        for mount in watchdog_mounts
+        if str(mount.get("source", "")).endswith("docker.sock")
+    ]
+    if len(socket_mounts) != 1 or socket_mounts[0].get("target") != "/var/run/docker.sock":
+        raise SystemExit("The watchdog requires exactly one Docker socket mount.")
+    for service_name, service in services.items():
+        if service_name == "add-watchdog":
+            continue
+        if any(
+            str(mount.get("source", "")).endswith("docker.sock")
+            for mount in service.get("volumes", [])
+        ):
+            raise SystemExit(f"{service_name} must never receive the Docker socket.")
     return 0
 
 

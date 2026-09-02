@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -233,16 +234,40 @@ async def send_identity_catalog(connector_id: str, catalog: dict) -> bool:
     )
 
 
+async def monitor_event_loop_lag(stop: asyncio.Event) -> None:
+    """Report stalls that make lightweight HTTP requests and WebSockets wait."""
+
+    interval = 1.0
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + interval
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+        observed = loop.time()
+        lag = max(0.0, observed - expected)
+        if lag >= settings.event_loop_lag_warning_seconds:
+            logger.warning("ADD event loop lag detected lag_seconds=%.3f", lag)
+        expected = observed + interval
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings.require_production_secrets()
     if settings.auto_create_schema:
         init_db()
     stop = asyncio.Event()
-    task = asyncio.create_task(maintenance_loop(stop))
-    yield
-    stop.set()
-    await task
+    tasks = [
+        asyncio.create_task(maintenance_loop(stop)),
+        asyncio.create_task(monitor_event_loop_lag(stop)),
+    ]
+    try:
+        yield
+    finally:
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(
@@ -281,7 +306,29 @@ async def sanitized_validation_error(_request: Request, error: RequestValidation
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id") or str(uuid4())
-    response = await call_next(request)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration = time.perf_counter() - started
+        logger.exception(
+            "ADD request failed method=%s path=%s duration_seconds=%.3f request_id=%s",
+            request.method,
+            request.url.path,
+            duration,
+            request_id,
+        )
+        raise
+    duration = time.perf_counter() - started
+    if duration >= settings.slow_request_seconds:
+        logger.warning(
+            "ADD slow request method=%s path=%s status=%s duration_seconds=%.3f request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+            request_id,
+        )
     response.headers["X-Request-Id"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -335,8 +382,15 @@ async def require_connector(
 
 
 @app.get("/health/live")
-def health_live():
+async def health_live():
     return {"ok": True, "app": "attendance-device-dashboard", "version": APP_VERSION}
+
+
+@app.get("/health/serve")
+def health_serve():
+    """Prove a synchronous request can obtain a Starlette worker-thread slot."""
+
+    return {"ok": True, "request_threadpool": True}
 
 
 @app.get("/health/ready")

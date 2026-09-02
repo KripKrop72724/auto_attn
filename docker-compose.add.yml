@@ -1,10 +1,42 @@
 name: attendance-device-dashboard
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     init: true
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${ADD_POSTGRES_SHARED_BUFFERS:-4GB}
+      - -c
+      - effective_cache_size=${ADD_POSTGRES_EFFECTIVE_CACHE_SIZE:-12GB}
+      - -c
+      - maintenance_work_mem=${ADD_POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=200
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - idle_in_transaction_session_timeout=60s
     environment:
       POSTGRES_DB: ${ADD_POSTGRES_DB:-attendance_devices}
       POSTGRES_USER: ${ADD_POSTGRES_USER:-add_service}
@@ -17,14 +49,18 @@ services:
       timeout: 4s
       retries: 20
     networks: [add-private]
-    mem_limit: 1g
+    mem_limit: ${ADD_POSTGRES_MEMORY_LIMIT:-16g}
+    shm_size: ${ADD_POSTGRES_SHM_SIZE:-2gb}
+    logging: *default-logging
+    labels:
+      add.selfheal: "true"
     security_opt: [no-new-privileges:true]
 
   redis:
     image: redis:7-alpine
     init: true
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "${ADD_REDIS_MAXMEMORY:-1gb}", "--maxmemory-policy", "noeviction"]
     volumes:
       - add-redis:/data
     healthcheck:
@@ -33,7 +69,10 @@ services:
       timeout: 3s
       retries: 20
     networks: [add-private]
-    mem_limit: 384m
+    mem_limit: ${ADD_REDIS_MEMORY_LIMIT:-2g}
+    logging: *default-logging
+    labels:
+      add.selfheal: "true"
     security_opt: [no-new-privileges:true]
 
   add-api:
@@ -69,20 +108,27 @@ services:
       ADD_REDIS_URL: redis://redis:6379/0
       ADD_AUTO_CREATE_SCHEMA: "false"
       ADD_ADMIN_COOKIE_SECURE: ${ADD_ADMIN_COOKIE_SECURE:-true}
-    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1"]
+    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1 --timeout-keep-alive 10"]
     ports:
       - "0.0.0.0:8096:8096"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/health/ready', timeout=2)"]
+      test: ["CMD", "python", "/app/apps/add_backend/docker_healthcheck.py"]
       interval: 10s
-      timeout: 4s
-      retries: 12
-      start_period: 30s
+      timeout: 8s
+      retries: 6
+      start_period: 60s
     networks: [add-private, provisioning-private]
-    mem_limit: 768m
+    mem_limit: ${ADD_API_MEMORY_LIMIT:-8g}
+    pids_limit: 1024
+    stop_grace_period: 30s
+    logging: *default-logging
+    labels:
+      # Liveness-only recovery is handled inside docker_healthcheck.py so a database outage
+      # cannot make the external watchdog repeatedly restart an otherwise responsive API.
+      add.selfheal: "internal"
     security_opt: [no-new-privileges:true]
 
   add-provisioner:
@@ -113,8 +159,18 @@ services:
       ADD_ORDS_USERNAME: ${ADD_ORDS_USERNAME:-}
       ADD_ORDS_PASSWORD: ${ADD_ORDS_PASSWORD:-}
       ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64: ${ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
     networks: [provisioning-private]
-    mem_limit: 768m
+    mem_limit: ${ADD_PROVISIONER_MEMORY_LIMIT:-4g}
+    pids_limit: 512
+    logging: *default-logging
+    labels:
+      add.selfheal: "true"
     security_opt: [no-new-privileges:true]
 
   add-web:
@@ -133,7 +189,34 @@ services:
     depends_on:
       add-api: { condition: service_healthy }
     networks: [add-private]
-    mem_limit: 192m
+    mem_limit: ${ADD_WEB_MEMORY_LIMIT:-1g}
+    pids_limit: 256
+    logging: *default-logging
+    labels:
+      add.selfheal: "true"
+    security_opt: [no-new-privileges:true]
+
+  add-watchdog:
+    image: state-life/add-watchdog:production
+    build:
+      context: .
+      dockerfile: deploy/add/watchdog/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    network_mode: none
+    environment:
+      ADD_WATCHDOG_INTERVAL_SECONDS: ${ADD_WATCHDOG_INTERVAL_SECONDS:-10}
+      ADD_WATCHDOG_UNHEALTHY_OBSERVATIONS: ${ADD_WATCHDOG_UNHEALTHY_OBSERVATIONS:-1}
+      ADD_WATCHDOG_RESTART_GRACE_SECONDS: ${ADD_WATCHDOG_RESTART_GRACE_SECONDS:-30}
+      ADD_WATCHDOG_RESTART_COOLDOWN_SECONDS: ${ADD_WATCHDOG_RESTART_COOLDOWN_SECONDS:-60}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+      - /tmp:size=8m,mode=1777,noexec,nosuid,nodev
+    mem_limit: ${ADD_WATCHDOG_MEMORY_LIMIT:-256m}
+    pids_limit: 128
+    logging: *default-logging
     security_opt: [no-new-privileges:true]
 
 networks:

@@ -20,11 +20,31 @@ def create_database_engine(database_url: str | None = None) -> Engine:
     is_sqlite = value.startswith("sqlite")
     if value.startswith("sqlite:///"):
         Path(value.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
+    if is_sqlite:
+        connect_args = {"check_same_thread": False}
+        pool_options = {}
+    else:
+        connect_args = {
+            "connect_timeout": settings.database_connect_timeout_seconds,
+            "options": (
+                f"-c statement_timeout={settings.database_statement_timeout_ms} "
+                f"-c lock_timeout={settings.database_lock_timeout_ms} "
+                "-c idle_in_transaction_session_timeout=60000"
+            ),
+        }
+        pool_options = {
+            "pool_size": settings.database_pool_size,
+            "max_overflow": settings.database_max_overflow,
+            "pool_timeout": settings.database_pool_timeout_seconds,
+            "pool_recycle": settings.database_pool_recycle_seconds,
+            "pool_use_lifo": True,
+        }
     engine = create_engine(
         value,
-        connect_args={"check_same_thread": False} if is_sqlite else {},
+        connect_args=connect_args,
         pool_pre_ping=True,
         future=True,
+        **pool_options,
     )
     if is_sqlite:
         @event.listens_for(engine, "connect")
@@ -59,4 +79,3 @@ def session_scope() -> Iterator[Session]:
         raise
     finally:
         session.close()
-
