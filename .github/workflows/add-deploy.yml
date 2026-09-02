@@ -11,6 +11,11 @@ on:
         description: Exact tested commit SHA to deploy (defaults to the current main SHA)
         required: false
         type: string
+      recover_core:
+        description: Start the existing API and UI containers without rebuilding or changing data
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -21,9 +26,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  recover-core:
+    if: github.event_name == 'workflow_dispatch' && inputs.recover_core == true
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Start the existing core containers and verify local service
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $core = @(
+            'attendance-device-dashboard-postgres-1',
+            'attendance-device-dashboard-redis-1',
+            'attendance-device-dashboard-add-api-1'
+          )
+          $known = @(& docker ps -a --format '{{.Names}}')
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Docker is unavailable on the ADD production runner.'
+          }
+          foreach ($name in $core) {
+            if ($known -notcontains $name) {
+              throw "Required ADD container is missing: $name"
+            }
+            & docker start $name
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not start required ADD container: $name"
+            }
+          }
+
+          function Wait-HealthyEndpoint {
+            param([Parameter(Mandatory = $true)][string] $Uri)
+            foreach ($attempt in 1..30) {
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri $Uri -TimeoutSec 3
+                if ($response.StatusCode -eq 200) { return }
+              } catch {
+                Start-Sleep -Seconds 2
+              }
+            }
+            throw "ADD recovery endpoint did not become healthy: $Uri"
+          }
+
+          Wait-HealthyEndpoint -Uri 'http://127.0.0.1:8096/health/live'
+          $web = 'attendance-device-dashboard-add-web-1'
+          if ($known -notcontains $web) {
+            throw "Required ADD container is missing: $web"
+          }
+          & docker start $web
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not start required ADD container: $web"
+          }
+          Wait-HealthyEndpoint -Uri 'http://127.0.0.1:8095/health/ui'
+          Write-Host 'Existing ADD API and UI containers are serving locally.'
+
   announce:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true) ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -51,7 +112,7 @@ jobs:
 
   deploy:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true) ||
       github.event.workflow_run.conclusion == 'success'
     needs: announce
     runs-on: [self-hosted, Windows, X64]
