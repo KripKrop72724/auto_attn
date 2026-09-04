@@ -1375,6 +1375,8 @@ class AttendanceRepairReuseAttestation(Base):
     __tablename__ = "add_attendance_repair_reuse_attestations"
     __table_args__ = (
         UniqueConstraint("job_id", name="uq_add_attendance_repair_reuse_job"),
+        Index("ix_add_repair_reuse_target_digest", "target_identity_digest"),
+        Index("ix_add_repair_reuse_event_digest", "event_membership_digest"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1385,9 +1387,9 @@ class AttendanceRepairReuseAttestation(Base):
     target_id: Mapped[int] = mapped_column(
         ForeignKey("add_attendance_repair_targets.id"), index=True
     )
-    target_identity_digest: Mapped[str] = mapped_column(String(64), index=True)
+    target_identity_digest: Mapped[str] = mapped_column(String(64))
     target_row_version: Mapped[int] = mapped_column(Integer)
-    event_membership_digest: Mapped[str] = mapped_column(String(64), index=True)
+    event_membership_digest: Mapped[str] = mapped_column(String(64))
     event_count: Mapped[int] = mapped_column(Integer)
     evidence_type: Mapped[str] = mapped_column(String(60), index=True)
     verified_name_digest: Mapped[str] = mapped_column(String(64))

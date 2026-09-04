@@ -1,6 +1,34 @@
 from __future__ import annotations
 
 import zk_add.db as add_db
+import zk_add.models  # noqa: F401
+
+
+def test_declared_schema_identifiers_fit_postgresql_limit():
+    identifiers: list[tuple[str, str]] = []
+    for table in add_db.Base.metadata.tables.values():
+        identifiers.append((f"table {table.name}", table.name))
+        identifiers.extend(
+            (f"column {table.name}.{column.name}", column.name)
+            for column in table.columns
+        )
+        identifiers.extend(
+            (f"index on {table.name}", index.name)
+            for index in table.indexes
+            if index.name
+        )
+        identifiers.extend(
+            (f"constraint on {table.name}", constraint.name)
+            for constraint in table.constraints
+            if constraint.name
+        )
+
+    over_limit = [
+        f"{context}: {name} ({len(name)})"
+        for context, name in identifiers
+        if len(name) > 63
+    ]
+    assert over_limit == []
 
 
 def test_postgres_engine_has_bounded_pool_and_database_waits(monkeypatch):
