@@ -14,6 +14,7 @@ whenever sqlerror exit failure rollback
 
 declare
     l_previous_body clob;
+    l_normalized_body clob;
     l_candidate_body clob;
     l_status varchar2(30);
     l_errors number;
@@ -96,8 +97,14 @@ declare
     end validate_body;
 begin
     dbms_lob.createtemporary(l_previous_body, true);
+    dbms_lob.createtemporary(l_normalized_body, true);
     dbms_lob.writeappend(
         l_previous_body,
+        length('create or replace '),
+        'create or replace '
+    );
+    dbms_lob.writeappend(
+        l_normalized_body,
         length('create or replace '),
         'create or replace '
     );
@@ -113,19 +120,24 @@ begin
             length(source_line.text),
             source_line.text
         );
+        dbms_lob.writeappend(
+            l_normalized_body,
+            length(rtrim(source_line.text, ' ' || chr(9) || chr(13) || chr(10)) || chr(10)),
+            rtrim(source_line.text, ' ' || chr(9) || chr(13) || chr(10)) || chr(10)
+        );
     end loop;
 
-    if occurrence_count(l_previous_body, l_new_declaration) = 1
-       and occurrence_count(l_previous_body, l_new_handler) = 1
-       and occurrence_count(l_previous_body, l_old_handler) = 0 then
+    if occurrence_count(l_normalized_body, l_new_declaration) = 1
+       and occurrence_count(l_normalized_body, l_new_handler) = 1
+       and occurrence_count(l_normalized_body, l_old_handler) = 0 then
         validate_body;
         dbms_output.put_line('identity_repair_failure_diagnostics=already_installed');
         return;
     end if;
-    if occurrence_count(l_previous_body, l_old_declaration) <> 1
-       or occurrence_count(l_previous_body, l_old_handler) <> 1
-       or occurrence_count(l_previous_body, l_new_declaration) <> 0
-       or occurrence_count(l_previous_body, l_new_handler) <> 0 then
+    if occurrence_count(l_normalized_body, l_old_declaration) <> 1
+       or occurrence_count(l_normalized_body, l_old_handler) <> 1
+       or occurrence_count(l_normalized_body, l_new_declaration) <> 0
+       or occurrence_count(l_normalized_body, l_new_handler) <> 0 then
         raise_application_error(
             -20880,
             'Installed identity-repair body does not match the guarded patch shape.'
@@ -133,7 +145,7 @@ begin
     end if;
 
     l_candidate_body := replace(
-        replace(l_previous_body, l_old_declaration, l_new_declaration),
+        replace(l_normalized_body, l_old_declaration, l_new_declaration),
         l_old_handler,
         l_new_handler
     );
