@@ -22,6 +22,7 @@ import type {
   AttendanceReleaseQueueResponse,
   AttendanceReleaseQueueRow,
   AttendanceRepairJob,
+  AttendanceRepairItemOutcome,
   AttendanceRepairListResponse,
   Device,
 } from '../types'
@@ -85,6 +86,17 @@ const lockCopy: Record<string, string> = {
 
 const explainLock = (code?: string | null) =>
   code ? lockCopy[code] || humanize(code) : 'This punch cannot be released safely.'
+
+const outcomeDetail = (item: AttendanceRepairItemOutcome) => {
+  if (item.error_message) return item.error_message
+  if (
+    item.downstream_status === 'VERIFIED' ||
+    item.downstream_verified_at ||
+    item.outcome?.includes('DOWNSTREAM_VERIFIED')
+  ) return 'Oracle content and downstream attendance are verified.'
+  if (item.error_code) return explainLock(item.error_code)
+  return humanize(item.state)
+}
 
 const punchCopy = (punch?: string | null) => {
   if (punch === '0') return 'Check in'
@@ -788,7 +800,7 @@ export function AttendanceReleaseHistory({
                 <article className="release-outcome-row" key={item.event_uid}>
                   <span><strong>{punchCopy(item.punch)}</strong><small>{dateTime(item.event_time)} · {humanize(item.capture_source)}</small><code>{item.event_uid.slice(0, 12)}…</code></span>
                   <span><StatusBadge state={item.oracle_classification} /><small>{humanize(item.risk_class)}</small></span>
-                  <span><StatusBadge state={item.outcome || item.state} /><small>{item.error_message || explainLock(item.error_code)}</small></span>
+                  <span><StatusBadge state={item.outcome || item.state} /><small>{outcomeDetail(item)}</small></span>
                   <span><strong>{item.oracle_receipt_id || 'No receipt yet'}</strong><small>{item.downstream_status ? `${humanize(item.downstream_status)} ${item.downstream_verified_at ? relativeTime(item.downstream_verified_at) : ''}` : 'Downstream proof pending'}</small></span>
                   <span><strong>{item.attempt_count}</strong><small>Oracle {item.oracle_attempt_count} · downstream {item.downstream_attempt_count}</small></span>
                 </article>

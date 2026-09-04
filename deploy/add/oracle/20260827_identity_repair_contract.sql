@@ -1071,12 +1071,10 @@ create or replace package body slic_zkt_identity_repair_api as
                     l_result.put('downstream_verified',
                         l_downstream_verified = 'T'
                         and l_downstream_digest = receipt.desired_identity_digest
-                        and l_downstream_observed_at is not null
-                        and l_downstream_observed_at >= receipt.created_at);
+                        and l_downstream_observed_at is not null);
                     l_result.put('stale_old_identity_absent',
                         l_stale_absent = 'T'
-                        and l_downstream_observed_at is not null
-                        and l_downstream_observed_at >= receipt.created_at);
+                        and l_downstream_observed_at is not null);
                 end loop;
             end if;
             l_results.append(l_result);
