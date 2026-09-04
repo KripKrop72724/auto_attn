@@ -12,6 +12,9 @@ DOWNSTREAM = ROOT / "deploy/add/oracle/20260827_downstream_adapter_contract.sql"
 DOWNSTREAM_TIMEZONE_FIX = (
     ROOT / "deploy/add/oracle/20260904_fix_downstream_timezone_expression.sql"
 )
+DOWNSTREAM_STATUS_FIX = (
+    ROOT / "deploy/add/oracle/20260904_fix_downstream_status_supersession.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -122,6 +125,35 @@ def test_downstream_timezone_hotfix_is_guarded_and_package_only() -> None:
     assert "attendance_rows_changed=0" in source
     assert "at time zone c_attendance_timezone" in source
     assert "at time zone ''asia/karachi''" in source
+
+
+def test_downstream_status_uses_latest_verified_employee_day_projection() -> None:
+    contract = CONTRACT.read_text().lower()
+    source = DOWNSTREAM_STATUS_FIX.read_text().lower()
+
+    for marker in (
+        "with requested_log as",
+        "projection_versions as",
+        "latest_projections as",
+        "partition by employee_id, attendance_date",
+        "latest_new.projection_digest",
+        "latest_old.projection_digest",
+        "latest_new.projection_rank = 1",
+        "latest_old.projection_rank = 1",
+    ):
+        assert marker in contract
+        assert marker in source
+
+    assert "slic_zkt_identity_repair_api" in source
+    assert "installed identity-repair body does not match" in source
+    assert "automatic restoration both failed" in source
+    assert "execute immediate l_previous_body" in source
+    assert "whenever sqlerror exit failure rollback" in source
+    assert "attendance_rows_changed=0" in source
+    assert "delete from hr_raw_attn_capture_events" not in source
+    assert "update hr_raw_attn_capture_events" not in source
+    assert "delete from hr_employee_attendance" not in source
+    assert "update hr_employee_attendance" not in source
 
 
 def test_existing_full_history_reconcile_delete_paths_remain_gated() -> None:

@@ -971,11 +971,96 @@ create or replace package body slic_zkt_identity_repair_api as
                     l_downstream_observed_at := null;
                     if downstream_ready then
                         begin
-                            execute immediate
-                                'select downstream_verified, stale_old_identity_absent, '
-                                || 'identity_digest, observed_at '
-                                || 'from slic_zkt_repair_downstream_status '
-                                || 'where operation_id = :operation_id'
+                            execute immediate q'~
+                                with requested_log as (
+                                    select *
+                                      from slic_zkt_ds_repair_log
+                                     where operation_id = :operation_id
+                                ), projection_versions as (
+                                    select candidate.operation_id,
+                                           candidate.new_employee_id employee_id,
+                                           candidate.attendance_date,
+                                           candidate.new_projection_digest projection_digest,
+                                           candidate.downstream_verified verified,
+                                           candidate.observed_at
+                                      from slic_zkt_ds_repair_log candidate
+                                      join requested_log requested
+                                        on requested.attendance_date = candidate.attendance_date
+                                       and (
+                                           candidate.new_employee_id = requested.new_employee_id
+                                           or candidate.new_employee_id = requested.old_employee_id
+                                       )
+                                    union all
+                                    select candidate.operation_id,
+                                           candidate.old_employee_id employee_id,
+                                           candidate.attendance_date,
+                                           candidate.old_projection_digest projection_digest,
+                                           candidate.stale_old_identity_absent verified,
+                                           candidate.observed_at
+                                      from slic_zkt_ds_repair_log candidate
+                                      join requested_log requested
+                                        on requested.attendance_date = candidate.attendance_date
+                                       and (
+                                           candidate.old_employee_id = requested.new_employee_id
+                                           or candidate.old_employee_id = requested.old_employee_id
+                                       )
+                                     where candidate.old_employee_id is not null
+                                       and candidate.old_employee_id <> candidate.new_employee_id
+                                ), latest_projections as (
+                                    select projection_versions.*,
+                                           row_number() over (
+                                               partition by employee_id, attendance_date
+                                               order by observed_at desc, operation_id desc
+                                           ) projection_rank
+                                      from projection_versions
+                                )
+                                select case
+                                           when current_log.downstream_verified = 'T'
+                                            and latest_new.verified = 'T'
+                                            and slic_zkt_downstream_repair.projection_digest(
+                                                    current_log.new_employee_id,
+                                                    current_log.attendance_date
+                                                ) = latest_new.projection_digest
+                                           then 'T' else 'F'
+                                       end,
+                                       case
+                                           when current_log.stale_old_identity_absent = 'T'
+                                            and (
+                                                current_log.old_employee_id is null
+                                                or current_log.old_employee_id = current_log.new_employee_id
+                                                or (
+                                                    latest_old.verified = 'T'
+                                                    and slic_zkt_downstream_repair.projection_digest(
+                                                            current_log.old_employee_id,
+                                                            current_log.attendance_date
+                                                        ) = latest_old.projection_digest
+                                                )
+                                            )
+                                           then 'T' else 'F'
+                                       end,
+                                       receipt.desired_identity_digest,
+                                       greatest(
+                                           current_log.observed_at,
+                                           latest_new.observed_at,
+                                           case
+                                               when current_log.old_employee_id is null
+                                                 or current_log.old_employee_id = current_log.new_employee_id
+                                               then current_log.observed_at
+                                               else latest_old.observed_at
+                                           end
+                                       )
+                                  from requested_log current_log
+                                  join slic_zkt_id_repair_receipts receipt
+                                    on receipt.operation_id = current_log.operation_id
+                                  join latest_projections latest_new
+                                    on latest_new.employee_id = current_log.new_employee_id
+                                   and latest_new.attendance_date = current_log.attendance_date
+                                   and latest_new.projection_rank = 1
+                                  left join latest_projections latest_old
+                                    on latest_old.employee_id = current_log.old_employee_id
+                                   and latest_old.attendance_date = current_log.attendance_date
+                                   and latest_old.projection_rank = 1
+                            ~'
                                 into l_downstream_verified, l_stale_absent,
                                      l_downstream_digest, l_downstream_observed_at
                                 using receipt.operation_id;
