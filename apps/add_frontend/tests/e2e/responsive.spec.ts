@@ -195,6 +195,88 @@ const attendanceRepairJob = {
   items_next_cursor: null,
 }
 
+const attendanceReleaseQueue = {
+  preview_enabled: true,
+  execution_enabled: false,
+  totals: { employees: 1, events: 1, eligible: 1, locked: 0 },
+  rows: [{
+    connector_id: device.connector_id,
+    device_id: device.device_id,
+    device_name: device.display_name,
+    user_key: representativeUser.user_key,
+    row_version: representativeUser.row_version,
+    display_name: representativeUser.display_name,
+    user_id: representativeUser.user_id,
+    uid: representativeUser.uid,
+    cnic_masked: representativeUser.cnic_masked,
+    eligible: true,
+    lock_reason: null,
+    lock_reasons: [],
+    source_current: true,
+    active_release_job_id: null,
+    counts: {
+      ordinary_blocked: 1,
+      identity_reuse: 0,
+      eligible: 1,
+      locked: 0,
+      in_progress: 0,
+    },
+    first_event_at: '2026-08-12T08:00:00Z',
+    last_event_at: '2026-08-12T08:00:00Z',
+  }],
+  next_cursor: null,
+}
+
+const attendanceReleaseCandidates = {
+  candidate_set_token: 'candidate-set-token',
+  expires_at: '2099-08-12T10:15:00Z',
+  source_current: true,
+  source_certificate: { certificate_digest: 'c'.repeat(64) },
+  target: {
+    user_key: representativeUser.user_key,
+    row_version: representativeUser.row_version,
+    display_name: representativeUser.display_name,
+    user_id: representativeUser.user_id,
+    uid: representativeUser.uid,
+    cnic_masked: representativeUser.cnic_masked,
+    eligible: true,
+    lock_reason: null,
+  },
+  filters: {
+    date_from: null,
+    date_to: null,
+    hold_statuses: ['BLOCKED_IDENTITY', 'QUARANTINED_IDENTITY_REUSE'],
+    punch: null,
+    source: null,
+  },
+  totals: {
+    all: 1,
+    eligible: 1,
+    locked: 0,
+    ordinary_blocked: 1,
+    identity_reuse: 0,
+  },
+  rows: [{
+    event_token: 'event-token-one',
+    event_uid: 'release-event-one',
+    device_event_time: '2026-08-12T08:00:00Z',
+    punch: '0',
+    status: '0',
+    source: 'FULL_HISTORY',
+    device_serial: device.zkt.serial,
+    uid: representativeUser.uid,
+    user_id: representativeUser.user_id,
+    display_name: representativeUser.display_name,
+    clock_quality: 'OK',
+    source_ords_status: 'BLOCKED_IDENTITY',
+    risk_class: 'ORDINARY_BLOCKED',
+    evidence_classification: 'CURRENT_USER_LINEAGE',
+    eligible: true,
+    lock_reason: null,
+  }],
+  next_cursor: null,
+}
+
 const factoryBundle = {
   bundle_id: 'zone-lite-2.4.5-6132c9b773b9', hardware_profile: 'esp32s3-16mb-zone-lite-v1',
   version: '2.4.5', git_sha: '6132c9b773b9a4016173e9b99dfde6ccc5dc29e5',
@@ -217,6 +299,8 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/alerts') json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null, device: { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id, hardware_id: device.hardware_id } }], next_cursor: null, totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 } }
     else if (url.pathname.endsWith('/alerts')) json = { rows: [] }
     else if (url.pathname === '/api/v1/attendance') json = { rows: [representativeAttendance], next_cursor: null }
+    else if (url.pathname === '/api/v2/attendance-release-queue') json = attendanceReleaseQueue
+    else if (url.pathname === `/api/v2/devices/${device.connector_id}/attendance-release-candidates/query`) json = attendanceReleaseCandidates
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', revoked_at: null, revoked_by: null, hil_target_mac: null }], next_cursor: null, filtered_total: 1, totals: { all: 1, available: 1, hil_only: 0, revoked: 0 } }
     else if (url.pathname === '/api/v1/firmware/campaigns') json = { enabled: true, hil_enabled: false, rows: [], next_cursor: null, filtered_total: 0, totals: { campaigns: { all: 0 }, deployments: { all: 0 } } }
     else if (url.pathname === '/api/v1/provisioning/capabilities') json = { enabled: true, supported_platforms: ['windows-x64', 'macos-arm64'], hardware_profile: 'esp32s3-16mb-zone-lite-v1', companion_min_version: '1.0.0', latest_bundle: factoryBundle, can_start: true }
@@ -456,42 +540,31 @@ test('populated Users and Attendance workspaces are responsive, keyboard-operabl
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
 
-test('employee repair gives a simple, safe, and responsive guided flow', async ({ page }, testInfo) => {
+test('legacy employee repair route opens the responsive blocked-punch review', async ({ page }, testInfo) => {
   await page.goto('/reconciliation?tab=employee-repair&device_id=connector-one')
-  await expect(page.getByRole('heading', { name: 'Fix past attendance for an employee' })).toBeVisible()
-  await expect(page.getByText('People can keep punching')).toBeVisible()
-  await expect(page.getByRole('navigation', { name: 'Repair steps' })).toContainText('Machine')
-  await expect(page.getByRole('navigation', { name: 'Repair steps' })).toContainText('Done')
+  await expect(page).toHaveURL(/\/attendance\?view=needs-review&device_id=connector-one$/)
+  await expect(page.getByRole('heading', { name: 'Attendance · Needs review' })).toBeVisible()
+  await expect(page.getByRole('tab', { name: /Needs review/ })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByRole('heading', { name: 'Employees needing review' })).toBeVisible()
+  await expect(page.getByText('Ayesha Khan')).toBeVisible()
+  await expect(page.getByText('One release always stays within one employee and one terminal.')).toBeVisible()
 
-  const employee = page.getByRole('checkbox', { name: 'Select Ayesha Khan' })
-  await employee.focus()
+  await page.getByRole('button', { name: 'Review punches' }).click()
+  await expect(page.getByRole('heading', { name: 'Ayesha Khan' })).toBeVisible()
+  await expect(page.getByText('Nothing is selected automatically. New punches never join this frozen candidate set.')).toBeVisible()
+  const punch = page.getByRole('checkbox', { name: /Select Check in/ })
+  await expect(punch).not.toBeChecked()
+  await punch.focus()
   await page.keyboard.press('Space')
-  await expect(employee).toBeChecked()
-  await page.getByRole('button', { name: 'Review past punches' }).click()
+  await expect(punch).toBeChecked()
+  await expect(page.getByText('1 selected')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Prepare 1 punches' })).toBeEnabled()
 
-  await expect(page.getByRole('heading', { name: 'Review the past punches we found' })).toBeVisible()
-  await expect(page.getByText('42 punches').first()).toBeVisible()
-  await expect(page.getByText('Only the employee name and CNIC can be fixed')).toBeVisible()
-  const olderRecords = page.getByText(/Possible older employee records \(1\)/)
-  await olderRecords.click()
-  await expect(page.getByText(/Previous details O\*\* N\*\*\*/)).toBeVisible()
-  await expect(page.getByText('Not safe to include automatically')).toHaveCount(0)
-
-  let dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
-  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
-  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('employee-repair-review.png'), fullPage: true })
-
-  await page.getByRole('button', { name: 'Prepare final check' }).click()
-  await expect(page.getByRole('heading', { name: 'Waiting for approval' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Ready for your final confirmation' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Check once more, then start the repair' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Start the repair' })).toBeDisabled()
-
-  dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
-  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('employee-repair-confirm.png'), fullPage: true })
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('attendance-release-review.png'), fullPage: true })
 })
 
 test('terminal multi-selection survives server-side search and current-view toggles', async ({ page }, testInfo) => {
