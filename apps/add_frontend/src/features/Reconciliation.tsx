@@ -23,7 +23,6 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
-import { EmployeeRepair } from './EmployeeRepair'
 import type {
   Device,
   ReconciliationDivergenceDetail,
@@ -141,7 +140,6 @@ function WorkspaceTabs({
   }> = [
     { id: 'jobs', label: 'Jobs', count: activeJobs },
     { id: 'exceptions', label: 'Source exceptions', count: openExceptions },
-    { id: 'employee-repair', label: 'Employee repair', count: 0 },
   ]
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let next = index
@@ -1175,9 +1173,7 @@ export function ReconciliationView({
   const [section, setSection] = useState<ReconciliationSection>(
     initial.get('tab') === 'source-exceptions'
       ? 'exceptions'
-      : initial.get('tab') === 'employee-repair'
-        ? 'employee-repair'
-        : 'jobs',
+      : 'jobs',
   )
   const [rows, setRows] = useState<ReconciliationJob[]>([])
   const [scheduler, setScheduler] =
@@ -1246,11 +1242,19 @@ export function ReconciliationView({
     [devices],
   )
 
+  useEffect(() => {
+    if (initial.get('tab') !== 'employee-repair') return
+    const params = new URLSearchParams({ view: 'needs-review' })
+    const deviceId = initial.get('device_id')
+    if (deviceId) params.set('device_id', deviceId)
+    window.history.replaceState(null, '', `/attendance?${params}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }, [initial])
+
   const setWorkspaceSection = (next: ReconciliationSection) => {
     setSection(next)
     const params = new URLSearchParams()
     if (next === 'exceptions') params.set('tab', 'source-exceptions')
-    if (next === 'employee-repair') params.set('tab', 'employee-repair')
     const deviceId = next === 'exceptions' ? exceptionFilters.device_id : ''
     const jobId = next === 'exceptions' ? exceptionFilters.job_id : ''
     if (deviceId) params.set('device_id', deviceId)
@@ -1289,9 +1293,7 @@ export function ReconciliationView({
       const next =
         params.get('tab') === 'source-exceptions'
           ? 'exceptions'
-          : params.get('tab') === 'employee-repair'
-            ? 'employee-repair'
-            : 'jobs'
+          : 'jobs'
       setSection(next)
       if (next === 'exceptions') {
         const deviceId = params.get('device_id') || ''
@@ -1570,18 +1572,16 @@ export function ReconciliationView({
         description="Recover complete terminal history through bounded, restart-safe capture and separately prove append-only Oracle membership. Every committed checkpoint and exception remains immutable."
         action={
           <div className="page-actions">
-            {section !== 'employee-repair' && (
-              <button
-                className="button secondary"
-                onClick={() =>
-                  void (section === 'jobs'
-                    ? loadJobs({ quiet: true })
-                    : loadExceptions({ quiet: true }))
-                }
-              >
-                <Icon name="refresh" /> Refresh
-              </button>
-            )}
+            <button
+              className="button secondary"
+              onClick={() =>
+                void (section === 'jobs'
+                  ? loadJobs({ quiet: true })
+                  : loadExceptions({ quiet: true }))
+              }
+            >
+              <Icon name="refresh" /> Refresh
+            </button>
             {section === 'jobs' && (
               <button
                 className="button primary"
@@ -1611,9 +1611,7 @@ export function ReconciliationView({
         openExceptions={exceptionTotals.open}
         onChange={setWorkspaceSection}
       />
-      {section === 'employee-repair' ? (
-        <EmployeeRepair devices={devices} revision={revision} toast={toast} />
-      ) : section === 'jobs' ? (
+      {section === 'jobs' ? (
         <div
           role="tabpanel"
           id="reconciliation-jobs-panel"

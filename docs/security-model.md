@@ -73,16 +73,18 @@ command. Every approval is bound to the complete snapshot's exact member IDs and
 requires password step-up plus `SAME EMPLOYEE`, and becomes stale on membership change. Revocation
 blocks new ambiguous punches again; previously captured terminal facts are never removed.
 
-Employee attendance repair is also ADD-only, but has a stricter Oracle content-proof boundary. The
-browser submits stable user keys, row versions, and server-issued cohort tokens; it never submits the
-desired CNIC/name at approval. ADD freezes encrypted identity from the certified current terminal
-snapshot, exact event membership, immutable-fact digests, source ownership, and Oracle content
-preconditions. Approval requires CSRF, recent administrator password step-up, a 15-minute preview
-digest, idempotency key, audited reason, and exact event-count confirmation phrase. Oracle must issue
-a durable content receipt before ADD activates a new effective identity revision. Cross-device UID
-collision, UID reuse, immutable mismatch, or precondition drift has no override path. Audit and repair
-ledgers contain only IDs, counts, states, and protected digests; reasons and frozen identity are
-encrypted. See [the attendance repair runbook](attendance-repair-runbook.md).
+Blocked-punch release is also ADD-only, but has a stricter Oracle content-proof boundary. The browser
+submits a purpose-bound candidate token and opaque event tokens; it cannot author event membership or
+the desired identity. ADD freezes encrypted identity from the certified current terminal snapshot,
+exact selected and omitted membership, immutable-fact digests, source ownership, and Oracle content
+preconditions. Approval requires CSRF, current administrator password, a 15-minute preview digest,
+idempotency key, audited reason, and exact event-count confirmation phrase. A safe identity-reuse
+selection additionally requires full-CNIC and authoritative-name re-entry; those values are compared
+transiently with current and frozen historical evidence and are never stored or logged in plaintext.
+Oracle must issue a durable content receipt before ADD activates a new effective identity revision.
+Cross-device UID collision, ambiguous ownership, immutable mismatch, or precondition drift has no
+override path. Audit and repair ledgers contain only IDs, counts, states, and protected digests;
+reasons and frozen identity are encrypted. See [the attendance repair runbook](attendance-repair-runbook.md).
 
 ## eFuse ceremony
 

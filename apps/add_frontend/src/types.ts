@@ -21,7 +21,7 @@ export type DashboardRoute =
   | 'alerts'
 
 export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
-export type ReconciliationSection = 'jobs' | 'exceptions' | 'employee-repair'
+export type ReconciliationSection = 'jobs' | 'exceptions'
 export type ReconciliationStatusGroup = '' | 'ACTIVE' | 'QUEUED_WAITING' | 'PAUSED' | 'ATTENTION' | 'COMPLETED' | 'CANCELLED'
 
 export interface FirmwareScopePreview {
@@ -710,6 +710,15 @@ export interface AttendanceRepairPreflight {
       last_error_at: string | null
       last_error_code: string | null
     } | null
+    release_v2?: {
+      queue_oldest_age_seconds: number
+      preparing_oldest_age_seconds: number
+      awaiting_approval_oldest_age_seconds: number
+      execution_oldest_age_seconds: number
+      exclusions_by_code: Record<string, number>
+      retry_exhausted_jobs: number
+      reuse_attribution_failures: Record<string, number>
+    }
   }
 }
 
@@ -729,6 +738,11 @@ export interface AttendanceRepairItemOutcome {
   event_uid: string
   user_key: string | null
   event_time: string | null
+  punch?: string | null
+  capture_source?: string | null
+  source_ords_status?: string | null
+  risk_class?: string
+  selection_origin?: string
   state: string
   oracle_classification: string
   outcome: string | null
@@ -737,6 +751,13 @@ export interface AttendanceRepairItemOutcome {
   downstream_attempt_count: number
   next_attempt_at: string | null
   error_code: string | null
+  error_message?: string | null
+  operation_id?: string
+  oracle_receipt_id?: string | null
+  oracle_verified_at?: string | null
+  downstream_status?: string | null
+  downstream_verified_at?: string | null
+  effective_identity_activated_at?: string | null
 }
 
 export interface AttendanceRepairJob {
@@ -745,7 +766,21 @@ export interface AttendanceRepairJob {
   device_id: string
   actor: string
   status: string
+  release_state?: string
   phase: string
+  workflow_version?: string
+  selection_mode?: string
+  selection_manifest_digest?: string | null
+  selection_filters?: {
+    date_from: string | null
+    date_to: string | null
+    hold_statuses: string[]
+    punch: string | null
+    source: string | null
+  } | null
+  selection_exclusion_manifest_digest?: string | null
+  candidate_membership_digest?: string | null
+  release_target_user_id?: string | null
   date_scope: {
     timezone: 'Asia/Karachi'
     start_utc: string | null
@@ -758,6 +793,12 @@ export interface AttendanceRepairJob {
   totals: {
     employees: number
     events: number
+    selected?: number
+    safe?: number
+    ordinary?: number
+    reuse?: number
+    safe_reuse?: number
+    operator_excluded?: number
     excluded: number
     completed_employees: number
     completed_events: number
@@ -773,7 +814,16 @@ export interface AttendanceRepairJob {
   approved_at: string | null
   started_at: string | null
   completed_at: string | null
+  reason?: string | null
   typed_confirmation?: string
+  reuse_attestation?: {
+    attestation_id: string
+    evidence_type: string
+    event_count: number
+    event_membership_digest: string
+    actor: string
+    created_at: string
+  } | null
   downstream_impact?: {
     timezone: 'Asia/Karachi'
     calendar_days: number
@@ -795,6 +845,97 @@ export interface AttendanceRepairListResponse {
   next_cursor: number | null
   totals: { all: number; active: number; attention: number }
   worker: AttendanceRepairPreflight['worker']
+}
+
+export interface AttendanceReleaseQueueRow {
+  connector_id: string | null
+  device_id: string | null
+  device_name: string
+  user_key: string | null
+  row_version: number | null
+  display_name: string
+  user_id: string
+  uid: string | null
+  cnic_masked: string | null
+  eligible: boolean
+  lock_reason: string | null
+  lock_reasons: string[]
+  source_current: boolean
+  active_release_job_id: string | null
+  counts: {
+    ordinary_blocked: number
+    identity_reuse: number
+    eligible: number
+    locked: number
+    in_progress: number
+  }
+  first_event_at: string
+  last_event_at: string
+}
+
+export interface AttendanceReleaseQueueResponse {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  totals: {
+    employees: number
+    events: number
+    eligible: number
+    locked: number
+  }
+  rows: AttendanceReleaseQueueRow[]
+  next_cursor: number | null
+}
+
+export interface AttendanceReleaseCandidate {
+  event_token: string | null
+  event_uid: string
+  device_event_time: string
+  punch: string | null
+  status: string | null
+  source: string
+  device_serial: string | null
+  uid: string | null
+  user_id: string | null
+  display_name: string | null
+  clock_quality: string
+  source_ords_status: 'BLOCKED_IDENTITY' | 'QUARANTINED_IDENTITY_REUSE'
+  risk_class: 'ORDINARY_BLOCKED' | 'IDENTITY_REUSE'
+  evidence_classification: string | null
+  eligible: boolean
+  lock_reason: string | null
+}
+
+export interface AttendanceReleaseCandidates {
+  candidate_set_token: string
+  expires_at: string
+  source_current: boolean
+  source_certificate: Record<string, unknown>
+  target: {
+    user_key: string
+    row_version: number
+    display_name: string
+    user_id: string
+    uid: string | null
+    cnic_masked: string | null
+    eligible: boolean
+    lock_reason: string | null
+  }
+  filters: {
+    date_from: string | null
+    date_to: string | null
+    hold_statuses: string[]
+    punch: string | null
+    source: string | null
+  }
+  totals: {
+    all: number
+    eligible: number
+    locked: number
+    ordinary_blocked: number
+    identity_reuse: number
+  }
+  rows: AttendanceReleaseCandidate[]
+  next_cursor: number | null
 }
 
 export interface UserDeletionJobItem {
@@ -954,6 +1095,18 @@ export interface AttendanceEvent {
   identity_resolution_status?: string
   identity_snapshot_id?: number | null
   identity_repaired_at?: string | null
+  identity_content_status?: string
+  identity_content_confirmed_at?: string | null
+  identity_downstream_confirmed_at?: string | null
+  release_state?: string
+  release_state_label?: string
+  effective_identity_confirmed_at?: string | null
+  effective_identity_downstream_confirmed_at?: string | null
+  active_release_job_id?: string | null
+  latest_release_job_id?: string | null
+  release_target_user_key?: string | null
+  release_connector_id?: string | null
+  release_lock_reason?: string | null
 }
 
 export interface DeviceLog {

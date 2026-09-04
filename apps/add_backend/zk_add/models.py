@@ -409,6 +409,32 @@ Index(
     AttendanceEvent.device_event_time,
     AttendanceEvent.id,
 )
+Index(
+    "ix_add_attendance_release_queue",
+    AttendanceEvent.zkt_device_id,
+    AttendanceEvent.ords_status,
+    AttendanceEvent.user_id,
+    AttendanceEvent.device_event_time,
+    AttendanceEvent.id,
+    postgresql_where=text(
+        "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
+    ),
+    sqlite_where=text(
+        "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
+    ),
+)
+Index(
+    "ix_add_attendance_release_queue_status_date",
+    AttendanceEvent.ords_status,
+    AttendanceEvent.device_event_time,
+    AttendanceEvent.id,
+    postgresql_where=text(
+        "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
+    ),
+    sqlite_where=text(
+        "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
+    ),
+)
 
 
 class AttendanceBatchReceipt(Base):
@@ -1237,6 +1263,16 @@ class AttendanceRepairJob(Base):
     phase: Mapped[str] = mapped_column(String(50), default="SOURCE_PREFLIGHT", index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     request_digest: Mapped[str] = mapped_column(String(64), index=True)
+    workflow_version: Mapped[str] = mapped_column(
+        String(30), default="LEGACY_COHORT_V1", index=True
+    )
+    selection_mode: Mapped[str] = mapped_column(String(30), default="COHORT", index=True)
+    selection_manifest_digest: Mapped[str | None] = mapped_column(String(64), index=True)
+    selection_filters: Mapped[dict | None] = mapped_column(JSON)
+    selection_exclusion_manifest_digest: Mapped[str | None] = mapped_column(String(64))
+    candidate_membership_digest: Mapped[str | None] = mapped_column(String(64))
+    candidate_source_certificate_digest: Mapped[str | None] = mapped_column(String(64))
+    release_target_user_id: Mapped[str | None] = mapped_column(String(100), index=True)
     preview_digest: Mapped[str | None] = mapped_column(String(64), index=True)
     cohort_digest: Mapped[str | None] = mapped_column(String(64), index=True)
     source_certificate_digest: Mapped[str | None] = mapped_column(String(64))
@@ -1247,6 +1283,10 @@ class AttendanceRepairJob(Base):
     date_end_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     target_count: Mapped[int] = mapped_column(Integer, default=0)
     event_count: Mapped[int] = mapped_column(Integer, default=0)
+    selected_blocked_count: Mapped[int] = mapped_column(Integer, default=0)
+    selected_reuse_count: Mapped[int] = mapped_column(Integer, default=0)
+    operator_excluded_count: Mapped[int] = mapped_column(Integer, default=0)
+    safe_reuse_count: Mapped[int] = mapped_column(Integer, default=0)
     excluded_count: Mapped[int] = mapped_column(Integer, default=0)
     completed_target_count: Mapped[int] = mapped_column(Integer, default=0)
     completed_event_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -1299,6 +1339,64 @@ class AttendanceRepairTarget(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AttendanceRepairSelection(Base):
+    """Exact operator-selected event membership captured before source recertification."""
+
+    __tablename__ = "add_attendance_repair_selections"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "attendance_event_id",
+            name="uq_add_attendance_repair_selection_event",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_repair_jobs.id"), index=True)
+    target_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_repair_targets.id"), index=True
+    )
+    attendance_event_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_events.id"), index=True
+    )
+    event_uid: Mapped[str] = mapped_column(String(128), index=True)
+    immutable_facts_digest: Mapped[str] = mapped_column(String(64))
+    source_ownership_digest: Mapped[str] = mapped_column(String(64))
+    before_identity_digest: Mapped[str] = mapped_column(String(64))
+    source_ords_status: Mapped[str] = mapped_column(String(40), index=True)
+    risk_class: Mapped[str] = mapped_column(String(40), index=True)
+    selection_origin: Mapped[str] = mapped_column(String(30), index=True)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceRepairReuseAttestation(Base):
+    """PII-free proof that an admin approved exact identity-reuse event membership."""
+
+    __tablename__ = "add_attendance_repair_reuse_attestations"
+    __table_args__ = (
+        UniqueConstraint("job_id", name="uq_add_attendance_repair_reuse_job"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attestation_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_repair_jobs.id"), index=True)
+    target_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_repair_targets.id"), index=True
+    )
+    target_identity_digest: Mapped[str] = mapped_column(String(64), index=True)
+    target_row_version: Mapped[int] = mapped_column(Integer)
+    event_membership_digest: Mapped[str] = mapped_column(String(64), index=True)
+    event_count: Mapped[int] = mapped_column(Integer)
+    evidence_type: Mapped[str] = mapped_column(String(60), index=True)
+    verified_name_digest: Mapped[str] = mapped_column(String(64))
+    reason_digest: Mapped[str] = mapped_column(String(64))
+    confirmation_digest: Mapped[str] = mapped_column(String(64))
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    created_at: Mapped[datetime] = utc_column()
+
+
 class AttendanceRepairCohort(Base):
     __tablename__ = "add_attendance_repair_cohorts"
     __table_args__ = (
@@ -1320,6 +1418,7 @@ class AttendanceRepairCohort(Base):
     first_event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     event_count: Mapped[int] = mapped_column(Integer)
+    selected_event_count: Mapped[int] = mapped_column(Integer, default=0)
     selected: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = utc_column()
 
@@ -1343,6 +1442,13 @@ class AttendanceRepairItem(Base):
     attendance_event_id: Mapped[int] = mapped_column(
         ForeignKey("add_attendance_events.id"), index=True
     )
+    reuse_attestation_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "add_attendance_repair_reuse_attestations.id",
+            name="fk_add_attendance_repair_item_reuse_attestation",
+        ),
+        index=True,
+    )
     event_uid: Mapped[str] = mapped_column(String(128), index=True)
     immutable_facts_digest: Mapped[str] = mapped_column(String(64))
     source_ownership_digest: Mapped[str] = mapped_column(String(64))
@@ -1357,6 +1463,9 @@ class AttendanceRepairItem(Base):
     desired_cnic_lookup_hash: Mapped[str] = mapped_column(String(64))
     desired_cnic_last4: Mapped[str] = mapped_column(String(4))
     desired_identity_digest: Mapped[str] = mapped_column(String(64))
+    source_ords_status: Mapped[str | None] = mapped_column(String(40), index=True)
+    risk_class: Mapped[str] = mapped_column(String(40), default="LEGACY", index=True)
+    selection_origin: Mapped[str] = mapped_column(String(30), default="COHORT", index=True)
     oracle_classification: Mapped[str] = mapped_column(
         String(40), default="NOT_CHECKED", index=True
     )

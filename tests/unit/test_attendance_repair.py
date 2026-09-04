@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from zk_add import attendance_repair as repair
+from zk_add.attendance_repair_api import AttendanceReleaseApproveRequest
 from zk_add.crypto import cnic_lookup, decrypt_text, encrypt_cnic, encrypt_text
 from zk_add.db import Base
 from zk_add.models import (
@@ -22,6 +23,8 @@ from zk_add.models import (
     AttendanceRepairJob,
     AttendanceRepairEvent,
     AttendanceRepairOracleSlot,
+    AttendanceRepairReuseAttestation,
+    AttendanceRepairSelection,
     AttendanceRepairTarget,
     AuditChainHead,
     AuditEvent,
@@ -42,6 +45,23 @@ from zk_add.time_utils import utc_now
 SERIAL = "ADZV211860253"
 CORRECT_CNIC = "3520212345671"
 WRONG_CNIC = "3520299999991"
+
+
+def test_v2_reuse_approval_request_masks_proof_values() -> None:
+    request = AttendanceReleaseApproveRequest(
+        reason="Verified identity reuse evidence.",
+        password="current-admin-password",
+        typed_confirmation="RELEASE server confirmation",
+        preview_digest="a" * 64,
+        idempotency_key="reuse-approval-request",
+        reuse_cnic=CORRECT_CNIC,
+        reuse_employee_name="Dr Farzana",
+    )
+
+    rendered = repr(request)
+    assert CORRECT_CNIC not in rendered
+    assert "Dr Farzana" not in rendered
+    assert "current-admin-password" not in rendered
 
 
 @pytest.fixture()
@@ -260,6 +280,90 @@ def _freeze_approved_job(sessions: sessionmaker[Session], connector_id: str, use
         return job.job_id
 
 
+def _certify_additional_held_event(
+    session: Session,
+    *,
+    connector_id: str,
+    event_uid_seed: bytes,
+    event_time: datetime,
+    ords_status: str = "BLOCKED_IDENTITY",
+) -> AttendanceEvent:
+    """Add a second source-certified punch to the compact repair fixture."""
+
+    connector = session.scalar(
+        select(repair.Connector).where(repair.Connector.connector_id == connector_id)
+    )
+    assert connector is not None and connector.zkt_device is not None
+    zkt = connector.zkt_device
+    user = session.scalar(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id))
+    coverage = session.scalar(
+        select(ReconciliationCoverage).where(
+            ReconciliationCoverage.zkt_device_id == zkt.id,
+            ReconciliationCoverage.active == True,  # noqa: E712
+        )
+    )
+    baseline = session.get(ReconciliationJob, coverage.job_id if coverage else None)
+    assert user is not None and coverage is not None and baseline is not None
+    ordinal = int(coverage.source_committed_cursor or 0)
+    event = AttendanceEvent(
+        event_uid=hashlib.sha256(event_uid_seed).hexdigest(),
+        connector_id=connector.id,
+        zkt_device_id=zkt.id,
+        device_user_id=user.id,
+        identity_snapshot_id=zkt.identity_snapshot_id,
+        identity_resolution_status="RESOLVED_CURRENT_SNAPSHOT",
+        device_serial=SERIAL,
+        uid=user.uid,
+        user_id=user.user_id,
+        display_name="Wrong Name",
+        cnic_encrypted=encrypt_cnic(WRONG_CNIC),
+        cnic_lookup_hash=cnic_lookup(WRONG_CNIC),
+        cnic_last4=WRONG_CNIC[-4:],
+        device_event_time=event_time,
+        captured_at=event_time,
+        source="FULL_HISTORY",
+        status="0",
+        punch="1",
+        raw_punch=False,
+        clock_quality="OK",
+        raw_event={"source_record": f"preserved-{ordinal}"},
+        ords_status=ords_status,
+    )
+    session.add(event)
+    session.flush()
+    session.add(
+        TerminalRecordManifest(
+            job_id=baseline.id,
+            connector_id=connector.id,
+            zkt_device_id=zkt.id,
+            terminal_serial=SERIAL,
+            generation=coverage.terminal_generation,
+            source_epoch_id=coverage.source_epoch_id,
+            ordinal=ordinal,
+            canonical_source=True,
+            raw_record_digest=hashlib.sha256(f"raw-{ordinal}".encode()).hexdigest(),
+            terminal_record_key=hashlib.sha256(f"key-{ordinal}".encode()).hexdigest(),
+            attendance_event_id=event.id,
+            disposition="EVENT",
+            observed_uid=user.uid,
+            observed_user_id=user.user_id,
+        )
+    )
+    new_count = ordinal + 1
+    zkt.attendance_count = new_count
+    baseline.cutoff_count = new_count
+    baseline.latest_terminal_count = new_count
+    coverage.certified_source_cursor = new_count
+    coverage.source_committed_cursor = new_count
+    coverage.source_chain_digest = hashlib.sha256(
+        f"source-chain-{new_count}".encode()
+    ).hexdigest()
+    coverage.source_committed_chain_digest = coverage.source_chain_digest
+    coverage.captured_at = utc_now()
+    session.flush()
+    return event
+
+
 def test_repair_activation_preserves_physical_facts_and_verifies_downstream(
     repair_store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -426,9 +530,852 @@ def test_feature_gates_default_to_fail_closed() -> None:
     )
     assert defaults.attendance_repair_preview_enabled is False
     assert defaults.attendance_repair_execution_enabled is False
+    assert defaults.attendance_repair_legacy_admission_enabled is False
     assert defaults.attendance_repair_max_employees == 500
     assert defaults.attendance_repair_max_events == 250_000
     assert defaults.attendance_repair_oracle_concurrency == 2
+
+
+def test_v2_release_queue_and_explicit_selection_freeze_only_the_chosen_punch(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and user is not None and event is not None
+        user.display_name = "Dr Farzana"
+        event.ords_status = "BLOCKED_IDENTITY"
+        session.flush()
+
+        queue = repair.build_attendance_release_queue(
+            session,
+            connector=connector,
+            q="Farzana",
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            cursor=0,
+            limit=100,
+        )
+        assert queue["totals"] == {
+            "employees": 1,
+            "events": 1,
+            "eligible": 1,
+            "locked": 0,
+        }
+        assert queue["rows"][0]["display_name"] == "Dr Farzana"
+        assert queue["rows"][0]["counts"]["ordinary_blocked"] == 1
+        assert queue["rows"][0]["cnic_masked"] == "*****-****567-1"
+        effective = repair.attendance_release_states(session, [event])[event.id]
+        assert effective["release_state"] == "ELIGIBLE"
+        assert effective["release_connector_id"] == connector_id
+        assert effective["release_target_user_key"] == user_key
+
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        assert candidates["totals"] == {
+            "all": 1,
+            "eligible": 1,
+            "locked": 0,
+            "ordinary_blocked": 1,
+            "identity_reuse": 0,
+        }
+        assert candidates["rows"][0]["event_token"]
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=candidates["candidate_set_token"],
+            selection_mode="EXPLICIT",
+            event_tokens=[candidates["rows"][0]["event_token"]],
+            excluded_event_tokens=[],
+            idempotency_key="release-explicit-one",
+        )
+        session.flush()
+        selections = list(
+            session.scalars(
+                select(AttendanceRepairSelection).where(
+                    AttendanceRepairSelection.job_id == job.id
+                )
+            ).all()
+        )
+        assert job.workflow_version == "EVENT_SELECTION_V2"
+        assert job.target_count == 1
+        assert job.event_count == 1
+        assert job.selected_blocked_count == 1
+        assert [row.event_uid for row in selections] == [event_uid]
+        assert selections[0].selection_origin == "EXPLICIT"
+        assert event.ords_status == "BLOCKED_IDENTITY"
+
+        repair._freeze_membership(session, job)
+        session.flush()
+        item = session.scalar(
+            select(AttendanceRepairItem).where(AttendanceRepairItem.job_id == job.id)
+        )
+        cohort = session.scalar(
+            select(AttendanceRepairCohort).join(
+                AttendanceRepairTarget,
+                AttendanceRepairCohort.target_id == AttendanceRepairTarget.id,
+            ).where(AttendanceRepairTarget.job_id == job.id)
+        )
+        assert item is not None and cohort is not None
+        assert item.source_ords_status == "BLOCKED_IDENTITY"
+        assert item.risk_class == "ORDINARY_BLOCKED"
+        assert cohort.event_count == 1
+        assert cohort.selected_event_count == 1
+
+
+def test_v2_all_filtered_selection_spans_pages_and_honours_explicit_exclusions(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        first = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and first is not None
+        first.ords_status = "BLOCKED_IDENTITY"
+        second = _certify_additional_held_event(
+            session,
+            connector_id=connector_id,
+            event_uid_seed=b"repair-event-2",
+            event_time=datetime(2026, 8, 20, 4, 15, tzinfo=timezone.utc),
+        )
+
+        page_one = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=1,
+        )
+        assert page_one["totals"]["eligible"] == 2
+        assert page_one["next_cursor"] == 1
+        page_two = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=page_one["next_cursor"],
+            limit=1,
+            candidate_set_token=page_one["candidate_set_token"],
+        )
+        assert page_two["candidate_set_token"] == page_one["candidate_set_token"]
+        excluded = page_one["rows"][0]["event_token"]
+        assert excluded
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=page_one["candidate_set_token"],
+            selection_mode="ALL_FILTERED",
+            event_tokens=[],
+            excluded_event_tokens=[excluded],
+            idempotency_key="release-all-filtered",
+        )
+        session.flush()
+        selection = session.scalar(
+            select(AttendanceRepairSelection).where(
+                AttendanceRepairSelection.job_id == job.id
+            )
+        )
+        assert selection is not None
+        assert job.event_count == 1
+        assert job.operator_excluded_count == 1
+        assert job.selection_exclusion_manifest_digest is not None
+        assert len(job.selection_exclusion_manifest_digest) == 64
+        assert job.candidate_membership_digest is not None
+        assert len(job.candidate_membership_digest) == 64
+        assert selection.selection_origin == "ALL_FILTERED"
+        assert selection.event_uid == page_two["rows"][0]["event_uid"]
+        assert {first.event_uid, second.event_uid} == {
+            page_one["rows"][0]["event_uid"],
+            page_two["rows"][0]["event_uid"],
+        }
+
+
+def test_v2_exact_selection_limit_applies_to_selected_punches_not_full_cohort(
+    repair_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    monkeypatch.setattr(settings, "attendance_repair_max_events", 1)
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        selected = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and selected is not None
+        selected.ords_status = "BLOCKED_IDENTITY"
+        _certify_additional_held_event(
+            session,
+            connector_id=connector_id,
+            event_uid_seed=b"repair-event-unselected-cohort-member",
+            event_time=datetime(2026, 8, 20, 4, 15, tzinfo=timezone.utc),
+            ords_status="ACKED_CHECK",
+        )
+        session.add(
+            AttendanceEvent(
+                event_uid=hashlib.sha256(b"unrelated-held-event").hexdigest(),
+                connector_id=selected.connector_id,
+                zkt_device_id=selected.zkt_device_id,
+                device_user_id=None,
+                identity_snapshot_id=selected.identity_snapshot_id,
+                identity_resolution_status="UNRESOLVED",
+                device_serial=selected.device_serial,
+                uid="99",
+                user_id="9999",
+                display_name="Another Employee",
+                cnic_encrypted=None,
+                cnic_lookup_hash=None,
+                cnic_last4=None,
+                device_event_time=datetime(2026, 8, 20, 4, 45, tzinfo=timezone.utc),
+                captured_at=datetime(2026, 8, 20, 4, 45, tzinfo=timezone.utc),
+                source="LIVE",
+                status="0",
+                punch="0",
+                raw_punch=False,
+                clock_quality="OK",
+                raw_event={"source_record": "unrelated"},
+                ords_status="BLOCKED_IDENTITY",
+            )
+        )
+        session.flush()
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        assert candidates["totals"]["eligible"] == 1
+        event_token = candidates["rows"][0]["event_token"]
+        assert event_token
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=candidates["candidate_set_token"],
+            selection_mode="EXPLICIT",
+            event_tokens=[event_token],
+            excluded_event_tokens=[],
+            idempotency_key="release-selected-cap-only",
+        )
+        repair._freeze_membership(session, job)
+        session.flush()
+        cohort = session.scalar(
+            select(AttendanceRepairCohort)
+            .join(
+                AttendanceRepairTarget,
+                AttendanceRepairCohort.target_id == AttendanceRepairTarget.id,
+            )
+            .where(AttendanceRepairTarget.job_id == job.id)
+        )
+        assert cohort is not None
+        assert job.event_count == 1
+        assert cohort.event_count == 2
+        assert cohort.selected_event_count == 1
+
+
+def test_v2_frozen_preview_detects_new_matching_candidate_membership(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        original = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and original is not None
+        original.ords_status = "BLOCKED_IDENTITY"
+        session.flush()
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        event_token = candidates["rows"][0]["event_token"]
+        assert event_token
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=candidates["candidate_set_token"],
+            selection_mode="EXPLICIT",
+            event_tokens=[event_token],
+            excluded_event_tokens=[],
+            idempotency_key="release-membership-drift",
+        )
+        repair._freeze_membership(session, job)
+        session.flush()
+        item = session.scalar(
+            select(AttendanceRepairItem).where(AttendanceRepairItem.job_id == job.id)
+        )
+        assert item is not None
+        item.oracle_classification = "MISMATCH"
+        item.expected_oracle_token_encrypted = encrypt_text("a" * 64)
+        item.state = "ORACLE_APPLY"
+        session.flush()
+        job.preview_digest = repair._sha(repair._preview_material(session, job))
+        job.preview_expires_at = utc_now() + timedelta(minutes=15)
+        job.status = "AWAITING_APPROVAL"
+        job.phase = "PREVIEW_FROZEN"
+
+        discovered = AttendanceEvent(
+            event_uid=hashlib.sha256(b"newly-discovered-held-event").hexdigest(),
+            connector_id=original.connector_id,
+            zkt_device_id=original.zkt_device_id,
+            device_user_id=original.device_user_id,
+            identity_snapshot_id=original.identity_snapshot_id,
+            identity_resolution_status=original.identity_resolution_status,
+            device_serial=original.device_serial,
+            uid=original.uid,
+            user_id=original.user_id,
+            display_name=original.display_name,
+            cnic_encrypted=original.cnic_encrypted,
+            cnic_lookup_hash=original.cnic_lookup_hash,
+            cnic_last4=original.cnic_last4,
+            device_event_time=datetime(2026, 8, 20, 5, 15, tzinfo=timezone.utc),
+            captured_at=datetime(2026, 8, 20, 5, 15, tzinfo=timezone.utc),
+            source="FULL_HISTORY",
+            status="0",
+            punch="1",
+            raw_punch=False,
+            clock_quality="OK",
+            raw_event={"source_record": "newly-discovered"},
+            ords_status="BLOCKED_IDENTITY",
+        )
+        session.add(discovered)
+        session.flush()
+
+        with pytest.raises(repair.RepairError) as drifted:
+            repair.assert_preview_current(session, job)
+        assert drifted.value.code == "PREVIEW_DRIFT"
+
+
+def test_v2_selection_tokens_reject_tampering_expiry_and_membership_drift(
+    repair_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and event is not None
+        event.ords_status = "BLOCKED_IDENTITY"
+        session.flush()
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        token = candidates["rows"][0]["event_token"]
+        assert token
+        tampered = f"{token[:-1]}{'A' if token[-1] != 'A' else 'B'}"
+        with pytest.raises(repair.RepairError) as rejected:
+            repair._validate_release_selection(
+                session,
+                connector=connector,
+                candidate_set_token=candidates["candidate_set_token"],
+                selection_mode="EXPLICIT",
+                event_tokens=[tampered],
+                excluded_event_tokens=[],
+            )
+        assert rejected.value.code == "SELECTION_TOKEN_INVALID"
+
+        issued_at = repair.utc_now()
+        monkeypatch.setattr(
+            repair,
+            "utc_now",
+            lambda: issued_at + timedelta(minutes=16),
+        )
+        with pytest.raises(repair.RepairError) as expired:
+            repair._validate_release_selection(
+                session,
+                connector=connector,
+                candidate_set_token=candidates["candidate_set_token"],
+                selection_mode="EXPLICIT",
+                event_tokens=[token],
+                excluded_event_tokens=[],
+            )
+        assert expired.value.code == "SELECTION_TOKEN_EXPIRED"
+
+        monkeypatch.setattr(repair, "utc_now", lambda: issued_at)
+        event.identity_content_status = "VERIFIED"
+        session.flush()
+        with pytest.raises(repair.RepairError) as drifted:
+            repair._validate_release_selection(
+                session,
+                connector=connector,
+                candidate_set_token=candidates["candidate_set_token"],
+                selection_mode="EXPLICIT",
+                event_tokens=[token],
+                excluded_event_tokens=[],
+            )
+        assert drifted.value.code == "SELECTION_DRIFT"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        ("missing_cnic", "TARGET_CNIC_MISSING"),
+        ("bad_clock", "CLOCK_NOT_OK"),
+    ],
+)
+def test_v2_release_queue_keeps_ineligible_employee_punches_visible_and_locked(
+    repair_store,
+    mutate: str,
+    expected_reason: str,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and user is not None and event is not None
+        event.ords_status = "BLOCKED_IDENTITY"
+        if mutate == "missing_cnic":
+            user.cnic_encrypted = None
+            user.cnic_lookup_hash = None
+            user.cnic_last4 = None
+        else:
+            event.clock_quality = "INVALID_DEVICE_TIME"
+        session.flush()
+
+        queue = repair.build_attendance_release_queue(
+            session,
+            connector=connector,
+            q=None,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            cursor=0,
+            limit=100,
+        )
+        assert queue["totals"]["events"] == 1
+        assert queue["totals"]["eligible"] == 0
+        assert queue["totals"]["locked"] == 1
+        assert queue["rows"][0]["eligible"] is False
+        assert expected_reason in queue["rows"][0]["lock_reasons"]
+
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        assert candidates["rows"][0]["eligible"] is False
+        assert candidates["rows"][0]["event_token"] is None
+        assert candidates["rows"][0]["lock_reason"] == expected_reason
+
+
+def test_v2_invalid_time_stays_locked_in_all_events_and_outside_release_queue(
+    repair_store,
+) -> None:
+    sessions, connector_id, _user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and event is not None
+        event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+        event.clock_quality = "INVALID"
+        session.flush()
+
+        effective = repair.attendance_release_states(session, [event])[event.id]
+        assert effective["release_state"] == "LOCKED"
+        assert effective["release_lock_reason"] == "QUARANTINED_INVALID_DEVICE_TIME"
+        queue = repair.build_attendance_release_queue(
+            session,
+            connector=connector,
+            q=None,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            cursor=0,
+            limit=100,
+        )
+        assert queue["totals"]["events"] == 0
+        assert queue["rows"] == []
+
+
+def test_v2_reuse_approval_requires_exact_transient_proof_and_exports_no_plaintext(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        user = session.scalar(select(DeviceUser).where(DeviceUser.user_key == user_key))
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and user is not None and event is not None
+        event.ords_status = "QUARANTINED_IDENTITY_REUSE"
+        event.display_name = user.display_name
+        session.flush()
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=["QUARANTINED_IDENTITY_REUSE"],
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        event_token = candidates["rows"][0]["event_token"]
+        assert event_token
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=candidates["candidate_set_token"],
+            selection_mode="EXPLICIT",
+            event_tokens=[event_token],
+            excluded_event_tokens=[],
+            idempotency_key="release-reuse-prepare",
+            actor_session_id="session-row-7",
+            actor_ip="192.0.2.10",
+        )
+        repair._freeze_membership(session, job)
+        session.flush()
+        item = session.scalar(
+            select(AttendanceRepairItem).where(AttendanceRepairItem.job_id == job.id)
+        )
+        assert item is not None
+        item.oracle_classification = "MISMATCH"
+        item.expected_oracle_token_encrypted = encrypt_text("a" * 64)
+        item.state = "ORACLE_APPLY"
+        job.safe_reuse_count = 1
+        session.flush()
+        job.preview_digest = repair._sha(repair._preview_material(session, job))
+        job.preview_expires_at = utc_now() + timedelta(minutes=15)
+        job.status = "AWAITING_APPROVAL"
+        job.phase = "PREVIEW_FROZEN"
+        session.flush()
+        detail = repair.serialize_repair_job(session, job, include_items=True)
+        assert item.risk_class == "IDENTITY_REUSE"
+        assert repair._sha(repair._preview_material(session, job)) == job.preview_digest
+        assert detail["typed_confirmation"].startswith(
+            "RELEASE 1 OF 1 PUNCHES FOR 1007 ON TEST-1 INCLUDING 1 REUSE "
+        )
+
+        with pytest.raises(repair.RepairError) as wrong_cnic:
+            repair.approve_repair_job(
+                session,
+                job=job,
+                actor="operator",
+                reason="Verified reuse attribution against current terminal identity.",
+                typed_confirmation=detail["typed_confirmation"],
+                preview_digest=job.preview_digest,
+                idempotency_key="release-reuse-bad-cnic",
+                reuse_cnic=WRONG_CNIC,
+                reuse_employee_name=user.display_name,
+            )
+        assert wrong_cnic.value.code == "REUSE_CNIC_MISMATCH"
+        repair.record_release_approval_rejection(
+            session,
+            job=job,
+            actor="operator",
+            error_code=wrong_cnic.value.code,
+            reuse_evidence_supplied=True,
+            actor_session_id="session-row-7",
+            actor_ip="192.0.2.10",
+        )
+        rejection = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "ATTENDANCE_RELEASE_APPROVAL_REJECTED"
+            )
+        )
+        assert rejection is not None
+        assert rejection.outcome == "REUSE_CNIC_MISMATCH"
+        assert rejection.after["reuse_evidence_supplied"] is True
+        assert (
+            repair.repair_worker_metrics(session)["release_v2"][
+                "reuse_attribution_failures"
+            ]["REUSE_CNIC_MISMATCH"]
+            == 1
+        )
+
+        repair.approve_repair_job(
+            session,
+            job=job,
+            actor="operator",
+            reason="Verified reuse attribution against current terminal identity.",
+            typed_confirmation=detail["typed_confirmation"],
+            preview_digest=job.preview_digest,
+            idempotency_key="release-reuse-approved",
+            reuse_cnic=CORRECT_CNIC,
+            reuse_employee_name=user.display_name,
+            actor_session_id="session-row-7",
+            actor_ip="192.0.2.10",
+        )
+        session.flush()
+        attestation = session.scalar(
+            select(AttendanceRepairReuseAttestation).where(
+                AttendanceRepairReuseAttestation.job_id == job.id
+            )
+        )
+        assert attestation is not None
+        assert attestation.event_count == 1
+        assert item.reuse_attestation_id == attestation.id
+        assert job.status == "QUEUED"
+
+        encoded = json.dumps(repair.repair_evidence(session, job), default=str)
+        assert CORRECT_CNIC not in encoded
+        assert WRONG_CNIC not in encoded
+        assert user.display_name not in encoded
+        assert "session-row-7" not in encoded
+        assert "192.0.2.10" not in encoded
+        assert "verified_name_digest" in encoded
+        assert "event_membership_digest" in encoded
+
+
+def test_v2_partial_safe_approval_keeps_unsafe_oracle_item_locked(
+    repair_store,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        first = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and first is not None
+        first.ords_status = "BLOCKED_IDENTITY"
+        second = _certify_additional_held_event(
+            session,
+            connector_id=connector_id,
+            event_uid_seed=b"release-unsafe-oracle-item",
+            event_time=datetime(2026, 8, 20, 4, 15, tzinfo=timezone.utc),
+        )
+        candidates = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        tokens = [row["event_token"] for row in candidates["rows"]]
+        assert all(tokens)
+        job = repair.create_exact_release_job(
+            session,
+            connector=connector,
+            actor="operator",
+            candidate_set_token=candidates["candidate_set_token"],
+            selection_mode="EXPLICIT",
+            event_tokens=[str(token) for token in tokens],
+            excluded_event_tokens=[],
+            idempotency_key="release-partial-safe",
+        )
+        repair._freeze_membership(session, job)
+        session.flush()
+        items = list(
+            session.scalars(
+                select(AttendanceRepairItem)
+                .where(AttendanceRepairItem.job_id == job.id)
+                .order_by(AttendanceRepairItem.event_uid)
+            ).all()
+        )
+        assert len(items) == 2
+        safe = next(item for item in items if item.event_uid == first.event_uid)
+        unsafe = next(item for item in items if item.event_uid == second.event_uid)
+        safe.oracle_classification = "MISMATCH"
+        safe.expected_oracle_token_encrypted = encrypt_text("a" * 64)
+        safe.state = "ORACLE_APPLY"
+        unsafe.oracle_classification = "AMBIGUOUS"
+        unsafe.state = "NEEDS_REVIEW"
+        unsafe.outcome = "AMBIGUOUS"
+        unsafe.error_code = "AMBIGUOUS"
+        job.excluded_count = 1
+        job.attention_event_count = 1
+        session.flush()
+        job.preview_digest = repair._sha(repair._preview_material(session, job))
+        job.preview_expires_at = utc_now() + timedelta(minutes=15)
+        job.status = "AWAITING_APPROVAL"
+        job.phase = "PREVIEW_FROZEN"
+        session.flush()
+
+        repair.assert_preview_current(session, job)
+        detail = repair.serialize_repair_job(session, job, include_items=True)
+        assert detail["totals"]["safe"] == 1
+        assert detail["totals"]["excluded"] == 1
+        assert detail["typed_confirmation"].startswith(
+            "RELEASE 1 OF 2 PUNCHES FOR 1007 ON TEST-1 "
+        )
+        repair.approve_repair_job(
+            session,
+            job=job,
+            actor="operator",
+            reason="Release only the Oracle-classified safe punch.",
+            typed_confirmation=detail["typed_confirmation"],
+            preview_digest=job.preview_digest,
+            idempotency_key="release-partial-safe-approval",
+        )
+        assert job.status == "QUEUED"
+
+        first.identity_content_status = "VERIFIED"
+        job.status = "COMPLETED_WITH_ATTENTION"
+        job.completed_at = utc_now()
+        session.flush()
+        refreshed = repair.build_attendance_release_candidates(
+            session,
+            connector=connector,
+            user_key=user_key,
+            date_from=None,
+            date_to=None,
+            hold_statuses=None,
+            punch=None,
+            source=None,
+            cursor=0,
+            limit=100,
+        )
+        assert refreshed["totals"] == {
+            "all": 1,
+            "eligible": 0,
+            "locked": 1,
+            "ordinary_blocked": 1,
+            "identity_reuse": 0,
+        }
+        assert refreshed["rows"][0]["event_uid"] == second.event_uid
+        assert refreshed["rows"][0]["lock_reason"] == "AMBIGUOUS"
+        assert refreshed["rows"][0]["event_token"] is None
+
+
+def test_v2_candidate_cap_applies_before_any_release_job_is_created(
+    repair_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, connector_id, user_key, event_uid = repair_store
+    monkeypatch.setattr(settings, "attendance_repair_max_events", 1)
+    with sessions() as session:
+        connector = session.scalar(
+            select(repair.Connector).where(
+                repair.Connector.connector_id == connector_id
+            )
+        )
+        first = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid)
+        )
+        assert connector is not None and first is not None
+        first.ords_status = "BLOCKED_IDENTITY"
+        _certify_additional_held_event(
+            session,
+            connector_id=connector_id,
+            event_uid_seed=b"repair-event-over-cap",
+            event_time=datetime(2026, 8, 20, 4, 15, tzinfo=timezone.utc),
+        )
+        with pytest.raises(repair.RepairError) as over_limit:
+            repair.build_attendance_release_candidates(
+                session,
+                connector=connector,
+                user_key=user_key,
+                date_from=None,
+                date_to=None,
+                hold_statuses=None,
+                punch=None,
+                source=None,
+                cursor=0,
+                limit=100,
+            )
+        assert over_limit.value.code == "EVENT_LIMIT"
+        assert session.scalar(select(repair.func.count(AttendanceRepairJob.id))) == 0
 
 
 def test_source_certificate_digest_is_stable_but_stale_coverage_is_rejected(
