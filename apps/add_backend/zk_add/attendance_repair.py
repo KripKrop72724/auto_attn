@@ -9,6 +9,8 @@ fields on ``AttendanceEvent``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 import hashlib
@@ -16,15 +18,16 @@ import hmac
 import json
 import secrets
 from typing import Any, Iterable
+import unicodedata
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
-from zk_add.crypto import decrypt_cnic, decrypt_text, encrypt_text
+from zk_add.crypto import decrypt_cnic, decrypt_text, encrypt_text, normalize_cnic
 from zk_add.identity_conflicts import valid_identity_resolutions
 from zk_add.models import (
     AttendanceEvent,
@@ -34,8 +37,11 @@ from zk_add.models import (
     AttendanceRepairItem,
     AttendanceRepairJob,
     AttendanceRepairOracleSlot,
+    AttendanceRepairReuseAttestation,
+    AttendanceRepairSelection,
     AttendanceRepairTarget,
     AttendanceRepairWorkerHeartbeat,
+    AuditEvent,
     Connector,
     DeviceUser,
     IdentityTombstone,
@@ -46,7 +52,7 @@ from zk_add.models import (
     TerminalRecordManifest,
     ZKTDevice,
 )
-from zk_add.ords_states import ORDS_ACTIVE_STATUSES
+from zk_add.ords_states import ORDS_ACTIVE_STATUSES, ORDS_TERMINAL_REVIEW_STATUSES
 from zk_add.reconciliation import (
     TERMINAL_JOB_STATES as RECONCILIATION_TERMINAL_STATES,
     active_coverage,
@@ -73,6 +79,13 @@ ORACLE_UNKNOWN_RESPONSE_CODES = frozenset(
 FORWARD_COMPLETION_STATES = frozenset({"ORACLE_VERIFY", "ADD_ACTIVATE", "DOWNSTREAM_VERIFY"})
 REPAIR_CONTRACT_VERSION = "1"
 MAX_CANDIDATE_COHORT_PAIRS = 25_000
+RELEASE_WORKFLOW_VERSION = "EVENT_SELECTION_V2"
+RELEASE_HELD_STATUSES = frozenset({"BLOCKED_IDENTITY", "QUARANTINED_IDENTITY_REUSE"})
+RELEASE_RISK_BLOCKED = "ORDINARY_BLOCKED"
+RELEASE_RISK_REUSE = "IDENTITY_REUSE"
+RELEASE_SELECTION_MODES = frozenset({"EXPLICIT", "ALL_FILTERED"})
+RELEASE_TOKEN_VERSION = 1
+RELEASE_TOKEN_SECONDS = 15 * 60
 _oracle_mutation_slots = asyncio.Semaphore(settings.attendance_repair_oracle_concurrency)
 _repair_worker_id = f"attendance-repair-{uuid4()}"
 
@@ -119,10 +132,119 @@ def _protected_digest(value: Any) -> str:
     return hmac.new(settings.pii_lookup_key.encode(), _canonical(value), hashlib.sha256).hexdigest()
 
 
+def _token_b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _token_unb64(value: str) -> bytes:
+    if not value or "=" in value:
+        raise binascii.Error("Release tokens require unpadded base64url encoding.")
+    padding = "=" * (-len(value) % 4)
+    decoded = base64.b64decode(
+        f"{value}{padding}".encode("ascii"),
+        altchars=b"-_",
+        validate=True,
+    )
+    # Python's decoder accepts alternate final characters when their unused
+    # padding bits differ. Re-encoding rejects those non-canonical spellings so
+    # every signed byte string has exactly one token representation.
+    if not secrets.compare_digest(_token_b64(decoded), value):
+        raise binascii.Error("Non-canonical base64url encoding.")
+    return decoded
+
+
+def _release_token(payload: dict[str, Any], *, purpose: str) -> str:
+    """Sign non-PII review state so event identifiers are never client-authoritative."""
+
+    if not settings.pii_lookup_key:
+        raise RepairError(
+            "ADD_PII_LOOKUP_KEY is required for protected release tokens.",
+            code="PII_LOOKUP_KEY_MISSING",
+        )
+    material = {
+        **payload,
+        "purpose": purpose,
+        "version": RELEASE_TOKEN_VERSION,
+    }
+    encoded = _canonical(material)
+    key = hmac.new(
+        settings.pii_lookup_key.encode(),
+        b"attendance-release-token-v1",
+        hashlib.sha256,
+    ).digest()
+    signature = hmac.new(key, encoded, hashlib.sha256).digest()
+    return f"{_token_b64(encoded)}.{_token_b64(signature)}"
+
+
+def _read_release_token(token: str, *, purpose: str) -> dict[str, Any]:
+    try:
+        encoded_part, signature_part = token.split(".", 1)
+        encoded = _token_unb64(encoded_part)
+        supplied_signature = _token_unb64(signature_part)
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID") from exc
+    if not settings.pii_lookup_key:
+        raise RepairError(
+            "ADD_PII_LOOKUP_KEY is required for protected release tokens.",
+            code="PII_LOOKUP_KEY_MISSING",
+        )
+    key = hmac.new(
+        settings.pii_lookup_key.encode(),
+        b"attendance-release-token-v1",
+        hashlib.sha256,
+    ).digest()
+    expected_signature = hmac.new(key, encoded, hashlib.sha256).digest()
+    if not secrets.compare_digest(expected_signature, supplied_signature):
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID")
+    try:
+        payload = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("purpose") != purpose
+        or payload.get("version") != RELEASE_TOKEN_VERSION
+    ):
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID")
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, str):
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID")
+    try:
+        expiry = ensure_utc(datetime.fromisoformat(expires_at))
+    except ValueError as exc:
+        raise RepairError("Invalid release review token.", code="SELECTION_TOKEN_INVALID") from exc
+    if expiry <= utc_now():
+        raise RepairError(
+            "The release selection expired; refresh the employee punches.",
+            code="SELECTION_TOKEN_EXPIRED",
+        )
+    return payload
+
+
 def _reason_digest(value: str) -> str:
     """Create non-reversible audit evidence for potentially sensitive operator text."""
 
     return _protected_digest({"purpose": "attendance-repair-reason", "value": value.strip()})
+
+
+def _operator_evidence(
+    *,
+    actor_session_id: str | None,
+    actor_ip: str | None,
+) -> dict[str, str]:
+    evidence: dict[str, str] = {}
+    if actor_session_id:
+        evidence["actor_session_digest"] = _protected_digest(
+            {
+                "purpose": "attendance-release-admin-session",
+                "value": actor_session_id,
+            }
+        )
+    if actor_ip:
+        evidence["actor_ip_digest"] = _protected_digest(
+            {"purpose": "attendance-release-client-ip", "value": actor_ip}
+        )
+    return evidence
 
 
 def _identity_digest(display_name: str | None, cnic: str | None) -> str:
@@ -262,6 +384,1089 @@ def _query_events(
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.scalars(statement).all())
+
+
+def _query_events_for_group_keys(
+    session: Session,
+    *,
+    zkt_device_id: int,
+    start_utc: datetime | None,
+    end_utc: datetime | None,
+    keys: Iterable[tuple[int | None, str, str]],
+) -> dict[tuple[int | None, str, str], list[AttendanceEvent]]:
+    """Read complete source cohorts without imposing the selected-event cap.
+
+    Exact releases are limited by selected membership, not by unrelated terminal
+    history.  Batched predicates avoid both a full-terminal materialization and
+    database parameter limits while preserving the legacy full-cohort drift
+    certificate for every selected source identity.
+    """
+
+    ordered_keys = sorted(set(keys), key=str)
+    grouped: dict[tuple[int | None, str, str], list[AttendanceEvent]] = defaultdict(list)
+    for offset in range(0, len(ordered_keys), 100):
+        batch = ordered_keys[offset : offset + 100]
+        cohort_clauses = []
+        for device_user_id, uid, user_id in batch:
+            device_user_clause = (
+                AttendanceEvent.device_user_id.is_(None)
+                if device_user_id is None
+                else AttendanceEvent.device_user_id == device_user_id
+            )
+            uid_clause = (
+                or_(AttendanceEvent.uid.is_(None), AttendanceEvent.uid == "")
+                if not uid
+                else AttendanceEvent.uid == uid
+            )
+            cohort_clauses.append(
+                and_(
+                    device_user_clause,
+                    uid_clause,
+                    AttendanceEvent.user_id == user_id,
+                )
+            )
+        statement = select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt_device_id,
+            or_(*cohort_clauses),
+        )
+        if start_utc is not None:
+            statement = statement.where(AttendanceEvent.device_event_time >= start_utc)
+        if end_utc is not None:
+            statement = statement.where(AttendanceEvent.device_event_time < end_utc)
+        statement = statement.order_by(
+            AttendanceEvent.device_event_time,
+            AttendanceEvent.id,
+        )
+        for event in session.scalars(statement):
+            key = (event.device_user_id, event.uid or "", event.user_id)
+            if key in batch:
+                grouped[key].append(event)
+    return dict(grouped)
+
+
+def _normalized_release_name(value: str | None) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
+
+
+def _release_filters(
+    *,
+    date_from: date | None,
+    date_to: date | None,
+    hold_statuses: Iterable[str] | None,
+    punch: str | None,
+    source: str | None,
+) -> dict[str, Any]:
+    statuses = sorted(
+        {
+            str(value).strip().upper()
+            for value in (hold_statuses or RELEASE_HELD_STATUSES)
+            if str(value).strip()
+        }
+    )
+    if not statuses or not set(statuses).issubset(RELEASE_HELD_STATUSES):
+        raise RepairError(
+            "Only identity-held attendance statuses can be reviewed.",
+            code="RELEASE_STATUS_INVALID",
+        )
+    start_utc, end_utc = _date_scope(date_from, date_to)
+    return {
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "start_utc": start_utc,
+        "end_utc": end_utc,
+        "hold_statuses": statuses,
+        "punch": (punch or "").strip() or None,
+        "source": (source or "").strip().upper() or None,
+    }
+
+
+def _held_release_events(
+    session: Session,
+    *,
+    zkt_device_id: int | None,
+    filters: dict[str, Any],
+    limit: int | None = None,
+    target: DeviceUser | None = None,
+    related_device_user_ids: set[int] | None = None,
+) -> list[AttendanceEvent]:
+    statement = select(AttendanceEvent).where(
+        AttendanceEvent.ords_status.in_(filters["hold_statuses"]),
+        AttendanceEvent.identity_content_status != "VERIFIED",
+    )
+    if zkt_device_id is not None:
+        statement = statement.where(AttendanceEvent.zkt_device_id == zkt_device_id)
+    if target is not None:
+        identity_clauses = [AttendanceEvent.user_id == target.user_id]
+        if target.uid:
+            identity_clauses.append(AttendanceEvent.uid == target.uid)
+        if related_device_user_ids:
+            identity_clauses.append(
+                AttendanceEvent.device_user_id.in_(related_device_user_ids)
+            )
+        statement = statement.where(or_(*identity_clauses))
+    if filters["start_utc"] is not None:
+        statement = statement.where(AttendanceEvent.device_event_time >= filters["start_utc"])
+    if filters["end_utc"] is not None:
+        statement = statement.where(AttendanceEvent.device_event_time < filters["end_utc"])
+    if filters["punch"]:
+        statement = statement.where(AttendanceEvent.punch == filters["punch"])
+    if filters["source"]:
+        statement = statement.where(AttendanceEvent.source == filters["source"])
+    statement = statement.order_by(AttendanceEvent.device_event_time.desc(), AttendanceEvent.id.desc())
+    if limit is not None:
+        statement = statement.limit(limit)
+    return list(session.scalars(statement).all())
+
+
+def _release_identity_context(
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+) -> dict[str, Any]:
+    users = list(
+        session.scalars(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)).all()
+    )
+    active = [
+        row for row in users if row.present and row.lifecycle_state == "ACTIVE"
+    ]
+    by_id = {row.id: row for row in users if row.id is not None}
+    by_user_id: dict[str, list[DeviceUser]] = defaultdict(list)
+    by_uid: dict[str, list[DeviceUser]] = defaultdict(list)
+    by_cnic: dict[str, list[DeviceUser]] = defaultdict(list)
+    for row in active:
+        by_user_id[row.user_id].append(row)
+        if row.uid:
+            by_uid[row.uid].append(row)
+        if row.cnic_lookup_hash:
+            by_cnic[row.cnic_lookup_hash].append(row)
+    valid_resolutions = valid_identity_resolutions(session, zkt=zkt)
+    tombstoned_user_ids = set(
+        session.scalars(
+            select(IdentityTombstone.device_user_id).where(
+                IdentityTombstone.zkt_device_id == zkt.id
+            )
+        ).all()
+    )
+    active_job_event_ids = set(
+        session.scalars(
+            select(AttendanceRepairItem.attendance_event_id)
+            .join(AttendanceRepairJob, AttendanceRepairItem.job_id == AttendanceRepairJob.id)
+            .where(
+                AttendanceRepairJob.zkt_device_id == zkt.id,
+                AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+            )
+        ).all()
+    )
+    active_job_event_ids.update(
+        session.scalars(
+            select(AttendanceRepairSelection.attendance_event_id)
+            .join(AttendanceRepairJob, AttendanceRepairSelection.job_id == AttendanceRepairJob.id)
+            .where(
+                AttendanceRepairJob.zkt_device_id == zkt.id,
+                AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+            )
+        ).all()
+    )
+    terminal_review_reasons: dict[int, str] = {}
+    for event_id, error_code in session.execute(
+        select(
+            AttendanceRepairItem.attendance_event_id,
+            AttendanceRepairItem.error_code,
+        )
+        .join(
+            AttendanceRepairJob,
+            AttendanceRepairItem.job_id == AttendanceRepairJob.id,
+        )
+        .where(
+            AttendanceRepairJob.zkt_device_id == zkt.id,
+            AttendanceRepairItem.state == "NEEDS_REVIEW",
+            AttendanceRepairItem.error_code.in_(UNSAFE_ORACLE_CLASSIFICATIONS),
+        )
+        .order_by(
+            AttendanceRepairItem.attendance_event_id,
+            AttendanceRepairJob.id.desc(),
+            AttendanceRepairItem.id.desc(),
+        )
+    ):
+        if error_code:
+            terminal_review_reasons.setdefault(int(event_id), str(error_code))
+    return {
+        "users": users,
+        "active": active,
+        "by_id": by_id,
+        "by_user_id": by_user_id,
+        "by_uid": by_uid,
+        "by_cnic": by_cnic,
+        "valid_resolutions": valid_resolutions,
+        "tombstoned_user_ids": tombstoned_user_ids,
+        "active_job_event_ids": active_job_event_ids,
+        "terminal_review_reasons": terminal_review_reasons,
+    }
+
+
+def _same_resolved_identity(
+    target: DeviceUser,
+    other: DeviceUser | None,
+    context: dict[str, Any],
+) -> bool:
+    if other is None:
+        return False
+    if other.id == target.id:
+        return True
+    if (
+        not target.cnic_lookup_hash
+        or not other.cnic_lookup_hash
+        or not secrets.compare_digest(target.cnic_lookup_hash, other.cnic_lookup_hash)
+    ):
+        return False
+    if not other.present or other.lifecycle_state != "ACTIVE":
+        return other.id in context["tombstoned_user_ids"]
+    return target.cnic_lookup_hash in context["valid_resolutions"]
+
+
+def _release_target_for_event(
+    event: AttendanceEvent,
+    *,
+    context: dict[str, Any],
+) -> tuple[DeviceUser | None, str | None]:
+    linked = context["by_id"].get(event.device_user_id)
+    if linked is not None and linked.present and linked.lifecycle_state == "ACTIVE":
+        return linked, None
+
+    candidates = list(context["by_user_id"].get(event.user_id, []))
+    if event.uid:
+        exact_uid = [row for row in candidates if row.uid == event.uid]
+        if exact_uid:
+            candidates = exact_uid
+    event_name = _normalized_release_name(event.display_name)
+    if len(candidates) > 1 and event_name:
+        exact_name = [
+            row
+            for row in candidates
+            if _normalized_release_name(row.display_name) == event_name
+        ]
+        if exact_name:
+            candidates = exact_name
+    if len(candidates) == 1:
+        return candidates[0], None
+
+    if linked is not None and linked.cnic_lookup_hash:
+        cnic_candidates = list(context["by_cnic"].get(linked.cnic_lookup_hash, []))
+        if event.uid:
+            exact_uid = [row for row in cnic_candidates if row.uid == event.uid]
+            if exact_uid:
+                cnic_candidates = exact_uid
+        if len(cnic_candidates) == 1:
+            return cnic_candidates[0], None
+
+    if not candidates and event.uid:
+        uid_candidates = list(context["by_uid"].get(event.uid, []))
+        if len(uid_candidates) == 1:
+            return uid_candidates[0], None
+    if candidates:
+        return None, "TARGET_IDENTITY_AMBIGUOUS"
+    return None, "TARGET_NOT_ACTIVE"
+
+
+def _competing_identity_owner(
+    *,
+    event: AttendanceEvent,
+    target: DeviceUser,
+    context: dict[str, Any],
+) -> bool:
+    owners: dict[int, DeviceUser] = {}
+    for row in context["by_user_id"].get(event.user_id, []):
+        if row.id is not None:
+            owners[row.id] = row
+    if event.uid:
+        for row in context["by_uid"].get(event.uid, []):
+            if row.id is not None:
+                owners[row.id] = row
+    return any(
+        row.id != target.id and not _same_resolved_identity(target, row, context)
+        for row in owners.values()
+    )
+
+
+def _release_event_eligibility(
+    event: AttendanceEvent,
+    *,
+    target: DeviceUser | None,
+    zkt: ZKTDevice,
+    session: Session,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    risk = (
+        RELEASE_RISK_REUSE
+        if event.ords_status == "QUARANTINED_IDENTITY_REUSE"
+        else RELEASE_RISK_BLOCKED
+    )
+    if target is None:
+        return {"eligible": False, "lock_reason": "TARGET_NOT_ACTIVE", "risk_class": risk}
+    eligible_target, target_code = _eligible_target(session, zkt=zkt, user=target)
+    if not eligible_target:
+        return {"eligible": False, "lock_reason": target_code, "risk_class": risk}
+    if event.id in context["active_job_event_ids"]:
+        return {"eligible": False, "lock_reason": "RELEASE_ALREADY_IN_PROGRESS", "risk_class": risk}
+    if event.clock_quality != "OK":
+        return {"eligible": False, "lock_reason": "CLOCK_NOT_OK", "risk_class": risk}
+    if event.ords_status not in RELEASE_HELD_STATUSES:
+        return {"eligible": False, "lock_reason": "STATUS_NOT_REVIEWABLE", "risk_class": risk}
+    if event.identity_content_status == "VERIFIED":
+        return {"eligible": False, "lock_reason": "ALREADY_RELEASED", "risk_class": risk}
+    terminal_review_reason = context["terminal_review_reasons"].get(event.id)
+    if terminal_review_reason:
+        return {
+            "eligible": False,
+            "lock_reason": terminal_review_reason,
+            "risk_class": risk,
+        }
+    cnic_owners = context["by_cnic"].get(target.cnic_lookup_hash, [])
+    if any(
+        row.id != target.id and not _same_resolved_identity(target, row, context)
+        for row in cnic_owners
+    ):
+        return {
+            "eligible": False,
+            "lock_reason": "TARGET_DUPLICATE_CNIC_UNRESOLVED",
+            "risk_class": risk,
+        }
+
+    source_user = context["by_id"].get(event.device_user_id)
+    source_matches = _same_resolved_identity(target, source_user, context)
+    exact_user_id = event.user_id == target.user_id
+    compatible_uid = not event.uid or not target.uid or event.uid == target.uid
+    names_match = bool(
+        _normalized_release_name(event.display_name)
+        and _normalized_release_name(event.display_name)
+        == _normalized_release_name(target.display_name)
+    )
+    if _competing_identity_owner(event=event, target=target, context=context):
+        return {
+            "eligible": False,
+            "lock_reason": "SOURCE_IDENTITY_AMBIGUOUS",
+            "risk_class": risk,
+        }
+    if risk == RELEASE_RISK_REUSE:
+        if not names_match:
+            return {"eligible": False, "lock_reason": "REUSE_NAME_MISMATCH", "risk_class": risk}
+        if not (source_matches or (exact_user_id and compatible_uid)):
+            return {"eligible": False, "lock_reason": "REUSE_SOURCE_UNPROVEN", "risk_class": risk}
+        evidence = (
+            "VERIFIED_SAME_CNIC_SOURCE"
+            if source_matches
+            else "CURRENT_IDENTITY_EXACT_TERMINAL_MATCH"
+        )
+    else:
+        linked_target = event.device_user_id == target.id
+        unlinked_current = event.device_user_id is None and exact_user_id and compatible_uid
+        if not (linked_target or unlinked_current or source_matches):
+            return {"eligible": False, "lock_reason": "SOURCE_IDENTITY_UNPROVEN", "risk_class": risk}
+        if unlinked_current and event.display_name and not names_match:
+            return {"eligible": False, "lock_reason": "SOURCE_NAME_MISMATCH", "risk_class": risk}
+        evidence = (
+            "CURRENT_USER_LINEAGE"
+            if linked_target or unlinked_current
+            else "VERIFIED_SAME_CNIC_SOURCE"
+        )
+    return {
+        "eligible": True,
+        "lock_reason": None,
+        "risk_class": risk,
+        "evidence_classification": evidence,
+    }
+
+
+def _candidate_material(row: dict[str, Any]) -> dict[str, Any]:
+    event = row["event"]
+    return {
+        "event_uid": event.event_uid,
+        "immutable_facts_digest": _immutable_digest(event),
+        "source_ownership_digest": _source_ownership_digest(event),
+        "before_identity_digest": _identity_digest(
+            event.display_name or "",
+            decrypt_cnic(event.cnic_encrypted),
+        ),
+        "source_ords_status": event.ords_status,
+        "risk_class": row["risk_class"],
+        "eligible": row["eligible"],
+        "lock_reason": row.get("lock_reason"),
+        "evidence_classification": row.get("evidence_classification"),
+    }
+
+
+def _release_candidates_for_target(
+    session: Session,
+    *,
+    connector: Connector,
+    user_key: str,
+    filters: dict[str, Any],
+    ignore_active_event_ids: set[int] | None = None,
+) -> tuple[DeviceUser, list[dict[str, Any]], dict[str, Any], bool]:
+    zkt = connector.zkt_device
+    if zkt is None:
+        raise RepairError("No ZKT terminal is assigned.", code="NO_TERMINAL")
+    target = session.scalar(
+        select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_key == user_key,
+        )
+    )
+    if target is None:
+        raise RepairError("The selected employee no longer exists.", code="TARGET_NOT_FOUND")
+    context = _release_identity_context(session, zkt=zkt)
+    related_device_user_ids = {
+        row.id
+        for row in context["users"]
+        if row.id is not None and _same_resolved_identity(target, row, context)
+    }
+    events = _held_release_events(
+        session,
+        zkt_device_id=zkt.id,
+        filters=filters,
+        limit=settings.attendance_repair_max_events + 1,
+        target=target,
+        related_device_user_ids=related_device_user_ids,
+    )
+    if len(events) > settings.attendance_repair_max_events:
+        raise RepairError(
+            "The filtered review exceeds 250,000 events; narrow the Pakistan date range.",
+            code="EVENT_LIMIT",
+        )
+    if ignore_active_event_ids:
+        context["active_job_event_ids"] = set(context["active_job_event_ids"]) - set(
+            ignore_active_event_ids
+        )
+        context["terminal_review_reasons"] = {
+            event_id: reason
+            for event_id, reason in context["terminal_review_reasons"].items()
+            if event_id not in ignore_active_event_ids
+        }
+    rows: list[dict[str, Any]] = []
+    for event in events:
+        matched_target, association_error = _release_target_for_event(event, context=context)
+        if matched_target is None or matched_target.id != target.id:
+            continue
+        eligibility = _release_event_eligibility(
+            event,
+            target=target,
+            zkt=zkt,
+            session=session,
+            context=context,
+        )
+        if association_error and not eligibility.get("lock_reason"):
+            eligibility["eligible"] = False
+            eligibility["lock_reason"] = association_error
+        rows.append({"event": event, **eligibility})
+    source_current, certificate, _coverage = _source_certificate(session, connector)
+    return target, rows, certificate, source_current
+
+
+def _public_release_filters(filters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date_from": filters["date_from"],
+        "date_to": filters["date_to"],
+        "hold_statuses": filters["hold_statuses"],
+        "punch": filters["punch"],
+        "source": filters["source"],
+    }
+
+
+def _release_membership_digest(rows: list[dict[str, Any]]) -> str:
+    return _protected_digest(
+        [
+            _candidate_material(row)
+            for row in sorted(rows, key=lambda value: value["event"].event_uid)
+        ]
+    )
+
+
+def build_attendance_release_candidates(
+    session: Session,
+    *,
+    connector: Connector,
+    user_key: str,
+    date_from: date | None,
+    date_to: date | None,
+    hold_statuses: Iterable[str] | None,
+    punch: str | None,
+    source: str | None,
+    cursor: int,
+    limit: int,
+    candidate_set_token: str | None = None,
+) -> dict[str, Any]:
+    if not settings.attendance_repair_preview_enabled:
+        raise RepairError(
+            "Attendance release preview is disabled.", code="PREVIEW_DISABLED"
+        )
+    filters = _release_filters(
+        date_from=date_from,
+        date_to=date_to,
+        hold_statuses=hold_statuses,
+        punch=punch,
+        source=source,
+    )
+    target, rows, certificate, source_current = _release_candidates_for_target(
+        session,
+        connector=connector,
+        user_key=user_key,
+        filters=filters,
+    )
+    membership_digest = _release_membership_digest(rows)
+    hard_blockers, waitable_blockers = _terminal_eligibility(session, connector)
+    review_lock_reason = (
+        hard_blockers[0]["code"]
+        if hard_blockers
+        else waitable_blockers[0]["code"]
+        if waitable_blockers
+        else "SOURCE_RECERTIFICATION_REQUIRED"
+        if not source_current
+        else None
+    )
+    review_ready = review_lock_reason is None
+    now = utc_now()
+    token_payload = {
+        "connector_id": connector.connector_id,
+        "user_key": target.user_key,
+        "target_row_version": target.row_version,
+        "filters": _public_release_filters(filters),
+        "source_certificate_digest": certificate.get("certificate_digest"),
+        "membership_digest": membership_digest,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=RELEASE_TOKEN_SECONDS)).isoformat(),
+    }
+    if candidate_set_token:
+        supplied = _read_release_token(candidate_set_token, purpose="candidate-set")
+        comparable = {
+            key: supplied.get(key)
+            for key in (
+                "connector_id",
+                "user_key",
+                "target_row_version",
+                "filters",
+                "source_certificate_digest",
+                "membership_digest",
+            )
+        }
+        current = {
+            key: token_payload.get(key)
+            for key in (
+                "connector_id",
+                "user_key",
+                "target_row_version",
+                "filters",
+                "source_certificate_digest",
+                "membership_digest",
+            )
+        }
+        if comparable != current:
+            raise RepairError(
+                "The attendance review changed; refresh the employee punches.",
+                code="SELECTION_DRIFT",
+            )
+        token_payload["issued_at"] = supplied["issued_at"]
+        token_payload["expires_at"] = supplied["expires_at"]
+        candidate_set_token = candidate_set_token
+    else:
+        candidate_set_token = _release_token(token_payload, purpose="candidate-set")
+    set_digest = _sha(candidate_set_token)
+    bounded_limit = max(1, min(limit, 500))
+    bounded_cursor = max(0, cursor)
+    page = rows[bounded_cursor : bounded_cursor + bounded_limit]
+    expires_at = token_payload["expires_at"]
+    serialized_rows = []
+    for row in page:
+        event = row["event"]
+        material = _candidate_material(row)
+        row_eligible = bool(row["eligible"] and review_ready)
+        event_token = (
+            _release_token(
+                {
+                    "candidate_set_digest": set_digest,
+                    "event_uid": event.event_uid,
+                    "event_material_digest": _protected_digest(material),
+                    "expires_at": expires_at,
+                },
+                purpose="candidate-event",
+            )
+            if row_eligible
+            else None
+        )
+        serialized_rows.append(
+            {
+                "event_token": event_token,
+                "event_uid": event.event_uid,
+                "device_event_time": event.device_event_time,
+                "punch": event.punch,
+                "status": event.status,
+                "source": event.source,
+                "device_serial": event.device_serial,
+                "uid": _mask_source_identifier(event.uid),
+                "user_id": _mask_source_identifier(event.user_id),
+                "display_name": event.display_name,
+                "clock_quality": event.clock_quality,
+                "source_ords_status": event.ords_status,
+                "risk_class": row["risk_class"],
+                "evidence_classification": row.get("evidence_classification"),
+                "eligible": row_eligible,
+                "lock_reason": review_lock_reason or row.get("lock_reason"),
+            }
+        )
+    eligible_rows = [row for row in rows if row["eligible"]] if review_ready else []
+    target_eligible, target_lock_reason = _eligible_target(
+        session, zkt=connector.zkt_device, user=target
+    )
+    return {
+        "candidate_set_token": candidate_set_token,
+        "expires_at": expires_at,
+        "source_current": source_current,
+        "source_certificate": certificate,
+        "target": {
+            "user_key": target.user_key,
+            "row_version": target.row_version,
+            "display_name": target.display_name,
+            "user_id": target.user_id,
+            "uid": target.uid,
+            "cnic_masked": _mask_cnic_last4(target.cnic_last4),
+            "eligible": bool(target_eligible and review_ready),
+            "lock_reason": review_lock_reason or target_lock_reason,
+        },
+        "filters": _public_release_filters(filters),
+        "totals": {
+            "all": len(rows),
+            "eligible": len(eligible_rows),
+            "locked": len(rows) - len(eligible_rows),
+            "ordinary_blocked": sum(
+                row["risk_class"] == RELEASE_RISK_BLOCKED for row in rows
+            ),
+            "identity_reuse": sum(
+                row["risk_class"] == RELEASE_RISK_REUSE for row in rows
+            ),
+        },
+        "rows": serialized_rows,
+        "next_cursor": (
+            bounded_cursor + bounded_limit
+            if bounded_cursor + bounded_limit < len(rows)
+            else None
+        ),
+    }
+def _release_queue_group_key(
+    event: AttendanceEvent,
+    target: DeviceUser | None,
+) -> str:
+    if target is not None:
+        return target.user_key
+    return f"locked:{event.zkt_device_id}:{_protected_digest([event.user_id, event.uid or ''])[:20]}"
+
+
+def build_attendance_release_queue(
+    session: Session,
+    *,
+    connector: Connector | None,
+    q: str | None,
+    date_from: date | None,
+    date_to: date | None,
+    hold_statuses: Iterable[str] | None,
+    cursor: int,
+    limit: int,
+) -> dict[str, Any]:
+    filters = _release_filters(
+        date_from=date_from,
+        date_to=date_to,
+        hold_statuses=hold_statuses,
+        punch=None,
+        source=None,
+    )
+    events = _held_release_events(
+        session,
+        zkt_device_id=connector.zkt_device.id if connector and connector.zkt_device else None,
+        filters=filters,
+        limit=settings.attendance_repair_max_events + 1,
+    )
+    if len(events) > settings.attendance_repair_max_events:
+        raise RepairError(
+            "The release queue exceeds 250,000 held events; narrow the Pakistan date range.",
+            code="EVENT_LIMIT",
+        )
+    zkt_ids = sorted({event.zkt_device_id for event in events})
+    zkt_rows = {
+        row.id: row
+        for row in session.scalars(select(ZKTDevice).where(ZKTDevice.id.in_(zkt_ids))).all()
+    }
+    connectors = {
+        zkt_id: connector_row
+        for connector_row, zkt_id in session.execute(
+            select(Connector, ZKTDevice.id)
+            .join(ZKTDevice, ZKTDevice.connector_id == Connector.id)
+            .where(ZKTDevice.id.in_(zkt_ids))
+        ).all()
+    }
+    contexts = {
+        zkt_id: _release_identity_context(session, zkt=zkt)
+        for zkt_id, zkt in zkt_rows.items()
+    }
+    groups: dict[tuple[int, str], dict[str, Any]] = {}
+    for event in events:
+        zkt = zkt_rows.get(event.zkt_device_id)
+        context = contexts.get(event.zkt_device_id)
+        if zkt is None or context is None:
+            continue
+        target, association_error = _release_target_for_event(event, context=context)
+        eligibility = _release_event_eligibility(
+            event,
+            target=target,
+            zkt=zkt,
+            session=session,
+            context=context,
+        )
+        if association_error and not eligibility.get("lock_reason"):
+            eligibility["eligible"] = False
+            eligibility["lock_reason"] = association_error
+        key = (zkt.id, _release_queue_group_key(event, target))
+        row = groups.setdefault(
+            key,
+            {
+                "connector": connectors.get(zkt.id),
+                "target": target,
+                "display_name": target.display_name if target else event.display_name or "Unknown employee",
+                "user_id": target.user_id if target else event.user_id,
+                "uid": target.uid if target else event.uid,
+                "cnic_masked": _mask_cnic_last4(target.cnic_last4) if target else None,
+                "ordinary_blocked": 0,
+                "identity_reuse": 0,
+                "eligible_count": 0,
+                "locked_count": 0,
+                "in_progress_count": 0,
+                "lock_reasons": set(),
+                "first_event_at": event.device_event_time,
+                "last_event_at": event.device_event_time,
+            },
+        )
+        if eligibility["risk_class"] == RELEASE_RISK_REUSE:
+            row["identity_reuse"] += 1
+        else:
+            row["ordinary_blocked"] += 1
+        if eligibility["eligible"]:
+            row["eligible_count"] += 1
+        else:
+            row["locked_count"] += 1
+            reason = eligibility.get("lock_reason")
+            if reason:
+                row["lock_reasons"].add(reason)
+            if reason == "RELEASE_ALREADY_IN_PROGRESS":
+                row["in_progress_count"] += 1
+        row["first_event_at"] = min(row["first_event_at"], event.device_event_time)
+        row["last_event_at"] = max(row["last_event_at"], event.device_event_time)
+
+    term = (q or "").strip().casefold()
+    active_terminal_jobs = {
+        row.zkt_device_id: row.job_id
+        for row in session.scalars(
+            select(AttendanceRepairJob).where(
+                AttendanceRepairJob.zkt_device_id.in_(zkt_ids),
+                AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+            )
+        ).all()
+    }
+    terminal_locks: dict[int, str] = {}
+    source_current_by_zkt: dict[int, bool] = {}
+    for zkt_id in zkt_ids:
+        connector_row = connectors.get(zkt_id)
+        if connector_row is None:
+            terminal_locks[zkt_id] = "NO_CONNECTOR"
+            source_current_by_zkt[zkt_id] = False
+            continue
+        hard_blockers, waitable_blockers = _terminal_eligibility(
+            session,
+            connector_row,
+        )
+        source_current, _certificate, _coverage = _source_certificate(
+            session,
+            connector_row,
+        )
+        source_current_by_zkt[zkt_id] = source_current
+        if hard_blockers:
+            terminal_locks[zkt_id] = hard_blockers[0]["code"]
+        elif waitable_blockers:
+            terminal_locks[zkt_id] = waitable_blockers[0]["code"]
+        elif not source_current:
+            terminal_locks[zkt_id] = "SOURCE_RECERTIFICATION_REQUIRED"
+        elif zkt_id in active_terminal_jobs:
+            terminal_locks[zkt_id] = "TERMINAL_RELEASE_IN_PROGRESS"
+    serialized = []
+    for (zkt_id, _group_key), row in groups.items():
+        connector_row = row["connector"]
+        target = row["target"]
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    row["display_name"],
+                    row["user_id"],
+                    row["uid"] or "",
+                    connector_row.display_name if connector_row else "",
+                    connector_row.device_id if connector_row else "",
+                ],
+            )
+        ).casefold()
+        if term and term not in haystack:
+            continue
+        lock_reasons = sorted(row["lock_reasons"])
+        terminal_lock = terminal_locks.get(zkt_id)
+        if terminal_lock and terminal_lock not in lock_reasons:
+            lock_reasons.insert(0, terminal_lock)
+        total_count = row["ordinary_blocked"] + row["identity_reuse"]
+        eligible_count = 0 if terminal_lock else row["eligible_count"]
+        locked_count = total_count if terminal_lock else row["locked_count"]
+        serialized.append(
+            {
+                "connector_id": connector_row.connector_id if connector_row else None,
+                "device_id": connector_row.device_id if connector_row else None,
+                "device_name": connector_row.display_name if connector_row else "Unknown terminal",
+                "user_key": target.user_key if target else None,
+                "row_version": target.row_version if target else None,
+                "display_name": row["display_name"],
+                "user_id": row["user_id"],
+                "uid": row["uid"],
+                "cnic_masked": row["cnic_masked"],
+                "eligible": eligible_count > 0,
+                "lock_reason": lock_reasons[0] if lock_reasons else None,
+                "lock_reasons": lock_reasons,
+                "source_current": source_current_by_zkt.get(zkt_id, False),
+                "active_release_job_id": active_terminal_jobs.get(zkt_id),
+                "counts": {
+                    "ordinary_blocked": row["ordinary_blocked"],
+                    "identity_reuse": row["identity_reuse"],
+                    "eligible": eligible_count,
+                    "locked": locked_count,
+                    "in_progress": row["in_progress_count"],
+                },
+                "first_event_at": row["first_event_at"],
+                "last_event_at": row["last_event_at"],
+            }
+        )
+    serialized.sort(
+        key=lambda value: (value["last_event_at"], value["display_name"]), reverse=True
+    )
+    bounded_cursor = max(0, cursor)
+    bounded_limit = max(1, min(limit, 200))
+    page = serialized[bounded_cursor : bounded_cursor + bounded_limit]
+    return {
+        "preview_enabled": settings.attendance_repair_preview_enabled,
+        "execution_enabled": settings.attendance_repair_execution_enabled,
+        "totals": {
+            "employees": len(serialized),
+            "events": sum(
+                row["counts"]["ordinary_blocked"] + row["counts"]["identity_reuse"]
+                for row in serialized
+            ),
+            "eligible": sum(row["counts"]["eligible"] for row in serialized),
+            "locked": sum(row["counts"]["locked"] for row in serialized),
+        },
+        "rows": page,
+        "next_cursor": (
+            bounded_cursor + bounded_limit
+            if bounded_cursor + bounded_limit < len(serialized)
+            else None
+        ),
+    }
+
+
+def attendance_release_states(
+    session: Session,
+    events: Iterable[AttendanceEvent],
+) -> dict[int, dict[str, Any]]:
+    """Describe effective release state without mutating original ORDS disposition."""
+
+    rows = list(events)
+    if not rows:
+        return {}
+    event_ids = [row.id for row in rows]
+    repair_rows = session.execute(
+        select(
+            AttendanceRepairItem,
+            AttendanceRepairJob,
+            AttendanceRepairTarget,
+        )
+        .join(
+            AttendanceRepairJob,
+            AttendanceRepairItem.job_id == AttendanceRepairJob.id,
+        )
+        .join(
+            AttendanceRepairTarget,
+            AttendanceRepairItem.target_id == AttendanceRepairTarget.id,
+        )
+        .where(AttendanceRepairItem.attendance_event_id.in_(event_ids))
+        .order_by(
+            AttendanceRepairItem.attendance_event_id,
+            AttendanceRepairJob.id.desc(),
+            AttendanceRepairItem.id.desc(),
+        )
+    )
+    latest: dict[
+        int,
+        tuple[AttendanceRepairItem, AttendanceRepairJob, AttendanceRepairTarget],
+    ] = {}
+    for item, job, target in repair_rows:
+        latest.setdefault(item.attendance_event_id, (item, job, target))
+
+    zkt_ids = sorted({row.zkt_device_id for row in rows})
+    zkt_by_id = {
+        row.id: row
+        for row in session.scalars(
+            select(ZKTDevice).where(ZKTDevice.id.in_(zkt_ids))
+        ).all()
+    }
+    connector_by_zkt = {
+        zkt_id: connector_row
+        for connector_row, zkt_id in session.execute(
+            select(Connector, ZKTDevice.id)
+            .join(ZKTDevice, ZKTDevice.connector_id == Connector.id)
+            .where(ZKTDevice.id.in_(zkt_ids))
+        ).all()
+    }
+    held_zkt_ids = {
+        row.zkt_device_id
+        for row in rows
+        if row.ords_status in RELEASE_HELD_STATUSES and row.id not in latest
+    }
+    active_terminal_jobs = {
+        row.zkt_device_id: row.job_id
+        for row in session.scalars(
+            select(AttendanceRepairJob).where(
+                AttendanceRepairJob.zkt_device_id.in_(held_zkt_ids),
+                AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+            )
+        ).all()
+    }
+    terminal_locks: dict[int, str] = {}
+    for zkt_id in held_zkt_ids:
+        connector = connector_by_zkt.get(zkt_id)
+        if connector is None:
+            terminal_locks[zkt_id] = "NO_CONNECTOR"
+            continue
+        hard_blockers, waitable_blockers = _terminal_eligibility(session, connector)
+        source_current, _certificate, _coverage = _source_certificate(session, connector)
+        if hard_blockers:
+            terminal_locks[zkt_id] = hard_blockers[0]["code"]
+        elif waitable_blockers:
+            terminal_locks[zkt_id] = waitable_blockers[0]["code"]
+        elif not source_current:
+            terminal_locks[zkt_id] = "SOURCE_RECERTIFICATION_REQUIRED"
+        elif zkt_id in active_terminal_jobs:
+            terminal_locks[zkt_id] = "TERMINAL_RELEASE_IN_PROGRESS"
+    contexts: dict[int, dict[str, Any]] = {}
+    result: dict[int, dict[str, Any]] = {}
+    for event in rows:
+        current = latest.get(event.id)
+        release_state = "NOT_APPLICABLE"
+        label = "Not held for review"
+        target_user_key: str | None = None
+        latest_job_id: str | None = None
+        active_job_id: str | None = None
+        lock_reason: str | None = None
+        if (
+            event.identity_content_status == "VERIFIED"
+            and event.identity_content_confirmed_at is not None
+            and event.identity_downstream_confirmed_at is not None
+        ):
+            release_state = "RELEASED"
+            label = "Released · Oracle verified"
+            if current:
+                _item, job, target = current
+                latest_job_id = job.job_id
+                target_user_key = target.user_key
+        elif current and current[1].status != "CANCELLED":
+            item, job, target = current
+            latest_job_id = job.job_id
+            target_user_key = target.user_key
+            if job.status not in JOB_TERMINAL_STATES:
+                active_job_id = job.job_id
+            if job.status == "PREPARING_SOURCE":
+                release_state, label = "PREPARING", "Preparing release"
+            elif job.status == "AWAITING_APPROVAL":
+                release_state, label = "AWAITING_APPROVAL", "Awaiting approval"
+            elif job.status == "QUEUED":
+                release_state, label = "QUEUED", "Release queued"
+            elif job.status in {"RUNNING", "WAITING_ORACLE"}:
+                release_state, label = "SENDING_TO_ORACLE", "Sending to Oracle"
+            elif job.status == "WAITING_DOWNSTREAM":
+                release_state, label = "VERIFYING", "Verifying downstream"
+            elif job.status == "PAUSED":
+                release_state, label = "PAUSED", "Release paused"
+            elif job.status in {"NEEDS_ATTENTION", "COMPLETED_WITH_ATTENTION"}:
+                release_state, label = (
+                    "COMPLETED_WITH_ATTENTION",
+                    "Release needs attention",
+                )
+                lock_reason = item.error_code or job.error_code
+            elif job.status == "CANCELLED":
+                release_state, label = "CANCELLED", "Release cancelled"
+                lock_reason = "RELEASE_CANCELLED"
+            else:
+                release_state, label = "VERIFYING", "Verifying release"
+        elif event.ords_status in ORDS_TERMINAL_REVIEW_STATUSES:
+            release_state, label = "LOCKED", "Locked"
+            lock_reason = event.ords_status
+        elif event.ords_status in RELEASE_HELD_STATUSES:
+            if current:
+                _cancelled_item, cancelled_job, cancelled_target = current
+                latest_job_id = cancelled_job.job_id
+                target_user_key = cancelled_target.user_key
+            zkt = zkt_by_id.get(event.zkt_device_id)
+            terminal_lock = terminal_locks.get(event.zkt_device_id)
+            if terminal_lock:
+                release_state, label = "LOCKED", "Locked"
+                lock_reason = terminal_lock
+            elif zkt is None:
+                release_state, label = "LOCKED", "Locked"
+                lock_reason = "NO_TERMINAL"
+            else:
+                context = contexts.get(zkt.id)
+                if context is None:
+                    context = _release_identity_context(session, zkt=zkt)
+                    contexts[zkt.id] = context
+                target, association_error = _release_target_for_event(
+                    event,
+                    context=context,
+                )
+                eligibility = _release_event_eligibility(
+                    event,
+                    target=target,
+                    zkt=zkt,
+                    session=session,
+                    context=context,
+                )
+                target_user_key = target.user_key if target else None
+                if eligibility["eligible"] and not association_error:
+                    release_state = "ELIGIBLE"
+                    label = (
+                        "Needs review · prior release cancelled"
+                        if current
+                        else "Needs review"
+                    )
+                else:
+                    release_state, label = "LOCKED", "Locked"
+                    lock_reason = (
+                        association_error
+                        or eligibility.get("lock_reason")
+                        or "NOT_ELIGIBLE"
+                    )
+        connector = connector_by_zkt.get(event.zkt_device_id)
+        result[event.id] = {
+            "release_state": release_state,
+            "release_state_label": label,
+            "effective_identity_confirmed_at": event.identity_content_confirmed_at,
+            "effective_identity_downstream_confirmed_at": (
+                event.identity_downstream_confirmed_at
+            ),
+            "active_release_job_id": active_job_id,
+            "latest_release_job_id": latest_job_id,
+            "release_target_user_key": target_user_key,
+            "release_connector_id": connector.connector_id if connector else None,
+            "release_lock_reason": lock_reason,
+        }
+    return result
 
 
 def _manifested_event_ids(
@@ -1054,6 +2259,383 @@ def create_repair_job(
     return job
 
 
+def _release_filters_from_public(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID")
+    try:
+        date_from = date.fromisoformat(raw["date_from"]) if raw.get("date_from") else None
+        date_to = date.fromisoformat(raw["date_to"]) if raw.get("date_to") else None
+    except (TypeError, ValueError) as exc:
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID") from exc
+    statuses = raw.get("hold_statuses")
+    if not isinstance(statuses, list) or not all(isinstance(value, str) for value in statuses):
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID")
+    if raw.get("punch") is not None and not isinstance(raw.get("punch"), str):
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID")
+    if raw.get("source") is not None and not isinstance(raw.get("source"), str):
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID")
+    return _release_filters(
+        date_from=date_from,
+        date_to=date_to,
+        hold_statuses=statuses,
+        punch=raw.get("punch"),
+        source=raw.get("source"),
+    )
+
+
+def _filters_from_candidate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _release_filters_from_public(payload.get("filters"))
+
+
+def _validate_release_selection(
+    session: Session,
+    *,
+    connector: Connector,
+    candidate_set_token: str,
+    selection_mode: str,
+    event_tokens: list[str],
+    excluded_event_tokens: list[str],
+) -> tuple[
+    DeviceUser,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+    bool,
+]:
+    mode = selection_mode.strip().upper()
+    if mode not in RELEASE_SELECTION_MODES:
+        raise RepairError("Invalid release selection mode.", code="SELECTION_MODE_INVALID")
+    if mode == "EXPLICIT" and (not event_tokens or excluded_event_tokens):
+        raise RepairError(
+            "Explicit selection requires included event tokens only.",
+            code="SELECTION_INVALID",
+        )
+    if mode == "ALL_FILTERED" and event_tokens:
+        raise RepairError(
+            "All-filtered selection accepts exclusion tokens only.",
+            code="SELECTION_INVALID",
+        )
+    supplied = _read_release_token(candidate_set_token, purpose="candidate-set")
+    if supplied.get("connector_id") != connector.connector_id:
+        raise RepairError("The release token belongs to another terminal.", code="SELECTION_DRIFT")
+    user_key = supplied.get("user_key")
+    if not isinstance(user_key, str):
+        raise RepairError("Invalid release candidate token.", code="SELECTION_TOKEN_INVALID")
+    filters = _filters_from_candidate_payload(supplied)
+    target, rows, certificate, source_current = _release_candidates_for_target(
+        session,
+        connector=connector,
+        user_key=user_key,
+        filters=filters,
+    )
+    if not source_current:
+        raise RepairError(
+            "The terminal source snapshot must be recertified before punches can be released.",
+            code="SOURCE_RECERTIFICATION_REQUIRED",
+        )
+    current_membership = _release_membership_digest(rows)
+    current_values = {
+        "target_row_version": target.row_version,
+        "filters": _public_release_filters(filters),
+        "source_certificate_digest": certificate.get("certificate_digest"),
+        "membership_digest": current_membership,
+    }
+    if any(supplied.get(key) != value for key, value in current_values.items()):
+        raise RepairError(
+            "The attendance review changed; refresh the employee punches.",
+            code="SELECTION_DRIFT",
+        )
+    by_uid = {row["event"].event_uid: row for row in rows}
+    candidate_set_digest = _sha(candidate_set_token)
+
+    def decode_events(tokens: list[str]) -> set[str]:
+        selected: set[str] = set()
+        for token in tokens:
+            decoded = _read_release_token(token, purpose="candidate-event")
+            if decoded.get("candidate_set_digest") != candidate_set_digest:
+                raise RepairError(
+                    "A selected punch belongs to another review.",
+                    code="SELECTION_TOKEN_INVALID",
+                )
+            event_uid = decoded.get("event_uid")
+            row = by_uid.get(event_uid) if isinstance(event_uid, str) else None
+            if row is None or not row["eligible"]:
+                raise RepairError(
+                    "A selected punch is no longer eligible.", code="SELECTION_DRIFT"
+                )
+            expected_material = _protected_digest(_candidate_material(row))
+            if not secrets.compare_digest(
+                str(decoded.get("event_material_digest") or ""), expected_material
+            ):
+                raise RepairError(
+                    "A selected punch changed; refresh the employee punches.",
+                    code="SELECTION_DRIFT",
+                )
+            if event_uid in selected:
+                raise RepairError(
+                    "Each punch may be selected once.", code="DUPLICATE_EVENT_SELECTION"
+                )
+            selected.add(event_uid)
+        return selected
+
+    if len(event_tokens) + len(excluded_event_tokens) > settings.attendance_repair_max_events:
+        raise RepairError(
+            "The release selection exceeds 250,000 events.", code="EVENT_LIMIT"
+        )
+    operator_excluded_rows: list[dict[str, Any]] = []
+    if mode == "EXPLICIT":
+        selected_uids = decode_events(event_tokens)
+    else:
+        excluded_uids = decode_events(excluded_event_tokens)
+        operator_excluded_rows = [by_uid[event_uid] for event_uid in excluded_uids]
+        selected_uids = {
+            row["event"].event_uid for row in rows if row["eligible"]
+        } - excluded_uids
+    selected_rows = [
+        row for row in rows if row["event"].event_uid in selected_uids and row["eligible"]
+    ]
+    if not selected_rows:
+        raise RepairError("Select at least one eligible punch.", code="EMPTY_REPAIR")
+    if len(selected_rows) > settings.attendance_repair_max_events:
+        raise RepairError(
+            "The release selection exceeds 250,000 events.", code="EVENT_LIMIT"
+        )
+    selected_rows.sort(key=lambda row: row["event"].event_uid)
+    operator_excluded_rows.sort(key=lambda row: row["event"].event_uid)
+    return (
+        target,
+        selected_rows,
+        operator_excluded_rows,
+        filters,
+        certificate,
+        source_current,
+    )
+
+
+def _selection_manifest(rows: list[dict[str, Any]], *, selection_mode: str) -> str:
+    return _protected_digest(
+        {
+            "selection_mode": selection_mode,
+            "events": [_candidate_material(row) for row in rows],
+        }
+    )
+
+
+def _selection_exclusion_manifest(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    return _protected_digest(
+        {
+            "purpose": "attendance-release-operator-exclusions",
+            "events": [_candidate_material(row) for row in rows],
+        }
+    )
+
+
+def create_exact_release_job(
+    session: Session,
+    *,
+    connector: Connector,
+    actor: str,
+    candidate_set_token: str,
+    selection_mode: str,
+    event_tokens: list[str],
+    excluded_event_tokens: list[str],
+    idempotency_key: str,
+    actor_session_id: str | None = None,
+    actor_ip: str | None = None,
+) -> AttendanceRepairJob:
+    if not settings.attendance_repair_preview_enabled:
+        raise RepairError("Attendance release preview is disabled.", code="PREVIEW_DISABLED")
+    mode = selection_mode.strip().upper()
+    request_digest = _sha(
+        {
+            "workflow_version": RELEASE_WORKFLOW_VERSION,
+            "connector_id": connector.connector_id,
+            "candidate_set_token_digest": _sha(candidate_set_token),
+            "selection_mode": mode,
+            "event_token_digests": sorted(_sha(value) for value in event_tokens),
+            "excluded_event_token_digests": sorted(
+                _sha(value) for value in excluded_event_tokens
+            ),
+        }
+    )
+    locked_connector = session.scalar(
+        select(Connector).where(Connector.id == connector.id).with_for_update()
+    )
+    if locked_connector is None or locked_connector.zkt_device is None:
+        raise RepairError("The selected terminal no longer exists.", code="NO_TERMINAL")
+    connector = locked_connector
+    replay = session.scalar(
+        select(AttendanceRepairJob).where(
+            AttendanceRepairJob.connector_id == connector.id,
+            AttendanceRepairJob.idempotency_key == idempotency_key,
+        )
+    )
+    if replay is not None:
+        if not secrets.compare_digest(replay.request_digest, request_digest):
+            raise RepairError(
+                "That idempotency key was used for a different release request.",
+                code="IDEMPOTENCY_CONFLICT",
+            )
+        return replay
+    active = session.scalar(
+        select(AttendanceRepairJob).where(
+            AttendanceRepairJob.connector_id == connector.id,
+            AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+        )
+    )
+    if active is not None:
+        raise RepairError(
+            f"This terminal already has active attendance release {active.job_id}.",
+            code="ACTIVE_REPAIR_EXISTS",
+        )
+    hard, waitable = _terminal_eligibility(session, connector)
+    if hard:
+        raise RepairError(hard[0]["message"], code=hard[0]["code"])
+    if waitable:
+        raise RepairError(waitable[0]["message"], code=waitable[0]["code"])
+
+    (
+        target,
+        selected_rows,
+        operator_excluded_rows,
+        filters,
+        certificate,
+        source_current,
+    ) = _validate_release_selection(
+        session,
+        connector=connector,
+        candidate_set_token=candidate_set_token,
+        selection_mode=mode,
+        event_tokens=event_tokens,
+        excluded_event_tokens=excluded_event_tokens,
+    )
+    candidate_payload = _read_release_token(candidate_set_token, purpose="candidate-set")
+    manifest_digest = _selection_manifest(selected_rows, selection_mode=mode)
+    exclusion_manifest_digest = _selection_exclusion_manifest(operator_excluded_rows)
+    job = AttendanceRepairJob(
+        connector_id=connector.id,
+        zkt_device_id=connector.zkt_device.id,
+        actor=actor,
+        status="PREPARING_SOURCE",
+        phase="SOURCE_PREFLIGHT",
+        idempotency_key=idempotency_key,
+        request_digest=request_digest,
+        workflow_version=RELEASE_WORKFLOW_VERSION,
+        selection_mode=mode,
+        selection_manifest_digest=manifest_digest,
+        selection_filters=_public_release_filters(filters),
+        selection_exclusion_manifest_digest=exclusion_manifest_digest,
+        candidate_membership_digest=str(
+            candidate_payload.get("membership_digest") or ""
+        ),
+        candidate_source_certificate_digest=certificate.get("certificate_digest"),
+        release_target_user_id=target.user_id,
+        date_start_utc=filters["start_utc"],
+        date_end_utc=filters["end_utc"],
+        target_count=1,
+        event_count=len(selected_rows),
+        selected_blocked_count=sum(
+            row["risk_class"] == RELEASE_RISK_BLOCKED for row in selected_rows
+        ),
+        selected_reuse_count=sum(
+            row["risk_class"] == RELEASE_RISK_REUSE for row in selected_rows
+        ),
+        operator_excluded_count=len(operator_excluded_rows),
+    )
+    session.add(job)
+    session.flush()
+    frozen_target = _target_from_selection(
+        session,
+        job=job,
+        zkt=connector.zkt_device,
+        user_key=target.user_key,
+        expected_row_version=target.row_version,
+        all_provable_history=False,
+        alias_tokens=[],
+    )
+    for row in selected_rows:
+        event = row["event"]
+        material = _candidate_material(row)
+        session.add(
+            AttendanceRepairSelection(
+                job_id=job.id,
+                target_id=frozen_target.id,
+                attendance_event_id=event.id,
+                event_uid=event.event_uid,
+                immutable_facts_digest=material["immutable_facts_digest"],
+                source_ownership_digest=material["source_ownership_digest"],
+                before_identity_digest=material["before_identity_digest"],
+                source_ords_status=event.ords_status,
+                risk_class=row["risk_class"],
+                selection_origin=mode,
+            )
+        )
+    if source_current:
+        job.source_certificate_digest = certificate["certificate_digest"]
+        job.phase = "MEMBERSHIP_FREEZE"
+        job.wait_reason = None
+        _repair_event(
+            session,
+            job,
+            "SOURCE_CERTIFIED",
+            details={"source_certificate_digest": job.source_certificate_digest},
+        )
+    else:
+        _attach_source_dependency(session, job=job, connector=connector)
+    _repair_event(
+        session,
+        job,
+        "EXACT_SELECTION_RECORDED",
+        details={
+            "selection_mode": mode,
+            "selection_manifest_digest": manifest_digest,
+            "selection_filters": _public_release_filters(filters),
+            "selection_exclusion_manifest_digest": exclusion_manifest_digest,
+            "candidate_membership_digest": job.candidate_membership_digest,
+            "event_count": len(selected_rows),
+            "operator_excluded_count": len(operator_excluded_rows),
+            "ordinary_blocked": job.selected_blocked_count,
+            "identity_reuse": job.selected_reuse_count,
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+    )
+    append_audit(
+        session,
+        actor=actor,
+        action="ATTENDANCE_RELEASE_PREPARED",
+        target_type="attendance_repair_job",
+        target_id=job.job_id,
+        outcome=job.status,
+        after={
+            "connector_id": connector.connector_id,
+            "target_count": 1,
+            "event_count": len(selected_rows),
+            "selection_mode": mode,
+            "selection_manifest_digest": manifest_digest,
+            "selection_filters": _public_release_filters(filters),
+            "selection_exclusion_manifest_digest": exclusion_manifest_digest,
+            "candidate_membership_digest": job.candidate_membership_digest,
+            "source_dependency": bool(job.source_reconciliation_job_id),
+            "operator_excluded_count": len(operator_excluded_rows),
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+        ip_address=actor_ip,
+        request_id=(
+            f"admin-session-{actor_session_id}" if actor_session_id else None
+        ),
+    )
+    return job
+
+
 def _candidate_map_for_target(
     session: Session,
     *,
@@ -1133,12 +2715,248 @@ def _candidate_map_for_target(
     return result
 
 
+def _freeze_exact_membership(
+    session: Session,
+    job: AttendanceRepairJob,
+) -> None:
+    connector = session.get(Connector, job.connector_id)
+    zkt = session.get(ZKTDevice, job.zkt_device_id)
+    if connector is None or zkt is None:
+        raise RepairError("The terminal disappeared during preparation.", code="TERMINAL_DRIFT")
+    if (
+        not job.candidate_source_certificate_digest
+        or not job.source_certificate_digest
+        or not secrets.compare_digest(
+            job.candidate_source_certificate_digest,
+            job.source_certificate_digest,
+        )
+    ):
+        raise RepairError(
+            "Terminal source membership changed after selection; refresh the employee punches.",
+            code="SELECTION_SOURCE_DRIFT",
+        )
+    targets = list(
+        session.scalars(
+            select(AttendanceRepairTarget).where(AttendanceRepairTarget.job_id == job.id)
+        ).all()
+    )
+    if len(targets) != 1 or job.target_count != 1:
+        raise RepairError(
+            "An exact attendance release must contain one employee.",
+            code="TARGET_LIMIT",
+        )
+    target = targets[0]
+    user = session.get(DeviceUser, target.device_user_id)
+    if user is None or user.user_key != target.user_key:
+        raise RepairError("The selected employee disappeared.", code="TARGET_DRIFT")
+    eligible_target, target_code = _eligible_target(session, zkt=zkt, user=user)
+    if not eligible_target:
+        raise RepairError(
+            "The employee is no longer eligible for attendance release.",
+            code=target_code or "TARGET_DRIFT",
+        )
+    if user.row_version != target.expected_row_version:
+        raise RepairError("The employee changed after selection.", code="TARGET_DRIFT")
+    if zkt.identity_snapshot_id != target.identity_snapshot_id:
+        raise RepairError(
+            "The terminal identity snapshot changed after selection.", code="TARGET_DRIFT"
+        )
+    try:
+        current_cnic = decrypt_cnic(user.cnic_encrypted)
+    except Exception as exc:
+        raise RepairError(
+            "The employee's protected identity cannot be read.",
+            code="TARGET_PII_UNREADABLE",
+        ) from exc
+    if _identity_digest(user.display_name, current_cnic) != target.desired_identity_digest:
+        raise RepairError("The employee identity changed after selection.", code="TARGET_DRIFT")
+
+    selections = list(
+        session.scalars(
+            select(AttendanceRepairSelection)
+            .where(AttendanceRepairSelection.job_id == job.id)
+            .order_by(AttendanceRepairSelection.event_uid)
+        ).all()
+    )
+    if not selections or len(selections) != job.event_count:
+        raise RepairError("The exact release selection is incomplete.", code="SELECTION_DRIFT")
+    event_ids = [row.attendance_event_id for row in selections]
+    events = {
+        row.id: row
+        for row in session.scalars(
+            select(AttendanceEvent)
+            .where(AttendanceEvent.id.in_(event_ids))
+            .with_for_update()
+        ).all()
+    }
+    if len(events) != len(selections):
+        raise RepairError("A selected punch disappeared.", code="EVENT_DRIFT")
+    context = _release_identity_context(session, zkt=zkt)
+    context["active_job_event_ids"] = set(context["active_job_event_ids"]) - set(event_ids)
+    checked_rows: list[dict[str, Any]] = []
+    selection_by_event: dict[int, AttendanceRepairSelection] = {}
+    evidence_by_event: dict[int, str] = {}
+    for selection in selections:
+        event = events[selection.attendance_event_id]
+        matched_target, association_error = _release_target_for_event(event, context=context)
+        if matched_target is None or matched_target.id != user.id or association_error:
+            raise RepairError(
+                "A selected punch no longer maps uniquely to the employee.",
+                code="SELECTION_DRIFT",
+            )
+        eligibility = _release_event_eligibility(
+            event,
+            target=user,
+            zkt=zkt,
+            session=session,
+            context=context,
+        )
+        if not eligibility["eligible"]:
+            raise RepairError(
+                "A selected punch is no longer eligible for release.",
+                code=eligibility.get("lock_reason") or "SELECTION_DRIFT",
+            )
+        material = _candidate_material({"event": event, **eligibility})
+        expected = {
+            "event_uid": selection.event_uid,
+            "immutable_facts_digest": selection.immutable_facts_digest,
+            "source_ownership_digest": selection.source_ownership_digest,
+            "before_identity_digest": selection.before_identity_digest,
+            "source_ords_status": selection.source_ords_status,
+            "risk_class": selection.risk_class,
+        }
+        if event.event_uid != selection.event_uid or any(
+            material[key] != value for key, value in expected.items() if key != "event_uid"
+        ):
+            raise RepairError(
+                "A selected punch changed after review.", code="SELECTION_DRIFT"
+            )
+        checked_rows.append({"event": event, **eligibility})
+        selection_by_event[event.id] = selection
+        evidence_by_event[event.id] = str(eligibility.get("evidence_classification") or "")
+    checked_rows.sort(key=lambda row: row["event"].event_uid)
+    if not job.selection_manifest_digest or not secrets.compare_digest(
+        job.selection_manifest_digest,
+        _selection_manifest(checked_rows, selection_mode=job.selection_mode),
+    ):
+        raise RepairError("The release selection manifest changed.", code="SELECTION_DRIFT")
+
+    selected_groups: dict[
+        tuple[int | None, str, str], list[AttendanceEvent]
+    ] = defaultdict(list)
+    for row in checked_rows:
+        event = row["event"]
+        selected_groups[(event.device_user_id, event.uid or "", event.user_id)].append(event)
+    full_groups = _query_events_for_group_keys(
+        session,
+        zkt_device_id=zkt.id,
+        start_utc=job.date_start_utc,
+        end_utc=job.date_end_utc,
+        keys=selected_groups,
+    )
+
+    cohort_digests: list[str] = []
+    total = 0
+    for key, selected_events in sorted(selected_groups.items(), key=lambda item: str(item[0])):
+        all_events = full_groups.get(key, [])
+        if not all_events:
+            raise RepairError("A selected source cohort disappeared.", code="COHORT_DRIFT")
+        membership = _membership_digest(all_events)
+        cohort = AttendanceRepairCohort(
+            target_id=target.id,
+            cohort_token=_cohort_token(
+                target=user,
+                key=key,
+                start_utc=job.date_start_utc,
+                end_utc=job.date_end_utc,
+            ),
+            evidence_classification=(
+                evidence_by_event[selected_events[0].id] or "EXACT_EVENT_SELECTION"
+            ),
+            source_device_user_id=key[0],
+            source_uid_digest=_protected_digest(key[1]),
+            source_user_id_digest=_protected_digest(key[2]),
+            membership_digest=membership,
+            first_event_at=min(
+                all_events,
+                key=lambda row: ensure_utc(row.device_event_time),
+            ).device_event_time,
+            last_event_at=max(
+                all_events,
+                key=lambda row: ensure_utc(row.device_event_time),
+            ).device_event_time,
+            event_count=len(all_events),
+            selected_event_count=len(selected_events),
+            selected=True,
+        )
+        session.add(cohort)
+        session.flush()
+        cohort_digests.append(membership)
+        for event in selected_events:
+            selection = selection_by_event[event.id]
+            try:
+                before_cnic = decrypt_cnic(event.cnic_encrypted)
+            except Exception as exc:
+                raise RepairError(
+                    "A selected event contains unreadable protected identity data.",
+                    code="EVENT_PII_UNREADABLE",
+                ) from exc
+            session.add(
+                AttendanceRepairItem(
+                    job_id=job.id,
+                    target_id=target.id,
+                    cohort_id=cohort.id,
+                    attendance_event_id=event.id,
+                    event_uid=event.event_uid,
+                    immutable_facts_digest=selection.immutable_facts_digest,
+                    source_ownership_digest=selection.source_ownership_digest,
+                    before_device_user_id=event.device_user_id,
+                    before_display_name_encrypted=encrypt_text(event.display_name),
+                    before_cnic_encrypted=event.cnic_encrypted,
+                    before_cnic_lookup_hash=event.cnic_lookup_hash,
+                    before_cnic_last4=event.cnic_last4,
+                    before_identity_digest=_identity_digest(event.display_name or "", before_cnic),
+                    desired_display_name_encrypted=target.desired_display_name_encrypted,
+                    desired_cnic_encrypted=target.desired_cnic_encrypted,
+                    desired_cnic_lookup_hash=target.desired_cnic_lookup_hash,
+                    desired_cnic_last4=target.desired_cnic_last4,
+                    desired_identity_digest=target.desired_identity_digest,
+                    source_ords_status=selection.source_ords_status,
+                    risk_class=selection.risk_class,
+                    selection_origin=selection.selection_origin,
+                    state="FROZEN",
+                )
+            )
+            total += 1
+    if total != job.event_count:
+        raise RepairError("The frozen event count changed.", code="SELECTION_DRIFT")
+    target.event_count = total
+    target.status = "FROZEN"
+    job.cohort_digest = _sha(sorted(cohort_digests))
+    job.phase = "ORACLE_CLASSIFICATION"
+    job.wait_reason = None
+    job.updated_at = utc_now()
+    _repair_event(
+        session,
+        job,
+        "MEMBERSHIP_FROZEN",
+        details={
+            "target_count": 1,
+            "event_count": total,
+            "selection_manifest_digest": job.selection_manifest_digest,
+        },
+    )
+
+
 def _freeze_membership(
     session: Session,
     job: AttendanceRepairJob,
     *,
     allow_certified_snapshot_rebind: bool = False,
 ) -> None:
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        _freeze_exact_membership(session, job)
+        return
     connector = session.get(Connector, job.connector_id)
     zkt = session.get(ZKTDevice, job.zkt_device_id)
     if connector is None or zkt is None:
@@ -1299,6 +3117,7 @@ def _freeze_membership(
                 first_event_at=rows[0].device_event_time,
                 last_event_at=rows[-1].device_event_time,
                 event_count=len(rows),
+                selected_event_count=len(rows),
                 selected=True,
             )
             session.add(cohort)
@@ -1344,6 +3163,9 @@ def _freeze_membership(
                     desired_cnic_lookup_hash=target.desired_cnic_lookup_hash,
                     desired_cnic_last4=target.desired_cnic_last4,
                     desired_identity_digest=target.desired_identity_digest,
+                    source_ords_status=event.ords_status,
+                    risk_class="LEGACY",
+                    selection_origin="COHORT",
                     state="FROZEN",
                 )
                 session.add(item)
@@ -1654,39 +3476,60 @@ def _oracle_item_payload(
     return payload
 
 
-def _preview_items_certificate(session: Session, job_id: int) -> dict[str, Any]:
+def _preview_items_certificate(
+    session: Session,
+    job_id: int,
+    *,
+    v2: bool,
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     count = 0
-    statement = (
-        select(
-            AttendanceRepairItem.event_uid,
-            AttendanceRepairItem.immutable_facts_digest,
-            AttendanceRepairItem.source_ownership_digest,
-            AttendanceRepairItem.before_identity_digest,
-            AttendanceRepairItem.desired_identity_digest,
-            AttendanceRepairItem.oracle_classification,
-            AttendanceRepairItem.expected_oracle_token_encrypted,
+    columns = [
+        AttendanceRepairItem.event_uid,
+        AttendanceRepairItem.immutable_facts_digest,
+        AttendanceRepairItem.source_ownership_digest,
+        AttendanceRepairItem.before_identity_digest,
+        AttendanceRepairItem.desired_identity_digest,
+        AttendanceRepairItem.oracle_classification,
+        AttendanceRepairItem.expected_oracle_token_encrypted,
+    ]
+    if v2:
+        columns.extend(
+            [
+                AttendanceRepairItem.source_ords_status,
+                AttendanceRepairItem.risk_class,
+                AttendanceRepairItem.selection_origin,
+            ]
         )
+    statement = (
+        select(*columns)
         .where(AttendanceRepairItem.job_id == job_id)
         .order_by(AttendanceRepairItem.event_uid)
         .execution_options(yield_per=1000)
     )
     for row in session.execute(statement):
-        material = _canonical(
-            {
-                "event_uid": row.event_uid,
-                "immutable_facts_digest": row.immutable_facts_digest,
-                "source_ownership_digest": row.source_ownership_digest,
-                "before_identity_digest": row.before_identity_digest,
-                "desired_identity_digest": row.desired_identity_digest,
-                "oracle_classification": row.oracle_classification,
-                "oracle_token_digest": (
-                    _sha(row.expected_oracle_token_encrypted)
-                    if row.expected_oracle_token_encrypted
-                    else None
-                ),
-            }
-        )
+        item_material = {
+            "event_uid": row.event_uid,
+            "immutable_facts_digest": row.immutable_facts_digest,
+            "source_ownership_digest": row.source_ownership_digest,
+            "before_identity_digest": row.before_identity_digest,
+            "desired_identity_digest": row.desired_identity_digest,
+            "oracle_classification": row.oracle_classification,
+            "oracle_token_digest": (
+                _sha(row.expected_oracle_token_encrypted)
+                if row.expected_oracle_token_encrypted
+                else None
+            ),
+        }
+        if v2:
+            item_material.update(
+                {
+                    "source_ords_status": row.source_ords_status,
+                    "risk_class": row.risk_class,
+                    "selection_origin": row.selection_origin,
+                }
+            )
+        material = _canonical(item_material)
         digest.update(len(material).to_bytes(8, "big"))
         digest.update(material)
         count += 1
@@ -1751,8 +3594,9 @@ def _preview_material(session: Session, job: AttendanceRepairJob) -> dict[str, A
             .order_by(AttendanceRepairCohort.id)
         ).all()
     )
-    return {
-        "schema_version": "1",
+    is_v2 = job.workflow_version == RELEASE_WORKFLOW_VERSION
+    material: dict[str, Any] = {
+        "schema_version": "2" if is_v2 else "1",
         "job_id": job.job_id,
         "connector_id": job.connector_id,
         "zkt_device_id": job.zkt_device_id,
@@ -1777,9 +3621,26 @@ def _preview_material(session: Session, job: AttendanceRepairJob) -> dict[str, A
             }
             for row in cohorts
         ],
-        "items_certificate": _preview_items_certificate(session, job.id),
+        "items_certificate": _preview_items_certificate(session, job.id, v2=is_v2),
         "downstream_impact": _downstream_impact_summary(session, job.id),
     }
+    if is_v2:
+        material.update(
+            {
+                "workflow_version": job.workflow_version,
+                "selection_mode": job.selection_mode,
+                "selection_manifest_digest": job.selection_manifest_digest,
+                "selection_filters": job.selection_filters,
+                "selection_exclusion_manifest_digest": (
+                    job.selection_exclusion_manifest_digest
+                ),
+                "candidate_membership_digest": job.candidate_membership_digest,
+                "operator_excluded_count": job.operator_excluded_count,
+            }
+        )
+        for cohort_material, cohort in zip(material["cohorts"], cohorts, strict=True):
+            cohort_material["selected_event_count"] = cohort.selected_event_count
+    return material
 
 
 async def classify_repair_preview(job_public_id: str, *, max_batches: int = 5) -> None:
@@ -1973,7 +3834,7 @@ async def classify_repair_preview(job_public_id: str, *, max_batches: int = 5) -
                 or job.phase != "ORACLE_CLASSIFICATION"
             ):
                 return
-            total, classified, exclusions, remaining = session.execute(
+            total, classified, exclusions, remaining, safe_reuse = session.execute(
                 select(
                     func.count(AttendanceRepairItem.id),
                     func.count(AttendanceRepairItem.id).filter(
@@ -1984,6 +3845,10 @@ async def classify_repair_preview(job_public_id: str, *, max_batches: int = 5) -
                     ),
                     func.count(AttendanceRepairItem.id).filter(
                         AttendanceRepairItem.state == "FROZEN"
+                    ),
+                    func.count(AttendanceRepairItem.id).filter(
+                        AttendanceRepairItem.state == "ORACLE_APPLY",
+                        AttendanceRepairItem.risk_class == RELEASE_RISK_REUSE,
                     ),
                 ).where(AttendanceRepairItem.job_id == job.id)
             ).one()
@@ -1997,6 +3862,7 @@ async def classify_repair_preview(job_public_id: str, *, max_batches: int = 5) -
                 )
             exclusions = int(exclusions or 0)
             job.excluded_count = exclusions
+            job.safe_reuse_count = int(safe_reuse or 0)
             job.attention_event_count = exclusions
             job.next_attempt_at = None
             job.error_code = None
@@ -2082,6 +3948,15 @@ async def classify_repair_preview(job_public_id: str, *, max_batches: int = 5) -
 
 def _expected_confirmation(job: AttendanceRepairJob, connector: Connector) -> str:
     prefix = (job.preview_digest or "")[:12]
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        safe_count = max(0, job.event_count - job.excluded_count)
+        base = (
+            f"RELEASE {safe_count} OF {job.event_count} PUNCHES "
+            f"FOR {job.release_target_user_id or 'UNKNOWN'} ON {connector.device_id}"
+        )
+        if job.safe_reuse_count:
+            base = f"{base} INCLUDING {job.safe_reuse_count} REUSE"
+        return f"{base} {prefix}"
     return (
         f"REPAIR {job.target_count} EMPLOYEES / {job.event_count} EVENTS "
         f"ON {connector.device_id} {prefix}"
@@ -2151,6 +4026,45 @@ def assert_preview_current(session: Session, job: AttendanceRepairJob) -> None:
             raise RepairError(
                 "The terminal identity snapshot changed; regenerate preview.", code="TARGET_DRIFT"
             )
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        if len(targets) != 1 or not job.selection_filters:
+            raise RepairError(
+                "The frozen release review is incomplete; regenerate preview.",
+                code="PREVIEW_DRIFT",
+            )
+        selected_event_ids = set(
+            session.scalars(
+                select(AttendanceRepairSelection.attendance_event_id).where(
+                    AttendanceRepairSelection.job_id == job.id
+                )
+            ).all()
+        )
+        filters = _release_filters_from_public(job.selection_filters)
+        try:
+            _target, current_candidates, _candidate_certificate, _source_current = (
+                _release_candidates_for_target(
+                    session,
+                    connector=connector,
+                    user_key=targets[0].user_key,
+                    filters=filters,
+                    ignore_active_event_ids=selected_event_ids,
+                )
+            )
+        except RepairError as exc:
+            if exc.code in {"EVENT_LIMIT", "TARGET_NOT_FOUND"}:
+                raise RepairError(
+                    "The attendance review membership changed; regenerate preview.",
+                    code="PREVIEW_DRIFT",
+                ) from exc
+            raise
+        if not job.candidate_membership_digest or not secrets.compare_digest(
+            job.candidate_membership_digest,
+            _release_membership_digest(current_candidates),
+        ):
+            raise RepairError(
+                "The attendance review membership changed; regenerate preview.",
+                code="PREVIEW_DRIFT",
+            )
     cohorts = list(
         session.scalars(
             select(AttendanceRepairCohort)
@@ -2211,6 +4125,163 @@ def assert_preview_current(session: Session, job: AttendanceRepairJob) -> None:
         raise RepairError("The frozen preview digest changed.", code="PREVIEW_DRIFT")
 
 
+def _persist_reuse_attestation(
+    session: Session,
+    *,
+    job: AttendanceRepairJob,
+    actor: str,
+    reason: str,
+    typed_confirmation: str,
+    reuse_cnic: str | None,
+    reuse_employee_name: str | None,
+    actor_session_id: str | None,
+    actor_ip: str | None,
+) -> AttendanceRepairReuseAttestation | None:
+    if job.workflow_version != RELEASE_WORKFLOW_VERSION or not job.safe_reuse_count:
+        return None
+    normalized_cnic = normalize_cnic(reuse_cnic)
+    entered_name = (reuse_employee_name or "").strip()
+    if normalized_cnic is None or not entered_name:
+        raise RepairError(
+            "Full CNIC and authoritative employee name are required for identity reuse.",
+            code="REUSE_EVIDENCE_REQUIRED",
+        )
+    target = session.scalar(
+        select(AttendanceRepairTarget).where(AttendanceRepairTarget.job_id == job.id)
+    )
+    if target is None:
+        raise RepairError("The frozen employee is missing.", code="TARGET_DRIFT")
+    user = session.get(DeviceUser, target.device_user_id)
+    if user is None:
+        raise RepairError("The frozen employee is missing.", code="TARGET_DRIFT")
+    try:
+        current_cnic = decrypt_cnic(user.cnic_encrypted)
+    except Exception as exc:
+        raise RepairError(
+            "The employee's protected CNIC cannot be verified.",
+            code="TARGET_PII_UNREADABLE",
+        ) from exc
+    if not current_cnic or not secrets.compare_digest(current_cnic, normalized_cnic):
+        raise RepairError(
+            "The entered CNIC does not match the selected employee.",
+            code="REUSE_CNIC_MISMATCH",
+        )
+    entered_name_normalized = _normalized_release_name(entered_name)
+    if (
+        not entered_name_normalized
+        or not secrets.compare_digest(
+            entered_name_normalized,
+            _normalized_release_name(user.display_name),
+        )
+    ):
+        raise RepairError(
+            "The authoritative name does not exactly match the selected employee.",
+            code="REUSE_NAME_MISMATCH",
+        )
+    items = list(
+        session.scalars(
+            select(AttendanceRepairItem)
+            .where(
+                AttendanceRepairItem.job_id == job.id,
+                AttendanceRepairItem.risk_class == RELEASE_RISK_REUSE,
+                AttendanceRepairItem.state == "ORACLE_APPLY",
+            )
+            .order_by(AttendanceRepairItem.event_uid)
+            .with_for_update()
+        ).all()
+    )
+    if len(items) != job.safe_reuse_count:
+        raise RepairError(
+            "The safe identity-reuse membership changed.", code="PREVIEW_DRIFT"
+        )
+    for item in items:
+        try:
+            historical_name = decrypt_text(item.before_display_name_encrypted)
+        except Exception as exc:
+            raise RepairError(
+                "Historical identity evidence cannot be verified.",
+                code="EVENT_PII_UNREADABLE",
+            ) from exc
+        if not historical_name or not secrets.compare_digest(
+            _normalized_release_name(historical_name), entered_name_normalized
+        ):
+            raise RepairError(
+                "A selected identity-reuse punch has a different historical name.",
+                code="REUSE_NAME_MISMATCH",
+            )
+    membership_digest = _protected_digest(
+        [
+            {
+                "event_uid": item.event_uid,
+                "immutable_facts_digest": item.immutable_facts_digest,
+                "source_ownership_digest": item.source_ownership_digest,
+            }
+            for item in items
+        ]
+    )
+    attestation = AttendanceRepairReuseAttestation(
+        job_id=job.id,
+        target_id=target.id,
+        target_identity_digest=target.desired_identity_digest,
+        target_row_version=target.expected_row_version,
+        event_membership_digest=membership_digest,
+        event_count=len(items),
+        evidence_type="CURRENT_ACTIVE_IDENTITY_EXACT_MATCH",
+        verified_name_digest=_protected_digest(
+            {"purpose": "attendance-release-verified-name", "value": entered_name_normalized}
+        ),
+        reason_digest=_reason_digest(reason),
+        confirmation_digest=_protected_digest(
+            {"purpose": "attendance-release-confirmation", "value": typed_confirmation}
+        ),
+        actor=actor,
+    )
+    session.add(attestation)
+    session.flush()
+    for item in items:
+        item.reuse_attestation_id = attestation.id
+    _repair_event(
+        session,
+        job,
+        "IDENTITY_REUSE_ATTESTED",
+        details={
+            "attestation_id": attestation.attestation_id,
+            "event_count": len(items),
+            "event_membership_digest": membership_digest,
+            "target_identity_digest": target.desired_identity_digest,
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+        idempotency_key=f"reuse-attestation-{job.job_id}",
+    )
+    append_audit(
+        session,
+        actor=actor,
+        action="ATTENDANCE_RELEASE_REUSE_ATTESTED",
+        target_type="attendance_repair_reuse_attestation",
+        target_id=attestation.attestation_id,
+        outcome="VERIFIED",
+        after={
+            "job_id": job.job_id,
+            "event_count": len(items),
+            "event_membership_digest": membership_digest,
+            "target_identity_digest": target.desired_identity_digest,
+            "reason_digest": _reason_digest(reason),
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+        ip_address=actor_ip,
+        request_id=(
+            f"admin-session-{actor_session_id}" if actor_session_id else None
+        ),
+    )
+    return attestation
+
+
 def approve_repair_job(
     session: Session,
     *,
@@ -2220,6 +4291,10 @@ def approve_repair_job(
     typed_confirmation: str,
     preview_digest: str,
     idempotency_key: str,
+    reuse_cnic: str | None = None,
+    reuse_employee_name: str | None = None,
+    actor_session_id: str | None = None,
+    actor_ip: str | None = None,
 ) -> AttendanceRepairJob:
     if not settings.attendance_repair_execution_enabled:
         raise RepairError(
@@ -2234,6 +4309,26 @@ def approve_repair_job(
             "reason": reason.strip(),
             "typed_confirmation": typed_confirmation,
             "preview_digest": preview_digest,
+            "reuse_cnic_digest": (
+                _protected_digest(
+                    {
+                        "purpose": "attendance-release-entered-cnic",
+                        "value": normalize_cnic(reuse_cnic),
+                    }
+                )
+                if reuse_cnic
+                else None
+            ),
+            "reuse_name_digest": (
+                _protected_digest(
+                    {
+                        "purpose": "attendance-release-entered-name",
+                        "value": _normalized_release_name(reuse_employee_name),
+                    }
+                )
+                if reuse_employee_name
+                else None
+            ),
         }
     )
     replay = session.scalar(
@@ -2277,6 +4372,17 @@ def approve_repair_job(
             code="LIVE_ORDS_BACKLOG_HIGH",
         )
     assert_preview_current(session, job)
+    _persist_reuse_attestation(
+        session,
+        job=job,
+        actor=actor,
+        reason=reason,
+        typed_confirmation=typed_confirmation,
+        reuse_cnic=reuse_cnic,
+        reuse_employee_name=reuse_employee_name,
+        actor_session_id=actor_session_id,
+        actor_ip=actor_ip,
+    )
     # Reasons can accidentally contain identity data. Keep the operator's text
     # encrypted at rest and place only its digest in audit/repair ledgers.
     job.reason = encrypt_text(reason.strip())
@@ -2292,6 +4398,10 @@ def approve_repair_job(
             "preview_digest": preview_digest,
             "reason_digest": _reason_digest(reason),
             "request_digest": approval_request_digest,
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
         },
         idempotency_key=idempotency_key,
     )
@@ -2308,9 +4418,51 @@ def approve_repair_job(
             "event_count": job.event_count,
             "preview_digest": preview_digest,
             "reason_digest": _reason_digest(reason),
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
         },
+        ip_address=actor_ip,
+        request_id=(
+            f"admin-session-{actor_session_id}" if actor_session_id else None
+        ),
     )
     return job
+
+
+def record_release_approval_rejection(
+    session: Session,
+    *,
+    job: AttendanceRepairJob,
+    actor: str,
+    error_code: str,
+    reuse_evidence_supplied: bool,
+    actor_session_id: str | None = None,
+    actor_ip: str | None = None,
+) -> None:
+    """Persist a PII-free failed approval attempt after its work is rolled back."""
+
+    append_audit(
+        session,
+        actor=actor,
+        action="ATTENDANCE_RELEASE_APPROVAL_REJECTED",
+        target_type="attendance_repair_job",
+        target_id=job.job_id,
+        outcome=error_code[:40],
+        after={
+            "error_code": error_code,
+            "reuse_evidence_supplied": reuse_evidence_supplied,
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+        ip_address=actor_ip,
+        request_id=(
+            f"admin-session-{actor_session_id}" if actor_session_id else None
+        ),
+    )
 
 
 def control_repair_job(
@@ -2321,6 +4473,8 @@ def control_repair_job(
     actor: str,
     reason: str,
     idempotency_key: str,
+    actor_session_id: str | None = None,
+    actor_ip: str | None = None,
 ) -> AttendanceRepairJob:
     job = _lock_job(session, job.id)
     control_request_digest = _protected_digest(
@@ -2558,6 +4712,10 @@ def control_repair_job(
             "action": action,
             "reason_digest": _reason_digest(reason),
             "request_digest": control_request_digest,
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
         },
         idempotency_key=idempotency_key,
     )
@@ -2569,7 +4727,18 @@ def control_repair_job(
         target_id=job.job_id,
         outcome=job.status,
         before={"status": before},
-        after={"status": job.status, "reason_digest": _reason_digest(reason)},
+        after={
+            "status": job.status,
+            "reason_digest": _reason_digest(reason),
+            **_operator_evidence(
+                actor_session_id=actor_session_id,
+                actor_ip=actor_ip,
+            ),
+        },
+        ip_address=actor_ip,
+        request_id=(
+            f"admin-session-{actor_session_id}" if actor_session_id else None
+        ),
     )
     return job
 
@@ -2586,6 +4755,28 @@ def _serialize_target(target: AttendanceRepairTarget) -> dict[str, Any]:
         "completed_event_count": target.completed_event_count,
         "attention_event_count": target.attention_event_count,
     }
+
+
+def _release_job_state(job: AttendanceRepairJob) -> str:
+    if job.status == "PREPARING_SOURCE":
+        return "Preparing"
+    if job.status == "AWAITING_APPROVAL":
+        return "Awaiting approval"
+    if job.status == "QUEUED":
+        return "Queued"
+    if job.status in {"RUNNING", "WAITING_ORACLE"}:
+        return "Verifying" if job.phase in {"ADD_ACTIVATE", "DOWNSTREAM_VERIFY"} else "Sending to Oracle"
+    if job.status == "WAITING_DOWNSTREAM":
+        return "Verifying"
+    if job.status == "COMPLETED":
+        return "Released"
+    if job.status in {"COMPLETED_WITH_ATTENTION", "NEEDS_ATTENTION"}:
+        return "Completed with attention"
+    if job.status == "PAUSED":
+        return "Paused"
+    if job.status == "CANCELLED":
+        return "Cancelled"
+    return job.status.replace("_", " ").title()
 
 
 def serialize_repair_job(
@@ -2615,7 +4806,17 @@ def serialize_repair_job(
         "device_id": connector.device_id if connector else None,
         "actor": job.actor,
         "status": job.status,
+        "release_state": _release_job_state(job),
         "phase": job.phase,
+        "workflow_version": job.workflow_version,
+        "selection_mode": job.selection_mode,
+        "selection_manifest_digest": job.selection_manifest_digest,
+        "selection_filters": job.selection_filters,
+        "selection_exclusion_manifest_digest": (
+            job.selection_exclusion_manifest_digest
+        ),
+        "candidate_membership_digest": job.candidate_membership_digest,
+        "release_target_user_id": job.release_target_user_id,
         "date_scope": {
             "timezone": "Asia/Karachi",
             "start_utc": job.date_start_utc,
@@ -2633,6 +4834,12 @@ def serialize_repair_job(
         "totals": {
             "employees": job.target_count,
             "events": job.event_count,
+            "selected": job.event_count,
+            "safe": max(0, job.event_count - job.excluded_count),
+            "ordinary": job.selected_blocked_count,
+            "reuse": job.selected_reuse_count,
+            "operator_excluded": job.operator_excluded_count,
+            "safe_reuse": job.safe_reuse_count,
             "excluded": job.excluded_count,
             "completed_employees": job.completed_target_count,
             "completed_events": job.completed_event_count,
@@ -2650,9 +4857,31 @@ def serialize_repair_job(
         "completed_at": job.completed_at,
         "targets": [_serialize_target(target) for target in targets],
     }
+    attestation = session.scalar(
+        select(AttendanceRepairReuseAttestation).where(
+            AttendanceRepairReuseAttestation.job_id == job.id
+        )
+    )
+    response["reuse_attestation"] = (
+        {
+            "attestation_id": attestation.attestation_id,
+            "evidence_type": attestation.evidence_type,
+            "event_count": attestation.event_count,
+            "event_membership_digest": attestation.event_membership_digest,
+            "actor": attestation.actor,
+            "created_at": attestation.created_at,
+        }
+        if attestation
+        else None
+    )
     if job.status == "AWAITING_APPROVAL" and connector is not None:
         response["typed_confirmation"] = _expected_confirmation(job, connector)
     if include_items:
+        if job.reason:
+            try:
+                response["reason"] = decrypt_text(job.reason)
+            except Exception:
+                response["reason"] = None
         response["downstream_impact"] = _downstream_impact_summary(session, job.id)
         item_limit = max(1, min(item_limit, 500))
         item_statement = select(AttendanceRepairItem).where(AttendanceRepairItem.job_id == job.id)
@@ -2673,6 +4902,27 @@ def serialize_repair_job(
             ).all()
         }
         target_by_id = {target.id: target.user_key for target in targets}
+        receipts_by_item = {
+            row.repair_item_id: row
+            for row in session.scalars(
+                select(OracleIdentityRepairReceipt).where(
+                    OracleIdentityRepairReceipt.repair_item_id.in_(
+                        [item.id for item in items]
+                    )
+                )
+            ).all()
+        }
+        revisions_by_item = {
+            row.repair_item_id: row
+            for row in session.scalars(
+                select(AttendanceIdentityRevision).where(
+                    AttendanceIdentityRevision.repair_item_id.in_(
+                        [item.id for item in items]
+                    ),
+                    AttendanceIdentityRevision.state == "ACTIVE",
+                )
+            ).all()
+        }
         response["items"] = [
             {
                 "event_uid": item.event_uid,
@@ -2682,6 +4932,19 @@ def serialize_repair_job(
                     if item.attendance_event_id in event_by_id
                     else None
                 ),
+                "punch": (
+                    event_by_id[item.attendance_event_id].punch
+                    if item.attendance_event_id in event_by_id
+                    else None
+                ),
+                "capture_source": (
+                    event_by_id[item.attendance_event_id].source
+                    if item.attendance_event_id in event_by_id
+                    else None
+                ),
+                "source_ords_status": item.source_ords_status,
+                "risk_class": item.risk_class,
+                "selection_origin": item.selection_origin,
                 "state": item.state,
                 "oracle_classification": item.oracle_classification,
                 "outcome": item.outcome,
@@ -2690,6 +4953,33 @@ def serialize_repair_job(
                 "downstream_attempt_count": item.downstream_attempt_count,
                 "next_attempt_at": item.next_attempt_at,
                 "error_code": item.error_code,
+                "error_message": item.error_message,
+                "operation_id": item.operation_id,
+                "oracle_receipt_id": (
+                    receipts_by_item[item.id].oracle_receipt_id
+                    if item.id in receipts_by_item
+                    else None
+                ),
+                "oracle_verified_at": (
+                    receipts_by_item[item.id].raw_content_verified_at
+                    if item.id in receipts_by_item
+                    else None
+                ),
+                "downstream_status": (
+                    receipts_by_item[item.id].downstream_status
+                    if item.id in receipts_by_item
+                    else None
+                ),
+                "downstream_verified_at": (
+                    receipts_by_item[item.id].downstream_verified_at
+                    if item.id in receipts_by_item
+                    else None
+                ),
+                "effective_identity_activated_at": (
+                    revisions_by_item[item.id].activated_at
+                    if item.id in revisions_by_item
+                    else None
+                ),
             }
             for item in items
         ]
@@ -2711,6 +5001,7 @@ def _certificate_stream(rows: Iterable[Any]) -> dict[str, Any]:
 
 
 def _repair_certificate_digest(session: Session, job: AttendanceRepairJob) -> str:
+    is_v2 = job.workflow_version == RELEASE_WORKFLOW_VERSION
     targets = session.execute(
         select(
             AttendanceRepairTarget.user_key,
@@ -2735,29 +5026,39 @@ def _repair_certificate_digest(session: Session, job: AttendanceRepairJob) -> st
         }
         for row in targets
     )
-    items = session.execute(
-        select(
-            AttendanceRepairItem.event_uid,
-            AttendanceRepairItem.immutable_facts_digest,
-            AttendanceRepairItem.source_ownership_digest,
-            AttendanceRepairItem.before_identity_digest,
-            AttendanceRepairItem.desired_identity_digest,
-            AttendanceRepairItem.oracle_classification,
-            AttendanceRepairItem.operation_id,
-            AttendanceRepairItem.operation_payload_digest,
-            AttendanceRepairItem.state,
-            AttendanceRepairItem.outcome,
-            AttendanceRepairItem.error_code,
-            AttendanceRepairItem.attempt_count,
-            AttendanceRepairItem.oracle_attempt_count,
-            AttendanceRepairItem.downstream_attempt_count,
+    item_columns = [
+        AttendanceRepairItem.event_uid,
+        AttendanceRepairItem.immutable_facts_digest,
+        AttendanceRepairItem.source_ownership_digest,
+        AttendanceRepairItem.before_identity_digest,
+        AttendanceRepairItem.desired_identity_digest,
+        AttendanceRepairItem.oracle_classification,
+        AttendanceRepairItem.operation_id,
+        AttendanceRepairItem.operation_payload_digest,
+        AttendanceRepairItem.state,
+        AttendanceRepairItem.outcome,
+        AttendanceRepairItem.error_code,
+        AttendanceRepairItem.attempt_count,
+        AttendanceRepairItem.oracle_attempt_count,
+        AttendanceRepairItem.downstream_attempt_count,
+    ]
+    if is_v2:
+        item_columns.extend(
+            [
+                AttendanceRepairItem.source_ords_status,
+                AttendanceRepairItem.risk_class,
+                AttendanceRepairItem.selection_origin,
+                AttendanceRepairItem.reuse_attestation_id,
+            ]
         )
+    items = session.execute(
+        select(*item_columns)
         .where(AttendanceRepairItem.job_id == job.id)
         .order_by(AttendanceRepairItem.event_uid)
         .execution_options(yield_per=1000)
     )
-    item_certificate = _certificate_stream(
-        {
+    def item_material(row: Any) -> dict[str, Any]:
+        material = {
             "event_uid": row.event_uid,
             "immutable": row.immutable_facts_digest,
             "source": row.source_ownership_digest,
@@ -2773,8 +5074,18 @@ def _repair_certificate_digest(session: Session, job: AttendanceRepairJob) -> st
             "oracle_attempt_count": row.oracle_attempt_count,
             "downstream_attempt_count": row.downstream_attempt_count,
         }
-        for row in items
-    )
+        if is_v2:
+            material.update(
+                {
+                    "source_ords_status": row.source_ords_status,
+                    "risk_class": row.risk_class,
+                    "selection_origin": row.selection_origin,
+                    "reuse_attestation_id": row.reuse_attestation_id,
+                }
+            )
+        return material
+
+    item_certificate = _certificate_stream(item_material(row) for row in items)
     receipts = session.execute(
         select(
             OracleIdentityRepairReceipt.operation_id,
@@ -2803,9 +5114,8 @@ def _repair_certificate_digest(session: Session, job: AttendanceRepairJob) -> st
         }
         for row in receipts
     )
-    return _sha(
-        {
-            "schema_version": "1",
+    certificate_material: dict[str, Any] = {
+            "schema_version": "2" if is_v2 else "1",
             "job_id": job.job_id,
             "actor": job.actor,
             "request_digest": job.request_digest,
@@ -2824,7 +5134,62 @@ def _repair_certificate_digest(session: Session, job: AttendanceRepairJob) -> st
             "items": item_certificate,
             "oracle_receipts": receipt_certificate,
         }
-    )
+    if is_v2:
+        attestations = session.execute(
+            select(
+                AttendanceRepairReuseAttestation.attestation_id,
+                AttendanceRepairReuseAttestation.target_identity_digest,
+                AttendanceRepairReuseAttestation.target_row_version,
+                AttendanceRepairReuseAttestation.event_membership_digest,
+                AttendanceRepairReuseAttestation.event_count,
+                AttendanceRepairReuseAttestation.evidence_type,
+                AttendanceRepairReuseAttestation.verified_name_digest,
+                AttendanceRepairReuseAttestation.reason_digest,
+                AttendanceRepairReuseAttestation.confirmation_digest,
+                AttendanceRepairReuseAttestation.actor,
+                AttendanceRepairReuseAttestation.created_at,
+            )
+            .where(AttendanceRepairReuseAttestation.job_id == job.id)
+            .order_by(AttendanceRepairReuseAttestation.attestation_id)
+        )
+        attestation_certificate = _certificate_stream(
+            {
+                "attestation_id": row.attestation_id,
+                "target_identity_digest": row.target_identity_digest,
+                "target_row_version": row.target_row_version,
+                "event_membership_digest": row.event_membership_digest,
+                "event_count": row.event_count,
+                "evidence_type": row.evidence_type,
+                "verified_name_digest": row.verified_name_digest,
+                "reason_digest": row.reason_digest,
+                "confirmation_digest": row.confirmation_digest,
+                "actor": row.actor,
+                "created_at": row.created_at,
+            }
+            for row in attestations
+        )
+        certificate_material.update(
+            {
+                "workflow_version": job.workflow_version,
+                "selection_mode": job.selection_mode,
+                "selection_manifest_digest": job.selection_manifest_digest,
+                "selection_filters": job.selection_filters,
+                "selection_exclusion_manifest_digest": (
+                    job.selection_exclusion_manifest_digest
+                ),
+                "candidate_membership_digest": job.candidate_membership_digest,
+                "candidate_source_certificate_digest": (
+                    job.candidate_source_certificate_digest
+                ),
+                "release_target_user_id": job.release_target_user_id,
+                "selected_blocked_count": job.selected_blocked_count,
+                "selected_reuse_count": job.selected_reuse_count,
+                "operator_excluded_count": job.operator_excluded_count,
+                "safe_reuse_count": job.safe_reuse_count,
+                "reuse_attestations": attestation_certificate,
+            }
+        )
+    return _sha(certificate_material)
 
 
 def _repair_ledger_proof(
@@ -2889,7 +5254,7 @@ def _repair_ledger_proof_values(
 
 
 def _evidence_job(job: AttendanceRepairJob) -> dict[str, Any]:
-    return {
+    material: dict[str, Any] = {
         "job_id": job.job_id,
         "actor": job.actor,
         "request_digest": job.request_digest,
@@ -2905,6 +5270,28 @@ def _evidence_job(job: AttendanceRepairJob) -> dict[str, Any]:
         "approved_at": job.approved_at,
         "completed_at": job.completed_at,
     }
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        material.update(
+            {
+                "workflow_version": job.workflow_version,
+                "selection_mode": job.selection_mode,
+                "selection_manifest_digest": job.selection_manifest_digest,
+                "selection_filters": job.selection_filters,
+                "selection_exclusion_manifest_digest": (
+                    job.selection_exclusion_manifest_digest
+                ),
+                "candidate_membership_digest": job.candidate_membership_digest,
+                "candidate_source_certificate_digest": (
+                    job.candidate_source_certificate_digest
+                ),
+                "release_target_user_id": job.release_target_user_id,
+                "selected_blocked_count": job.selected_blocked_count,
+                "selected_reuse_count": job.selected_reuse_count,
+                "operator_excluded_count": job.operator_excluded_count,
+                "safe_reuse_count": job.safe_reuse_count,
+            }
+        )
+    return material
 
 
 def _evidence_targets(session: Session, job_id: int) -> Iterable[dict[str, Any]]:
@@ -2930,7 +5317,11 @@ def _evidence_targets(session: Session, job_id: int) -> Iterable[dict[str, Any]]
         }
 
 
-def _evidence_items(session: Session, job_id: int) -> Iterable[dict[str, Any]]:
+def _evidence_items(
+    session: Session,
+    job: AttendanceRepairJob,
+) -> Iterable[dict[str, Any]]:
+    is_v2 = job.workflow_version == RELEASE_WORKFLOW_VERSION
     rows = session.execute(
         select(
             AttendanceRepairItem.event_uid,
@@ -2947,14 +5338,18 @@ def _evidence_items(session: Session, job_id: int) -> Iterable[dict[str, Any]]:
             AttendanceRepairItem.attempt_count,
             AttendanceRepairItem.oracle_attempt_count,
             AttendanceRepairItem.downstream_attempt_count,
+            AttendanceRepairItem.source_ords_status,
+            AttendanceRepairItem.risk_class,
+            AttendanceRepairItem.selection_origin,
+            AttendanceRepairItem.reuse_attestation_id,
             AttendanceRepairItem.id,
         )
-        .where(AttendanceRepairItem.job_id == job_id)
+        .where(AttendanceRepairItem.job_id == job.id)
         .order_by(AttendanceRepairItem.event_uid, AttendanceRepairItem.id)
         .execution_options(yield_per=1000)
     )
     for row in rows:
-        yield {
+        material = {
             "event_uid": row.event_uid,
             "immutable_facts_digest": row.immutable_facts_digest,
             "source_ownership_digest": row.source_ownership_digest,
@@ -2969,6 +5364,41 @@ def _evidence_items(session: Session, job_id: int) -> Iterable[dict[str, Any]]:
             "attempt_count": row.attempt_count,
             "oracle_attempt_count": row.oracle_attempt_count,
             "downstream_attempt_count": row.downstream_attempt_count,
+        }
+        if is_v2:
+            material.update(
+                {
+                    "source_ords_status": row.source_ords_status,
+                    "risk_class": row.risk_class,
+                    "selection_origin": row.selection_origin,
+                    "reuse_attestation_id": row.reuse_attestation_id,
+                }
+            )
+        yield material
+
+
+def _evidence_reuse_attestations(
+    session: Session,
+    job_id: int,
+) -> Iterable[dict[str, Any]]:
+    rows = session.scalars(
+        select(AttendanceRepairReuseAttestation)
+        .where(AttendanceRepairReuseAttestation.job_id == job_id)
+        .order_by(AttendanceRepairReuseAttestation.attestation_id)
+    )
+    for row in rows:
+        yield {
+            "attestation_id": row.attestation_id,
+            "target_identity_digest": row.target_identity_digest,
+            "target_row_version": row.target_row_version,
+            "event_membership_digest": row.event_membership_digest,
+            "event_count": row.event_count,
+            "evidence_type": row.evidence_type,
+            "verified_name_digest": row.verified_name_digest,
+            "reason_digest": row.reason_digest,
+            "confirmation_digest": row.confirmation_digest,
+            "actor": row.actor,
+            "created_at": row.created_at,
         }
 
 
@@ -3067,7 +5497,7 @@ def _evidence_fragments(
     yield _canonical(certificate)
     yield b',"items":['
     comma = False
-    for row in _evidence_items(session, job.id):
+    for row in _evidence_items(session, job):
         if comma:
             yield b","
         yield _canonical(row)
@@ -3090,7 +5520,17 @@ def _evidence_fragments(
         comma = True
     yield b'],"policy":'
     yield _canonical("IMMUTABLE_PUNCH_EFFECTIVE_IDENTITY_REPAIR")
-    yield b',"schema_version":"1","targets":['
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        yield b',"reuse_attestations":['
+        comma = False
+        for row in _evidence_reuse_attestations(session, job.id):
+            if comma:
+                yield b","
+            yield _canonical(row)
+            comma = True
+        yield b'],"schema_version":"2","targets":['
+    else:
+        yield b',"schema_version":"1","targets":['
     comma = False
     for row in _evidence_targets(session, job.id):
         if comma:
@@ -3104,11 +5544,13 @@ def _evidence_fragments(
 
 def repair_evidence(session: Session, job: AttendanceRepairJob) -> dict[str, Any]:
     targets = list(_evidence_targets(session, job.id))
-    items = list(_evidence_items(session, job.id))
+    items = list(_evidence_items(session, job))
     receipts = list(_evidence_receipts(session, job.id))
     ledger = list(_evidence_ledger(session, job.id))
     evidence = {
-        "schema_version": "1",
+        "schema_version": (
+            "2" if job.workflow_version == RELEASE_WORKFLOW_VERSION else "1"
+        ),
         "policy": "IMMUTABLE_PUNCH_EFFECTIVE_IDENTITY_REPAIR",
         "job": _evidence_job(job),
         "targets": targets,
@@ -3116,6 +5558,10 @@ def repair_evidence(session: Session, job: AttendanceRepairJob) -> dict[str, Any
         "oracle_receipts": receipts,
         "ledger": ledger,
     }
+    if job.workflow_version == RELEASE_WORKFLOW_VERSION:
+        evidence["reuse_attestations"] = list(
+            _evidence_reuse_attestations(session, job.id)
+        )
     evidence["certificate"] = _evidence_certificate(session, job)
     evidence["export_digest"] = _sha(evidence)
     return evidence
@@ -4467,6 +6913,69 @@ def repair_worker_metrics(session: Session) -> dict[str, Any]:
         )
         or 0
     )
+    release_clause = AttendanceRepairJob.workflow_version == RELEASE_WORKFLOW_VERSION
+    oldest_release_queue = session.scalar(
+        select(func.min(AttendanceEvent.received_at)).where(
+            AttendanceEvent.ords_status.in_(RELEASE_HELD_STATUSES),
+            AttendanceEvent.identity_content_status != "VERIFIED",
+        )
+    )
+    release_stage_oldest = {
+        str(row.status): row.oldest
+        for row in session.execute(
+            select(
+                AttendanceRepairJob.status,
+                func.min(AttendanceRepairJob.updated_at).label("oldest"),
+            )
+            .where(
+                release_clause,
+                AttendanceRepairJob.status.not_in(JOB_TERMINAL_STATES),
+            )
+            .group_by(AttendanceRepairJob.status)
+        )
+    }
+    release_exclusions = {
+        str(row.error_code or "UNCLASSIFIED"): int(row.total or 0)
+        for row in session.execute(
+            select(
+                AttendanceRepairItem.error_code,
+                func.count(AttendanceRepairItem.id).label("total"),
+            )
+            .join(
+                AttendanceRepairJob,
+                AttendanceRepairItem.job_id == AttendanceRepairJob.id,
+            )
+            .where(
+                release_clause,
+                AttendanceRepairItem.state == "NEEDS_REVIEW",
+            )
+            .group_by(AttendanceRepairItem.error_code)
+        )
+    }
+    reuse_rejections = {
+        str(row.outcome): int(row.total or 0)
+        for row in session.execute(
+            select(AuditEvent.outcome, func.count(AuditEvent.id).label("total"))
+            .where(
+                AuditEvent.action == "ATTENDANCE_RELEASE_APPROVAL_REJECTED",
+                AuditEvent.outcome.like("REUSE_%"),
+            )
+            .group_by(AuditEvent.outcome)
+        )
+    }
+    retry_exhausted = int(
+        session.scalar(
+            select(func.count(AttendanceRepairJob.id)).where(
+                release_clause,
+                AttendanceRepairJob.error_code.like("%RETRY_EXHAUSTED%"),
+            )
+        )
+        or 0
+    )
+
+    def age_seconds(value: datetime | None) -> int:
+        return max(0, int((now - ensure_utc(value)).total_seconds())) if value else 0
+
     return {
         "active_jobs": active,
         "review_items": review,
@@ -4496,4 +7005,29 @@ def repair_worker_metrics(session: Session) -> dict[str, Any]:
             if heartbeat
             else None
         ),
+        "release_v2": {
+            "queue_oldest_age_seconds": age_seconds(oldest_release_queue),
+            "preparing_oldest_age_seconds": age_seconds(
+                release_stage_oldest.get("PREPARING_SOURCE")
+            ),
+            "awaiting_approval_oldest_age_seconds": age_seconds(
+                release_stage_oldest.get("AWAITING_APPROVAL")
+            ),
+            "execution_oldest_age_seconds": max(
+                (
+                    age_seconds(release_stage_oldest.get(status))
+                    for status in (
+                        "QUEUED",
+                        "RUNNING",
+                        "WAITING_ORACLE",
+                        "WAITING_DOWNSTREAM",
+                        "PAUSED",
+                    )
+                ),
+                default=0,
+            ),
+            "exclusions_by_code": release_exclusions,
+            "retry_exhausted_jobs": retry_exhausted,
+            "reuse_attribution_failures": reuse_rejections,
+        },
     }

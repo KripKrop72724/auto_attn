@@ -44,12 +44,16 @@ export function UserOperationDialog({
   const conflictRequiresCnic = Boolean(
     state.mode === 'edit' && user?.identity_conflict_code && !user.identity_conflict_resolved,
   )
+  const missingCnicRequiresCnic = Boolean(
+    state.mode === 'edit' && user && !user.cnic_available,
+  )
+  const editRequiresCnic = conflictRequiresCnic || missingCnicRequiresCnic
   const permanentElevation = state.mode === 'edit' && user?.privilege !== 14 && privilege === 14
   const elevationConfirmation = user ? `ELEVATE ${user.user_id} ON ${device.device_id}` : ''
   const preview = cnic
     ? buildMachinePreview(displayName, cnic, shiftWorker)
-    : conflictRequiresCnic
-      ? 'Enter the corrected CNIC to generate a safe terminal preview.'
+    : editRequiresCnic
+      ? 'Enter the verified CNIC to generate a safe terminal preview.'
       : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
   const hasEditChange = Boolean(
     user && (
@@ -63,7 +67,7 @@ export function UserOperationDialog({
     state.mode === 'create'
       ? Boolean(displayName.trim()) && /^\d{13}$/.test(cnic) && (!userIdOverride || /^\d+$/.test(userIdOverride))
       : state.mode === 'edit'
-        ? hasEditChange && Boolean(displayName.trim()) && (!cnic || /^\d{13}$/.test(cnic)) && (!conflictRequiresCnic || /^\d{13}$/.test(cnic)) && (!permanentElevation || (elevationReason.trim().length >= 10 && confirmation === elevationConfirmation))
+        ? hasEditChange && Boolean(displayName.trim()) && (!cnic || /^\d{13}$/.test(cnic)) && (!editRequiresCnic || /^\d{13}$/.test(cnic)) && (!permanentElevation || (elevationReason.trim().length >= 10 && confirmation === elevationConfirmation))
         : state.mode === 'delete'
           ? confirmationMatches(confirmation, state.user)
           : true
@@ -78,8 +82,8 @@ export function UserOperationDialog({
       if (validation) return setError(validation)
     } else if (state.mode === 'edit' && !displayName.trim()) {
       return setError('Full name is required.')
-    } else if (state.mode === 'edit' && conflictRequiresCnic && !cnic) {
-      return setError('A replacement CNIC is required to resolve this identity conflict.')
+    } else if (state.mode === 'edit' && editRequiresCnic && !cnic) {
+      return setError(conflictRequiresCnic ? 'A replacement CNIC is required to resolve this identity conflict.' : 'A verified CNIC is required for this employee.')
     } else if (state.mode === 'edit' && cnic && !/^\d{13}$/.test(cnic)) {
       return setError('CNIC must contain exactly 13 digits.')
     } else if (!password) {
@@ -179,12 +183,12 @@ export function UserOperationDialog({
           <>
             <div className="form-grid">
               <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} aria-invalid={Boolean(fieldErrors.display_name)} />{fieldErrors.display_name?.[0] && <small className="field-error">{fieldErrors.display_name[0]}</small>}</label>
-              <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={conflictRequiresCnic} aria-invalid={Boolean(fieldErrors.cnic)} />{fieldErrors.cnic?.[0] && <small className="field-error">{fieldErrors.cnic[0]}</small>}</label>
+              <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : missingCnicRequiresCnic ? 'Replacement CNIC (required for missing CNIC)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={editRequiresCnic} aria-invalid={Boolean(fieldErrors.cnic)} />{fieldErrors.cnic?.[0] && <small className="field-error">{fieldErrors.cnic[0]}</small>}</label>
               {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, 24))} aria-invalid={Boolean(fieldErrors.user_id_override)} />{fieldErrors.user_id_override?.[0] && <small className="field-error">{fieldErrors.user_id_override[0]}</small>}</label>}
               {state.mode === 'edit' && <label>Terminal role<select value={privilege} onChange={(event) => { setPrivilege(Number(event.target.value) as 0 | 14); setConfirmation(''); setElevationReason('') }}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select><small>Prefer the separate 10-minute enrollment lease for routine fingerprint enrollment.</small></label>}
             </div>
             <label className="check-field"><input type="checkbox" checked={shiftWorker} onChange={(event) => setShiftWorker(event.target.checked)} /><span><strong>Shift worker</strong><small>Adds the -S- identity marker used for raw-punch handling.</small></span></label>
-            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : conflictRequiresCnic ? 'Correction is required before this update can be queued.' : 'Stored CNIC remains write-only.'}</small></div>
+            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : editRequiresCnic ? 'Verified CNIC is required before this update can be queued.' : 'Stored CNIC remains write-only.'}</small></div>
           </>
         )}
         {state.mode === 'delete' && (

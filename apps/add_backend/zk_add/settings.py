@@ -63,7 +63,8 @@ class AddSettings(BaseSettings):
     # before the first Oracle mutation is possible.
     attendance_repair_preview_enabled: bool = False
     attendance_repair_execution_enabled: bool = False
-    attendance_repair_preview_seconds: int = Field(default=15 * 60, ge=60, le=60 * 60)
+    attendance_repair_legacy_admission_enabled: bool = False
+    attendance_repair_preview_seconds: int = Field(default=15 * 60, ge=60, le=15 * 60)
     attendance_repair_max_employees: int = Field(default=500, ge=1, le=500)
     attendance_repair_max_events: int = Field(default=250_000, ge=1, le=250_000)
     attendance_repair_oracle_batch_size: int = Field(default=100, ge=1, le=100)

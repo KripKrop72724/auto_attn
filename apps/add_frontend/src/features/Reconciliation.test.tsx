@@ -406,23 +406,20 @@ describe('Reviewed source-exception continuation', () => {
     expect(String(reviewRequest?.[1]?.body)).not.toContain(job().job_id)
   })
 
-  it('supports the employee-repair deep link and keyboard tab navigation', async () => {
-    window.history.replaceState(null, '', '/reconciliation?tab=employee-repair')
+  it('redirects the retired employee-repair deep link to Attendance review', async () => {
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=employee-repair&device_id=${device.connector_id}`,
+    )
     vi.stubGlobal('fetch', reconciliationFetch())
     render(<Harness />)
 
-    const repairTab = screen.getByRole('tab', { name: /Employee repair/i })
-    expect(repairTab.getAttribute('aria-selected')).toBe('true')
-    expect(
-      await screen.findByRole('heading', {
-        name: 'Fix past attendance for an employee',
-      }),
-    ).toBeTruthy()
-
-    fireEvent.keyDown(repairTab, { key: 'Home' })
-    const jobsTab = screen.getByRole('tab', { name: /^Jobs/i })
-    expect(jobsTab.getAttribute('aria-selected')).toBe('true')
-    expect(document.activeElement).toBe(jobsTab)
-    expect(window.location.search).toBe('')
+    await waitFor(() =>
+      expect(`${window.location.pathname}${window.location.search}`).toBe(
+        `/attendance?view=needs-review&device_id=${device.connector_id}`,
+      ),
+    )
+    expect(screen.queryByRole('tab', { name: /Employee repair/i })).toBeNull()
   })
 })

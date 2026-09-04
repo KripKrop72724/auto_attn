@@ -319,6 +319,7 @@ export function UsersView({
   toast: ReturnType<typeof useToast>
   refreshFleet: () => Promise<void>
 }) {
+  const requestedUserId = new URLSearchParams(window.location.search).get('user_id')?.trim() || ''
   const selectedFromFleet = devices.find((device) => device.connector_id === selectedDeviceId)
   const [deviceDetail, setDeviceDetail] = useState<Device | null>(null)
   const selected = deviceDetail?.connector_id === selectedDeviceId ? deviceDetail : selectedFromFleet
@@ -330,7 +331,7 @@ export function UsersView({
   const [historicalReport, setHistoricalReport] = useState<HistoricalIdentityReport | null>(null)
   const [deletionJob, setDeletionJob] = useState<UserDeletionJob | null>(null)
   const [nextCursor, setNextCursor] = useState<number | null>(null)
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useState(requestedUserId)
   const [cnicQuery, setCnicQuery] = useState('')
   const [identity, setIdentity] = useState('ALL')
   const [role, setRole] = useState('ALL')
@@ -356,6 +357,7 @@ export function UsersView({
   activeTerminalId.current = selectedDeviceId
   const selectEligibleRowsRef = useRef<HTMLInputElement>(null)
   const revisionRef = useRef(revision)
+  const openedRequestedUser = useRef('')
   const tabsRef = useRef<HTMLDivElement>(null)
   const userTableRef = useRef<HTMLDivElement>(null)
   const userVirtualizer = useVirtualizer({
@@ -451,7 +453,7 @@ export function UsersView({
     setDeletionJob(null)
     setDeviceDetail(null)
     setNextCursor(null)
-    setQuery('')
+    setQuery(requestedUserId)
     setCnicQuery('')
     setIdentity('ALL')
     setRole('ALL')
@@ -467,12 +469,22 @@ export function UsersView({
     setRevokeLeaseOpen(false)
     setSerialConfirmationOpen(false)
     setCommand(null)
-  }, [selectedDeviceId])
+    openedRequestedUser.current = ''
+  }, [requestedUserId, selectedDeviceId])
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void loadDirectory(), 250)
     return () => window.clearTimeout(timeout)
   }, [loadDirectory])
+
+  useEffect(() => {
+    if (!requestedUserId || openedRequestedUser.current === requestedUserId) return
+    const requested = rows.find((row) => row.user_id === requestedUserId)
+    if (!requested) return
+    openedRequestedUser.current = requestedUserId
+    setSection('directory')
+    setDialog({ mode: 'edit', user: requested })
+  }, [requestedUserId, rows])
 
   useEffect(() => {
     void loadDiagnostics()

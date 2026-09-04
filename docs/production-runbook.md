@@ -182,8 +182,8 @@ After every release, verify:
 Employee attendance repair has independent dark-launch gates and an Oracle/downstream deployment
 ceremony. Both gates remain false by default. Do not enable execution based on a successful generic
 ORDS membership probe: first complete the inventory, unique-event-UID, ADD-only authentication,
-operation replay, daily-flag, downstream stale-identity-removal, and controlled 1/10/50 employee
-gates in the [Employee attendance repair and resync runbook](attendance-repair-runbook.md).
+operation replay, daily-flag, downstream stale-identity-removal, and controlled 1/10/50 punch
+gates in the [Attendance blocked-punch review and ORDS release runbook](attendance-repair-runbook.md).
 
 ```text
 http://127.0.0.1:8095/health/ui

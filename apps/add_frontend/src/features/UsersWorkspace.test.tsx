@@ -84,6 +84,35 @@ describe('Selected-terminal users workspace', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    window.history.replaceState(null, '', '/')
+  })
+
+  it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
+    const missingCnic = user({
+      id: 10,
+      user_key: 'user-ten',
+      user_id: '1010',
+      display_name: 'Dr Farzana',
+      cnic_masked: null,
+      cnic_available: false,
+      identity_complete: false,
+      machine_name_preview: null,
+    })
+    const fetchMock = workspaceFetch({ rows: [missingCnic] })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState(null, '', '/users/connector-one?user_id=1010')
+
+    render(<UsersHarness rows={[missingCnic]} />)
+
+    expect(await screen.findByRole('heading', { name: 'Edit device user' })).toBeTruthy()
+    const cnic = screen.getByLabelText(
+      'Replacement CNIC (required for missing CNIC)',
+    ) as HTMLInputElement
+    expect(cnic.required).toBe(true)
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        new URL(String(input), 'https://add.test').searchParams.get('q') === '1010'),
+    ).toBe(true)
   })
 
   it('shows trusted metrics, counted tabs, per-row command state, and action-specific capability reasons', async () => {

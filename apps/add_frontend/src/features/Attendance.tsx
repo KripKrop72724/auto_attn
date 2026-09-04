@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react'
 import './Attendance.css'
 import { api, queryString } from '../api'
 import {
@@ -8,8 +15,10 @@ import {
 import { Icon } from '../Icon'
 import type { RealtimeState } from '../realtime'
 import type { AttendanceEvent, Device } from '../types'
+import { AttendanceReleaseHistory, AttendanceReleaseReview } from './AttendanceRelease'
 
 type AttendanceRange = 'latest' | 'today' | 'last24' | 'custom'
+type AttendanceViewMode = 'all-events' | 'needs-review' | 'release-history'
 type AttendanceFilters = {
   device_id: string
   q: string
@@ -73,16 +82,18 @@ function AttendanceSkeleton() {
   )
 }
 
-export function AttendanceView({
+function AllAttendanceEvents({
   devices,
   revision,
   realtimeState,
   realtimeLastSyncAt,
+  onReviewEmployee,
 }: {
   devices: Device[]
   revision: number
   realtimeState: RealtimeState
   realtimeLastSyncAt: Date | null
+  onReviewEmployee: (row: AttendanceEvent) => void
 }) {
   const [rows, setRows] = useState<AttendanceEvent[]>([])
   const rowsRef = useRef(rows)
@@ -306,7 +317,7 @@ export function AttendanceView({
   }[realtimeState]
 
   return (
-    <div className="attendance-workspace">
+    <div className="attendance-all-events">
       <PageHeader
         eyebrow="IMMUTABLE CAPTURE LEDGER"
         title="Live attendance"
@@ -382,15 +393,20 @@ export function AttendanceView({
           {loading && !rows.length && <AttendanceSkeleton />}
           {rows.map((row) => {
             const terminal = row.device_serial ? deviceBySerial.get(row.device_serial) : undefined
-            const rowAttention = !row.display_name || !row.cnic_masked || row.clock_quality !== 'OK' || statusPattern(row.ords_status) === 'blocked'
+            const rowAttention = !row.display_name || !row.cnic_masked || row.clock_quality !== 'OK' || statusPattern(row.ords_status) === 'blocked' || row.release_state === 'LOCKED'
             return (
               <article className={`attendance-event ${rowAttention ? 'attendance-event-attention' : ''}`} key={row.event_uid} aria-label={`${row.display_name || 'Unknown identity'}, ${punchLabel(row.punch)}, ${dateTime(row.device_event_time)}`}>
                 <div className="attendance-event-cell attendance-person" data-label="Employee"><span className="avatar">{(row.display_name || '?').slice(0, 2).toUpperCase()}</span><span><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id} · identity incomplete`}</small></span></div>
                 <div className="attendance-event-cell" data-label="Event"><strong>{punchLabel(row.punch)}</strong><small>{dateTime(row.device_event_time)} · received {relativeTime(row.received_at)}</small></div>
                 <div className="attendance-event-cell" data-label="Terminal"><strong>{terminal?.display_name || row.device_serial || 'Unreported terminal'}</strong><small>{terminal ? row.device_serial : 'Device name unavailable'}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Capture"><StatusBadge state={captureLabel(row.source)} /><small className={row.clock_quality === 'OK' ? '' : 'attention-copy'}>{row.clock_quality === 'OK' ? 'Clock verified' : `Clock ${row.clock_quality.toLowerCase()}`}</small></div>
-                <div className="attendance-event-cell attendance-status-stack" data-label="Oracle delivery"><StatusBadge state={row.ords_status} /><small>{row.oracle_confirmed_at ? `Confirmed ${relativeTime(row.oracle_confirmed_at)}` : 'Confirmation pending'}</small></div>
-                <details className="attendance-event-details"><summary aria-label={`View event details for ${row.display_name || `user ${row.user_id}`}`}><Icon name="chevron" /></summary><div><span><small>Terminal IDs</small><strong>UID {row.uid || '—'} · User {row.user_id}</strong></span><span><small>Captured / received</small><strong>{dateTime(row.captured_at)} / {dateTime(row.received_at)}</strong></span><span><small>Clock evidence</small><strong>{row.clock_drift_seconds == null ? row.clock_quality : `${Math.round(row.clock_drift_seconds)}s drift · ${row.clock_quality}`}</strong></span><span><small>Event UID</small><code>{row.event_uid}</code></span><span><small>Oracle path</small><strong>{row.oracle_confirmation_path ? row.oracle_confirmation_path.replaceAll('_', ' ').toLowerCase() : 'Not confirmed'}</strong></span></div></details>
+                <div className="attendance-event-cell attendance-status-stack" data-label="Oracle delivery">
+                  <StatusBadge state={row.ords_status} />
+                  {row.release_state && row.release_state !== 'NOT_APPLICABLE' && <StatusBadge state={row.release_state_label || row.release_state} />}
+                  <small>{row.release_state === 'RELEASED' && row.effective_identity_downstream_confirmed_at ? `Oracle and downstream verified ${relativeTime(row.effective_identity_downstream_confirmed_at)}` : row.oracle_confirmed_at ? `Original disposition confirmed ${relativeTime(row.oracle_confirmed_at)}` : row.release_lock_reason ? explainReleaseLock(row.release_lock_reason) : 'Confirmation pending'}</small>
+                  {row.release_state === 'ELIGIBLE' && row.release_target_user_key && row.release_connector_id && <button className="text-button" type="button" onClick={() => onReviewEmployee(row)}>Review employee</button>}
+                </div>
+                <details className="attendance-event-details"><summary aria-label={`View event details for ${row.display_name || `user ${row.user_id}`}`}><Icon name="chevron" /></summary><div><span><small>Terminal IDs</small><strong>UID {row.uid || '—'} · User {row.user_id}</strong></span><span><small>Captured / received</small><strong>{dateTime(row.captured_at)} / {dateTime(row.received_at)}</strong></span><span><small>Clock evidence</small><strong>{row.clock_drift_seconds == null ? row.clock_quality : `${Math.round(row.clock_drift_seconds)}s drift · ${row.clock_quality}`}</strong></span><span><small>Event UID</small><code>{row.event_uid}</code></span><span><small>Original Oracle disposition</small><strong>{row.ords_status.replaceAll('_', ' ').toLowerCase()}</strong></span><span><small>Effective release state</small><strong>{row.release_state_label || 'Not released'}{row.latest_release_job_id ? ` · job ${row.latest_release_job_id}` : ''}</strong></span></div></details>
               </article>
             )
           })}
@@ -398,6 +414,154 @@ export function AttendanceView({
         </div>
         {nextCursor && <div className="load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={() => void loadOlder()}>{loadingMore ? 'Loading older events…' : 'Load older events'}</button><small>{rows.length.toLocaleString()} events loaded in this browser</small></div>}
       </section>
+    </div>
+  )
+}
+
+const explainReleaseLock = (code: string) =>
+  ({
+    TARGET_CNIC_MISSING: 'Add a valid CNIC before release',
+    TARGET_NOT_ACTIVE: 'Employee is not active',
+    TARGET_SNAPSHOT_UNSTABLE: 'Terminal employee snapshot is unstable',
+    IDENTITY_SNAPSHOT_UNSTABLE: 'Terminal employee snapshot is unstable',
+    TARGET_DUPLICATE_CNIC_UNRESOLVED: 'Duplicate CNIC conflict must be resolved',
+    CLOCK_NOT_OK: 'Invalid terminal time remains locked',
+    QUARANTINED_INVALID_DEVICE_TIME: 'Invalid terminal time remains locked',
+    QUARANTINED_INVALID_EVENT_UID: 'Invalid event UID remains locked',
+    QUARANTINED_ORDS_REJECTED: 'Oracle-rejected punch remains locked',
+    SOURCE_RECERTIFICATION_REQUIRED: 'Fresh terminal source certificate required',
+    TERMINAL_RELEASE_IN_PROGRESS: 'Another release is active on this terminal',
+  } as Record<string, string>)[code] || code.replaceAll('_', ' ').toLowerCase()
+
+export function AttendanceView({
+  devices,
+  revision,
+  realtimeState,
+  realtimeLastSyncAt,
+  toast,
+}: {
+  devices: Device[]
+  revision: number
+  realtimeState: RealtimeState
+  realtimeLastSyncAt: Date | null
+  toast?: { notice: (message: string) => void; error: (message: string) => void }
+}) {
+  const initial = useMemo(() => new URLSearchParams(window.location.search), [])
+  const initialMode = initial.get('view')
+  const [mode, setMode] = useState<AttendanceViewMode>(
+    initialMode === 'needs-review' || initialMode === 'release-history'
+      ? initialMode
+      : 'all-events',
+  )
+  const [reviewConnectorId, setReviewConnectorId] = useState(initial.get('device_id'))
+  const [reviewUserKey, setReviewUserKey] = useState(initial.get('user_key'))
+  const [releaseJobId, setReleaseJobId] = useState(initial.get('release_job'))
+  const safeToast = useMemo(
+    () => toast || { notice: () => undefined, error: () => undefined },
+    [toast],
+  )
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const tabs = [
+    { id: 'all-events', label: 'All events', icon: 'pulse' },
+    { id: 'needs-review', label: 'Needs review', icon: 'shield' },
+    { id: 'release-history', label: 'Release history', icon: 'list' },
+  ] as const
+
+  const navigateMode = useCallback((
+    next: AttendanceViewMode,
+    values?: { connectorId?: string | null; userKey?: string | null; jobId?: string | null },
+  ) => {
+    const params = new URLSearchParams(window.location.search)
+    params.set('view', next)
+    params.delete('device_id')
+    params.delete('user_key')
+    params.delete('release_job')
+    if (values?.connectorId) params.set('device_id', values.connectorId)
+    if (values?.userKey) params.set('user_key', values.userKey)
+    if (values?.jobId) params.set('release_job', values.jobId)
+    window.history.pushState(null, '', `${window.location.pathname}?${params}`)
+    setReviewConnectorId(values?.connectorId || null)
+    setReviewUserKey(values?.userKey || null)
+    setReleaseJobId(values?.jobId || null)
+    setMode(next)
+  }, [])
+
+  useEffect(() => {
+    const synchronizeFromLocation = () => {
+      const params = new URLSearchParams(window.location.search)
+      const requested = params.get('view')
+      const next: AttendanceViewMode =
+        requested === 'needs-review' || requested === 'release-history'
+          ? requested
+          : 'all-events'
+      setReviewConnectorId(params.get('device_id'))
+      setReviewUserKey(params.get('user_key'))
+      setReleaseJobId(params.get('release_job'))
+      setMode(next)
+    }
+    window.addEventListener('popstate', synchronizeFromLocation)
+    return () => window.removeEventListener('popstate', synchronizeFromLocation)
+  }, [])
+
+  const moveTab = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    let next = index
+    if (event.key === 'ArrowRight') next = (index + 1) % tabs.length
+    else if (event.key === 'ArrowLeft')
+      next = (index - 1 + tabs.length) % tabs.length
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = tabs.length - 1
+    else return
+    event.preventDefault()
+    navigateMode(tabs[next].id)
+    tabRefs.current[next]?.focus()
+  }
+
+  const reviewEmployee = (row: AttendanceEvent) => {
+    navigateMode('needs-review', {
+      connectorId: row.release_connector_id,
+      userKey: row.release_target_user_key,
+    })
+  }
+
+  return (
+    <div className="attendance-workspace">
+      {mode !== 'all-events' && (
+        <PageHeader
+          eyebrow="CONTROLLED ORDS RELEASE"
+          title={mode === 'needs-review' ? 'Attendance · Needs review' : 'Attendance · Release history'}
+          description={mode === 'needs-review' ? 'Review exact identity-held punches for one current employee and terminal at a time.' : 'Trace approvals, Oracle receipts, retries, downstream proof and every per-punch outcome.'}
+        />
+      )}
+      <nav className="attendance-view-tabs" role="tablist" aria-label="Attendance views">
+        {tabs.map((tab, index) => (
+          <button
+            key={tab.id}
+            ref={(node) => { tabRefs.current[index] = node }}
+            type="button"
+            role="tab"
+            id={`attendance-${tab.id}-tab`}
+            aria-controls={`attendance-${tab.id}-panel`}
+            aria-selected={mode === tab.id}
+            tabIndex={mode === tab.id ? 0 : -1}
+            onKeyDown={(event) => moveTab(event, index)}
+            onClick={() => navigateMode(tab.id)}
+          >
+            <Icon name={tab.icon} /> {tab.label}
+          </button>
+        ))}
+      </nav>
+      <div
+        id={`attendance-${mode}-panel`}
+        role="tabpanel"
+        aria-labelledby={`attendance-${mode}-tab`}
+      >
+        {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} />}
+        {mode === 'needs-review' && <AttendanceReleaseReview devices={devices} revision={revision} toast={safeToast} initialConnectorId={reviewConnectorId} initialUserKey={reviewUserKey} onOpenHistory={(jobId) => navigateMode('release-history', { jobId })} />}
+        {mode === 'release-history' && <AttendanceReleaseHistory devices={devices} revision={revision} toast={safeToast} initialJobId={releaseJobId} />}
+      </div>
     </div>
   )
 }

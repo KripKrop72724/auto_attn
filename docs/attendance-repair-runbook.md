@@ -1,6 +1,6 @@
-# Employee attendance repair and resync runbook
+# Attendance blocked-punch review and ORDS release runbook
 
-This runbook governs the terminal-scoped **Reconciliation → Employee repair** workflow. It is a correction of effective identity attribution, not a rewrite of physical attendance history.
+This runbook governs the terminal-scoped **Attendance → Needs review** and **Attendance → Release history** workflow. It is a correction of effective identity attribution, not a rewrite of physical attendance history. **All events** continues to show the original capture disposition and adds the independently verified effective release state.
 
 ## Non-negotiable safety contract
 
@@ -19,7 +19,7 @@ Membership and content proof remain separate:
 - `ords_status` and its confirmation timestamp prove event-UID membership only;
 - `identity_content_status`, `identity_content_confirmed_at`, and `identity_downstream_confirmed_at` prove corrected identity content and downstream convergence.
 
-Ambiguous ownership, UID reuse, cross-device UID collisions, immutable-field mismatches, or changed preconditions are `NEEDS_REVIEW`. There is no force/override path. Existing full-history reconciliation remains non-destructive; both legacy Oracle delete statements remain permanently gated by `WHERE 1 = 0`.
+Ambiguous ownership, cross-device UID collisions, immutable-field mismatches, changed preconditions, invalid clock/event UID, and ORDS-rejected events remain locked. Identity-reuse events may proceed only through the v2 full-CNIC/name attestation path when current, frozen historical, UID/user-ID, CNIC, and ownership evidence all agree. There is no force/override path. Existing full-history reconciliation remains non-destructive; both legacy Oracle delete statements remain permanently gated by `WHERE 1 = 0`.
 
 ## Feature gates and limits
 
@@ -28,6 +28,7 @@ Both gates default to `false`:
 ```text
 ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED=false
 ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED=false
+ADD_ATTENDANCE_REPAIR_LEGACY_ADMISSION_ENABLED=false
 ```
 
 Execution cannot start unless preview is enabled and the ADD ORDS URL plus the dedicated
@@ -35,21 +36,24 @@ Execution cannot start unless preview is enabled and the ADD ORDS URL plus the d
 configured. The generic `ADD_ORDS_USERNAME` / `ADD_ORDS_PASSWORD` connector credential is never
 sent to an identity-repair route. The server enforces:
 
-- one terminal per job;
-- 1–500 current employees;
+- one terminal and exactly one current employee per v2 release;
+- legacy jobs already in progress retain their original 1–500 employee shape;
 - no more than 250,000 frozen events;
 - 100 Oracle items per transaction;
 - two Oracle correction requests globally;
 - 15-minute immutable preview validity;
 - database leases and bounded exponential retry.
 
-Prepare only records the durable request and frozen target identity. Exact cohort/event
-membership is built by the repair worker inside a database savepoint, including when source
-coverage is already current; a rejected large cohort therefore cannot leave a partial preview.
+Prepare records the exact selected-event manifest, any explicit all-filtered omissions, the
+candidate-set membership digest, filters, frozen target identity, and full source certificate.
+Exact item/cohort membership is built by the repair worker inside a database savepoint, including
+when source coverage is already current; a rejected large selection therefore cannot leave a
+partial preview. The event cap applies to selected punches. Full source cohorts remain certified
+without allowing unrelated terminal history to consume that cap.
 Retryable Oracle preview failures (transport, 408, 429, and 5xx) back off durably before they
 require operator attention.
 
-Larger histories must be split into Pakistan-time date ranges. The server converts each inclusive Pakistan date range to a UTC half-open interval. It does not truncate a cohort.
+Larger review sets must be split into Pakistan-time date ranges. The server converts each inclusive Pakistan date range to a UTC half-open interval. It does not truncate a selected source cohort or silently add a newly discovered punch to an existing selection.
 
 ## Production prerequisites
 
@@ -95,8 +99,8 @@ The correction endpoint intentionally commits before serializing its response. I
 ## ADD deployment
 
 1. Keep both feature gates disabled.
-2. Run the normal transactional deployment. Migration `20260827_0021` is additive and creates the durable job, target, cohort, item, identity-revision, Oracle-receipt, hash-ledger, audit-chain-head, Oracle-slot, and worker-heartbeat records.
-3. Verify `/health/ready`, sign-in, CSRF protection, password step-up, and the employee-repair tab while the gate is dark.
+2. Run the normal transactional deployment. Migration `20260827_0021` creates the durable repair engine; additive migration `20260904_0023` adds exact selections, workflow versioning, source/selection manifests, selected cohort counts, reuse attestations, and release-queue indexes.
+3. Verify `/health/ready`, sign-in, CSRF protection, password step-up, and all three Attendance views while the gate is dark.
 4. Confirm the repair worker heartbeat is updating and that no new Oracle operation can be claimed while execution is disabled.
 5. Set preview enabled and execution disabled. Restart through the normal deployment process; do not edit a running container.
 
@@ -105,21 +109,21 @@ secrets named `ADD_ATTENDANCE_REPAIR_ORDS_USERNAME` and
 `ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD`. The deployment refuses preview when either is missing, when
 the pair matches the connector credential, or when the authenticated capability probe is not ready.
 
-Never use Alembic downgrade to roll back a production database containing repair jobs or identity revisions. Restore the paired PostgreSQL backup instead.
+Never use Alembic downgrade to roll back a production database containing repair jobs, releases, attestations, or identity revisions. Restore the paired PostgreSQL and Oracle backups instead.
 
 ## Preview-only validation
 
 Use one certified terminal with a complete stable user snapshot.
 
-1. Query a known employee with no intended correction.
-2. Confirm the UI shows only masked CNIC and masked source identifiers.
-3. Confirm candidate cohorts show exact device-user, source UID/user ID, evidence class, first/last time, count, and source evidence.
-4. If coverage is stale or incomplete, confirm ADD creates one existing full-device reconciliation dependency. The ZKT protocol cannot scan one employee; the dependency may ingest missing punches for other employees.
-5. After certification, confirm ADD rebuilds the final employee preview and that newly discovered events are included.
-6. Compare frozen event count, cohort digest, source certificate, and Oracle classifications with independent read-only queries.
-7. Wait beyond 15 minutes and confirm approval is rejected as expired.
-8. Change one target, source cohort, event, or snapshot and confirm approval is rejected as drift.
-9. Confirm no Oracle repair receipt, ADD identity revision, or raw-row change was created.
+1. Confirm **All events** remains chronological and keeps `ords_status` unchanged while showing a separate effective release state.
+2. Confirm only `BLOCKED_IDENTITY` and `QUARANTINED_IDENTITY_REUSE` appear in **Needs review**. Invalid-time, invalid-event-UID, ambiguous, non-OK-clock, and ORDS-rejected punches must stay locked.
+3. Query a known active employee and confirm the UI shows only masked CNIC and masked source identifiers. A missing-CNIC employee must remain visible and disabled, with **Add CNIC** linking to Users.
+4. Confirm the punch table starts with nothing selected. Exercise explicit selection and all-filtered selection with exclusions across multiple pages; newly arriving punches must not enter either frozen selection.
+5. Compare the candidate membership, selected and omitted manifests, source certificate, full-cohort certificate, event count, affected employee-days, and Oracle classifications with independent read-only queries.
+6. Confirm unsafe Oracle classifications are explained and excluded while safe `MATCH`, `MISSING`, and `MISMATCH` items can proceed. A fully unsafe job must end **Completed with attention** without an Oracle mutation.
+7. For reuse, confirm wrong CNIC, wrong current/historical name, competing UID/user-ID/CNIC owner, unstable snapshot, and unresolved duplicate CNIC all reject approval without storing plaintext proof.
+8. Wait beyond 15 minutes and confirm approval is rejected as expired. Change one target, candidate membership, source cohort, event, or snapshot and confirm approval is rejected as drift.
+9. Confirm no Oracle repair receipt, ADD identity revision, or raw-row change was created during preview-only validation.
 
 Source freshness gates the start of membership freeze. If a large read-only Oracle classification
 outlasts that age window, elapsed time alone does not invalidate it; approval still requires the
@@ -130,11 +134,11 @@ event facts.
 
 Enable execution only after preview validation and an approved change window.
 
-1. One synthetic employee/event.
-2. One known real correction on one terminal.
-3. A job with 10 employees.
-4. A job with 50 employees.
-5. Open the existing 500-employee limit only after every prior gate passes.
+1. One synthetic punch.
+2. One known real blocked punch on one terminal.
+3. One release with 10 punches for one employee.
+4. One release with 50 punches for one employee.
+5. Widen use only after every prior gate passes; keep the exact 250,000 selected-punch ceiling.
 
 For each stage, retain the evidence JSON and independently require:
 
@@ -152,16 +156,14 @@ Stop immediately on any immutable change, content mismatch, cross-device collisi
 
 ## Operator procedure
 
-1. Open **Reconciliation → Employee repair** and select one terminal.
-2. Check preview and execution gates, worker health, Oracle capabilities, stable snapshot, and source certification.
-3. Select up to 500 eligible current employees. An unresolved duplicate-CNIC employee is not eligible.
-4. Choose all dates or an inclusive Pakistan date range.
-5. Build candidates. Current lineage is included; historical aliases require explicit selection. Do not select a cohort based only on name, CNIC suffix, or user ID similarity.
-6. Freeze the preview. If ADD must reconcile the full device first, wait for the dependency and review the rebuilt final preview.
-7. Review exclusions, Oracle classifications, affected events/days, and the preview digest.
-8. Enter a non-PII audited reason, complete administrator password step-up, and type the exact confirmation phrase.
-9. Monitor the durable per-employee and per-event ledger through Oracle check/apply/verify, ADD activation, and downstream verification.
-10. Download the evidence JSON after completion and verify its certificate.
+1. Open **Attendance → Needs review** and find one employee/terminal group.
+2. Check its precise lock/eligibility reason, stable current snapshot, saved CNIC, source certification, feature gates, and worker health.
+3. Open the employee, apply optional Pakistan date/status/punch/source filters, and explicitly select individual punches or choose **Select all eligible matching filters**. Selection never crosses employee or terminal boundaries.
+4. Prepare the release and review selected, safe, unsafe/excluded, ordinary, reuse, omitted-by-operator, and affected employee-day counts. Review every unsafe explanation.
+5. If safe reuse is included, re-enter the full CNIC and authoritative employee name exactly. These values are verified transiently and never logged or stored in plaintext.
+6. Enter a 10–500 character reason, current administrator password, and the exact server-generated confirmation phrase containing the preview digest prefix.
+7. After approval, monitor **Attendance → Release history** through Oracle check/apply/verify, ADD activation, and downstream verification. Use pause/resume/cancel/retry only with an audited reason and password step-up.
+8. Download the evidence JSON after completion and verify its repair ledger and certificate.
 
 Cancellation before the first Oracle request cancels the draft. After execution starts, cancellation affects only untouched `ORACLE_APPLY` items. Oracle-committed or unknown-outcome operations always forward-complete; the system never attempts an unsafe identity rollback.
 
@@ -187,8 +189,11 @@ Successful employees remain complete when another employee needs review.
 The authenticated overview, repair preflight, and repair job-list responses expose PII-free worker telemetry:
 
 - active jobs and oldest job age;
+- oldest v2 blocked-punch queue age plus preparing, awaiting-approval, and execution age;
 - review items;
+- v2 Oracle exclusions grouped by code and identity-reuse approval failures grouped by code;
 - retrying items and unknown Oracle outcomes;
+- retry-exhausted v2 jobs;
 - downstream wait count and oldest downstream lag;
 - stale item leases and leased Oracle slots;
 - durable worker heartbeat state/timestamps/error code.
@@ -200,6 +205,7 @@ Alert on:
 - downstream lag outside the approved service objective;
 - stale leases;
 - increasing review or retry-exhaustion backlog;
+- increasing blocked-punch queue age or reuse-attribution failure rate;
 - `ATTENDANCE_REPAIR_NEEDS_ATTENTION`;
 - Oracle authentication/capability loss.
 
@@ -207,7 +213,7 @@ Alerts, logs, realtime browser events, audit rows, and job metadata must contain
 
 ## Outage and rollback rules
 
-During an Oracle outage, general ADD and live source preservation remain available. Repair operations wait durably. Disable `ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED` to stop new Oracle mutations; leave the worker running so known receipts, ADD activation, and downstream verification can forward-complete.
+During an Oracle outage, general ADD and live source preservation remain available. Release operations wait durably. Disable `ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED` to stop admission of new Oracle mutations; leave the worker running so operations that may already have committed, known receipts, ADD activation, and downstream verification can forward-complete.
 
 Application rollback:
 

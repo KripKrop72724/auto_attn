@@ -162,7 +162,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
-from zk_add.attendance_repair import repair_worker_metrics
+from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.time_utils import parse_datetime, utc_now
 from zk_add.reconciliation import (
     apply_reconciliation_assignment_release,
@@ -2460,9 +2460,9 @@ def attendance(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    statement = select(AttendanceEvent).where(
-        AttendanceEvent.ords_status != "QUARANTINED_INVALID_EVENT_UID"
-    )
+    # The immutable ledger also shows invalid-UID quarantine rows. They remain
+    # visibly locked and can never enter the identity-release candidate set.
+    statement = select(AttendanceEvent)
     if device_id:
         connector = connector_or_404(db, device_id)
         statement = statement.where(AttendanceEvent.connector_id == connector.id)
@@ -2494,7 +2494,14 @@ def attendance(
         statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
     rows = db.scalars(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
-    return {"rows": [serialize_attendance(row) for row in rows[:limit]], "next_cursor": next_cursor}
+    page_rows = rows[:limit]
+    release_states = attendance_release_states(db, page_rows)
+    return {
+        "rows": [
+            serialize_attendance(row, release_states.get(row.id)) for row in page_rows
+        ],
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/api/v1/devices/{connector_id}/logs")
@@ -3604,8 +3611,11 @@ def serialize_identity_resolution(row: IdentityConflictResolution) -> dict:
     }
 
 
-def serialize_attendance(row: AttendanceEvent) -> dict:
-    return {
+def serialize_attendance(
+    row: AttendanceEvent,
+    release: dict | None = None,
+) -> dict:
+    result = {
         "id": row.id,
         "event_uid": row.event_uid,
         "device_serial": row.device_serial,
@@ -3625,7 +3635,27 @@ def serialize_attendance(row: AttendanceEvent) -> dict:
         "oracle_confirmed_at": row.oracle_confirmed_at,
         "oracle_confirmation_path": row.oracle_confirmation_path,
         "identity_resolution_id": row.identity_resolution_id,
+        "identity_content_status": row.identity_content_status,
+        "identity_content_confirmed_at": row.identity_content_confirmed_at,
+        "identity_downstream_confirmed_at": row.identity_downstream_confirmed_at,
     }
+    result.update(
+        release
+        or {
+            "release_state": "NOT_APPLICABLE",
+            "release_state_label": "Not held for review",
+            "effective_identity_confirmed_at": row.identity_content_confirmed_at,
+            "effective_identity_downstream_confirmed_at": (
+                row.identity_downstream_confirmed_at
+            ),
+            "active_release_job_id": None,
+            "latest_release_job_id": None,
+            "release_target_user_key": None,
+            "release_connector_id": None,
+            "release_lock_reason": None,
+        }
+    )
+    return result
 
 
 def serialize_log(row: DeviceLog) -> dict:
