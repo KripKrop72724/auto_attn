@@ -18,6 +18,17 @@ branch_labels = None
 depends_on = None
 
 
+REUSE_ATTESTATION_INDEXES = {
+    "attestation_id": "ix_add_attendance_repair_reuse_attestations_attestation_id",
+    "job_id": "ix_add_attendance_repair_reuse_attestations_job_id",
+    "target_id": "ix_add_attendance_repair_reuse_attestations_target_id",
+    "target_identity_digest": "ix_add_repair_reuse_target_digest",
+    "event_membership_digest": "ix_add_repair_reuse_event_digest",
+    "evidence_type": "ix_add_attendance_repair_reuse_attestations_evidence_type",
+    "actor": "ix_add_attendance_repair_reuse_attestations_actor",
+}
+
+
 def _columns(table: str) -> set[str]:
     return {row["name"] for row in inspect(op.get_bind()).get_columns(table)}
 
@@ -153,20 +164,12 @@ def upgrade() -> None:
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
             sa.UniqueConstraint("job_id", name="uq_add_attendance_repair_reuse_job"),
         )
-        for name in (
-            "attestation_id",
-            "job_id",
-            "target_id",
-            "target_identity_digest",
-            "event_membership_digest",
-            "evidence_type",
-            "actor",
-        ):
+        for column_name, index_name in REUSE_ATTESTATION_INDEXES.items():
             op.create_index(
-                f"ix_add_attendance_repair_reuse_attestations_{name}",
+                index_name,
                 "add_attendance_repair_reuse_attestations",
-                [name],
-                unique=name == "attestation_id",
+                [column_name],
+                unique=column_name == "attestation_id",
             )
 
     item_columns = _columns("add_attendance_repair_items")
