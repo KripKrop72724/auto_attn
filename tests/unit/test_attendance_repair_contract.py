@@ -9,6 +9,9 @@ MIGRATION = ROOT / "apps/add_backend/migrations/versions/20260827_0021_attendanc
 CONTRACT = ROOT / "deploy/add/oracle/20260827_identity_repair_contract.sql"
 PREFLIGHT = ROOT / "deploy/add/oracle/20260827_identity_repair_preflight.sql"
 DOWNSTREAM = ROOT / "deploy/add/oracle/20260827_downstream_adapter_contract.sql"
+DOWNSTREAM_TIMEZONE_FIX = (
+    ROOT / "deploy/add/oracle/20260904_fix_downstream_timezone_expression.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -105,6 +108,20 @@ def test_oracle_rollout_implements_verified_production_downstream_semantics() ->
     assert "no_attendance_data_mutated_by_install=true" in downstream
     assert "stale_old_identity_absent" in downstream
     assert "slic_zkt_repair_downstream_status" in downstream
+    assert "at time zone c_attendance_timezone" not in downstream
+    assert downstream.count("at time zone 'asia/karachi'") == 2
+
+
+def test_downstream_timezone_hotfix_is_guarded_and_package_only() -> None:
+    source = DOWNSTREAM_TIMEZONE_FIX.read_text().lower()
+    assert "slic_zkt_downstream_repair" in source
+    assert "installed downstream-repair body does not match" in source
+    assert "automatic restoration both failed" in source
+    assert "execute immediate l_previous_body" in source
+    assert "whenever sqlerror exit failure rollback" in source
+    assert "attendance_rows_changed=0" in source
+    assert "at time zone c_attendance_timezone" in source
+    assert "at time zone ''asia/karachi''" in source
 
 
 def test_existing_full_history_reconcile_delete_paths_remain_gated() -> None:

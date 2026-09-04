@@ -440,10 +440,10 @@ create or replace package body slic_zkt_downstream_repair as
     begin
         select count(*),
                min(case when check_in = 'T' then
-                   cast(event_timestamp at time zone c_attendance_timezone as date)
+                   cast(event_timestamp at time zone 'Asia/Karachi' as date)
                end),
                max(case when check_out = 'T' then
-                   cast(event_timestamp at time zone c_attendance_timezone as date)
+                   cast(event_timestamp at time zone 'Asia/Karachi' as date)
                end)
           into o_event_count, o_check_in, o_check_out
           from hr_raw_attn_capture_events
