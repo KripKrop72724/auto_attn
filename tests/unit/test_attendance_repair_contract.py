@@ -15,6 +15,9 @@ DOWNSTREAM_TIMEZONE_FIX = (
 DOWNSTREAM_STATUS_FIX = (
     ROOT / "deploy/add/oracle/20260904_fix_downstream_status_supersession.sql"
 )
+DOWNSTREAM_RECEIPT_ORDER_FIX = (
+    ROOT / "deploy/add/oracle/20260904_fix_downstream_status_receipt_order.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -66,7 +69,7 @@ def test_oracle_identity_repair_contract_is_add_only_and_non_destructive() -> No
     assert "content_precondition_mismatch" in source
     assert "review_required" in source
     assert "stale_old_identity_absent" in source
-    assert "l_downstream_observed_at >= receipt.created_at" in source
+    assert "l_downstream_observed_at >= receipt.created_at" not in source
     assert "identity_repair_previous_body" in source
     assert "automatic package restoration also failed" in source
     assert "whenever sqlerror exit failure rollback" in source
@@ -145,6 +148,29 @@ def test_downstream_status_uses_latest_verified_employee_day_projection() -> Non
         assert marker in source
 
     assert "slic_zkt_identity_repair_api" in source
+    assert "installed identity-repair body does not match" in source
+    assert "automatic restoration both failed" in source
+    assert "execute immediate l_previous_body" in source
+    assert "whenever sqlerror exit failure rollback" in source
+    assert "attendance_rows_changed=0" in source
+    assert "delete from hr_raw_attn_capture_events" not in source
+    assert "update hr_raw_attn_capture_events" not in source
+    assert "delete from hr_employee_attendance" not in source
+    assert "update hr_employee_attendance" not in source
+
+
+def test_downstream_status_uses_atomic_operation_binding_not_impossible_time_order() -> None:
+    contract = CONTRACT.read_text().lower()
+    source = DOWNSTREAM_RECEIPT_ORDER_FIX.read_text().lower()
+
+    assert "l_downstream_observed_at >= receipt.created_at" not in contract
+    assert contract.count("and l_downstream_observed_at is not null);") == 2
+    assert "receipt.operation_id = current_log.operation_id" in contract
+    assert "where operation_id = :operation_id" in contract
+
+    assert "slic_zkt_identity_repair_api" in source
+    assert "exact operation-id join" in source
+    assert "atomic commit" in source
     assert "installed identity-repair body does not match" in source
     assert "automatic restoration both failed" in source
     assert "execute immediate l_previous_body" in source
