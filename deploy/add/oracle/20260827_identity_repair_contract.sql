@@ -471,6 +471,8 @@ create or replace package body slic_zkt_identity_repair_api as
         l_results json_array_t := json_array_t();
         l_result json_object_t;
         l_json clob;
+        l_error_code number;
+        l_error_line number;
     begin
         require_add_auth;
         if not downstream_ready then
@@ -861,8 +863,28 @@ create or replace package body slic_zkt_identity_repair_api as
     exception
         when e_response_sent then rollback;
         when others then
+            l_error_code := sqlcode;
+            l_error_line := to_number(
+                regexp_substr(
+                    dbms_utility.format_error_backtrace,
+                    'line ([0-9]+)',
+                    1,
+                    1,
+                    'i',
+                    1
+                )
+            );
             rollback;
-            send_json(500, '{"success":false,"error_code":"REPAIR_TRANSACTION_FAILED"}');
+            select json_object(
+                       'success' value 'false' format json,
+                       'error_code' value 'REPAIR_TRANSACTION_FAILED',
+                       'oracle_sqlcode' value l_error_code,
+                       'failure_line' value l_error_line
+                       returning clob
+                   )
+              into l_json
+              from dual;
+            send_json(500, l_json);
     end post_repair;
 
     procedure post_status(p_body in clob) is

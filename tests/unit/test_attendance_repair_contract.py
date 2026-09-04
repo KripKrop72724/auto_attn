@@ -72,6 +72,10 @@ def test_oracle_identity_repair_contract_is_add_only_and_non_destructive() -> No
     assert "value bool_json(" not in source
     assert "l_token := sha256(l_material)" in source
     assert "l_ready_json := bool_json(l_ready)" in source
+    assert "'oracle_sqlcode' value l_error_code" in source
+    assert "'failure_line' value l_error_line" in source
+    assert "format_error_backtrace" in source
+    assert "sqlerrm" not in source
     check_body, repair_and_status = source.rsplit("procedure post_repair", maxsplit=1)
     repair_body = repair_and_status.split("procedure post_status", maxsplit=1)[0]
     assert "l_before_count := l_count" not in check_body
