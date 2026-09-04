@@ -354,6 +354,77 @@ describe('Live attendance workspace', () => {
     expect(within(row).getByText(/job 22222222/i)).toBeTruthy()
   })
 
+  it('describes completed release-history punches as verified rather than unsafe', async () => {
+    const completed = releaseJob({
+      status: 'COMPLETED',
+      release_state: 'Released',
+      phase: 'CERTIFIED',
+      started_at: '2026-08-12T09:01:00Z',
+      completed_at: '2026-08-12T09:02:00Z',
+      totals: {
+        employees: 1,
+        events: 1,
+        selected: 1,
+        safe: 1,
+        ordinary: 1,
+        reuse: 0,
+        safe_reuse: 0,
+        excluded: 0,
+        completed_employees: 1,
+        completed_events: 1,
+        attention_events: 0,
+      },
+      items: [{
+        event_uid: 'release-event-one',
+        user_key: '11111111-1111-4111-8111-111111111111',
+        event_time: '2026-08-12T08:00:00Z',
+        punch: '0',
+        capture_source: 'FULL_HISTORY',
+        source_ords_status: 'BLOCKED_IDENTITY',
+        risk_class: 'ORDINARY_BLOCKED',
+        selection_origin: 'EXPLICIT',
+        state: 'COMPLETE',
+        oracle_classification: 'MISSING',
+        outcome: 'INSERTED_DOWNSTREAM_VERIFIED',
+        attempt_count: 1,
+        oracle_attempt_count: 1,
+        downstream_attempt_count: 1,
+        next_attempt_at: null,
+        error_code: null,
+        error_message: null,
+        operation_id: '33333333-3333-4333-8333-333333333333',
+        oracle_receipt_id: '33333333-3333-4333-8333-333333333333',
+        downstream_status: 'VERIFIED',
+        downstream_verified_at: '2026-08-12T09:02:00Z',
+      }],
+    })
+    window.history.replaceState(
+      null,
+      '',
+      `/attendance?view=release-history&release_job=${completed.job_id}`,
+    )
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.pathname === `/api/v2/attendance-releases/${completed.job_id}`)
+        return response(completed)
+      if (url.pathname === '/api/v2/attendance-releases')
+        return response({
+          preview_enabled: true,
+          execution_enabled: true,
+          rows: [completed],
+          next_cursor: null,
+          totals: { all: 1, active: 0, attention: 0 },
+          worker: {},
+        })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }))
+
+    render(<AttendanceView {...attendanceProps} />)
+
+    expect(await screen.findByText('Oracle content and downstream attendance are verified.')).toBeTruthy()
+    expect(screen.queryByText('This punch cannot be released safely.')).toBeNull()
+  })
+
   it('supports keyboard navigation across all three Attendance views and URL restoration', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), 'https://add.test')
