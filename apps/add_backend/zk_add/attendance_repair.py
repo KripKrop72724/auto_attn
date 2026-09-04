@@ -3197,6 +3197,46 @@ def _ords_url(path: str) -> str:
     return f"{settings.ords_base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
+def _oracle_transaction_failure(response: httpx.Response) -> tuple[str, str] | None:
+    """Extract only the repair package's deliberately PII-free diagnostics.
+
+    ORDS response bodies otherwise remain opaque.  The Oracle contract emits
+    only a numeric SQLCODE and package line for an unexpected transactional
+    failure; SQLERRM/backtraces are intentionally neither returned nor logged.
+    """
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or payload.get("error_code") != "REPAIR_TRANSACTION_FAILED":
+        return None
+    oracle_sqlcode = payload.get("oracle_sqlcode")
+    failure_line = payload.get("failure_line")
+    if (
+        isinstance(oracle_sqlcode, bool)
+        or not isinstance(oracle_sqlcode, int)
+        or oracle_sqlcode == 0
+        or oracle_sqlcode < -99999
+        or oracle_sqlcode > 99999
+    ):
+        return None
+    if (
+        isinstance(failure_line, bool)
+        or not isinstance(failure_line, int)
+        or failure_line < 1
+        or failure_line > 100000
+    ):
+        failure_line = None
+    sign = "N" if oracle_sqlcode < 0 else "P"
+    diagnostic_code = f"ORACLE_REPAIR_{sign}{abs(oracle_sqlcode)}"
+    message = f"Oracle repair transaction failed with code {oracle_sqlcode}"
+    if failure_line is not None:
+        diagnostic_code += f"_L{failure_line}"
+        message += f" at guarded package line {failure_line}"
+    return diagnostic_code, message + "."
+
+
 async def _ords_request(path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if (
         not settings.attendance_repair_ords_username
@@ -3231,9 +3271,18 @@ async def _ords_request(path: str, *, payload: dict[str, Any] | None = None) -> 
             status_code=response.status_code,
         )
     if response.status_code in {408, 429} or response.status_code >= 500:
+        transaction_failure = (
+            _oracle_transaction_failure(response) if response.status_code >= 500 else None
+        )
         raise OracleRepairError(
-            "Oracle repair service is temporarily unavailable.",
-            code=f"ORDS_HTTP_{response.status_code}",
+            transaction_failure[1]
+            if transaction_failure
+            else "Oracle repair service is temporarily unavailable.",
+            code=(
+                transaction_failure[0]
+                if transaction_failure
+                else f"ORDS_HTTP_{response.status_code}"
+            ),
             retryable=True,
             status_code=response.status_code,
         )

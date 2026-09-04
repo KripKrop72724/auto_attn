@@ -1858,6 +1858,53 @@ def test_repair_ords_client_uses_only_the_dedicated_credential(
     assert "fleet-user" not in observed["headers"].values()
 
 
+def test_repair_ords_client_surfaces_only_safe_transaction_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubResponse:
+        status_code = 500
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "success": False,
+                "error_code": "REPAIR_TRANSACTION_FAILED",
+                "oracle_sqlcode": -1,
+                "failure_line": 812,
+                # Unexpected fields, including a future unsafe server field,
+                # must never be copied into ADD's durable error evidence.
+                "message": "sensitive server detail",
+            }
+
+    class StubClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def request(self, *_args, **_kwargs):
+            return StubResponse()
+
+    monkeypatch.setattr(settings, "ords_base_url", "https://example.invalid/ords/raw")
+    monkeypatch.setattr(settings, "attendance_repair_ords_username", "repair-user")
+    monkeypatch.setattr(settings, "attendance_repair_ords_password", "repair-password")
+    monkeypatch.setattr(repair.httpx, "AsyncClient", StubClient)
+
+    with pytest.raises(repair.OracleRepairError) as captured:
+        asyncio.run(repair._ords_request("identity-repairs", payload={"items": []}))
+    assert captured.value.code == "ORACLE_REPAIR_N1_L812"
+    assert captured.value.retryable is True
+    assert captured.value.status_code == 500
+    assert str(captured.value) == (
+        "Oracle repair transaction failed with code -1 at guarded package line 812."
+    )
+    assert "sensitive" not in str(captured.value)
+
+
 def test_retryable_preview_failure_uses_durable_backoff(
     repair_store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
