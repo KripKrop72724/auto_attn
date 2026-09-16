@@ -44,7 +44,8 @@ def test_245_supports_partial_final_credit_and_fresh_source_probes():
     assert "!assignment.source_probe" in CONNECTOR
     assert '"type": "source_coverage"' in WEB
     assert '"active": False' in WEB
-    assert "!authoritative_coverage.active" in ZONE
+    assert "!coverage->active" in ZONE
+    assert "apply_add_source_coverage(&authoritative_coverage)" in ZONE
 
 
 def test_stream_v2_ack_is_json_native_and_assignment_wins_truth_race():

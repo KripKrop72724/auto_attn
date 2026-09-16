@@ -427,3 +427,16 @@ read/settlement errors, each prefix read and close failure, and changed prefix b
 The 100,000-byte legacy fixture validates slice bounds and preserved checkpoints;
 the multi-generation blocked fixture still drains 10,003 records. These changes do
 not implement or claim the remaining whole-device HEALTHY gate or HIL acceptance.
+
+## Checked source-coverage application
+
+All runtime-checkpoint save call sites now inspect or return their result. The ADD
+source-coverage handler logs APPLIED only after a successful NVS commit; failure
+keeps source recovery required. A terminal mismatch clears both runtime and
+telemetry certification. Actual adapter tests cover failed commit, successful
+commit, mismatched terminal, inactive coverage and null input. The existing runtime
+NVS failure matrix independently verifies restoration of committed fields.
+
+Validation before this follow-up: 595 firmware/unit tests and 100 frontend tests
+passed, as did the ESP-IDF 5.5.3 build and every diagnostics cJSON allocation failure.
+This follow-up also passes the firmware build; exact-commit CI remains mandatory.

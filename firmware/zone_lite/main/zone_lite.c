@@ -845,8 +845,9 @@ static void zkt_mark_authenticated(uint32_t ip, const char *reason, bool live_se
     g_add_zkt.backoff_until_epoch = 0;
     bool authenticated_ip_changed = g_last_authenticated_zkt_ip != ip;
     g_last_authenticated_zkt_ip = ip;
-    if (authenticated_ip_changed) {
-        nvs_save_runtime_state();
+    if (authenticated_ip_changed && !nvs_save_runtime_state()) {
+        add_connector_log("WARN", "storage", "AUTHENTICATED_IP_NOT_PERSISTED",
+            "Terminal connection is active, but its runtime checkpoint requires recovery.");
     }
     led_status_clear_fault(LED_STATUS_ZKT_FAILURE);
     if (planned_refresh_probe) {
@@ -4291,6 +4292,52 @@ static bool process_add_reconciliation_assignment(
     return ok;
 }
 
+static bool apply_add_source_coverage(const add_source_coverage_t *coverage)
+{
+    if (!coverage) return false;
+    if (strcmp(coverage->terminal_serial, g_device_serial) != 0) {
+        g_add_source_coverage_certified = false;
+        g_add_zkt.add_source_coverage_certified = false;
+        add_connector_log(
+            "CRITICAL",
+            "reconcile",
+            "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH",
+            "ADD source coverage belongs to a different authenticated terminal; tail reconciliation remains disabled.");
+    } else if (!coverage->active) {
+        g_add_source_coverage_certified = false;
+        g_add_zkt.add_source_coverage_certified = false;
+        g_add_zkt.add_source_coverage_cursor = 0;
+    } else {
+        if (g_add_source_coverage_certified &&
+            g_add_source_coverage_cursor >
+                coverage->committed_next_ordinal) {
+            add_connector_log(
+                "WARN",
+                "reconcile",
+                "ADD_SOURCE_CHECKPOINT_REPLAY",
+                "Local tail cursor was ahead of ADD; replaying from ADD's authoritative durable checkpoint.");
+        }
+        g_add_source_coverage_certified = true;
+        g_add_source_coverage_cursor =
+            coverage->committed_next_ordinal;
+        g_add_source_coverage_generation =
+            coverage->terminal_generation;
+        strlcpy(
+            g_add_source_coverage_chain,
+            coverage->committed_chain_digest,
+            sizeof(g_add_source_coverage_chain));
+        g_add_zkt.add_source_coverage_certified = true;
+        g_add_zkt.add_source_coverage_cursor =
+            coverage->committed_next_ordinal;
+    }
+    if (!nvs_save_runtime_state()) return false;
+    if (g_add_source_coverage_certified) {
+        add_connector_log("INFO", "reconcile", "ADD_SOURCE_COVERAGE_APPLIED",
+            "Committed ADD's authoritative terminal source cursor and chain; bounded tail reconciliation may continue.");
+    }
+    return true;
+}
+
 static bool process_add_incremental_tail(
     int sock,
     zk_context_t *ctx,
@@ -4303,7 +4350,10 @@ static bool process_add_incremental_tail(
     if ((uint32_t)latest_records < g_add_source_coverage_cursor) {
         g_add_source_coverage_certified = false;
         g_add_zkt.add_source_coverage_certified = false;
-        nvs_save_runtime_state();
+        if (!nvs_save_runtime_state()) {
+            add_connector_log("ERROR", "storage", "SOURCE_INVALIDATION_NOT_PERSISTED",
+                "Source count regressed; recovery remains required and checkpoint persistence failed.");
+        }
         add_connector_log(
             "CRITICAL",
             "reconcile",
@@ -7984,47 +8034,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_activity("LIVE_CAPTURE");
         }
         add_source_coverage_t authoritative_coverage;
-        if (add_connector_take_source_coverage(&authoritative_coverage)) {
-            if (strcmp(authoritative_coverage.terminal_serial, g_device_serial) != 0) {
-                g_add_source_coverage_certified = false;
-                add_connector_log(
-                    "CRITICAL",
-                    "reconcile",
-                    "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH",
-                    "ADD source coverage belongs to a different authenticated terminal; tail reconciliation remains disabled.");
-            } else if (!authoritative_coverage.active) {
-                g_add_source_coverage_certified = false;
-                g_add_zkt.add_source_coverage_certified = false;
-                g_add_zkt.add_source_coverage_cursor = 0;
-            } else {
-                if (g_add_source_coverage_certified &&
-                    g_add_source_coverage_cursor >
-                        authoritative_coverage.committed_next_ordinal) {
-                    add_connector_log(
-                        "WARN",
-                        "reconcile",
-                        "ADD_SOURCE_CHECKPOINT_REPLAY",
-                        "Local tail cursor was ahead of ADD; replaying from ADD's authoritative durable checkpoint.");
-                }
-                g_add_source_coverage_certified = true;
-                g_add_source_coverage_cursor =
-                    authoritative_coverage.committed_next_ordinal;
-                g_add_source_coverage_generation =
-                    authoritative_coverage.terminal_generation;
-                strlcpy(
-                    g_add_source_coverage_chain,
-                    authoritative_coverage.committed_chain_digest,
-                    sizeof(g_add_source_coverage_chain));
-                g_add_zkt.add_source_coverage_certified = true;
-                g_add_zkt.add_source_coverage_cursor =
-                    authoritative_coverage.committed_next_ordinal;
-                add_connector_log(
-                    "INFO",
-                    "reconcile",
-                    "ADD_SOURCE_COVERAGE_APPLIED",
-                    "Applied ADD's authoritative terminal source cursor and chain; bounded tail reconciliation may continue.");
-            }
-            nvs_save_runtime_state();
+        if (add_connector_take_source_coverage(&authoritative_coverage) &&
+            !apply_add_source_coverage(&authoritative_coverage)) {
+            add_connector_log("ERROR", "storage", "ADD_SOURCE_COVERAGE_DEFERRED",
+                "ADD source coverage could not be committed locally; source recovery remains required.");
         }
         add_reconcile_assignment_t reconciliation_assignment;
         if (!g_temp_admin_active &&
