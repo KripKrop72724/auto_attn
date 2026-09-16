@@ -128,6 +128,7 @@ void add_connector_init(void);
 void add_connector_start(void);
 bool add_connector_is_connected(void);
 bool add_connector_boot_health_ready(void);
+bool add_connector_ota_reconcile_ready(void);
 bool add_connector_consume_connected_edge(void);
 uint32_t add_connector_outbox_depth(void);
 bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out);

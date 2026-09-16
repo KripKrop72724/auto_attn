@@ -3744,6 +3744,18 @@ bool add_connector_boot_health_ready(void)
     return ready;
 }
 
+bool add_connector_ota_reconcile_ready(void)
+{
+    if (!add_connector_boot_health_ready()) return false;
+    bool ready = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ready = s_zkt.add_source_coverage_certified && s_zkt.attendance_count >= 0 &&
+            s_zkt.add_source_coverage_cursor == (uint32_t)s_zkt.attendance_count;
+        xSemaphoreGive(s_lock);
+    }
+    return ready;
+}
+
 bool add_connector_consume_connected_edge(void)
 {
     bool edge = false;

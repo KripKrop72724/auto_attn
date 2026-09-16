@@ -162,3 +162,19 @@ field insertion; sanitizer tests use the ESP-IDF cJSON implementation.
 436 backend/unit, firmware and companion tests and the ESP-IDF build pass locally.
 Auxiliary catalog/command writers, verified recovery gating, and activation of
 segmented producers still require completion. This checkpoint is not release approval.
+
+
+## OTA journal and installation ordering
+
+OTA now stores a versioned, checksummed NVS checkpoint and reads validated legacy
+journals only when the new checkpoint is absent. Failed/uncertain writes stop the
+operation, restore the last committed in-memory state, and require checked reload.
+The READY_TO_BOOT checkpoint commits before OTA finish can select a new slot;
+invalid image digests restore the running slot. Interrupted downloads abort their
+transport handle. Same-version assignment alone cannot manufacture completion.
+
+OTA success waits for certified source coverage instead of a fixed delay and retries
+lost server transition acknowledgements without clearing the journal. Actual C host
+tests inject NVS, transport, descriptor, image verification, boot-selection and
+completion failures. These tests do not certify a physical upgrade or rollback.
+The predecessor compatibility guard is still required before segmented activation.
