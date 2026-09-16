@@ -9,6 +9,8 @@ firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
 functions = source[source.index("static FILE *create_catalog_stage("):
                    source.index("static void recover_identity_catalog_backup_if_active_missing(")]
+persist = source[source.index("static bool persist_identity_catalog_locked("):
+                 source.index("static bool persist_identity_catalog(")]
 program = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -21,6 +23,11 @@ program = r'''
 #include "cJSON.h"
 #include "storage_budget.h"
 #define DQ_MAX_RECORD_BYTES 8192
+#define ADD_IDENTITY_CATALOG_MAX_ROWS 8192
+#define ADD_IDENTITY_CATALOG_TMP_PATH "catalog.tmp"
+static bool s_identity_catalog_active_memory_valid=true;
+static bool activation_fails;
+static bool activate_identity_catalog(const char *path){return !activation_fails && rename(path,"active")==0;}
 #define ADD_IDENTITY_CATALOG_MAX_BYTES (2U * 1024U * 1024U)
 #define QS_ADMIT_HISTORICAL 1
 #define LED_STATUS_LOCAL_FAILURE 1
@@ -33,7 +40,7 @@ static bool qs_local_begin(int policy,size_t bytes){assert(policy==1 && !held);h
 static void qs_local_end(bool ok,int error){(void)ok;(void)error;assert(held);held=false;}
 static void led_status_fault(int state){assert(state==1);}
 static char *encrypt_storage_json(const char *plain){if(!plain)return NULL;char *out=malloc(strlen(plain)+1);if(out)strcpy(out,plain);return out;}
-''' + functions + r'''
+''' + functions + persist + r'''
 int main(void){
  cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
  cJSON *row=cJSON_Parse("{\"user_id\":\"test\"}");assert(row);
@@ -52,6 +59,17 @@ int main(void){
  assert(!ftruncate(fileno(file),ADD_IDENTITY_CATALOG_MAX_BYTES));
  assert(!write_encrypted_json_line(file,row));assert(ftell(file)==ADD_IDENTITY_CATALOG_MAX_BYTES && !held);
  assert(!fclose(file));cJSON_Delete(row);
+ cJSON *catalog=cJSON_Parse("{\"rows\":[{\"user_id\":\"test\"}]}");assert(catalog);
+ calls=0;fail_at=0;s_identity_catalog_active_memory_valid=true;
+ assert(persist_identity_catalog_locked(catalog,NULL));assert(!s_identity_catalog_active_memory_valid);total=calls;
+ for(size_t i=1;i<=total;i++){
+  calls=0;fail_at=i;s_identity_catalog_active_memory_valid=true;
+  assert(!persist_identity_catalog_locked(catalog,NULL));assert(s_identity_catalog_active_memory_valid && !held);
+ }
+ fail_at=0;activation_fails=true;
+ assert(!persist_identity_catalog_locked(catalog,NULL) && s_identity_catalog_active_memory_valid);
+ activation_fails=false;assert(persist_identity_catalog_locked(catalog,NULL) && !s_identity_catalog_active_memory_valid);
+ cJSON_Delete(catalog);
  puts("catalog allocation and capacity regressions passed");
 }
 '''

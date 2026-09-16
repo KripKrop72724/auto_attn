@@ -963,6 +963,11 @@ static bool persist_identity_catalog_locked(cJSON *root, size_t *row_count_out)
         ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH);
     }
     if (!ok) (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
+    if (ok) {
+        // Catalog readers share s_catalog_lock: a committed flash generation
+        // supersedes any older volatile aliases, including tombstone updates.
+        s_identity_catalog_active_memory_valid = false;
+    }
     if (ok && row_count_out) {
         *row_count_out = (size_t)row_count;
     }

@@ -263,3 +263,8 @@ upgrade modes pass inside Linux/ESP-IDF. This is not a green release-qualificati
 - Tombstone updates no longer replace unreadable, truncated, or allocation-failed catalogs with an empty catalog. Reused user IDs retain separate enrollment UIDs. Every cJSON allocation in the actual update path is tested against ESP-IDF cJSON; failed close also prevents persistence.
 - Encrypted storage wrappers check plaintext allocation and SHA derivation failures before decryption. Host tests inject allocator and crypto failures under sanitizers (crypto primitives are test doubles in that test; it is not cryptographic qualification).
 - Firmware suite: 140 tests passed. Actual catalog activation restart matrix and actual-cJSON tombstone matrix passed. ESP-IDF 5.5.3 build passed, unsigned 0x130000-byte application with 52% partition headroom. Production deployment/qualification remains outstanding.
+
+A successful flash catalog replacement now invalidates an older volatile alias
+catalog. Actual persistence/allocation tests verify that failed replacements keep
+the old cache authoritative and successful replacements switch lookups to the new
+committed flash generation.
