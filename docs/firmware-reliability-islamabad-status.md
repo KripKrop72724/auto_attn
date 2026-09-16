@@ -12,19 +12,22 @@ Branch: `codex/firmware-reliability-islamabad-hil`.
 | 3 | Allocation-free queue scan with unknown/error state; verified EOF retirement | Fault matrix and integration with committed segmented checkpoints |
 | 4 | Allocation-free JSON syntax check; retry parse/serialization allocation failures; preserve failed quarantine | Complete injected write/allocation failures and durable evidence transfer |
 | 5 | Bounded live parser, sanitizer coverage including 13-byte frame | Established protocol hint for concatenated frames and source recovery integration |
-| 6 | Explicit resource error; durable-outcome success allowlist; serializers reject incomplete JSON | Complete end-to-end allocation matrix and reconciliation assertions |
-| 7 | Portable segmented queue and capacity adapter | Runtime integration, bounded ACK cache, auxiliary-file budgets, resumable blocked repair |
-| 8 | 64 KiB segments; legacy ORDS streams from a checked persistent cursor without a second backlog copy | Integrate remaining queues and qualify all legacy backup combinations |
+| 6 | Explicit resource error; durable-outcome success allowlist; complete-UID dedup with bounded probes; serializers reject incomplete JSON | Complete end-to-end allocation matrix and reconciliation assertions |
+| 7 | Portable segmented queue; tested 60/55 pressure hysteresis, reserved admission and retirement cleanup | Runtime integration, bounded ACK cache, auxiliary-file budgets, resumable blocked repair |
+| 8 | 64 KiB segments; legacy ADD and ORDS stream from checked persistent cursors without a second backlog copy | Integrate blocked/evidence queues and qualify all legacy backup combinations |
 | 9 | Legacy ORDS uses bounded read/send/commit; at most 100 events or one ORDS request per slice | Sustained-load qualification and worker diagnostics |
 | 10 | Checked task startup, buffer retry, supervisor and visible faults | Exhaustive worker-failure and liveness qualification |
-| 11 | Preserve ambiguous blocked backup generations | Recover every legacy transition with explicit transaction generations |
+| 11 | ADD/ORDS active, backup and temp files drain independently; preserve ambiguous blocked backup generations | Complete blocked-file recovery and all interruption boundaries |
 | 12 | Require terminal serial and identity fingerprint for local historical repair | Terminal replacement/reused-ID integration tests and verified resolution path |
-| 13 | Coherent versioned/checksummed runtime NVS blob, checked legacy queue commits and batch flush/sync/close | Complete persistence fault matrix and audit remaining call sites |
-| 14 | Initial 4:1 live/background worker scheduling and capped priority hold | Separate receipts, per-queue retry, sustained-load fairness proof |
-| 15 | Completed-with-exclusions wording; persistent local fault on delivery fallback | Optional diagnostics across firmware/backend/UI; operator-state tests |
+| 13 | Coherent versioned/checksummed runtime NVS blob, checked legacy queue commits and batch flush/sync/close | Complete remaining persistence fault matrix and call-site audit; segmented I/O faults already exercised |
+| 14 | Shared tested 4:1 scheduler, alternating bulk/proof service and per-lane backoff; ADD segmented compatibility reader | Activate separate receipt writes; prove direct-send and sustained-load fairness |
+| 15 | Versioned optional diagnostics across firmware/backend/UI, stale/missing labels, durable fault recovery gating and completed-with-exclusions wording | Complete persistence/queue/reconciliation instrumentation and browser qualification |
 | 16 | No production change | Version reservation, compatibility image, upgrade/rollback proofs and exact-target OTA |
 
-The new segmented component is compiled but **not yet used by the runtime queues**.
+The ADD worker can read segmented attendance/receipt queues for compatibility,
+but **new segmented writes remain disabled**. The ORDS segmented compatibility
+reader is also connected and tested across receipt failure/restart. Blocked/evidence
+readers, complete migration and predecessor-image verification remain outstanding.
 Existing firmware version remains unchanged. Local build uses the CI setup password
 and is unsigned; it is not a production artifact.
 
@@ -33,14 +36,29 @@ and is unsigned; it is not a production artifact.
 - ESP-IDF 5.5.3 Docker build passes; binary 0x120000 bytes, application partition
   0x280000 bytes, 55% free. Bootloader and partition definitions unchanged.
 - Portable queue/parser C regression tests run under AddressSanitizer and
-  UndefinedBehaviorSanitizer.
+  UndefinedBehaviorSanitizer. Actual segmented queue I/O is faulted at open,
+  seek, read, partial write, flush, sync, close, checkpoint and deletion calls;
+  restart preserves previous durable records, including uncertain commits.
+- Legacy appends reject an unfinished trailing row. Startup dedup ignores
+  incomplete/oversized/malformed rows and compares full UIDs; a full cache
+  cannot manufacture a duplicate.
+- The capacity adapter reserves space inside a 75% absolute ceiling, stops
+  historical admission at 60%, resumes below 55%, and admits only reserved
+  operations at 70%. Tests cover those thresholds and nearly full storage.
+  Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 393 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 401 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
   This does not substitute for exact-commit GitHub CI.
+- Draft PR #161 at initial commit `83df4fd36575cbb8ae8ebc15840f41a3d7cdaaa2`
+  passed every GitHub check, including containers. Subsequent changes require
+  another exact-commit run.
+- The diagnostics migration was tested against isolated PostgreSQL 16, including
+  downgrade/upgrade and schema-drift checks. The frontend passed 94 tests, its
+  production build and bundle budget after diagnostics changes.
 
 ## Unperformed qualification and deployment
 

@@ -9,6 +9,8 @@ typedef enum { REL_SCAN_ERROR = -1, REL_SCAN_EMPTY = 0, REL_SCAN_OK = 1 } rel_sc
 rel_scan_result_t rel_count_rows(FILE *file, uint32_t *count);
 bool rel_settled_eof(FILE *file, off_t boundary);
 bool rel_json_syntax_valid(const char *text, size_t length);
+/* Never append a valid record onto an interrupted, unterminated legacy row. */
+FILE *rel_open_append(const char *path);
 
 typedef struct {
     char user_id[32];

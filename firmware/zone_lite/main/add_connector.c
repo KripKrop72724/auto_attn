@@ -20,6 +20,7 @@
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "esp_wifi.h"
@@ -34,6 +35,10 @@
 
 #include "zone_config.h"
 #include "reliability.h"
+#include "legacy_queue.h"
+#include "queue_store.h"
+#include "delivery_scheduler.h"
+#include "nvs.h"
 #include "led_status.h"
 
 #include "zone_lite_config.example.h"
@@ -119,6 +124,8 @@ typedef struct {
     uint32_t ack_since_checkpoint;
     const char *label;
     SemaphoreHandle_t lock;
+    legacy_queue_t legacy;
+    lq_token_t pending_token;
 } add_outbox_t;
 
 typedef struct {
@@ -221,6 +228,10 @@ static volatile uint32_t s_outbox_progress_ms;
 static volatile bool s_outbox_buffer_ready;
 static volatile bool s_worker_start_failed;
 static volatile bool s_outboxes_initialized;
+static volatile uint32_t s_ords_worker_tick_ms;
+static volatile bool s_ords_worker_started;
+static volatile add_worker_operation_t s_ords_worker_operation;
+static volatile add_worker_operation_t s_add_worker_operation;
 static void outbox_task(void *arg);
 static void heartbeat_task(void *arg);
 
@@ -828,7 +839,7 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
         }
     }
     if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) ok = false;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     if (ok) {
         ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH);
     }
@@ -938,7 +949,7 @@ static bool identity_catalog_stage_begin(cJSON *root)
             fflush(file) == 0 && fsync(fileno(file)) == 0;
     }
     cJSON_Delete(metadata);
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     s_identity_catalog_stage_file_ok = ok;
     if (!ok) {
         (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -997,7 +1008,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     if (!rows_ok) return false;
 
     if (s_identity_catalog_stage_file_ok) {
-        FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "a");
+        FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
         bool file_ok = file != NULL;
         cJSON_ArrayForEach(row, rows) {
             if (file_ok && !write_encrypted_json_line(file, row)) {
@@ -1007,7 +1018,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
         if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
             file_ok = false;
         }
-        if (file) fclose(file);
+        if (file && fclose(file) != 0) file_ok = false;
         if (!file_ok) {
             s_identity_catalog_stage_file_ok = false;
             (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -1152,10 +1163,10 @@ bool add_connector_persist_command_tombstone(const add_command_t *command)
 
 static bool append_cancelled_command(const char *command_id)
 {
-    FILE *file = fopen(ADD_CANCELLED_COMMANDS_PATH, "a");
+    FILE *file = rel_open_append(ADD_CANCELLED_COMMANDS_PATH);
     bool ok = file && fprintf(file, "%s\n", command_id) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     return ok;
 }
 
@@ -1457,10 +1468,10 @@ static bool command_journal_append(cJSON *root, const char *command_id)
     }
     char *plain = cJSON_PrintUnformatted(root);
     char *line = encrypt_storage_json(plain);
-    FILE *file = line ? fopen(ADD_COMMAND_INBOX_PATH, "a") : NULL;
+    FILE *file = line ? rel_open_append(ADD_COMMAND_INBOX_PATH) : NULL;
     bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     free(line);
     free(plain);
     xSemaphoreGive(s_command_lock);
@@ -2047,6 +2058,84 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     }
 }
 
+void add_connector_report_ords_worker(add_worker_operation_t operation)
+{
+    s_ords_worker_operation = operation;
+    s_ords_worker_tick_ms = (uint32_t)monotonic_ms();
+    s_ords_worker_started = true;
+}
+
+static bool append_worker_diagnostic(cJSON *workers, const char *name,
+                                     bool started, uint32_t tick,
+                                     add_worker_operation_t operation)
+{
+    int64_t now = monotonic_ms();
+    uint32_t age = (uint32_t)now - tick;
+    const char *state = !started ? "STOPPED" : age > 90000 ? "FAULT" :
+        operation == ADD_WORKER_RESOURCE ? "WAITING_RESOURCE" :
+        operation == ADD_WORKER_NETWORK ? "WAITING_NETWORK" : "RUNNING";
+    const char *operation_name = operation == ADD_WORKER_READING ? "reading queue" :
+        operation == ADD_WORKER_NETWORK ? "waiting for acknowledgement" :
+        operation == ADD_WORKER_COMMITTING ? "committing receipt" :
+        operation == ADD_WORKER_RESOURCE ? "allocating delivery buffer" : "idle";
+    cJSON *worker = cJSON_CreateObject();
+    if (!worker) return false;
+    if (!cJSON_AddItemToArray(workers, worker)) { cJSON_Delete(worker); return false; }
+    return cJSON_AddStringToObject(worker, "name", name) &&
+        cJSON_AddStringToObject(worker, "state", state) &&
+        cJSON_AddStringToObject(worker, "operation", operation_name) &&
+        (!started || cJSON_AddNumberToObject(worker, "last_activity_uptime_ms", (double)(now - age)));
+}
+
+static void append_firmware_diagnostics(cJSON *payload)
+{
+    cJSON *diagnostics = cJSON_CreateObject();
+    if (!diagnostics) return;
+    cJSON *storage = cJSON_AddObjectToObject(diagnostics, "storage");
+    cJSON *workers = cJSON_AddArrayToObject(diagnostics, "workers");
+    cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
+    if (!storage || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1)) goto failed;
+    size_t total = 0, used = 0;
+    esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
+    if (measured == ESP_OK) {
+        cJSON_AddNumberToObject(storage, "total_bytes", (double)total);
+        cJSON_AddNumberToObject(storage, "used_bytes", (double)used);
+    } else {
+        cJSON_AddStringToObject(storage, "error_operation", "filesystem_info");
+        cJSON_AddNumberToObject(storage, "error_code", measured);
+    }
+    // A connected heartbeat does not prove persistence. Until a checked
+    // recovery/write result is available, report UNKNOWN rather than healthy.
+    const char *led = led_status_current_name();
+    const char *durability = measured != ESP_OK || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
+        ? "DEGRADED" : "UNKNOWN";
+    if (!cJSON_AddStringToObject(storage, "durability", durability)) goto failed;
+    if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
+            s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE) ||
+        !append_worker_diagnostic(workers, "ords_delivery", s_ords_worker_started,
+            s_ords_worker_tick_ms, s_ords_worker_operation)) goto failed;
+    add_outbox_t *outboxes[] = {&s_live_outbox, &s_bulk_outbox};
+    const char *names[] = {"live", "bulk"};
+    for (size_t i = 0; i < 2; i++) {
+        cJSON *queue = cJSON_CreateObject();
+        if (!queue) goto failed;
+        if (!cJSON_AddItemToArray(queues, queue)) { cJSON_Delete(queue); goto failed; }
+        if (!cJSON_AddStringToObject(queue, "name", names[i])) goto failed;
+        add_outbox_t *outbox = outboxes[i];
+        if (outbox->lock && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            cJSON_AddBoolToObject(queue, "count_known", outbox->depth_known);
+            if (outbox->depth_known) cJSON_AddNumberToObject(queue, "records", outbox->depth);
+            struct stat st;
+            if (stat(outbox->path, &st) == 0) cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
+            else if (errno == ENOENT) cJSON_AddNumberToObject(queue, "bytes", 0);
+            xSemaphoreGive(outbox->lock);
+        }
+    }
+    if (cJSON_AddItemToObject(payload, "diagnostics", diagnostics)) return;
+failed:
+    cJSON_Delete(diagnostics);
+}
+
 static void heartbeat_task(void *arg)
 {
     (void)arg;
@@ -2076,6 +2165,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
             cJSON_AddNumberToObject(payload, "outbox_depth", add_connector_outbox_depth());
+            append_firmware_diagnostics(payload);
             ota_manager_append_telemetry(payload);
             cJSON_AddStringToObject(payload, "current_activity", activity);
             cJSON_AddStringToObject(payload, "led_state", led_status_current_name());
@@ -2211,48 +2301,60 @@ static bool write_outbox_cursor(const add_outbox_t *outbox, off_t offset)
 
 static void restore_outbox_if_needed(add_outbox_t *outbox)
 {
-    struct stat pending = {0};
-    struct stat backup = {0};
-    bool has_pending = stat(outbox->path, &pending) == 0;
-    bool has_backup = stat(outbox->backup_path, &backup) == 0;
-    if (!has_pending && has_backup) {
-        if (rename(outbox->backup_path, outbox->path) == 0) {
-            ESP_LOGW(TAG, "Recovered ADD %s outbox after interrupted compaction", outbox->label);
-            has_pending = true;
+    struct stat st;
+    if (stat(outbox->path, &st) == 0) return;
+    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    const char *generations[] = {outbox->backup_path, outbox->tmp_path};
+    for (size_t i = 0; i < 2; i++) {
+        if (stat(generations[i], &st) == 0) {
+            if (rename(generations[i], outbox->path) != 0)
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            outbox->depth_known = false;
+            return;
         }
+        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
     }
-    if (has_pending) (void)remove(outbox->backup_path);
-    (void)remove(outbox->tmp_path);
-    (void)remove(outbox->cursor_tmp_path);
+    // Each surviving generation is streamed independently. Existence of a
+    // newer active file is never permission to discard an older backup/temp.
+}
+
+static int add_legacy_load(void *context, lq_checkpoint_t *checkpoint)
+{
+    add_outbox_t *outbox = context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("add_legacy", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, outbox->label, checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool add_legacy_commit(void *context, const lq_checkpoint_t *checkpoint)
+{
+    add_outbox_t *outbox = context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("add_legacy", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, outbox->label, checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
 }
 
 static off_t load_outbox_cursor(add_outbox_t *outbox)
 {
-    struct stat st = {0};
-    if (stat(outbox->path, &st) != 0 || st.st_size <= 0) {
-        (void)remove(outbox->cursor_path);
+    lq_port_t port = {add_legacy_load, add_legacy_commit, outbox};
+    if (lq_open(&outbox->legacy, outbox->path, port) != DQ_OK) {
+        outbox->depth_known = false;
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return 0;
     }
-    FILE *cursor = fopen(outbox->cursor_path, "r");
-    long long value = 0;
-    bool parsed = cursor && fscanf(cursor, "%lld", &value) == 1;
-    if (cursor) fclose(cursor);
-    if (!parsed || value < 0 || value > (long long)st.st_size) {
-        (void)remove(outbox->cursor_path);
-        return 0;
-    }
-    if (value > 0) {
-        FILE *file = fopen(outbox->path, "r");
-        int preceding = EOF;
-        if (file && fseek(file, (long)value - 1, SEEK_SET) == 0) preceding = fgetc(file);
-        if (file) fclose(file);
-        if (preceding != '\n') {
-            ESP_LOGW(TAG, "Ignoring invalid ADD %s outbox cursor", outbox->label);
-            (void)remove(outbox->cursor_path);
-            return 0;
-        }
-    }
-    return (off_t)value;
+    // The old text cursor is not sufficient generation evidence. A first
+    // upgrade conservatively replays the file; ADD settles existing UIDs once.
+    return (off_t)outbox->legacy.checkpoint.offset;
 }
 
 static rel_scan_result_t count_outbox_rows(add_outbox_t *outbox)
@@ -2280,123 +2382,51 @@ static rel_scan_result_t count_outbox_rows(add_outbox_t *outbox)
     return result;
 }
 
-static bool outbox_boundary_is_eof(const add_outbox_t *outbox, off_t offset)
-{
-    FILE *file = fopen(outbox->path, "r");
-    bool complete = rel_settled_eof(file, offset);
-    if (file && fclose(file) != 0) complete = false;
-    return complete;
-}
-
 static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
 {
-    if (outbox->offset <= 0) return true;
-    struct stat st = {0};
-    if (stat(outbox->path, &st) != 0) {
-        if (errno != ENOENT) return false;
-        outbox->offset = 0;
-        outbox->depth = 0;
-        outbox->ack_since_checkpoint = 0;
-        (void)remove(outbox->cursor_path);
-        return true;
-    }
-    if (!force && (outbox->offset < ADD_OUTBOX_COMPACT_MIN_BYTES ||
-        outbox->offset < st.st_size / 2)) {
-        return true;
-    }
-    if (outbox_boundary_is_eof(outbox, outbox->offset)) {
-        // Clear the old generation's cursor durably before unlink. A restart
-        // at either boundary may replay settled rows, never skip a new file.
-        if (!write_outbox_cursor(outbox, 0) || remove(outbox->path) != 0) return false;
-        (void)remove(outbox->cursor_path);
-        outbox->offset = 0;
-        outbox->depth = 0;
-        outbox->ack_since_checkpoint = 0;
-        return true;
-    }
-
-    FILE *in = fopen(outbox->path, "r");
-    FILE *out = fopen(outbox->tmp_path, "w");
-    char *buffer = allocate_outbox_line_buffer();
-    if (!in || !out || !buffer || fseek(in, (long)outbox->offset, SEEK_SET) != 0) {
-        if (in) fclose(in);
-        if (out) fclose(out);
-        free(buffer);
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    bool ok = true;
-    size_t read = 0;
-    while ((read = fread(buffer, 1, ADD_OUTBOX_LINE_BYTES, in)) > 0) {
-        if (fwrite(buffer, 1, read, out) != read) {
-            ok = false;
-            break;
-        }
-    }
-    if (ferror(in) || fflush(out) != 0 || fsync(fileno(out)) != 0) ok = false;
-    fclose(in);
-    fclose(out);
-    free(buffer);
-    if (!ok || !write_outbox_cursor(outbox, 0)) {
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    (void)remove(outbox->backup_path);
-    if (rename(outbox->path, outbox->backup_path) != 0) {
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    if (rename(outbox->tmp_path, outbox->path) != 0) {
-        (void)rename(outbox->backup_path, outbox->path);
-        return false;
-    }
-    (void)remove(outbox->backup_path);
+    (void)force;
+    if (!outbox->legacy.ready) return false;
+    struct stat st;
+    if (stat(outbox->path, &st) != 0) return errno == ENOENT && !outbox->legacy.checkpoint.offset;
+    if ((uint64_t)st.st_size != outbox->legacy.checkpoint.offset) return true;
+    // No suffix rewrite or second copy. Clear the predecessor's text cursor
+    // before retiring a fully settled file so rollback cannot skip a new file.
+    if (!write_outbox_cursor(outbox, 0) || lq_reclaim(&outbox->legacy) != DQ_OK) return false;
     outbox->offset = 0;
+    outbox->depth = 0;
+    outbox->depth_known = true;
     outbox->ack_since_checkpoint = 0;
-    ESP_LOGI(TAG, "Compacted acknowledged prefix from ADD %s outbox", outbox->label);
+    restore_outbox_if_needed(outbox);
+    if (stat(outbox->path, &st) == 0) outbox->depth_known = false;
     return true;
 }
 
 static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end)
 {
-    if (row_end <= outbox->offset) return false;
-    outbox->offset = row_end;
-    if (outbox->depth > 0) outbox->depth--;
-    outbox->ack_since_checkpoint++;
-    if (outbox_boundary_is_eof(outbox, row_end)) {
-        // Every row in this generation has been acknowledged, so deleting the
-        // file is itself the durable checkpoint.
-        if (!write_outbox_cursor(outbox, 0) || remove(outbox->path) != 0) return false;
-        (void)remove(outbox->cursor_path);
-        outbox->offset = 0;
-        outbox->depth = 0;
-        outbox->depth_known = true;
-        outbox->ack_since_checkpoint = 0;
-        return true;
+    if (row_end <= outbox->offset || row_end != (off_t)outbox->pending_token.end) return false;
+    if (lq_settle(&outbox->legacy, &outbox->pending_token) != DQ_OK) {
+        outbox->depth_known = false;
+        return false;
     }
-    // Checkpoint in small groups to limit flash wear.  A power loss before a
-    // checkpoint only replays already-acknowledged event UIDs.
-    if (outbox->ack_since_checkpoint >= 16 && write_outbox_cursor(outbox, row_end)) {
-        outbox->ack_since_checkpoint = 0;
-    }
+    outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
+    if (outbox->depth_known && outbox->depth) outbox->depth--;
     return compact_outbox_locked(outbox, false);
 }
 
 static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_end)
 {
-    FILE *file = fopen(outbox->path, "r");
-    if (!file) return false;
-    bool ok = fseek(file, (long)outbox->offset, SEEK_SET) == 0 &&
-              fgets(line, ADD_OUTBOX_LINE_BYTES, file) != NULL;
-    long end = ok ? ftell(file) : -1;
-    if (ferror(file)) ok = false;
-    if (fclose(file) != 0) ok = false;
-    if (!ok || end <= (long)outbox->offset) return false;
-    if (!strchr(line, '\n')) {
+    if (!outbox->legacy.ready) outbox->offset = load_outbox_cursor(outbox);
+    dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
+    if (result == DQ_EMPTY) {
+        if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return false;
+    }
+    if (result != DQ_OK) {
+        outbox->depth_known = false;
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return false;
     }
-    *row_end = (off_t)end;
+    *row_end = (off_t)outbox->pending_token.end;
     return true;
 }
 
@@ -2623,7 +2653,7 @@ static bool preserve_corrupt_outbox_row(const char *line)
         }
         rotated = true;
     }
-    FILE *file = fopen(ADD_CORRUPT_OUTBOX_PATH, "a");
+    FILE *file = rel_open_append(ADD_CORRUPT_OUTBOX_PATH);
     bool ok = file && fprintf(file, "%s\n", line) > 0 &&
         fflush(file) == 0 && fsync(fileno(file)) == 0;
     if (file && fclose(file) != 0) ok = false;
@@ -2805,7 +2835,7 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
                 current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
             }
             if (current + (off_t)strlen(line) + 1 <= outbox->max_bytes) {
-                FILE *file = fopen(outbox->path, "a");
+                FILE *file = rel_open_append(outbox->path);
                 if (file) {
                     ok = fprintf(file, "%s\n", line) > 0 &&
                         fflush(file) == 0 &&
@@ -2992,7 +3022,19 @@ bool add_connector_enqueue_oracle_receipts(
 
     bool ok = add_connector_enqueue_validated_line(
         line,
-        strcmp(confirmation_path, "FIRMWARE_LIVE") == 0);
+        true);
+    // Receipt preservation has a bounded local attempt even for historical
+    // delivery. A full legacy filesystem can still drain if ADD durably takes
+    // responsibility for the Oracle proof. This caller owns no storage lock.
+    if (!ok && add_connector_is_connected()) {
+        cJSON *record = cJSON_Parse(line);
+        cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
+        char *json = cJSON_IsObject(payload) ? cJSON_PrintUnformatted(payload) : NULL;
+        if (json) ok = send_payload_and_wait_for_ack("oracle_receipt_batch", json,
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+        free(json);
+        cJSON_Delete(record);
+    }
     free(line);
     return ok;
 }
@@ -3067,7 +3109,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         }
 
         bool ok = true;
-        FILE *file = fopen(s_bulk_outbox.path, "a");
+        FILE *file = rel_open_append(s_bulk_outbox.path);
         if (!file) ok = false;
         uint32_t written = 0;
         for (size_t i = 0; ok && i < count; i++) {
@@ -3089,11 +3131,15 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         }
         if (file) {
             if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
-            fclose(file);
+            if (fclose(file) != 0) ok = false;
         }
-        s_bulk_outbox.depth += written;
+        if (ok) s_bulk_outbox.depth += written;
+        else {
+            s_bulk_outbox.depth_known = false;
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        }
         xSemaphoreGive(s_bulk_outbox.lock);
-        if (written > 0) {
+        if (ok && written > 0) {
             ESP_LOGI(
                 TAG,
                 "Durably appended %lu ADD reconcile batch(es) with one flash sync",
@@ -3116,12 +3162,14 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
 static void outbox_task(void *arg)
 {
     (void)arg;
-    uint32_t retry_ms = ADD_OUTBOX_RETRY_MS;
+    delivery_scheduler_t scheduler = {0};
     char *line = NULL;
-    uint32_t live_served = 0;
     int64_t priority_started = 0;
-    while (true) {
-        s_outbox_tick_ms = (uint32_t)monotonic_ms();
+    const qs_lane_t lanes[] = {QS_LIVE, QS_LIVE, QS_BULK, QS_BULK, QS_RECEIPTS, QS_EVIDENCE};
+    for (;;) {
+        int64_t now = monotonic_ms();
+        s_outbox_tick_ms = (uint32_t)now;
+        s_add_worker_operation = ADD_WORKER_READING;
         if (!line) line = allocate_outbox_line_buffer();
         s_outbox_buffer_ready = line != NULL;
         if (!line) {
@@ -3129,115 +3177,117 @@ static void outbox_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
             continue;
         }
+        if (!add_connector_is_connected()) {
+            s_add_worker_operation = ADD_WORKER_IDLE;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        bool background_due = false;
         if (priority_delivery_hold_active()) {
-            if (!priority_started) priority_started = monotonic_ms();
-            if (monotonic_ms() - priority_started < ADD_PRIORITY_HOLD_MS) {
+            if (!priority_started) priority_started = now;
+            if (now - priority_started < ADD_PRIORITY_HOLD_MS) {
                 vTaskDelay(pdMS_TO_TICKS(250));
                 continue;
             }
-            live_served = 4;
+            background_due = true;
         }
         priority_started = 0;
-        bool have_row = false;
-        add_outbox_t *outbox = NULL;
-        off_t row_end = 0;
-        uint32_t live_depth = 0;
-        if (s_live_outbox.lock && xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            live_depth = s_live_outbox.depth_known ? s_live_outbox.depth : 1;
-            xSemaphoreGive(s_live_outbox.lock);
+        unsigned ready = 0;
+        for (unsigned i = 0; i < 5; i++) {
+            uint32_t depth = 0;
+            if (i == 0 || i == 2) {
+                add_outbox_t *legacy = i == 0 ? &s_live_outbox : &s_bulk_outbox;
+                if (legacy->lock && xSemaphoreTake(legacy->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    if (!legacy->depth_known || legacy->depth) ready |= 1U << i;
+                    xSemaphoreGive(legacy->lock);
+                }
+            } else if (!qs_snapshot(lanes[i], &depth) || depth) ready |= 1U << i;
         }
-        outbox = live_depth > 0 && live_served < 4 ? &s_live_outbox : &s_bulk_outbox;
-        if (outbox == &s_live_outbox) live_served++;
-        else live_served = 0;
-        if (add_connector_is_connected() && outbox->lock &&
-            xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        int selected = ds_pick(&scheduler, ready, (uint64_t)now, background_due);
+        if (selected < 0) {
+            s_add_worker_operation = ADD_WORKER_IDLE;
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+        bool segmented = selected != 0 && selected != 2;
+        add_outbox_t *outbox = selected == 0 ? &s_live_outbox : &s_bulk_outbox;
+        off_t row_end = 0;
+        dq_token_t token = {0};
+        bool have_row = false;
+        if (segmented) {
+            size_t length = 0;
+            dq_result_t read = qs_peek(lanes[selected], line, ADD_OUTBOX_LINE_BYTES - 1, &length, &token);
+            have_row = read == DQ_OK;
+            if (have_row) line[length] = 0;
+            else if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        } else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
             have_row = read_outbox_row_locked(outbox, line, &row_end);
             xSemaphoreGive(outbox->lock);
         }
         if (!have_row) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            scheduler.retry_at[selected] = (uint64_t)monotonic_ms() + 1000;
             continue;
         }
-        line[strcspn(line, "\r\n")] = '\0';
+        ds_attempted(&scheduler, (unsigned)selected);
+        line[strcspn(line, "\r\n")] = 0;
         bool syntax_valid = rel_json_syntax_valid(line, strlen(line));
         cJSON *record = syntax_valid ? cJSON_Parse(line) : NULL;
         if (syntax_valid && !record) {
-            // Syntax was validated without allocation: retry temporary resource failure.
-            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
             continue;
         }
         cJSON *type = record ? cJSON_GetObjectItemCaseSensitive(record, "type") : NULL;
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
         bool valid = cJSON_IsString(type) && cJSON_IsObject(payload) &&
-            ((strcmp(type->valuestring, "attendance_batch") == 0 &&
-              attendance_payload_is_valid(payload)) ||
-             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 &&
-              oracle_receipt_payload_is_valid(payload)));
+            ((strcmp(type->valuestring, "attendance_batch") == 0 && attendance_payload_is_valid(payload)) ||
+             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 && oracle_receipt_payload_is_valid(payload)));
         char *payload_json = valid ? cJSON_PrintUnformatted(payload) : NULL;
         if (valid && !payload_json) {
             cJSON_Delete(record);
-            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
             continue;
         }
         if (!valid) {
             cJSON_Delete(record);
             free(payload_json);
-            ESP_LOGE(TAG, "Preserving and skipping a corrupt ADD %s outbox row", outbox->label);
-            if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                bool preserved = preserve_corrupt_outbox_row(line);
-                if (!preserved) {
-                    ESP_LOGE(
-                        TAG,
-                        "Corrupt-row evidence storage unavailable; retaining the original %s row",
-                        outbox->label);
-                }
-                if (preserved && !advance_outbox_locked(outbox, row_end)) {
-                    ESP_LOGE(TAG, "Could not skip corrupt ADD %s outbox row", outbox->label);
-                }
+            bool preserved = false;
+            if (!segmented && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                preserved = preserve_corrupt_outbox_row(line);
+                if (preserved && !advance_outbox_locked(outbox, row_end)) preserved = false;
                 xSemaphoreGive(outbox->lock);
             }
-            retry_ms = ADD_OUTBOX_RETRY_MS;
+            // New-format evidence must retain its generation/token provenance.
+            // Until a verified transfer is recorded, leave the source untouched.
+            if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), preserved, esp_random());
             continue;
         }
         add_attendance_settlement_ack_t attendance_ack = {0};
         bool is_attendance = strcmp(type->valuestring, "attendance_batch") == 0;
-        bool acknowledged = send_payload_and_wait_for_ack(
-            type->valuestring,
-            payload_json,
-            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
-            pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
-            NULL,
-            is_attendance ? &attendance_ack : NULL);
-        if (acknowledged && is_attendance &&
-            !attendance_settlement_matches_payload(payload_json, &attendance_ack)) {
+        s_add_worker_operation = ADD_WORKER_NETWORK;
+        bool acknowledged = send_payload_and_wait_for_ack(type->valuestring, payload_json,
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
+            NULL, is_attendance ? &attendance_ack : NULL);
+        if (acknowledged && is_attendance && !attendance_settlement_matches_payload(payload_json, &attendance_ack))
             acknowledged = false;
-        }
         cJSON_Delete(record);
         free(payload_json);
         if (acknowledged && attendance_ack.valid && attendance_ack.quarantined > 0) {
-            ESP_LOGW(
-                TAG,
-                "ADD durably quarantined %lu attendance row(s) without blocking receipt=%s outcome=%s accepted=%lu duplicates=%lu",
-                (unsigned long)attendance_ack.quarantined,
-                attendance_ack.receipt_id,
-                attendance_ack.outcome,
-                (unsigned long)attendance_ack.accepted,
-                (unsigned long)attendance_ack.duplicates);
+            ESP_LOGW(TAG, "ADD durably quarantined %lu attendance row(s) without blocking",
+                (unsigned long)attendance_ack.quarantined);
         }
-        if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            if (!advance_outbox_locked(outbox, row_end)) {
-                ESP_LOGE(TAG, "Could not advance acknowledged ADD %s attendance outbox", outbox->label);
+        s_add_worker_operation = ADD_WORKER_COMMITTING;
+        bool committed = false;
+        if (acknowledged) {
+            if (segmented) committed = qs_settle(lanes[selected], &token) == DQ_OK;
+            else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                committed = advance_outbox_locked(outbox, row_end);
+                xSemaphoreGive(outbox->lock);
             }
-            xSemaphoreGive(outbox->lock);
-            s_outbox_progress_ms = (uint32_t)monotonic_ms();
-            retry_ms = ADD_OUTBOX_RETRY_MS;
-        } else {
-            uint32_t delay_ms = retry_ms + (esp_random() % 1000U);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            retry_ms = retry_ms >= ADD_OUTBOX_RETRY_MAX_MS / 2
-                ? ADD_OUTBOX_RETRY_MAX_MS
-                : retry_ms * 2;
+            if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         }
+        if (committed) s_outbox_progress_ms = (uint32_t)monotonic_ms();
+        ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), committed, esp_random());
     }
 }
 
@@ -3503,12 +3553,14 @@ static void start_websocket(void)
         restore_outbox_if_needed(&s_live_outbox);
         s_live_outbox.offset = load_outbox_cursor(&s_live_outbox);
         (void)count_outbox_rows(&s_live_outbox);
+        if (s_live_outbox.depth_known && !s_live_outbox.depth) (void)compact_outbox_locked(&s_live_outbox, true);
         xSemaphoreGive(s_live_outbox.lock);
     }
     if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_bulk_outbox);
         s_bulk_outbox.offset = load_outbox_cursor(&s_bulk_outbox);
         (void)count_outbox_rows(&s_bulk_outbox);
+        if (s_bulk_outbox.depth_known && !s_bulk_outbox.depth) (void)compact_outbox_locked(&s_bulk_outbox, true);
         xSemaphoreGive(s_bulk_outbox.lock);
     }
     ESP_LOGI(
@@ -3637,7 +3689,11 @@ bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out)
         return false;
     }
     *depth_out = s_bulk_outbox.depth;
+    bool known = s_bulk_outbox.depth_known;
     xSemaphoreGive(s_bulk_outbox.lock);
+    uint32_t segmented = 0;
+    if (!known || !qs_snapshot(QS_BULK, &segmented) || segmented > UINT32_MAX - *depth_out) return false;
+    *depth_out += segmented;
     return true;
 }
 

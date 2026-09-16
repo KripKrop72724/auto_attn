@@ -175,6 +175,11 @@ bool add_connector_send_source_tail_acknowledged(
     uint32_t timeout_ms,
     add_source_tail_ack_t *ack_out);
 bool add_connector_enqueue_attendance(const char *payload_json);
+typedef enum {
+    ADD_WORKER_IDLE, ADD_WORKER_READING, ADD_WORKER_NETWORK,
+    ADD_WORKER_COMMITTING, ADD_WORKER_RESOURCE
+} add_worker_operation_t;
+void add_connector_report_ords_worker(add_worker_operation_t operation);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count);

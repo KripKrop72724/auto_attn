@@ -2956,6 +2956,58 @@ def test_tombstone_lookup_fails_closed_when_exact_user_id_uid_is_ambiguous(
     assert row.ords_status == "BLOCKED_IDENTITY"
 
 
+def test_durability_fault_survives_connected_heartbeat_until_verified_recovery(db: Session):
+    connector = connector_fixture(db)
+    heartbeat = {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}}
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=1,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "DEGRADED", "write_failures": 1},
+                     }))
+    db.flush()
+    assert connector.connected
+    assert connector.lifecycle_state == "DEGRADED"
+    assert connector.firmware_diagnostics["storage"]["used_bytes"] is None
+    assert connector.firmware_diagnostics_at is not None
+    # Older/missing diagnostics cannot manufacture a successful storage check.
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=2,
+                     payload=HeartbeatPayload(**heartbeat))
+    db.flush()
+    assert connector.firmware_diagnostics is None
+    assert connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=3,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "HEALTHY"},
+                     }))
+    assert connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=4,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "HEALTHY", "persistence_verified": True,
+                                     "recovery_complete": True},
+                     }))
+    db.flush()
+    assert connector.lifecycle_state == "ONLINE"
+    fault = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ESP_DURABILITY_FAULT"))
+    assert fault.state == "RESOLVED"
+
+
+def test_worker_failure_is_independent_of_network_connectivity(db: Session):
+    connector = connector_fixture(db)
+    heartbeat = {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}}
+    update_heartbeat(db, connector=connector, boot_id="worker", sequence=1,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={"workers": [
+                         {"name": "add_delivery", "state": "WAITING_RESOURCE"},
+                         {"name": "ords_delivery", "state": "RUNNING"},
+                     ]}))
+    db.flush()
+    assert connector.connected and connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="worker", sequence=2,
+                     payload=HeartbeatPayload(**heartbeat, uptime_seconds=100, diagnostics={"workers": [
+                         {"name": "add_delivery", "state": "WAITING_NETWORK", "last_activity_uptime_ms": 90_000},
+                         {"name": "ords_delivery", "state": "RUNNING", "last_activity_uptime_ms": 90_000},
+                     ]}))
+    assert connector.lifecycle_state == "ONLINE"
+
+
 def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     connector = connector_fixture(db)
     payload = HeartbeatPayload(
@@ -4570,6 +4622,43 @@ def test_oracle_receipt_batch_cannot_poison_another_connectors_event(db: Session
             DeviceAlert.state == "OPEN",
         )
     )
+
+
+def test_rejected_oracle_receipt_never_acknowledges_source_retirement(db: Session, monkeypatch):
+    owner = connector_fixture(db)
+    snapshot_user(db, owner)
+    uid = "9" * 64
+    ingest_attendance(db, connector=owner, events=[event(event_uid=uid)])
+    reporter = connector_fixture(db, hardware_id="e0:72:a1:d6:f3:29", expected_serial="OTHER")
+    db.flush()
+    committed = False
+
+    @contextmanager
+    def tracked_scope():
+        nonlocal committed
+        yield db
+        db.commit()
+        committed = True
+
+    class Socket:
+        messages = []
+
+        async def send_json(self, message):
+            assert committed
+            self.messages.append(message)
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    socket = Socket()
+    asyncio.run(add_web.handle_envelope(reporter.id, Envelope(
+        message_id="rejected-receipt", connector_id=reporter.connector_id, boot_id="receipt-test",
+        seq=1, sent_at=utc_now(), type="oracle_receipt_batch", payload={
+            "confirmation_path": "FIRMWARE_LIVE", "oracle_observed_at": utc_now().isoformat(),
+            "event_uids": [uid],
+        },
+    ), socket))
+    assert socket.messages[0]["type"] == "error"
+    assert socket.messages[0]["code"] == "ORACLE_RECEIPT_REJECTED"
+    assert not any(message["type"] == "ack" for message in socket.messages)
 
 
 def test_ords_membership_response_is_fail_closed():

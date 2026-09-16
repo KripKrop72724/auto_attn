@@ -59,6 +59,47 @@ class OtaHeartbeatPayload(BaseModel):
     last_error: str = Field(default="", max_length=64)
 
 
+class QueueDiagnostics(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    bytes: int | None = Field(default=None, ge=0)
+    records: int | None = Field(default=None, ge=0)
+    count_known: bool = False
+    oldest_pending_age_seconds: int | None = Field(default=None, ge=0)
+    last_progress_uptime_ms: int | None = Field(default=None, ge=0)
+
+
+class WorkerDiagnostics(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    state: Literal["RUNNING", "WAITING_NETWORK", "WAITING_RESOURCE", "STOPPED", "FAULT", "UNKNOWN"]
+    last_activity_uptime_ms: int | None = Field(default=None, ge=0)
+    operation: str | None = Field(default=None, max_length=80)
+    restart_count: int | None = Field(default=None, ge=0)
+
+
+class StorageDiagnostics(BaseModel):
+    total_bytes: int | None = Field(default=None, ge=0)
+    used_bytes: int | None = Field(default=None, ge=0)
+    admission_reserve_bytes: int | None = Field(default=None, ge=0)
+    write_failures: int | None = Field(default=None, ge=0)
+    durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"] = "UNKNOWN"
+    persistence_verified: bool = False
+    recovery_complete: bool = False
+    error_operation: str | None = Field(default=None, max_length=80)
+    error_code: int | None = None
+
+
+class FirmwareDiagnostics(BaseModel):
+    schema_version: Literal[1] = 1
+    storage: StorageDiagnostics | None = None
+    queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
+    workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
+    reconciliation_mode: str | None = Field(default=None, max_length=40)
+    last_light_check_uptime_ms: int | None = Field(default=None, ge=0)
+    last_tail_audit_uptime_ms: int | None = Field(default=None, ge=0)
+    source_generation: int | None = Field(default=None, ge=0)
+    committed_source_cursor: int | None = Field(default=None, ge=0)
+
+
 class HeartbeatPayload(BaseModel):
     firmware_version: str | None = None
     config_version: int = 1
@@ -71,6 +112,7 @@ class HeartbeatPayload(BaseModel):
     current_activity: str | None = None
     led_state: str | None = None
     ota: OtaHeartbeatPayload = Field(default_factory=OtaHeartbeatPayload)
+    diagnostics: FirmwareDiagnostics | None = None
     zkt: dict[str, Any] = Field(default_factory=dict)
 
 

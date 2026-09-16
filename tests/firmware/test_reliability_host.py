@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("component", ["reliability", "durable_queue", "legacy_queue"])
+@pytest.mark.parametrize("component", ["reliability", "durable_queue", "legacy_queue", "delivery_scheduler", "uid_cache", "storage_budget"])
 def test_reliability_c_regressions(tmp_path: Path, component: str) -> None:
     compiler = shutil.which(os.environ.get("CC", "cc"))
     assert compiler, "A C compiler is required for the firmware regression gate"

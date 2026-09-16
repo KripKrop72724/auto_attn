@@ -52,6 +52,8 @@ class Connector(Base):
     device_id: Mapped[str] = mapped_column(String(120), index=True)
     display_name: Mapped[str] = mapped_column(String(255))
     firmware_version: Mapped[str | None] = mapped_column(String(80))
+    firmware_diagnostics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    firmware_diagnostics_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ota_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     ota_secure_boot: Mapped[bool] = mapped_column(Boolean, default=False)
     ota_rollback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)

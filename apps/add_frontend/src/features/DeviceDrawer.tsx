@@ -5,6 +5,7 @@ import {
   relativeTime, statusPattern, useToast, type DrawerTab,
 } from '../App'
 import { Icon } from '../Icon'
+import { FirmwareHealth } from './FirmwareHealth'
 import type {
   Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceLog,
 } from '../types'
@@ -265,8 +266,11 @@ export function DeviceDrawer({
           <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
             <h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3>
-            <p>{device.zkt?.user_count ?? '—'} users · Last 15-minute reconciliation {relativeTime(device.zkt?.last_reconcile_at)}</p>
-            <dl>
+            <p>{device.zkt?.user_count ?? '—'} users{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : ` · Last full reconciliation ${relativeTime(device.zkt?.last_reconcile_at)}`}</p>
+            {device.zkt?.capabilities.source_coverage_certified ? <dl>
+              <div><dt>Source assurance</dt><dd>Certified source with append-tail verification</dd></div>
+              <div><dt>Committed source cursor</dt><dd>{device.firmware_diagnostics?.committed_source_cursor ?? device.zkt?.capabilities.source_coverage_cursor ?? 'Not reported'}</dd></div>
+            </dl> : <dl>
               <div>
                 <dt>Historical truth</dt>
                 <dd><StatusBadge state={String(device.zkt?.capabilities.history_backfill_state || 'NOT_STARTED')} /></dd>
@@ -283,8 +287,9 @@ export function DeviceDrawer({
                 <dt>Blocked windows</dt>
                 <dd>{Number(device.zkt?.capabilities.history_failed_windows || 0)}</dd>
               </div>
-            </dl>
+            </dl>}
           </article>
+          <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} />
           {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
         </div>}

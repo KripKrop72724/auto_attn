@@ -1484,7 +1484,8 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "is_attendance ? &attendance_ack : NULL" in connector
     assert "ADD durably quarantined %lu attendance row(s) without blocking" in connector
     assert "ADD_OUTBOX_RETRY_MAX_MS" in connector
-    assert "esp_random() % 1000U" in connector
+    assert "ds_complete(&scheduler" in connector
+    assert "esp_random()" in connector
 
     corrupt = connector[
         connector.index("static bool preserve_corrupt_outbox_row(") :

@@ -45,6 +45,50 @@ static bool checkpoint_valid(const dq_checkpoint_t *c)
         (c->read_segment != c->write_segment || c->read_offset <= c->write_offset) &&
         c->crc == dq_crc32(c, offsetof(dq_checkpoint_t, crc));
 }
+
+/* A crash after the retirement checkpoint but before unlink must not leak a
+ * segment forever. Only the committed read segment authorizes reclamation. */
+static bool reclaim_retired(durable_queue_t *q)
+{
+    char directory[128];
+    const char *base = strrchr(q->prefix, '/');
+    if (base) {
+        size_t n = (size_t)(base - q->prefix);
+        memcpy(directory, q->prefix, n); directory[n] = 0; ++base;
+        if (!n) strcpy(directory, "/");
+    } else { strcpy(directory, "."); base = q->prefix; }
+    DIR *dir = opendir(directory);
+    if (!dir) return false;
+    bool ok = true;
+    unsigned reclaimed = 0;
+    size_t prefix_length = strlen(base);
+    struct dirent *entry;
+    while (reclaimed < 8) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno) ok = false; break; }
+        if (strncmp(entry->d_name, base, prefix_length) ||
+            strlen(entry->d_name) != prefix_length + 10 ||
+            strcmp(entry->d_name + prefix_length + 8, ".q")) continue;
+        uint32_t segment = 0;
+        bool valid = true;
+        for (unsigned i = 0; i < 8; ++i) {
+            char c = entry->d_name[prefix_length + i];
+            unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) : 16U;
+            if (digit > 15) { valid = false; break; }
+            segment = (segment << 4) | digit;
+        }
+        if (!valid || segment >= q->checkpoint.read_segment) continue;
+        char path[160];
+        if (!name(q, segment, path) || (remove(path) != 0 && errno != ENOENT)) {
+            ok = false; break;
+        }
+        ++reclaimed;
+    }
+    if (closedir(dir) != 0) ok = false;
+    return ok;
+}
 dq_result_t dq_open(durable_queue_t *q, const char *prefix, dq_port_t port)
 {
     if (!q || !prefix || strlen(prefix) >= sizeof(q->prefix) || !port.load || !port.commit) return DQ_IO;
@@ -72,6 +116,7 @@ dq_result_t dq_open(durable_queue_t *q, const char *prefix, dq_port_t port)
         dq_checkpoint_t initial = {.version = DQ_CHECKPOINT_VERSION, .next_sequence = 1};
         if (!commit(q, initial)) return DQ_IO;
     }
+    if (!reclaim_retired(q)) return DQ_IO;
     q->ready = true;
     return DQ_OK;
 }
@@ -135,7 +180,8 @@ dq_result_t dq_peek(durable_queue_t *q, void *data, size_t capacity, size_t *len
         fread(header, 1, sizeof(header), f) == sizeof(header);
     if (ok && decode32(header) == DQ_MAGIC && decode32(header + 4) == 0 &&
         segment < c->write_segment) {
-        fclose(f); segment++; offset = 0;
+        if (fclose(f) != 0) return DQ_IO;
+        segment++; offset = 0;
         if (!name(q, segment, path)) return DQ_IO;
         f = fopen(path, "rb");
         if (!f) return DQ_IO;
@@ -172,7 +218,7 @@ dq_result_t dq_settle(durable_queue_t *q, const dq_token_t *token)
         bool sealed = old && fseek(old, (long)next.read_offset, SEEK_SET) == 0 &&
             fread(seal, 1, sizeof(seal), old) == sizeof(seal) &&
             decode32(seal) == DQ_MAGIC && decode32(seal + 4) == 0;
-        if (old) fclose(old);
+        if (old && fclose(old) != 0) return DQ_IO;
         if (!sealed) return DQ_STALE;
     }
     FILE *f = fopen(path, "rb");
@@ -190,7 +236,8 @@ dq_result_t dq_settle(durable_queue_t *q, const dq_token_t *token)
         next.write_offset = 0; next.read_offset = 0;
     }
     if (!commit(q, next)) return DQ_IO;
-    if (token->segment < next.read_segment && name(q, token->segment, path)) (void)remove(path);
-    if (retired < next.read_segment && name(q, retired, path)) (void)remove(path);
+    if (retired != next.read_segment && !reclaim_retired(q)) {
+        q->ready = false; return DQ_IO;
+    }
     return DQ_OK;
 }

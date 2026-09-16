@@ -475,6 +475,53 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         resolve_alert(session, connector, code="USER_SNAPSHOT_TRUNCATED")
 
 
+def apply_firmware_diagnostics(session: Session, connector: Connector, payload: HeartbeatPayload) -> None:
+    diagnostics = payload.diagnostics
+    connector.firmware_diagnostics = diagnostics.model_dump(mode="json") if diagnostics else None
+    connector.firmware_diagnostics_at = utc_now() if diagnostics else None
+    storage = diagnostics.storage if diagnostics else None
+    storage_failed = storage is not None and storage.durability in {"DEGRADED", "FULL"}
+    storage_verified = bool(storage and storage.durability == "HEALTHY"
+                            and storage.persistence_verified and storage.recovery_complete)
+    workers = diagnostics.workers if diagnostics else []
+    def activity_fresh(row) -> bool:
+        return (payload.uptime_seconds is not None and row.last_activity_uptime_ms is not None
+                and 0 <= payload.uptime_seconds * 1000 - row.last_activity_uptime_ms <= 90_000)
+
+    workers_failed = any(
+        row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
+        or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
+        for row in workers
+    )
+    workers_verified = (
+        {row.name for row in workers} >= {"add_delivery", "ords_delivery"}
+        and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
+    )
+    for code, failed, verified, message in (
+        ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
+         "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
+        ("ESP_DELIVERY_WORKER_FAULT", workers_failed, workers_verified,
+         "An attendance delivery worker is stopped or waiting for resources."),
+    ):
+        if failed:
+            upsert_alert(session, connector, code=code, severity="HIGH", message=message,
+                         details={"diagnostics_schema_version": 1})
+        elif verified:
+            resolve_alert(session, connector, code=code)
+            if connector.last_error_code == code:
+                connector.last_error_code = None
+                connector.last_error_message = None
+        unresolved = None if verified and not failed else session.scalar(select(DeviceAlert.id).where(
+            DeviceAlert.connector_id == connector.id, DeviceAlert.code == code,
+            DeviceAlert.state == "OPEN",
+        ))
+        if failed or unresolved:
+            if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
+                connector.lifecycle_state = "DEGRADED"
+            connector.last_error_code = code
+            connector.last_error_message = message
+
+
 def update_heartbeat(
     session: Session,
     *,
@@ -764,6 +811,7 @@ def update_heartbeat(
         if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
             connector.last_error_code = None
             connector.last_error_message = None
+    apply_firmware_diagnostics(session, connector, payload)
     apply_ota_heartbeat_diagnostics(
         session,
         connector=connector,
@@ -4402,6 +4450,8 @@ def serialize_connector(connector: Connector) -> dict:
         "state": connector.lifecycle_state,
         "connected": connector.connected,
         "firmware_version": connector.firmware_version,
+        "firmware_diagnostics": connector.firmware_diagnostics,
+        "firmware_diagnostics_at": connector.firmware_diagnostics_at,
         "ota_capable": connector.ota_capable,
         "ota_state": connector.ota_state,
         "ota_partition_layout": connector.ota_partition_layout,

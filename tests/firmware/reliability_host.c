@@ -5,6 +5,17 @@
 
 int main(void)
 {
+    FILE *append = rel_open_append("legacy-append"); assert(append);
+    assert(fputs("settled\n", append) >= 0); assert(fclose(append) == 0);
+    append = rel_open_append("legacy-append"); assert(append);
+    assert(fputs("interrupted", append) >= 0); assert(fclose(append) == 0);
+    assert(rel_open_append("legacy-append") == NULL);
+    append = fopen("legacy-append", "rb"); assert(append);
+    char preserved[64] = {0};
+    assert(fread(preserved, 1, sizeof(preserved), append) == 19);
+    assert(strcmp(preserved, "settled\ninterrupted") == 0);
+    assert(fclose(append) == 0);
+    assert(remove("legacy-append") == 0);
     const char *valid[] = {"{}", "[]", "null", "-12.30e+4", "{\"a\":[true,false,null,\"x\\n\",{}]}", " \"\\u0041\" "};
     const char *invalid[] = {"", "{", "[1,]", "{\"a\":}", "01", "+1", "1.", "1e", "true false", "\"x\n\"", "\"\\x\"", "[}"};
     for (size_t i = 0; i < sizeof(valid)/sizeof(*valid); i++) assert(rel_json_syntax_valid(valid[i], strlen(valid[i])));
@@ -14,6 +25,9 @@ int main(void)
 
     size_t shape;
     assert(!rel_live_frame_size(13, 0, &shape));
+    assert(!rel_live_frame_size(36, 0, &shape));
+    assert(rel_live_frame_size(36, 12, &shape) && shape == 12);
+    assert(rel_live_frame_size(36, 36, &shape) && shape == 36);
     assert(!rel_live_frame_size(64, 0, &shape));
     assert(rel_live_frame_size(64, 32, &shape) && shape == 32);
     assert(!rel_live_frame_size(65, 32, &shape));

@@ -117,6 +117,41 @@ export interface ZktDevice {
   next_restart_at: string | null
 }
 
+export interface FirmwareDiagnostics {
+  schema_version: 1
+  storage?: {
+    total_bytes?: number | null
+    used_bytes?: number | null
+    admission_reserve_bytes?: number | null
+    write_failures?: number | null
+    durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
+    persistence_verified: boolean
+    recovery_complete: boolean
+    error_operation?: string | null
+    error_code?: number | null
+  } | null
+  queues: Array<{
+    name: string
+    bytes?: number | null
+    records?: number | null
+    count_known: boolean
+    oldest_pending_age_seconds?: number | null
+    last_progress_uptime_ms?: number | null
+  }>
+  workers: Array<{
+    name: string
+    state: 'RUNNING' | 'WAITING_NETWORK' | 'WAITING_RESOURCE' | 'STOPPED' | 'FAULT' | 'UNKNOWN'
+    last_activity_uptime_ms?: number | null
+    operation?: string | null
+    restart_count?: number | null
+  }>
+  reconciliation_mode?: string | null
+  last_light_check_uptime_ms?: number | null
+  last_tail_audit_uptime_ms?: number | null
+  source_generation?: number | null
+  committed_source_cursor?: number | null
+}
+
 export interface Device {
   connector_id: string
   hardware_id: string
@@ -127,6 +162,8 @@ export interface Device {
   state: DeviceState
   connected: boolean
   firmware_version: string | null
+  firmware_diagnostics?: FirmwareDiagnostics | null
+  firmware_diagnostics_at?: string | null
   comm_key_capable?: boolean
   comm_key_revision?: number
   ota_capable?: boolean

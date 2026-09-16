@@ -3260,6 +3260,14 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "rejected": rejected,
                 "confirmation_path": receipt_batch.confirmation_path,
             }
+            if rejected:
+                # A generic acknowledgement must not retire firmware proof
+                # that this connector was not authorized to settle.
+                ack_payload = {
+                    "type": "error", "message_id": envelope.message_id,
+                    "code": "ORACLE_RECEIPT_REJECTED",
+                    "detail": "Receipt ownership could not be verified; retain source evidence.",
+                }
         elif envelope.type == "reconcile_anchor":
             anchor = ReconciliationAnchorRequest.model_validate(envelope.payload)
             job = apply_reconciliation_anchor(db, connector=connector, payload=anchor)

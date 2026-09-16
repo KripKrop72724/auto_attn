@@ -2,6 +2,7 @@
 #include "durable_queue.h"
 
 typedef enum { QS_LIVE, QS_BULK, QS_ORDS, QS_BLOCKED, QS_RECEIPTS, QS_EVIDENCE, QS_COUNT } qs_lane_t;
+typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY } qs_admission_t;
 typedef struct {
     size_t total_bytes, used_bytes;
     bool available, bulk_paused;
@@ -10,6 +11,7 @@ typedef struct {
 } qs_health_t;
 bool qs_init(void);
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length);
+dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy);
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token);
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token);
 bool qs_snapshot(qs_lane_t lane, uint32_t *depth);

@@ -1,4 +1,5 @@
 #include "queue_store.h"
+#include "storage_budget.h"
 #include <errno.h>
 #include <stdio.h>
 #include "esp_spiffs.h"
@@ -6,10 +7,11 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 
-typedef struct { durable_queue_t queue; SemaphoreHandle_t mutex; qs_lane_t lane; } lane_t;
+typedef struct { durable_queue_t queue; SemaphoreHandle_t mutex; qs_lane_t lane; qs_admission_t admission; } lane_t;
 static lane_t lanes[QS_COUNT];
 static SemaphoreHandle_t budget_lock;
 static qs_health_t health;
+static storage_budget_t budget;
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe"};
 static int load(void *arg, dq_checkpoint_t *checkpoint)
 {
@@ -38,28 +40,30 @@ static bool measure(void)
 {
     health.available = esp_spiffs_info(NULL, &health.total_bytes, &health.used_bytes) == ESP_OK && health.total_bytes;
     if (!health.available) return false;
-    if (health.used_bytes * 100 >= health.total_bytes * 60) health.bulk_paused = true;
-    else if (health.used_bytes * 100 < health.total_bytes * 55) health.bulk_paused = false;
+    (void)storage_budget_admit(&budget, health.total_bytes, health.used_bytes, 0, SB_RECOVERY);
+    health.bulk_paused = budget.bulk_paused;
     return true;
 }
 static bool admit(void *arg, size_t bytes)
 {
     lane_t *lane = arg;
     if (!measure()) return false;
-    size_t ceiling = health.total_bytes * 70 / 100;
-    size_t live_reserve = 512 * 1024, recovery_reserve = 512 * 1024;
-    if (lane->lane == QS_BULK || lane->lane == QS_BLOCKED) {
-        if (health.bulk_paused) return false;
-        ceiling = ceiling > live_reserve + recovery_reserve ? ceiling - live_reserve - recovery_reserve : 0;
-    } else if (lane->lane == QS_LIVE || lane->lane == QS_ORDS) {
-        ceiling = ceiling > recovery_reserve ? ceiling - recovery_reserve : 0;
-    }
-    return health.used_bytes <= ceiling && bytes <= ceiling - health.used_bytes;
+    sb_class_t kind = lane->admission == QS_ADMIT_HISTORICAL ? SB_HISTORICAL :
+        lane->admission == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
+    return storage_budget_admit(&budget, health.total_bytes, health.used_bytes, bytes, kind);
 }
 static bool lock(qs_lane_t lane)
 {
     return (unsigned)lane < QS_COUNT && lanes[lane].mutex &&
         xSemaphoreTake(lanes[lane].mutex, pdMS_TO_TICKS(1000)) == pdTRUE;
+}
+static dq_result_t reopen(lane_t *lane)
+{
+    if (lane->queue.ready) return DQ_OK;
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "/storage/%s", names[lane->lane]);
+    dq_port_t port = {load, commit, admit, lane};
+    return dq_open(&lane->queue, prefix, port);
 }
 bool qs_init(void)
 {
@@ -70,20 +74,27 @@ bool qs_init(void)
         lane_t *lane = &lanes[i]; lane->lane = (qs_lane_t)i;
         if (!lane->mutex) lane->mutex = xSemaphoreCreateMutex();
         if (!lock((qs_lane_t)i)) { ok = false; continue; }
-        char prefix[32]; snprintf(prefix, sizeof(prefix), "/storage/%s", names[i]);
-        dq_port_t port = {load, commit, admit, lane};
-        if (dq_open(&lane->queue, prefix, port) != DQ_OK) ok = false;
+        if (reopen(lane) != DQ_OK) ok = false;
         xSemaphoreGive(lane->mutex);
     }
     return ok;
 }
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 {
+    qs_admission_t policy = lane == QS_BULK || lane == QS_BLOCKED ? QS_ADMIT_HISTORICAL :
+        lane == QS_RECEIPTS || lane == QS_EVIDENCE ? QS_ADMIT_RECOVERY : QS_ADMIT_LIVE;
+    return qs_append_with_policy(lane, data, length, policy);
+}
+dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy)
+{
+    if ((unsigned)policy > QS_ADMIT_RECOVERY) return DQ_IO;
     if (!lock(lane)) return DQ_IO;
+    lanes[lane].admission = policy;
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
     }
-    dq_result_t result = dq_append(&lanes[lane].queue, data, length);
+    dq_result_t result = reopen(&lanes[lane]);
+    if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
     if (result != DQ_OK) { health.failures++; health.last_error = errno; }
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
@@ -92,14 +103,16 @@ dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
 {
     if (!lock(lane)) return DQ_IO;
-    dq_result_t result = dq_peek(&lanes[lane].queue, data, capacity, length, token);
+    dq_result_t result = reopen(&lanes[lane]);
+    if (result == DQ_OK) result = dq_peek(&lanes[lane].queue, data, capacity, length, token);
     xSemaphoreGive(lanes[lane].mutex);
     return result;
 }
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
 {
     if (!lock(lane)) return DQ_IO;
-    dq_result_t result = dq_settle(&lanes[lane].queue, token);
+    dq_result_t result = reopen(&lanes[lane]);
+    if (result == DQ_OK) result = dq_settle(&lanes[lane].queue, token);
     xSemaphoreGive(lanes[lane].mutex);
     return result;
 }

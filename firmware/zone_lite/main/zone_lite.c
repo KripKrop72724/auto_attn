@@ -1,3 +1,4 @@
+#include "uid_cache.h"
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -54,6 +55,7 @@
 #include "reliability.h"
 #include "runtime_checkpoint.h"
 #include "legacy_queue.h"
+#include "queue_store.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -170,7 +172,7 @@
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
 #define CANCELLED_COMMANDS_PATH STORAGE_BASE "/add_cancelled.txt"
 #define MAX_USERS 2048
-#define SEEN_HASH_CAPACITY 262144
+#define SEEN_UID_CAPACITY 65536
 #define MAX_EVENT_JSON 1024
 #define ADD_RECONCILE_BATCH_EVENTS 10
 #define ADD_RECONCILE_COMMIT_BATCHES 32
@@ -381,6 +383,7 @@ typedef struct {
 typedef struct {
     uint16_t session_id;
     uint16_t reply_id;
+    uint8_t live_record_size;
 } zk_context_t;
 
 typedef struct {
@@ -457,8 +460,9 @@ typedef struct {
 } attendance_event_t;
 
 static char g_device_serial[80] = "";
-static uint64_t *g_seen_hashes;
-static size_t g_seen_count;
+static uid_cache_t g_seen_cache;
+static uint8_t g_seen_occupied[SEEN_UID_CAPACITY / 8];
+static SemaphoreHandle_t g_seen_lock;
 static uint32_t g_last_authenticated_zkt_ip;
 static int32_t g_last_synced_attendance_count = -1;
 static int64_t g_last_full_truth_reconcile_epoch;
@@ -2661,66 +2665,27 @@ static void build_event_uid(attendance_event_t *event)
     sha256_hex(material, event->event_uid);
 }
 
-static uint64_t seen_hash_uid(const char *uid)
-{
-    uint64_t hash = 1469598103934665603ULL;
-    while (*uid != '\0') {
-        hash ^= (uint8_t)*uid++;
-        hash *= 1099511628211ULL;
-    }
-    return hash == 0 ? 1 : hash;
-}
-
 static bool seen_contains(const char *uid)
 {
-    if (g_seen_hashes == NULL) {
+    if (!g_seen_lock || xSemaphoreTake(g_seen_lock, pdMS_TO_TICKS(200)) != pdTRUE)
         return false;
-    }
-    uint64_t hash = seen_hash_uid(uid);
-    size_t slot = hash % SEEN_HASH_CAPACITY;
-    for (size_t i = 0; i < SEEN_HASH_CAPACITY; i++) {
-        uint64_t current = g_seen_hashes[slot];
-        if (current == 0) {
-            return false;
-        }
-        if (current == hash) {
-            return true;
-        }
-        slot = (slot + 1) % SEEN_HASH_CAPACITY;
-    }
-    return true;
+    bool found = uid_cache_contains(&g_seen_cache, uid);
+    xSemaphoreGive(g_seen_lock);
+    return found;
 }
 
 static bool seen_add(const char *uid)
 {
-    if (g_seen_hashes == NULL) {
+    if (!g_seen_lock || xSemaphoreTake(g_seen_lock, pdMS_TO_TICKS(200)) != pdTRUE)
         return false;
-    }
-    if (g_seen_count + 1 >= (SEEN_HASH_CAPACITY * 7 / 10)) {
-        ESP_LOGW(TAG, "Seen UID cache near capacity; increase SEEN_HASH_CAPACITY");
-        return false;
-    }
-    uint64_t hash = seen_hash_uid(uid);
-    size_t slot = hash % SEEN_HASH_CAPACITY;
-    for (size_t i = 0; i < SEEN_HASH_CAPACITY; i++) {
-        uint64_t current = g_seen_hashes[slot];
-        if (current == hash) {
-            return true;
-        }
-        if (current == 0) {
-            g_seen_hashes[slot] = hash;
-            g_seen_count++;
-            return true;
-        }
-        slot = (slot + 1) % SEEN_HASH_CAPACITY;
-    }
-    ESP_LOGW(TAG, "Seen UID cache full");
-    return false;
+    bool stored = uid_cache_add(&g_seen_cache, uid);
+    xSemaphoreGive(g_seen_lock);
+    return stored;
 }
 
 static bool append_line(const char *path, const char *line)
 {
-    FILE *f = fopen(path, "a");
+    FILE *f = rel_open_append(path);
     if (f == NULL) {
         ESP_LOGE(TAG, "Could not open %s for append", path);
         return false;
@@ -2774,13 +2739,18 @@ static void load_seen_from_file(const char *path)
     size_t loaded = 0;
     while (fgets(line, sizeof(line), f) != NULL) {
         char uid[65];
+        if (!strchr(line, '\n')) {
+            /* A fragment containing an event_uid is not a preserved record.
+             * Consume an oversized row before inspecting the next boundary. */
+            int ch;
+            while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+            continue;
+        }
         line[strcspn(line, "\r\n")] = '\0';
-        if (extract_event_uid(line, uid)) {
-            seen_add(uid);
-            loaded++;
+        if (rel_json_syntax_valid(line, strlen(line)) && extract_event_uid(line, uid)) {
+            if (seen_add(uid)) loaded++;
         } else if (strlen(line) == 64) {
-            seen_add(line);
-            loaded++;
+            if (seen_add(line)) loaded++;
         }
         if (loaded > 0 && (loaded % 250) == 0) {
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -2809,24 +2779,19 @@ static bool file_has_nonempty_line(const char *path)
 
 static void restore_pending_backup_if_needed(void)
 {
-    struct stat pending_stat;
-    struct stat backup_stat;
-    bool pending_exists = stat(PENDING_PATH, &pending_stat) == 0;
-    bool backup_exists = stat(PENDING_BACKUP_PATH, &backup_stat) == 0;
-    if (!backup_exists) {
-        return;
-    }
-    if (!pending_exists) {
-        if (rename(PENDING_BACKUP_PATH, PENDING_PATH) == 0) {
-            ESP_LOGW(TAG, "Restored pending outbox from backup after interrupted rewrite");
-        } else {
-            ESP_LOGE(TAG, "Could not restore pending outbox backup errno=%d", errno);
+    struct stat st;
+    if (stat(PENDING_PATH, &st) == 0) return;
+    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    const char *generations[] = {PENDING_BACKUP_PATH, PENDING_TMP_PATH};
+    for (size_t i = 0; i < 2; i++) {
+        if (stat(generations[i], &st) == 0) {
+            if (rename(generations[i], PENDING_PATH) != 0)
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            return;
         }
-        return;
+        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
     }
-    if (remove(PENDING_BACKUP_PATH) != 0 && errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not remove stale pending outbox backup errno=%d", errno);
-    }
+    // Older and temporary files remain independent recoverable generations.
 }
 
 static bool restore_blocked_backup_if_needed(void)
@@ -2869,7 +2834,7 @@ static void recover_valid_unclassified_blocked_events(void)
     FILE *in = fopen(BLOCKED_PATH, "r");
     if (!in) return;
     FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
-    FILE *pending = fopen(PENDING_PATH, "a");
+    FILE *pending = rel_open_append(PENDING_PATH);
     if (!kept || !pending) {
         if (kept) fclose(kept);
         if (pending) fclose(pending);
@@ -2895,9 +2860,9 @@ static void recover_valid_unclassified_blocked_events(void)
     if (ferror(in)) ok = false;
     if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
     if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
-    fclose(in);
-    fclose(kept);
-    fclose(pending);
+    if (fclose(in) != 0) ok = false;
+    if (fclose(kept) != 0) ok = false;
+    if (fclose(pending) != 0) ok = false;
 
     if (!ok) {
         (void)remove(BLOCKED_RECOVERY_TMP_PATH);
@@ -2956,7 +2921,7 @@ static bool recover_blocked_events_from_snapshot(
         return true;
     }
     FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
-    FILE *pending = fopen(PENDING_PATH, "a");
+    FILE *pending = rel_open_append(PENDING_PATH);
     if (!kept || !pending) {
         if (kept) fclose(kept);
         if (pending) fclose(pending);
@@ -3034,9 +2999,9 @@ static bool recover_blocked_events_from_snapshot(
     if (ferror(in)) ok = false;
     if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
     if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
-    fclose(in);
-    fclose(kept);
-    fclose(pending);
+    if (fclose(in) != 0) ok = false;
+    if (fclose(kept) != 0) ok = false;
+    if (fclose(pending) != 0) ok = false;
     if (ok) {
         (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
         if (rename(BLOCKED_PATH, BLOCKED_RECOVERY_BACKUP_PATH) != 0 ||
@@ -3069,13 +3034,15 @@ static bool recover_blocked_events_from_snapshot(
 
 static void storage_init(void)
 {
-    g_seen_hashes = heap_caps_calloc(SEEN_HASH_CAPACITY, sizeof(uint64_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (g_seen_hashes == NULL) {
-        g_seen_hashes = calloc(SEEN_HASH_CAPACITY, sizeof(uint64_t));
+    g_seen_lock = xSemaphoreCreateMutex();
+    g_seen_cache.capacity = SEEN_UID_CAPACITY;
+    g_seen_cache.occupied = g_seen_occupied;
+    g_seen_cache.keys = heap_caps_calloc(SEEN_UID_CAPACITY, 32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (g_seen_cache.keys == NULL) {
+        g_seen_cache.keys = calloc(SEEN_UID_CAPACITY, 32);
     }
-    if (g_seen_hashes == NULL) {
-        ESP_LOGE(TAG, "Could not allocate event UID cache");
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!g_seen_cache.keys || !g_seen_lock) {
+        ESP_LOGW(TAG, "Volatile UID cache unavailable; durable deliveries may replay");
     }
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
@@ -3095,6 +3062,7 @@ static void storage_init(void)
             "Continuing in fail-safe online-delivery mode without erasing attendance storage");
         return;
     }
+    if (!qs_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     restore_pending_backup_if_needed();
     (void)restore_blocked_backup_if_needed();
     recover_valid_unclassified_blocked_events();
@@ -3102,7 +3070,7 @@ static void storage_init(void)
     load_seen_from_file(BLOCKED_PATH);
     load_seen_from_file(ACKED_PATH);
     led_status_set_backlog(file_has_nonempty_line(PENDING_PATH));
-    ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_count);
+    ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_cache.count);
 }
 
 static const char *oracle_capture_type(const char *capturetype)
@@ -3481,8 +3449,7 @@ static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype,
     FILE *pending_file,
-    FILE *blocked_file,
-    bool publish_add)
+    FILE *blocked_file)
 {
     if (seen_contains(event->event_uid)) {
         return ENQUEUE_DUPLICATE;
@@ -3497,12 +3464,6 @@ static enqueue_result_t enqueue_event_to_files(
         if (!append_line_to_open_file(blocked_file, BLOCKED_PATH, json)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
-            if (recover_live_event_after_storage_error(
-                    event,
-                    capturetype,
-                    "blocked-identity append failure")) {
-                return ENQUEUE_ACKNOWLEDGED;
-            }
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
@@ -3514,12 +3475,6 @@ static enqueue_result_t enqueue_event_to_files(
         if (!append_line_to_open_file(pending_file, PENDING_PATH, json)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
-            if (recover_live_event_after_storage_error(
-                    event,
-                    capturetype,
-                    "pending-event append failure")) {
-                return ENQUEUE_ACKNOWLEDGED;
-            }
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_set_backlog(true);
@@ -3529,14 +3484,6 @@ static enqueue_result_t enqueue_event_to_files(
     }
     if (!pending_file && !blocked_file && !seen_add(event->event_uid)) {
         ESP_LOGW(TAG, "Event persisted but volatile dedup cache could not record %s", event->event_uid);
-    }
-    if (publish_add && !add_send_attendance_event(event, capturetype)) {
-        ESP_LOGE(TAG, "Attendance persisted for ORDS but could not be added to the independent ADD outbox");
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
-    } else if (publish_add) {
-        // A fully durable live path proves that a transient local resource or
-        // storage failure recovered; do not leave the operator-facing LED red.
-        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
     }
     free(json);
     return result;
@@ -3555,8 +3502,18 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
         }
         return ENQUEUE_STORAGE_ERROR;
     }
-    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL, true);
+    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL);
     xSemaphoreGive(g_storage_lock);
+    // ADD capacity waits and acknowledgement recovery must never own the local
+    // storage lock. Local capture has already settled or explicitly failed.
+    if (result == ENQUEUE_STORAGE_ERROR && recover_live_event_after_storage_error(
+            event, capturetype, "local append failure")) return ENQUEUE_ACKNOWLEDGED;
+    if (result == ENQUEUE_PENDING || result == ENQUEUE_BLOCKED) {
+        if (!add_send_attendance_event(event, capturetype)) {
+            ESP_LOGE(TAG, "Attendance remains locally preserved; ADD delivery requires retry");
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        }
+    }
     return result;
 }
 
@@ -4961,11 +4918,11 @@ static bool reconcile_attendance_dump(
         xSemaphoreGive(g_ords_outbox_gate);
         return false;
     }
-    FILE *pending_file = fopen(PENDING_PATH, "a");
+    FILE *pending_file = rel_open_append(PENDING_PATH);
     if (pending_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", PENDING_PATH);
     }
-    FILE *blocked_file = fopen(BLOCKED_PATH, "a");
+    FILE *blocked_file = rel_open_append(BLOCKED_PATH);
     if (blocked_file == NULL) {
         ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
     }
@@ -5015,7 +4972,7 @@ static bool reconcile_attendance_dump(
                 identity_mapped_count++;
             }
             enqueue_result_t result = enqueue_event_to_files(
-                &event, capturetype, pending_file, blocked_file, false);
+                &event, capturetype, pending_file, blocked_file);
             if (result == ENQUEUE_PENDING) {
                 added++;
                 pending++;
@@ -6867,7 +6824,7 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
     led_status_fault(LED_STATUS_LOCAL_FAILURE);
     ESP_LOGW(
         TAG,
-        "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable errno=%d; original outbox remains intact",
+        "ORDS delivery deferred at %s because a storage resource was unavailable errno=%d; preserved records remain recoverable",
         stage,
         error_code);
     if (g_ords_storage_last_log_ms == 0 ||
@@ -6876,7 +6833,7 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
         snprintf(
             message,
             sizeof(message),
-            "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable (errno=%d). The original pending outbox remains unchanged; delivery retry is backed off without deleting the queue; local durability remains degraded.",
+            "ORDS delivery deferred at %s because a storage resource was unavailable (errno=%d). Unsettled records remain preserved; delivery retry is backed off and local durability remains degraded.",
             stage,
             error_code);
         (void)add_connector_log(
@@ -6891,6 +6848,49 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
 static legacy_queue_t g_legacy_pending;
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
 static bool g_legacy_probe_head;
+static bool g_ords_buffer_failed;
+static bool g_prefer_segmented_ords;
+static int64_t g_segmented_ords_retry_ms;
+
+/* Compatibility reader: one request per slice, with no storage mutex held
+ * across transport or receipt delivery. New-format production remains gated. */
+static bool oracle_drain_segmented_slice(void)
+{
+    int64_t now = uptime_ms();
+    if (now < g_segmented_ords_retry_ms) return false;
+    char *event = (char *)g_legacy_drain_buffer;
+    size_t length = 0;
+    dq_token_t token;
+    dq_result_t read = qs_peek(QS_ORDS, event, DQ_MAX_RECORD_BYTES, &length, &token);
+    if (read == DQ_EMPTY) return false;
+    if (read != DQ_OK || memchr(event, 0, length)) {
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        g_segmented_ords_retry_ms = now + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
+        return false;
+    }
+    event[length] = 0;
+    add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+    oracle_delivery_result_t delivery = oracle_send_live(event);
+    char *events[] = {event};
+    bool settled = delivery == ORACLE_DELIVERY_ACKED &&
+        add_enqueue_json_receipts(events, 1, "FIRMWARE_LIVE");
+    char *quarantine = delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
+        ? oracle_mark_permanent_rejection(event) : NULL;
+    add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    if ((quarantine || delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) &&
+        g_storage_lock && xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        settled = append_line(quarantine ? BLOCKED_PATH : CORRUPT_ORDS_PATH,
+                              quarantine ? quarantine : event);
+        xSemaphoreGive(g_storage_lock);
+    }
+    free(quarantine);
+    if (settled && qs_settle(QS_ORDS, &token) != DQ_OK) {
+        settled = false;
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    }
+    g_segmented_ords_retry_ms = settled ? 0 : now + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
+    return true;
+}
 
 static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)
 {
@@ -6928,12 +6928,21 @@ static void oracle_drain_pending(bool live_first)
         g_legacy_drain_buffer = heap_caps_malloc(
             100 * sizeof(*g_legacy_drain_buffer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!g_legacy_drain_buffer) {
+            g_ords_buffer_failed = true;
+            add_connector_report_ords_worker(ADD_WORKER_RESOURCE);
             ords_drain_preserved_deferred("allocate", ENOMEM);
             return;
         }
+        g_ords_buffer_failed = false;
     }
+    add_connector_report_ords_worker(ADD_WORKER_READING);
     if (!g_ords_outbox_gate ||
         xSemaphoreTake(g_ords_outbox_gate, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    g_prefer_segmented_ords = !g_prefer_segmented_ords;
+    if (g_prefer_segmented_ords && oracle_drain_segmented_slice()) {
+        xSemaphoreGive(g_ords_outbox_gate);
+        return;
+    }
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(g_ords_outbox_gate);
         return;
@@ -6958,11 +6967,17 @@ static void oracle_drain_pending(bool live_first)
     }
     if (!count && read == DQ_EMPTY) {
         dq_result_t reclaim = lq_reclaim(&g_legacy_pending);
+        if (reclaim == DQ_OK) restore_pending_backup_if_needed();
         if (reclaim != DQ_OK && reclaim != DQ_EMPTY) read = reclaim;
     }
     xSemaphoreGive(g_storage_lock);
     if (!count) {
-        if (read == DQ_EMPTY) led_status_set_backlog(false);
+        if (read == DQ_EMPTY) {
+            if (!oracle_drain_segmented_slice()) {
+                uint32_t depth = 0;
+                if (qs_snapshot(QS_ORDS, &depth) && depth == 0) led_status_set_backlog(false);
+            }
+        }
         else ords_drain_preserved_deferred("legacy-read", EIO);
         xSemaphoreGive(g_ords_outbox_gate);
         return;
@@ -6971,6 +6986,7 @@ static void oracle_drain_pending(bool live_first)
     // At most 100 events and one completed ORDS request per slice. No storage
     // lock is held during ORDS waits or durable ADD receipt enqueue/backpressure.
     oracle_delivery_result_t delivery;
+    add_connector_report_ords_worker(ADD_WORKER_NETWORK);
     if (count == 1) delivery = oracle_send_live(events[0]);
     else delivery = oracle_send_bulk(events, count) ? ORACLE_DELIVERY_ACKED : ORACLE_DELIVERY_RETRYABLE;
     bool settled = delivery == ORACLE_DELIVERY_ACKED &&
@@ -6981,6 +6997,7 @@ static void oracle_drain_pending(bool live_first)
     char *quarantine = count == 1 && delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
         ? oracle_mark_permanent_rejection(events[0]) : NULL;
     const char *failure_stage = NULL;
+    add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
         else if (count == 1 && delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW)
@@ -6998,6 +7015,7 @@ static void oracle_drain_pending(bool live_first)
             if (!failure_stage) {
                 g_ords_drain_retry_not_before_ms = 0;
                 dq_result_t reclaimed = lq_reclaim(&g_legacy_pending);
+                if (reclaimed == DQ_OK) restore_pending_backup_if_needed();
                 if (reclaimed != DQ_OK && reclaimed != DQ_STALE) failure_stage = "legacy-retire";
             }
         }
@@ -7012,6 +7030,7 @@ static void ords_uploader_task(void *arg)
 {
     (void)arg;
     while (true) {
+        add_connector_report_ords_worker(g_ords_buffer_failed ? ADD_WORKER_RESOURCE : ADD_WORKER_IDLE);
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
             oracle_drain_pending(true);
         }
@@ -7146,17 +7165,27 @@ static bool discover_zkt(uint32_t *selected_ip, uint32_t skip_ip)
     return false;
 }
 
-static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users)
+static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users, uint8_t *wire_hint)
 {
     size_t record_size = 0;
     // A complete singleton frame establishes its wire shape. Batched frames
     // without an independently negotiated shape must be recovered from truth.
-    if (!rel_live_frame_size(len, 0, &record_size)) {
+    if (!wire_hint || !rel_live_frame_size(len, *wire_hint, &record_size)) {
         g_force_truth_reconcile = true;
         (void)add_connector_log("WARN", "live", "LIVE_PACKET_FORMAT_REJECTED",
             "Truncated or ambiguous live frame; source recovery required");
         return 0;
     }
+    // Validate the whole frame before accepting any record. The wire hint is
+    // scoped to this authenticated connection and never inferred from user rows.
+    for (size_t offset = 0; offset < len; offset += record_size) {
+        rel_live_record_t checked;
+        if (!rel_parse_live_record(data + offset, record_size, &checked)) {
+            g_force_truth_reconcile = true;
+            return 0;
+        }
+    }
+    *wire_hint = (uint8_t)record_size;
     size_t observed = 0;
     while (len >= record_size) {
         rel_live_record_t row;
@@ -7860,7 +7889,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 live_events_since_sync += process_live_packet(
                     packet + sizeof(zk_header_t),
                     top.length - sizeof(zk_header_t),
-                    users);
+                    users,
+                    &ctx.live_record_size);
                 add_connector_set_activity("LIVE_CAPTURE");
             }
             free(packet);

@@ -1,9 +1,31 @@
 #include "reliability.h"
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+FILE *rel_open_append(const char *path)
+{
+    FILE *file = fopen(path, "a+b");
+    if (!file) return NULL;
+    bool ok = fseek(file, 0, SEEK_END) == 0;
+    long length = ok ? ftell(file) : -1;
+    if (length < 0) ok = false;
+    if (ok && length > 0) {
+        ok = fseek(file, -1, SEEK_END) == 0 && fgetc(file) == '\n';
+        if (!ok && !ferror(file)) errno = EBADMSG;
+    }
+    if (ok) ok = fseek(file, 0, SEEK_END) == 0;
+    if (!ok) {
+        int error = errno;
+        (void)fclose(file);
+        errno = error;
+        return NULL;
+    }
+    return file;
+}
 
 rel_scan_result_t rel_count_rows(FILE *file, uint32_t *count)
 {
@@ -125,7 +147,9 @@ bool rel_live_frame_size(size_t length, size_t hint, size_t *record_size)
         *record_size = hint;
         return true;
     }
-    if (length != 12 && length != 32 && length != 36 && length != 52) return false;
+    // 36 bytes could be one extended record or three 12-byte records.
+    // Length alone cannot establish that format for a new session.
+    if (length != 12 && length != 32 && length != 52) return false;
     *record_size = length;
     return true;
 }
