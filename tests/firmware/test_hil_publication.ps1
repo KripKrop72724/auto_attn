@@ -7,6 +7,28 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $publish = Join-Path $repo 'deploy/add/publish-firmware.ps1'
 try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
+. (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
+$contractImage = Join-Path $root 'contract.bin'
+foreach ($version in @('2.5.4', '2.6.0')) {
+    $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
+    $marker = "ZONE_STORAGE_CONTRACT_V1:${mode}:READ=2:LANES=3F:COMPAT=2.5.4"
+    [IO.File]::WriteAllText($contractImage, $marker + [char]0)
+    $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
+    if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
+    $other = if ($version -eq '2.6.0') { '2.5.4' } else { '2.6.0' }
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $other | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Wrong writer mode accepted' }
+    [IO.File]::WriteAllText($contractImage, $marker + [char]0 + $marker)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $version | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Ambiguous contract accepted' }
+}
+[IO.File]::WriteAllText($contractImage, 'old-application')
+if ($null -ne (Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.5.3')) { throw 'Old signing changed' }
+$rejected = $false
+try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.0' | Out-Null } catch { $rejected = $true }
+if (-not $rejected) { throw 'Missing contract accepted' }
 $image = Join-Path $source 'zone-lite-2.6.0.bin'
 [IO.File]::WriteAllText($image, 'fixture, not deployable firmware')
 $manifest = @{version='2.6.0';image_name='zone-lite-2.6.0.bin';image_sha256=(Get-FileHash $image).Hash.ToLowerInvariant();image_size=(Get-Item $image).Length;git_sha=('a'*40);application_sha256=('c'*64)}

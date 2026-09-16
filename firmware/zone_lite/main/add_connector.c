@@ -3,6 +3,7 @@
 #include "ota_manager.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -38,6 +39,8 @@
 #include "reliability.h"
 #include "legacy_queue.h"
 #include "queue_store.h"
+#include "storage_upgrade.h"
+#include "worker_retry.h"
 #include "delivery_scheduler.h"
 #include "nvs.h"
 #include "led_status.h"
@@ -225,11 +228,15 @@ static int64_t s_last_transport_restart_ms;
 static volatile uint32_t s_priority_delivery_until_ms;
 
 static TaskHandle_t s_outbox_task_handle;
+static atomic_bool s_background_ack_waiting;
+static atomic_uint_least32_t s_background_ack_since_ms;
 static TaskHandle_t s_heartbeat_task_handle;
 static volatile uint32_t s_outbox_tick_ms;
 static volatile uint32_t s_outbox_progress_ms;
 static volatile bool s_outbox_buffer_ready;
 static volatile bool s_worker_start_failed;
+static worker_retry_t s_outbox_retry, s_heartbeat_retry;
+static volatile uint32_t s_ords_start_attempts;
 static volatile bool s_outboxes_initialized;
 static volatile uint32_t s_ords_worker_tick_ms;
 static volatile bool s_ords_worker_started;
@@ -401,6 +408,26 @@ static bool evidence_identity(const cJSON *payload, evidence_receipt_t *out, boo
     return strlen(out->digest) == 64;
 }
 
+/* Takes ownership of payload on every outcome. An incomplete envelope is retryable. */
+static cJSON *message_envelope(cJSON *payload, const char *type, const char *message_id,
+    const char *connector_id, const char *boot_id, uint64_t seq, const char *sent_at)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root || !cJSON_AddStringToObject(root, "schema_version", "2") ||
+        !cJSON_AddStringToObject(root, "message_id", message_id) ||
+        !cJSON_AddStringToObject(root, "connector_id", connector_id) ||
+        !cJSON_AddStringToObject(root, "boot_id", boot_id) ||
+        !cJSON_AddNumberToObject(root, "seq", (double)seq) ||
+        !cJSON_AddStringToObject(root, "sent_at", sent_at) ||
+        !cJSON_AddStringToObject(root, "type", type) ||
+        !cJSON_AddItemToObject(root, "payload", payload)) {
+        cJSON_Delete(payload);
+        cJSON_Delete(root);
+        return NULL;
+    }
+    return root;
+}
+
 static bool send_payload(
     const char *type,
     const char *payload_json,
@@ -459,15 +486,12 @@ static bool send_payload(
     time(&now);
     char sent_at[32];
     iso_utc(now, sent_at);
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "schema_version", "2");
-    cJSON_AddStringToObject(root, "message_id", message_id);
-    cJSON_AddStringToObject(root, "connector_id", zone_config_get()->connector_id);
-    cJSON_AddStringToObject(root, "boot_id", s_boot_id);
-    cJSON_AddNumberToObject(root, "seq", (double)seq);
-    cJSON_AddStringToObject(root, "sent_at", sent_at);
-    cJSON_AddStringToObject(root, "type", type);
-    cJSON_AddItemToObject(root, "payload", payload);
+    cJSON *root = message_envelope(payload, type, message_id, zone_config_get()->connector_id,
+        s_boot_id, seq, sent_at);
+    if (!root) {
+        xSemaphoreGive(s_send_lock);
+        return false;
+    }
     if (wait_for_ack) {
         while (xSemaphoreTake(s_ack_sem, 0) == pdTRUE) {
         }
@@ -502,8 +526,20 @@ static bool send_payload_and_wait_for_ack(
     add_reconcile_chunk_ack_t *reconcile_ack_out,
     add_attendance_settlement_ack_t *attendance_ack_out)
 {
+    bool background = s_outbox_task_handle && xTaskGetCurrentTaskHandle() == s_outbox_task_handle;
+    if (background) {
+        atomic_store(&s_background_ack_since_ms, (uint32_t)monotonic_ms());
+        atomic_store(&s_background_ack_waiting, true);
+    } else if (atomic_load(&s_background_ack_waiting) &&
+        (uint32_t)((uint32_t)monotonic_ms() - atomic_load(&s_background_ack_since_ms)) < 90000U) {
+        // A higher-priority direct sender must not reacquire the ACK mutex
+        // before the scheduled background attempt gets service. Returning a
+        // retry leaves its local record or authoritative source pending.
+        return false;
+    }
     if (!s_ack_wait_lock ||
         xSemaphoreTake(s_ack_wait_lock, lock_timeout) != pdTRUE) {
+        if (background) atomic_store(&s_background_ack_waiting, false);
         return false;
     }
     char message_id[80] = {0};
@@ -527,6 +563,7 @@ static bool send_payload_and_wait_for_ack(
         xSemaphoreGive(s_lock);
     }
     xSemaphoreGive(s_ack_wait_lock);
+    if (background) atomic_store(&s_background_ack_waiting, false);
     return acknowledged;
 }
 
@@ -2092,6 +2129,12 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     }
 }
 
+void add_connector_report_ords_start(bool started, uint32_t attempts)
+{
+    s_ords_start_attempts = attempts;
+    if (!started) s_ords_worker_started = false;
+}
+
 void add_connector_report_ords_worker(add_worker_operation_t operation)
 {
     s_ords_worker_operation = operation;
@@ -2118,6 +2161,9 @@ static bool append_worker_diagnostic(cJSON *workers, const char *name,
     return cJSON_AddStringToObject(worker, "name", name) &&
         cJSON_AddStringToObject(worker, "state", state) &&
         cJSON_AddStringToObject(worker, "operation", operation_name) &&
+        cJSON_AddNumberToObject(worker, "restart_attempts", !strcmp(name, "add_delivery")
+            ? (s_outbox_retry.total ? s_outbox_retry.total - 1U : 0U)
+            : (s_ords_start_attempts ? s_ords_start_attempts - 1U : 0U)) &&
         (!started || cJSON_AddNumberToObject(worker, "last_activity_uptime_ms", (double)(now - age)));
 }
 
@@ -2143,7 +2189,10 @@ static void append_firmware_diagnostics(cJSON *payload)
     const char *led = led_status_current_name();
     const char *durability = measured != ESP_OK || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
         ? "DEGRADED" : "UNKNOWN";
-    if (!cJSON_AddStringToObject(storage, "durability", durability)) goto failed;
+    if (!cJSON_AddStringToObject(storage, "durability", durability) ||
+        !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
+        !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
+        !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready())) goto failed;
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE) ||
         !append_worker_diagnostic(workers, "ords_delivery", s_ords_worker_started,
@@ -2435,10 +2484,11 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
     return true;
 }
 
-static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end)
+static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end, bool custody)
 {
     if (row_end <= outbox->offset || row_end != (off_t)outbox->pending_token.end) return false;
-    if (lq_settle(&outbox->legacy, &outbox->pending_token) != DQ_OK) {
+    if ((custody ? lq_settle_evidence(&outbox->legacy, &outbox->pending_token) :
+        lq_settle(&outbox->legacy, &outbox->pending_token)) != DQ_OK) {
         outbox->depth_known = false;
         return false;
     }
@@ -2865,6 +2915,10 @@ static void refresh_capacity_deadline_on_progress(
 static bool add_connector_enqueue_validated_line_with_policy(const char *line, bool live, qs_admission_t policy)
 {
     if (!line) return false;
+    if (storage_upgrade_segmented_writes()) {
+        qs_lane_t lane = policy == QS_ADMIT_RECOVERY ? QS_RECEIPTS : live ? QS_LIVE : QS_BULK;
+        return qs_append_with_policy(lane, line, strlen(line), policy) == DQ_OK;
+    }
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
@@ -3106,6 +3160,16 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         return false;
     }
 
+    if (storage_upgrade_segmented_writes()) {
+        for (size_t i = 0; i < count; ++i) {
+            bool live = false;
+            char *line = attendance_outbox_record_line(payloads[i], &live);
+            bool ok = line && !live && qs_append_with_policy(QS_BULK, line, strlen(line), QS_ADMIT_HISTORICAL) == DQ_OK;
+            free(line);
+            if (!ok) return false; // Partial durable batches may replay idempotently.
+        }
+        return true;
+    }
     size_t required_bytes = 0;
     for (size_t i = 0; i < count; i++) {
         if (!payloads[i]) return false;
@@ -3298,7 +3362,7 @@ static void outbox_task(void *arg)
             continue;
         }
         ds_attempted(&scheduler, (unsigned)selected);
-        bool syntax_valid = !memchr(line, 0, raw_length) && rel_json_syntax_valid(line, raw_length);
+        bool syntax_valid = (segmented || !legacy_token.evidence_required) && !memchr(line, 0, raw_length) && rel_json_syntax_valid(line, raw_length);
         cJSON *record = syntax_valid ? cJSON_Parse(line) : NULL;
         if (syntax_valid && !record) {
             ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
@@ -3340,7 +3404,7 @@ static void outbox_task(void *arg)
             if (preserved) {
                 if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
                 else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                    preserved = advance_outbox_locked(outbox, row_end);
+                    preserved = advance_outbox_locked(outbox, row_end, true);
                     xSemaphoreGive(outbox->lock);
                 } else preserved = false;
             }
@@ -3368,7 +3432,7 @@ static void outbox_task(void *arg)
         if (acknowledged) {
             if (segmented) committed = qs_settle(lanes[selected], &token) == DQ_OK;
             else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                committed = advance_outbox_locked(outbox, row_end);
+                committed = advance_outbox_locked(outbox, row_end, false);
                 xSemaphoreGive(outbox->lock);
             }
             if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -3381,19 +3445,13 @@ static void outbox_task(void *arg)
 static void delivery_supervisor_task(void *arg)
 {
     (void)arg;
-    uint32_t attempts = 0;
-    int64_t window = monotonic_ms();
     for (;;) {
-        if (monotonic_ms() - window >= 10 * 60 * 1000) {
-            attempts = 0;
-            window = monotonic_ms();
-        }
-        if (s_client && s_outboxes_initialized && (!s_outbox_task_handle || !s_heartbeat_task_handle) && attempts < 3) {
-            attempts++;
-            if (!s_heartbeat_task_handle &&
+        uint32_t now = (uint32_t)monotonic_ms();
+        if (s_client && s_outboxes_initialized) {
+            if (!s_heartbeat_task_handle && worker_retry_allow(&s_heartbeat_retry, now) &&
                 xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, &s_heartbeat_task_handle) != pdPASS)
                 s_heartbeat_task_handle = NULL;
-            if (!s_outbox_task_handle &&
+            if (!s_outbox_task_handle && worker_retry_allow(&s_outbox_retry, now) &&
                 xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, &s_outbox_task_handle) != pdPASS)
                 s_outbox_task_handle = NULL;
             s_worker_start_failed = !s_outbox_task_handle || !s_heartbeat_task_handle;
@@ -3713,6 +3771,7 @@ bool add_connector_is_connected(void)
 bool add_connector_boot_health_ready(void)
 {
     bool ready = false;
+    if (!storage_upgrade_ready()) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         time_t now = time(NULL);
         bool authenticated_stability_elapsed =
@@ -3732,7 +3791,9 @@ bool add_connector_boot_health_ready(void)
             (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
         ready = s_connected
             && s_outbox_task_handle && s_heartbeat_task_handle && s_outbox_buffer_ready
-            && !s_worker_start_failed
+            && !s_worker_start_failed && s_ords_worker_started
+            && s_ords_worker_operation != ADD_WORKER_RESOURCE
+            && (uint32_t)((uint32_t)monotonic_ms() - s_ords_worker_tick_ms) < 90000U
             && (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) < 90000U
             && identity_ready
             && s_zkt.online

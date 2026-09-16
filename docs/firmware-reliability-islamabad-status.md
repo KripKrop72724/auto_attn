@@ -178,3 +178,49 @@ lost server transition acknowledgements without clearing the journal. Actual C h
 tests inject NVS, transport, descriptor, image verification, boot-selection and
 completion failures. These tests do not certify a physical upgrade or rollback.
 The predecessor compatibility guard is still required before segmented activation.
+
+
+## Compatibility guard, worker recovery, and fragmented legacy recovery
+
+The candidate writer now requires a checksummed compatibility capability and the
+matching secure-boot predecessor image in the other OTA slot. The compatibility
+mode continues legacy writes and reads every segmented lane. Host tests run the
+actual ESP adapter with NVS, wrong-version, wrong-slot and digest failures. Both
+compile modes have built with ESP-IDF 5.5.3, but no physical upgrade has occurred.
+The signing script now verifies a compiled storage-contract marker before key access;
+the signed manifest binds read/write formats and the compatibility version. ADD
+checks fresh healthy compatibility telemetry and matching successful boot evidence
+at preview, assignment and download. Production execution remains unperformed.
+
+Delivery task startup uses retained handles and three attempts per rolling ten
+minutes. A healthy capture task survives a delivery-task startup failure. The
+acknowledgement lock gives a waiting background worker a turn before direct
+senders can reacquire it; the actual wrapper has a 100,000-attempt host regression.
+
+Legacy partial/oversized rows now transfer bounded raw fragments into durable ADD
+custody. Versioned checkpoints distinguish continuation bytes from attendance;
+ordinary delivery cannot settle fragments. Interrupted custody/checkpoint writes
+replay exact bytes. Tests include oversized rows, reboot between fragments, valid
+looking suffixes, failed custody and concurrent append. Transport envelope fields
+also reject every cJSON allocation failure in the ESP-IDF sanitizer matrix.
+
+Storage LED faults remain latched across timer expiry and unrelated network status.
+Verified storage recovery and comprehensive telemetry are still unfinished; this
+change does not assert recovered health or authorize publication.
+
+ADD inspection on 2026-09-16 found production 2.5.2 and the existing Quetta-only HIL
+2.5.3. Islamabad firmware has not been published or installed. No soak or production
+acceptance result is claimed by this checkpoint.
+
+
+The recovery/worker checkpoint passed 444 local backend, firmware and companion
+tests plus ESP-IDF 5.5.3. Seven additional signed-contract/predecessor tests reject
+missing acceptance, wrong hashes/partitions, stale telemetry and revoked predecessors.
+The publication fixture verifies legacy signing compatibility and rejects missing,
+ambiguous or wrong-mode compiled storage markers. These fixture packages are not
+production artifacts. The final exact-commit CI and release qualification remain
+required.
+
+The expanded checkpoint passes 451 tests locally and the firmware build. Queue
+initialization now retries missing local resources without requiring a reboot;
+segmented admission revalidates the durable storage instance before creating data.

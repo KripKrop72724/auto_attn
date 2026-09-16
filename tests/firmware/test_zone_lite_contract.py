@@ -346,8 +346,8 @@ def test_runtime_failures_self_heal_and_heartbeat_reports_the_real_led():
     assert "led_status_fault(LED_STATUS_FATAL)" not in runtime_before_app_main
     assert "LED_STATUS_LOCAL_FAILURE" in runtime_before_app_main
     assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" not in runtime_before_app_main
-    assert "runtime_start_failed" in app_main
-    assert "esp_restart();" in app_main
+    assert "worker_retry_allow(&ords_retry, now)" in app_main
+    assert "esp_restart();" not in app_main
     assert "expire_recoverable_fault" in led
     assert 'return "LOCAL_FAILURE";' in led
     assert 'cJSON_AddStringToObject(payload, "led_state", led_status_current_name());' in connector
@@ -912,7 +912,7 @@ def test_blocked_identity_recovery_requires_terminal_and_identity_provenance():
         'cJSON_AddStringToObject(root, "cnic", user->cnic)'
     )
     assert "output && append_line(PENDING_PATH, output)" in recovery
-    assert recovery.index("append_line(PENDING_PATH, output)") < recovery.index("settle_blocked_locked(&token)")
+    assert recovery.index("append_line(PENDING_PATH, output)") < recovery.index("settle_blocked_locked(&token, false)")
 
 
 def test_blocked_identity_recovery_uses_bounded_persistent_reads():
@@ -1488,7 +1488,7 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
         connector.index("void add_connector_init(")
     ]
     assert worker.index("add_connector_transfer_queue_evidence(") < worker.index(
-        "advance_outbox_locked(outbox, row_end)"
+        "advance_outbox_locked(outbox, row_end, true)"
     )
     assert "if (preserved)" in worker
     assert "!memchr(line, 0, raw_length)" in worker

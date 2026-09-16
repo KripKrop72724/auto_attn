@@ -71,7 +71,7 @@ def hil_session(monkeypatch, tmp_path):
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         release = ota.FirmwareRelease(
-            release_id="ordered-hil", version="2.6.0", git_sha="a" * 40,
+            release_id="ordered-hil", version="2.5.99", git_sha="a" * 40,
             image_sha256="b" * 64, image_size=1024, signing_key_id="production-key",
             partition_layout=ota.OTA_LAYOUT, minimum_bootstrap_version="2.2.0",
             storage_name="hil/firmware.bin", manifest_signature="test-signature", state="HIL_ONLY",

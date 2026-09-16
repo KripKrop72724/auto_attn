@@ -1,4 +1,5 @@
 #include "queue_store.h"
+#include "storage_upgrade.h"
 #include "storage_budget.h"
 #include <errno.h>
 #include <dirent.h>
@@ -147,13 +148,15 @@ bool qs_init(void)
 {
     if (!budget_lock) budget_lock = xSemaphoreCreateMutex();
     if (!budget_lock) return false;
-    if (!ensure_storage_generation()) return false;
     bool ok = true;
     for (unsigned i = 0; i < QS_COUNT; i++) {
         lane_t *lane = &lanes[i]; lane->lane = (qs_lane_t)i;
         if (!lane->mutex) lane->mutex = xSemaphoreCreateMutex();
         if (!lock((qs_lane_t)i)) { ok = false; continue; }
-        if (reopen(lane) != DQ_OK) ok = false;
+        if (xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            if (!ensure_storage_generation() || reopen(lane) != DQ_OK) ok = false;
+            xSemaphoreGive(budget_lock);
+        } else ok = false;
         xSemaphoreGive(lane->mutex);
     }
     return ok;
@@ -166,13 +169,13 @@ dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 }
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy)
 {
-    if ((unsigned)policy > QS_ADMIT_RECOVERY) return DQ_IO;
+    if (!storage_upgrade_segmented_writes() || (unsigned)policy > QS_ADMIT_RECOVERY) return DQ_IO;
     if (!lock(lane)) return DQ_IO;
     lanes[lane].admission = policy;
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
     }
-    dq_result_t result = reopen(&lanes[lane]);
+    dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
     if (result != DQ_OK) {
         health.failures++;

@@ -36,7 +36,8 @@ from zk_add.db import Base
 from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import ensure_utc, utc_now
+from zk_add.storage_contract import COMPAT_MARKER, COMPAT_VERSION, validate_storage_contract
 
 OTA_LAYOUT = "zone-lite-ota-v1"
 HIL_MARKER = ".hil-only.json"
@@ -293,6 +294,45 @@ def _decode_scope_token(token: str) -> dict[str, Any]:
     return payload
 
 
+def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, connector: Connector) -> str | None:
+    try:
+        contract = validate_storage_contract(release.manifest or {}, release.version)
+    except ValueError:
+        return "STORAGE_CONTRACT_INVALID"
+    if not contract or contract["write_format"] != 2:
+        return None
+    if not _versions_match(connector.firmware_version, COMPAT_VERSION):
+        return "COMPATIBILITY_FIRMWARE_REQUIRED"
+    reported = connector.firmware_diagnostics_at
+    storage = (connector.firmware_diagnostics or {}).get("storage") or {}
+    if (reported is None or not 0 <= (utc_now() - ensure_utc(reported)).total_seconds() <= 45 or
+            storage.get("upgrade_ready") is not True or storage.get("upgrade_contract") != COMPAT_MARKER or
+            storage.get("upgrade_error") or storage.get("durability") != "HEALTHY" or
+            storage.get("persistence_verified") is not True or storage.get("recovery_complete") is not True):
+        return "COMPATIBILITY_RECOVERY_NOT_VERIFIED"
+    # Require the latest successful, digest-checked boot, not any old version claim.
+    accepted = session.execute(select(FirmwareEvent, FirmwareDeployment, FirmwareRelease)
+        .join(FirmwareDeployment, FirmwareEvent.deployment_id == FirmwareDeployment.id)
+        .join(FirmwareRelease, FirmwareDeployment.release_id == FirmwareRelease.id)
+        .where(FirmwareDeployment.connector_id == connector.id, FirmwareEvent.state == "SUCCEEDED")
+        .order_by(FirmwareEvent.id.desc()).limit(1)).first()
+    if accepted is None:
+        return "COMPATIBILITY_ACCEPTANCE_MISSING"
+    event, deployment, predecessor = accepted
+    details = event.details or {}
+    try:
+        predecessor_contract = validate_storage_contract(predecessor.manifest or {}, predecessor.version)
+    except ValueError:
+        predecessor_contract = None
+    if (deployment.status != "SUCCEEDED" or predecessor.state not in {"AVAILABLE", "HIL_ONLY"} or
+            predecessor.version != COMPAT_VERSION or not predecessor_contract or
+            details.get("image_sha256") != _application_sha256(predecessor) or
+            not _versions_match(details.get("running_version"), COMPAT_VERSION) or
+            details.get("running_partition") not in {"ota_0", "ota_1"}):
+        return "COMPATIBILITY_ACCEPTANCE_MISMATCH"
+    return None
+
+
 def _campaign_scope(
     session: Session,
     *,
@@ -339,6 +379,8 @@ def _campaign_scope(
         )
         if ordered_target and not target_matches(ordered_target, connector):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
+        if not reason:
+            reason = _storage_predecessor_exclusion(session, release, connector)
         if reason:
             excluded.append((connector, reason))
         else:
@@ -482,6 +524,7 @@ def sync_release_store(session: Session) -> None:
             continue
         signature = manifest_path.with_name("manifest.sig").read_text(encoding="ascii").strip()
         _verify_manifest(manifest, signature)
+        validate_storage_contract(manifest, str(manifest.get("version", "")))
         image_name = os.path.basename(str(manifest["image_name"]))
         image = manifest_path.parent / image_name
         digest = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -635,6 +678,8 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         return None
     if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
+        return None
+    if _storage_predecessor_exclusion(session, release, connector):
         return None
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         return None
@@ -1143,6 +1188,9 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
                 raise ValueError("HIL firmware release is unavailable.")
             if connector is None or connector.hardware_id.lower() != target:
                 raise ValueError("HIL firmware grant target mismatch.")
+    connector = session.get(Connector, grant.connector_id)
+    if connector is None or _storage_predecessor_exclusion(session, release, connector):
+        raise ValueError("Firmware storage predecessor is no longer eligible.")
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()
     if root not in image.parents or not image.is_file():

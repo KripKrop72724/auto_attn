@@ -1,4 +1,6 @@
 #include "uid_cache.h"
+#include "storage_upgrade.h"
+#include "worker_retry.h"
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -2700,7 +2702,12 @@ static bool seen_add(const char *uid)
 
 static bool append_line_policy(const char *path, const char *line, qs_admission_t policy)
 {
-    if (!path || !line || !qs_local_begin(policy, strlen(line) + 1)) return false;
+    if (!path || !line) return false;
+    if (storage_upgrade_segmented_writes() && (!strcmp(path, PENDING_PATH) || !strcmp(path, BLOCKED_PATH))) {
+        return qs_append_with_policy(!strcmp(path, PENDING_PATH) ? QS_ORDS : QS_BLOCKED,
+            line, strlen(line), policy) == DQ_OK;
+    }
+    if (!qs_local_begin(policy, strlen(line) + 1)) return false;
     errno = 0;
     FILE *f = rel_open_append(path);
     bool ok = f && fputs(line, f) >= 0 && fputc('\n', f) != EOF && fflush(f) == 0;
@@ -2844,9 +2851,10 @@ static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *
     return result;
 }
 
-static bool settle_blocked_locked(const lq_token_t *token)
+static bool settle_blocked_locked(const lq_token_t *token, bool custody)
 {
-    if (lq_settle(&g_legacy_blocked, token) != DQ_OK) return false;
+    if ((custody ? lq_settle_evidence(&g_legacy_blocked, token) :
+        lq_settle(&g_legacy_blocked, token)) != DQ_OK) return false;
     dq_result_t retired = lq_reclaim(&g_legacy_blocked);
     if (retired == DQ_OK) return restore_blocked_backup_if_needed();
     return retired == DQ_STALE;
@@ -2864,7 +2872,7 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         return read == DQ_EMPTY;
     }
     size_t length = token.end - token.offset;
-    bool syntax_valid = !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
+    bool syntax_valid = !token.evidence_required && !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
     cJSON *root = syntax_valid ? cJSON_Parse(line) : NULL;
     if (syntax_valid && !root) { xSemaphoreGive(g_storage_lock); return false; }
     const cJSON *user_id = root ? cJSON_GetObjectItemCaseSensitive(root, "user_id") : NULL;
@@ -2891,7 +2899,7 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
     char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
     ok = output && append_line(PENDING_PATH, output);
-    if (ok) ok = settle_blocked_locked(&token);
+    if (ok) ok = settle_blocked_locked(&token, false);
     free(output); cJSON_Delete(root);
     if (ok && recovered_out) *recovered_out = 1;
     if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
@@ -2899,6 +2907,8 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     return ok;
 }
+
+static bool g_queue_store_ready;
 
 static void storage_init(void)
 {
@@ -2930,7 +2940,9 @@ static void storage_init(void)
             "Continuing in fail-safe online-delivery mode without erasing attendance storage");
         return;
     }
-    if (!qs_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!storage_upgrade_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    g_queue_store_ready = qs_init();
+    if (!g_queue_store_ready) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     restore_pending_backup_if_needed();
     (void)restore_blocked_backup_if_needed();
     load_seen_from_file(PENDING_PATH);
@@ -6815,7 +6827,7 @@ static void oracle_drain_pending(bool live_first)
         events[count] = g_legacy_drain_buffer[count];
         read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
         if (read != DQ_OK) break;
-        bool binary = memchr(events[count], 0, tokens[count].end - tokens[count].offset) != NULL;
+        bool binary = tokens[count].evidence_required || memchr(events[count], 0, tokens[count].end - tokens[count].offset) != NULL;
         if (binary && count) break;
         scan.checkpoint.offset = tokens[count].end;
         count++;
@@ -6872,7 +6884,9 @@ static void oracle_drain_pending(bool live_first)
                 // The outbox gate excludes other consumers. Prior successful
                 // commits in this batch only advance the checkpoint generation.
                 tokens[i].generation = g_legacy_pending.checkpoint.generation;
-                if (lq_settle(&g_legacy_pending, &tokens[i]) != DQ_OK) {
+                if ((delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW
+                    ? lq_settle_evidence(&g_legacy_pending, &tokens[i])
+                    : lq_settle(&g_legacy_pending, &tokens[i])) != DQ_OK) {
                     failure_stage = "legacy-commit";
                     break;
                 }
@@ -6918,7 +6932,7 @@ static void blocked_evidence_slice(void)
         return;
     }
     line[length] = 0;
-    bool syntax = !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
+    bool syntax = (segmented || !legacy_token.evidence_required) && !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
     cJSON *root = syntax ? cJSON_Parse(line) : NULL;
     if (syntax && !root) { add_connector_report_ords_worker(ADD_WORKER_RESOURCE); return; }
     const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
@@ -6938,7 +6952,7 @@ static void blocked_evidence_slice(void)
     if (preserved) {
         if (segmented) preserved = qs_settle(QS_BLOCKED, &segmented_token) == DQ_OK;
         else if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-            preserved = settle_blocked_locked(&legacy_token);
+            preserved = settle_blocked_locked(&legacy_token, true);
             xSemaphoreGive(g_storage_lock);
         } else preserved = false;
         if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -9112,14 +9126,16 @@ void app_main(void)
         return;
     }
     nvs_load_runtime_state();
-    g_storage_lock = xSemaphoreCreateMutex();
-    g_ords_http_lock = xSemaphoreCreateMutex();
-    g_ords_outbox_gate = xSemaphoreCreateMutex();
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        if (!g_storage_lock) g_storage_lock = xSemaphoreCreateMutex();
+        if (!g_ords_http_lock) g_ords_http_lock = xSemaphoreCreateMutex();
+        if (!g_ords_outbox_gate) g_ords_outbox_gate = xSemaphoreCreateMutex();
+        if (g_storage_lock && g_ords_http_lock && g_ords_outbox_gate) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     if (!g_storage_lock || !g_ords_http_lock || !g_ords_outbox_gate) {
-        ESP_LOGE(TAG, "Could not create durable storage or ORDS coordination locks");
-        led_status_set(LED_STATUS_RECOVERY_REBOOT);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_restart();
+        ESP_LOGE(TAG, "Could not create storage coordination locks; preserving data and remaining inert");
+        led_status_fault(LED_STATUS_FATAL);
         return;
     }
     add_connector_init();
@@ -9141,38 +9157,29 @@ void app_main(void)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     add_connector_set_zkt(&g_add_zkt);
     add_connector_start();
-    bool runtime_start_failed = false;
-    // Preserve the proven 2.4.x task footprint. COMM Key recovery is serialized
-    // through the gateway task so an OTA candidate never needs another internal-
-    // RAM stack before it can authenticate the staged terminal configuration.
-    if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(
-            TAG,
-            "Could not start ORDS outbox uploader task (internal=%u largest=%u)",
-            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        runtime_start_failed = true;
-    }
-    if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(
-            TAG,
-            "Could not start Zone Lite gateway task (internal=%u largest=%u)",
-            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        runtime_start_failed = true;
-    }
-    ESP_LOGI(
-        TAG,
-        "Runtime task allocation complete internal=%u largest=%u aggregate=%u",
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-        (unsigned)esp_get_free_heap_size());
-    if (runtime_start_failed) {
-        // Running with only half of the attendance pipeline is unsafe. Task
-        // allocation pressure is normally transient, and a controlled reboot
-        // also lets the OTA rollback gate reject a bad candidate.
-        led_status_set(LED_STATUS_RECOVERY_REBOOT);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_restart();
+    // Retain handles and retry startup from the existing app task. Delivery
+    // allocation failure must not reboot a healthy capture task repeatedly.
+    TaskHandle_t ords_handle = NULL, gateway_handle = NULL;
+    worker_retry_t ords_retry = {0}, gateway_retry = {0};
+    for (;;) {
+        uint32_t now = (uint32_t)uptime_ms();
+        if (!gateway_handle && worker_retry_allow(&gateway_retry, now)) {
+            if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, &gateway_handle) != pdPASS) {
+                gateway_handle = NULL;
+                ESP_LOGE(TAG, "Capture worker startup deferred: largest internal block=%u",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            }
+        }
+        if (!ords_handle && worker_retry_allow(&ords_retry, now)) {
+            if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, &ords_handle) != pdPASS) {
+                ords_handle = NULL;
+                ESP_LOGE(TAG, "ORDS worker startup deferred: largest internal block=%u",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            }
+            add_connector_report_ords_start(ords_handle != NULL, ords_retry.total);
+        }
+        if (!g_queue_store_ready) g_queue_store_ready = qs_init();
+        if (!gateway_handle || !ords_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

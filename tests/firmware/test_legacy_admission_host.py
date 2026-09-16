@@ -23,6 +23,11 @@ def test_legacy_append_shares_reserves_and_releases_budget_on_every_failure(tmp_
 #include <string.h>
 #include <unistd.h>
 #define ESP_OK 0
+#define PENDING_PATH "pending"
+#define BLOCKED_PATH "blocked"
+static bool storage_upgrade_segmented_writes(void) { return false; }
+dq_result_t qs_append_with_policy(qs_lane_t lane,const void *data,size_t length,qs_admission_t policy)
+{ (void)lane;(void)data;(void)length;(void)policy;assert(false);return DQ_IO; }
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
 #define ESP_LOGE(...) ((void)0)

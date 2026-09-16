@@ -258,3 +258,41 @@ with tempfile.TemporaryDirectory() as directory:
         "-lm", "-o", str(executable),
     ], check=True)
     subprocess.run([str(executable)], check=True)
+
+# Every allocation in the actual transport envelope must fail closed.
+envelope = connector[connector.index("static cJSON *message_envelope("):
+                     connector.index("static bool send_payload(\n")]
+envelope_program = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "cJSON.h"
+static size_t calls, fail_at;
+static void *allocate(size_t size) { if (++calls == fail_at) return NULL; return malloc(size); }
+''' + envelope + r'''
+int main(void) {
+    cJSON_Hooks hooks = {allocate, free}; cJSON_InitHooks(&hooks);
+    cJSON *payload=cJSON_CreateObject(); calls=0;
+    cJSON *root=message_envelope(payload,"attendance_batch","message","connector","boot",1,"time");
+    assert(root); size_t total=calls; cJSON_Delete(root);
+    for(size_t i=1;i<=total;i++) {
+        fail_at=0;payload=cJSON_CreateObject();assert(payload);
+        calls=0;fail_at=i;
+        assert(!message_envelope(payload,"attendance_batch","message","connector","boot",1,"time"));
+    }
+    puts("Transport envelope allocation regressions passed");
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    temporary = Path(directory)
+    unit = temporary / "envelope.c"
+    unit.write_text(envelope_program)
+    executable = temporary / "envelope"
+    subprocess.run([
+        "cc", "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-I", str(cjson), str(unit), str(cjson / "cJSON.c"),
+        "-lm", "-o", str(executable),
+    ], check=True)
+    subprocess.run([str(executable)], check=True)

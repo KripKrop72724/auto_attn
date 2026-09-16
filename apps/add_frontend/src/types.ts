@@ -120,6 +120,9 @@ export interface ZktDevice {
 export interface FirmwareDiagnostics {
   schema_version: 1
   storage?: {
+    upgrade_contract?: string | null
+    upgrade_error?: string | null
+    upgrade_ready?: boolean | null
     total_bytes?: number | null
     used_bytes?: number | null
     admission_reserve_bytes?: number | null
@@ -144,6 +147,7 @@ export interface FirmwareDiagnostics {
     last_activity_uptime_ms?: number | null
     operation?: string | null
     restart_count?: number | null
+    restart_attempts?: number | null
   }>
   reconciliation_mode?: string | null
   last_light_check_uptime_ms?: number | null

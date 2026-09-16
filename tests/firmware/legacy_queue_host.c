@@ -44,7 +44,8 @@ int main(int argc,char **argv)
     assert(remove(argv[1])==0);
     append(argv[1],"partial");
     assert(lq_open(&q,argv[1],port)==DQ_OK);
-    assert(lq_peek(&q,data,sizeof(data),&token)==DQ_CORRUPT);
+    assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK && token.evidence_required);
+    assert(lq_settle(&q,&token)==DQ_STALE);
     append(argv[1],"\n");
     assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK);
     assert(lq_settle(&q,&token)==DQ_OK);assert(lq_reclaim(&q)==DQ_OK);
@@ -54,6 +55,34 @@ int main(int argc,char **argv)
         assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK);
         assert(lq_settle(&q,&token)==DQ_OK);
     }
+    assert(lq_reclaim(&q)==DQ_OK);
+    // An oversized row is raw custody only, including a valid-looking suffix.
+    f=fopen(argv[1],"ab");assert(f);
+    for(unsigned i=0;i<70000;i++) assert(fputc('x',f)!=EOF);
+    assert(fflush(f)==0 && fsync(fileno(f))==0);assert(fclose(f)==0);
+    append(argv[1],"{\"attendance\":true}\nnext\n");
+    size_t preserved=0;
+    do {
+        assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK);
+        assert(token.evidence_required);
+        assert(lq_settle(&q,&token)==DQ_STALE);
+        lq_token_t original=token;
+        state.fail=true;assert(lq_settle_evidence(&q,&token)==DQ_IO);state.fail=false;
+        assert(lq_open(&q,argv[1],port)==DQ_OK);
+        assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK);
+        assert(token.offset==original.offset && token.crc==original.crc);
+        preserved+=token.end-token.offset;
+        assert(lq_settle_evidence(&q,&token)==DQ_OK);
+        assert(lq_open(&q,argv[1],port)==DQ_OK);
+    } while(q.checkpoint.version==2);
+    assert(preserved==70000+strlen("{\"attendance\":true}\n"));
+    assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK && !token.evidence_required && !strcmp(data,"next\n"));
+    assert(lq_settle(&q,&token)==DQ_OK);assert(lq_reclaim(&q)==DQ_OK);
+    append(argv[1],"unfinished");
+    assert(lq_peek(&q,data,sizeof(data),&token)==DQ_OK && token.evidence_required);
+    assert(lq_settle(&q,&token)==DQ_STALE);
+    assert(lq_settle_evidence(&q,&token)==DQ_OK);
+    assert(lq_open(&q,argv[1],port)==DQ_OK);
     assert(lq_reclaim(&q)==DQ_OK);
     puts("legacy queue host regression tests passed");
 }

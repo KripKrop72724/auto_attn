@@ -74,9 +74,13 @@ class WorkerDiagnostics(BaseModel):
     last_activity_uptime_ms: int | None = Field(default=None, ge=0)
     operation: str | None = Field(default=None, max_length=80)
     restart_count: int | None = Field(default=None, ge=0)
+    restart_attempts: int | None = Field(default=None, ge=0)
 
 
 class StorageDiagnostics(BaseModel):
+    upgrade_contract: str | None = Field(default=None, max_length=100)
+    upgrade_error: str | None = Field(default=None, max_length=80)
+    upgrade_ready: bool | None = None
     total_bytes: int | None = Field(default=None, ge=0)
     used_bytes: int | None = Field(default=None, ge=0)
     admission_reserve_bytes: int | None = Field(default=None, ge=0)

@@ -28,6 +28,8 @@ static bool g_legacy_probe_head;
 static bool g_ords_buffer_failed;
 static bool fail_evidence;
 static unsigned evidence_requests;
+static const char *expected_evidence="bad\0row\n";
+static size_t expected_length=8;
 static bool g_prefer_segmented_ords;
 static int64_t g_segmented_ords_retry_ms;
 static durable_queue_t segmented;
@@ -91,7 +93,7 @@ static bool add_connector_transfer_queue_evidence(
 {
     (void)serial;
     assert(!storage_lock && queue[0] && generation[0] && record_id[0] && !strcmp(reason,"MALFORMED"));
-    assert(length==8 && !memcmp(data,"bad\0row\n",8));
+    assert(length==expected_length && !memcmp(data,expected_evidence,length));
     ++evidence_requests;
     return !fail_evidence;
 }
@@ -152,6 +154,16 @@ int main(void)
     fail_evidence=false;
     oracle_drain_pending(true);
     assert(evidence_requests==2 && stat(PENDING_PATH,&st)!=0);
+    // A partial tail cannot reach Oracle even if its fragment resembles a row.
+    f=fopen(PENDING_PATH,"wb");assert(f);
+    assert(fputs("partial",f)>=0);assert(!fclose(f));
+    expected_evidence="partial";expected_length=7;
+    prior=requests;fail_evidence=true;
+    oracle_drain_pending(true);
+    assert(requests==prior && durable.offset==0 && !stat(PENDING_PATH,&st));
+    fail_evidence=false;g_legacy_pending.ready=false;
+    oracle_drain_pending(true);
+    assert(requests==prior && stat(PENDING_PATH,&st)!=0);
     free(g_legacy_drain_buffer);
     puts("legacy drain integration regressions passed");
 }

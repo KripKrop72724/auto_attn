@@ -181,6 +181,7 @@ typedef enum {
     ADD_WORKER_COMMITTING, ADD_WORKER_RESOURCE
 } add_worker_operation_t;
 void add_connector_report_ords_worker(add_worker_operation_t operation);
+void add_connector_report_ords_start(bool started, uint32_t attempts);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count);
