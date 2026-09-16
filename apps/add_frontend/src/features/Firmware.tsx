@@ -9,6 +9,7 @@ import {
 } from 'react'
 import { z } from 'zod'
 import './Firmware.css'
+import { hilDevice, hilScopeLabel } from './hilTargets'
 import { api, queryString } from '../api'
 import {
   Dialog,
@@ -667,13 +668,7 @@ function CampaignCreator({
   const [clock, setClock] = useState(() => Date.now())
   const selectedRelease =
     releases.find((release) => release.release_id === releaseId) || null
-  const hilTarget = selectedRelease?.hil_target_mac
-    ? devices.find(
-        (device) =>
-          device.hardware_id.toLowerCase() ===
-          selectedRelease.hil_target_mac?.toLowerCase(),
-      ) || null
-    : null
+  const hilTarget = hilDevice(selectedRelease, devices)
   const isHil = selectedRelease?.state === 'HIL_ONLY'
   const zones = useMemo(
     () =>
@@ -705,13 +700,7 @@ function CampaignCreator({
     setReleaseId(value)
     resetScope()
     const next = releases.find((release) => release.release_id === value)
-    const target = next?.hil_target_mac
-      ? devices.find(
-          (device) =>
-            device.hardware_id.toLowerCase() ===
-            next.hil_target_mac?.toLowerCase(),
-        )
-      : null
+    const target = hilDevice(next, devices)
     setZoneId(next?.state === 'HIL_ONLY' ? target?.zone_id || '' : '')
   }
   const preview = async () => {
@@ -881,9 +870,9 @@ function CampaignCreator({
               >
                 <Icon name={hilTarget ? 'shield' : 'alert'} />
                 <span>
-                  <strong>Exact-MAC HIL quarantine</strong>
+                  <strong>Exact-device HIL quarantine</strong>
                   <small>
-                    {selectedRelease?.hil_target_mac || 'No target MAC'}
+                    {selectedRelease ? hilScopeLabel(selectedRelease) : 'No target'}
                     {hilTarget
                       ? ` · ${hilTarget.display_name}`
                       : ' · no registered match'}
@@ -1469,7 +1458,7 @@ export function FirmwareView({
               </h3>
               <p>
                 {hilRelease
-                  ? `Bound to ${hilRelease.hil_target_mac || 'an unresolved target MAC'}. It cannot be offered nationally.`
+                  ? `${hilScopeLabel(hilRelease)}. Restricted to HIL devices.`
                   : 'HIL publishing remains a protected external workflow.'}
               </p>
               <StatusBadge state={hilRelease?.state || 'NO CANDIDATE'} />
@@ -1679,7 +1668,7 @@ export function FirmwareView({
                     <span>
                       <strong>Quarantined target</strong>
                       <small>
-                        {release.hil_target_mac || 'Target MAC is unavailable'}
+                        {hilScopeLabel(release)}
                       </small>
                     </span>
                   </div>

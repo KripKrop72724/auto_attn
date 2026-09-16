@@ -23,6 +23,9 @@ jobs:
           persist-credentials: false
       - name: Enforce ADD and Zone Lite consolidation
         run: python3 scripts/check_repository_contract.py
+      - name: Exercise immutable ordered HIL publication
+        shell: pwsh
+        run: ./tests/firmware/test_hil_publication.ps1
       - name: Parse production PowerShell scripts
         shell: pwsh
         run: |

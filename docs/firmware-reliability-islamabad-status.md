@@ -48,7 +48,7 @@ and is unsigned; it is not a production artifact.
   Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 401 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 422 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
@@ -58,7 +58,23 @@ and is unsigned; it is not a production artifact.
   another exact-commit run.
 - The diagnostics migration was tested against isolated PostgreSQL 16, including
   downgrade/upgrade and schema-drift checks. The frontend passed 94 tests, its
-  production build and bundle budget after diagnostics changes.
+  production build and bundle budget after diagnostics changes. Ordered HIL UI
+  changes passed 98 frontend tests and another production build.
+
+## Ordered HIL rollout controls
+
+Locally implemented: additive ordered exact-target markers, configured allowlist,
+connector/MAC/confirmed terminal matching, preview digest binding to target order
+and hashes, assignment and download revalidation, paused/revoked grant rejection,
+and next-target selection based on same-candidate acceptance evidence. Legacy
+Quetta single-MAC scope remains supported. The protected candidate workflow now
+requires exact-commit green checks and accepts either target format. Publication
+is tested with PowerShell in an isolated fixture, including immutable scope and
+legacy compatibility. The fixture is not a real release.
+
+The acceptance-recording endpoint/validator, scoped maintenance commands,
+predecessor capability validation and production evidence are still outstanding.
+No HIL acceptance evidence has been inserted into production.
 
 ## Unperformed qualification and deployment
 

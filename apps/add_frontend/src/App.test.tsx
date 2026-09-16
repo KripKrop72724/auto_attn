@@ -839,7 +839,7 @@ describe('State Life ADD interface', () => {
     fireEvent.change(screen.getByLabelText('Release channel'), {
       target: { value: 'release-2-2-4' },
     })
-    expect(await screen.findByText(/Exact-MAC HIL quarantine/)).toBeTruthy()
+    expect(await screen.findByText(/Exact-device HIL quarantine/)).toBeTruthy()
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).value).toBe(device.zone_id)
     expect((screen.getByLabelText('Zone') as HTMLSelectElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText('Audited reason'), {

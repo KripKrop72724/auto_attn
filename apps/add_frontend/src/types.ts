@@ -517,6 +517,12 @@ export interface ReconciliationListResponse {
   totals: ReconciliationJobTotals
 }
 
+export interface HilTarget {
+  connector_id: string
+  mac: string
+  terminal_serial: string
+}
+
 export interface FirmwareRelease {
   release_id: string
   version: string
@@ -531,6 +537,9 @@ export interface FirmwareRelease {
   revoked_at?: string | null
   revoked_by?: string | null
   hil_target_mac: string | null
+  hil_targets?: HilTarget[] | null
+  hil_next_target?: HilTarget | null
+  hil_scope_message?: string | null
 }
 
 export interface FirmwareCampaign {

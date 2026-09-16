@@ -33,6 +33,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from zk_add.db import Base
+from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
@@ -154,6 +155,44 @@ class FirmwareDownloadGrant(Base):
     last_used_at: Mapped[Any | None] = mapped_column(DateTime(timezone=True))
 
 
+def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget | None:
+    raw = (release.manifest or {}).get("_hil_targets")
+    if raw is None:
+        return None
+    if not settings.firmware_hil_enabled or not settings.firmware_hil_targets_json:
+        raise ValueError("Ordered firmware HIL quarantine is disabled.")
+    targets = parse_hil_targets(raw)
+    configured = parse_hil_targets(json.loads(settings.firmware_hil_targets_json))
+    if targets != configured:
+        raise ValueError("Ordered HIL targets do not match the configured exact scope.")
+    events = list(session.execute(
+        select(FirmwareEvent, Connector, FirmwareDeployment)
+        .join(FirmwareDeployment, FirmwareEvent.deployment_id == FirmwareDeployment.id)
+        .join(Connector, FirmwareDeployment.connector_id == Connector.id)
+        .where(
+            FirmwareDeployment.release_id == release.id,
+            FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE"]),
+        ).order_by(FirmwareEvent.id)
+    ))
+    for target in targets:
+        evidence = [
+            (event, deployment)
+            for event, connector, deployment in events
+            if target_matches(target, connector)
+            and event.details.get("target") == target.model_dump()
+            and event.details.get("git_sha") == release.git_sha
+            and event.details.get("artifact_sha256") == release.image_sha256
+            and event.details.get("application_sha256") == _application_sha256(release)
+        ]
+        if not evidence:
+            return target
+        latest, deployment = evidence[-1]
+        if (latest.state != "HIL_ACCEPTED" or latest.details.get("outcome") != "PASS"
+                or deployment.status != "SUCCEEDED"):
+            return target
+    raise ValueError("All ordered HIL targets already have acceptance; release remains HIL_ONLY.")
+
+
 def capability_is_eligible(connector: Connector) -> bool:
     return bool(connector.ota_capable and connector.ota_secure_boot and connector.ota_rollback_enabled
                 and connector.ota_partition_layout == OTA_LAYOUT)
@@ -190,16 +229,29 @@ def _scope_exclusion_reason(
     return None
 
 
-def _scope_digest(release: FirmwareRelease, zone_id: str, connectors: list[Connector]) -> str:
+def _scope_digest(
+    release: FirmwareRelease, zone_id: str, connectors: list[Connector],
+    eligible: list[Connector],
+) -> str:
     payload = {
         "release_id": release.release_id,
         "release_state": release.state,
+        "artifact_sha256": release.image_sha256,
+        "application_sha256": _application_sha256(release),
+        "hil_targets": (release.manifest or {}).get("_hil_targets"),
+        "hil_target_mac": (release.manifest or {}).get("_hil_target_mac"),
+        "eligible": sorted(row.connector_id for row in eligible),
         "version": release.version,
         "zone_id": zone_id,
         "connectors": [
             {
                 "connector_id": row.connector_id,
                 "active": row.active,
+                "is_spare": row.is_spare,
+                "firmware_version": row.firmware_version,
+                "terminal_serial": row.zkt_device.serial if row.zkt_device else None,
+                "confirmed_serial": row.zkt_device.confirmed_serial if row.zkt_device else None,
+                "expected_serial": row.zkt_device.expected_serial if row.zkt_device else None,
                 "hardware_id": row.hardware_id.lower(),
                 "ota_capable": row.ota_capable,
                 "ota_secure_boot": row.ota_secure_boot,
@@ -261,7 +313,10 @@ def _campaign_scope(
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         raise ValueError("National firmware OTA remains disabled.")
     hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-    if release.state == "HIL_ONLY":
+    ordered_target = _ordered_hil_target(session, release) if release.state == "HIL_ONLY" else None
+    if ordered_target:
+        hil_target_mac = ordered_target.mac
+    elif release.state == "HIL_ONLY":
         configured_target = (settings.firmware_hil_target_mac or "").strip().lower()
         if not settings.firmware_hil_enabled or not configured_target:
             raise ValueError("Firmware HIL quarantine is disabled.")
@@ -282,6 +337,8 @@ def _campaign_scope(
             hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" else "",
             minimum_version=release.minimum_bootstrap_version,
         )
+        if ordered_target and not target_matches(ordered_target, connector):
+            reason = "HIL_EXACT_IDENTITY_MISMATCH"
         if reason:
             excluded.append((connector, reason))
         else:
@@ -308,7 +365,7 @@ def preview_campaign_scope(
         zone_id=zone_id,
     )
     expires_at = utc_now() + timedelta(seconds=ttl_seconds)
-    digest = _scope_digest(release, zone_id, connectors)
+    digest = _scope_digest(release, zone_id, connectors, eligible)
     token = _encode_scope_token(
         {
             "release_id": release.release_id,
@@ -370,7 +427,7 @@ def verify_campaign_scope_token(
         release_public_id=release_public_id,
         zone_id=zone_id,
     )
-    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors):
+    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors, eligible):
         raise ValueError("Firmware scope changed. Refresh the preview before starting the campaign.")
     return release, connectors, eligible
 
@@ -442,11 +499,19 @@ def sync_release_store(session: Session) -> None:
             raise RuntimeError(f"Firmware release {release_id} has an unknown partition layout.")
         marker_path = manifest_path.parent / HIL_MARKER
         hil_target_mac = None
+        hil_targets = None
         desired_state = "AVAILABLE"
         if marker_path.is_file():
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            hil_target_mac = str(marker.get("target_mac") or "").strip().lower()
-            if not hil_target_mac:
+            if "targets" in marker:
+                hil_targets = [target.model_dump() for target in parse_hil_targets(marker["targets"])]
+                if marker.get("target_mac"):
+                    raise RuntimeError("HIL marker cannot mix ordered and legacy target scopes.")
+                if marker.get("application_sha256") != application_digest:
+                    raise RuntimeError("Ordered HIL marker must bind the application digest.")
+            else:
+                hil_target_mac = str(marker.get("target_mac") or "").strip().lower()
+            if not hil_target_mac and not hil_targets:
                 raise RuntimeError(f"Firmware release {release_id} has an invalid HIL quarantine marker.")
             if str(marker.get("git_sha") or "") != str(manifest["git_sha"]):
                 raise RuntimeError(f"Firmware release {release_id} HIL marker has a different source SHA.")
@@ -457,6 +522,7 @@ def sync_release_store(session: Session) -> None:
             **manifest,
             "_publication_mode": desired_state,
             "_hil_target_mac": hil_target_mac,
+            "_hil_targets": hil_targets,
         }
         existing = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == release_id))
@@ -573,12 +639,20 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         return None
     if release.state == "HIL_ONLY":
-        target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-        configured = (settings.firmware_hil_target_mac or "").strip().lower()
-        if not settings.firmware_hil_enabled or not target or target != configured:
+        try:
+            ordered_target = _ordered_hil_target(session, release)
+        except ValueError:
             return None
-        if connector.hardware_id.lower() != target:
-            return None
+        if ordered_target:
+            if not target_matches(ordered_target, connector):
+                return None
+        else:
+            target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
+            configured = (settings.firmware_hil_target_mac or "").strip().lower()
+            if not settings.firmware_hil_enabled or not target or target != configured:
+                return None
+            if connector.hardware_id.lower() != target:
+                return None
     application_digest = _application_sha256(release)
     if application_digest is None:
         return None
@@ -678,7 +752,15 @@ def record_progress(
     return deployment
 
 
-def _serialize_release(row: FirmwareRelease) -> dict[str, Any]:
+def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]:
+    next_target = None
+    scope_message = None
+    if row.state == "HIL_ONLY" and (row.manifest or {}).get("_hil_targets") is not None:
+        try:
+            target = _ordered_hil_target(session, row)
+            next_target = target.model_dump() if target else None
+        except ValueError as exc:
+            scope_message = str(exc)
     return {
         "release_id": row.release_id,
         "version": row.version,
@@ -693,6 +775,9 @@ def _serialize_release(row: FirmwareRelease) -> dict[str, Any]:
         "revoked_at": row.revoked_at,
         "revoked_by": row.revoked_by,
         "hil_target_mac": (row.manifest or {}).get("_hil_target_mac"),
+        "hil_targets": (row.manifest or {}).get("_hil_targets"),
+        "hil_next_target": next_target,
+        "hil_scope_message": scope_message,
     }
 
 
@@ -747,7 +832,7 @@ def release_page(
         totals[normalized] = int(count)
         totals["all"] += int(count)
     return {
-        "rows": [_serialize_release(row) for row in page],
+        "rows": [_serialize_release(row, session) for row in page],
         "next_cursor": next_cursor,
         "filtered_total": int(filtered_total),
         "totals": totals,
@@ -1055,13 +1140,21 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         raise ValueError("Firmware release is unavailable.")
     if release.state == "HIL_ONLY":
+        campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+        if campaign is None or campaign.status != "ACTIVE" or deployment.status not in ACTIVE_DEPLOYMENT_STATES:
+            raise ValueError("HIL firmware campaign is not active.")
         target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
         configured = (settings.firmware_hil_target_mac or "").strip().lower()
         connector = session.get(Connector, grant.connector_id)
-        if not settings.firmware_hil_enabled or not target or target != configured:
-            raise ValueError("HIL firmware release is unavailable.")
-        if connector is None or connector.hardware_id.lower() != target:
-            raise ValueError("HIL firmware grant target mismatch.")
+        ordered_target = _ordered_hil_target(session, release)
+        if ordered_target:
+            if connector is None or not target_matches(ordered_target, connector):
+                raise ValueError("HIL firmware grant exact target mismatch.")
+        else:
+            if not settings.firmware_hil_enabled or not target or target != configured:
+                raise ValueError("HIL firmware release is unavailable.")
+            if connector is None or connector.hardware_id.lower() != target:
+                raise ValueError("HIL firmware grant target mismatch.")
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()
     if root not in image.parents or not image.is_file():
