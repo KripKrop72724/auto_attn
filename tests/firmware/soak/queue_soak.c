@@ -89,7 +89,7 @@ int main(int argc,char **argv) {
   uint32_t bulk_due=backlog+(uint32_t)(elapsed/1000);
   for(unsigned i=0;i<16 && live<live_due;i++){if(append(0,1000000U+live+1)!=DQ_OK)break;live++;}
   for(unsigned i=0;i<16 && bulk<bulk_due;i++){if(append(1,bulk+1)!=DQ_OK)break;bulk++;}
-  if(elapsed>=1800000 && !load_checked){assert(live>=17990);load_checked=true;puts("30_MINUTE_10_EPS_CAPTURE_PASSED");fflush(stdout);}
+  if(elapsed>=1800000 && !load_checked){assert(live>=17990 && bulk>=1000 && receipted>0);load_checked=true;puts("30_MINUTE_10_EPS_CAPTURE_PASSED");fflush(stdout);}
   bool offline=elapsed%120000>=20000 && elapsed%120000<50000;
   drain(&scheduler,elapsed,offline);
   if(elapsed/17000>last_restart){last_restart=elapsed/17000;for(unsigned i=0;i<3;i++)reopen(i);restarts++;}
@@ -101,6 +101,7 @@ int main(int argc,char **argv) {
   * records not admitted remain behind the simulated authoritative cursor. */
  uint64_t finish=milliseconds()+120000;memset(&scheduler,0,sizeof(scheduler));
  while(queues[0].checkpoint.depth || queues[1].checkpoint.depth || queues[2].checkpoint.depth){assert(milliseconds()<finish);drain(&scheduler,milliseconds(),false);}
+ if(seconds>=86400)assert(load_checked && bulk>=backlog);
  for(uint32_t i=1;i<=bulk;i++)assert(confirmed[i]);
  for(uint32_t i=1;i<=live;i++)assert(confirmed[1000000U+i]);
  /* An uncertain append may preserve the next source row while the source
