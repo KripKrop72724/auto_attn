@@ -728,6 +728,8 @@ def apply_reconciliation_chunk(
             disposition = "TERMINAL_DUPLICATE"
         elif event and event.ords_status == "BLOCKED_IDENTITY":
             disposition = "BLOCKED_IDENTITY"
+        elif event and disposition == "BLOCKED_IDENTITY" and event.cnic_lookup_hash:
+            disposition = "EVENT"
         seen_terminal_keys.add(source.terminal_record_key)
         if disposition == "BLOCKED_IDENTITY":
             blocked += 1
@@ -1161,6 +1163,8 @@ def apply_source_tail_chunk(
                 disposition = "TERMINAL_DUPLICATE"
             elif event.ords_status == "BLOCKED_IDENTITY":
                 disposition = "BLOCKED_IDENTITY"
+            elif disposition == "BLOCKED_IDENTITY" and event.cnic_lookup_hash:
+                disposition = "EVENT"
         seen_terminal_keys.add(source.terminal_record_key)
         if disposition == "BLOCKED_IDENTITY":
             blocked += 1

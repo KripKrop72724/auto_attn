@@ -247,3 +247,11 @@ The command checkpoint passes 452 local tests and the ESP-IDF build. GitHub's ea
 8ce0279 firmware/frontend jobs passed, but the backend job exposed a missing POSIX
 feature flag in the storage-upgrade host harness. That test flag is corrected and both
 upgrade modes pass inside Linux/ESP-IDF. This is not a green release-qualification claim.
+
+### Historical identity and immutable release follow-up (2026-09-16)
+
+- Historical ingestion now requires an explicit terminal serial, confirmed binding, exact enrollment UID/fingerprint, and a stable snapshot continuity interval covering the event time. Missing/conflicting evidence is durably accepted as `BLOCKED_PROVENANCE`, without a person/CNIC assignment. Automatic current-snapshot/tombstone repair cannot overwrite this state.
+- Firmware history parsing preserves event UIDs and source identifiers but cannot copy a current CNIC into direct historical ORDS delivery. Legacy historical ORDS rows and terminal-namespace mismatches transfer raw evidence to ADD as unresolved custody before their source checkpoint advances. ADD may resolve new historical attendance using its stored continuity evidence.
+- Legacy quarantine files now drain in bounded fragments, including binary, partial and oversized rows, with exact durable custody before retirement.
+- Release-store synchronization rejects changed signed manifests or artifact identities for an existing release ID, including otherwise valid signatures.
+- Actual cJSON allocation fault tests now include ORDS normalization and permanent-rejection serialization. Local ESP-IDF 5.5.3 compatibility-mode build passed (unsigned development artifact only). Production signing/publication, HIL run controls, complete recovery diagnostics, and the full qualification campaign remain incomplete; this is not HIL acceptance evidence.

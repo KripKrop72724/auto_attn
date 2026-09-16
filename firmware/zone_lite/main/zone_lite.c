@@ -2880,7 +2880,10 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
     const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
     const cJSON *fingerprint = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_identity_fingerprint") : NULL;
     const cJSON *reason = root ? cJSON_GetObjectItemCaseSensitive(root, "blocked_reason") : NULL;
-    const zkt_user_t *user = cJSON_IsString(user_id) && !reason
+    const cJSON *capture = root ? cJSON_GetObjectItemCaseSensitive(root, "capturetype") : NULL;
+    bool captured_live = cJSON_IsString(capture) &&
+        (!strcmp(capture->valuestring, "LIVE") || !strcmp(capture->valuestring, "LIVE_POLL"));
+    const zkt_user_t *user = captured_live && cJSON_IsString(user_id) && !reason
         ? find_user_by_user_id(users, user_id->valuestring) : NULL;
     if (user && cJSON_IsString(uid) && uid->valuestring[0] && strcmp(user->uid, uid->valuestring)) user = NULL;
     if (!user || !rel_identity_matches(cJSON_IsString(serial) ? serial->valuestring : NULL, g_device_serial,
@@ -3042,6 +3045,7 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
     cJSON *row = cJSON_CreateObject();
     if (!row) return NULL;
     cJSON_AddStringToObject(row, "event_uid", event->event_uid);
+    if (g_device_serial[0]) cJSON_AddStringToObject(row, "terminal_serial", g_device_serial);
     if (event->uid[0]) {
         cJSON_AddStringToObject(row, "uid", event->uid);
     }
@@ -3082,7 +3086,7 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
         "event_uid", "user_id", "device_event_time", "captured_at", "source",
         "status", "punch", "raw_punch", "clock_quality", "raw_event",
     };
-    bool complete = true;
+    bool complete = g_device_serial[0] && cJSON_HasObjectItem(row, "terminal_serial");
     for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
         if (!cJSON_HasObjectItem(row, required[i])) complete = false;
     }
@@ -3679,6 +3683,14 @@ static bool parse_attendance_record(
         status,
         punch,
         snapshot_identity);
+    if (built) {
+        // A current snapshot cannot prove who owned a historical enrollment.
+        // ADD may resolve it using durable namespace/continuity evidence.
+        // Keep identifiers and the existing event UID; prevent direct ORDS enrichment.
+        event->cnic[0] = '\0';
+        event->employee_name[0] = '\0';
+        event->raw_punch = false;
+    }
     if (built && record_uid != 0) {
         snprintf(
             event->attendance_record_uid,
@@ -5739,8 +5751,26 @@ static bool oracle_duplicate_body(const char *body)
     return ok;
 }
 
+/* A stored current name is not historical ownership evidence. Historical
+ * identity resolution belongs to ADD, which retains snapshot continuity.
+ * -1 means allocation failure (retry), 0 unresolved, 1 eligible live capture. */
+static int oracle_local_identity_eligible(const char *event_json)
+{
+    cJSON *root = cJSON_Parse(event_json);
+    if (!root) return -1;
+    const cJSON *capture = cJSON_GetObjectItemCaseSensitive(root, "capturetype");
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(root, "device_serial");
+    bool eligible = cJSON_IsObject(root) && cJSON_IsString(capture) &&
+        (!strcmp(capture->valuestring, "LIVE") || !strcmp(capture->valuestring, "LIVE_POLL")) &&
+        cJSON_IsString(serial) && g_device_serial[0] &&
+        !strcmp(serial->valuestring, g_device_serial);
+    cJSON_Delete(root);
+    return eligible ? 1 : 0;
+}
+
 static char *oracle_normalize_event_json(const char *event_json)
 {
+    if (oracle_local_identity_eligible(event_json) != 1) return NULL;
     cJSON *root = cJSON_Parse(event_json);
     if (!root || !cJSON_IsObject(root)) {
         cJSON_Delete(root);
@@ -5751,9 +5781,13 @@ static char *oracle_normalize_event_json(const char *event_json)
     char normalized[32];
     strlcpy(normalized, oracle_capture_type(source), sizeof(normalized));
     cJSON_DeleteItemFromObjectCaseSensitive(root, "capturetype");
-    cJSON_AddStringToObject(root, "capturetype", normalized);
+    if (!cJSON_AddStringToObject(root, "capturetype", normalized)) {
+        cJSON_Delete(root); return NULL;
+    }
     cJSON_DeleteItemFromObjectCaseSensitive(root, "trust_status");
-    cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized));
+    if (!cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized))) {
+        cJSON_Delete(root); return NULL;
+    }
     // These fields are durable local/ADD identity provenance. The public ORDS
     // raw-capture contract does not consume them.
     cJSON_DeleteItemFromObjectCaseSensitive(root, "_terminal_uid");
@@ -5772,7 +5806,9 @@ static char *oracle_mark_permanent_rejection(const char *event_json)
         return NULL;
     }
     cJSON_DeleteItemFromObjectCaseSensitive(root, "blocked_reason");
-    cJSON_AddStringToObject(root, "blocked_reason", "ORDS_PERMANENT_REJECTION");
+    if (!cJSON_AddStringToObject(root, "blocked_reason", "ORDS_PERMANENT_REJECTION")) {
+        cJSON_Delete(root); return NULL;
+    }
     char *result = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return result;
@@ -5815,12 +5851,16 @@ typedef enum {
     ORACLE_DELIVERY_ACKED,
     ORACLE_DELIVERY_PERMANENT_REJECTION,
     ORACLE_DELIVERY_CORRUPT_LOCAL_ROW,
+    ORACLE_DELIVERY_IDENTITY_UNRESOLVED,
 } oracle_delivery_result_t;
 
 static oracle_delivery_result_t oracle_send_live(const char *event_json)
 {
     if (!event_json || !rel_json_syntax_valid(event_json, strlen(event_json)))
         return ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
+    int identity = oracle_local_identity_eligible(event_json);
+    if (identity < 0) return ORACLE_DELIVERY_RETRYABLE;
+    if (!identity) return ORACLE_DELIVERY_IDENTITY_UNRESOLVED;
     char *normalized_event = oracle_normalize_event_json(event_json);
     if (!normalized_event) {
         ESP_LOGE(TAG, "Could not normalize persisted ORDS event JSON");
@@ -5930,6 +5970,13 @@ static bool oracle_send_bulk(char **events, size_t count)
         return false;
     }
     for (size_t i = 0; i < count; i++) {
+        if (oracle_local_identity_eligible(events[i]) == 0) {
+            // The next bounded slice transfers this head as unresolved evidence.
+            // An identity exception is not a filesystem failure.
+            for (size_t j = 0; j < count; j++) free(normalized_events[j]);
+            free(normalized_events);
+            return false;
+        }
         normalized_events[i] = oracle_normalize_event_json(events[i]);
         if (!normalized_events[i]) {
             for (size_t j = 0; j < count; j++) free(normalized_events[j]);
@@ -6737,12 +6784,14 @@ static bool oracle_drain_segmented_slice(void)
     char *quarantine = delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
         ? oracle_mark_permanent_rejection(event) : NULL;
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
-    if (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
+    if (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW ||
+        delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED) {
         char instance[33], record_id[80];
         snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)token.segment,
             (unsigned long)token.offset, (unsigned long)token.sequence);
         settled = qs_generation(instance) && add_connector_transfer_queue_evidence(
-            "ords", instance, record_id, event, length, NULL, "MALFORMED");
+            "ords", instance, record_id, event, length, NULL,
+            delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED ? "IDENTITY_UNRESOLVED" : "MALFORMED");
     } else if (quarantine && g_storage_lock &&
                xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         settled = append_line(BLOCKED_PATH, quarantine);
@@ -6865,7 +6914,8 @@ static void oracle_drain_pending(bool live_first)
     g_legacy_probe_head = delivery != ORACLE_DELIVERY_ACKED;
     char *quarantine = count == 1 && delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
         ? oracle_mark_permanent_rejection(events[0]) : NULL;
-    if (count == 1 && delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
+    if (count == 1 && (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW ||
+        delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED)) {
         char instance[33], generation[80], record_id[80];
         bool identity = qs_generation(instance);
         snprintf(generation, sizeof(generation), "%s-legacy-%lu", identity ? instance : "",
@@ -6873,7 +6923,8 @@ static void oracle_drain_pending(bool live_first)
         snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)tokens[0].offset,
             (unsigned long)tokens[0].crc);
         settled = identity && add_connector_transfer_queue_evidence("ords_legacy", generation,
-            record_id, events[0], tokens[0].end - tokens[0].offset, NULL, "MALFORMED");
+            record_id, events[0], tokens[0].end - tokens[0].offset, NULL,
+            delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED ? "IDENTITY_UNRESOLVED" : "MALFORMED");
     }
     const char *failure_stage = NULL;
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
@@ -6959,6 +7010,55 @@ static void blocked_evidence_slice(void)
     }
 }
 
+/* Old quarantine generations carry evidence, never inferred attendance. They
+ * drain independently and require exact ADD custody before source retirement. */
+static legacy_queue_t g_legacy_quarantine[3];
+static unsigned g_quarantine_lane;
+static void legacy_quarantine_slice(void)
+{
+    if (!add_connector_is_connected() || !g_blocked_drain_buffer) return;
+    static const char *paths[] = {CORRUPT_ORDS_PATH, STORAGE_BASE "/add_corrupt.jsonl", STORAGE_BASE "/add_corrupt.bak"};
+    static const char *keys[] = {"old_qo", "old_qa", "old_qb"};
+    static const char *names[] = {"legacy_ords_quarantine", "legacy_add_quarantine", "legacy_add_quarantine_backup"};
+    unsigned lane = g_quarantine_lane++ % 3U;
+    legacy_queue_t *queue = &g_legacy_quarantine[lane];
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    dq_result_t read = DQ_OK;
+    if (!queue->ready) {
+        lq_port_t port = {legacy_pending_load, legacy_pending_commit, (void *)keys[lane]};
+        read = lq_open(queue, paths[lane], port);
+    }
+    lq_token_t token;
+    if (read == DQ_OK) read = lq_peek(queue, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &token);
+    if (read == DQ_EMPTY) {
+        dq_result_t reclaimed = lq_reclaim(queue);
+        if (reclaimed != DQ_OK && reclaimed != DQ_EMPTY) read = reclaimed;
+    }
+    xSemaphoreGive(g_storage_lock);
+    if (read != DQ_OK) {
+        if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return;
+    }
+    char instance[33], generation[80], record_id[80];
+    if (!qs_generation(instance)) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    snprintf(generation, sizeof(generation), "%s-quarantine-%u-%lu", instance, lane,
+        (unsigned long)token.generation);
+    snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)token.offset, (unsigned long)token.crc);
+    add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+    bool preserved = add_connector_transfer_queue_evidence(names[lane], generation, record_id,
+        g_blocked_drain_buffer, token.end - token.offset, NULL, "LEGACY_RECOVERY");
+    add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    if (!preserved) return;
+    if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    bool committed = lq_settle_evidence(queue, &token) == DQ_OK;
+    if (committed) {
+        dq_result_t reclaimed = lq_reclaim(queue);
+        committed = reclaimed == DQ_OK || reclaimed == DQ_STALE;
+    }
+    xSemaphoreGive(g_storage_lock);
+    if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+}
+
 static void ords_uploader_task(void *arg)
 {
     (void)arg;
@@ -6967,6 +7067,7 @@ static void ords_uploader_task(void *arg)
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
             oracle_drain_pending(true);
             blocked_evidence_slice();
+            legacy_quarantine_slice();
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }

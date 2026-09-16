@@ -570,6 +570,19 @@ def sync_release_store(session: Session) -> None:
         existing = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == release_id))
         if existing is not None:
+            immutable = {
+                "version": existing.version, "git_sha": existing.git_sha,
+                "image_sha256": existing.image_sha256, "image_size": existing.image_size,
+                "signing_key_id": existing.signing_key_id, "partition_layout": existing.partition_layout,
+                "minimum_bootstrap_version": existing.minimum_bootstrap_version,
+            }
+            if any(manifest.get(key, "2.2.0" if key == "minimum_bootstrap_version" else None) != value
+                   for key, value in immutable.items()):
+                raise RuntimeError(f"Firmware release {release_id} changed immutable identity.")
+            previous_signed = {key: value for key, value in (existing.manifest or {}).items()
+                               if not key.startswith("_")}
+            if previous_signed != manifest:
+                raise RuntimeError(f"Firmware release {release_id} changed its signed manifest.")
             if existing.state != "REVOKED":
                 existing.state = desired_state
                 existing.manifest = stored_manifest

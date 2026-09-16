@@ -60,6 +60,7 @@ from zk_add.schemas import (
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
 from zk_add.identity_states import PINNED_IDENTITY_RESOLUTION_STATUSES
+from zk_add.identity_provenance import historical_identity_is_supported
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
@@ -2477,6 +2478,10 @@ def enrich_undelivered_attendance(
             AttendanceEvent.ords_status.in_(eligible_statuses),
             or_(
                 AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
                 AttendanceEvent.identity_resolution_status.not_in(
                     PINNED_IDENTITY_RESOLUTION_STATUSES
                 ),
@@ -2585,6 +2590,10 @@ def repair_verified_tombstone_backlog(
         select(AttendanceEvent)
         .where(
             AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
             AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
             eligible_tombstone,
         )
@@ -2715,6 +2724,10 @@ def repair_verified_active_identity_backlog(
             .where(
                 AttendanceEvent.zkt_device_id == zkt.id,
                 AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+                or_(
+                    AttendanceEvent.identity_resolution_status.is_(None),
+                    AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+                ),
                 AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
                 AttendanceEvent.device_event_time >= identity_change_at,
                 DeviceUser.lifecycle_state == "ACTIVE",
@@ -2829,6 +2842,10 @@ def block_undelivered_attendance(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.user_id == user.user_id,
             AttendanceEvent.ords_status.in_(eligible_statuses),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
             or_(
                 AttendanceEvent.identity_resolution_status.is_(None),
                 AttendanceEvent.identity_resolution_status.not_in(
@@ -3010,6 +3027,35 @@ def ingest_attendance(
             cnic = decrypt_cnic(tombstone.cnic_encrypted)
             display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
             shift_worker = tombstone.shift_worker
+        historical = incoming.source not in {"LIVE", "LIVE_POLL"}
+        namespace_mismatch = bool(
+            incoming.terminal_serial and incoming.terminal_serial != zkt.serial
+        )
+        provenance_blocked = namespace_mismatch or (
+            historical
+            and not historical_identity_is_supported(
+                serial=incoming.terminal_serial,
+                bound_serial=zkt.serial,
+                confirmed_serial=zkt.confirmed_serial,
+                uid=incoming.uid,
+                expected_uid=user.uid if user else None,
+                fingerprint=incoming.terminal_identity_fingerprint,
+                expected_fingerprint=user.terminal_identity_fingerprint if user else None,
+                event_time=incoming.device_event_time,
+                continuity_started=zkt.last_identity_change_at,
+                snapshot_observed=zkt.identity_snapshot_observed_at,
+                snapshot_stable=snapshot_verified,
+                tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
+            )
+        )
+        if provenance_blocked:
+            # Keep the raw row, but never attach a current person or tombstone
+            # merely because a historical user ID/UID was reused.
+            cnic = cnic_encrypted = cnic_hash = cnic_last4 = None
+            user = tombstone = identity_resolution = None
+            display_name = parsed.display_name or incoming.raw_name
+            snapshot_verified = False
+            shift_worker = False
         receipt = receipts_by_uid.get(incoming.event_uid)
         receipt_matches_connector = bool(
             receipt is not None and receipt.connector_id == connector.id
@@ -3056,7 +3102,9 @@ def ingest_attendance(
                 else incoming.terminal_identity_fingerprint
             ),
             identity_resolution_status=(
-                "RESOLVED"
+                "BLOCKED_PROVENANCE"
+                if provenance_blocked
+                else "RESOLVED"
                 if cnic
                 else (
                     "WAITING_FOR_SNAPSHOT"
@@ -3065,7 +3113,7 @@ def ingest_attendance(
                 )
             ),
             identity_resolved_at=utc_now() if cnic else None,
-            device_serial=zkt.serial,
+            device_serial=incoming.terminal_serial or (None if historical else zkt.serial),
             uid=incoming.uid,
             user_id=incoming.user_id,
             display_name=display_name,

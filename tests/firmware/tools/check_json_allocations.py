@@ -18,6 +18,8 @@ serializer = source[source.index("static const char *oracle_capture_type("):
                     source.index("typedef enum {", source.index("static char *event_to_json("))]
 row = source[source.index("static cJSON *add_attendance_json_row("):
              source.index("static char *add_serialize_attendance_events(")]
+oracle_serializers = source[source.index("static int oracle_local_identity_eligible("):
+                            source.index("static void oracle_log_rejection_details(")]
 program = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -35,8 +37,11 @@ static void *allocate(size_t size) {
 #define ZONE_LITE_ZONE_ID "test-zone"
 #define ZONE_LITE_ZONE_DEVICE_ID "test-device"
 static char g_device_serial[80] = "test-terminal";
+static size_t strlcpy(char *out, const char *in, size_t size) {
+    size_t length = strlen(in); if (size) snprintf(out, size, "%s", in); return length;
+}
 static void iso_system_now(char *out) { strcpy(out, "2026-09-16T10:00:00"); }
-''' + event_type + helpers + serializer + row + r'''
+''' + event_type + helpers + serializer + row + oracle_serializers + r'''
 int main(void) {
     cJSON_Hooks hooks = {allocate, free};
     cJSON_InitHooks(&hooks);
@@ -63,6 +68,26 @@ int main(void) {
         calls=0; fail_at=i;
         row = add_attendance_json_row(&event, "LIVE");
         assert(row == NULL);
+    }
+    const char *live = "{\"device_serial\":\"test-terminal\",\"capturetype\":\"LIVE\"}";
+    const char *historical = "{\"device_serial\":\"test-terminal\",\"capturetype\":\"DUMP_STARTUP\"}";
+    const char *wrong = "{\"device_serial\":\"old-terminal\",\"capturetype\":\"LIVE\"}";
+    calls=0; fail_at=0;
+    assert(oracle_local_identity_eligible(live) == 1);
+    total=calls;
+    for (size_t i=1; i<=total; i++) {
+        calls=0; fail_at=i; assert(oracle_local_identity_eligible(live) == -1);
+    }
+    calls=0; fail_at=0;
+    assert(oracle_local_identity_eligible(historical) == 0);
+    assert(oracle_local_identity_eligible(wrong) == 0);
+    assert(oracle_local_identity_eligible("{}") == 0);
+    char *(*functions[])(const char *) = {oracle_normalize_event_json, oracle_mark_permanent_rejection};
+    for (size_t f=0; f<2; f++) {
+        calls=0; fail_at=0; json=functions[f](live); assert(json); free(json); total=calls;
+        for (size_t i=1; i<=total; i++) {
+            calls=0; fail_at=i; json=functions[f](live); assert(json == NULL);
+        }
     }
     puts("Attendance serializer allocation regressions passed");
 }

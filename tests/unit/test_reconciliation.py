@@ -55,7 +55,7 @@ from zk_add.schemas import (
     UserSnapshotRequest,
     UserSnapshotRow,
 )
-from zk_add.service import onboard_connector, replace_user_snapshot
+from zk_add.service import onboard_connector, replace_user_snapshot, ingest_attendance, repair_verified_active_identity_backlog, repair_verified_tombstone_backlog
 from zk_add.source_exceptions import (
     list_source_exceptions,
     reveal_source_exception,
@@ -110,6 +110,7 @@ def reconciliation_db(monkeypatch: pytest.MonkeyPatch):
         zkt = connector.zkt_device
         assert zkt is not None
         zkt.serial = SERIAL
+        zkt.confirmed_serial = SERIAL
         zkt.online = True
         zkt.connection_state = "ONLINE"
         zkt.certification_state = "CERTIFIED"
@@ -126,6 +127,24 @@ def reconciliation_db(monkeypatch: pytest.MonkeyPatch):
             session,
             connector=connector,
             snapshot=UserSnapshotRequest(
+                snapshot_id="initial-source-snapshot",
+                complete=True,
+                observed_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+                users=[
+                    UserSnapshotRow(
+                        uid="7",
+                        user_id="1007",
+                        name="Ayesha-3520212345671",
+                        privilege=0,
+                        terminal_identity_fingerprint="a" * 64,
+                    )
+                ],
+            ),
+        )
+        replace_user_snapshot(
+            session,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
                 snapshot_id="stable-source-snapshot",
                 complete=True,
                 observed_at=utc_now(),
@@ -135,6 +154,7 @@ def reconciliation_db(monkeypatch: pytest.MonkeyPatch):
                         user_id="1007",
                         name="Ayesha-3520212345671",
                         privilege=0,
+                        terminal_identity_fingerprint="a" * 64,
                     )
                 ],
             ),
@@ -160,6 +180,8 @@ def _source_record() -> ReconciliationSourceRecord:
             device_event_time=datetime(2026, 8, 6, 8, 0, tzinfo=timezone.utc),
             captured_at=utc_now(),
             source="FULL_HISTORY",
+            terminal_serial=SERIAL,
+            terminal_identity_fingerprint="a" * 64,
             punch=0,
             status=0,
             clock_quality="OK",
@@ -258,6 +280,8 @@ def _tail_source(
             device_event_time=datetime(2026, 8, 6, 9, ordinal, tzinfo=timezone.utc),
             captured_at=utc_now(),
             source="CURRENT_RECONCILE",
+            terminal_serial=SERIAL,
+            terminal_identity_fingerprint="a" * 64,
             punch=0,
             status=0,
             clock_quality="OK",
@@ -1523,3 +1547,58 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     assert job.committed_next_ordinal == 0
     assert job.review_required is True
     assert job.completion_outcome == "CURRENT_TRUTH_CERTIFIED_WITH_SOURCE_CHANGE"
+
+
+@pytest.mark.parametrize("changes", [
+    {"terminal_serial": None},
+    {"terminal_serial": "REPLACED-TERMINAL"},
+    {"terminal_identity_fingerprint": None},
+    {"terminal_identity_fingerprint": "b" * 64},
+    {"uid": "8"},
+    {"device_event_time": datetime(2026, 8, 4, tzinfo=timezone.utc)},
+])
+def test_historical_identity_requires_namespace_and_continuity(reconciliation_db, changes):
+    session, connector = reconciliation_db
+    incoming = _source_record().event.model_copy(update=changes)
+    accepted, duplicates = ingest_attendance(session, connector=connector, events=[incoming])
+    session.flush()
+    row = session.scalar(select(AttendanceEvent))
+    assert accepted == [incoming.event_uid] and duplicates == []
+    assert row.identity_resolution_status == "BLOCKED_PROVENANCE"
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert row.device_user_id is None and row.cnic_lookup_hash is None
+    assert row.device_serial == incoming.terminal_serial
+    repair_verified_active_identity_backlog(session)
+    repair_verified_tombstone_backlog(session)
+    assert row.identity_resolution_status == "BLOCKED_PROVENANCE"
+    assert row.cnic_lookup_hash is None
+    accepted, duplicates = ingest_attendance(session, connector=connector, events=[incoming])
+    assert accepted == [] and duplicates == [incoming.event_uid]
+
+
+def test_historical_identity_with_continuity_can_deliver(reconciliation_db):
+    session, connector = reconciliation_db
+    incoming = _source_record().event
+    ingest_attendance(session, connector=connector, events=[incoming])
+    session.flush()
+    row = session.scalar(select(AttendanceEvent))
+    assert row.identity_resolution_status == "RESOLVED"
+    assert row.device_user_id is not None and row.cnic_lookup_hash is not None
+    assert row.ords_status == "PENDING"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("confirmed_serial", None),
+    ("confirmed_serial", "REPLACED-TERMINAL"),
+    ("identity_snapshot_stable", False),
+    ("last_identity_change_at", None),
+    ("last_identity_change_at", datetime(2026, 8, 7, tzinfo=timezone.utc)),
+])
+def test_historical_identity_requires_verified_device_evidence(reconciliation_db, field, value):
+    session, connector = reconciliation_db
+    setattr(connector.zkt_device, field, value)
+    ingest_attendance(session, connector=connector, events=[_source_record().event])
+    session.flush()
+    row = session.scalar(select(AttendanceEvent))
+    assert row.identity_resolution_status == "BLOCKED_PROVENANCE"
+    assert row.cnic_lookup_hash is None

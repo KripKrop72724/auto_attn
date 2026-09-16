@@ -154,6 +154,7 @@ class UserSnapshotRequest(BaseModel):
 
 
 class AttendanceEventIn(BaseModel):
+    terminal_serial: str | None = Field(default=None, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
     event_uid: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     uid: str | None = Field(default=None, max_length=40)
     terminal_identity_fingerprint: str | None = Field(

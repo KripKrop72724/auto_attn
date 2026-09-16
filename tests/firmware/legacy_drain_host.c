@@ -26,7 +26,8 @@ static legacy_queue_t g_legacy_pending;
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
 static bool g_legacy_probe_head;
 static bool g_ords_buffer_failed;
-static bool fail_evidence;
+static bool fail_evidence, unresolved_identity;
+static const char *expected_reason="MALFORMED";
 static unsigned evidence_requests;
 static const char *expected_evidence="bad\0row\n";
 static size_t expected_length=8;
@@ -53,7 +54,7 @@ static lq_checkpoint_t durable;
 static bool exists;
 static unsigned requests, accepted, faults;
 typedef enum {ORACLE_DELIVERY_RETRYABLE, ORACLE_DELIVERY_ACKED,
-    ORACLE_DELIVERY_PERMANENT_REJECTION, ORACLE_DELIVERY_CORRUPT_LOCAL_ROW} oracle_delivery_result_t;
+    ORACLE_DELIVERY_PERMANENT_REJECTION, ORACLE_DELIVERY_CORRUPT_LOCAL_ROW, ORACLE_DELIVERY_IDENTITY_UNRESOLVED} oracle_delivery_result_t;
 static void *heap_caps_malloc(size_t n,int flags)
 { (void)flags; return fail_allocate?NULL:malloc(n); }
 static int64_t uptime_ms(void) { return 1000; }
@@ -79,7 +80,7 @@ static void request(size_t count)
     if(append_during_send) { append_during_send=false;assert(append_line(PENDING_PATH,"arrived-live")); }
 }
 static oracle_delivery_result_t oracle_send_live(const char *event)
-{ assert(event[0]);request(1);return ORACLE_DELIVERY_ACKED; }
+{ assert(event[0]);if(unresolved_identity)return ORACLE_DELIVERY_IDENTITY_UNRESOLVED;request(1);return ORACLE_DELIVERY_ACKED; }
 static bool oracle_send_bulk(char **events,size_t count)
 { assert(events[0][0] && count<=100);request(count);return !fail_bulk; }
 static bool add_enqueue_json_receipts(char *const *events,size_t count,const char *path)
@@ -92,7 +93,7 @@ static bool add_connector_transfer_queue_evidence(
     const void *data,size_t length,const char *serial,const char *reason)
 {
     (void)serial;
-    assert(!storage_lock && queue[0] && generation[0] && record_id[0] && !strcmp(reason,"MALFORMED"));
+    assert(!storage_lock && queue[0] && generation[0] && record_id[0] && !strcmp(reason,expected_reason));
     assert(length==expected_length && !memcmp(data,expected_evidence,length));
     ++evidence_requests;
     return !fail_evidence;
@@ -164,6 +165,23 @@ int main(void)
     fail_evidence=false;g_legacy_pending.ready=false;
     oracle_drain_pending(true);
     assert(requests==prior && stat(PENDING_PATH,&st)!=0);
+    unresolved_identity=true;expected_reason="IDENTITY_UNRESOLVED";
+    expected_evidence="historical\n";expected_length=11;
+    assert(append_line(PENDING_PATH,"historical"));
+    fail_evidence=true;prior=requests;
+    oracle_drain_pending(true);
+    assert(requests==prior && !stat(PENDING_PATH,&st) && durable.offset==0);
+    fail_evidence=false;fail_commit=true;oracle_drain_pending(true);
+    assert(!stat(PENDING_PATH,&st) && durable.offset==0);
+    fail_commit=false;g_legacy_pending.ready=false;oracle_drain_pending(true);
+    assert(requests==prior && stat(PENDING_PATH,&st)!=0);
+    expected_evidence="historical";expected_length=10;
+    assert(dq_append(&segmented,"historical",10)==DQ_OK);
+    fail_evidence=true;g_segmented_ords_retry_ms=0;
+    oracle_drain_pending(true);assert(segmented.checkpoint.depth==1);
+    fail_evidence=false;g_segmented_ords_retry_ms=0;
+    assert(dq_open(&segmented,"segmented-",port)==DQ_OK);
+    oracle_drain_pending(true);assert(segmented.checkpoint.depth==0 && requests==prior);
     free(g_legacy_drain_buffer);
     puts("legacy drain integration regressions passed");
 }
