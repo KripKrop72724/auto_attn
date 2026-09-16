@@ -275,6 +275,8 @@ jobs:
           -w /project
           espressif/idf:v5.5.3
           python tests/firmware/tools/check_json_allocations.py
+          python tests/firmware/tools/check_command_journal.py
+          python tests/firmware/tools/check_catalog_storage.py
       - name: Build ESP32-S3 production firmware with ESP-IDF 5.5.3
         run: >-
           docker run --rm

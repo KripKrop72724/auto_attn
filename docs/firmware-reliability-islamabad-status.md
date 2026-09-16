@@ -224,3 +224,26 @@ required.
 The expanded checkpoint passes 451 tests locally and the firmware build. Queue
 initialization now retries missing local resources without requiring a reboot;
 segmented admission revalidates the durable storage instance before creating data.
+
+
+## Command replacement and auxiliary capacity
+
+Command inbox replacements now use checked NVS generations and keep the old file
+until the replacement is committed. Recovery tests cover each checkpoint boundary,
+uncertain commits, rename/delete failures, shorter/empty replacements, and ambiguous
+legacy generations. Inbox scans distinguish errors from absence. Failed allocation,
+decryption, reads, writes or close cannot silently remove a row. Queue-full or
+allocation-limited boot replay remains retryable, without scheduling duplicates.
+The active command inbox is limited to 64 KiB and shares recovery admission; larger
+legacy command journals remain preserved and need a separate bounded migration.
+
+Catalog streams share historical admission, are capped at 2 MiB, and sync each bounded
+record. Metadata insertions and restore-close results are checked. Real cJSON fault
+and measured 60/55/70 capacity tests exercise the production writer. Catalog replacement
+generation migration, processed/cancelled-command retention and HIL command deduplication
+are still outstanding. These changes do not close all auxiliary-persistence findings.
+
+The command checkpoint passes 452 local tests and the ESP-IDF build. GitHub's earlier
+8ce0279 firmware/frontend jobs passed, but the backend job exposed a missing POSIX
+feature flag in the storage-upgrade host harness. That test flag is corrected and both
+upgrade modes pass inside Linux/ESP-IDF. This is not a green release-qualification claim.

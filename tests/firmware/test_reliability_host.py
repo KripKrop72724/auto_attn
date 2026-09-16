@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("component", ["worker_retry", "reliability", "durable_queue", "legacy_queue", "delivery_scheduler", "uid_cache", "storage_budget", "evidence_receipt"])
+@pytest.mark.parametrize("component", ["file_transaction", "worker_retry", "reliability", "durable_queue", "legacy_queue", "delivery_scheduler", "uid_cache", "storage_budget", "evidence_receipt"])
 def test_reliability_c_regressions(tmp_path: Path, component: str) -> None:
     compiler = shutil.which(os.environ.get("CC", "cc"))
     assert compiler, "A C compiler is required for the firmware regression gate"
@@ -18,8 +18,9 @@ def test_reliability_c_regressions(tmp_path: Path, component: str) -> None:
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-omit-frame-pointer", "-I", str(firmware),
+        *(["-Drename=ft_test_rename", "-Dremove=ft_test_remove"] if component == "file_transaction" else []),
         str(firmware / f"{component}.c"),
-        *([str(firmware / "durable_queue.c")] if component == "legacy_queue" else []),
+        *([str(firmware / "durable_queue.c")] if component in {"legacy_queue", "file_transaction"} else []),
         str(ROOT / f"tests/firmware/{component}_host.c"), "-o", str(executable),
     ], check=True)
     result = subprocess.run([str(executable), "queue-"], cwd=tmp_path, capture_output=True, text=True)

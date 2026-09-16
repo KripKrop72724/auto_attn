@@ -98,7 +98,7 @@ int main(void)
     for mode in (0, 1):
         executable = tmp_path / f"upgrade-{mode}"
         subprocess.run([
-            shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+            shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
             f"-DZONE_LITE_SEGMENTED_WRITES={mode}", "-I", str(tmp_path), "-I", str(firmware),
             str(unit), str(firmware / "storage_upgrade.c"), str(firmware / "upgrade_guard.c"),

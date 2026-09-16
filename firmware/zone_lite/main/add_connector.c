@@ -1,5 +1,6 @@
 #include "add_connector.h"
 #include "evidence_receipt.h"
+#include "file_transaction.h"
 #include "ota_manager.h"
 
 #include <ctype.h>
@@ -78,6 +79,7 @@
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
+#define ADD_IDENTITY_CATALOG_MAX_BYTES (2U * 1024U * 1024U)
 #define ADD_OUTBOX_ACK_TIMEOUT_MS 10000
 #define ADD_PRIORITY_ACK_TIMEOUT_MS 10000
 #define ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS 12000
@@ -108,6 +110,8 @@
 #define ADD_CORRUPT_OUTBOX_MAX_BYTES (128 * 1024)
 #define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
 #define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
+#define ADD_COMMAND_INBOX_BACKUP_PATH "/storage/add_commands.bak"
+#define ADD_COMMAND_INBOX_MAX_BYTES (64U * 1024U)
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
 #define ADD_IDENTITY_CATALOG_TMP_PATH "/storage/add_identities.tmp"
@@ -734,11 +738,30 @@ static char *decrypt_storage_line(const char *line)
     return (char *)plain;
 }
 
+static FILE *create_catalog_stage(const char *path)
+{
+    if (!qs_local_begin(QS_ADMIT_HISTORICAL, 4096)) return NULL;
+    FILE *file = fopen(path, "w");
+    int captured = file ? 0 : errno;
+    qs_local_end(file != NULL, captured);
+    if (!file) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return file;
+}
+
 static bool write_encrypted_json_line(FILE *file, cJSON *value)
 {
     char *plain = value ? cJSON_PrintUnformatted(value) : NULL;
     char *encrypted = encrypt_storage_json(plain);
-    bool ok = file && encrypted && fprintf(file, "%s\n", encrypted) > 0;
+    size_t bytes = encrypted ? strlen(encrypted) + 1 : 0;
+    long position = file && fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    bool admitted = encrypted && bytes <= DQ_MAX_RECORD_BYTES && position >= 0 &&
+        (uint64_t)position <= ADD_IDENTITY_CATALOG_MAX_BYTES &&
+        bytes <= ADD_IDENTITY_CATALOG_MAX_BYTES - (size_t)position &&
+        qs_local_begin(QS_ADMIT_HISTORICAL, bytes);
+    bool ok = admitted && fprintf(file, "%s\n", encrypted) > 0 &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(plain);
     free(encrypted);
     return ok;
@@ -829,7 +852,7 @@ static bool restore_valid_identity_catalog(void)
     }
     if (file && ferror(file)) ok = false;
     if (ok && row_count != (size_t)expected_rows) ok = false;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     free(line);
     if (!ok) {
         ESP_LOGW(TAG, "No complete encrypted ADD identity catalog was restored");
@@ -887,14 +910,14 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
     // payload and cJSON tree already account for the catalog once; duplicating
     // both on large terminals can exhaust internal heap before boot health can
     // acknowledge the freshly delivered catalog.
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w");
+    FILE *file = create_catalog_stage(ADD_IDENTITY_CATALOG_TMP_PATH);
     cJSON *metadata = cJSON_CreateObject();
     bool ok = file && metadata;
     if (ok) {
-        cJSON_AddStringToObject(metadata, "schema_version", "3");
-        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
-        cJSON_AddNumberToObject(metadata, "rows_count", row_count);
-        ok = write_encrypted_json_line(file, metadata);
+        ok = cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+            cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+            cJSON_AddNumberToObject(metadata, "rows_count", row_count) &&
+            write_encrypted_json_line(file, metadata);
     }
     cJSON_Delete(metadata);
     cJSON *row = NULL;
@@ -1003,14 +1026,14 @@ static bool identity_catalog_stage_begin(cJSON *root)
             s_identity_catalog_stage_alias_capacity = (size_t)expected;
         }
     }
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "w");
+    FILE *file = create_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     cJSON *metadata = cJSON_CreateObject();
     bool ok = file && metadata;
     if (ok) {
-        cJSON_AddStringToObject(metadata, "schema_version", "3");
-        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
-        cJSON_AddNumberToObject(metadata, "rows_count", expected);
-        ok = write_encrypted_json_line(file, metadata) &&
+        ok = cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+            cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+            cJSON_AddNumberToObject(metadata, "rows_count", expected) &&
+            write_encrypted_json_line(file, metadata) &&
             fflush(file) == 0 && fsync(fileno(file)) == 0;
     }
     cJSON_Delete(metadata);
@@ -1502,23 +1525,64 @@ static bool parse_reconcile_assignment(
     return true;
 }
 
-static bool command_journal_contains_locked(const char *command_id)
+static int command_transaction_load(void *context, ft_checkpoint_t *checkpoint)
 {
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, "commands", checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool command_transaction_commit(void *context, const ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, "commands", checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+
+static const ft_port_t command_transaction_port = {command_transaction_load, command_transaction_commit, NULL};
+static bool command_journal_recover_locked(void)
+{
+    bool ok = ft_recover(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
+        ADD_COMMAND_INBOX_BACKUP_PATH, command_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
+}
+
+/* -1 means unavailable; it is never permission to append a duplicate command. */
+static int command_journal_contains_locked(const char *command_id)
+{
+    if (!command_journal_recover_locked()) return -1;
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
-    if (!file) return false;
+    if (!file) return errno == ENOENT ? 0 : -1;
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    bool found = false;
+    int found = line ? 0 : -1;
     while (line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { found = -1; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
-        if (cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0) found = true;
+        if (!cJSON_IsString(id)) found = -1;
+        else if (strcmp(id->valuestring, command_id) == 0) found = 1;
         cJSON_Delete(root);
         free(plain);
         if (found) break;
     }
     free(line);
-    fclose(file);
+    if (ferror(file)) found = -1;
+    if (fclose(file) != 0) found = -1;
     return found;
 }
 
@@ -1527,16 +1591,26 @@ static bool command_journal_append(cJSON *root, const char *command_id)
     if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return false;
     }
-    if (command_journal_contains_locked(command_id)) {
+    int existing = command_journal_contains_locked(command_id);
+    if (existing != 0) {
         xSemaphoreGive(s_command_lock);
-        return true;
+        return existing == 1;
     }
     char *plain = cJSON_PrintUnformatted(root);
     char *line = encrypt_storage_json(plain);
-    FILE *file = line ? rel_open_append(ADD_COMMAND_INBOX_PATH) : NULL;
+    struct stat st;
+    int stat_result = stat(ADD_COMMAND_INBOX_PATH, &st);
+    bool known = stat_result == 0 || errno == ENOENT;
+    size_t bytes = line ? strlen(line) + 1 : 0;
+    size_t existing_bytes = stat_result == 0 && st.st_size >= 0 ? (size_t)st.st_size : 0;
+    bool admitted = line && known && existing_bytes <= ADD_COMMAND_INBOX_MAX_BYTES &&
+        bytes <= ADD_COMMAND_INBOX_MAX_BYTES - existing_bytes && qs_local_begin(QS_ADMIT_RECOVERY, bytes);
+    FILE *file = admitted ? rel_open_append(ADD_COMMAND_INBOX_PATH) : NULL;
     bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
     if (file && fclose(file) != 0) ok = false;
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(line);
     free(plain);
     xSemaphoreGive(s_command_lock);
@@ -1605,10 +1679,18 @@ static void restore_command_inbox(void)
         xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return;
     }
+    if (!command_journal_recover_locked()) {
+        xSemaphoreGive(s_command_lock);
+        return;
+    }
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool complete = file != NULL || errno == ENOENT;
+    char *line = file ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    if (file && !line) complete = false;
     uint32_t restored = 0;
-    while (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    while (complete && file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { complete = false; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         add_command_t command = {0};
@@ -1616,17 +1698,20 @@ static void restore_command_inbox(void)
         QueueHandle_t target = parsed && strcmp(command.command_type, "APPLY_CONFIG") == 0
             ? s_config_commands
             : s_commands;
-        if (parsed && target && command.command_id[0] &&
-            xQueueSend(target, &command, 0) == pdTRUE) {
-            command_mark_queued_locked(command.command_id);
-            restored++;
+        if (!parsed || !command.command_id[0]) complete = false;
+        else if (!command_is_scheduled_locked(command.command_id)) {
+            if (target && xQueueSend(target, &command, 0) == pdTRUE) {
+                command_mark_queued_locked(command.command_id);
+                restored++;
+            } else complete = false;
         }
         cJSON_Delete(root);
         free(plain);
     }
-    if (file) fclose(file);
+    if (file && ferror(file)) complete = false;
+    if (file && fclose(file) != 0) complete = false;
     free(line);
-    s_command_inbox_restored = true;
+    s_command_inbox_restored = complete;
     xSemaphoreGive(s_command_lock);
     if (restored > 0) {
         ESP_LOGW(TAG, "Restored %lu durable ADD command(s) after boot", (unsigned long)restored);
@@ -3459,6 +3544,7 @@ static void delivery_supervisor_task(void *arg)
         if (s_worker_start_failed || (s_outbox_tick_ms &&
             (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) > 90000U))
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        restore_command_inbox();
         // Do not asynchronously delete a task which might own a mutex.
         // Buffer failures self-retry; stalled operations are independently visible.
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -3998,37 +4084,46 @@ void add_connector_command_retry(const char *command_id)
 bool add_connector_command_complete(const char *command_id)
 {
     if (!command_id || !s_command_lock ||
-        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        return false;
-    }
-    if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
-    command_unmark_queued_locked(command_id);
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
+    if (!command_journal_recover_locked()) { xSemaphoreGive(s_command_lock); return false; }
     FILE *input = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!input) {
+        bool absent = errno == ENOENT;
+        if (absent && strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
         xSemaphoreGive(s_command_lock);
-        return true;
+        return absent;
     }
-    FILE *output = fopen(ADD_COMMAND_INBOX_TMP_PATH, "w");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    struct stat st;
+    bool bounded = fstat(fileno(input), &st) == 0 && st.st_size >= 0 && st.st_size <= ADD_COMMAND_INBOX_MAX_BYTES;
+    bool admitted = bounded && qs_local_begin(QS_ADMIT_RECOVERY, (size_t)st.st_size);
+    FILE *output = admitted ? fopen(ADD_COMMAND_INBOX_TMP_PATH, "w") : NULL;
+    char *line = output ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
     bool ok = output && line;
     while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, input)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { ok = false; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
-        bool remove = cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0;
+        if (!cJSON_IsString(id)) ok = false; // allocation/decryption errors retain the old generation
+        bool remove_row = cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0;
         cJSON_Delete(root);
         free(plain);
-        if (!remove && fputs(line, output) == EOF) ok = false;
+        if (ok && !remove_row && fputs(line, output) == EOF) ok = false;
     }
+    if (ferror(input)) ok = false;
     if (output && (fflush(output) != 0 || fsync(fileno(output)) != 0)) ok = false;
-    fclose(input);
-    if (output) fclose(output);
+    if (fclose(input) != 0) ok = false;
+    if (output && fclose(output) != 0) ok = false;
     free(line);
+    if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
+        ADD_COMMAND_INBOX_BACKUP_PATH, ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
+    // Never remove a staged generation after an uncertain NVS commit.
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
     if (ok) {
-        (void)remove(ADD_COMMAND_INBOX_PATH);
-        ok = rename(ADD_COMMAND_INBOX_TMP_PATH, ADD_COMMAND_INBOX_PATH) == 0;
-    }
-    if (!ok) (void)remove(ADD_COMMAND_INBOX_TMP_PATH);
+        if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
+        command_unmark_queued_locked(command_id);
+    } else led_status_fault(LED_STATUS_LOCAL_FAILURE);
     xSemaphoreGive(s_command_lock);
     return ok;
 }
