@@ -303,3 +303,11 @@ object and releases every acquired lock. Actual ESP-IDF cJSON allocation injecti
 passed, the firmware suite passed 142 tests, and the ESP-IDF 5.5.3 unsigned development
 build passed. Verified recovery/healthy reporting and release qualification remain
 outstanding; no production firmware was published by this checkpoint.
+
+### Light reconciliation commit ordering (2026-09-16)
+
+Light reconciliation now resets its live-event evidence and reports success only
+after the runtime checkpoint commits. Actual firmware adapter tests and the actual
+NVS runtime writer cover failed open, set, commit, and uncertain commit: the previous
+authoritative count is restored, live evidence is retained, and recovery is required.
+The targeted sanitizer tests and ESP-IDF 5.5.3 development build pass.

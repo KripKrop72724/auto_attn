@@ -642,6 +642,17 @@ static bool nvs_save_runtime_state(void)
     return true;
 }
 
+// A light check only becomes a new baseline after its checkpoint commits.
+// Keep the live evidence intact on failure so the recovery pass can account for it.
+static bool commit_light_reconcile(int32_t refreshed_records, size_t *live_events)
+{
+    if (!live_events) return false;
+    g_last_synced_attendance_count = refreshed_records;
+    if (!nvs_save_runtime_state()) return false;
+    *live_events = 0;
+    return true;
+}
+
 static void nvs_load_runtime_state(void)
 {
     nvs_handle_t handle;
@@ -8444,11 +8455,11 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     "Light reconcile passed: device_delta=%lld matched %u live events; heavy dump skipped",
                     (long long)record_delta,
                     (unsigned)live_events_since_sync);
-                ESP_LOGI(TAG, "%s", summary);
-                add_connector_log("INFO", "reconcile", "LIGHT_RECONCILE_OK", summary);
-                g_last_synced_attendance_count = refreshed_records;
-                live_events_since_sync = 0;
-                nvs_save_runtime_state();
+                reconcile_succeeded = commit_light_reconcile(refreshed_records, &live_events_since_sync);
+                if (reconcile_succeeded) {
+                    ESP_LOGI(TAG, "%s", summary);
+                    add_connector_log("INFO", "reconcile", "LIGHT_RECONCILE_OK", summary);
+                }
             }
             g_add_zkt.user_count = refreshed_users;
             g_add_zkt.attendance_count = refreshed_records;

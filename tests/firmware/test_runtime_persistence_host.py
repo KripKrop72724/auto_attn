@@ -76,6 +76,13 @@ int main(void) {
     assert(fault_count==4);
     failure=0;g_force_truth_reconcile=false;g_add_source_coverage_cursor=300;
     assert(nvs_save_runtime_state());assert(durable.source_cursor==300);
+    size_t live=3;
+    for(failure=1;failure<=4;++failure) {
+        assert(!commit_light_reconcile(103,&live));
+        assert(live==3 && g_last_synced_attendance_count==100);
+    }
+    failure=0;assert(commit_light_reconcile(103,&live));
+    assert(live==0 && durable.attendance_count==103);
     unsigned prior=writes;g_add_source_coverage_chain[0]='X';
     assert(!nvs_save_runtime_state());assert(writes==prior);
     assert(g_add_source_coverage_chain[0]=='0');
