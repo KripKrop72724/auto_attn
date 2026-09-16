@@ -48,6 +48,9 @@ class Envelope(BaseModel):
 class OtaHeartbeatPayload(BaseModel):
     """Bounded OTA runtime evidence emitted by Zone Lite heartbeats."""
 
+    running_version: str | None = Field(default=None, min_length=1, max_length=80)
+    running_partition: Literal["ota_0", "ota_1"] | None = None
+    image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     capable: bool = False
     secure_boot: bool = False
     rollback_enabled: bool = False

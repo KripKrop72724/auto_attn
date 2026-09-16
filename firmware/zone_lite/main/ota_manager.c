@@ -582,14 +582,17 @@ bool ota_manager_busy(void)
 void ota_manager_append_telemetry(cJSON *heartbeat)
 {
     if (!heartbeat) return;
-    cJSON *ota = cJSON_AddObjectToObject(heartbeat, "ota");
-    cJSON_AddBoolToObject(ota, "capable", true);
-    cJSON_AddBoolToObject(ota, "secure_boot", esp_secure_boot_enabled());
-    cJSON_AddBoolToObject(ota, "rollback_enabled", true);
-    cJSON_AddStringToObject(ota, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT);
-    cJSON_AddStringToObject(ota, "state", s_busy ? "UPDATING" : s_journal.state);
-    cJSON_AddStringToObject(ota, "target_version", s_journal.target_version);
-    cJSON_AddNumberToObject(ota, "bytes_written", (double)s_journal.bytes_written);
-    cJSON_AddNumberToObject(ota, "image_size", (double)s_journal.image_size);
-    if (s_last_error[0]) cJSON_AddStringToObject(ota, "last_error", s_last_error);
+    cJSON *ota = cJSON_CreateObject();
+    bool valid = ota && add_running_image_evidence(ota) &&
+        cJSON_AddBoolToObject(ota, "capable", true) &&
+        cJSON_AddBoolToObject(ota, "secure_boot", esp_secure_boot_enabled()) &&
+        cJSON_AddBoolToObject(ota, "rollback_enabled", true) &&
+        cJSON_AddStringToObject(ota, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT) &&
+        cJSON_AddStringToObject(ota, "state", s_busy ? "UPDATING" : s_journal.state) &&
+        cJSON_AddStringToObject(ota, "target_version", s_journal.target_version) &&
+        cJSON_AddNumberToObject(ota, "bytes_written", (double)s_journal.bytes_written) &&
+        cJSON_AddNumberToObject(ota, "image_size", (double)s_journal.image_size);
+    if (valid && s_last_error[0]) valid = cJSON_AddStringToObject(ota, "last_error", s_last_error) != NULL;
+    if (valid && cJSON_AddItemToObject(heartbeat, "ota", ota)) return;
+    cJSON_Delete(ota);
 }

@@ -156,6 +156,31 @@ class FirmwareDownloadGrant(Base):
     last_used_at: Mapped[Any | None] = mapped_column(DateTime(timezone=True))
 
 
+class FirmwareHilRun(Base):
+    __tablename__ = "add_firmware_hil_runs"
+    __table_args__ = (
+        UniqueConstraint("actor", "idempotency_key", name="uq_add_hil_run_actor_key"),
+        Index("uq_add_hil_run_active_connector", "connector_id", unique=True,
+              postgresql_where=text("status = 'OBSERVING'"),
+              sqlite_where=text("status = 'OBSERVING'")),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("add_firmware_deployments.id"), index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    release_id: Mapped[int] = mapped_column(ForeignKey("add_firmware_releases.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default="OBSERVING", index=True)
+    target: Mapped[dict] = mapped_column(JSON)
+    release_identity: Mapped[dict] = mapped_column(JSON)
+    baseline: Mapped[dict] = mapped_column(JSON)
+    started_at: Mapped[Any] = utc_column()
+    ends_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[Any | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 def _require_previous_candidate_acceptance(
     session: Session, release: FirmwareRelease, targets: list[HilTarget], index: int,
 ) -> None:

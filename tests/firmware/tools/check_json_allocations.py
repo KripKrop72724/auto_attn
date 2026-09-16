@@ -186,7 +186,9 @@ typedef struct { const char *version; } esp_app_desc_t;
 typedef struct { const char *label; } esp_partition_t;
 static const esp_app_desc_t description={"2.6.0"};
 static const esp_partition_t partition={"ota_1"};
-static struct { char deployment_id[48];size_t bytes_written; } s_journal={"test",1024};
+static struct { char deployment_id[48];size_t bytes_written,image_size;char state[40],target_version[80]; } s_journal={.deployment_id="test",.bytes_written=1024,.image_size=1024,.state="SUCCEEDED",.target_version="2.6.0"};
+static bool s_busy;
+static const char s_last_error[]="test_error";
 static const esp_app_desc_t *esp_app_get_description(void) { return missing_description?NULL:&description; }
 static const esp_partition_t *esp_ota_get_running_partition(void) { return missing_partition?NULL:&partition; }
 static bool esp_secure_boot_enabled(void) { return true; }
@@ -201,7 +203,7 @@ static bool post_json(const char *path,cJSON *root)
     if(strstr(path,"progress"))assert(strstr(body,"bytes_written") && strstr(body,"error_code"));
     ++sends;free(body);return true;
 }
-''' + ota[start:end] + r'''
+''' + ota[start:end] + ota[ota.index("void ota_manager_append_telemetry("):] + r'''
 int main(void)
 {
     cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
@@ -220,6 +222,18 @@ int main(void)
         missing_description=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_description=false;
         assert(!sends);
     }
+    fail_at=0;cJSON *heartbeat=cJSON_CreateObject();calls=0;
+    ota_manager_append_telemetry(heartbeat);size_t total=calls;
+    cJSON *evidence=cJSON_GetObjectItemCaseSensitive(heartbeat,"ota");assert(evidence);
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(evidence,"running_version")->valuestring,"2.6.0"));
+    assert(strlen(cJSON_GetObjectItemCaseSensitive(evidence,"image_sha256")->valuestring)==64);
+    cJSON_Delete(heartbeat);
+    for(size_t i=1;i<=total;i++){
+        fail_at=0;heartbeat=cJSON_CreateObject();calls=0;fail_at=i;
+        ota_manager_append_telemetry(heartbeat);assert(!cJSON_HasObjectItem(heartbeat,"ota"));cJSON_Delete(heartbeat);
+    }
+    fail_at=0;heartbeat=cJSON_CreateObject();fail_hash=true;
+    ota_manager_append_telemetry(heartbeat);assert(!cJSON_HasObjectItem(heartbeat,"ota"));cJSON_Delete(heartbeat);
     puts("OTA evidence allocation regressions passed");
 }
 '''

@@ -3803,6 +3803,59 @@ from zk_add.ota import (  # noqa: E402
 from zk_add.time_utils import utc_now as _ota_utc_now  # noqa: E402
 
 
+from zk_add.hil_scope import HilTarget as _HilTarget  # noqa: E402
+from zk_add.hil_runs import (  # noqa: E402
+    start_run as _start_hil_run, cancel_run as _cancel_hil_run, serialize_run as _serialize_hil_run,
+)
+from zk_add.ota import FirmwareHilRun as _FirmwareHilRun  # noqa: E402
+
+
+class _HilRunIn(_BaseModel):
+    deployment_id: str = _Field(min_length=1, max_length=100)
+    target: _HilTarget
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+
+@app.post("/api/v1/firmware/hil-runs", status_code=201)
+def start_firmware_hil_run(
+    body: _HilRunIn, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        run = _start_hil_run(db, deployment_id=body.deployment_id, target=body.target,
+                             actor=context.username, idempotency_key=body.idempotency_key)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_HIL_STARTED", target_type="connector",
+                  target_id=body.target.connector_id, outcome=run.status, after={"run_id": run.run_id})
+    db.commit()
+    return _serialize_hil_run(run)
+
+
+@app.get("/api/v1/firmware/hil-runs/{run_id}")
+def get_firmware_hil_run(run_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _ = auth
+    run = db.scalar(_select(_FirmwareHilRun).where(_FirmwareHilRun.run_id == run_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="HIL observation not found")
+    return _serialize_hil_run(run)
+
+
+@app.post("/api/v1/firmware/hil-runs/{run_id}/cancel")
+def cancel_firmware_hil_run(
+    run_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        run = _cancel_hil_run(db, run_id, actor=context.username)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_HIL_CANCELLED", target_type="connector",
+                  target_id=run.target["connector_id"], outcome=run.status, after={"run_id": run.run_id})
+    db.commit()
+    return _serialize_hil_run(run)
+
+
 class _FirmwareCapabilityIn(_BaseModel):
     capable: bool
     secure_boot: bool

@@ -351,3 +351,34 @@ requires committed source files and records source/binary hashes, compiler, elap
 time, logs and outcome. A short 22-second harness check accounted for 1,240 records
 across 14 checkpoint faults and one simulated restart. This short check is not the
 required 24-hour qualification receipt.
+
+### Current-boot evidence and durable HIL observation ownership (2026-09-16)
+
+Firmware heartbeats now include the running application version, OTA partition and
+application digest. Serialization is complete-or-omit under allocation/hash failure;
+actual ESP-IDF cJSON failure injection and the development build pass. Older firmware
+reports no invented image evidence. Backend schema tests cover both formats.
+
+ADD now persists exact-target HIL observation ownership with a 15-minute window,
+idempotency and a database constraint preventing concurrent observations of one ESP.
+Starting requires the next ordered target, successful latest deployment, fresh boot
+evidence, verified storage recovery, healthy workers, known queue depth and a completed
+source certificate matching the committed cursor. Admin/CSRF-protected start/read/cancel
+routes are implemented. Cancellation records INCOMPLETE exactly once without promotion.
+The observation service passed 19 regression cases; HTTP authentication/CSRF tests pass.
+PostgreSQL 16 migration 0026 passed upgrade, downgrade, re-upgrade and schema-drift checks.
+The full local suite passed 596 tests before the additional HTTP route test.
+Maintenance commands, immutable observation collection/final acceptance, the operator
+UI and remote validation workflow remain outstanding. These endpoints have not been
+deployed to production.
+
+The 24-hour production-component host soak started at 2026-09-16 14:28:50 UTC using
+committed queue/scheduler/capacity sources from ca2f774f5be3b23d4a0e88c2a96da376cfab6187.
+Its independent manifest and result are stored in the local workspace artifacts under
+islamabad-hil/queue-soak-20260916T142850Z. It is RUNNING, not a passing receipt.
+
+The user subsequently requested nationwide rollout after successful Islamabad HIL.
+The 15-minute windows remain smoke tests. Nationwide promotion is now an intended
+subsequent phase after both target receipts and required software qualification, using
+staged rollout. Existing promotion controls remain in force; no Karachi, physical
+power-cut or hardware endurance gate is represented as passed by this Islamabad test.
