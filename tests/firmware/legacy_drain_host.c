@@ -26,6 +26,8 @@ static legacy_queue_t g_legacy_pending;
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
 static bool g_legacy_probe_head;
 static bool g_ords_buffer_failed;
+static bool fail_evidence;
+static unsigned evidence_requests;
 static bool g_prefer_segmented_ords;
 static int64_t g_segmented_ords_retry_ms;
 static durable_queue_t segmented;
@@ -82,6 +84,17 @@ static bool add_enqueue_json_receipts(char *const *events,size_t count,const cha
 { assert(!storage_lock && events[0][0] && count<=100 && path[0]);return !fail_receipt; }
 static char *oracle_mark_permanent_rejection(const char *line) { (void)line;return NULL; }
 
+bool qs_generation(char output[33]) { memset(output, 'a', 32);output[32]=0;return true; }
+static bool add_connector_transfer_queue_evidence(
+    const char *queue,const char *generation,const char *record_id,
+    const void *data,size_t length,const char *serial,const char *reason)
+{
+    (void)serial;
+    assert(!storage_lock && queue[0] && generation[0] && record_id[0] && !strcmp(reason,"MALFORMED"));
+    assert(length==8 && !memcmp(data,"bad\0row\n",8));
+    ++evidence_requests;
+    return !fail_evidence;
+}
 /* INSERT_PRODUCTION_SEGMENTED */
 /* INSERT_PRODUCTION_DRAIN */
 
@@ -131,6 +144,14 @@ int main(void)
     oracle_drain_pending(true);
     assert(requests==prior+2 && segmented.checkpoint.depth==0);
     assert(!storage_lock && !gate_lock);
+    f=fopen(PENDING_PATH,"wb");assert(f);
+    assert(fwrite("bad\0row\n",1,8,f)==8);assert(!fclose(f));
+    fail_evidence=true;g_prefer_segmented_ords=true;
+    oracle_drain_pending(true);
+    assert(evidence_requests==1 && g_legacy_pending.checkpoint.offset==0);
+    fail_evidence=false;
+    oracle_drain_pending(true);
+    assert(evidence_requests==2 && stat(PENDING_PATH,&st)!=0);
     free(g_legacy_drain_buffer);
     puts("legacy drain integration regressions passed");
 }

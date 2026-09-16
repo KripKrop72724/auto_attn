@@ -192,3 +192,8 @@ bool add_connector_log(
     const char *subsystem,
     const char *code,
     const char *message);
+
+/* True only after ADD durably accepts exact bytes and unresolved provenance. */
+bool add_connector_transfer_queue_evidence(
+    const char *queue, const char *generation, const char *record_id,
+    const void *raw, size_t raw_length, const char *terminal_serial, const char *reason);

@@ -10,7 +10,7 @@ Branch: `codex/firmware-reliability-islamabad-hil`.
 | Finding | Implemented locally | Remaining release requirements |
 |---|---|---|
 | 3 | Allocation-free queue scan with unknown/error state; verified EOF retirement | Fault matrix and integration with committed segmented checkpoints |
-| 4 | Allocation-free JSON syntax check; retry parse/serialization allocation failures; preserve failed quarantine | Complete injected write/allocation failures and durable evidence transfer |
+| 4 | Allocation-free JSON syntax check; retry parse/serialization allocation failures; preserve failed quarantine | Complete remaining injected failures and legacy evidence-file draining |
 | 5 | Bounded live parser, sanitizer coverage including 13-byte frame | Established protocol hint for concatenated frames and source recovery integration |
 | 6 | Explicit resource error; durable-outcome success allowlist; complete-UID dedup with bounded probes; serializers reject incomplete JSON | Complete end-to-end allocation matrix and reconciliation assertions |
 | 7 | Portable segmented queue; tested 60/55 pressure hysteresis, reserved admission and retirement cleanup | Runtime integration, bounded ACK cache, auxiliary-file budgets, resumable blocked repair |
@@ -19,15 +19,16 @@ Branch: `codex/firmware-reliability-islamabad-hil`.
 | 10 | Checked task startup, buffer retry, supervisor and visible faults | Exhaustive worker-failure and liveness qualification |
 | 11 | ADD/ORDS active, backup and temp files drain independently; preserve ambiguous blocked backup generations | Complete blocked-file recovery and all interruption boundaries |
 | 12 | Require terminal serial and identity fingerprint for local historical repair | Terminal replacement/reused-ID integration tests and verified resolution path |
-| 13 | Coherent versioned/checksummed runtime NVS blob, checked legacy queue commits and batch flush/sync/close | Complete remaining persistence fault matrix and call-site audit; segmented I/O faults already exercised |
+| 13 | Coherent versioned/checksummed runtime NVS blob, checked legacy queue commits and batch flush/sync/close | Complete remaining call-site audit; segmented I/O and actual runtime NVS failure matrix exercised |
 | 14 | Shared tested 4:1 scheduler, alternating bulk/proof service and per-lane backoff; ADD segmented compatibility reader | Activate separate receipt writes; prove direct-send and sustained-load fairness |
 | 15 | Versioned optional diagnostics across firmware/backend/UI, stale/missing labels, durable fault recovery gating and completed-with-exclusions wording | Complete persistence/queue/reconciliation instrumentation and browser qualification |
 | 16 | No production change | Version reservation, compatibility image, upgrade/rollback proofs and exact-target OTA |
 
 The ADD worker can read segmented attendance/receipt queues for compatibility,
 but **new segmented writes remain disabled**. The ORDS segmented compatibility
-reader is also connected and tested across receipt failure/restart. Blocked/evidence
-readers, complete migration and predecessor-image verification remain outstanding.
+reader is also connected and tested across receipt failure/restart. Blocked queue readers,
+legacy migration and predecessor-image verification remain outstanding.
+The ADD worker also reads the evidence lane with an exact custody receipt check.
 Existing firmware version remains unchanged. Local build uses the CI setup password
 and is unsigned; it is not a production artifact.
 
@@ -48,7 +49,7 @@ and is unsigned; it is not a production artifact.
   Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 422 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 428 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
@@ -60,6 +61,26 @@ and is unsigned; it is not a production artifact.
   downgrade/upgrade and schema-drift checks. The frontend passed 94 tests, its
   production build and bundle budget after diagnostics changes. Ordered HIL UI
   changes passed 98 frontend tests and another production build.
+
+## Durable queue evidence and runtime checkpoints
+
+ADD stores original queue bytes and provenance encrypted, with a unique custody
+identity and digest. Retries return the same receipt; changed bytes/provenance or
+wrong ownership are rejected. Acknowledgements occur after commit. Custody is
+explicitly `PRESERVED_UNRESOLVED`, not an attendance identity resolution. Admin
+listing omits raw data; reveal requires CSRF, step-up and an audit entry.
+
+The firmware verifies exact evidence receipt identity before retiring malformed
+ADD/ORDS rows. Embedded nulls cannot hide trailing bytes. Queue generations use
+a checked persistent storage instance. Evidence serialization is tested against
+actual cJSON with every allocation failed in turn. PostgreSQL migration upgrade,
+downgrade and schema checks pass. Legacy blocked and old quarantine files still
+need bounded draining integration.
+
+Runtime NVS failures restore the last committed source cursor in memory, invalidate
+completion telemetry and require recovery. The actual writer is host-tested with
+open/set/commit failures, including an uncertain commit, invalid state and generation
+exhaustion. Remaining persistence callers still require audit.
 
 ## Ordered HIL rollout controls
 

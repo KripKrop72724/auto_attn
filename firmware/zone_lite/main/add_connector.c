@@ -1,4 +1,5 @@
 #include "add_connector.h"
+#include "evidence_receipt.h"
 #include "ota_manager.h"
 
 #include <ctype.h>
@@ -173,6 +174,8 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+static bool s_waiting_evidence;
+static evidence_receipt_t s_evidence_expected;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
 static add_source_tail_ack_t s_source_tail_ack;
@@ -381,6 +384,23 @@ static bool send_root_locked(cJSON *root)
     return ok;
 }
 
+static bool evidence_identity(const cJSON *payload, evidence_receipt_t *out, bool receipt)
+{
+    memset(out, 0, sizeof(*out));
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(payload, "schema_version");
+    if (!cJSON_IsNumber(version) || version->valuedouble != 1) return false;
+    out->version = 1;
+    const char *names[] = {"connector_id", "queue", "queue_generation", "record_id", "payload_digest", "receipt_id", "disposition"};
+    char *destinations[] = {out->connector_id, out->queue, out->generation, out->record_id, out->digest, out->receipt_id, out->disposition};
+    size_t capacities[] = {sizeof(out->connector_id), sizeof(out->queue), sizeof(out->generation), sizeof(out->record_id), sizeof(out->digest), sizeof(out->receipt_id), sizeof(out->disposition)};
+    for (unsigned i = 0; i < (receipt ? 7U : 5U); ++i) {
+        const cJSON *field = cJSON_GetObjectItemCaseSensitive(payload, names[i]);
+        if (!cJSON_IsString(field) || !field->valuestring[0] || strlen(field->valuestring) >= capacities[i]) return false;
+        strlcpy(destinations[i], field->valuestring, capacities[i]);
+    }
+    return strlen(out->digest) == 64;
+}
+
 static bool send_payload(
     const char *type,
     const char *payload_json,
@@ -398,6 +418,12 @@ static bool send_payload(
     cJSON *payload = cJSON_Parse(safe_payload_json);
     free(safe_payload_json);
     if (!payload || !cJSON_IsObject(payload)) {
+        cJSON_Delete(payload);
+        return false;
+    }
+    evidence_receipt_t expected = {0};
+    bool evidence = strcmp(type, "queue_evidence") == 0;
+    if (evidence && !evidence_identity(payload, &expected, false)) {
         cJSON_Delete(payload);
         return false;
     }
@@ -447,6 +473,8 @@ static bool send_payload(
         }
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             strlcpy(s_waiting_ack, message_id, sizeof(s_waiting_ack));
+            s_waiting_evidence = evidence;
+            s_evidence_expected = expected;
             s_ack_matched = false;
             xSemaphoreGive(s_lock);
         } else {
@@ -1584,7 +1612,8 @@ static void parse_inbound(const char *data, size_t len)
          strcmp(type->valuestring, "reconcile_chunk_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_manifest_ack") == 0 ||
          strcmp(type->valuestring, "source_probe_ack") == 0 ||
-         strcmp(type->valuestring, "source_tail_ack") == 0)) {
+         strcmp(type->valuestring, "source_tail_ack") == 0 ||
+         strcmp(type->valuestring, "queue_evidence_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
@@ -1714,7 +1743,12 @@ static void parse_inbound(const char *data, size_t len)
                     }
                 }
                 s_waiting_ack[0] = '\0';
-                s_ack_matched = true;
+                if (s_waiting_evidence) {
+                    evidence_receipt_t receipt;
+                    s_ack_matched = strcmp(type->valuestring, "queue_evidence_ack") == 0 &&
+                        evidence_identity(root, &receipt, true) &&
+                        evidence_receipt_matches(&s_evidence_expected, &receipt);
+                } else s_ack_matched = true;
                 xSemaphoreGive(s_ack_sem);
             }
             xSemaphoreGive(s_lock);
@@ -2632,35 +2666,47 @@ static bool oracle_receipt_payload_is_valid(const cJSON *payload)
     return true;
 }
 
-static bool preserve_corrupt_outbox_row(const char *line)
+bool add_connector_transfer_queue_evidence(
+    const char *queue, const char *generation, const char *record_id,
+    const void *raw, size_t raw_length, const char *terminal_serial,
+    const char *reason)
 {
-    if (!line) return false;
-    size_t required = strlen(line) + 1;
-    if (required > ADD_CORRUPT_OUTBOX_MAX_BYTES) return false;
-    struct stat current = {0};
-    off_t current_bytes = stat(ADD_CORRUPT_OUTBOX_PATH, &current) == 0
-        ? current.st_size
-        : 0;
-    bool rotated = false;
-    if (current_bytes + (off_t)required > ADD_CORRUPT_OUTBOX_MAX_BYTES) {
-        // Unacknowledged evidence is never rotated away.
-        struct stat backup;
-        if (stat(ADD_CORRUPT_OUTBOX_BACKUP_PATH, &backup) == 0 || errno != ENOENT) return false;
-        if (rename(
-                ADD_CORRUPT_OUTBOX_PATH,
-                ADD_CORRUPT_OUTBOX_BACKUP_PATH) != 0) {
-            return false;
-        }
-        rotated = true;
+    if (!raw || !raw_length || raw_length > 8192 || !queue || !generation || !record_id || !reason)
+        return false;
+    unsigned char digest[32];
+    if (mbedtls_sha256(raw, raw_length, digest, 0) != 0) return false;
+    char hex[65];
+    for (size_t i = 0; i < sizeof(digest); ++i) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    size_t encoded_capacity = ((raw_length + 2) / 3) * 4 + 1;
+    unsigned char *encoded = malloc(encoded_capacity);
+    size_t encoded_length = 0;
+    if (!encoded || mbedtls_base64_encode(encoded, encoded_capacity, &encoded_length, raw, raw_length) != 0) {
+        free(encoded); return false;
     }
-    FILE *file = rel_open_append(ADD_CORRUPT_OUTBOX_PATH);
-    bool ok = file && fprintf(file, "%s\n", line) > 0 &&
-        fflush(file) == 0 && fsync(fileno(file)) == 0;
-    if (file && fclose(file) != 0) ok = false;
-    if (!ok && rotated) {
-        (void)remove(ADD_CORRUPT_OUTBOX_PATH);
-        (void)rename(ADD_CORRUPT_OUTBOX_BACKUP_PATH, ADD_CORRUPT_OUTBOX_PATH);
+    encoded[encoded_length] = 0;
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *provenance = cJSON_CreateObject();
+    bool ok = payload && provenance &&
+        cJSON_AddNumberToObject(payload, "schema_version", 1) &&
+        cJSON_AddStringToObject(payload, "connector_id", zone_config_get()->connector_id) &&
+        cJSON_AddStringToObject(payload, "queue", queue) &&
+        cJSON_AddStringToObject(payload, "queue_generation", generation) &&
+        cJSON_AddStringToObject(payload, "record_id", record_id) &&
+        cJSON_AddStringToObject(payload, "payload_digest", hex) &&
+        cJSON_AddStringToObject(payload, "raw_b64", (const char *)encoded) &&
+        cJSON_AddStringToObject(provenance, "reason", reason) &&
+        cJSON_AddStringToObject(provenance, "encoding", "LEGACY_ROW");
+    if (ok && terminal_serial && terminal_serial[0])
+        ok = cJSON_AddStringToObject(provenance, "terminal_serial", terminal_serial) != NULL;
+    if (ok) {
+        ok = cJSON_AddItemToObject(payload, "provenance", provenance);
+        if (ok) provenance = NULL;
     }
+    char *json = ok ? cJSON_PrintUnformatted(payload) : NULL;
+    cJSON_Delete(provenance); cJSON_Delete(payload); free(encoded);
+    ok = json && send_payload_and_wait_for_ack("queue_evidence", json,
+        pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+    free(json);
     return ok;
 }
 
@@ -3193,7 +3239,7 @@ static void outbox_task(void *arg)
         }
         priority_started = 0;
         unsigned ready = 0;
-        for (unsigned i = 0; i < 5; i++) {
+        for (unsigned i = 0; i < 6; i++) {
             uint32_t depth = 0;
             if (i == 0 || i == 2) {
                 add_outbox_t *legacy = i == 0 ? &s_live_outbox : &s_bulk_outbox;
@@ -3213,15 +3259,21 @@ static void outbox_task(void *arg)
         add_outbox_t *outbox = selected == 0 ? &s_live_outbox : &s_bulk_outbox;
         off_t row_end = 0;
         dq_token_t token = {0};
+        lq_token_t legacy_token = {0};
+        size_t raw_length = 0;
         bool have_row = false;
         if (segmented) {
             size_t length = 0;
             dq_result_t read = qs_peek(lanes[selected], line, ADD_OUTBOX_LINE_BYTES - 1, &length, &token);
             have_row = read == DQ_OK;
-            if (have_row) line[length] = 0;
+            if (have_row) { line[length] = 0; raw_length = length; }
             else if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         } else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
             have_row = read_outbox_row_locked(outbox, line, &row_end);
+            if (have_row) {
+                legacy_token = outbox->pending_token;
+                raw_length = legacy_token.end - legacy_token.offset;
+            }
             xSemaphoreGive(outbox->lock);
         }
         if (!have_row) {
@@ -3229,8 +3281,7 @@ static void outbox_task(void *arg)
             continue;
         }
         ds_attempted(&scheduler, (unsigned)selected);
-        line[strcspn(line, "\r\n")] = 0;
-        bool syntax_valid = rel_json_syntax_valid(line, strlen(line));
+        bool syntax_valid = !memchr(line, 0, raw_length) && rel_json_syntax_valid(line, raw_length);
         cJSON *record = syntax_valid ? cJSON_Parse(line) : NULL;
         if (syntax_valid && !record) {
             ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
@@ -3238,9 +3289,11 @@ static void outbox_task(void *arg)
         }
         cJSON *type = record ? cJSON_GetObjectItemCaseSensitive(record, "type") : NULL;
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
+        evidence_receipt_t evidence_identity_fields;
         bool valid = cJSON_IsString(type) && cJSON_IsObject(payload) &&
             ((strcmp(type->valuestring, "attendance_batch") == 0 && attendance_payload_is_valid(payload)) ||
-             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 && oracle_receipt_payload_is_valid(payload)));
+             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 && oracle_receipt_payload_is_valid(payload)) ||
+             (strcmp(type->valuestring, "queue_evidence") == 0 && evidence_identity(payload, &evidence_identity_fields, false)));
         char *payload_json = valid ? cJSON_PrintUnformatted(payload) : NULL;
         if (valid && !payload_json) {
             cJSON_Delete(record);
@@ -3250,14 +3303,31 @@ static void outbox_task(void *arg)
         if (!valid) {
             cJSON_Delete(record);
             free(payload_json);
-            bool preserved = false;
-            if (!segmented && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                preserved = preserve_corrupt_outbox_row(line);
-                if (preserved && !advance_outbox_locked(outbox, row_end)) preserved = false;
-                xSemaphoreGive(outbox->lock);
+            char instance[33], generation[80], record_id[80];
+            bool have_identity = qs_generation(instance);
+            if (segmented) {
+                snprintf(generation, sizeof(generation), "%s-segmented-v2", have_identity ? instance : "");
+                snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)token.segment,
+                    (unsigned long)token.offset, (unsigned long)token.sequence);
+            } else {
+                snprintf(generation, sizeof(generation), "%s-legacy-%lu", have_identity ? instance : "",
+                    (unsigned long)legacy_token.generation);
+                snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)legacy_token.offset,
+                    (unsigned long)legacy_token.crc);
             }
-            // New-format evidence must retain its generation/token provenance.
-            // Until a verified transfer is recorded, leave the source untouched.
+            const char *queue_names[] = {"add_live_legacy", "add_live", "add_bulk_legacy", "add_bulk", "receipts", "evidence"};
+            s_add_worker_operation = ADD_WORKER_NETWORK;
+            bool preserved = have_identity && add_connector_transfer_queue_evidence(
+                queue_names[selected], generation, record_id, line, raw_length, NULL, "MALFORMED");
+            s_add_worker_operation = ADD_WORKER_COMMITTING;
+            if (preserved) {
+                if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
+                else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                    preserved = advance_outbox_locked(outbox, row_end);
+                    xSemaphoreGive(outbox->lock);
+                } else preserved = false;
+            }
+            // Failed custody transfer leaves the exact original row in place.
             if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
             ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), preserved, esp_random());
             continue;

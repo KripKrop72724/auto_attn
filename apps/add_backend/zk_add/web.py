@@ -38,6 +38,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
+from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence
+from zk_add.models import QueueEvidence
+from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
 from zk_add.identity_conflicts import (
     build_identity_conflict_report,
@@ -1490,6 +1493,62 @@ def reveal_source_exception_endpoint(
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return result
+
+
+@app.get("/api/v1/devices/{connector_id}/queue-evidence")
+def list_queue_evidence(
+    connector_id: str,
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+    if connector is None:
+        raise HTTPException(status_code=404, detail="Connector not found.")
+    query = select(QueueEvidence).where(QueueEvidence.connector_id == connector.id)
+    if before is not None:
+        query = query.where(QueueEvidence.id < before)
+    rows = list(db.scalars(query.order_by(QueueEvidence.id.desc()).limit(limit + 1)))
+    return {
+        "rows": [{"receipt_id": row.receipt_id, "queue": row.queue,
+                  "queue_generation": row.queue_generation, "record_id": row.record_id,
+                  "payload_digest": row.payload_digest, "byte_count": row.byte_count,
+                  "disposition": row.disposition, "created_at": row.created_at}
+                 for row in rows[:limit]],
+        "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
+    }
+
+
+@app.post("/api/v1/queue-evidence/{receipt_id}/reveal")
+def reveal_queue_evidence(
+    receipt_id: str,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    row = db.scalar(select(QueueEvidence).where(QueueEvidence.receipt_id == receipt_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Queue evidence not found.")
+    protected = decrypt_json(row.protected_evidence)
+    connector = db.get(Connector, row.connector_id)
+    try:
+        validated = QueueEvidenceRequest.model_validate({
+            "connector_id": connector.connector_id, "queue": row.queue,
+            "queue_generation": row.queue_generation, "record_id": row.record_id,
+            "payload_digest": row.payload_digest, **protected,
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="Protected queue evidence failed verification.") from exc
+    append_audit(db, actor=context.username, action="QUEUE_EVIDENCE_REVEALED",
+                 target_type="queue_evidence", target_id=row.receipt_id, outcome="SUCCESS",
+                 after={"reason": body.reason.strip()}, request_id=body.idempotency_key)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return {"receipt_id": row.receipt_id, "disposition": row.disposition,
+            "raw_b64": validated.raw_b64, "provenance": validated.provenance.model_dump()}
 
 
 @app.get("/api/v1/reconciliation-divergences/{divergence_id}")
@@ -3246,6 +3305,13 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
             )
+        elif envelope.type == "queue_evidence":
+            evidence = preserve_queue_evidence(
+                db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
+            )
+            ack_payload = evidence_ack(evidence, connector, envelope.message_id)
+            event_payload = {"connector_id": connector.connector_id,
+                             "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}
         elif envelope.type == "oracle_receipt_batch":
             receipt_batch = OracleReceiptBatchRequest.model_validate(envelope.payload)
             applied, awaiting_event, rejected = record_oracle_receipts(

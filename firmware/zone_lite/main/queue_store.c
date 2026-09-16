@@ -1,6 +1,9 @@
 #include "queue_store.h"
 #include "storage_budget.h"
 #include <errno.h>
+#include <dirent.h>
+#include <string.h>
+#include "esp_random.h"
 #include <stdio.h>
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
@@ -12,7 +15,53 @@ static lane_t lanes[QS_COUNT];
 static SemaphoreHandle_t budget_lock;
 static qs_health_t health;
 static storage_budget_t budget;
+static char storage_generation[33];
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe"};
+static bool ensure_storage_generation(void)
+{
+    if (storage_generation[0]) return true;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("durable_queue", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    char value[33] = {0};
+    size_t length = sizeof(value);
+    result = nvs_get_str(handle, "instance", value, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        // Never attach a fresh identity to existing, unaccounted segments.
+        DIR *dir = opendir("/storage");
+        if (!dir) { nvs_close(handle); return false; }
+        struct dirent *entry;
+        bool orphaned = false;
+        errno = 0;
+        while ((entry = readdir(dir)) != NULL) {
+            for (unsigned i = 0; i < QS_COUNT; ++i) {
+                if (strncmp(entry->d_name, names[i], strlen(names[i])) == 0) orphaned = true;
+            }
+        }
+        if (errno) orphaned = true;
+        if (closedir(dir) != 0) orphaned = true;
+        if (orphaned) { nvs_close(handle); return false; }
+        uint8_t random[16];
+        esp_fill_random(random, sizeof(random));
+        for (unsigned i = 0; i < sizeof(random); ++i) snprintf(value + 2 * i, 3, "%02x", random[i]);
+        result = nvs_set_str(handle, "instance", value);
+        if (result == ESP_OK) result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (result != ESP_OK || strlen(value) != 32 || strspn(value, "0123456789abcdef") != 32) return false;
+    memcpy(storage_generation, value, sizeof(storage_generation));
+    return true;
+}
+
+bool qs_generation(char output[33])
+{
+    if (!output || !budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = ensure_storage_generation();
+    if (ok) memcpy(output, storage_generation, sizeof(storage_generation));
+    xSemaphoreGive(budget_lock);
+    return ok;
+}
+
 static int load(void *arg, dq_checkpoint_t *checkpoint)
 {
     lane_t *lane = arg;
@@ -69,6 +118,7 @@ bool qs_init(void)
 {
     if (!budget_lock) budget_lock = xSemaphoreCreateMutex();
     if (!budget_lock) return false;
+    if (!ensure_storage_generation()) return false;
     bool ok = true;
     for (unsigned i = 0; i < QS_COUNT; i++) {
         lane_t *lane = &lanes[i]; lane->lane = (qs_lane_t)i;

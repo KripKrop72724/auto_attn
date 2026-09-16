@@ -569,11 +569,25 @@ static int64_t epoch_now(void)
 }
 
 static uint32_t g_runtime_checkpoint_generation;
+static runtime_checkpoint_t g_committed_runtime;
+static bool g_committed_runtime_valid;
 
 static void runtime_checkpoint_failed(void)
 {
     g_force_truth_reconcile = true;
     g_add_source_coverage_certified = false;
+    g_add_source_coverage_cursor = g_committed_runtime_valid ? g_committed_runtime.source_cursor : 0;
+    g_add_source_coverage_generation = g_committed_runtime_valid ? g_committed_runtime.source_generation : 0;
+    strlcpy(g_add_source_coverage_chain, g_committed_runtime_valid ? g_committed_runtime.source_chain :
+        "0000000000000000000000000000000000000000000000000000000000000000", sizeof(g_add_source_coverage_chain));
+    g_last_synced_attendance_count = g_committed_runtime_valid ? g_committed_runtime.attendance_count : -1;
+    g_history_cursor_year = g_committed_runtime_valid ? g_committed_runtime.history_year : 0;
+    g_history_cursor_month = g_committed_runtime_valid ? g_committed_runtime.history_month : 0;
+    g_history_backfill_pending = true;
+    g_history_backfill_had_failures = true;
+    g_add_zkt.add_source_coverage_certified = false;
+    g_add_zkt.add_source_coverage_cursor = g_add_source_coverage_cursor;
+    update_history_telemetry();
     led_status_fault(LED_STATUS_LOCAL_FAILURE);
     (void)add_connector_log("ERROR", "storage", "NVS_CHECKPOINT_FAILED",
         "Runtime checkpoint is unavailable; source recovery remains required");
@@ -614,6 +628,7 @@ static bool nvs_save_runtime_state(void)
         strlcpy(state.truth_version, description ? description->version : "unknown", sizeof(state.truth_version));
     }
     state.crc = dq_crc32(&state, offsetof(runtime_checkpoint_t, crc));
+    if (!runtime_checkpoint_valid(&state)) { runtime_checkpoint_failed(); return false; }
     nvs_handle_t handle;
     esp_err_t result = nvs_open("zone_lite", NVS_READWRITE, &handle);
     if (result == ESP_OK) {
@@ -626,13 +641,18 @@ static bool nvs_save_runtime_state(void)
         return false;
     }
     g_runtime_checkpoint_generation = state.generation;
+    g_committed_runtime = state;
+    g_committed_runtime_valid = true;
     return true;
 }
 
 static void nvs_load_runtime_state(void)
 {
     nvs_handle_t handle;
-    if (nvs_open("zone_lite", NVS_READONLY, &handle) != ESP_OK) {
+    esp_err_t open_result = nvs_open("zone_lite", NVS_READONLY, &handle);
+    if (open_result != ESP_OK) {
+        if (open_result != ESP_ERR_NVS_NOT_FOUND) runtime_checkpoint_failed();
+        else g_force_truth_reconcile = true;
         return;
     }
     runtime_checkpoint_t state;
@@ -648,6 +668,8 @@ static void nvs_load_runtime_state(void)
             return;
         }
         g_runtime_checkpoint_generation = state.generation;
+        g_committed_runtime = state;
+        g_committed_runtime_valid = true;
         g_last_authenticated_zkt_ip = state.zkt_ip;
         g_last_synced_attendance_count = state.attendance_count;
         g_last_full_truth_reconcile_epoch = state.truth_epoch;
@@ -4127,7 +4149,7 @@ static bool process_add_reconciliation_assignment(
             g_force_truth_reconcile = false;
             g_history_backfill_pending = false;
             g_history_backfill_had_failures = false;
-            nvs_save_runtime_state();
+            if (!nvs_save_runtime_state()) return false;
             add_connector_log(
                 "INFO",
                 "reconcile",
@@ -4523,7 +4545,7 @@ static bool process_add_incremental_tail(
         g_last_synced_attendance_count = latest_records;
         g_last_full_truth_reconcile_epoch = epoch_now();
     }
-    nvs_save_runtime_state();
+    if (!nvs_save_runtime_state()) return false;
     if (exception_count > 0) {
         char message[192];
         snprintf(
@@ -5565,7 +5587,7 @@ static bool daily_zkt_reboot_should_attempt(int *local_day_key)
 static void daily_zkt_reboot_mark_complete(int local_day_key)
 {
     g_daily_zkt_reboot_completed_day = local_day_key;
-    nvs_save_runtime_state();
+    if (!nvs_save_runtime_state()) return;
     ESP_LOGW(TAG, "Scheduled ZKT maintenance reboot completed for slot=%d", local_day_key);
 }
 
@@ -6227,8 +6249,8 @@ static void history_finish_sweep(int64_t current_epoch)
     history_dump_cache_clear();
     g_history_backfill_pending = false;
     g_history_last_sweep_epoch = current_epoch > 1700000000 ? current_epoch : epoch_now();
+    if (!nvs_save_runtime_state()) return;
     update_history_telemetry();
-    nvs_save_runtime_state();
     char message[224];
     snprintf(
         message,
@@ -6863,24 +6885,30 @@ static bool oracle_drain_segmented_slice(void)
     dq_token_t token;
     dq_result_t read = qs_peek(QS_ORDS, event, DQ_MAX_RECORD_BYTES, &length, &token);
     if (read == DQ_EMPTY) return false;
-    if (read != DQ_OK || memchr(event, 0, length)) {
+    if (read != DQ_OK) {
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
         g_segmented_ords_retry_ms = now + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
         return false;
     }
     event[length] = 0;
     add_connector_report_ords_worker(ADD_WORKER_NETWORK);
-    oracle_delivery_result_t delivery = oracle_send_live(event);
+    oracle_delivery_result_t delivery = memchr(event, 0, length)
+        ? ORACLE_DELIVERY_CORRUPT_LOCAL_ROW : oracle_send_live(event);
     char *events[] = {event};
     bool settled = delivery == ORACLE_DELIVERY_ACKED &&
         add_enqueue_json_receipts(events, 1, "FIRMWARE_LIVE");
     char *quarantine = delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
         ? oracle_mark_permanent_rejection(event) : NULL;
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
-    if ((quarantine || delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) &&
-        g_storage_lock && xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        settled = append_line(quarantine ? BLOCKED_PATH : CORRUPT_ORDS_PATH,
-                              quarantine ? quarantine : event);
+    if (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
+        char instance[33], record_id[80];
+        snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)token.segment,
+            (unsigned long)token.offset, (unsigned long)token.sequence);
+        settled = qs_generation(instance) && add_connector_transfer_queue_evidence(
+            "ords", instance, record_id, event, length, NULL, "MALFORMED");
+    } else if (quarantine && g_storage_lock &&
+               xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        settled = append_line(BLOCKED_PATH, quarantine);
         xSemaphoreGive(g_storage_lock);
     }
     free(quarantine);
@@ -6950,6 +6978,7 @@ static void oracle_drain_pending(bool live_first)
     lq_token_t tokens[100];
     char *events[100];
     size_t count = 0;
+    bool binary_head = false;
     dq_result_t read = DQ_OK;
     if (!g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
@@ -6961,9 +6990,11 @@ static void oracle_drain_pending(bool live_first)
         events[count] = g_legacy_drain_buffer[count];
         read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
         if (read != DQ_OK) break;
+        bool binary = memchr(events[count], 0, tokens[count].end - tokens[count].offset) != NULL;
+        if (binary && count) break;
         scan.checkpoint.offset = tokens[count].end;
-        events[count][strcspn(events[count], "\r\n")] = 0;
         count++;
+        if (binary) { binary_head = true; break; }
     }
     if (!count && read == DQ_EMPTY) {
         dq_result_t reclaim = lq_reclaim(&g_legacy_pending);
@@ -6987,7 +7018,8 @@ static void oracle_drain_pending(bool live_first)
     // lock is held during ORDS waits or durable ADD receipt enqueue/backpressure.
     oracle_delivery_result_t delivery;
     add_connector_report_ords_worker(ADD_WORKER_NETWORK);
-    if (count == 1) delivery = oracle_send_live(events[0]);
+    if (binary_head) delivery = ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
+    else if (count == 1) delivery = oracle_send_live(events[0]);
     else delivery = oracle_send_bulk(events, count) ? ORACLE_DELIVERY_ACKED : ORACLE_DELIVERY_RETRYABLE;
     bool settled = delivery == ORACLE_DELIVERY_ACKED &&
         add_enqueue_json_receipts(events, count, count == 1 ? "FIRMWARE_LIVE" : "FIRMWARE_BULK");
@@ -6996,12 +7028,20 @@ static void oracle_drain_pending(bool live_first)
     g_legacy_probe_head = delivery != ORACLE_DELIVERY_ACKED;
     char *quarantine = count == 1 && delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
         ? oracle_mark_permanent_rejection(events[0]) : NULL;
+    if (count == 1 && delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
+        char instance[33], generation[80], record_id[80];
+        bool identity = qs_generation(instance);
+        snprintf(generation, sizeof(generation), "%s-legacy-%lu", identity ? instance : "",
+            (unsigned long)tokens[0].generation);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)tokens[0].offset,
+            (unsigned long)tokens[0].crc);
+        settled = identity && add_connector_transfer_queue_evidence("ords_legacy", generation,
+            record_id, events[0], tokens[0].end - tokens[0].offset, NULL, "MALFORMED");
+    }
     const char *failure_stage = NULL;
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
-        else if (count == 1 && delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW)
-            settled = append_line(CORRUPT_ORDS_PATH, events[0]);
         if (settled) {
             for (size_t i = 0; i < count; i++) {
                 // The outbox gate excludes other consumers. Prior successful

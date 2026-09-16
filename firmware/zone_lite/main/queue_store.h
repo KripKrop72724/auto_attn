@@ -10,6 +10,7 @@ typedef struct {
     int last_error;
 } qs_health_t;
 bool qs_init(void);
+bool qs_generation(char output[33]);
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length);
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy);
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token);

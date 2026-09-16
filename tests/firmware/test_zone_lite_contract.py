@@ -1487,20 +1487,14 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "ds_complete(&scheduler" in connector
     assert "esp_random()" in connector
 
-    corrupt = connector[
-        connector.index("static bool preserve_corrupt_outbox_row(") :
-        connector.index("static char *outbox_record_line(")
-    ]
-    assert "ADD_CORRUPT_OUTBOX_MAX_BYTES" in corrupt
-    assert "ADD_CORRUPT_OUTBOX_BACKUP_PATH" in corrupt
-    assert "fsync(fileno(file)) == 0" in corrupt
     worker = connector[
         connector.index("static void outbox_task(") :
         connector.index("void add_connector_init(")
     ]
-    assert worker.index("preserve_corrupt_outbox_row(line)") < worker.index(
+    assert worker.index("add_connector_transfer_queue_evidence(") < worker.index(
         "advance_outbox_locked(outbox, row_end)"
     )
-    assert "preserved && !advance_outbox_locked" in worker
+    assert "if (preserved)" in worker
+    assert "!memchr(line, 0, raw_length)" in worker
     assert "syntax_valid && !record" in worker
     assert "valid && !payload_json" in worker
