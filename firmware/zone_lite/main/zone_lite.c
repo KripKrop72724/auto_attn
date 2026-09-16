@@ -51,6 +51,9 @@
 #include "ota_manager.h"
 #include "setup_portal.h"
 #include "zone_config.h"
+#include "reliability.h"
+#include "runtime_checkpoint.h"
+#include "legacy_queue.h"
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -561,44 +564,65 @@ static int64_t epoch_now(void)
     return (int64_t)now;
 }
 
-static void nvs_save_runtime_state(void)
+static uint32_t g_runtime_checkpoint_generation;
+
+static void runtime_checkpoint_failed(void)
 {
-    nvs_handle_t handle;
-    if (nvs_open("zone_lite", NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+    g_force_truth_reconcile = true;
+    g_add_source_coverage_certified = false;
+    led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    (void)add_connector_log("ERROR", "storage", "NVS_CHECKPOINT_FAILED",
+        "Runtime checkpoint is unavailable; source recovery remains required");
+}
+
+static bool nvs_save_runtime_state(void)
+{
+    runtime_checkpoint_t state;
+    memset(&state, 0, sizeof(state));
+    if (g_runtime_checkpoint_generation == UINT32_MAX) {
+        runtime_checkpoint_failed();
+        return false;
     }
-    (void)nvs_set_u32(handle, "zkt_ip", g_last_authenticated_zkt_ip);
-    (void)nvs_set_i32(handle, "attn_count", g_last_synced_attendance_count);
-    (void)nvs_set_i64(handle, "truth_epoch", g_last_full_truth_reconcile_epoch);
+    state.version = RUNTIME_CHECKPOINT_VERSION;
+    state.generation = g_runtime_checkpoint_generation + 1;
+    state.history_schema = ZONE_LITE_HISTORY_SCHEMA_VERSION;
+    state.zkt_ip = g_last_authenticated_zkt_ip;
+    state.attendance_count = g_last_synced_attendance_count;
+    state.truth_epoch = g_last_full_truth_reconcile_epoch;
+    state.history_pending = g_history_backfill_pending;
+    state.history_failed = g_history_backfill_had_failures;
+    state.history_year = g_history_cursor_year;
+    state.history_month = g_history_cursor_month;
+    state.oldest_year = g_history_oldest_year;
+    state.oldest_month = g_history_oldest_month;
+    state.history_sweep = g_history_last_sweep_epoch;
+    state.history_failures = g_history_failed_windows;
+    state.restart_day = g_daily_zkt_reboot_completed_day;
+    state.lease_active = g_temp_admin_active;
+    state.lease_uid = g_temp_admin_uid;
+    state.lease_expiry = g_temp_admin_expires_epoch;
+    state.source_certified = g_add_source_coverage_certified;
+    state.source_cursor = g_add_source_coverage_cursor;
+    state.source_generation = g_add_source_coverage_generation;
+    strlcpy(state.source_chain, g_add_source_coverage_chain, sizeof(state.source_chain));
     if (!g_force_truth_reconcile) {
         const esp_app_desc_t *description = esp_app_get_description();
-        const char *version = description && description->version[0]
-            ? description->version
-            : "unknown";
-        (void)nvs_set_str(handle, "truth_ver", version);
+        strlcpy(state.truth_version, description ? description->version : "unknown", sizeof(state.truth_version));
     }
-    (void)nvs_set_u8(handle, "hist_schema", ZONE_LITE_HISTORY_SCHEMA_VERSION);
-    (void)nvs_set_u8(handle, "hist_pending", g_history_backfill_pending ? 1 : 0);
-    (void)nvs_set_u8(handle, "hist_failed", g_history_backfill_had_failures ? 1 : 0);
-    (void)nvs_set_i32(handle, "hist_year", g_history_cursor_year);
-    (void)nvs_set_i32(handle, "hist_month", g_history_cursor_month);
-    (void)nvs_set_i32(handle, "hist_old_y", g_history_oldest_year);
-    (void)nvs_set_i32(handle, "hist_old_m", g_history_oldest_month);
-    (void)nvs_set_i64(handle, "hist_sweep", g_history_last_sweep_epoch);
-    (void)nvs_set_u32(handle, "hist_fail_n", g_history_failed_windows);
-    (void)nvs_set_i32(handle, "restart_slot", g_daily_zkt_reboot_completed_day);
-    (void)nvs_set_u8(handle, "lease_active", g_temp_admin_active ? 1 : 0);
-    (void)nvs_set_u16(handle, "lease_uid", g_temp_admin_uid);
-    (void)nvs_set_i64(handle, "lease_exp", g_temp_admin_expires_epoch);
-    (void)nvs_set_u8(
-        handle,
-        "add_src_cert",
-        g_add_source_coverage_certified ? 1 : 0);
-    (void)nvs_set_u32(handle, "add_src_cur", g_add_source_coverage_cursor);
-    (void)nvs_set_u32(handle, "add_src_gen", g_add_source_coverage_generation);
-    (void)nvs_set_str(handle, "add_src_hash", g_add_source_coverage_chain);
-    (void)nvs_commit(handle);
-    nvs_close(handle);
+    state.crc = dq_crc32(&state, offsetof(runtime_checkpoint_t, crc));
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("zone_lite", NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_set_blob(handle, "runtime_v1", &state, sizeof(state));
+        if (result == ESP_OK) result = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (result != ESP_OK) {
+        runtime_checkpoint_failed();
+        return false;
+    }
+    g_runtime_checkpoint_generation = state.generation;
+    return true;
 }
 
 static void nvs_load_runtime_state(void)
@@ -607,6 +631,47 @@ static void nvs_load_runtime_state(void)
     if (nvs_open("zone_lite", NVS_READONLY, &handle) != ESP_OK) {
         return;
     }
+    runtime_checkpoint_t state;
+    size_t state_size = sizeof(state);
+    esp_err_t state_result = nvs_get_blob(handle, "runtime_v1", &state, &state_size);
+    if (state_result != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        if (state_result != ESP_OK || state_size != sizeof(state) ||
+            !runtime_checkpoint_valid(&state) || state.history_schema != ZONE_LITE_HISTORY_SCHEMA_VERSION) {
+            // Never fall back to stale legacy keys after a new-format checkpoint
+            // exists. An unreadable generation requires conservative recovery.
+            runtime_checkpoint_failed();
+            return;
+        }
+        g_runtime_checkpoint_generation = state.generation;
+        g_last_authenticated_zkt_ip = state.zkt_ip;
+        g_last_synced_attendance_count = state.attendance_count;
+        g_last_full_truth_reconcile_epoch = state.truth_epoch;
+        g_history_backfill_pending = state.history_pending;
+        g_history_backfill_had_failures = state.history_failed;
+        g_history_cursor_year = state.history_year;
+        g_history_cursor_month = state.history_month;
+        g_history_oldest_year = state.oldest_year;
+        g_history_oldest_month = state.oldest_month;
+        g_history_last_sweep_epoch = state.history_sweep;
+        g_history_failed_windows = state.history_failures;
+        g_daily_zkt_reboot_completed_day = state.restart_day;
+        g_temp_admin_active = state.lease_active;
+        g_temp_admin_uid = state.lease_uid;
+        g_temp_admin_expires_epoch = state.lease_expiry;
+        g_add_source_coverage_certified = state.source_certified;
+        g_add_source_coverage_cursor = state.source_cursor;
+        g_add_source_coverage_generation = state.source_generation;
+        strlcpy(g_add_source_coverage_chain, state.source_chain, sizeof(g_add_source_coverage_chain));
+        const esp_app_desc_t *description = esp_app_get_description();
+        if (!description || strcmp(state.truth_version, description->version) != 0) {
+            g_force_truth_reconcile = true;
+            g_last_full_truth_reconcile_epoch = 0;
+            g_last_full_truth_reconcile_ms = 0;
+        }
+        return;
+    }
+    // Upgrade reader for 2.4.12. The next successful save writes one coherent blob.
     uint8_t active = 0;
     uint8_t add_source_certified = 0;
     uint8_t history_schema = 0;
@@ -2385,7 +2450,8 @@ static bool json_add_utf8_string(cJSON *object, const char *key, const char *val
     size_t input_len = strlen(value);
     char *safe = malloc(input_len + 1);
     if (!safe) {
-        cJSON_AddStringToObject(object, key, "");
+        // Leave the field absent so callers can reject an incomplete record.
+        // An empty replacement would silently erase identity under pressure.
         return true;
     }
     const unsigned char *input = (const unsigned char *)value;
@@ -2763,6 +2829,20 @@ static void restore_pending_backup_if_needed(void)
     }
 }
 
+static bool restore_blocked_backup_if_needed(void)
+{
+    struct stat backup, active;
+    if (stat(BLOCKED_RECOVERY_BACKUP_PATH, &backup) != 0) return errno == ENOENT;
+    if (stat(BLOCKED_PATH, &active) == 0) {
+        // Both generations may contain unique rows. A bounded migration must
+        // settle each; never classify the backup as disposable by existence.
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return false;
+    }
+    if (errno != ENOENT) return false;
+    return rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH) == 0;
+}
+
 static bool json_event_has_valid_identity_and_no_block_reason(const char *event_json)
 {
     cJSON *root = cJSON_Parse(event_json);
@@ -2785,6 +2865,7 @@ static bool json_event_has_valid_identity_and_no_block_reason(const char *event_
 
 static void recover_valid_unclassified_blocked_events(void)
 {
+    if (!restore_blocked_backup_if_needed()) return;
     FILE *in = fopen(BLOCKED_PATH, "r");
     if (!in) return;
     FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
@@ -2842,6 +2923,7 @@ static bool recover_blocked_events_from_snapshot(
     size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
+    if (!restore_blocked_backup_if_needed()) return false;
     struct stat blocked_stat = {0};
     if (stat(BLOCKED_PATH, &blocked_stat) == 0 &&
         blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES) {
@@ -2912,24 +2994,21 @@ static bool recover_blocked_events_from_snapshot(
             strcmp(user->uid, verified_uid) != 0) {
             user = NULL;
         }
+        const cJSON *saved_serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
+        const cJSON *saved_fingerprint = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_identity_fingerprint") : NULL;
+        if (!user || !rel_identity_matches(
+                cJSON_IsString(saved_serial) ? saved_serial->valuestring : NULL,
+                g_device_serial,
+                cJSON_IsString(saved_fingerprint) ? saved_fingerprint->valuestring : NULL,
+                user ? user->terminal_identity_fingerprint : NULL)) user = NULL;
         char recovered_name[64] = "";
         char recovered_cnic[16] = "";
         bool recovered_shift_worker = false;
-        bool identity_found = false;
-        if (user && strlen(user->cnic) == 13) {
+        bool identity_found = user && strlen(user->cnic) == 13;
+        if (identity_found) {
             strlcpy(recovered_name, user->employee_name, sizeof(recovered_name));
             strlcpy(recovered_cnic, user->cnic, sizeof(recovered_cnic));
             recovered_shift_worker = user->raw_punch;
-            identity_found = true;
-        } else if (cJSON_IsString(user_id) && blocked_reason == NULL) {
-            identity_found = add_connector_lookup_identity(
-                user_id->valuestring,
-                verified_uid,
-                recovered_name,
-                sizeof(recovered_name),
-                recovered_cnic,
-                sizeof(recovered_cnic),
-                &recovered_shift_worker);
         }
         if (identity_found && strlen(recovered_cnic) == 13) {
             cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
@@ -3017,6 +3096,7 @@ static void storage_init(void)
         return;
     }
     restore_pending_backup_if_needed();
+    (void)restore_blocked_backup_if_needed();
     recover_valid_unclassified_blocked_events();
     load_seen_from_file(PENDING_PATH);
     load_seen_from_file(BLOCKED_PATH);
@@ -3051,6 +3131,7 @@ static char *event_to_json(const attendance_event_t *event, const char *capturet
 {
     const char *normalized_capturetype = oracle_capture_type(capturetype);
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON_AddStringToObject(root, "event_uid", event->event_uid);
     cJSON_AddStringToObject(root, "zone_id", ZONE_LITE_ZONE_ID);
     cJSON_AddStringToObject(root, "device_id", ZONE_LITE_ZONE_DEVICE_ID);
@@ -3078,6 +3159,23 @@ static char *event_to_json(const attendance_event_t *event, const char *capturet
     cJSON_AddStringToObject(root, "capturetype", normalized_capturetype);
     cJSON_AddStringToObject(root, "trust_status", oracle_trust_status(normalized_capturetype));
     cJSON_AddStringToObject(root, "raw_punch", event->raw_punch ? "T" : "F");
+    const char *required[] = {
+        "event_uid", "zone_id", "device_id", "device_serial", "user_id",
+        "employee_name", "cnic", "timestamp", "clockdiff", "capturetype",
+        "trust_status", "raw_punch",
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        if (!cJSON_IsString(cJSON_GetObjectItemCaseSensitive(root, required[i]))) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+    }
+    if ((event->uid[0] && !cJSON_HasObjectItem(root, "_terminal_uid")) ||
+        (event->attendance_record_uid[0] && !cJSON_HasObjectItem(root, "_attendance_record_uid")) ||
+        (event->terminal_identity_fingerprint[0] && !cJSON_HasObjectItem(root, "_terminal_identity_fingerprint"))) {
+        cJSON_Delete(root);
+        return NULL;
+    }
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return json;
@@ -3089,6 +3187,7 @@ typedef enum {
     ENQUEUE_BLOCKED,
     ENQUEUE_ACKNOWLEDGED,
     ENQUEUE_STORAGE_ERROR,
+    ENQUEUE_RESOURCE_ERROR,
 } enqueue_result_t;
 
 static cJSON *add_attendance_json_row(const attendance_event_t *event, const char *capturetype)
@@ -3132,6 +3231,23 @@ static cJSON *add_attendance_json_row(const attendance_event_t *event, const cha
             "attendance_record_uid",
             event->attendance_record_uid);
     }
+    const char *required[] = {
+        "event_uid", "user_id", "device_event_time", "captured_at", "source",
+        "status", "punch", "raw_punch", "clock_quality", "raw_event",
+    };
+    bool complete = true;
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        if (!cJSON_HasObjectItem(row, required[i])) complete = false;
+    }
+    if ((event->uid[0] && (!cJSON_HasObjectItem(row, "uid") ||
+                           !cJSON_HasObjectItem(raw_event, "terminal_uid"))) ||
+        (event->attendance_record_uid[0] && !cJSON_HasObjectItem(raw_event, "attendance_record_uid")) ||
+        (event->terminal_identity_fingerprint[0] && !cJSON_HasObjectItem(row, "terminal_identity_fingerprint")) ||
+        ((event->cnic[0] || event->employee_name[0]) && !cJSON_HasObjectItem(row, "raw_name"))) complete = false;
+    if (!complete) {
+        cJSON_Delete(row);
+        return NULL;
+    }
     return row;
 }
 
@@ -3143,8 +3259,12 @@ static char *add_serialize_attendance_events(cJSON *events, const char *batch_id
         cJSON_Delete(events);
         return NULL;
     }
-    cJSON_AddStringToObject(payload, "batch_id", batch_id);
-    cJSON_AddItemToObject(payload, "events", events);
+    if (!cJSON_AddStringToObject(payload, "batch_id", batch_id) ||
+        !cJSON_AddItemToObject(payload, "events", events)) {
+        cJSON_Delete(events);
+        cJSON_Delete(payload);
+        return NULL;
+    }
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     if (!json) return NULL;
@@ -3234,7 +3354,7 @@ static bool recover_live_event_after_storage_error(
     if (event->cnic[0] == '\0') {
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
     }
-    led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
+    led_status_fault(LED_STATUS_LOCAL_FAILURE);
     char message[224];
     snprintf(
         message,
@@ -3369,7 +3489,8 @@ static enqueue_result_t enqueue_event_to_files(
     }
     char *json = event_to_json(event, capturetype);
     if (json == NULL) {
-        return ENQUEUE_DUPLICATE;
+        g_force_truth_reconcile = true;
+        return ENQUEUE_RESOURCE_ERROR;
     }
     enqueue_result_t result = ENQUEUE_PENDING;
     if (event->cnic[0] == '\0') {
@@ -3406,7 +3527,7 @@ static enqueue_result_t enqueue_event_to_files(
             ESP_LOGI(TAG, "Queued LIVE event_uid=%s user_id=%s raw=%s", event->event_uid, event->user_id, event->raw_punch ? "T" : "F");
         }
     }
-    if (!seen_add(event->event_uid)) {
+    if (!pending_file && !blocked_file && !seen_add(event->event_uid)) {
         ESP_LOGW(TAG, "Event persisted but volatile dedup cache could not record %s", event->event_uid);
     }
     if (publish_add && !add_send_attendance_event(event, capturetype)) {
@@ -4901,7 +5022,7 @@ static bool reconcile_attendance_dump(
             } else if (result == ENQUEUE_BLOCKED) {
                 added++;
                 blocked++;
-            } else if (result == ENQUEUE_STORAGE_ERROR) {
+            } else if (result == ENQUEUE_STORAGE_ERROR || result == ENQUEUE_RESOURCE_ERROR) {
                 durable_enqueue_ok = false;
             } else {
                 duplicates++;
@@ -4917,14 +5038,12 @@ static bool reconcile_attendance_dump(
         }
     }
     if (pending_file != NULL) {
-        (void)fflush(pending_file);
-        (void)fsync(fileno(pending_file));
-        fclose(pending_file);
+        if (fflush(pending_file) != 0 || fsync(fileno(pending_file)) != 0) durable_enqueue_ok = false;
+        if (fclose(pending_file) != 0) durable_enqueue_ok = false;
     }
     if (blocked_file != NULL) {
-        (void)fflush(blocked_file);
-        (void)fsync(fileno(blocked_file));
-        fclose(blocked_file);
+        if (fflush(blocked_file) != 0 || fsync(fileno(blocked_file)) != 0) durable_enqueue_ok = false;
+        if (fclose(blocked_file) != 0) durable_enqueue_ok = false;
     }
     xSemaphoreGive(g_storage_lock);
     xSemaphoreGive(g_ords_outbox_gate);
@@ -5884,11 +6003,13 @@ typedef enum {
 
 static oracle_delivery_result_t oracle_send_live(const char *event_json)
 {
+    if (!event_json || !rel_json_syntax_valid(event_json, strlen(event_json)))
+        return ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
     char *normalized_event = oracle_normalize_event_json(event_json);
     if (!normalized_event) {
         ESP_LOGE(TAG, "Could not normalize persisted ORDS event JSON");
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
-        return ORACLE_DELIVERY_CORRUPT_LOCAL_ROW;
+        return ORACLE_DELIVERY_RETRYABLE;
     }
     char url[576];
     snprintf(url, sizeof(url), "%s/raw-captures", ZONE_LITE_ORDS_BASE_URL);
@@ -6708,75 +6829,6 @@ static bool oracle_send_reconcile(
     return ok;
 }
 
-static void append_acked_uid_from_json_to_file(const char *event_json, FILE *acked_file)
-{
-    cJSON *root = cJSON_Parse(event_json);
-    if (root == NULL) {
-        return;
-    }
-    cJSON *uid = cJSON_GetObjectItemCaseSensitive(root, "event_uid");
-    if (cJSON_IsString(uid)) {
-        if (acked_file != NULL) {
-            append_line_to_open_file(acked_file, ACKED_PATH, uid->valuestring);
-        } else {
-            append_line(ACKED_PATH, uid->valuestring);
-        }
-        seen_add(uid->valuestring);
-    }
-    cJSON_Delete(root);
-}
-
-static bool replace_pending_with_backup(
-    bool *authoritative_source_preserved,
-    int *error_out)
-{
-    if (authoritative_source_preserved != NULL) {
-        *authoritative_source_preserved = true;
-    }
-    if (error_out != NULL) {
-        *error_out = 0;
-    }
-    bool had_backup = false;
-    if (remove(PENDING_BACKUP_PATH) != 0 && errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not remove stale pending backup errno=%d", errno);
-    }
-    if (rename(PENDING_PATH, PENDING_BACKUP_PATH) == 0) {
-        had_backup = true;
-    } else if (errno != ENOENT) {
-        int preserve_errno = errno;
-        ESP_LOGW(TAG, "Could not preserve pending outbox before rewrite errno=%d", errno);
-        if (error_out != NULL) {
-            *error_out = preserve_errno;
-        }
-        return false;
-    }
-
-    if (rename(PENDING_TMP_PATH, PENDING_PATH) == 0) {
-        if (had_backup && remove(PENDING_BACKUP_PATH) != 0 && errno != ENOENT) {
-            ESP_LOGW(TAG, "Could not remove pending backup after rewrite errno=%d", errno);
-        }
-        return true;
-    }
-
-    int rewrite_errno = errno;
-    ESP_LOGW(TAG, "Could not rewrite pending outbox errno=%d", rewrite_errno);
-    if (had_backup && rename(PENDING_BACKUP_PATH, PENDING_PATH) != 0) {
-        int restore_errno = errno;
-        ESP_LOGE(TAG, "Could not restore pending outbox backup errno=%d", restore_errno);
-        if (authoritative_source_preserved != NULL) {
-            *authoritative_source_preserved = false;
-        }
-        if (error_out != NULL) {
-            *error_out = restore_errno;
-        }
-        return false;
-    }
-    if (error_out != NULL) {
-        *error_out = rewrite_errno;
-    }
-    return false;
-}
-
 static bool add_enqueue_json_receipts(
     char *const *events,
     size_t count,
@@ -6807,31 +6859,12 @@ static bool add_enqueue_json_receipts(
     return ok;
 }
 
-static bool pending_rewrite_write(FILE *out, const char *line, bool add_newline, int *error_out)
-{
-    errno = 0;
-    int result = add_newline ? fprintf(out, "%s\n", line) : fputs(line, out);
-    if (result >= 0) {
-        return true;
-    }
-    if (error_out != NULL) {
-        *error_out = errno != 0 ? errno : EIO;
-    }
-    return false;
-}
-
 static void ords_drain_preserved_deferred(const char *stage, int error_code)
 {
     int64_t now_ms = uptime_ms();
     g_ords_drain_retry_not_before_ms = now_ms + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
     led_status_set_backlog(true);
-    // The authoritative pending outbox is still intact. Failure to construct
-    // or commit a disposable rewrite is a bounded backlog condition, not a
-    // corrupt-local-state fault. Clear a stale rewrite fault so repeated
-    // resource pressure cannot keep ADD degraded while live capture, direct
-    // delivery, and ZKT source truth remain healthy.
-    led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
-    led_status_set(LED_STATUS_HEALTHY);
+    led_status_fault(LED_STATUS_LOCAL_FAILURE);
     ESP_LOGW(
         TAG,
         "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable errno=%d; original outbox remains intact",
@@ -6843,7 +6876,7 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
         snprintf(
             message,
             sizeof(message),
-            "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable (errno=%d). The original pending outbox remains unchanged; delivery retry is backed off without deleting a queue or latching a local failure.",
+            "ORDS pending rewrite deferred at %s because a rewrite resource was unavailable (errno=%d). The original pending outbox remains unchanged; delivery retry is backed off without deleting the queue; local durability remains degraded.",
             stage,
             error_code);
         (void)add_connector_log(
@@ -6855,307 +6888,124 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
     }
 }
 
-static void oracle_drain_pending_locked(bool live_first)
+static legacy_queue_t g_legacy_pending;
+static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
+static bool g_legacy_probe_head;
+
+static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)
 {
-    if (!file_has_nonempty_line(PENDING_PATH)) {
-        led_status_set_backlog(false);
-        return;
-    }
-    led_status_set_backlog(true);
-    if (g_ords_drain_retry_not_before_ms > uptime_ms()) {
-        return;
-    }
-    if (!ords_send_allowed()) {
-        return;
-    }
-    led_status_set(LED_STATUS_SYNCING);
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("legacy_queues", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, "ords_pending", checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
 
-    FILE *in = fopen(PENDING_PATH, "r");
-    if (in == NULL) {
-        led_status_set_backlog(false);
-        return;
-    }
-    // A stale rewrite is never authoritative. Removing it before open both
-    // recovers its space and guarantees that a partial prior transaction can
-    // never be mistaken for the pending outbox.
-    (void)remove(PENDING_TMP_PATH);
-    FILE *out = fopen(PENDING_TMP_PATH, "w");
-    if (out == NULL) {
-        int open_error = errno;
-        fclose(in);
-        ords_drain_preserved_deferred("open", open_error);
-        return;
-    }
-    FILE *acked_file = fopen(ACKED_PATH, "a");
-    if (acked_file == NULL) {
-        ESP_LOGW(TAG, "Could not keep %s open for ack appends", ACKED_PATH);
-    }
-
-    char **bulk = calloc(ZONE_LITE_ORDS_BULK_CHUNK_SIZE, sizeof(char *));
-    if (bulk == NULL) {
-        fclose(in);
-        fclose(out);
-        if (acked_file != NULL) {
-            fclose(acked_file);
-        }
-        (void)remove(PENDING_TMP_PATH);
-        ords_drain_preserved_deferred("allocate", ENOMEM);
-        return;
-    }
-    size_t bulk_count = 0;
-    char line[MAX_EVENT_JSON];
-    bool failed = false;
-    bool made_progress = false;
-    bool rewrite_ok = true;
-    int rewrite_error = 0;
-
-    while (fgets(line, sizeof(line), in) != NULL) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '\0') {
-            continue;
-        }
-        if (live_first && bulk_count == 0) {
-            oracle_delivery_result_t delivery = oracle_send_live(line);
-            if (delivery == ORACLE_DELIVERY_ACKED) {
-                char *live_event[] = {line};
-                if (add_enqueue_json_receipts(
-                        live_event,
-                        1,
-                        "FIRMWARE_LIVE")) {
-                    append_acked_uid_from_json_to_file(line, acked_file);
-                    made_progress = true;
-                    live_first = false;
-                    continue;
-                }
-                ESP_LOGE(
-                    TAG,
-                    "Oracle accepted a live event but its ADD receipt could not be persisted; retaining the event for an idempotent retry");
-            }
-            if (delivery == ORACLE_DELIVERY_PERMANENT_REJECTION) {
-                char *blocked_json = oracle_mark_permanent_rejection(line);
-                if (blocked_json && append_line(BLOCKED_PATH, blocked_json)) {
-                    char event_uid[65] = "unknown";
-                    (void)extract_event_uid(line, event_uid);
-                    ESP_LOGE(
-                        TAG,
-                        "Preserved permanently rejected ORDS event in blocked outbox uid=%s",
-                        event_uid);
-                    (void)add_connector_log(
-                        "ERROR",
-                        "ords",
-                        "ORDS_EVENT_QUARANTINED",
-                        "Oracle permanently rejected a queued attendance event; it remains preserved for review while later events continue.");
-                    free(blocked_json);
-                    made_progress = true;
-                    continue;
-                }
-                free(blocked_json);
-                ESP_LOGE(TAG, "Could not preserve permanently rejected ORDS event");
-            }
-            if (delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW) {
-                if (append_line(CORRUPT_ORDS_PATH, line)) {
-                    ESP_LOGE(
-                        TAG,
-                        "Preserved malformed local ORDS row for forensic recovery and continued draining");
-                    (void)add_connector_log(
-                        "ERROR",
-                        "ords",
-                        "ORDS_LOCAL_ROW_QUARANTINED",
-                        "A malformed legacy ORDS outbox row was preserved separately so newer attendance can continue.");
-                    made_progress = true;
-                    continue;
-                }
-                ESP_LOGE(TAG, "Could not preserve malformed local ORDS row");
-            }
-            failed = true;
-            rewrite_ok = pending_rewrite_write(out, line, true, &rewrite_error);
-            live_first = false;
-            if (!rewrite_ok) {
-                break;
-            }
-            continue;
-        }
-        bulk[bulk_count] = strdup(line);
-        if (bulk[bulk_count] == NULL) {
-            // The source outbox is still authoritative. Abort the entire
-            // transaction so already-read rows can never be omitted from a
-            // partial rewrite after an allocation failure.
-            rewrite_ok = false;
-            rewrite_error = ENOMEM;
-            break;
-        }
-        bulk_count++;
-        if (bulk_count == ZONE_LITE_ORDS_BULK_CHUNK_SIZE) {
-            bool oracle_ok = oracle_send_bulk(bulk, bulk_count);
-            bool receipt_ok = oracle_ok && add_enqueue_json_receipts(
-                bulk,
-                bulk_count,
-                "FIRMWARE_BULK");
-            if (oracle_ok && receipt_ok) {
-                for (size_t i = 0; i < bulk_count; i++) {
-                    append_acked_uid_from_json_to_file(bulk[i], acked_file);
-                    free(bulk[i]);
-                    bulk[i] = NULL;
-                }
-                made_progress = true;
-            } else {
-                if (oracle_ok) {
-                    ESP_LOGE(
-                        TAG,
-                        "Oracle accepted a bulk chunk but its ADD receipt could not be persisted; retaining the chunk for an idempotent retry");
-                }
-                failed = true;
-                for (size_t i = 0; i < bulk_count; i++) {
-                    if (rewrite_ok) {
-                        rewrite_ok = pending_rewrite_write(
-                            out,
-                            bulk[i],
-                            true,
-                            &rewrite_error);
-                    }
-                    free(bulk[i]);
-                    bulk[i] = NULL;
-                }
-            }
-            bulk_count = 0;
-        }
-        if (failed || !rewrite_ok) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    if (rewrite_ok && ferror(in)) {
-        rewrite_ok = false;
-        rewrite_error = errno != 0 ? errno : EIO;
-    }
-
-    if (rewrite_ok && !failed && bulk_count > 0) {
-        bool oracle_ok = oracle_send_bulk(bulk, bulk_count);
-        bool receipt_ok = oracle_ok && add_enqueue_json_receipts(
-            bulk,
-            bulk_count,
-            "FIRMWARE_BULK");
-        if (oracle_ok && receipt_ok) {
-            for (size_t i = 0; i < bulk_count; i++) {
-                append_acked_uid_from_json_to_file(bulk[i], acked_file);
-            }
-            made_progress = true;
-        } else {
-            if (oracle_ok) {
-                ESP_LOGE(
-                    TAG,
-                    "Oracle accepted the final bulk chunk but its ADD receipt could not be persisted; retaining the chunk for an idempotent retry");
-            }
-            failed = true;
-            for (size_t i = 0; i < bulk_count; i++) {
-                if (rewrite_ok) {
-                    rewrite_ok = pending_rewrite_write(
-                        out,
-                        bulk[i],
-                        true,
-                        &rewrite_error);
-                }
-            }
-        }
-    }
-    for (size_t i = 0; i < bulk_count; i++) {
-        free(bulk[i]);
-    }
-    if (!rewrite_ok) {
-        fclose(in);
-        fclose(out);
-        if (acked_file != NULL) {
-            fclose(acked_file);
-        }
-        (void)remove(PENDING_TMP_PATH);
-        ords_drain_preserved_deferred("write", rewrite_error);
-        free(bulk);
-        return;
-    }
-    if (failed && !made_progress) {
-        fclose(in);
-        fclose(out);
-        if (acked_file != NULL) {
-            fclose(acked_file);
-        }
-        (void)remove(PENDING_TMP_PATH);
-        led_status_set_backlog(true);
-        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
-        led_status_set(LED_STATUS_HEALTHY);
-        free(bulk);
-        return;
-    }
-    if (failed) {
-        while (fgets(line, sizeof(line), in) != NULL) {
-            if (!pending_rewrite_write(out, line, false, &rewrite_error)) {
-                rewrite_ok = false;
-                break;
-            }
-        }
-        if (rewrite_ok && ferror(in)) {
-            rewrite_ok = false;
-            rewrite_error = errno != 0 ? errno : EIO;
-        }
-    }
-    fclose(in);
-    if (rewrite_ok && fflush(out) != 0) {
-        rewrite_ok = false;
-        rewrite_error = errno != 0 ? errno : EIO;
-    }
-    if (rewrite_ok && fsync(fileno(out)) != 0) {
-        rewrite_ok = false;
-        rewrite_error = errno != 0 ? errno : EIO;
-    }
-    if (fclose(out) != 0 && rewrite_ok) {
-        rewrite_ok = false;
-        rewrite_error = errno != 0 ? errno : EIO;
-    }
-    if (acked_file != NULL) {
-        fclose(acked_file);
-    }
-    if (!rewrite_ok) {
-        (void)remove(PENDING_TMP_PATH);
-        ords_drain_preserved_deferred("commit", rewrite_error);
-        free(bulk);
-        return;
-    }
-    bool authoritative_source_preserved = true;
-    int replace_error = 0;
-    if (!replace_pending_with_backup(
-            &authoritative_source_preserved,
-            &replace_error)) {
-        (void)remove(PENDING_TMP_PATH);
-        if (authoritative_source_preserved) {
-            ords_drain_preserved_deferred("replace", replace_error);
-        } else {
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        }
-    } else {
-        g_ords_drain_retry_not_before_ms = 0;
-        led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
-    }
-    bool has_backlog = failed || file_has_nonempty_line(PENDING_PATH);
-    led_status_set_backlog(has_backlog);
-    if (!has_backlog) {
-        led_status_set(LED_STATUS_HEALTHY);
-    }
-    free(bulk);
+static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("legacy_queues", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, "ords_pending", checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
 }
 
 static void oracle_drain_pending(bool live_first)
 {
+    (void)live_first;
     int64_t now_ms = uptime_ms();
-    if (truth_ords_gate_priority_active(now_ms)) return;
+    if (truth_ords_gate_priority_active(now_ms) ||
+        g_ords_drain_retry_not_before_ms > now_ms || !ords_send_allowed()) return;
+    if (!g_legacy_drain_buffer) {
+        g_legacy_drain_buffer = heap_caps_malloc(
+            100 * sizeof(*g_legacy_drain_buffer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_legacy_drain_buffer) {
+            ords_drain_preserved_deferred("allocate", ENOMEM);
+            return;
+        }
+    }
     if (!g_ords_outbox_gate ||
         xSemaphoreTake(g_ords_outbox_gate, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
-    oracle_drain_pending_locked(live_first);
+    lq_token_t tokens[100];
+    char *events[100];
+    size_t count = 0;
+    dq_result_t read = DQ_OK;
+    if (!g_legacy_pending.ready) {
+        lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
+        read = lq_open(&g_legacy_pending, PENDING_PATH, port);
+    }
+    legacy_queue_t scan = g_legacy_pending;
+    size_t limit = g_legacy_probe_head ? 1 : 100;
+    while (read == DQ_OK && count < limit) {
+        events[count] = g_legacy_drain_buffer[count];
+        read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
+        if (read != DQ_OK) break;
+        scan.checkpoint.offset = tokens[count].end;
+        events[count][strcspn(events[count], "\r\n")] = 0;
+        count++;
+    }
+    if (!count && read == DQ_EMPTY) {
+        dq_result_t reclaim = lq_reclaim(&g_legacy_pending);
+        if (reclaim != DQ_OK && reclaim != DQ_EMPTY) read = reclaim;
+    }
     xSemaphoreGive(g_storage_lock);
+    if (!count) {
+        if (read == DQ_EMPTY) led_status_set_backlog(false);
+        else ords_drain_preserved_deferred("legacy-read", EIO);
+        xSemaphoreGive(g_ords_outbox_gate);
+        return;
+    }
+    led_status_set_backlog(true);
+    // At most 100 events and one completed ORDS request per slice. No storage
+    // lock is held during ORDS waits or durable ADD receipt enqueue/backpressure.
+    oracle_delivery_result_t delivery;
+    if (count == 1) delivery = oracle_send_live(events[0]);
+    else delivery = oracle_send_bulk(events, count) ? ORACLE_DELIVERY_ACKED : ORACLE_DELIVERY_RETRYABLE;
+    bool settled = delivery == ORACLE_DELIVERY_ACKED &&
+        add_enqueue_json_receipts(events, count, count == 1 ? "FIRMWARE_LIVE" : "FIRMWARE_BULK");
+    // A failed bulk request is investigated one head record at a time on the
+    // next slice, so one malformed/rejected row cannot strand the whole batch.
+    g_legacy_probe_head = delivery != ORACLE_DELIVERY_ACKED;
+    char *quarantine = count == 1 && delivery == ORACLE_DELIVERY_PERMANENT_REJECTION
+        ? oracle_mark_permanent_rejection(events[0]) : NULL;
+    const char *failure_stage = NULL;
+    if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
+        else if (count == 1 && delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW)
+            settled = append_line(CORRUPT_ORDS_PATH, events[0]);
+        if (settled) {
+            for (size_t i = 0; i < count; i++) {
+                // The outbox gate excludes other consumers. Prior successful
+                // commits in this batch only advance the checkpoint generation.
+                tokens[i].generation = g_legacy_pending.checkpoint.generation;
+                if (lq_settle(&g_legacy_pending, &tokens[i]) != DQ_OK) {
+                    failure_stage = "legacy-commit";
+                    break;
+                }
+            }
+            if (!failure_stage) {
+                g_ords_drain_retry_not_before_ms = 0;
+                dq_result_t reclaimed = lq_reclaim(&g_legacy_pending);
+                if (reclaimed != DQ_OK && reclaimed != DQ_STALE) failure_stage = "legacy-retire";
+            }
+        }
+        xSemaphoreGive(g_storage_lock);
+    }
+    free(quarantine);
     xSemaphoreGive(g_ords_outbox_gate);
+    if (failure_stage) ords_drain_preserved_deferred(failure_stage, EIO);
 }
 
 static void ords_uploader_task(void *arg)
@@ -7298,49 +7148,38 @@ static bool discover_zkt(uint32_t *selected_ip, uint32_t skip_ip)
 
 static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users)
 {
+    size_t record_size = 0;
+    // A complete singleton frame establishes its wire shape. Batched frames
+    // without an independently negotiated shape must be recovered from truth.
+    if (!rel_live_frame_size(len, 0, &record_size)) {
+        g_force_truth_reconcile = true;
+        (void)add_connector_log("WARN", "live", "LIVE_PACKET_FORMAT_REJECTED",
+            "Truncated or ambiguous live frame; source recovery required");
+        return 0;
+    }
     size_t observed = 0;
-    while (len >= 12) {
-        char user_id[32] = "";
-        uint8_t status = 0;
-        uint8_t punch = 0;
-        uint32_t timestamp = 0;
-        if (len == 12) {
-            snprintf(user_id, sizeof(user_id), "%lu", (unsigned long)read_le32(data));
-            status = data[4];
-            punch = data[5];
-            timestamp = (uint32_t)data[6] * 12 * 31 * 24 * 60 * 60;
-            timestamp += ((uint32_t)data[7] - 1) * 31 * 24 * 60 * 60;
-            timestamp += ((uint32_t)data[8] - 1) * 24 * 60 * 60;
-            timestamp += (uint32_t)data[9] * 60 * 60 + (uint32_t)data[10] * 60 + data[11];
-            data += 12;
-            len -= 12;
-        } else {
-            size_t packet_len = len >= 52 ? 52 : (len >= 36 ? 36 : 32);
-            copy_zk_string(user_id, sizeof(user_id), data, 24);
-            status = data[24];
-            punch = data[25];
-            timestamp = (uint32_t)data[26] * 12 * 31 * 24 * 60 * 60;
-            timestamp += ((uint32_t)data[27] - 1) * 31 * 24 * 60 * 60;
-            timestamp += ((uint32_t)data[28] - 1) * 24 * 60 * 60;
-            timestamp += (uint32_t)data[29] * 60 * 60 + (uint32_t)data[30] * 60 + data[31];
-            data += packet_len;
-            len -= packet_len;
+    while (len >= record_size) {
+        rel_live_record_t row;
+        if (!rel_parse_live_record(data, record_size, &row)) {
+            g_force_truth_reconcile = true;
+            return observed;
         }
         attendance_event_t event;
-        if (build_attendance_event(&event, users, user_id, 0, timestamp, status, punch, true)) {
+        if (build_attendance_event(&event, users, row.user_id, 0, row.timestamp,
+                                   row.status, row.punch, true)) {
             enqueue_result_t result = enqueue_event(&event, "LIVE");
             if (result == ENQUEUE_PENDING || result == ENQUEUE_ACKNOWLEDGED) {
                 led_status_event(LED_EVENT_LIVE_PUNCH);
             }
-            // ZKT's counter may advance even when local flash is exhausted.
-            // Count the live record only after local durability or an
-            // authenticated ADD acknowledgement. A storage failure therefore
-            // creates a deliberate counter mismatch and forces authoritative
-            // terminal truth repair at the next reconcile interval.
-            if (result != ENQUEUE_STORAGE_ERROR) {
+            if (result == ENQUEUE_PENDING || result == ENQUEUE_BLOCKED ||
+                result == ENQUEUE_ACKNOWLEDGED || result == ENQUEUE_DUPLICATE) {
                 observed++;
+            } else {
+                g_force_truth_reconcile = true;
             }
         }
+        data += record_size;
+        len -= record_size;
     }
     return observed;
 }

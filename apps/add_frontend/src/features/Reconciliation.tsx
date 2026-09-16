@@ -2109,7 +2109,11 @@ export function ReconciliationView({
                               ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
                               : sourceAssurance.state === 'SCOPE_MISMATCH'
                                 ? 'Source-exception evidence mismatch'
-                                : 'Reviewed exclusions — assurance continuing'}
+                                : job.status === 'COMPLETED'
+                                  ? 'Completed with reviewed exclusions'
+                                  : terminalJobStates.has(job.status)
+                                    ? 'Reviewed exclusions — job ended'
+                                    : 'Reviewed exclusions — assurance continuing'}
                           </strong>
                           {sourceAssurance.reviewed.toLocaleString()} of{' '}
                           {sourceAssurance.total.toLocaleString()} certified

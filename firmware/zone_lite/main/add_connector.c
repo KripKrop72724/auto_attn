@@ -33,6 +33,7 @@
 #include "mbedtls/sha256.h"
 
 #include "zone_config.h"
+#include "reliability.h"
 #include "led_status.h"
 
 #include "zone_lite_config.example.h"
@@ -114,6 +115,7 @@ typedef struct {
     off_t max_bytes;
     off_t offset;
     uint32_t depth;
+    bool depth_known;
     uint32_t ack_since_checkpoint;
     const char *label;
     SemaphoreHandle_t lock;
@@ -211,6 +213,16 @@ static add_outbox_t s_live_outbox = {
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
 static volatile uint32_t s_priority_delivery_until_ms;
+
+static TaskHandle_t s_outbox_task_handle;
+static TaskHandle_t s_heartbeat_task_handle;
+static volatile uint32_t s_outbox_tick_ms;
+static volatile uint32_t s_outbox_progress_ms;
+static volatile bool s_outbox_buffer_ready;
+static volatile bool s_worker_start_failed;
+static volatile bool s_outboxes_initialized;
+static void outbox_task(void *arg);
+static void heartbeat_task(void *arg);
 
 static bool attendance_event_uid_is_valid(const char *value);
 
@@ -2181,7 +2193,7 @@ static bool write_outbox_cursor(const add_outbox_t *outbox, off_t offset)
     if (!file) return false;
     bool ok = fprintf(file, "%lld\n", (long long)offset) > 0 &&
               fflush(file) == 0 && fsync(fileno(file)) == 0;
-    fclose(file);
+    if (fclose(file) != 0) ok = false;
     if (!ok) {
         (void)remove(outbox->cursor_tmp_path);
         return false;
@@ -2243,30 +2255,37 @@ static off_t load_outbox_cursor(add_outbox_t *outbox)
     return (off_t)value;
 }
 
-static uint32_t count_outbox_rows(add_outbox_t *outbox)
+static rel_scan_result_t count_outbox_rows(add_outbox_t *outbox)
 {
+    outbox->depth_known = false;
+    errno = 0;
     FILE *file = fopen(outbox->path, "r");
-    if (!file) return 0;
-    if (outbox->offset > 0 && fseek(file, (long)outbox->offset, SEEK_SET) != 0) {
-        fclose(file);
-        outbox->offset = 0;
-        (void)remove(outbox->cursor_path);
-        file = fopen(outbox->path, "r");
-        if (!file) return 0;
+    if (!file) {
+        if (errno != ENOENT) return REL_SCAN_ERROR;
+        outbox->depth = 0;
+        outbox->depth_known = true;
+        return REL_SCAN_EMPTY;
     }
-    char *line = allocate_outbox_line_buffer();
-    if (!line) {
+    if (fseeko(file, outbox->offset, SEEK_SET) != 0) {
         fclose(file);
-        ESP_LOGE(TAG, "Could not allocate ADD outbox scan buffer");
-        return 0;
+        return REL_SCAN_ERROR;
     }
     uint32_t count = 0;
-    while (fgets(line, ADD_OUTBOX_LINE_BYTES, file)) {
-        if (line[0] != '\0') count++;
+    rel_scan_result_t result = rel_count_rows(file, &count);
+    if (fclose(file) != 0) result = REL_SCAN_ERROR;
+    if (result != REL_SCAN_ERROR) {
+        outbox->depth = count;
+        outbox->depth_known = true;
     }
-    free(line);
-    fclose(file);
-    return count;
+    return result;
+}
+
+static bool outbox_boundary_is_eof(const add_outbox_t *outbox, off_t offset)
+{
+    FILE *file = fopen(outbox->path, "r");
+    bool complete = rel_settled_eof(file, offset);
+    if (file && fclose(file) != 0) complete = false;
+    return complete;
 }
 
 static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
@@ -2274,6 +2293,7 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
     if (outbox->offset <= 0) return true;
     struct stat st = {0};
     if (stat(outbox->path, &st) != 0) {
+        if (errno != ENOENT) return false;
         outbox->offset = 0;
         outbox->depth = 0;
         outbox->ack_since_checkpoint = 0;
@@ -2284,8 +2304,10 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
         outbox->offset < st.st_size / 2)) {
         return true;
     }
-    if (outbox->depth == 0 || outbox->offset >= st.st_size) {
-        (void)remove(outbox->path);
+    if (outbox_boundary_is_eof(outbox, outbox->offset)) {
+        // Clear the old generation's cursor durably before unlink. A restart
+        // at either boundary may replay settled rows, never skip a new file.
+        if (!write_outbox_cursor(outbox, 0) || remove(outbox->path) != 0) return false;
         (void)remove(outbox->cursor_path);
         outbox->offset = 0;
         outbox->depth = 0;
@@ -2341,12 +2363,14 @@ static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end)
     outbox->offset = row_end;
     if (outbox->depth > 0) outbox->depth--;
     outbox->ack_since_checkpoint++;
-    if (outbox->depth == 0) {
+    if (outbox_boundary_is_eof(outbox, row_end)) {
         // Every row in this generation has been acknowledged, so deleting the
         // file is itself the durable checkpoint.
-        (void)remove(outbox->path);
+        if (!write_outbox_cursor(outbox, 0) || remove(outbox->path) != 0) return false;
         (void)remove(outbox->cursor_path);
         outbox->offset = 0;
+        outbox->depth = 0;
+        outbox->depth_known = true;
         outbox->ack_since_checkpoint = 0;
         return true;
     }
@@ -2365,8 +2389,13 @@ static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_
     bool ok = fseek(file, (long)outbox->offset, SEEK_SET) == 0 &&
               fgets(line, ADD_OUTBOX_LINE_BYTES, file) != NULL;
     long end = ok ? ftell(file) : -1;
-    fclose(file);
+    if (ferror(file)) ok = false;
+    if (fclose(file) != 0) ok = false;
     if (!ok || end <= (long)outbox->offset) return false;
+    if (!strchr(line, '\n')) {
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return false;
+    }
     *row_end = (off_t)end;
     return true;
 }
@@ -2584,7 +2613,9 @@ static bool preserve_corrupt_outbox_row(const char *line)
         : 0;
     bool rotated = false;
     if (current_bytes + (off_t)required > ADD_CORRUPT_OUTBOX_MAX_BYTES) {
-        (void)remove(ADD_CORRUPT_OUTBOX_BACKUP_PATH);
+        // Unacknowledged evidence is never rotated away.
+        struct stat backup;
+        if (stat(ADD_CORRUPT_OUTBOX_BACKUP_PATH, &backup) == 0 || errno != ENOENT) return false;
         if (rename(
                 ADD_CORRUPT_OUTBOX_PATH,
                 ADD_CORRUPT_OUTBOX_BACKUP_PATH) != 0) {
@@ -2779,7 +2810,7 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
                     ok = fprintf(file, "%s\n", line) > 0 &&
                         fflush(file) == 0 &&
                         fsync(fileno(file)) == 0;
-                    fclose(file);
+                    if (fclose(file) != 0) ok = false;
                     if (ok) outbox->depth++;
                 }
             }
@@ -3086,29 +3117,41 @@ static void outbox_task(void *arg)
 {
     (void)arg;
     uint32_t retry_ms = ADD_OUTBOX_RETRY_MS;
-    char *line = allocate_outbox_line_buffer();
-    if (!line) {
-        ESP_LOGE(TAG, "Could not allocate ADD outbox worker buffer");
-        vTaskDelete(NULL);
-        return;
-    }
+    char *line = NULL;
+    uint32_t live_served = 0;
+    int64_t priority_started = 0;
     while (true) {
-        if (priority_delivery_hold_active()) {
-            vTaskDelay(pdMS_TO_TICKS(250));
+        s_outbox_tick_ms = (uint32_t)monotonic_ms();
+        if (!line) line = allocate_outbox_line_buffer();
+        s_outbox_buffer_ready = line != NULL;
+        if (!line) {
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
             continue;
         }
+        if (priority_delivery_hold_active()) {
+            if (!priority_started) priority_started = monotonic_ms();
+            if (monotonic_ms() - priority_started < ADD_PRIORITY_HOLD_MS) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+            live_served = 4;
+        }
+        priority_started = 0;
         bool have_row = false;
         add_outbox_t *outbox = NULL;
         off_t row_end = 0;
         uint32_t live_depth = 0;
         if (s_live_outbox.lock && xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            live_depth = s_live_outbox.depth;
+            live_depth = s_live_outbox.depth_known ? s_live_outbox.depth : 1;
             xSemaphoreGive(s_live_outbox.lock);
         }
-        outbox = live_depth > 0 ? &s_live_outbox : &s_bulk_outbox;
+        outbox = live_depth > 0 && live_served < 4 ? &s_live_outbox : &s_bulk_outbox;
+        if (outbox == &s_live_outbox) live_served++;
+        else live_served = 0;
         if (add_connector_is_connected() && outbox->lock &&
             xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            have_row = outbox->depth > 0 && read_outbox_row_locked(outbox, line, &row_end);
+            have_row = read_outbox_row_locked(outbox, line, &row_end);
             xSemaphoreGive(outbox->lock);
         }
         if (!have_row) {
@@ -3116,7 +3159,13 @@ static void outbox_task(void *arg)
             continue;
         }
         line[strcspn(line, "\r\n")] = '\0';
-        cJSON *record = cJSON_Parse(line);
+        bool syntax_valid = rel_json_syntax_valid(line, strlen(line));
+        cJSON *record = syntax_valid ? cJSON_Parse(line) : NULL;
+        if (syntax_valid && !record) {
+            // Syntax was validated without allocation: retry temporary resource failure.
+            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
+            continue;
+        }
         cJSON *type = record ? cJSON_GetObjectItemCaseSensitive(record, "type") : NULL;
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
         bool valid = cJSON_IsString(type) && cJSON_IsObject(payload) &&
@@ -3125,7 +3174,12 @@ static void outbox_task(void *arg)
              (strcmp(type->valuestring, "oracle_receipt_batch") == 0 &&
               oracle_receipt_payload_is_valid(payload)));
         char *payload_json = valid ? cJSON_PrintUnformatted(payload) : NULL;
-        if (!valid || !payload_json) {
+        if (valid && !payload_json) {
+            cJSON_Delete(record);
+            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
+            continue;
+        }
+        if (!valid) {
             cJSON_Delete(record);
             free(payload_json);
             ESP_LOGE(TAG, "Preserving and skipping a corrupt ADD %s outbox row", outbox->label);
@@ -3134,10 +3188,10 @@ static void outbox_task(void *arg)
                 if (!preserved) {
                     ESP_LOGE(
                         TAG,
-                        "Bounded corrupt-row evidence storage was unavailable; skipping the unusable %s row to protect newer attendance",
+                        "Corrupt-row evidence storage unavailable; retaining the original %s row",
                         outbox->label);
                 }
-                if (!advance_outbox_locked(outbox, row_end)) {
+                if (preserved && !advance_outbox_locked(outbox, row_end)) {
                     ESP_LOGE(TAG, "Could not skip corrupt ADD %s outbox row", outbox->label);
                 }
                 xSemaphoreGive(outbox->lock);
@@ -3150,7 +3204,7 @@ static void outbox_task(void *arg)
         bool acknowledged = send_payload_and_wait_for_ack(
             type->valuestring,
             payload_json,
-            portMAX_DELAY,
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
             pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
             NULL,
             is_attendance ? &attendance_ack : NULL);
@@ -3175,6 +3229,7 @@ static void outbox_task(void *arg)
                 ESP_LOGE(TAG, "Could not advance acknowledged ADD %s attendance outbox", outbox->label);
             }
             xSemaphoreGive(outbox->lock);
+            s_outbox_progress_ms = (uint32_t)monotonic_ms();
             retry_ms = ADD_OUTBOX_RETRY_MS;
         } else {
             uint32_t delay_ms = retry_ms + (esp_random() % 1000U);
@@ -3183,6 +3238,35 @@ static void outbox_task(void *arg)
                 ? ADD_OUTBOX_RETRY_MAX_MS
                 : retry_ms * 2;
         }
+    }
+}
+
+static void delivery_supervisor_task(void *arg)
+{
+    (void)arg;
+    uint32_t attempts = 0;
+    int64_t window = monotonic_ms();
+    for (;;) {
+        if (monotonic_ms() - window >= 10 * 60 * 1000) {
+            attempts = 0;
+            window = monotonic_ms();
+        }
+        if (s_client && s_outboxes_initialized && (!s_outbox_task_handle || !s_heartbeat_task_handle) && attempts < 3) {
+            attempts++;
+            if (!s_heartbeat_task_handle &&
+                xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, &s_heartbeat_task_handle) != pdPASS)
+                s_heartbeat_task_handle = NULL;
+            if (!s_outbox_task_handle &&
+                xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, &s_outbox_task_handle) != pdPASS)
+                s_outbox_task_handle = NULL;
+            s_worker_start_failed = !s_outbox_task_handle || !s_heartbeat_task_handle;
+        }
+        if (s_worker_start_failed || (s_outbox_tick_ms &&
+            (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) > 90000U))
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        // Do not asynchronously delete a task which might own a mutex.
+        // Buffer failures self-retry; stalled operations are independently visible.
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -3221,6 +3305,11 @@ void add_connector_init(void)
                 s_reconcile_assignments &&
                 s_source_coverage &&
                 s_inbound_messages;
+    if (s_started && xTaskCreate(delivery_supervisor_task, "add_supervisor", 4096, NULL, 4, NULL) != pdPASS) {
+        s_started = false;
+        s_worker_start_failed = true;
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    }
     if (s_started &&
         xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
         s_started = false;
@@ -3413,13 +3502,13 @@ static void start_websocket(void)
     if (xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_live_outbox);
         s_live_outbox.offset = load_outbox_cursor(&s_live_outbox);
-        s_live_outbox.depth = count_outbox_rows(&s_live_outbox);
+        (void)count_outbox_rows(&s_live_outbox);
         xSemaphoreGive(s_live_outbox.lock);
     }
     if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_bulk_outbox);
         s_bulk_outbox.offset = load_outbox_cursor(&s_bulk_outbox);
-        s_bulk_outbox.depth = count_outbox_rows(&s_bulk_outbox);
+        (void)count_outbox_rows(&s_bulk_outbox);
         xSemaphoreGive(s_bulk_outbox.lock);
     }
     ESP_LOGI(
@@ -3427,8 +3516,8 @@ static void start_websocket(void)
         "ADD outboxes restored live=%lu reconcile=%lu",
         (unsigned long)s_live_outbox.depth,
         (unsigned long)s_bulk_outbox.depth);
-    xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, NULL);
-    xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, NULL);
+    s_outboxes_initialized = true;
+    // The independent supervisor checks creation results and retries boundedly.
     // Start transport and heartbeat visibility before scanning the encrypted
     // catalog.  The scan is bounded and fail-closed, but SPIFFS latency must
     // never delay OTA boot supervision or make an otherwise running connector
@@ -3503,6 +3592,9 @@ bool add_connector_boot_health_ready(void)
         bool identity_ready = s_identity_catalog_generation > 0 ||
             (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
         ready = s_connected
+            && s_outbox_task_handle && s_heartbeat_task_handle && s_outbox_buffer_ready
+            && !s_worker_start_failed
+            && (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) < 90000U
             && identity_ready
             && s_zkt.online
             && stable_terminal_session
