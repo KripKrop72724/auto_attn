@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_light_checkpoint_retains_live_evidence(tmp_path):
     source = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
-    start = source.index("static bool commit_light_reconcile(")
+    start = source.index("static bool commit_reconcile_count(")
     adapter = source[start:source.index("static void nvs_load_runtime_state", start)]
     program = r"""
 #include <assert.h>
@@ -27,12 +27,12 @@ static bool nvs_save_runtime_state(void) {
 int main(void) {
  size_t live=3;
  fail=true;
- assert(!commit_light_reconcile(103,&live));
+ assert(!commit_reconcile_count(103,&live));
  assert(live==3 && durable==100 && g_last_synced_attendance_count==100 && recovery);
  fail=false;
- assert(commit_light_reconcile(103,&live));
+ assert(commit_reconcile_count(103,&live));
  assert(live==0 && durable==103 && writes==2);
- assert(!commit_light_reconcile(105,NULL) && writes==2 && durable==103);
+ assert(!commit_reconcile_count(105,NULL) && writes==2 && durable==103);
  return 0;
 }
 """

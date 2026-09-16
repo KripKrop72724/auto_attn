@@ -1125,9 +1125,7 @@ def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
             runtime.index("if (!historical_reconcile && identity_blocked)"),
         )
     ]
-    assert "g_last_synced_attendance_count = refreshed_records;" in identity_blocked
-    assert "live_events_since_sync = 0;" in identity_blocked
-    assert "nvs_save_runtime_state();" in identity_blocked
+    assert "commit_reconcile_count(refreshed_records, &live_events_since_sync)" in identity_blocked
     assert "g_last_full_truth_reconcile_epoch = current_epoch;" in runtime
     assert "truth_retry_session = true;" in runtime
     assert (

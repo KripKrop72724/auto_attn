@@ -645,9 +645,9 @@ static bool nvs_save_runtime_state(void)
     return true;
 }
 
-// A light check only becomes a new baseline after its checkpoint commits.
+// A reconcile only becomes a new baseline after its checkpoint commits.
 // Keep the live evidence intact on failure so the recovery pass can account for it.
-static bool commit_light_reconcile(int32_t refreshed_records, size_t *live_events)
+static bool commit_reconcile_count(int32_t refreshed_records, size_t *live_events)
 {
     if (!live_events) return false;
     g_last_synced_attendance_count = refreshed_records;
@@ -6132,7 +6132,7 @@ static bool history_sweep_is_due(int64_t current_epoch)
     return current_epoch - g_history_last_sweep_epoch >= interval;
 }
 
-static void history_start_new_sweep(void)
+static bool history_start_new_sweep(void)
 {
     history_dump_cache_clear();
     g_history_backfill_pending = true;
@@ -6142,16 +6142,17 @@ static void history_start_new_sweep(void)
     g_history_oldest_year = 0;
     g_history_oldest_month = 0;
     g_history_failed_windows = 0;
+    if (!nvs_save_runtime_state()) return false;
     update_history_telemetry();
-    nvs_save_runtime_state();
+    return true;
 }
 
-static void history_finish_sweep(int64_t current_epoch)
+static bool history_finish_sweep(int64_t current_epoch)
 {
     history_dump_cache_clear();
     g_history_backfill_pending = false;
     g_history_last_sweep_epoch = current_epoch > 1700000000 ? current_epoch : epoch_now();
-    if (!nvs_save_runtime_state()) return;
+    if (!nvs_save_runtime_state()) return false;
     update_history_telemetry();
     char message[224];
     snprintf(
@@ -6169,6 +6170,7 @@ static void history_finish_sweep(int64_t current_epoch)
             ? "HISTORY_BACKFILL_BLOCKED"
             : "HISTORY_BACKFILL_COMPLETE",
         message);
+    return true;
 }
 
 static char *json_escape_alloc(const char *value)
@@ -8223,7 +8225,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     ZONE_LITE_FULL_TRUTH_RECONCILE_MS;
             }
             if (!g_history_backfill_pending && history_sweep_is_due(current_epoch)) {
-                history_start_new_sweep();
+                if (!history_start_new_sweep()) {
+                    add_connector_set_activity("LIVE_CAPTURE");
+                    continue;
+                }
             }
             bool historical_window_open = history_window_is_open(current_epoch);
             if (!historical_window_open && g_history_dump_cache != NULL) {
@@ -8311,7 +8316,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     if (dump_succeeded) {
                         if (historical_reconcile) {
                             if (history_exhausted) {
-                                history_finish_sweep(current_epoch);
+                                reconcile_succeeded = history_finish_sweep(current_epoch);
                             } else {
                                 advance_month(
                                     &g_history_cursor_year,
@@ -8321,22 +8326,20 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                         g_history_cursor_month,
                                         device_now.tm_year + 1900,
                                         device_now.tm_mon + 1) >= 0) {
-                                    history_finish_sweep(current_epoch);
+                                    reconcile_succeeded = history_finish_sweep(current_epoch);
                                 } else {
-                                    update_history_telemetry();
-                                    nvs_save_runtime_state();
+                                    reconcile_succeeded = nvs_save_runtime_state();
+                                    if (reconcile_succeeded) update_history_telemetry();
                                 }
                             }
                         } else {
                             g_force_truth_reconcile = false;
                             g_truth_retry_not_before_ms = 0;
-                            g_last_synced_attendance_count = refreshed_records;
-                            live_events_since_sync = 0;
                             g_last_full_truth_reconcile_ms = now_ms;
                             if (epoch_valid) {
                                 g_last_full_truth_reconcile_epoch = current_epoch;
                             }
-                            nvs_save_runtime_state();
+                            reconcile_succeeded = commit_reconcile_count(refreshed_records, &live_events_since_sync);
                         }
                     } else {
                         reconcile_succeeded = false;
@@ -8408,10 +8411,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                         g_history_cursor_month,
                                         device_now.tm_year + 1900,
                                         device_now.tm_mon + 1) >= 0) {
-                                    history_finish_sweep(current_epoch);
+                                    (void)history_finish_sweep(current_epoch);
                                 } else {
-                                    update_history_telemetry();
-                                    nvs_save_runtime_state();
+                                    if (nvs_save_runtime_state()) update_history_telemetry();
                                 }
                             }
                             if (!historical_reconcile && identity_blocked) {
@@ -8433,14 +8435,12 @@ static int64_t gateway_run(uint32_t host_order_ip)
                                 // false counter mismatch. New live punches advance
                                 // both sides of the next light-reconcile check;
                                 // genuinely missed events still create a mismatch.
-                                g_last_synced_attendance_count = refreshed_records;
-                                live_events_since_sync = 0;
                                 g_truth_retry_not_before_ms = 0;
                                 g_last_full_truth_reconcile_ms = now_ms;
                                 if (epoch_valid) {
                                     g_last_full_truth_reconcile_epoch = current_epoch;
                                 }
-                                nvs_save_runtime_state();
+                                (void)commit_reconcile_count(refreshed_records, &live_events_since_sync);
                                 truth_retry_session = true;
                             }
                             add_connector_log(
@@ -8464,7 +8464,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     (long long)record_delta,
                     (unsigned)live_events_since_sync);
                 add_connector_set_activity("LIGHT_RECONCILE");
-                reconcile_succeeded = commit_light_reconcile(refreshed_records, &live_events_since_sync);
+                reconcile_succeeded = commit_reconcile_count(refreshed_records, &live_events_since_sync);
                 if (reconcile_succeeded) {
                     ESP_LOGI(TAG, "%s", summary);
                     g_add_zkt.last_light_check_uptime_ms = uptime_ms();

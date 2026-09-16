@@ -320,3 +320,13 @@ and cursor. Tentative cursor changes cannot replace the committed diagnostic val
 Unknown checkpoints and checks not performed since boot remain omitted rather than
 reported as healthy zeroes. All 143 firmware tests passed, including actual NVS failure
 checks; real cJSON allocation injection and the ESP-IDF 5.5.3 build passed.
+
+### Full and historical reconciliation commit ordering (2026-09-16)
+
+Full reconciliation uses the same checked baseline commit as light reconciliation,
+including the identity-blocked observation path: live evidence clears only after
+persistence. Historical start/finish now return checked results, publish state after
+commit, and cannot report successful reconciliation after a failed checkpoint.
+Failed identity resolution remains unsuccessful even when its retry state saves.
+The actual history adapter is fault-tested under sanitizers; 144 firmware tests and
+the ESP-IDF 5.5.3 unsigned development build passed.
