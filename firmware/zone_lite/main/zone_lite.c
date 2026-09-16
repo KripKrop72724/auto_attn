@@ -1,3 +1,4 @@
+#include "lease_guard.h"
 #include "uid_cache.h"
 #include "storage_upgrade.h"
 #include "worker_retry.h"
@@ -7305,12 +7306,103 @@ static void mark_command_processed(const char *command_id)
     if (!command_was_processed(command_id)) (void)append_line(PROCESSED_COMMANDS_PATH, command_id);
 }
 
-static void temp_admin_clear(void)
+static bool temp_admin_clear(void)
 {
+    bool active = g_temp_admin_active;
+    uint16_t uid = g_temp_admin_uid;
+    int64_t expiry = g_temp_admin_expires_epoch;
     g_temp_admin_active = false;
     g_temp_admin_uid = 0;
     g_temp_admin_expires_epoch = 0;
-    nvs_save_runtime_state();
+    if (nvs_save_runtime_state()) return true;
+    // Keep the watchdog obligation until clearing it is durably recorded.
+    g_temp_admin_active = active;
+    g_temp_admin_uid = uid;
+    g_temp_admin_expires_epoch = expiry;
+    return false;
+}
+
+typedef struct {
+    int sock;
+    zk_context_t *ctx;
+    user_table_t *users;
+    const add_command_t *command;
+} temp_admin_port_t;
+static int64_t temp_admin_now(void *arg) { (void)arg; return epoch_now(); }
+static bool temp_admin_persist(void *arg, uint16_t uid, int64_t deadline, bool active)
+{
+    (void)arg;
+    if (!active) return temp_admin_clear();
+    g_temp_admin_active = true;
+    g_temp_admin_uid = uid;
+    g_temp_admin_expires_epoch = deadline;
+    return nvs_save_runtime_state();
+}
+static bool temp_admin_write(void *arg, uint16_t uid, int privilege)
+{
+    temp_admin_port_t *port = arg;
+    char key[16]; snprintf(key, sizeof(key), "%u", (unsigned)uid);
+    zkt_user_t *user = find_mutable_user_by_uid(port->users, key);
+    return user && zk_write_user(port->sock, port->ctx, user, NULL, privilege);
+}
+static bool temp_admin_elevate(void *arg, uint16_t uid) { return temp_admin_write(arg, uid, 14); }
+static bool temp_admin_revoke(void *arg, uint16_t uid) { return temp_admin_write(arg, uid, 0); }
+static bool temp_admin_verify(void *arg, uint16_t uid, int privilege)
+{
+    temp_admin_port_t *port = arg;
+    int32_t users = 0, records = 0;
+    if (!zk_get_counts(port->sock, port->ctx, &users, &records) ||
+        !zk_refresh_users_preserving_current(port->sock, port->ctx, port->users, users)) return false;
+    const zkt_user_t *verified = find_user_by_uid(port->users, uid);
+    if (!verified || verified->privilege != privilege ||
+        (port->command->user_id[0] && strcmp(verified->user_id, port->command->user_id)) ||
+        (port->command->has_expected_terminal_identity_fingerprint &&
+         strcmp(verified->terminal_identity_fingerprint, port->command->expected_terminal_identity_fingerprint))) return false;
+    g_add_zkt.user_count = users;
+    g_add_zkt.attendance_count = records;
+    add_connector_set_zkt(&g_add_zkt);
+    return true;
+}
+static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *users,
+    const add_command_t *command, const char **error_code, const char **error_message,
+    char *result, size_t result_size)
+{
+    if (!ensure_system_time_synced()) {
+        *error_code = "TRUSTED_TIME_UNAVAILABLE";
+        *error_message = "Trusted time is required before administrator elevation.";
+        return false;
+    }
+    unsigned seconds = command->duration_seconds > 0 && command->duration_seconds <= 600
+        ? (unsigned)command->duration_seconds : 600;
+    char *uid_end = NULL;
+    unsigned long parsed_uid = strtoul(command->uid, &uid_end, 10);
+    if (!command->uid[0] || !uid_end || *uid_end || !parsed_uid || parsed_uid > UINT16_MAX ||
+        (g_temp_admin_active && g_temp_admin_uid != (uint16_t)parsed_uid)) {
+        *error_code = "ACTIVE_ADMIN_LEASE";
+        *error_message = "The UID is invalid or another revocation obligation is still active.";
+        return false;
+    }
+    uint16_t uid = (uint16_t)parsed_uid;
+    int64_t deadline = command->lease_expires_epoch;
+    if (g_temp_admin_active && g_temp_admin_uid == uid && g_temp_admin_expires_epoch > 0 &&
+        (deadline <= 0 || g_temp_admin_expires_epoch < deadline)) deadline = g_temp_admin_expires_epoch;
+    temp_admin_port_t context = {sock, ctx, users, command};
+    lg_port_t port = {temp_admin_now, temp_admin_persist, temp_admin_elevate,
+        temp_admin_verify, temp_admin_revoke, &context};
+    lg_result_t outcome = lg_grant(port, uid, seconds, deadline);
+    if (outcome != LG_OK) {
+        *error_code = outcome == LG_STORAGE ? "LEASE_CHECKPOINT_FAILED" :
+            outcome == LG_EXPIRED ? "COMMAND_EXPIRED" : outcome == LG_TIME ? "TRUSTED_TIME_UNAVAILABLE" : "ZKT_USER_REREAD_FAILED";
+        *error_message = "Administrator elevation was not durably verified; any unresolved revocation obligation remains active.";
+        return false;
+    }
+    const zkt_user_t *verified = find_user_by_uid(users, uid);
+    if (!verified) return false;
+    snprintf(result, result_size,
+        "{\"verified_privilege\":14,\"expires_epoch\":%lld,\"verified_terminal_identity_fingerprint\":\"%s\","
+        "\"verified_terminal_state_fingerprint\":\"%s\"}",
+        (long long)g_temp_admin_expires_epoch, verified->terminal_identity_fingerprint, verified->terminal_state_fingerprint);
+    return true;
 }
 
 static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *users)
@@ -7318,6 +7410,9 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
     if (!g_temp_admin_active) return true;
     int64_t now = epoch_now();
     if (now >= ZONE_LITE_MIN_VALID_UNIX_TIME && now < g_temp_admin_expires_epoch) return true;
+    int32_t current_users = 0, current_records = 0;
+    if (!zk_get_counts(sock, ctx, &current_users, &current_records) ||
+        !zk_refresh_users_preserving_current(sock, ctx, users, current_users)) return false;
     char uid[16];
     snprintf(uid, sizeof(uid), "%u", g_temp_admin_uid);
     zkt_user_t *user = find_mutable_user_by_uid(users, uid);
@@ -7326,7 +7421,7 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
         return false;
     }
     if (user->privilege == 0) {
-        temp_admin_clear();
+        if (!temp_admin_clear()) return false;
         add_connector_log("INFO", "enrollment", "LEASE_REVOKED_LOCAL", "Temporary administrator privilege was revoked by the ESP watchdog");
         return true;
     }
@@ -7340,7 +7435,7 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
                 g_add_zkt.user_count = verified_users;
                 g_add_zkt.attendance_count = verified_records;
                 add_connector_set_zkt(&g_add_zkt);
-                temp_admin_clear();
+                if (!temp_admin_clear()) return false;
                 add_connector_log("INFO", "enrollment", "LEASE_REVOKED_LOCAL", "Temporary administrator privilege was revoked and verified by reread");
                 return true;
             }
@@ -7565,37 +7660,13 @@ static bool process_add_commands(
                 } else if (
                     strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
                     user->privilege == 14) {
-                    int lease_seconds =
-                        command.duration_seconds > 0 && command.duration_seconds <= 600
-                            ? command.duration_seconds
-                            : 600;
-                    int64_t deadline = command.lease_expires_epoch > 0
-                        ? command.lease_expires_epoch
-                        : epoch_now() + lease_seconds;
-                    if (deadline <= epoch_now()) {
-                        error_code = "COMMAND_EXPIRED";
-                        error_message = "The enrollment lease deadline passed before recovery completed.";
-                    } else {
-                        g_temp_admin_active = true;
-                        g_temp_admin_uid = (uint16_t)strtoul(user->uid, NULL, 10);
-                        g_temp_admin_expires_epoch = deadline;
-                        nvs_save_runtime_state();
-                        ok = true;
-                        snprintf(
-                            result,
-                            sizeof(result),
-                            "{\"duplicate\":true,\"verified_privilege\":14,\"expires_epoch\":%lld,"
-                            "\"verified_terminal_identity_fingerprint\":\"%s\","
-                            "\"verified_terminal_state_fingerprint\":\"%s\"}",
-                            (long long)deadline,
-                            user->terminal_identity_fingerprint,
-                            user->terminal_state_fingerprint);
-                    }
+                    ok = execute_temp_admin_grant(sock, ctx, users, &command,
+                        &error_code, &error_message, result, sizeof(result));
                 } else if (
                     strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0 &&
                     user->privilege == 0) {
-                    temp_admin_clear();
-                    ok = true;
+                    ok = temp_admin_clear();
+                    if (!ok) { error_code = "LEASE_CHECKPOINT_FAILED"; error_message = "Revocation was verified but its checkpoint could not be saved."; }
                     snprintf(
                         result,
                         sizeof(result),
@@ -7613,14 +7684,15 @@ static bool process_add_commands(
                 } else if (!user_matches_expected_state(user, &command)) {
                     error_code = "USER_PRECONDITION_FAILED";
                     error_message = "The fresh terminal user no longer matches the command precondition.";
+                } else if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0) {
+                    ok = execute_temp_admin_grant(sock, ctx, users, &command,
+                        &error_code, &error_message, result, sizeof(result));
                 } else {
                 int privilege = user->privilege;
                 const char *name = NULL;
                 if (strcmp(command.command_type, "UPDATE_USER") == 0) {
                     if (command.has_privilege) privilege = command.privilege;
                     if (command.has_name) name = command.name;
-                } else if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0) {
-                    privilege = 14;
                 } else {
                     privilege = 0;
                 }
@@ -7628,61 +7700,6 @@ static bool process_add_commands(
                 if (!ok) {
                     error_code = "ZKT_USER_WRITE_FAILED";
                     error_message = "The terminal did not acknowledge and verify the user write.";
-                } else if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0) {
-                    if (!ensure_system_time_synced()) {
-                        (void)zk_write_user(sock, ctx, user, NULL, 0);
-                        ok = false;
-                        error_code = "TRUSTED_TIME_UNAVAILABLE";
-                        error_message = "The elevation was rolled back because trusted time is unavailable.";
-                    } else {
-                        int32_t after_users = 0;
-                        int32_t after_records = 0;
-                        if (!zk_get_counts(sock, ctx, &after_users, &after_records) ||
-                            !zk_refresh_users_preserving_current(sock, ctx, users, after_users)) {
-                            ok = false;
-                            error_code = "ZKT_USER_REREAD_FAILED";
-                            error_message = "Administrator elevation could not be verified by reread.";
-                        } else {
-                            zkt_user_t *verified = find_mutable_user_by_uid(users, command.uid);
-                            if (!verified || !user_matches_command(verified, &command) ||
-                                verified->privilege != 14) {
-                                ok = false;
-                                error_code = "ZKT_USER_POSTCONDITION_FAILED";
-                                error_message = "Administrator elevation did not persist after reread.";
-                            } else {
-                                g_temp_admin_active = true;
-                                g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
-                                int lease_seconds =
-                                    command.duration_seconds > 0 && command.duration_seconds <= 600
-                                        ? command.duration_seconds
-                                        : 600;
-                                g_temp_admin_expires_epoch = command.lease_expires_epoch > 0
-                                    ? command.lease_expires_epoch
-                                    : epoch_now() + lease_seconds;
-                                if (g_temp_admin_expires_epoch <= epoch_now()) {
-                                    g_temp_admin_active = true;
-                                    g_temp_admin_uid = (uint16_t)strtoul(verified->uid, NULL, 10);
-                                    nvs_save_runtime_state();
-                                    (void)temp_admin_revoke_if_due(sock, ctx, users);
-                                    ok = false;
-                                    error_code = "COMMAND_EXPIRED";
-                                    error_message = "The enrollment lease deadline passed before elevation verification.";
-                                }
-                                nvs_save_runtime_state();
-                                if (ok) {
-                                    snprintf(
-                                        result,
-                                        sizeof(result),
-                                        "{\"verified_privilege\":14,\"expires_epoch\":%lld,"
-                                        "\"verified_terminal_identity_fingerprint\":\"%s\","
-                                        "\"verified_terminal_state_fingerprint\":\"%s\"}",
-                                        (long long)g_temp_admin_expires_epoch,
-                                        verified->terminal_identity_fingerprint,
-                                        verified->terminal_state_fingerprint);
-                                }
-                            }
-                        }
-                    }
                 } else if (strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0) {
                     int32_t after_users = 0;
                     int32_t after_records = 0;
@@ -7699,7 +7716,8 @@ static bool process_add_commands(
                             error_code = "ZKT_USER_POSTCONDITION_FAILED";
                             error_message = "Administrator revocation did not persist after reread.";
                         } else {
-                            temp_admin_clear();
+                            ok = temp_admin_clear();
+                            if (!ok) { error_code = "LEASE_CHECKPOINT_FAILED"; error_message = "Revocation was verified but its checkpoint could not be saved."; }
                             snprintf(
                                 result,
                                 sizeof(result),

@@ -96,8 +96,10 @@ def test_final_manifest_does_not_reopen_the_prepared_terminal_buffer():
 
 
 def test_admin_lease_duration_starts_after_verified_terminal_elevation():
-    assert "command.duration_seconds > 0 && command.duration_seconds <= 600" in ZONE
-    assert "epoch_now() + lease_seconds" in ZONE
+    assert "command->duration_seconds > 0 && command->duration_seconds <= 600" in ZONE
+    guard = (ROOT / "firmware/zone_lite/main/lease_guard.c").read_text()
+    assert guard.index("p.verify(p.context, uid, 14)") < guard.index("verified + seconds")
+    assert "lg_grant(port, uid, seconds, deadline)" in ZONE
 
 
 def test_physical_hil_gate_requires_reconciliation_fault_and_resume_evidence():

@@ -278,3 +278,18 @@ revoked, mismatched-scope and wrong-hash evidence are rejected. This applies thr
 the shared target selector used by preview, assignment and download authorization.
 The 35 HIL-scope/storage-contract tests pass. The acceptance writer and production
 validator are still pending; no acceptance is inferred from this unit test.
+
+### Temporary-admin persistence audit (2026-09-16)
+
+The runtime audit found another ignored checkpoint result in temporary-admin
+handling. Elevation now follows a tested lease guard: persist the bounded revocation
+obligation, elevate and reread, then persist the verified deadline before success.
+An uncertain elevation or failed final checkpoint triggers verified revocation;
+failed revocation retains the previously durable watchdog obligation. Clearing a
+lease restores the RAM obligation if its checkpoint fails. Watchdog revocation
+rereads terminal state rather than relying on an older user snapshot. Another UID's
+active obligation cannot be overwritten by a new grant, and replay cannot extend
+an existing deadline. Actual C state-machine and firmware-adapter host tests cover
+failed/uncertain persistence, failed verification/revocation, clock and expiry
+boundaries, invalid UIDs, and retained obligations. No production administrator
+permission was changed during these tests.
