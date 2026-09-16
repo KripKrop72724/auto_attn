@@ -5,6 +5,30 @@ Work in progress. This document is not release approval or HIL acceptance.
 Base: `55f049ab7292b80a771a37a882a2d042b1664021`.
 Branch: `codex/firmware-reliability-islamabad-hil`.
 
+## Current release status — 16 September 2026
+
+**Not release-ready.** No Islamabad release has been signed, published, installed,
+or accepted. The existing 2.5.3 release in ADD was published on 28 August and is
+restricted to Quetta; it is not this implementation. The requested targets remain
+13FL `e0:72:a1:d6:3c:7c` / `PGB1261200077`, followed by active 3FL
+`a4:cb:8f:d4:66:64` / `PGB1261200074`. The user will perform the production HIL
+checks. No elapsed observation interval by itself constitutes acceptance.
+
+Remaining implementation: verified whole-device recovery and persistence health;
+bounded ACK and command-journal reclamation with replay proofs; scoped ESP reboot
+and timed ADD interruption; server-owned HIL evidence collection and acceptance;
+remaining persistence/legacy-transition audits. Remaining qualification includes
+upgrade and rollback with interrupted migration, final-source soak and full CI.
+Then deploy ADD support, reserve versions, merge green commits, sign through the
+protected workflow, publish exact-target HIL releases, and verify OTA eligibility.
+The development version remains 2.5.2 with segmented writes disabled.
+
+The running 24-hour component soak uses source `ca2f774...` and has passed its
+30-minute 10 events/second phase. It is not a completed 24-hour result, does not
+include subsequent source changes, and is not hardware endurance evidence.
+The historical implementation log below records earlier checkpoints; this release
+status takes precedence over older qualification counts and pending-item wording.
+
 ## Current implementation
 
 | Finding | Implemented locally | Remaining release requirements |
@@ -382,3 +406,24 @@ The 15-minute windows remain smoke tests. Nationwide promotion is now an intende
 subsequent phase after both target receipts and required software qualification, using
 staged rollout. Existing promotion controls remain in force; no Karachi, physical
 power-cut or hardware endurance gate is represented as passed by this Islamabad test.
+
+## Queue error classification and bounded legacy recovery
+
+The queue now distinguishes unavailable checkpoint/directory reads from corrupt
+content and a too-small caller buffer. Failed directory enumeration/close cannot
+create an empty checkpoint. Segment reads and settlement failures are latched in
+storage diagnostics under the shared storage budget lock; stale tokens and buffer
+retries are not counted as storage faults. Read-failure counters are carried through
+ADD/UI and prevent a HIL pass when new failures occur. Connectivity cannot mask them.
+
+Firmware legacy readers verify consumed-prefix CRC in at most 8 KiB per invocation,
+close the file, and yield to their owner before the next slice. Failed read/close
+retries exactly the same slice. The authoritative source checkpoint remains unchanged.
+All legacy ADD, ORDS, blocked and evidence readers use this stepped recovery path.
+Queue depth remains unknown until recovery is complete or settled EOF is verified.
+
+Actual C sanitizer tests inject directory/checkpoint failure, small read buffers,
+read/settlement errors, each prefix read and close failure, and changed prefix bytes.
+The 100,000-byte legacy fixture validates slice bounds and preserved checkpoints;
+the multi-generation blocked fixture still drains 10,003 records. These changes do
+not implement or claim the remaining whole-device HEALTHY gate or HIL acceptance.

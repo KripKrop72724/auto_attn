@@ -30,6 +30,7 @@ export function FirmwareHealth({ diagnostics, observedAt }: {
         <div><dt>Storage used / total</dt><dd>{bytes(storage?.used_bytes)} / {bytes(storage?.total_bytes)}</dd></div>
         <div><dt>Reserved admission space</dt><dd>{bytes(storage?.admission_reserve_bytes)}</dd></div>
         <div><dt>Write failures</dt><dd>{storage?.write_failures ?? 'Not reported'}</dd></div>
+        <div><dt>Read failures</dt><dd>{storage?.read_failures ?? 'Not reported'}</dd></div>
         <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
         {storage?.error_operation && <div><dt>Last storage error</dt><dd>{storage.error_operation} · {storage.error_code ?? 'No code reported'}</dd></div>}

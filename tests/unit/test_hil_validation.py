@@ -44,6 +44,7 @@ def evidence():
             committed_cursor=100 + i,
             source_count=100 + i,
             write_failures=0,
+            read_failures=0,
             worker_restarts=0,
             message_rejections=0,
         )
@@ -144,6 +145,7 @@ def test_absent_proof_is_incomplete(evidence, field, value, reason):
         ("terminal_certified", False),
         ("recovery_complete", False),
         ("write_failures", 1),
+        ("read_failures", 1),
         ("worker_restarts", 1),
         ("message_rejections", 1),
         ("source_generation", 4),
@@ -163,6 +165,7 @@ def test_unsafe_observation_fails(evidence, field, value):
         "persistence_verified",
         "counts_known",
         "write_failures",
+        "read_failures",
         "source_generation",
     ],
 )

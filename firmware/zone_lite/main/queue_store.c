@@ -149,6 +149,18 @@ static dq_result_t reopen(lane_t *lane)
     dq_port_t port = {load, commit, admit, lane};
     return dq_open(&lane->queue, prefix, port);
 }
+/* Caller owns the budget lock. A successful unrelated operation must not
+ * clear a latched storage fault; only a complete recovery check may do so. */
+static void record_queue_result(dq_result_t result, const char *operation, bool writing)
+{
+    if (result == DQ_OK || result == DQ_EMPTY || result == DQ_STALE || result == DQ_BUFFER_SMALL) return;
+    health.failures++;
+    if (result == DQ_FULL) health.admission_rejections++;
+    else if (writing) health.write_failures++;
+    else health.read_failures++;
+    health.last_operation = result == DQ_FULL ? "capacity_admission" : operation;
+    health.last_error = result == DQ_FULL ? ENOSPC : result == DQ_CORRUPT ? EBADMSG : (errno ? errno : EIO);
+}
 bool qs_init(void)
 {
     if (!budget_lock) budget_lock = xSemaphoreCreateMutex();
@@ -159,7 +171,10 @@ bool qs_init(void)
         if (!lane->mutex) lane->mutex = xSemaphoreCreateMutex();
         if (!lock((qs_lane_t)i)) { ok = false; continue; }
         if (xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            if (!ensure_storage_generation() || reopen(lane) != DQ_OK) ok = false;
+            errno = 0;
+            dq_result_t result = ensure_storage_generation() ? reopen(lane) : DQ_IO;
+            record_queue_result(result, "segment_recovery", false);
+            if (result != DQ_OK) ok = false;
             xSemaphoreGive(budget_lock);
         } else ok = false;
         xSemaphoreGive(lane->mutex);
@@ -180,15 +195,10 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
     }
+    errno = 0;
     dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
-    if (result != DQ_OK) {
-        health.failures++;
-        if (result == DQ_FULL) health.admission_rejections++;
-        else health.write_failures++;
-        health.last_operation = result == DQ_FULL ? "capacity_admission" : "segment_append";
-        health.last_error = result == DQ_FULL ? ENOSPC : (errno ? errno : EIO);
-    }
+    record_queue_result(result, "segment_append", true);
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
     return result;
@@ -196,16 +206,28 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
 {
     if (!lock(lane)) return DQ_IO;
-    dq_result_t result = reopen(&lanes[lane]);
+    if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
+    }
+    errno = 0;
+    dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_peek(&lanes[lane].queue, data, capacity, length, token);
+    record_queue_result(result, "segment_read", false);
+    xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
     return result;
 }
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
 {
     if (!lock(lane)) return DQ_IO;
-    dq_result_t result = reopen(&lanes[lane]);
+    if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
+    }
+    errno = 0;
+    dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_settle(&lanes[lane].queue, token);
+    record_queue_result(result, "segment_settle", true);
+    xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
     return result;
 }

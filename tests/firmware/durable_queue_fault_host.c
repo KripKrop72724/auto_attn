@@ -8,6 +8,11 @@
 #include "durable_queue.h"
 
 static unsigned calls, fail_at;
+static bool directory_read_failure, directory_close_failure, checkpoint_read_failure;
+static struct dirent *fault_readdir(DIR *dir)
+{ if (directory_read_failure) { errno=EIO; return NULL; } return readdir(dir); }
+static int fault_closedir(DIR *dir)
+{ int result=closedir(dir); if(directory_close_failure) { errno=EIO; return -1; } return result; }
 static bool fails(void) { return ++calls == fail_at; }
 static FILE *fault_open(const char *p, const char *m)
 { if (fails()) { errno = EIO; return NULL; } return fopen(p,m); }
@@ -33,6 +38,8 @@ static int fault_remove(const char *p)
 #define fclose fault_close
 #define fseek fault_seek
 #define remove fault_remove
+#define readdir fault_readdir
+#define closedir fault_closedir
 #include "durable_queue.c"
 #undef fopen
 #undef fwrite
@@ -42,10 +49,12 @@ static int fault_remove(const char *p)
 #undef fclose
 #undef fseek
 #undef remove
+#undef readdir
+#undef closedir
 
 typedef struct { bool exists, uncertain; dq_checkpoint_t cp; } state_t;
 static int load(void *ctx, dq_checkpoint_t *cp)
-{ state_t *s=ctx; *cp=s->cp; return s->exists; }
+{ state_t *s=ctx; *cp=s->cp; return checkpoint_read_failure ? -1 : s->exists; }
 static bool save(void *ctx, const dq_checkpoint_t *cp)
 {
     state_t *s=ctx;
@@ -74,6 +83,25 @@ int main(void)
 {
     durable_queue_t q; state_t state;
     char row[8192]; size_t length; dq_token_t token;
+    // An unavailable directory or checkpoint cannot initialize an empty queue.
+    reset(&q,&state); clean(); memset(&state,0,sizeof(state));
+    directory_read_failure=true;
+    assert(dq_open(&q,"fault-",(dq_port_t){load,save,NULL,&state})==DQ_IO);
+    assert(!state.exists && !q.ready);
+    directory_read_failure=false; directory_close_failure=true;
+    assert(dq_open(&q,"fault-",(dq_port_t){load,save,NULL,&state})==DQ_IO);
+    assert(!state.exists && !q.ready);
+    directory_close_failure=false; checkpoint_read_failure=true;
+    assert(dq_open(&q,"fault-",(dq_port_t){load,save,NULL,&state})==DQ_IO);
+    assert(!state.exists && !q.ready);
+    checkpoint_read_failure=false;
+    reset(&q,&state);
+    assert(dq_append(&q,"valid record",12)==DQ_OK);
+    dq_checkpoint_t before=state.cp;
+    assert(dq_peek(&q,row,1,&length,&token)==DQ_BUFFER_SMALL && length==12);
+    assert(memcmp(&before,&state.cp,sizeof(before))==0);
+    assert(dq_peek(&q,row,sizeof(row),&length,&token)==DQ_OK && length==12);
+    assert(!memcmp(row,"valid record",12));
     /* Every injected call fails once, including short writes and uncertain
      * successful checkpoint commits reported as failures. Previous durable
      * records must remain readable, in order, after a restart. */

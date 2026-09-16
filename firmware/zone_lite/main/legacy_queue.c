@@ -23,31 +23,54 @@ static bool persist(legacy_queue_t *q, lq_checkpoint_t next)
     q->checkpoint=next;
     return true;
 }
-dq_result_t lq_open(legacy_queue_t *q, const char *path, lq_port_t port)
+dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
 {
     if (!q || !path || strlen(path)>=sizeof(q->path) || !port.load || !port.commit) return DQ_IO;
-    memset(q,0,sizeof(*q)); strcpy(q->path,path); q->port=port;
-    int loaded=port.load(port.context,&q->checkpoint);
+    if (!q->recovering || strcmp(q->path,path) || q->port.context!=port.context ||
+        q->port.load!=port.load || q->port.commit!=port.commit) {
+        memset(q,0,sizeof(*q)); strcpy(q->path,path); q->port=port;
+        int loaded=port.load(port.context,&q->checkpoint);
+        lq_checkpoint_t *cp=&q->checkpoint;
+        if (loaded<0) return DQ_IO;
+        if (loaded && ((cp->version!=1 && cp->version!=2) || !cp->generation ||
+            cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc)))) return DQ_CORRUPT;
+        q->recovering=true;
+    }
     lq_checkpoint_t *cp=&q->checkpoint;
-    if (loaded<0 || (loaded && ((cp->version!=1 && cp->version!=2) || !cp->generation ||
-        cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc))))) return DQ_CORRUPT;
-    if (cp->offset) {
+    if (cp->offset>q->recovery_offset) {
         FILE *file=fopen(path,"rb");
         if (!file) return DQ_IO;
-        unsigned char bytes[512]; uint32_t remaining=cp->offset, crc=0;
-        bool ok=true;
-        while (remaining) {
+        unsigned char bytes[512];
+        uint32_t position=q->recovery_offset, crc=q->recovery_crc;
+        uint32_t remaining=cp->offset-position;
+        if (remaining>LQ_RECOVERY_SLICE_BYTES) remaining=LQ_RECOVERY_SLICE_BYTES;
+        bool ok=fseek(file,(long)position,SEEK_SET)==0, boundary=true;
+        while (ok && remaining) {
             size_t n=remaining<sizeof(bytes)?remaining:sizeof(bytes);
             if (fread(bytes,1,n,file)!=n) { ok=false; break; }
-            crc=extend(crc,bytes,n); remaining-=(uint32_t)n;
-            if (!remaining && cp->version==1 && bytes[n-1]!='\n') ok=false;
+            crc=extend(crc,bytes,n); remaining-=(uint32_t)n; position+=(uint32_t)n;
+            if (position==cp->offset && cp->version==1 && bytes[n-1]!='\n') boundary=false;
         }
         if (ferror(file)) ok=false;
         if (fclose(file)!=0) ok=false;
-        if (!ok || crc!=cp->prefix_crc) return DQ_CORRUPT;
+        // Failed I/O retries exactly this slice, including a failed close.
+        if (!ok) return DQ_IO;
+        if (!boundary) { q->recovering=false; return DQ_CORRUPT; }
+        q->recovery_offset=position; q->recovery_crc=crc;
+        if (position<cp->offset) return DQ_PENDING;
+        if (crc!=cp->prefix_crc) { q->recovering=false; return DQ_CORRUPT; }
     }
-    q->ready=true;
+    q->recovering=false; q->ready=true;
     return DQ_OK;
+}
+/* Synchronous convenience for host tools. Firmware owners use the stepped API. */
+dq_result_t lq_open(legacy_queue_t *q, const char *path, lq_port_t port)
+{
+    if (!q) return DQ_IO;
+    memset(q,0,sizeof(*q));
+    dq_result_t result;
+    do { result=lq_open_step(q,path,port); } while(result==DQ_PENDING);
+    return result;
 }
 dq_result_t lq_peek(legacy_queue_t *q, char *data, size_t capacity, lq_token_t *token)
 {

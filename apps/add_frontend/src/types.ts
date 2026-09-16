@@ -127,6 +127,7 @@ export interface FirmwareDiagnostics {
     used_bytes?: number | null
     admission_reserve_bytes?: number | null
     write_failures?: number | null
+    read_failures?: number | null
     durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
     persistence_verified: boolean
     recovery_complete: boolean

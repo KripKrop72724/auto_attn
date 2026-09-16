@@ -6,7 +6,7 @@
 #define DQ_SEGMENT_BYTES (64U * 1024U)
 #define DQ_MAX_RECORD_BYTES 8192U
 #define DQ_CHECKPOINT_VERSION 2U
-typedef enum { DQ_OK, DQ_EMPTY, DQ_FULL, DQ_IO, DQ_CORRUPT, DQ_STALE } dq_result_t;
+typedef enum { DQ_OK, DQ_EMPTY, DQ_FULL, DQ_IO, DQ_CORRUPT, DQ_STALE, DQ_BUFFER_SMALL, DQ_PENDING } dq_result_t;
 typedef struct {
     uint32_t version, generation, read_segment, read_offset;
     uint32_t write_segment, write_offset, next_sequence, depth, crc;

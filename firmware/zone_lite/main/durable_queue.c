@@ -95,7 +95,8 @@ dq_result_t dq_open(durable_queue_t *q, const char *prefix, dq_port_t port)
     memset(q, 0, sizeof(*q));
     strcpy(q->prefix, prefix); q->port = port;
     int loaded = port.load(port.context, &q->checkpoint);
-    if (loaded < 0 || (loaded && !checkpoint_valid(&q->checkpoint))) return DQ_CORRUPT;
+    if (loaded < 0) return DQ_IO;
+    if (loaded && !checkpoint_valid(&q->checkpoint)) return DQ_CORRUPT;
     if (!loaded) {
         char directory[128];
         const char *base = strrchr(prefix, '/');
@@ -108,10 +109,13 @@ dq_result_t dq_open(durable_queue_t *q, const char *prefix, dq_port_t port)
         if (!dir) return DQ_IO;
         struct dirent *entry;
         bool orphaned = false;
+        errno = 0;
         while ((entry = readdir(dir)) != NULL) {
             if (!strncmp(entry->d_name, base, strlen(base))) { orphaned = true; break; }
         }
-        closedir(dir);
+        bool scanned = errno == 0;
+        if (closedir(dir) != 0) scanned = false;
+        if (!scanned) return DQ_IO;
         if (orphaned) return DQ_CORRUPT;
         dq_checkpoint_t initial = {.version = DQ_CHECKPOINT_VERSION, .next_sequence = 1};
         if (!commit(q, initial)) return DQ_IO;
@@ -188,10 +192,17 @@ dq_result_t dq_peek(durable_queue_t *q, void *data, size_t capacity, size_t *len
         ok = fread(header, 1, sizeof(header), f) == sizeof(header);
     }
     uint32_t n = ok ? decode32(header + 4) : 0;
-    if (!ok || decode32(header) != DQ_MAGIC || !n || n > DQ_MAX_RECORD_BYTES || n > capacity ||
+    if (!ok) { fclose(f); return DQ_IO; }
+    if (decode32(header) != DQ_MAGIC || !n || n > DQ_MAX_RECORD_BYTES ||
         offset + HEADER_BYTES + n > DQ_SEGMENT_BYTES ||
         (segment == c->write_segment && offset + HEADER_BYTES + n > c->write_offset)) {
         fclose(f); return DQ_CORRUPT;
+    }
+    // Buffer sizing is retryable; it is never evidence that a stored row is bad.
+    if (n > capacity) {
+        if (fclose(f) != 0) return DQ_IO;
+        *length = n;
+        return DQ_BUFFER_SMALL;
     }
     ok = fread(data, 1, n, f) == n && !ferror(f);
     if (fclose(f) != 0) ok = false;
@@ -215,17 +226,18 @@ dq_result_t dq_settle(durable_queue_t *q, const dq_token_t *token)
         char previous[160]; unsigned char seal[HEADER_BYTES];
         if (token->offset || !name(q, next.read_segment, previous)) return DQ_STALE;
         FILE *old = fopen(previous, "rb");
-        bool sealed = old && fseek(old, (long)next.read_offset, SEEK_SET) == 0 &&
-            fread(seal, 1, sizeof(seal), old) == sizeof(seal) &&
-            decode32(seal) == DQ_MAGIC && decode32(seal + 4) == 0;
+        bool read_ok = old && fseek(old, (long)next.read_offset, SEEK_SET) == 0 &&
+            fread(seal, 1, sizeof(seal), old) == sizeof(seal);
         if (old && fclose(old) != 0) return DQ_IO;
-        if (!sealed) return DQ_STALE;
+        if (!read_ok) return DQ_IO;
+        if (decode32(seal) != DQ_MAGIC || decode32(seal + 4) != 0) return DQ_STALE;
     }
     FILE *f = fopen(path, "rb");
     bool ok = f && fseek(f, (long)token->offset, SEEK_SET) == 0 &&
         fread(header, 1, sizeof(header), f) == sizeof(header);
     if (f && fclose(f) != 0) ok = false;
-    if (!ok || decode32(header) != DQ_MAGIC || decode32(header+8) != token->sequence ||
+    if (!ok) return DQ_IO;
+    if (decode32(header) != DQ_MAGIC || decode32(header+8) != token->sequence ||
         decode32(header+12) != token->crc || token->end != token->offset + HEADER_BYTES + decode32(header+4)) return DQ_STALE;
     uint32_t retired = next.read_segment;
     next.read_segment = token->segment; next.read_offset = token->end; next.depth--;

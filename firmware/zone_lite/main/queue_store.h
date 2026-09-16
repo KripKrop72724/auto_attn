@@ -6,7 +6,7 @@ typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY } qs_admiss
 typedef struct {
     size_t total_bytes, used_bytes, admission_reserve_bytes;
     bool observed, available, bulk_paused;
-    uint32_t failures, write_failures, admission_rejections;
+    uint32_t failures, write_failures, read_failures, admission_rejections;
     int last_error;
     const char *last_operation;
 } qs_health_t;

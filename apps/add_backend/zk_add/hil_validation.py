@@ -44,6 +44,7 @@ class SmokeSample(EvidenceModel):
     committed_cursor: int | None = Field(default=None, ge=0)
     source_count: int | None = Field(default=None, ge=0)
     write_failures: int | None = Field(default=None, ge=0)
+    read_failures: int | None = Field(default=None, ge=0)
     worker_restarts: int | None = Field(default=None, ge=0)
     message_rejections: int | None = Field(default=None, ge=0)
 
@@ -218,6 +219,7 @@ def evaluate_smoke(evidence: SmokeEvidence, *, now: datetime) -> SmokeVerdict:
             "committed_cursor",
             "source_count",
             "write_failures",
+            "read_failures",
             "worker_restarts",
             "message_rejections",
         ):
@@ -258,7 +260,7 @@ def evaluate_smoke(evidence: SmokeEvidence, *, now: datetime) -> SmokeVerdict:
             and sample.committed_cursor < previous.committed_cursor
         ):
             failed.append("SOURCE_CURSOR_REGRESSED")
-        for name in ("write_failures", "worker_restarts", "message_rejections"):
+        for name in ("write_failures", "read_failures", "worker_restarts", "message_rejections"):
             before, after = getattr(previous, name), getattr(sample, name)
             if (
                 before is not None

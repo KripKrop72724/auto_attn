@@ -2855,7 +2855,7 @@ static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *
     if (!restore_blocked_backup_if_needed()) return DQ_IO;
     if (!g_legacy_blocked.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, "blocked"};
-        dq_result_t open = lq_open(&g_legacy_blocked, BLOCKED_PATH, port);
+        dq_result_t open = lq_open_step(&g_legacy_blocked, BLOCKED_PATH, port);
         if (open != DQ_OK) return open;
     }
     dq_result_t result = lq_peek(&g_legacy_blocked, line, capacity, token);
@@ -6888,7 +6888,7 @@ static void oracle_drain_pending(bool live_first)
     dq_result_t read = DQ_OK;
     if (!g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
-        read = lq_open(&g_legacy_pending, PENDING_PATH, port);
+        read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
     }
     legacy_queue_t scan = g_legacy_pending;
     size_t limit = g_legacy_probe_head ? 1 : 100;
@@ -6915,7 +6915,7 @@ static void oracle_drain_pending(bool live_first)
                 if (qs_snapshot(QS_ORDS, &depth) && depth == 0) led_status_set_backlog(false);
             }
         }
-        else ords_drain_preserved_deferred("legacy-read", EIO);
+        else if (read != DQ_PENDING) ords_drain_preserved_deferred("legacy-read", EIO);
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
@@ -6999,7 +6999,7 @@ static void blocked_evidence_slice(void)
         xSemaphoreGive(g_storage_lock);
     }
     if (read != DQ_OK) {
-        if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return;
     }
     line[length] = 0;
@@ -7046,7 +7046,7 @@ static void legacy_quarantine_slice(void)
     dq_result_t read = DQ_OK;
     if (!queue->ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, (void *)keys[lane]};
-        read = lq_open(queue, paths[lane], port);
+        read = lq_open_step(queue, paths[lane], port);
     }
     lq_token_t token;
     if (read == DQ_OK) read = lq_peek(queue, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &token);
@@ -7056,7 +7056,7 @@ static void legacy_quarantine_slice(void)
     }
     xSemaphoreGive(g_storage_lock);
     if (read != DQ_OK) {
-        if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return;
     }
     char instance[33], generation[80], record_id[80];

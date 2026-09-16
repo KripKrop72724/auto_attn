@@ -54,7 +54,10 @@ int main(void)
     assert(read_blocked_locked(row,sizeof(row),&token)==DQ_OK);
     append(BLOCKED_PATH,"concurrent");assert(settle_blocked_locked(&token, true));
     unsigned rows=2;
-    while(read_blocked_locked(row,sizeof(row),&token)==DQ_OK){
+    for (;;) {
+        dq_result_t read=read_blocked_locked(row,sizeof(row),&token);
+        if(read==DQ_PENDING)continue; // Owner yields/relinquishes its lock here.
+        if(read!=DQ_OK)break;
         assert(settle_blocked_locked(&token, true));++rows;
         if(rows%997==0)g_legacy_blocked.ready=false;
         assert(rows<=10003);

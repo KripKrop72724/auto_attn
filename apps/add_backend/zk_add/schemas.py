@@ -88,6 +88,7 @@ class StorageDiagnostics(BaseModel):
     used_bytes: int | None = Field(default=None, ge=0)
     admission_reserve_bytes: int | None = Field(default=None, ge=0)
     write_failures: int | None = Field(default=None, ge=0)
+    read_failures: int | None = Field(default=None, ge=0)
     durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"] = "UNKNOWN"
     persistence_verified: bool = False
     recovery_complete: bool = False

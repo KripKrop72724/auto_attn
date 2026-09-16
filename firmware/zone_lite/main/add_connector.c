@@ -2348,6 +2348,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     qs_health_t measured_health = qs_health();
     if (measured_health.observed) {
         if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
+            !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
             !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
@@ -2356,7 +2357,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
     const char *led = led_status_current_name();
-    const char *durability = measured != ESP_OK || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
+    const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
         ? "DEGRADED" : "UNKNOWN";
     if (!cJSON_AddStringToObject(storage, "durability", durability) ||
         !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
@@ -2623,9 +2624,10 @@ static bool add_legacy_commit(void *context, const lq_checkpoint_t *checkpoint)
 static off_t load_outbox_cursor(add_outbox_t *outbox)
 {
     lq_port_t port = {add_legacy_load, add_legacy_commit, outbox};
-    if (lq_open(&outbox->legacy, outbox->path, port) != DQ_OK) {
+    dq_result_t result = lq_open_step(&outbox->legacy, outbox->path, port);
+    if (result != DQ_OK) {
         outbox->depth_known = false;
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (result != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return 0;
     }
     // The old text cursor is not sufficient generation evidence. A first
@@ -2636,6 +2638,7 @@ static off_t load_outbox_cursor(add_outbox_t *outbox)
 static rel_scan_result_t count_outbox_rows(add_outbox_t *outbox)
 {
     outbox->depth_known = false;
+    if (!outbox->legacy.ready) return REL_SCAN_ERROR;
     errno = 0;
     FILE *file = fopen(outbox->path, "r");
     if (!file) {
@@ -2693,6 +2696,7 @@ static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end, bool cust
 static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_end)
 {
     if (!outbox->legacy.ready) outbox->offset = load_outbox_cursor(outbox);
+    if (!outbox->legacy.ready) return false;
     dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
     if (result == DQ_EMPTY) {
         if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);

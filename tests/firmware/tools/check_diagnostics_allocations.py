@@ -35,7 +35,7 @@ static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n)
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
 static int64_t monotonic_ms(void){return 5000;}
-static const char *led_status_current_name(void){return "LOCAL_FAILURE";}
+static const char *led_status_current_name(void){return "HEALTHY";}
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
 static const char *storage_upgrade_contract(void){return "contract";}
@@ -46,7 +46,7 @@ static int *s_outbox_task_handle=&held;
 static uint32_t s_outbox_tick_ms=4000,s_ords_worker_tick_ms=4000;
 static bool s_outbox_buffer_ready=true,s_ords_worker_started=true;
 static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_worker_operation=ADD_WORKER_NETWORK;
-qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.admission_reserve_bytes=1048576,.last_error=EIO,.last_operation="local_write_commit"};}
+qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,.admission_reserve_bytes=1048576,.last_error=EIO,.last_operation="local_write_commit"};}
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
 ''' + functions + r'''
 int main(void){
@@ -59,6 +59,7 @@ int main(void){
  cJSON *storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
  cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==8);
  cJSON *unknown=cJSON_GetArrayItem(queues,2+QS_BLOCKED);assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(unknown,"count_known")));
  assert(!cJSON_HasObjectItem(unknown,"records"));cJSON_Delete(payload);
