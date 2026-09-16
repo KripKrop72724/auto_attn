@@ -330,3 +330,24 @@ commit, and cannot report successful reconciliation after a failed checkpoint.
 Failed identity resolution remains unsuccessful even when its retry state saves.
 The actual history adapter is fault-tested under sanitizers; 144 firmware tests and
 the ESP-IDF 5.5.3 unsigned development build passed.
+
+### Production smoke evaluator and host soak harness (2026-09-16)
+
+The new pure HIL evaluator requires exact target and signed release identity, fresh
+telemetry spanning at least 15 minutes after readiness, one scoped controlled reboot,
+an observed 30-second automatically expiring interruption, durable command dedup,
+Oracle-confirmed attendance around both tests, preserved exceptions, certified source
+continuity and final tail completion. Missing evidence cannot pass; a reset without
+a matching controlled command fails. Its 39 regression tests pass. It does not yet
+write acceptance records or authorize maintenance: the server evidence collector,
+run persistence/API, firmware maintenance adapter and remote workflow remain pending.
+
+A separate sanitizer-enabled host soak compiles the production durable queue, storage
+budget and service scheduler. It models a 100,000-record authoritative source, 10 live
+events/second for 30 minutes, continued churn, bounded transport outages, failed and
+uncertain checkpoints, receipt ordering and worker restarts. NVS and destinations are
+simulated ports; this is not a full-device or physical endurance test. The runner
+requires committed source files and records source/binary hashes, compiler, elapsed
+time, logs and outcome. A short 22-second harness check accounted for 1,240 records
+across 14 checkpoint faults and one simulated restart. This short check is not the
+required 24-hour qualification receipt.
