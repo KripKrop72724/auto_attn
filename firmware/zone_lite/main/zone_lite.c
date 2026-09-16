@@ -639,6 +639,9 @@ static bool nvs_save_runtime_state(void)
     g_runtime_checkpoint_generation = state.generation;
     g_committed_runtime = state;
     g_committed_runtime_valid = true;
+    g_add_zkt.committed_source_known = true;
+    g_add_zkt.committed_source_generation = state.source_generation;
+    g_add_zkt.committed_source_cursor = state.source_cursor;
     return true;
 }
 
@@ -677,6 +680,9 @@ static void nvs_load_runtime_state(void)
         g_runtime_checkpoint_generation = state.generation;
         g_committed_runtime = state;
         g_committed_runtime_valid = true;
+        g_add_zkt.committed_source_known = true;
+        g_add_zkt.committed_source_generation = state.source_generation;
+        g_add_zkt.committed_source_cursor = state.source_cursor;
         g_last_authenticated_zkt_ip = state.zkt_ip;
         g_last_synced_attendance_count = state.attendance_count;
         g_last_full_truth_reconcile_epoch = state.truth_epoch;
@@ -8145,6 +8151,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     users,
                     audit_records,
                     &more);
+            if (audit_ok && !more) g_add_zkt.last_tail_audit_uptime_ms = uptime_ms();
             g_add_zkt.attendance_count = audit_records;
             add_connector_set_zkt(&g_add_zkt);
             last_reconcile = more
@@ -8265,6 +8272,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
                         g_force_truth_reconcile ? "true" : "false",
                         historical_reconcile ? "true" : "false");
                     ESP_LOGI(TAG, "%s", reason);
+                    add_connector_set_activity(historical_reconcile ? "HISTORICAL_RECONCILE" : "FULL_RECONCILE");
                     add_connector_log("INFO", "reconcile", "FULL_RECONCILE", reason);
                     if (!zk_get_time_parts(sock, &ctx, &device_now)) break;
                     led_status_set(LED_STATUS_SYNCING);
@@ -8455,9 +8463,11 @@ static int64_t gateway_run(uint32_t host_order_ip)
                     "Light reconcile passed: device_delta=%lld matched %u live events; heavy dump skipped",
                     (long long)record_delta,
                     (unsigned)live_events_since_sync);
+                add_connector_set_activity("LIGHT_RECONCILE");
                 reconcile_succeeded = commit_light_reconcile(refreshed_records, &live_events_since_sync);
                 if (reconcile_succeeded) {
                     ESP_LOGI(TAG, "%s", summary);
+                    g_add_zkt.last_light_check_uptime_ms = uptime_ms();
                     add_connector_log("INFO", "reconcile", "LIGHT_RECONCILE_OK", summary);
                 }
             }

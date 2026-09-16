@@ -311,3 +311,12 @@ after the runtime checkpoint commits. Actual firmware adapter tests and the actu
 NVS runtime writer cover failed open, set, commit, and uncertain commit: the previous
 authoritative count is restored, live evidence is retained, and recovery is required.
 The targeted sanitizer tests and ESP-IDF 5.5.3 development build pass.
+
+### Committed reconciliation telemetry (2026-09-16)
+
+Heartbeat diagnostics now report actual reconciliation activity, append-tail assurance
+after certification, successful light/tail audit uptime, and the saved source generation
+and cursor. Tentative cursor changes cannot replace the committed diagnostic values.
+Unknown checkpoints and checks not performed since boot remain omitted rather than
+reported as healthy zeroes. All 143 firmware tests passed, including actual NVS failure
+checks; real cJSON allocation injection and the ESP-IDF 5.5.3 build passed.

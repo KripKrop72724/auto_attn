@@ -30,7 +30,7 @@ def test_runtime_checkpoint_failures_restore_committed_source(tmp_path: Path):
 typedef int esp_err_t;
 typedef unsigned nvs_handle_t;
 typedef struct { char version[32]; } esp_app_desc_t;
-typedef struct { bool add_source_coverage_certified; uint32_t add_source_coverage_cursor; } add_zkt_telemetry_t;
+typedef struct { bool add_source_coverage_certified; uint32_t add_source_coverage_cursor; bool committed_source_known; uint32_t committed_source_generation, committed_source_cursor; } add_zkt_telemetry_t;
 #define ESP_OK 0
 #define NVS_READWRITE 1
 #define LED_STATUS_LOCAL_FAILURE 1
@@ -71,6 +71,7 @@ int main(void) {
         assert(g_add_source_coverage_cursor==100 && g_add_zkt.add_source_coverage_cursor==100);
         assert(g_add_source_coverage_generation==9 && g_last_synced_attendance_count==100);
         assert(g_runtime_checkpoint_generation==1);
+        assert(g_add_zkt.committed_source_known && g_add_zkt.committed_source_cursor==100 && g_add_zkt.committed_source_generation==9);
         assert(g_history_backfill_pending && g_history_backfill_had_failures);
     }
     assert(fault_count==4);

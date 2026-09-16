@@ -2328,7 +2328,7 @@ static bool append_worker_diagnostic(cJSON *workers, const char *name,
         (!started || cJSON_AddNumberToObject(worker, "last_activity_uptime_ms", (double)(now - age)));
 }
 
-static void append_firmware_diagnostics(cJSON *payload)
+static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_t *zkt, const char *activity)
 {
     cJSON *diagnostics = cJSON_CreateObject();
     if (!diagnostics) return;
@@ -2396,6 +2396,17 @@ static void append_firmware_diagnostics(cJSON *payload)
             !cJSON_AddBoolToObject(queue, "count_known", known) ||
             (known && !cJSON_AddNumberToObject(queue, "records", depth))) goto failed;
     }
+    const char *mode = activity;
+    if (!strcmp(activity, "LIVE_CAPTURE") || !strcmp(activity, "ONLINE"))
+        mode = zkt->add_source_coverage_certified ? "APPEND_TAIL_ASSURANCE" : "IDLE";
+    if (!cJSON_AddStringToObject(diagnostics, "reconciliation_mode", mode) ||
+        (zkt->last_light_check_uptime_ms > 0 && !cJSON_AddNumberToObject(diagnostics,
+            "last_light_check_uptime_ms", (double)zkt->last_light_check_uptime_ms)) ||
+        (zkt->last_tail_audit_uptime_ms > 0 && !cJSON_AddNumberToObject(diagnostics,
+            "last_tail_audit_uptime_ms", (double)zkt->last_tail_audit_uptime_ms)) ||
+        (zkt->committed_source_known &&
+            (!cJSON_AddNumberToObject(diagnostics, "source_generation", zkt->committed_source_generation) ||
+             !cJSON_AddNumberToObject(diagnostics, "committed_source_cursor", zkt->committed_source_cursor)))) goto failed;
     if (cJSON_AddItemToObject(payload, "diagnostics", diagnostics)) return;
 failed:
     cJSON_Delete(diagnostics);
@@ -2430,7 +2441,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
             cJSON_AddNumberToObject(payload, "outbox_depth", add_connector_outbox_depth());
-            append_firmware_diagnostics(payload);
+            append_firmware_diagnostics(payload, &zkt, activity);
             ota_manager_append_telemetry(payload);
             cJSON_AddStringToObject(payload, "current_activity", activity);
             cJSON_AddStringToObject(payload, "led_state", led_status_current_name());

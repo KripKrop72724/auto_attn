@@ -112,6 +112,11 @@ typedef struct {
     int64_t backoff_until_epoch;
     int64_t stability_since_epoch;
     int64_t last_reconcile_epoch;
+    int64_t last_light_check_uptime_ms;
+    int64_t last_tail_audit_uptime_ms;
+    bool committed_source_known;
+    uint32_t committed_source_generation;
+    uint32_t committed_source_cursor;
     int64_t next_restart_epoch;
     char history_backfill_state[24];
     int32_t history_cursor_year;

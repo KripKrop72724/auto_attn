@@ -23,6 +23,8 @@ program = r'''
 #define ESP_OK 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
+typedef struct {bool add_source_coverage_certified,committed_source_known; int64_t last_light_check_uptime_ms,last_tail_audit_uptime_ms;uint32_t committed_source_generation,committed_source_cursor;} add_zkt_telemetry_t;
+static add_zkt_telemetry_t zkt={.add_source_coverage_certified=true,.committed_source_known=true,.last_light_check_uptime_ms=2000,.last_tail_audit_uptime_ms=4000,.committed_source_generation=9,.committed_source_cursor=100};
 typedef int esp_err_t;
 typedef enum {ADD_WORKER_IDLE,ADD_WORKER_READING,ADD_WORKER_NETWORK,ADD_WORKER_COMMITTING,ADD_WORKER_RESOURCE} add_worker_operation_t;
 typedef struct {int *lock;bool depth_known;unsigned depth;const char *path;} add_outbox_t;
@@ -50,8 +52,10 @@ bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_B
 int main(void){
  cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
  cJSON *payload=cJSON_CreateObject();assert(payload);calls=0;
- append_firmware_diagnostics(payload);size_t total=calls;
+ append_firmware_diagnostics(payload, &zkt, "LIVE_CAPTURE");size_t total=calls;
  cJSON *diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+ assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"APPEND_TAIL_ASSURANCE"));
+ assert(cJSON_GetObjectItemCaseSensitive(diagnostics,"committed_source_cursor")->valueint==100);
  cJSON *storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
@@ -60,8 +64,20 @@ int main(void){
  assert(!cJSON_HasObjectItem(unknown,"records"));cJSON_Delete(payload);
  for(size_t i=1;i<=total;i++){
   fail_at=0;payload=cJSON_CreateObject();assert(payload);calls=0;fail_at=i;
-  append_firmware_diagnostics(payload);assert(!cJSON_HasObjectItem(payload,"diagnostics") && !held);cJSON_Delete(payload);
+  append_firmware_diagnostics(payload, &zkt, "LIVE_CAPTURE");assert(!cJSON_HasObjectItem(payload,"diagnostics") && !held);cJSON_Delete(payload);
  }
+ fail_at=0;memset(&zkt,0,sizeof(zkt));
+ payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
+ diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+ assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"IDLE"));
+ assert(!cJSON_HasObjectItem(diagnostics,"committed_source_cursor"));
+ assert(!cJSON_HasObjectItem(diagnostics,"source_generation"));
+ assert(!cJSON_HasObjectItem(diagnostics,"last_light_check_uptime_ms"));
+ assert(!cJSON_HasObjectItem(diagnostics,"last_tail_audit_uptime_ms"));cJSON_Delete(payload);
+ payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"FULL_RECONCILE");
+ diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");
+ assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"FULL_RECONCILE"));
+ cJSON_Delete(payload);
  puts("diagnostics allocation regressions passed");
 }
 '''
