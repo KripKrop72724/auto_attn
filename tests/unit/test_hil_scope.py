@@ -226,3 +226,22 @@ def test_revoked_release_rejects_grant_and_assignment(hil_session):
     assert assignment_for_connector(session, connector=devices[0], public_base="https://test.invalid") is None
     with pytest.raises(ValueError, match="unavailable"):
         resolve_download(session, offer["download_url"].rsplit("/", 1)[1])
+
+
+@pytest.mark.parametrize("state", ["OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT",
+                                    "BOOTED_PENDING", "RECONCILING"])
+def test_matching_heartbeat_version_cannot_complete_hil_deployment(hil_session, state):
+    from sqlalchemy import select
+    from zk_add.ota import FirmwareDeployment, FirmwareEvent, assignment_for_connector
+    session, release, devices = hil_session
+    run = campaign(session, release)
+    deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id == run.id))
+    deployment.status = state
+    devices[0].firmware_version = release.version
+    session.flush()
+    offer = assignment_for_connector(session, connector=devices[0], public_base="https://test.invalid")
+    assert offer and offer["image_sha256"] == release.manifest["application_sha256"]
+    assert deployment.status == state
+    assert deployment.completed_at is None
+    assert session.scalar(select(FirmwareEvent).where(
+        FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == "SUCCEEDED")) is None

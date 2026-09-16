@@ -908,28 +908,24 @@ def test_blocked_identity_recovery_requires_terminal_and_identity_provenance():
     assert "_terminal_identity_fingerprint" in recovery
     assert "device_serial" in recovery
     assert "add_connector_lookup_identity(" not in recovery
-    assert "recovered_cnic" in recovery
-    assert "recovered_name" in recovery
-    assert "recovered_shift_worker" in recovery
     assert recovery.index("rel_identity_matches(") < recovery.index(
-        "cJSON_AddStringToObject(root, \"cnic\", recovered_cnic)"
+        'cJSON_AddStringToObject(root, "cnic", user->cnic)'
     )
-    assert "verified ADD identity alias" in recovery
+    assert "output && append_line(PENDING_PATH, output)" in recovery
+    assert recovery.index("append_line(PENDING_PATH, output)") < recovery.index("settle_blocked_locked(&token)")
 
 
-def test_large_blocked_identity_backlog_is_deferred_before_storage_lock():
+def test_blocked_identity_recovery_uses_bounded_persistent_reads():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
-    assert "#define ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES (64 * 1024)" in source
+    assert "ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES" not in source
     recovery = source[
         source.index("static bool recover_blocked_events_from_snapshot(") :
         source.index("static void storage_init(")
     ]
-    size_gate = recovery.index("blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES")
-    storage_lock = recovery.index("xSemaphoreTake(g_storage_lock")
-    assert size_gate < storage_lock
-    assert '"BLOCKED_IDENTITY_RECOVERY_DEFERRED"' in recovery
-    assert "records remain preserved for bounded truth recovery" in recovery
-    assert recovery.index("return true;", size_gate) < storage_lock
+    assert "read_blocked_locked(" in recovery
+    assert "char line[MAX_EVENT_JSON]" in recovery
+    assert "BLOCKED_RECOVERY_TMP_PATH" not in recovery
+    assert "settle_blocked_locked(" in recovery
 
 
 def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():

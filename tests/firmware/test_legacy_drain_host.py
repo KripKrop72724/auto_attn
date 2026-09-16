@@ -11,7 +11,7 @@ def test_actual_legacy_drain_preserves_records_and_releases_lock(tmp_path: Path)
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "zone_lite.c").read_text()
     start = source.index("static void oracle_drain_pending(bool live_first)")
-    end = source.index("static void ords_uploader_task(", start)
+    end = source.index("static char *g_blocked_drain_buffer;", start)
     harness = (ROOT / "tests/firmware/legacy_drain_host.c").read_text()
     restore_start = source.index("static void restore_pending_backup_if_needed(")
     restore_end = source.index("static bool restore_blocked_backup_if_needed(", restore_start)

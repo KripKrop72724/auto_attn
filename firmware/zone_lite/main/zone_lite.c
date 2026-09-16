@@ -160,13 +160,7 @@
 #define BLOCKED_PATH STORAGE_BASE "/blocked_identity.jsonl"
 #define BLOCKED_RECOVERY_TMP_PATH STORAGE_BASE "/blocked_recovery.tmp"
 #define BLOCKED_RECOVERY_BACKUP_PATH STORAGE_BASE "/blocked_recovery.bak"
-#ifndef ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES
-// Blocked-identity repair rewrites the complete local queue.  Keep automatic
-// repair bounded so a large historical backlog cannot delay ZKT live-event
-// registration or monopolize the storage lock.  Oversized queues remain
-// durably preserved for a later bounded repair/truth pass.
-#define ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES (64 * 1024)
-#endif
+
 #define CORRUPT_ORDS_PATH STORAGE_BASE "/corrupt_ords.jsonl"
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
@@ -507,7 +501,6 @@ static int64_t g_truth_ords_gate_priority_until_ms;
 static int64_t g_truth_ords_gate_last_defer_log_ms;
 static portMUX_TYPE g_truth_ords_gate_priority_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool g_truth_window_blocked;
-static bool g_blocked_recovery_deferred_logged;
 static int g_daily_zkt_reboot_completed_day = -1;
 static int64_t g_daily_zkt_reboot_last_attempt_ms;
 static int64_t g_last_full_scan_ms;
@@ -2818,239 +2811,93 @@ static void restore_pending_backup_if_needed(void)
 
 static bool restore_blocked_backup_if_needed(void)
 {
-    struct stat backup, active;
-    if (stat(BLOCKED_RECOVERY_BACKUP_PATH, &backup) != 0) return errno == ENOENT;
-    if (stat(BLOCKED_PATH, &active) == 0) {
-        // Both generations may contain unique rows. A bounded migration must
-        // settle each; never classify the backup as disposable by existence.
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        return false;
-    }
+    struct stat st;
+    if (stat(BLOCKED_PATH, &st) == 0) return true;
     if (errno != ENOENT) return false;
-    return rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH) == 0;
+    const char *generations[] = {BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_RECOVERY_TMP_PATH};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (stat(generations[i], &st) == 0) return rename(generations[i], BLOCKED_PATH) == 0;
+        if (errno != ENOENT) return false;
+    }
+    return true;
 }
 
-static bool json_event_has_valid_identity_and_no_block_reason(const char *event_json)
+static legacy_queue_t g_legacy_blocked;
+static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint);
+static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoint);
+
+static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *token)
 {
-    cJSON *root = cJSON_Parse(event_json);
-    if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        return false;
+    if (!restore_blocked_backup_if_needed()) return DQ_IO;
+    if (!g_legacy_blocked.ready) {
+        lq_port_t port = {legacy_pending_load, legacy_pending_commit, "blocked"};
+        dq_result_t open = lq_open(&g_legacy_blocked, BLOCKED_PATH, port);
+        if (open != DQ_OK) return open;
     }
-    cJSON *cnic = cJSON_GetObjectItemCaseSensitive(root, "cnic");
-    cJSON *user_id = cJSON_GetObjectItemCaseSensitive(root, "user_id");
-    cJSON *blocked_reason = cJSON_GetObjectItemCaseSensitive(root, "blocked_reason");
-    bool valid = cJSON_IsString(cnic) && strlen(cnic->valuestring) == 13 &&
-                 cJSON_IsString(user_id) && user_id->valuestring[0] != '\0' &&
-                 blocked_reason == NULL;
-    for (size_t i = 0; valid && i < 13; i++) {
-        valid = isdigit((unsigned char)cnic->valuestring[i]) != 0;
+    dq_result_t result = lq_peek(&g_legacy_blocked, line, capacity, token);
+    if (result == DQ_EMPTY) {
+        dq_result_t retired = lq_reclaim(&g_legacy_blocked);
+        if (retired == DQ_OK) {
+            if (!restore_blocked_backup_if_needed()) return DQ_IO;
+            result = lq_peek(&g_legacy_blocked, line, capacity, token);
+        } else if (retired != DQ_EMPTY) return retired;
     }
-    cJSON_Delete(root);
-    return valid;
+    return result;
 }
 
-static void recover_valid_unclassified_blocked_events(void)
+static bool settle_blocked_locked(const lq_token_t *token)
 {
-    if (!restore_blocked_backup_if_needed()) return;
-    FILE *in = fopen(BLOCKED_PATH, "r");
-    if (!in) return;
-    FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
-    FILE *pending = rel_open_append(PENDING_PATH);
-    if (!kept || !pending) {
-        if (kept) fclose(kept);
-        if (pending) fclose(pending);
-        fclose(in);
-        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
-        ESP_LOGE(TAG, "Could not open attendance outboxes for blocked-event recovery");
-        return;
-    }
-
-    bool ok = true;
-    size_t recovered = 0;
-    char line[MAX_EVENT_JSON];
-    while (fgets(line, sizeof(line), in) != NULL) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '\0') continue;
-        FILE *destination = json_event_has_valid_identity_and_no_block_reason(line) ? pending : kept;
-        if (fprintf(destination, "%s\n", line) < 0) {
-            ok = false;
-            break;
-        }
-        if (destination == pending) recovered++;
-    }
-    if (ferror(in)) ok = false;
-    if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
-    if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
-    if (fclose(in) != 0) ok = false;
-    if (fclose(kept) != 0) ok = false;
-    if (fclose(pending) != 0) ok = false;
-
-    if (!ok) {
-        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
-        ESP_LOGE(TAG, "Blocked-event recovery was interrupted; original rows remain preserved");
-        return;
-    }
-    (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
-    if (rename(BLOCKED_PATH, BLOCKED_RECOVERY_BACKUP_PATH) != 0 ||
-        rename(BLOCKED_RECOVERY_TMP_PATH, BLOCKED_PATH) != 0) {
-        (void)rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH);
-        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
-        ESP_LOGE(TAG, "Could not commit blocked-event recovery; backup remains preserved");
-        return;
-    }
-    (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
-    if (recovered > 0) {
-        ESP_LOGW(TAG, "Recovered %u valid event(s) from the legacy blocked outbox", (unsigned)recovered);
-    }
+    if (lq_settle(&g_legacy_blocked, token) != DQ_OK) return false;
+    dq_result_t retired = lq_reclaim(&g_legacy_blocked);
+    if (retired == DQ_OK) return restore_blocked_backup_if_needed();
+    return retired == DQ_STALE;
 }
 
-static bool recover_blocked_events_from_snapshot(
-    const user_table_t *users,
-    size_t *recovered_out)
+static bool recover_blocked_events_from_snapshot(const user_table_t *users, size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
-    if (!restore_blocked_backup_if_needed()) return false;
-    struct stat blocked_stat = {0};
-    if (stat(BLOCKED_PATH, &blocked_stat) == 0 &&
-        blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES) {
-        if (!g_blocked_recovery_deferred_logged) {
-            g_blocked_recovery_deferred_logged = true;
-            char message[224];
-            snprintf(
-                message,
-                sizeof(message),
-                "Deferred blocked-identity repair: queue=%lld bytes exceeds live-safe limit=%u; records remain preserved for bounded truth recovery.",
-                (long long)blocked_stat.st_size,
-                (unsigned)ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES);
-            ESP_LOGW(TAG, "%s", message);
-            add_connector_log(
-                "WARN",
-                "identity",
-                "BLOCKED_IDENTITY_RECOVERY_DEFERRED",
-                message);
-        }
-        return true;
-    }
-    g_blocked_recovery_deferred_logged = false;
-    if (!users || !g_storage_lock ||
-        xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return false;
-    }
-    FILE *in = fopen(BLOCKED_PATH, "r");
-    if (!in) {
-        xSemaphoreGive(g_storage_lock);
-        return true;
-    }
-    FILE *kept = fopen(BLOCKED_RECOVERY_TMP_PATH, "w");
-    FILE *pending = rel_open_append(PENDING_PATH);
-    if (!kept || !pending) {
-        if (kept) fclose(kept);
-        if (pending) fclose(pending);
-        fclose(in);
-        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
-        xSemaphoreGive(g_storage_lock);
-        return false;
-    }
-
-    bool ok = true;
-    size_t recovered = 0;
+    if (!users || !g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return false;
     char line[MAX_EVENT_JSON];
-    while (fgets(line, sizeof(line), in) != NULL) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '\0') continue;
-        char *output = NULL;
-        cJSON *root = cJSON_Parse(line);
-        cJSON *blocked_reason = root
-            ? cJSON_GetObjectItemCaseSensitive(root, "blocked_reason")
-            : NULL;
-        cJSON *user_id = root
-            ? cJSON_GetObjectItemCaseSensitive(root, "user_id")
-            : NULL;
-        cJSON *terminal_uid = root
-            ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid")
-            : NULL;
-        const char *verified_uid = cJSON_IsString(terminal_uid)
-            ? terminal_uid->valuestring
-            : NULL;
-        const zkt_user_t *user =
-            cJSON_IsString(user_id) && blocked_reason == NULL
-                ? find_user_by_user_id(users, user_id->valuestring)
-                : NULL;
-        if (user && verified_uid && verified_uid[0] &&
-            strcmp(user->uid, verified_uid) != 0) {
-            user = NULL;
-        }
-        const cJSON *saved_serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
-        const cJSON *saved_fingerprint = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_identity_fingerprint") : NULL;
-        if (!user || !rel_identity_matches(
-                cJSON_IsString(saved_serial) ? saved_serial->valuestring : NULL,
-                g_device_serial,
-                cJSON_IsString(saved_fingerprint) ? saved_fingerprint->valuestring : NULL,
-                user ? user->terminal_identity_fingerprint : NULL)) user = NULL;
-        char recovered_name[64] = "";
-        char recovered_cnic[16] = "";
-        bool recovered_shift_worker = false;
-        bool identity_found = user && strlen(user->cnic) == 13;
-        if (identity_found) {
-            strlcpy(recovered_name, user->employee_name, sizeof(recovered_name));
-            strlcpy(recovered_cnic, user->cnic, sizeof(recovered_cnic));
-            recovered_shift_worker = user->raw_punch;
-        }
-        if (identity_found && strlen(recovered_cnic) == 13) {
-            cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
-            cJSON_AddStringToObject(root, "cnic", recovered_cnic);
-            if (recovered_name[0]) {
-                cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
-                cJSON_AddStringToObject(root, "employee_name", recovered_name);
-            }
-            if (recovered_shift_worker) {
-                cJSON_DeleteItemFromObjectCaseSensitive(root, "raw_punch");
-                cJSON_AddBoolToObject(root, "raw_punch", true);
-            }
-            output = cJSON_PrintUnformatted(root);
-        }
-        FILE *destination = output ? pending : kept;
-        const char *serialized = output ? output : line;
-        if (fprintf(destination, "%s\n", serialized) < 0) ok = false;
-        if (output) recovered++;
-        free(output);
-        cJSON_Delete(root);
-        if (!ok) break;
+    lq_token_t token;
+    dq_result_t read = read_blocked_locked(line, sizeof(line), &token);
+    if (read != DQ_OK) {
+        xSemaphoreGive(g_storage_lock);
+        return read == DQ_EMPTY;
     }
-    if (ferror(in)) ok = false;
-    if (fflush(kept) != 0 || fsync(fileno(kept)) != 0) ok = false;
-    if (fflush(pending) != 0 || fsync(fileno(pending)) != 0) ok = false;
-    if (fclose(in) != 0) ok = false;
-    if (fclose(kept) != 0) ok = false;
-    if (fclose(pending) != 0) ok = false;
-    if (ok) {
-        (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
-        if (rename(BLOCKED_PATH, BLOCKED_RECOVERY_BACKUP_PATH) != 0 ||
-            rename(BLOCKED_RECOVERY_TMP_PATH, BLOCKED_PATH) != 0) {
-            (void)rename(BLOCKED_RECOVERY_BACKUP_PATH, BLOCKED_PATH);
-            ok = false;
-        }
+    size_t length = token.end - token.offset;
+    bool syntax_valid = !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
+    cJSON *root = syntax_valid ? cJSON_Parse(line) : NULL;
+    if (syntax_valid && !root) { xSemaphoreGive(g_storage_lock); return false; }
+    const cJSON *user_id = root ? cJSON_GetObjectItemCaseSensitive(root, "user_id") : NULL;
+    const cJSON *uid = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid") : NULL;
+    const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
+    const cJSON *fingerprint = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_identity_fingerprint") : NULL;
+    const cJSON *reason = root ? cJSON_GetObjectItemCaseSensitive(root, "blocked_reason") : NULL;
+    const zkt_user_t *user = cJSON_IsString(user_id) && !reason
+        ? find_user_by_user_id(users, user_id->valuestring) : NULL;
+    if (user && cJSON_IsString(uid) && uid->valuestring[0] && strcmp(user->uid, uid->valuestring)) user = NULL;
+    if (!user || !rel_identity_matches(cJSON_IsString(serial) ? serial->valuestring : NULL, g_device_serial,
+        cJSON_IsString(fingerprint) ? fingerprint->valuestring : NULL,
+        user ? user->terminal_identity_fingerprint : NULL)) user = NULL;
+    if (!user || strlen(user->cnic) != 13 || strspn(user->cnic, "0123456789") != 13) {
+        // Unresolved heads are independently transferred by the delivery worker;
+        // no whole-file rewrite or size cutoff blocks unrelated capture.
+        cJSON_Delete(root); xSemaphoreGive(g_storage_lock); return true;
     }
-    if (ok) {
-        (void)remove(BLOCKED_RECOVERY_BACKUP_PATH);
-        if (recovered > 0) {
-            led_status_set_backlog(true);
-            ESP_LOGW(TAG, "Repaired %u blocked identity event(s) from verified terminal truth", (unsigned)recovered);
-            add_connector_log(
-                "INFO",
-                "identity",
-                "BLOCKED_IDENTITY_REPAIRED",
-                "Blocked attendance was re-enriched from a stable terminal snapshot or verified ADD identity alias and returned to the ORDS queue.");
-        }
-    } else {
-        (void)remove(BLOCKED_RECOVERY_TMP_PATH);
-        ESP_LOGE(TAG, "Blocked identity repair was interrupted; preserved the original outbox");
-    }
-    if (ok && recovered_out) {
-        *recovered_out = recovered;
-    }
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "raw_punch");
+    bool ok = cJSON_AddStringToObject(root, "cnic", user->cnic) &&
+        cJSON_AddStringToObject(root, "employee_name", user->employee_name) &&
+        cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
+    char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
+    ok = output && append_line(PENDING_PATH, output);
+    if (ok) ok = settle_blocked_locked(&token);
+    free(output); cJSON_Delete(root);
+    if (ok && recovered_out) *recovered_out = 1;
+    if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
     xSemaphoreGive(g_storage_lock);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     return ok;
 }
 
@@ -3087,7 +2934,6 @@ static void storage_init(void)
     if (!qs_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     restore_pending_backup_if_needed();
     (void)restore_blocked_backup_if_needed();
-    recover_valid_unclassified_blocked_events();
     load_seen_from_file(PENDING_PATH);
     load_seen_from_file(BLOCKED_PATH);
     load_seen_from_file(ACKED_PATH);
@@ -6922,13 +6768,13 @@ static bool oracle_drain_segmented_slice(void)
 
 static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)
 {
-    (void)context;
+    const char *key = context ? (const char *)context : "ords_pending";
     nvs_handle_t handle;
     esp_err_t result = nvs_open("legacy_queues", NVS_READONLY, &handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
     if (result != ESP_OK) return -1;
     size_t size = sizeof(*checkpoint);
-    result = nvs_get_blob(handle, "ords_pending", checkpoint, &size);
+    result = nvs_get_blob(handle, key, checkpoint, &size);
     nvs_close(handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
     return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
@@ -6936,11 +6782,11 @@ static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)
 
 static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoint)
 {
-    (void)context;
+    const char *key = context ? (const char *)context : "ords_pending";
     nvs_handle_t handle;
     esp_err_t result = nvs_open("legacy_queues", NVS_READWRITE, &handle);
     if (result != ESP_OK) return false;
-    result = nvs_set_blob(handle, "ords_pending", checkpoint, sizeof(*checkpoint));
+    result = nvs_set_blob(handle, key, checkpoint, sizeof(*checkpoint));
     if (result == ESP_OK) result = nvs_commit(handle);
     nvs_close(handle);
     return result == ESP_OK;
@@ -7066,6 +6912,60 @@ static void oracle_drain_pending(bool live_first)
     if (failure_stage) ords_drain_preserved_deferred(failure_stage, EIO);
 }
 
+static char *g_blocked_drain_buffer;
+static bool g_prefer_segmented_blocked;
+
+static void blocked_evidence_slice(void)
+{
+    if (!add_connector_is_connected()) return;
+    if (!g_blocked_drain_buffer) g_blocked_drain_buffer = heap_caps_malloc(
+        DQ_MAX_RECORD_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_blocked_drain_buffer) { add_connector_report_ords_worker(ADD_WORKER_RESOURCE); return; }
+    char *line = g_blocked_drain_buffer;
+    size_t length = 0;
+    dq_token_t segmented_token = {0};
+    lq_token_t legacy_token = {0};
+    bool segmented = g_prefer_segmented_blocked = !g_prefer_segmented_blocked;
+    dq_result_t read = segmented ? qs_peek(QS_BLOCKED, line, DQ_MAX_RECORD_BYTES, &length, &segmented_token) : DQ_EMPTY;
+    if (read == DQ_EMPTY) {
+        segmented = false;
+        if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+        read = read_blocked_locked(line, DQ_MAX_RECORD_BYTES + 1, &legacy_token);
+        if (read == DQ_OK) length = legacy_token.end - legacy_token.offset;
+        xSemaphoreGive(g_storage_lock);
+    }
+    if (read != DQ_OK) {
+        if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return;
+    }
+    line[length] = 0;
+    bool syntax = !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
+    cJSON *root = syntax ? cJSON_Parse(line) : NULL;
+    if (syntax && !root) { add_connector_report_ords_worker(ADD_WORKER_RESOURCE); return; }
+    const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
+    char instance[33], generation[80], record_id[80];
+    bool identity = qs_generation(instance);
+    snprintf(generation, sizeof(generation), "%s-%s-%lu", identity ? instance : "",
+        segmented ? "segmented" : "legacy", segmented ? 2UL : (unsigned long)legacy_token.generation);
+    snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", segmented ? (unsigned long)segmented_token.segment : 0UL,
+        segmented ? (unsigned long)segmented_token.offset : (unsigned long)legacy_token.offset,
+        segmented ? (unsigned long)segmented_token.sequence : (unsigned long)legacy_token.crc);
+    add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+    bool preserved = identity && add_connector_transfer_queue_evidence(
+        segmented ? "blocked" : "blocked_legacy", generation, record_id, line, length,
+        cJSON_IsString(serial) ? serial->valuestring : NULL, syntax ? "LEGACY_RECOVERY" : "MALFORMED");
+    cJSON_Delete(root);
+    add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    if (preserved) {
+        if (segmented) preserved = qs_settle(QS_BLOCKED, &segmented_token) == DQ_OK;
+        else if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            preserved = settle_blocked_locked(&legacy_token);
+            xSemaphoreGive(g_storage_lock);
+        } else preserved = false;
+        if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    }
+}
+
 static void ords_uploader_task(void *arg)
 {
     (void)arg;
@@ -7073,6 +6973,7 @@ static void ords_uploader_task(void *arg)
         add_connector_report_ords_worker(g_ords_buffer_failed ? ADD_WORKER_RESOURCE : ADD_WORKER_IDLE);
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
             oracle_drain_pending(true);
+            blocked_evidence_slice();
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }

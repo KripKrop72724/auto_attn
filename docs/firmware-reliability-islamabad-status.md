@@ -13,11 +13,11 @@ Branch: `codex/firmware-reliability-islamabad-hil`.
 | 4 | Allocation-free JSON syntax check; retry parse/serialization allocation failures; preserve failed quarantine | Complete remaining injected failures and legacy evidence-file draining |
 | 5 | Bounded live parser, sanitizer coverage including 13-byte frame | Established protocol hint for concatenated frames and source recovery integration |
 | 6 | Explicit resource error; durable-outcome success allowlist; complete-UID dedup with bounded probes; serializers reject incomplete JSON | Complete end-to-end allocation matrix and reconciliation assertions |
-| 7 | Portable segmented queue; tested 60/55 pressure hysteresis, reserved admission and retirement cleanup | Runtime integration, bounded ACK cache, auxiliary-file budgets, resumable blocked repair |
-| 8 | 64 KiB segments; legacy ADD and ORDS stream from checked persistent cursors without a second backlog copy | Integrate blocked/evidence queues and qualify all legacy backup combinations |
+| 7 | Portable segmented queue; tested 60/55 pressure hysteresis, reserved admission and retirement cleanup | Runtime integration, bounded ACK cache, auxiliary-file budgets, blocked identity-resolution qualification |
+| 8 | 64 KiB segments; legacy ADD and ORDS stream from checked persistent cursors without a second backlog copy | Drain old evidence files and qualify all interruption boundaries |
 | 9 | Legacy ORDS uses bounded read/send/commit; at most 100 events or one ORDS request per slice | Sustained-load qualification and worker diagnostics |
 | 10 | Checked task startup, buffer retry, supervisor and visible faults | Exhaustive worker-failure and liveness qualification |
-| 11 | ADD/ORDS active, backup and temp files drain independently; preserve ambiguous blocked backup generations | Complete blocked-file recovery and all interruption boundaries |
+| 11 | ADD/ORDS active, backup and temp files drain independently; preserve ambiguous blocked backup generations | Complete all interruption boundaries and malformed-tail recovery |
 | 12 | Require terminal serial and identity fingerprint for local historical repair | Terminal replacement/reused-ID integration tests and verified resolution path |
 | 13 | Coherent versioned/checksummed runtime NVS blob, checked legacy queue commits and batch flush/sync/close | Complete remaining call-site audit; segmented I/O and actual runtime NVS failure matrix exercised |
 | 14 | Shared tested 4:1 scheduler, alternating bulk/proof service and per-lane backoff; ADD segmented compatibility reader | Activate separate receipt writes; prove direct-send and sustained-load fairness |
@@ -26,7 +26,8 @@ Branch: `codex/firmware-reliability-islamabad-hil`.
 
 The ADD worker can read segmented attendance/receipt queues for compatibility,
 but **new segmented writes remain disabled**. The ORDS segmented compatibility
-reader is also connected and tested across receipt failure/restart. Blocked queue readers,
+reader is also connected and tested across receipt failure/restart. Legacy and segmented
+blocked readers transfer unresolved evidence with verified custody receipts. Complete
 legacy migration and predecessor-image verification remain outstanding.
 The ADD worker also reads the evidence lane with an exact custody receipt check.
 Existing firmware version remains unchanged. Local build uses the CI setup password
@@ -49,7 +50,7 @@ and is unsigned; it is not a production artifact.
   Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 428 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 429 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
@@ -74,8 +75,10 @@ The firmware verifies exact evidence receipt identity before retiring malformed
 ADD/ORDS rows. Embedded nulls cannot hide trailing bytes. Queue generations use
 a checked persistent storage instance. Evidence serialization is tested against
 actual cJSON with every allocation failed in turn. PostgreSQL migration upgrade,
-downgrade and schema checks pass. Legacy blocked and old quarantine files still
-need bounded draining integration.
+downgrade and schema checks pass. Legacy blocked files now use bounded persistent reads, with independently preserved
+backup/temp generations. A sanitizer test drains 10,003 records across restart, failed
+checkpoint and concurrent append without copying the backlog; truncated tails remain
+preserved as faults. Old quarantine files still need bounded draining integration.
 
 Runtime NVS failures restore the last committed source cursor in memory, invalidate
 completion telemetry and require recovery. The actual writer is host-tested with
@@ -123,3 +126,12 @@ legitimate attendance, a scoped 30-second ADD interruption, a controlled ESP reb
 fresh telemetry, source continuity and durable delivery evidence. Record INCOMPLETE
 if evidence is missing; elapsed time is insufficient. Hold the second target until
 the first passes. The final release remains HIL_ONLY; no nationwide promotion.
+
+
+## OTA completion evidence
+
+Removed the server shortcut that completed an active OTA deployment from the
+heartbeat version string alone. Six regression cases cover every active phase;
+only the checked device progress path may complete a deployment. This is not HIL
+acceptance. Firmware journal/reconciliation recovery and predecessor verification
+still require implementation and qualification.

@@ -656,20 +656,8 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     application_digest = _application_sha256(release)
     if application_digest is None:
         return None
-    if (
-        deployment.status in ACTIVE_DEPLOYMENT_STATES
-        and _versions_match(connector.firmware_version, deployment.target_version)
-    ):
-        deployment.status = "SUCCEEDED"
-        deployment.completed_at = utc_now()
-        deployment.updated_at = utc_now()
-        connector.ota_state = "OTA_READY"
-        session.add(FirmwareEvent(
-            deployment_id=deployment.id,
-            state="SUCCEEDED",
-            details={"recovered_from_running_target_version": True},
-        ))
-        return None
+    # A heartbeat version string is not boot, digest, or reconciliation evidence.
+    # Only the checked progress transitions may complete this deployment.
     if pending_offer:
         deployment.status = "OFFERED"
         deployment.offered_at = utc_now()
