@@ -2750,8 +2750,12 @@ static char *outbox_record_line(
         cJSON_Delete(payload);
         return NULL;
     }
-    cJSON_AddStringToObject(record, "type", type);
-    cJSON_AddItemToObject(record, "payload", payload);
+    if (!cJSON_AddStringToObject(record, "type", type) ||
+        !cJSON_AddItemToObject(record, "payload", payload)) {
+        cJSON_Delete(payload);
+        cJSON_Delete(record);
+        return NULL;
+    }
     char *line = cJSON_PrintUnformatted(record);
     cJSON_Delete(record);
     size_t line_len = line ? strlen(line) : 0;
@@ -2858,7 +2862,7 @@ static void refresh_capacity_deadline_on_progress(
     *last_depth = outbox->depth;
 }
 
-static bool add_connector_enqueue_validated_line(const char *line, bool live)
+static bool add_connector_enqueue_validated_line_with_policy(const char *line, bool live, qs_admission_t policy)
 {
     if (!line) return false;
     bool ok = false;
@@ -2881,13 +2885,18 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
                 current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
             }
             if (current + (off_t)strlen(line) + 1 <= outbox->max_bytes) {
-                FILE *file = rel_open_append(outbox->path);
-                if (file) {
-                    ok = fprintf(file, "%s\n", line) > 0 &&
-                        fflush(file) == 0 &&
-                        fsync(fileno(file)) == 0;
-                    if (fclose(file) != 0) ok = false;
+                if (qs_local_begin(policy, strlen(line) + 1)) {
+                    errno = 0;
+                    FILE *file = rel_open_append(outbox->path);
+                    int error = file ? 0 : errno;
+                    if (file) {
+                        ok = fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 && fsync(fileno(file)) == 0;
+                        if (!ok) error = errno;
+                        if (fclose(file) != 0) { ok = false; if (!error) error = errno; }
+                    }
+                    qs_local_end(ok, error);
                     if (ok) outbox->depth++;
+                    else outbox->depth_known = false;
                 }
             }
             xSemaphoreGive(outbox->lock);
@@ -2910,6 +2919,12 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
             outbox->label);
     }
     return ok;
+}
+
+static bool add_connector_enqueue_validated_line(const char *line, bool live)
+{
+    return add_connector_enqueue_validated_line_with_policy(line, live,
+        live ? QS_ADMIT_LIVE : QS_ADMIT_HISTORICAL);
 }
 
 static bool add_connector_enqueue_record(const char *type, const char *payload_json)
@@ -3066,9 +3081,7 @@ bool add_connector_enqueue_oracle_receipts(
             (unsigned long)duplicate_count);
     }
 
-    bool ok = add_connector_enqueue_validated_line(
-        line,
-        true);
+    bool ok = add_connector_enqueue_validated_line_with_policy(line, true, QS_ADMIT_RECOVERY);
     // Receipt preservation has a bounded local attempt even for historical
     // delivery. A full legacy filesystem can still drain if ADD durably takes
     // responsibility for the Oracle proof. This caller owns no storage lock.
@@ -3154,8 +3167,10 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
             continue;
         }
 
-        bool ok = true;
-        FILE *file = rel_open_append(s_bulk_outbox.path);
+        bool admitted = qs_local_begin(QS_ADMIT_HISTORICAL, required_bytes);
+        bool ok = admitted;
+        errno = 0;
+        FILE *file = admitted ? rel_open_append(s_bulk_outbox.path) : NULL;
         if (!file) ok = false;
         uint32_t written = 0;
         for (size_t i = 0; ok && i < count; i++) {
@@ -3179,6 +3194,8 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
             if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
             if (fclose(file) != 0) ok = false;
         }
+        int captured_error = errno;
+        if (admitted) qs_local_end(ok, captured_error);
         if (ok) s_bulk_outbox.depth += written;
         else {
             s_bulk_outbox.depth_known = false;

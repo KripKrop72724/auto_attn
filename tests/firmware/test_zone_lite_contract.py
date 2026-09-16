@@ -345,7 +345,7 @@ def test_runtime_failures_self_heal_and_heartbeat_reports_the_real_led():
     runtime_before_app_main = runtime[: runtime.index("void app_main(void)")]
     assert "led_status_fault(LED_STATUS_FATAL)" not in runtime_before_app_main
     assert "LED_STATUS_LOCAL_FAILURE" in runtime_before_app_main
-    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" in runtime_before_app_main
+    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" not in runtime_before_app_main
     assert "runtime_start_failed" in app_main
     assert "esp_restart();" in app_main
     assert "expire_recoverable_fault" in led
@@ -1311,7 +1311,7 @@ def test_oracle_receipt_batches_collapse_duplicate_terminal_event_uids():
     assert "cJSON_CreateString" not in receipt_enqueue
     assert "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT" in receipt_enqueue
     assert "ADD_OUTBOX_LINE_BYTES - used" in receipt_enqueue
-    assert "add_connector_enqueue_validated_line(" in receipt_enqueue
+    assert "add_connector_enqueue_validated_line_with_policy(line, true, QS_ADMIT_RECOVERY)" in receipt_enqueue
 
 
 def test_ords_drain_preserves_authoritative_outbox_under_storage_pressure():

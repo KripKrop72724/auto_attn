@@ -17,3 +17,9 @@ dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length,
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token);
 bool qs_snapshot(qs_lane_t lane, uint32_t *depth);
 qs_health_t qs_health(void);
+
+/* Holds the shared filesystem admission lock across bounded local writes only.
+ * Every successful begin must have exactly one end; never wait on a network
+ * while admitted. All producers, including legacy writers, share this budget. */
+bool qs_local_begin(qs_admission_t policy, size_t bytes);
+void qs_local_end(bool persisted, int captured_error);

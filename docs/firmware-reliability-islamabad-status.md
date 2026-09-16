@@ -50,7 +50,7 @@ and is unsigned; it is not a production artifact.
   Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 435 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 436 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
@@ -142,3 +142,23 @@ JSON fields. The production functions run against ESP-IDF cJSON with every alloc
 failed in turn under sanitizers; no incomplete message is sent. Frontend validation
 now passes 100 tests, including completed-with-exclusions and explicitly cancelled
 wording; build and bundle budgets also pass. ESP-IDF 5.5.3 rebuild passes.
+
+
+## Shared legacy capacity admission
+
+Legacy pending/blocked capture and ADD outboxes now share the same measured
+filesystem budget as segmented writes. Oracle receipt writes use the recovery
+reserve. Historical materialization stops making local writes after a failed
+admission, while the complete source scan remains available for acknowledged
+server recovery. Legacy capture commits each record and releases the capture
+lock between records rather than holding it for a full historical scan.
+
+Actual admission/append code is tested under allocation-free capacity measurement,
+60/55 hysteresis, reserved-space exhaustion, and open/write/flush/sync/close faults.
+Every admitted local operation releases the budget lock on failure. ADD acceptance
+no longer clears a local storage fault. Outbox envelopes reject every failed cJSON
+field insertion; sanitizer tests use the ESP-IDF cJSON implementation.
+
+436 backend/unit, firmware and companion tests and the ESP-IDF build pass locally.
+Auxiliary catalog/command writers, verified recovery gating, and activation of
+segmented producers still require completion. This checkpoint is not release approval.

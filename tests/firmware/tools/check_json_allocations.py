@@ -210,3 +210,51 @@ with tempfile.TemporaryDirectory() as directory:
         "-lm", "-o", str(executable),
     ], check=True)
     subprocess.run([str(executable)], check=True)
+
+start = connector.index("static char *outbox_record_line(")
+end = connector.index("static char *attendance_outbox_record_line(", start)
+outbox_program = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "cJSON.h"
+#define ADD_OUTBOX_LINE_BYTES 8192
+#define ESP_LOGE(...) ((void)0)
+static size_t calls, fail_at;
+static void *allocate(size_t size) { if(++calls==fail_at)return NULL;return malloc(size); }
+static bool attendance_payload_is_valid(const cJSON *p) { return cJSON_IsObject(p); }
+static bool attendance_payload_is_live(const cJSON *p) { (void)p;return true; }
+static bool oracle_receipt_payload_is_valid(const cJSON *p) { return cJSON_IsObject(p); }
+''' + connector[start:end] + r'''
+int main(void)
+{
+    cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
+    const char *types[]={"attendance_batch","oracle_receipt_batch"};
+    for(unsigned kind=0;kind<2;++kind){
+        calls=fail_at=0;bool live=false;
+        char *line=outbox_record_line(types[kind],"{\"confirmation_path\":\"FIRMWARE_LIVE\"}",&live);
+        assert(line && live && strstr(line,"payload") && strstr(line,types[kind]));free(line);
+        size_t total=calls;
+        for(size_t i=1;i<=total;++i){
+            calls=0;fail_at=i;
+            line=outbox_record_line(types[kind],"{\"confirmation_path\":\"FIRMWARE_LIVE\"}",&live);
+            assert(!line);
+        }
+    }
+    puts("Outbox envelope allocation regressions passed");
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    temporary = Path(directory)
+    c_file = temporary / "outbox.c"
+    c_file.write_text(outbox_program)
+    executable = temporary / "outbox"
+    subprocess.run([
+        "cc", "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-I", str(cjson), str(c_file), str(cjson / "cJSON.c"),
+        "-lm", "-o", str(executable),
+    ], check=True)
+    subprocess.run([str(executable)], check=True)

@@ -101,6 +101,35 @@ static bool admit(void *arg, size_t bytes)
         lane->admission == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
     return storage_budget_admit(&budget, health.total_bytes, health.used_bytes, bytes, kind);
 }
+bool qs_local_begin(qs_admission_t policy, size_t bytes)
+{
+    if ((unsigned)policy > QS_ADMIT_RECOVERY || !budget_lock ||
+        xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool measured = measure();
+    sb_class_t kind = policy == QS_ADMIT_HISTORICAL ? SB_HISTORICAL :
+        policy == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
+    bool admitted = measured && storage_budget_admit(&budget,
+        health.total_bytes, health.used_bytes, bytes, kind);
+    health.bulk_paused = budget.bulk_paused;
+    if (!admitted) {
+        health.failures++;
+        int error = measured ? ENOSPC : EIO;
+        health.last_error = error;
+        xSemaphoreGive(budget_lock);
+        errno = error;
+    }
+    return admitted;
+}
+
+void qs_local_end(bool persisted, int captured_error)
+{
+    if (!persisted) {
+        health.failures++;
+        health.last_error = captured_error ? captured_error : EIO;
+    }
+    xSemaphoreGive(budget_lock);
+}
+
 static bool lock(qs_lane_t lane)
 {
     return (unsigned)lane < QS_COUNT && lanes[lane].mutex &&
@@ -145,7 +174,10 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     }
     dq_result_t result = reopen(&lanes[lane]);
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
-    if (result != DQ_OK) { health.failures++; health.last_error = errno; }
+    if (result != DQ_OK) {
+        health.failures++;
+        health.last_error = result == DQ_FULL ? ENOSPC : (errno ? errno : EIO);
+    }
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
     return result;

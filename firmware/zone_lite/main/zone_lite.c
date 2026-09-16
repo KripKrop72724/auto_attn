@@ -2698,26 +2698,25 @@ static bool seen_add(const char *uid)
     return stored;
 }
 
-static bool append_line(const char *path, const char *line)
+static bool append_line_policy(const char *path, const char *line, qs_admission_t policy)
 {
+    if (!path || !line || !qs_local_begin(policy, strlen(line) + 1)) return false;
+    errno = 0;
     FILE *f = rel_open_append(path);
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Could not open %s for append", path);
-        return false;
-    }
-    bool ok = fputs(line, f) >= 0 && fputc('\n', f) != EOF && fflush(f) == 0;
+    bool ok = f && fputs(line, f) >= 0 && fputc('\n', f) != EOF && fflush(f) == 0;
     if (ok && fsync(fileno(f)) != 0) ok = false;
-    if (fclose(f) != 0) ok = false;
-    if (!ok) ESP_LOGE(TAG, "Durable append failed for %s errno=%d", path, errno);
+    int error = ok ? 0 : errno;
+    if (f && fclose(f) != 0) { ok = false; if (!error) error = errno; }
+    qs_local_end(ok, error);
+    if (!ok) ESP_LOGE(TAG, "Durable append failed for %s errno=%d", path, error);
     return ok;
 }
 
-static bool append_line_to_open_file(FILE *f, const char *path, const char *line)
+static bool append_line(const char *path, const char *line)
 {
-    if (f != NULL) {
-        return fputs(line, f) >= 0 && fputc('\n', f) != EOF;
-    }
-    return append_line(path, line);
+    // Transfers and command settlement use the recovery reserve. Capture
+    // supplies its explicit live/historical class below.
+    return append_line_policy(path, line, QS_ADMIT_RECOVERY);
 }
 
 static bool extract_event_uid(const char *line, char uid[65])
@@ -3315,9 +3314,7 @@ static bool add_enqueue_reconcile_events(
 
 static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
-    const char *capturetype,
-    FILE *pending_file,
-    FILE *blocked_file)
+    const char *capturetype)
 {
     if (seen_contains(event->event_uid)) {
         return ENQUEUE_DUPLICATE;
@@ -3327,9 +3324,11 @@ static enqueue_result_t enqueue_event_to_files(
         g_force_truth_reconcile = true;
         return ENQUEUE_RESOURCE_ERROR;
     }
+    qs_admission_t policy = strcmp(capturetype, "LIVE") == 0 || strcmp(capturetype, "LIVE_POLL") == 0
+        ? QS_ADMIT_LIVE : QS_ADMIT_HISTORICAL;
     enqueue_result_t result = ENQUEUE_PENDING;
     if (event->cnic[0] == '\0') {
-        if (!append_line_to_open_file(blocked_file, BLOCKED_PATH, json)) {
+        if (!append_line_policy(BLOCKED_PATH, json, policy)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
             return ENQUEUE_STORAGE_ERROR;
@@ -3340,7 +3339,7 @@ static enqueue_result_t enqueue_event_to_files(
             ESP_LOGW(TAG, "Blocked LIVE identity user_id=%s event_uid=%s", event->user_id, event->event_uid);
         }
     } else {
-        if (!append_line_to_open_file(pending_file, PENDING_PATH, json)) {
+        if (!append_line_policy(PENDING_PATH, json, policy)) {
             free(json);
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
             return ENQUEUE_STORAGE_ERROR;
@@ -3350,7 +3349,7 @@ static enqueue_result_t enqueue_event_to_files(
             ESP_LOGI(TAG, "Queued LIVE event_uid=%s user_id=%s raw=%s", event->event_uid, event->user_id, event->raw_punch ? "T" : "F");
         }
     }
-    if (!pending_file && !blocked_file && !seen_add(event->event_uid)) {
+    if (!seen_add(event->event_uid)) {
         ESP_LOGW(TAG, "Event persisted but volatile dedup cache could not record %s", event->event_uid);
     }
     free(json);
@@ -3370,7 +3369,7 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
         }
         return ENQUEUE_STORAGE_ERROR;
     }
-    enqueue_result_t result = enqueue_event_to_files(event, capturetype, NULL, NULL);
+    enqueue_result_t result = enqueue_event_to_files(event, capturetype);
     xSemaphoreGive(g_storage_lock);
     // ADD capacity waits and acknowledgement recovery must never own the local
     // storage lock. Local capture has already settled or explicitly failed.
@@ -4780,20 +4779,6 @@ static bool reconcile_attendance_dump(
         filter_year,
         filter_month,
         day_end);
-    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGW(TAG, "Skipping reconcile because attendance storage is busy");
-        reconcile_dump_release(data);
-        xSemaphoreGive(g_ords_outbox_gate);
-        return false;
-    }
-    FILE *pending_file = rel_open_append(PENDING_PATH);
-    if (pending_file == NULL) {
-        ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", PENDING_PATH);
-    }
-    FILE *blocked_file = rel_open_append(BLOCKED_PATH);
-    if (blocked_file == NULL) {
-        ESP_LOGW(TAG, "Could not keep %s open for reconcile appends", BLOCKED_PATH);
-    }
     while (remain >= record_size) {
         attendance_event_t event;
         uint32_t timestamp = 0;
@@ -4839,8 +4824,11 @@ static bool reconcile_attendance_dump(
             if (event.cnic[0] != '\0') {
                 identity_mapped_count++;
             }
-            enqueue_result_t result = enqueue_event_to_files(
-                &event, capturetype, pending_file, blocked_file);
+            enqueue_result_t result = ENQUEUE_STORAGE_ERROR;
+            if (durable_enqueue_ok && g_storage_lock && xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                result = enqueue_event_to_files(&event, capturetype);
+                xSemaphoreGive(g_storage_lock);
+            }
             if (result == ENQUEUE_PENDING) {
                 added++;
                 pending++;
@@ -4862,15 +4850,6 @@ static bool reconcile_attendance_dump(
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
-    if (pending_file != NULL) {
-        if (fflush(pending_file) != 0 || fsync(fileno(pending_file)) != 0) durable_enqueue_ok = false;
-        if (fclose(pending_file) != 0) durable_enqueue_ok = false;
-    }
-    if (blocked_file != NULL) {
-        if (fflush(blocked_file) != 0 || fsync(fileno(blocked_file)) != 0) durable_enqueue_ok = false;
-        if (fclose(blocked_file) != 0) durable_enqueue_ok = false;
-    }
-    xSemaphoreGive(g_storage_lock);
     xSemaphoreGive(g_ords_outbox_gate);
     if (invalid_timestamp_count > 0) {
         char quarantine_summary[224];
@@ -5214,7 +5193,7 @@ static bool reconcile_attendance_dump(
                 "reconcile",
                 "LOCAL_RECONCILE_STORAGE_RECOVERED",
                 "Local preservation storage was full, but the unchanged ZKT retained source truth and ADD acknowledged every authoritative batch; no queue was deleted");
-            led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
+            // ADD acceptance does not prove the local filesystem has recovered.
         } else {
             ESP_LOGE(
                 TAG,
