@@ -255,3 +255,11 @@ upgrade modes pass inside Linux/ESP-IDF. This is not a green release-qualificati
 - Legacy quarantine files now drain in bounded fragments, including binary, partial and oversized rows, with exact durable custody before retirement.
 - Release-store synchronization rejects changed signed manifests or artifact identities for an existing release ID, including otherwise valid signatures.
 - Actual cJSON allocation fault tests now include ORDS normalization and permanent-rejection serialization. Local ESP-IDF 5.5.3 compatibility-mode build passed (unsigned development artifact only). Production signing/publication, HIL run controls, complete recovery diagnostics, and the full qualification campaign remain incomplete; this is not HIL acceptance evidence.
+
+### Catalog transaction and memory follow-up (2026-09-16)
+
+- Catalog activation now uses a canonical commit file and checked NVS transaction generations. Interrupted prepare/commit/retirement operations recover through the shared file transaction component; ambiguous legacy backups remain preserved. A dedicated catalog mutex serializes replacement, tombstone read/modify/write, and lookups without holding a transport or live-storage mutex.
+- Pre-transport recovery checks only metadata and idle legacy replacement. Content verification for a prepared generation runs after transport startup. Uncertain canonical commit files are not removed by producer-stage cleanup.
+- Tombstone updates no longer replace unreadable, truncated, or allocation-failed catalogs with an empty catalog. Reused user IDs retain separate enrollment UIDs. Every cJSON allocation in the actual update path is tested against ESP-IDF cJSON; failed close also prevents persistence.
+- Encrypted storage wrappers check plaintext allocation and SHA derivation failures before decryption. Host tests inject allocator and crypto failures under sanitizers (crypto primitives are test doubles in that test; it is not cryptographic qualification).
+- Firmware suite: 140 tests passed. Actual catalog activation restart matrix and actual-cJSON tombstone matrix passed. ESP-IDF 5.5.3 build passed, unsigned 0x130000-byte application with 52% partition headroom. Production deployment/qualification remains outstanding.

@@ -64,6 +64,9 @@ int main(int argc,char **argv)
     assert(!remove("active"));write_file("stage","legacy-only\n");
     assert(!ft_recover("active","stage","backup",port));
     assert(content("stage","legacy-only\n"));
+    // Only explicit replacement may install a first stage as the active file.
+    assert(ft_replace("active","stage","backup",64,port));
+    assert(content("active","legacy-only\n"));
     // Lost/corrupt transaction metadata cannot authorize deleting a generation.
     saved=(ft_checkpoint_t){.version=1,.generation=1,.phase=2,.crc=123};
     assert(!ft_recover("active","stage","backup",port));

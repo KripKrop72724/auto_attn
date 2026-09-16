@@ -117,6 +117,7 @@
 #define ADD_IDENTITY_CATALOG_TMP_PATH "/storage/add_identities.tmp"
 #define ADD_IDENTITY_CATALOG_STAGE_PATH "/storage/add_identities.stage"
 #define ADD_IDENTITY_CATALOG_BACKUP_PATH "/storage/add_identities.backup"
+#define ADD_IDENTITY_CATALOG_COMMIT_PATH "/storage/add_identities.commit"
 #define ADD_CANCELLED_COMMANDS_PATH "/storage/add_cancelled.txt"
 
 typedef struct {
@@ -172,6 +173,7 @@ static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
 static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
+static SemaphoreHandle_t s_catalog_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
 static bool s_ota_restart_claimed;
@@ -652,7 +654,9 @@ static char *encrypt_storage_json(const char *plain)
         memcpy(raw + 1 + index, &value, 4);
     }
     unsigned char key[32];
-    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    if (mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0) != 0) {
+        free(raw); return NULL;
+    }
     mbedtls_gcm_context context;
     mbedtls_gcm_init(&context);
     int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
@@ -711,8 +715,11 @@ static char *decrypt_storage_line(const char *line)
     }
     size_t plain_len = raw_len - 29;
     unsigned char *plain = calloc(1, plain_len + 1);
+    if (!plain) { free(raw); return NULL; }
     unsigned char key[32];
-    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    if (mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0) != 0) {
+        free(raw); free(plain); return NULL;
+    }
     mbedtls_gcm_context context;
     mbedtls_gcm_init(&context);
     int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
@@ -736,6 +743,45 @@ static char *decrypt_storage_line(const char *line)
         return NULL;
     }
     return (char *)plain;
+}
+
+static int catalog_transaction_load(void *context, ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, "catalog", checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool catalog_transaction_commit(void *context, const ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, "catalog", checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+static const ft_port_t catalog_transaction_port = {catalog_transaction_load, catalog_transaction_commit, NULL};
+
+static bool recover_catalog_transaction_locked(void)
+{
+    bool ok = ft_recover(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
+    // Only a fully written producer stage is renamed to the canonical commit
+    // path. A first installation interrupted before prepare can finish here.
+    if (!ok) ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
 }
 
 static FILE *create_catalog_stage(const char *path)
@@ -769,34 +815,24 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
 
 static void recover_identity_catalog_backup_if_active_missing(void)
 {
-    struct stat active = {0};
-    errno = 0;
-    if (stat(ADD_IDENTITY_CATALOG_PATH, &active) == 0) {
-        return;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        led_status_fault(LED_STATUS_LOCAL_FAILURE); return;
     }
-    if (errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not inspect the active ADD identity catalog");
-        return;
-    }
-
-    // Finish only the interrupted active-to-backup transaction before the
-    // WebSocket can deliver a fresh catalog.  This rename is constant-time and
-    // does not parse or decrypt catalog rows, so it cannot hide the first boot
-    // heartbeat.  Once transport starts, restore_valid_identity_catalog()
-    // validates the recovered bytes and exact row count before publishing a
-    // non-zero generation to the OTA health gate.
-    errno = 0;
-    if (rename(
-            ADD_IDENTITY_CATALOG_BACKUP_PATH,
-            ADD_IDENTITY_CATALOG_PATH) == 0) {
-        ESP_LOGW(TAG, "Recovered interrupted ADD identity catalog transaction");
-    } else if (errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not recover the ADD identity catalog backup");
-    }
+    ft_checkpoint_t checkpoint = {0};
+    int loaded = catalog_transaction_load(NULL, &checkpoint);
+    bool valid = loaded == 0 || (loaded == 1 && checkpoint.version == 1 && checkpoint.generation &&
+        checkpoint.phase <= 2 && checkpoint.crc == dq_crc32(&checkpoint, offsetof(ft_checkpoint_t, crc)));
+    if (!valid) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    // Prepared generations require bounded-buffer content verification. Defer
+    // that scan until transport and its independent heartbeat have started.
+    else if (!checkpoint.phase) (void)ft_recover(ADD_IDENTITY_CATALOG_PATH,
+        ADD_IDENTITY_CATALOG_COMMIT_PATH, ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
+    xSemaphoreGive(s_catalog_lock);
 }
 
-static bool restore_valid_identity_catalog(void)
+static bool restore_valid_identity_catalog_locked(void)
 {
+    if (!recover_catalog_transaction_locked()) return false;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     bool ok = file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file);
@@ -871,34 +907,29 @@ static bool restore_valid_identity_catalog(void)
     return true;
 }
 
-static bool activate_identity_catalog(const char *staged_path)
+static bool restore_valid_identity_catalog(void)
 {
-    if (!staged_path) return false;
-    (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    // Some ESP-IDF VFS backends do not implement access() even though rename()
-    // is supported.  Treat a successful rename as the authoritative existence
-    // check; ENOENT is the only valid "no active catalog yet" result.
-    errno = 0;
-    int backup_result = rename(
-        ADD_IDENTITY_CATALOG_PATH,
-        ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    bool had_active = backup_result == 0;
-    if (!had_active && errno != ENOENT) {
-        return false;
-    }
-    if (rename(staged_path, ADD_IDENTITY_CATALOG_PATH) == 0) {
-        (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-        return true;
-    }
-    if (had_active) {
-        (void)rename(
-            ADD_IDENTITY_CATALOG_BACKUP_PATH,
-            ADD_IDENTITY_CATALOG_PATH);
-    }
-    return false;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = restore_valid_identity_catalog_locked();
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
 }
 
-static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
+static bool activate_identity_catalog(const char *staged_path)
+{
+    if (!staged_path || !recover_catalog_transaction_locked()) return false;
+    // The checked transaction is idle. A leftover canonical stage is an
+    // uncommitted producer result; the active/backup generations were verified.
+    errno = 0;
+    if (remove(ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0 && errno != ENOENT) return false;
+    if (rename(staged_path, ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0) return false;
+    bool ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
+}
+
+static bool persist_identity_catalog_locked(cJSON *root, size_t *row_count_out)
 {
     cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
     int row_count = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
@@ -935,6 +966,14 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
     if (ok && row_count_out) {
         *row_count_out = (size_t)row_count;
     }
+    return ok;
+}
+
+static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = persist_identity_catalog_locked(root, row_count_out);
+    xSemaphoreGive(s_catalog_lock);
     return ok;
 }
 
@@ -1119,7 +1158,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     return false;
 }
 
-static bool identity_catalog_stage_commit(
+static bool identity_catalog_stage_commit_locked(
     cJSON *root,
     size_t *row_count_out,
     bool *volatile_fallback_out)
@@ -1174,78 +1213,110 @@ static bool identity_catalog_stage_commit(
     return ok;
 }
 
-bool add_connector_persist_command_tombstone(const add_command_t *command)
+static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out, bool *volatile_fallback_out)
 {
-    if (!command || !command->has_tombstone || !command->user_id[0]) return false;
-    cJSON *root = NULL;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = identity_catalog_stage_commit_locked(root, row_count_out, volatile_fallback_out);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
+}
+
+static cJSON *load_catalog_for_tombstone(void)
+{
+    errno = 0;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    if (!file) {
+        if (errno != ENOENT) return NULL;
+        cJSON *empty = cJSON_CreateObject();
+        if (!empty || !cJSON_AddArrayToObject(empty, "rows")) {
+            cJSON_Delete(empty); return NULL;
+        }
+        return empty;
+    }
+    struct stat st;
+    bool ok = fstat(fileno(file), &st) == 0 && st.st_size > 0 &&
+        st.st_size <= ADD_IDENTITY_CATALOG_MAX_BYTES;
+    char *line = ok ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    cJSON *root = NULL;
+    if (line && fgets(line, ADD_COMMAND_LINE_BYTES, file) && strchr(line, '\n')) {
         char *plain = decrypt_storage_line(line);
         root = plain ? cJSON_Parse(plain) : NULL;
         free(plain);
-        cJSON *legacy_rows = root
-            ? cJSON_GetObjectItemCaseSensitive(root, "rows")
-            : NULL;
-        if (root && !cJSON_IsArray(legacy_rows)) {
-            cJSON_Delete(root);
-            root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "schema_version", "3");
-            cJSON_AddStringToObject(root, "type", "identity_catalog");
-            cJSON *stream_rows = cJSON_AddArrayToObject(root, "rows");
-            while (stream_rows && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
-                char *row_plain = decrypt_storage_line(line);
-                cJSON *row = row_plain ? cJSON_Parse(row_plain) : NULL;
-                free(row_plain);
-                if (!cJSON_IsObject(row)) {
-                    cJSON_Delete(row);
-                    cJSON_Delete(root);
-                    root = NULL;
-                    break;
-                }
-                cJSON_AddItemToArray(stream_rows, row);
+    }
+    ok = ok && cJSON_IsObject(root);
+    cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+    if (ok && !cJSON_IsArray(rows)) {
+        cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "rows_count");
+        int expected = cJSON_IsNumber(count) ? count->valueint : -1;
+        ok = expected >= 0 && expected <= ADD_IDENTITY_CATALOG_MAX_ROWS;
+        rows = ok ? cJSON_AddArrayToObject(root, "rows") : NULL;
+        ok = ok && rows;
+        int seen = 0;
+        while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+            if (!strchr(line, '\n') || seen >= expected) { ok = false; break; }
+            char *plain = decrypt_storage_line(line);
+            cJSON *row = plain ? cJSON_Parse(plain) : NULL;
+            free(plain);
+            if (!cJSON_IsObject(row) || !cJSON_AddItemToArray(rows, row)) {
+                cJSON_Delete(row); ok = false; break;
             }
+            seen++;
         }
+        ok = ok && seen == expected;
+    } else if (ok) {
+        // Legacy single-object catalogs cannot hide extra or truncated rows.
+        ok = fgetc(file) == EOF && cJSON_GetArraySize(rows) <= ADD_IDENTITY_CATALOG_MAX_ROWS;
     }
-    if (file) fclose(file);
+    if (ferror(file)) ok = false;
+    if (fclose(file) != 0) ok = false;
     free(line);
-    if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "schema_version", "2");
-        cJSON_AddStringToObject(root, "type", "identity_catalog");
-        cJSON_AddArrayToObject(root, "rows");
-    }
+    if (!ok) { cJSON_Delete(root); return NULL; }
+    return root;
+}
+
+static bool add_connector_persist_command_tombstone_locked(const add_command_t *command)
+{
+    if (!command || !command->has_tombstone || !command->user_id[0]) return false;
+    if (!recover_catalog_transaction_locked()) return false;
+    cJSON *root = load_catalog_for_tombstone();
+    if (!root) return false; // OOM or a failed read must never become an empty catalog.
     cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
-    if (!cJSON_IsArray(rows)) {
-        cJSON_DeleteItemFromObjectCaseSensitive(root, "rows");
-        rows = cJSON_AddArrayToObject(root, "rows");
-    }
     cJSON *target = NULL;
     cJSON *row = NULL;
     cJSON_ArrayForEach(row, rows) {
         cJSON *user_id = cJSON_GetObjectItemCaseSensitive(row, "user_id");
-        if (cJSON_IsString(user_id) && strcmp(user_id->valuestring, command->user_id) == 0) {
-            target = row;
-            break;
+        cJSON *uid = cJSON_GetObjectItemCaseSensitive(row, "uid");
+        if (cJSON_IsString(user_id) && cJSON_IsString(uid) &&
+            !strcmp(user_id->valuestring, command->user_id) && !strcmp(uid->valuestring, command->uid)) {
+            target = row; break;
         }
     }
     if (!target) {
         target = cJSON_CreateObject();
-        cJSON_AddItemToArray(rows, target);
+        if (!target || !cJSON_AddItemToArray(rows, target)) {
+            cJSON_Delete(target); cJSON_Delete(root); return false;
+        }
     }
     cJSON_DeleteItemFromObjectCaseSensitive(target, "uid");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "user_id");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "display_name");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "cnic");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "shift_worker");
-    cJSON_AddStringToObject(target, "uid", command->uid);
-    cJSON_AddStringToObject(target, "user_id", command->user_id);
-    cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name);
-    cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic);
-    cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker);
-    bool ok = persist_identity_catalog(root, NULL);
+    bool ok = cJSON_AddStringToObject(target, "uid", command->uid) &&
+        cJSON_AddStringToObject(target, "user_id", command->user_id) &&
+        cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name) &&
+        cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic) &&
+        cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker) &&
+        persist_identity_catalog_locked(root, NULL);
     cJSON_Delete(root);
+    return ok;
+}
+
+bool add_connector_persist_command_tombstone(const add_command_t *command)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = add_connector_persist_command_tombstone_locked(command);
+    xSemaphoreGive(s_catalog_lock);
     return ok;
 }
 
@@ -3563,6 +3634,7 @@ void add_connector_init(void)
     s_ack_sem = xSemaphoreCreateBinary();
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
+    s_catalog_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     s_config_commands = xQueueCreate(
         ADD_CONFIG_COMMAND_QUEUE_DEPTH,
@@ -3581,7 +3653,7 @@ void add_connector_init(void)
     s_zkt.user_count = -1;
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
-                s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
+                s_ack_sem && s_ack_wait_lock && s_command_lock && s_catalog_lock && s_commands &&
                 s_config_commands &&
                 s_reconcile_assignments &&
                 s_source_coverage &&
@@ -4128,7 +4200,7 @@ bool add_connector_command_complete(const char *command_id)
     return ok;
 }
 
-bool add_connector_lookup_identity(
+static bool add_connector_lookup_identity_locked(
     const char *user_id,
     const char *uid,
     char *display_name,
@@ -4170,6 +4242,7 @@ bool add_connector_lookup_identity(
     // an alias that the latest verified catalog deliberately removed.
     if (memory_catalog_valid) return found;
 
+    if (!recover_catalog_transaction_locked()) return false;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
@@ -4249,6 +4322,16 @@ bool add_connector_lookup_identity(
     if (file) fclose(file);
     free(line);
     return found;
+}
+
+bool add_connector_lookup_identity(const char *user_id, const char *uid,
+    char *display_name, size_t display_name_size, char *cnic, size_t cnic_size, bool *shift_worker)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = add_connector_lookup_identity_locked(user_id, uid, display_name, display_name_size,
+        cnic, cnic_size, shift_worker);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
 }
 
 uint32_t add_connector_identity_catalog_generation(size_t *row_count)

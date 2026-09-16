@@ -92,8 +92,12 @@ bool ft_recover(const char *active, const char *stage, const char *backup, ft_po
 }
 bool ft_replace(const char *active, const char *stage, const char *backup, size_t limit, ft_port_t port)
 {
-    if (!ft_recover(active, stage, backup, port)) return false;
     ft_checkpoint_t cp;
+    if (!active || !stage || !backup || !load(port, &cp)) return false;
+    // Explicit replacement may install a first generation. Recovery alone
+    // still cannot promote an uncommitted stage without this owner decision.
+    if ((cp.phase || exists(active) != 0 || exists(backup) != 0) &&
+        !ft_recover(active, stage, backup, port)) return false;
     struct stat st;
     if (!load(port, &cp) || stat(stage, &st) != 0 || st.st_size < 0 ||
         (uint64_t)st.st_size > limit || (uint64_t)st.st_size > UINT32_MAX) return false;

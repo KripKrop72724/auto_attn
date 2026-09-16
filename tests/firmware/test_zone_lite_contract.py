@@ -882,7 +882,7 @@ def test_identity_catalog_has_bounded_memory_fallback_under_storage_pressure():
         connector.index("bool add_connector_persist_command_tombstone(")
     ]
     lookup = connector[
-        connector.index("bool add_connector_lookup_identity(") :
+        connector.index("static bool add_connector_lookup_identity_locked(") :
         connector.index("uint32_t add_connector_identity_catalog_generation(")
     ]
 
@@ -991,7 +991,7 @@ def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
     assert "fflush(file) != 0 || fsync(fileno(file)) != 0" in connector
     assert "activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH)" in connector
     assert "ADD_IDENTITY_CATALOG_BACKUP_PATH" in connector
-    assert "backup_result == 0" in connector
+    assert "ft_replace(ADD_IDENTITY_CATALOG_PATH" in connector
     assert "errno != ENOENT" in connector
     assert "access(ADD_IDENTITY_CATALOG_PATH" not in connector
     assert '"IDENTITY_CATALOG_PERSIST_FAILED"' in connector
