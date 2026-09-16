@@ -212,25 +212,30 @@ static bool post_json(const char *path, cJSON *root)
     return ok;
 }
 
+static bool add_running_image_evidence(cJSON *root)
+{
+    const esp_app_desc_t *description = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    unsigned char digest[32];
+    char digest_hex[65];
+    if (!root || !description || !running || esp_partition_get_sha256(running, digest) != ESP_OK) return false;
+    hex_bytes(digest, sizeof(digest), digest_hex);
+    return cJSON_AddStringToObject(root, "running_version", description->version) &&
+        cJSON_AddStringToObject(root, "running_partition", running->label) &&
+        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
+}
+
 static bool report_state(const char *state, const char *error)
 {
     if (!s_journal.deployment_id[0]) return false;
     char path[160];
     snprintf(path, sizeof(path), "/device/v2/firmware/deployments/%s/progress", s_journal.deployment_id);
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "state", state);
-    cJSON_AddNumberToObject(root, "bytes_written", (double)s_journal.bytes_written);
-    cJSON_AddStringToObject(root, "running_version", esp_app_get_description()->version);
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    cJSON_AddStringToObject(root, "running_partition", running ? running->label : "unknown");
-    unsigned char digest[32];
-    char digest_hex[65];
-    if (running && esp_partition_get_sha256(running, digest) == ESP_OK) {
-        hex_bytes(digest, sizeof(digest), digest_hex);
-        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
-    }
-    if (error && error[0]) cJSON_AddStringToObject(root, "error_code", error);
-    bool ok = post_json(path, root);
+    bool valid = root && cJSON_AddStringToObject(root, "state", state) &&
+        cJSON_AddNumberToObject(root, "bytes_written", (double)s_journal.bytes_written) &&
+        add_running_image_evidence(root);
+    if (valid && error && error[0]) valid = cJSON_AddStringToObject(root, "error_code", error) != NULL;
+    bool ok = valid && post_json(path, root);
     cJSON_Delete(root);
     return ok;
 }
@@ -238,20 +243,12 @@ static bool report_state(const char *state, const char *error)
 static bool report_capability(void)
 {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "capable", true);
-    cJSON_AddBoolToObject(root, "secure_boot", esp_secure_boot_enabled());
-    cJSON_AddBoolToObject(root, "rollback_enabled", true);
-    cJSON_AddStringToObject(root, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT);
-    cJSON_AddStringToObject(root, "running_version", esp_app_get_description()->version);
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    cJSON_AddStringToObject(root, "running_partition", running ? running->label : "unknown");
-    unsigned char digest[32];
-    char digest_hex[65];
-    if (running && esp_partition_get_sha256(running, digest) == ESP_OK) {
-        hex_bytes(digest, sizeof(digest), digest_hex);
-        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
-    }
-    bool ok = post_json("/device/v2/firmware/capability", root);
+    bool valid = root && cJSON_AddBoolToObject(root, "capable", true) &&
+        cJSON_AddBoolToObject(root, "secure_boot", esp_secure_boot_enabled()) &&
+        cJSON_AddBoolToObject(root, "rollback_enabled", true) &&
+        cJSON_AddStringToObject(root, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT) &&
+        add_running_image_evidence(root);
+    bool ok = valid && post_json("/device/v2/firmware/capability", root);
     cJSON_Delete(root);
     return ok;
 }

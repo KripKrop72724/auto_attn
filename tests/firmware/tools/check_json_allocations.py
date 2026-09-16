@@ -138,3 +138,75 @@ with tempfile.TemporaryDirectory() as directory:
         "-lm", "-o", str(executable),
     ], check=True)
     subprocess.run([str(executable)], check=True)
+
+# Compile the production OTA evidence builders, including serialization, against
+# actual cJSON; transport records only complete payloads.
+ota = (ROOT / "firmware/zone_lite/main/ota_manager.c").read_text()
+start = ota.index("static bool add_running_image_evidence(")
+end = ota.index("static bool fetch_assignment(", start)
+ota_program = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "cJSON.h"
+static size_t calls, fail_at, sends;
+static bool fail_hash, missing_partition, missing_description;
+static void *allocate(size_t n) { if(++calls==fail_at)return NULL;return malloc(n); }
+#define ESP_OK 0
+#define ZONE_LITE_OTA_PARTITION_LAYOUT "zone-lite-ota-v1"
+typedef struct { const char *version; } esp_app_desc_t;
+typedef struct { const char *label; } esp_partition_t;
+static const esp_app_desc_t description={"2.6.0"};
+static const esp_partition_t partition={"ota_1"};
+static struct { char deployment_id[48];size_t bytes_written; } s_journal={"test",1024};
+static const esp_app_desc_t *esp_app_get_description(void) { return missing_description?NULL:&description; }
+static const esp_partition_t *esp_ota_get_running_partition(void) { return missing_partition?NULL:&partition; }
+static bool esp_secure_boot_enabled(void) { return true; }
+static int esp_partition_get_sha256(const esp_partition_t *p,unsigned char digest[32])
+{ assert(p==&partition);memset(digest,0x11,32);return fail_hash?-1:0; }
+static void hex_bytes(const unsigned char *input,size_t length,char *out)
+{ (void)input;memset(out,'1',length*2);out[length*2]=0; }
+static bool post_json(const char *path,cJSON *root)
+{
+    assert(path[0]);char *body=cJSON_PrintUnformatted(root);if(!body)return false;
+    assert(strstr(body,"running_version") && strstr(body,"running_partition") && strstr(body,"image_sha256"));
+    if(strstr(path,"progress"))assert(strstr(body,"bytes_written") && strstr(body,"error_code"));
+    ++sends;free(body);return true;
+}
+''' + ota[start:end] + r'''
+int main(void)
+{
+    cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
+    for(unsigned mode=0;mode<2;++mode){
+        calls=fail_at=sends=0;
+        assert(mode?report_capability():report_state("SUCCEEDED","test"));
+        size_t total=calls;assert(sends==1);
+        for(size_t i=1;i<=total;++i){
+            calls=sends=0;fail_at=i;
+            assert(!(mode?report_capability():report_state("SUCCEEDED","test")));
+            assert(!sends);
+        }
+        fail_at=0;sends=0;
+        fail_hash=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));fail_hash=false;
+        missing_partition=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_partition=false;
+        missing_description=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_description=false;
+        assert(!sends);
+    }
+    puts("OTA evidence allocation regressions passed");
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    temporary = Path(directory)
+    c_file = temporary / "ota.c"
+    c_file.write_text(ota_program)
+    executable = temporary / "ota"
+    subprocess.run([
+        "cc", "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-I", str(cjson), str(c_file), str(cjson / "cJSON.c"),
+        "-lm", "-o", str(executable),
+    ], check=True)
+    subprocess.run([str(executable)], check=True)

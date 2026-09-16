@@ -2105,7 +2105,9 @@ export function ReconciliationView({
                         <Icon name="shield" />
                         <span>
                           <strong>
-                            {sourceAssurance.state === 'REVIEW_REQUIRED'
+                            {job.status === 'CANCELLED'
+                              ? 'Cancelled — source exceptions remain preserved'
+                              : sourceAssurance.state === 'REVIEW_REQUIRED'
                               ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
                               : sourceAssurance.state === 'SCOPE_MISMATCH'
                                 ? 'Source-exception evidence mismatch'

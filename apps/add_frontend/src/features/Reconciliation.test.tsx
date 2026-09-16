@@ -225,8 +225,8 @@ function Harness() {
   )
 }
 
-function reconciliationFetch() {
-  let reviewed = false
+function reconciliationFetch(terminalStatus?: ReconciliationJob['status']) {
+  let reviewed = terminalStatus !== undefined
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'https://add.test')
     if (url.pathname === `/api/v1/source-exceptions/${sourceException.id}/review`) {
@@ -294,7 +294,7 @@ function reconciliationFetch() {
       return json({
         enabled: true,
         scheduler,
-        rows: [currentJob],
+        rows: [{ ...currentJob, ...(terminalStatus ? { status: terminalStatus } : {}) }],
         next_cursor: null,
         filtered_total: 1,
         totals: {
@@ -338,6 +338,16 @@ describe('Reviewed source-exception continuation', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+  })
+
+  it.each([
+    ['COMPLETED', 'Completed with reviewed exclusions'],
+    ['CANCELLED', 'Cancelled — source exceptions remain preserved'],
+  ] as const)('keeps %s wording distinct from ongoing assurance', async (status, label) => {
+    vi.stubGlobal('fetch', reconciliationFetch(status))
+    render(<Harness />)
+    expect(await screen.findByText(label)).toBeTruthy()
+    expect(screen.queryByText('Reviewed exclusions — assurance continuing')).toBeNull()
   })
 
   it('replaces ineffective retry with an exact certified-cohort review path', async () => {

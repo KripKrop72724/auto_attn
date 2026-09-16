@@ -50,7 +50,7 @@ and is unsigned; it is not a production artifact.
   Integration across legacy/auxiliary files and verified recovery is unfinished.
 - Attendance serializers tested against the pinned ESP-IDF cJSON implementation,
   failing each allocation in turn; incomplete records are rejected. Included in CI.
-- All 429 backend/unit, firmware and companion tests pass locally. Actual legacy
+- All 435 backend/unit, firmware and companion tests pass locally. Actual legacy
   drain orchestration is compiled into a host test covering allocation failure,
   receipt failure, checkpoint failure, restart, concurrent live append during
   network delivery, and bulk failure followed by single-record recovery.
@@ -135,3 +135,10 @@ heartbeat version string alone. Six regression cases cover every active phase;
 only the checked device progress path may complete a deployment. This is not HIL
 acceptance. Firmware journal/reconciliation recovery and predecessor verification
 still require implementation and qualification.
+
+
+OTA progress and capability builders now reject missing image evidence and failed
+JSON fields. The production functions run against ESP-IDF cJSON with every allocation
+failed in turn under sanitizers; no incomplete message is sent. Frontend validation
+now passes 100 tests, including completed-with-exclusions and explicitly cancelled
+wording; build and bundle budgets also pass. ESP-IDF 5.5.3 rebuild passes.
