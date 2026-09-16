@@ -245,3 +245,72 @@ def test_matching_heartbeat_version_cannot_complete_hil_deployment(hil_session, 
     assert deployment.completed_at is None
     assert session.scalar(select(FirmwareEvent).where(
         FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == "SUCCEEDED")) is None
+
+
+def test_compatibility_second_target_waits_for_first_candidate_acceptance(hil_session):
+    from sqlalchemy import select
+    from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareRelease, _ordered_hil_target
+    from zk_add.storage_contract import COMPAT_VERSION, CANDIDATE_VERSION
+
+    session, compatibility, devices = hil_session
+    run = campaign(session, compatibility)
+    compatibility.version = COMPAT_VERSION
+    deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id == run.id))
+    assert _ordered_hil_target(session, compatibility).connector_id == "connector-1"
+    deployment.status = "SUCCEEDED"
+    run.status = "COMPLETED"
+    session.add(FirmwareEvent(deployment_id=deployment.id, state="HIL_ACCEPTED", details={
+        "outcome": "PASS", "target": target(1), "git_sha": compatibility.git_sha,
+        "artifact_sha256": compatibility.image_sha256, "application_sha256": "c" * 64,
+    }))
+    session.flush()
+    with pytest.raises(ValueError, match="matching hardening candidate"):
+        _ordered_hil_target(session, compatibility)
+    candidate = FirmwareRelease(
+        release_id="hardening-candidate", version=CANDIDATE_VERSION, git_sha="d" * 40,
+        image_sha256="e" * 64, image_size=1024, signing_key_id="production-key",
+        partition_layout=compatibility.partition_layout, minimum_bootstrap_version=COMPAT_VERSION,
+        storage_name="candidate.bin", manifest_signature="fixture", state="HIL_ONLY",
+        manifest={"_hil_targets": [target(1), target(2)], "application_sha256": "f" * 64},
+    )
+    session.add(candidate)
+    session.flush()
+    with pytest.raises(ValueError, match="no hardening-candidate HIL acceptance"):
+        _ordered_hil_target(session, compatibility)
+    candidate_run = FirmwareCampaign(campaign_id="candidate-run", release_id=candidate.id, zone_id="ZONE-HIL",
+                                    status="COMPLETED", actor="test", idempotency_key="candidate",
+                                    reason="test", typed_confirmation=CANDIDATE_VERSION)
+    session.add(candidate_run)
+    session.flush()
+    candidate_deployment = FirmwareDeployment(deployment_id="candidate-first", campaign_id=candidate_run.id,
+        release_id=candidate.id, connector_id=devices[0].id, status="SUCCEEDED", target_version=CANDIDATE_VERSION)
+    session.add(candidate_deployment)
+    session.flush()
+    details = {"outcome": "PASS", "target": target(1), "git_sha": candidate.git_sha,
+               "artifact_sha256": candidate.image_sha256, "application_sha256": "f" * 64}
+    proof = FirmwareEvent(deployment_id=candidate_deployment.id, state="HIL_ACCEPTED", details=details)
+    session.add(proof)
+    session.flush()
+    assert _ordered_hil_target(session, compatibility).connector_id == "connector-2"
+    for field, wrong in (("outcome", "INCOMPLETE"), ("artifact_sha256", "a" * 64),
+                         ("git_sha", "b" * 40), ("application_sha256", "a" * 64), ("target", target(3))):
+        proof.details = {**details, field: wrong}
+        with pytest.raises(ValueError):
+            _ordered_hil_target(session, compatibility)
+    proof.details = details
+    for state in ("HIL_FAILED", "HIL_INCOMPLETE"):
+        proof.state = state
+        with pytest.raises(ValueError):
+            _ordered_hil_target(session, compatibility)
+    proof.state = "HIL_ACCEPTED"
+    candidate_deployment.status = "RECONCILING"
+    with pytest.raises(ValueError):
+        _ordered_hil_target(session, compatibility)
+    candidate_deployment.status = "SUCCEEDED"
+    candidate.state = "REVOKED"
+    with pytest.raises(ValueError):
+        _ordered_hil_target(session, compatibility)
+    candidate.state = "HIL_ONLY"
+    candidate.manifest = {**candidate.manifest, "_hil_targets": [target(1), target(3)]}
+    with pytest.raises(ValueError):
+        _ordered_hil_target(session, compatibility)

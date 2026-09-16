@@ -37,7 +37,7 @@ from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
-from zk_add.storage_contract import COMPAT_MARKER, COMPAT_VERSION, validate_storage_contract
+from zk_add.storage_contract import CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, validate_storage_contract
 
 OTA_LAYOUT = "zone-lite-ota-v1"
 HIL_MARKER = ".hil-only.json"
@@ -156,6 +156,44 @@ class FirmwareDownloadGrant(Base):
     last_used_at: Mapped[Any | None] = mapped_column(DateTime(timezone=True))
 
 
+def _require_previous_candidate_acceptance(
+    session: Session, release: FirmwareRelease, targets: list[HilTarget], index: int,
+) -> None:
+    if release.version != COMPAT_VERSION or index == 0:
+        return
+    candidate = session.scalar(select(FirmwareRelease).where(
+        FirmwareRelease.version == CANDIDATE_VERSION,
+        FirmwareRelease.state == "HIL_ONLY",
+    ))
+    if candidate is None or (candidate.manifest or {}).get("_hil_targets") != [
+        target.model_dump() for target in targets
+    ]:
+        raise ValueError("The matching hardening candidate must pass the previous target before compatibility rollout continues.")
+    events = list(session.execute(
+        select(FirmwareEvent, Connector, FirmwareDeployment)
+        .join(FirmwareDeployment, FirmwareEvent.deployment_id == FirmwareDeployment.id)
+        .join(Connector, FirmwareDeployment.connector_id == Connector.id)
+        .where(
+            FirmwareDeployment.release_id == candidate.id,
+            FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE"]),
+        ).order_by(FirmwareEvent.id)
+    ))
+    for target in targets[:index]:
+        evidence = [
+            (event, deployment) for event, connector, deployment in events
+            if target_matches(target, connector)
+            and (event.details or {}).get("target") == target.model_dump()
+            and event.details.get("git_sha") == candidate.git_sha
+            and event.details.get("artifact_sha256") == candidate.image_sha256
+            and event.details.get("application_sha256") == _application_sha256(candidate)
+        ]
+        if not evidence:
+            raise ValueError("The previous target has no hardening-candidate HIL acceptance.")
+        event, deployment = evidence[-1]
+        if event.state != "HIL_ACCEPTED" or event.details.get("outcome") != "PASS" or deployment.status != "SUCCEEDED":
+            raise ValueError("The previous target must pass hardening-candidate HIL before the next compatibility update.")
+
+
 def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget | None:
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
@@ -175,7 +213,7 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
             FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE"]),
         ).order_by(FirmwareEvent.id)
     ))
-    for target in targets:
+    for index, target in enumerate(targets):
         evidence = [
             (event, deployment)
             for event, connector, deployment in events
@@ -186,10 +224,12 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
             and event.details.get("application_sha256") == _application_sha256(release)
         ]
         if not evidence:
+            _require_previous_candidate_acceptance(session, release, targets, index)
             return target
         latest, deployment = evidence[-1]
         if (latest.state != "HIL_ACCEPTED" or latest.details.get("outcome") != "PASS"
                 or deployment.status != "SUCCEEDED"):
+            _require_previous_candidate_acceptance(session, release, targets, index)
             return target
     raise ValueError("All ordered HIL targets already have acceptance; release remains HIL_ONLY.")
 

@@ -268,3 +268,13 @@ A successful flash catalog replacement now invalidates an older volatile alias
 catalog. Actual persistence/allocation tests verify that failed replacements keep
 the old cache authoritative and successful replacements switch lookups to the new
 committed flash generation.
+
+### Cross-release HIL sequencing (2026-09-16)
+
+Compatibility target 2 is now held until target 1 has successful hardening-candidate
+acceptance with the same exact ordered scope, source SHA, artifact digest and
+application digest, and a successful deployment. Missing, incomplete, failed,
+revoked, mismatched-scope and wrong-hash evidence are rejected. This applies through
+the shared target selector used by preview, assignment and download authorization.
+The 35 HIL-scope/storage-contract tests pass. The acceptance writer and production
+validator are still pending; no acceptance is inferred from this unit test.
