@@ -2339,11 +2339,19 @@ static void append_firmware_diagnostics(cJSON *payload)
     size_t total = 0, used = 0;
     esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
     if (measured == ESP_OK) {
-        cJSON_AddNumberToObject(storage, "total_bytes", (double)total);
-        cJSON_AddNumberToObject(storage, "used_bytes", (double)used);
+        if (!cJSON_AddNumberToObject(storage, "total_bytes", (double)total) ||
+            !cJSON_AddNumberToObject(storage, "used_bytes", (double)used)) goto failed;
     } else {
-        cJSON_AddStringToObject(storage, "error_operation", "filesystem_info");
-        cJSON_AddNumberToObject(storage, "error_code", measured);
+        if (!cJSON_AddStringToObject(storage, "error_operation", "filesystem_info") ||
+            !cJSON_AddNumberToObject(storage, "error_code", measured)) goto failed;
+    }
+    qs_health_t measured_health = qs_health();
+    if (measured_health.observed) {
+        if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
+            !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
+        if (measured == ESP_OK && measured_health.last_error &&
+            (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
+             !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
     }
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
@@ -2367,13 +2375,26 @@ static void append_firmware_diagnostics(cJSON *payload)
         if (!cJSON_AddStringToObject(queue, "name", names[i])) goto failed;
         add_outbox_t *outbox = outboxes[i];
         if (outbox->lock && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            cJSON_AddBoolToObject(queue, "count_known", outbox->depth_known);
-            if (outbox->depth_known) cJSON_AddNumberToObject(queue, "records", outbox->depth);
+            bool fields_ok = cJSON_AddBoolToObject(queue, "count_known", outbox->depth_known) &&
+                (!outbox->depth_known || cJSON_AddNumberToObject(queue, "records", outbox->depth));
             struct stat st;
-            if (stat(outbox->path, &st) == 0) cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
-            else if (errno == ENOENT) cJSON_AddNumberToObject(queue, "bytes", 0);
+            if (stat(outbox->path, &st) == 0) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
+            else if (errno == ENOENT) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", 0);
             xSemaphoreGive(outbox->lock);
+            if (!fields_ok) goto failed;
         }
+    }
+    const char *segmented_names[QS_COUNT] = {"segmented_live", "segmented_bulk", "segmented_ords",
+        "segmented_blocked", "segmented_receipts", "segmented_evidence"};
+    for (unsigned i = 0; i < QS_COUNT; i++) {
+        cJSON *queue = cJSON_CreateObject();
+        if (!queue) goto failed;
+        if (!cJSON_AddItemToArray(queues, queue)) { cJSON_Delete(queue); goto failed; }
+        uint32_t depth = 0;
+        bool known = qs_snapshot((qs_lane_t)i, &depth);
+        if (!cJSON_AddStringToObject(queue, "name", segmented_names[i]) ||
+            !cJSON_AddBoolToObject(queue, "count_known", known) ||
+            (known && !cJSON_AddNumberToObject(queue, "records", depth))) goto failed;
     }
     if (cJSON_AddItemToObject(payload, "diagnostics", diagnostics)) return;
 failed:

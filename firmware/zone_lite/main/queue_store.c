@@ -92,6 +92,7 @@ static bool measure(void)
     if (!health.available) return false;
     (void)storage_budget_admit(&budget, health.total_bytes, health.used_bytes, 0, SB_RECOVERY);
     health.bulk_paused = budget.bulk_paused;
+    health.admission_reserve_bytes = budget.live_reserve + budget.recovery_reserve;
     return true;
 }
 static bool admit(void *arg, size_t bytes)
@@ -114,6 +115,8 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
     health.bulk_paused = budget.bulk_paused;
     if (!admitted) {
         health.failures++;
+        health.admission_rejections++;
+        health.last_operation = measured ? "capacity_admission" : "filesystem_info";
         int error = measured ? ENOSPC : EIO;
         health.last_error = error;
         xSemaphoreGive(budget_lock);
@@ -126,6 +129,8 @@ void qs_local_end(bool persisted, int captured_error)
 {
     if (!persisted) {
         health.failures++;
+        health.write_failures++;
+        health.last_operation = "local_write_commit";
         health.last_error = captured_error ? captured_error : EIO;
     }
     xSemaphoreGive(budget_lock);
@@ -179,6 +184,9 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
     if (result != DQ_OK) {
         health.failures++;
+        if (result == DQ_FULL) health.admission_rejections++;
+        else health.write_failures++;
+        health.last_operation = result == DQ_FULL ? "capacity_admission" : "segment_append";
         health.last_error = result == DQ_FULL ? ENOSPC : (errno ? errno : EIO);
     }
     xSemaphoreGive(budget_lock);
@@ -213,7 +221,7 @@ qs_health_t qs_health(void)
 {
     qs_health_t snapshot = {0};
     if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        (void)measure(); snapshot = health; xSemaphoreGive(budget_lock);
+        (void)measure(); snapshot = health; snapshot.observed = true; xSemaphoreGive(budget_lock);
     }
     return snapshot;
 }

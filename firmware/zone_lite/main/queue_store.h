@@ -4,10 +4,11 @@
 typedef enum { QS_LIVE, QS_BULK, QS_ORDS, QS_BLOCKED, QS_RECEIPTS, QS_EVIDENCE, QS_COUNT } qs_lane_t;
 typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY } qs_admission_t;
 typedef struct {
-    size_t total_bytes, used_bytes;
-    bool available, bulk_paused;
-    uint32_t failures;
+    size_t total_bytes, used_bytes, admission_reserve_bytes;
+    bool observed, available, bulk_paused;
+    uint32_t failures, write_failures, admission_rejections;
     int last_error;
+    const char *last_operation;
 } qs_health_t;
 bool qs_init(void);
 bool qs_generation(char output[33]);

@@ -66,11 +66,14 @@ int main(void)
         assert(!append_line_policy("rows","retry",QS_ADMIT_LIVE));
         assert(!locked && health.last_error==EIO);
     }
+    assert(health.write_failures==operations);
     fail_operation=0;operation=0;
     used=(total*60+99)/100;
     unsigned before=opens;
     assert(!append_line_policy("rows","history",QS_ADMIT_HISTORICAL));
     assert(!locked && opens==before && health.bulk_paused);
+    assert(health.admission_rejections==1 && health.write_failures==operations);
+    assert(!strcmp(health.last_operation,"capacity_admission"));
     assert(append_line_policy("rows","live",QS_ADMIT_LIVE));
     used=total*56/100;
     assert(!append_line_policy("rows","history",QS_ADMIT_HISTORICAL));

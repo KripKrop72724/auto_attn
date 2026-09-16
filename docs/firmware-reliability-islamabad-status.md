@@ -293,3 +293,13 @@ an existing deadline. Actual C state-machine and firmware-adapter host tests cov
 failed/uncertain persistence, failed verification/revocation, clock and expiry
 boundaries, invalid UIDs, and retained obligations. No production administrator
 permission was changed during these tests.
+
+### Allocation-safe queue diagnostics (2026-09-16)
+
+Diagnostics now distinguish capacity admission rejection from actual write failure,
+report the measured admission reserve and operation, and expose known/unknown depth
+for all six segmented lanes. JSON allocation failure omits the incomplete diagnostic
+object and releases every acquired lock. Actual ESP-IDF cJSON allocation injection
+passed, the firmware suite passed 142 tests, and the ESP-IDF 5.5.3 unsigned development
+build passed. Verified recovery/healthy reporting and release qualification remain
+outstanding; no production firmware was published by this checkpoint.
