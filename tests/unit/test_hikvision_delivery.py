@@ -88,6 +88,57 @@ def test_no_name_derived_cnic_or_numeric_identifier_guess(db):
     assert session.scalar(select(OrdsOutbox)).status == "BLOCKED_IDENTITY"
 
 
+def publish_profile(session, connector, employee="00111"):
+    from zk_add.hikvision_profiles import accept_profile_page
+    raw = json.dumps({"employeeNo": employee, "name": "Test-S-1234512345671",
+                      "userType": "normal", "localUIRight": False}, separators=(",", ":"))
+    request = dict(snapshot_id="b" * 32, terminal_serial="terminal", position=0, total=1, records=[raw])
+    accept_profile_page(session, connector, {**request, "phase": 1})
+    accept_profile_page(session, connector, {**request, "phase": 2})
+    session.commit()
+
+
+def test_plain_historical_name_uses_exact_verified_employee_profile(db):
+    session, connector = db
+    policy(session, connector)
+    publish_profile(session, connector)
+    preserve_observation(session, connector, payload(name="Plain historic name"))
+    row = session.scalar(select(AttendanceEvent))
+    assert row.ords_status == "PENDING" and row.raw_punch
+    assert row.raw_event["identity_source"] == "VERIFIED_PROFILE_NAME_CNIC"
+    assert row.identity_snapshot_id == connector.zkt_device.identity_snapshot_id
+    assert decrypt_cnic(row.cnic_encrypted) == "1234512345671"
+
+
+def test_profile_arrival_releases_only_previously_unmapped_undelivered_punches(db):
+    from zk_add.hikvision_delivery import repair_profile_identity_holds
+    session, connector = db
+    policy(session, connector)
+    preserve_observation(session, connector, payload(name="Plain historic name"))
+    preserve_observation(session, connector, payload(serial=124, employee="111", name="Same display"))
+    session.commit()
+    first = session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 123))
+    uid = first.event_uid
+    publish_profile(session, connector)
+    assert repair_profile_identity_holds(session) == 1
+    assert first.ords_status == "PENDING" and first.event_uid == uid
+    # Leading zero identifiers are distinct; names never supply the join.
+    assert session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 124)).ords_status == "BLOCKED_IDENTITY"
+    assert repair_profile_identity_holds(session) == 0
+
+
+def test_detected_identifier_reuse_blocks_profile_fallback(db):
+    from zk_add.models import DeviceUser
+    session, connector = db
+    policy(session, connector)
+    publish_profile(session, connector)
+    session.add(DeviceUser(zkt_device_id=connector.zkt_device.id, uid="00111", user_id="00111",
+                           display_name="Old lifecycle", lifecycle_state="DELETED", present=False))
+    session.flush()
+    preserve_observation(session, connector, payload(name="Plain historic name"))
+    assert session.scalar(select(AttendanceEvent)).ords_status == "BLOCKED_IDENTITY"
+
+
 def test_encoded_name_does_not_require_a_separate_mapping_and_shift_is_preserved(db):
     session, connector = db
     policy(session, connector)

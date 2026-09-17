@@ -427,6 +427,8 @@ def prepare_maintenance_tick(
         advance_user_deletion_jobs(session)
         repair_verified_tombstone_backlog(session)
         repair_verified_active_identity_backlog(session)
+        from zk_add.hikvision_delivery import repair_profile_identity_holds
+        repair_profile_identity_holds(session)
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
         from zk_add.comm_keys import expire_staged_comm_key_operations

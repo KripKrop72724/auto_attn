@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from zk_add.crypto import encrypt_cnic, cnic_lookup, normalize_cnic
+from zk_add.crypto import encrypt_cnic, cnic_lookup, normalize_cnic, decrypt_text
 from zk_add.db import Base
 from zk_add.identity import parse_machine_name
-from zk_add.models import AttendanceEvent, Connector, OrdsOutbox
+from zk_add.models import AttendanceEvent, Connector, OrdsOutbox, DeviceUser, ZKTDevice
 from zk_add.time_utils import utc_now
 
 
@@ -26,6 +26,72 @@ class HikvisionPolicy(Base):
     mapping_revision: Mapped[int] = mapped_column(Integer, default=1)
     success_codes: Mapped[list] = mapped_column(JSON, default=list)
     excluded_codes: Mapped[list] = mapped_column(JSON, default=list)
+
+
+def profile_identity(session, connector, employee_no):
+    """Use the exact terminal employee number, never a name similarity match.
+
+    An observed identifier reuse or conflicting profile requires review. Snapshot
+    provenance is retained when importing preexisting history under the operator's
+    name-CNIC mapping rule; this does not claim historical continuity was observed.
+    """
+    terminal = connector.zkt_device
+    if not terminal or not terminal.snapshot_complete or not terminal.identity_snapshot_stable:
+        return None, None
+    rows = session.scalars(select(DeviceUser).where(
+        DeviceUser.zkt_device_id == terminal.id, DeviceUser.user_id == employee_no,
+    )).all()
+    if len(rows) != 1:
+        return None, None
+    user = rows[0]
+    if (not user.present or user.lifecycle_state != "ACTIVE" or user.identity_conflict_code
+            or user.snapshot_revision != terminal.identity_snapshot_revision):
+        return None, None
+    parsed = parse_machine_name(decrypt_text(user.machine_name_encrypted))
+    if not parsed.display_name or not normalize_cnic(parsed.cnic):
+        return None, None
+    return user, parsed
+
+
+def repair_profile_identity_holds(session: Session, limit: int = 200) -> int:
+    """Bounded recovery after a verified profile snapshot arrives after a punch."""
+    from sqlalchemy.orm import aliased
+    from zk_add.hikvision_evidence import HikvisionEvidence
+    from zk_add.hikvision_protocol import normalize_observation
+    from zk_add.hikvision_probe import decode_body
+
+    other = aliased(DeviceUser)
+    reused = select(other.id).where(
+        other.zkt_device_id == DeviceUser.zkt_device_id,
+        other.user_id == DeviceUser.user_id, other.id != DeviceUser.id,
+    ).exists()
+    candidates = session.scalars(select(HikvisionEvidence).join(
+        AttendanceEvent, AttendanceEvent.event_uid == HikvisionEvidence.event_uid,
+    ).join(DeviceUser, (DeviceUser.zkt_device_id == AttendanceEvent.zkt_device_id) &
+           (DeviceUser.user_id == AttendanceEvent.user_id)).join(
+        ZKTDevice, ZKTDevice.id == DeviceUser.zkt_device_id,
+    ).join(HikvisionPolicy, HikvisionPolicy.connector_id == HikvisionEvidence.connector_id).where(
+        HikvisionPolicy.enabled.is_(True), HikvisionPolicy.source_epoch == HikvisionEvidence.source_epoch,
+        HikvisionPolicy.terminal_serial == HikvisionEvidence.terminal_serial,
+        ZKTDevice.snapshot_complete.is_(True), ZKTDevice.identity_snapshot_stable.is_(True),
+        DeviceUser.snapshot_revision == ZKTDevice.identity_snapshot_revision,
+        HikvisionEvidence.disposition == "IDENTITY_BLOCKED",
+        AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+        AttendanceEvent.cnic_lookup_hash.is_(None),
+        DeviceUser.present.is_(True), DeviceUser.lifecycle_state == "ACTIVE",
+        DeviceUser.identity_conflict_code.is_(None), DeviceUser.cnic_lookup_hash.is_not(None),
+        ~reused,
+    ).order_by(HikvisionEvidence.id).limit(limit)).all()
+    resolved = 0
+    for evidence in candidates:
+        connector = session.get(Connector, evidence.connector_id)
+        raw = decode_body(decrypt_text(evidence.raw_encrypted).encode())
+        observation = normalize_observation(raw, terminal_serial=evidence.terminal_serial,
+                                            source_epoch=evidence.source_epoch)
+        deliver_observation(session, connector, evidence, observation, raw)
+        resolved += evidence.disposition == "ATTENDANCE"
+    session.flush()
+    return resolved
 
 
 def _hold_existing(session, row, code):
@@ -84,6 +150,14 @@ def deliver_observation(
     name = event.get("name") if isinstance(event, dict) else None
     parsed = parse_machine_name(name if isinstance(name, str) and len(name) <= 256 else None)
     cnic = normalize_cnic(parsed.cnic) if parsed.display_name else None
+    user = None
+    identity_source = "TERMINAL_NAME_CNIC" if cnic else "MISSING_NAME_CNIC"
+    if not cnic:
+        user, mapped = profile_identity(session, connector, observation.employee_no)
+        if mapped:
+            parsed = mapped
+            cnic = normalize_cnic(parsed.cnic)
+            identity_source = "VERIFIED_PROFILE_NAME_CNIC"
     lookup = cnic_lookup(cnic)
     if existing:
         if existing.connector_id != connector.id:
@@ -92,8 +166,28 @@ def deliver_observation(
             evidence.disposition = "IDENTITY_FACT_CONFLICT"
             _hold_existing(session, existing, "QUARANTINED_IDENTITY_CONFLICT")
             return
-        # An identity correction does not silently modify an already received
-        # punch. Existing controlled repair handles both held and delivered rows.
+        if (cnic and not existing.cnic_lookup_hash and existing.ords_status == "BLOCKED_IDENTITY"
+                and existing.identity_resolution_status == "BLOCKED_PROVENANCE"
+                and existing.oracle_confirmed_at is None):
+            outbox = session.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == existing.id))
+            if not outbox or outbox.status != "BLOCKED_IDENTITY" or outbox.attempt_count:
+                return
+            existing.cnic_encrypted = encrypt_cnic(cnic)
+            existing.cnic_lookup_hash = lookup
+            existing.cnic_last4 = cnic[-4:]
+            existing.display_name = parsed.display_name
+            existing.raw_punch = bool(parsed.shift_worker)
+            existing.identity_resolution_status = "RESOLVED_HIKVISION_NAME"
+            existing.identity_resolved_at = utc_now()
+            existing.device_user_id = user.id if user else None
+            existing.identity_snapshot_id = connector.zkt_device.identity_snapshot_id if user else None
+            existing.raw_event = {**existing.raw_event, "identity_source": identity_source,
+                                  "identity_profile_version": user.row_version if user else None,
+                                  "identity_snapshot_revision": user.snapshot_revision if user else None}
+            existing.ords_status = outbox.status = "PENDING"
+            evidence.disposition = "ATTENDANCE"
+            return
+        # An existing non-null identity is pinned. Corrections use controlled repair.
         evidence.disposition = "DUPLICATE_OBSERVATION"
         return
     event_time = datetime.fromisoformat(observation.event_time_utc)
@@ -109,6 +203,8 @@ def deliver_observation(
         event_uid=observation.event_uid,
         connector_id=connector.id,
         zkt_device_id=terminal.id,
+        device_user_id=user.id if user else None,
+        identity_snapshot_id=terminal.identity_snapshot_id if user else None,
         identity_resolution_status="RESOLVED_HIKVISION_NAME" if cnic else "BLOCKED_PROVENANCE",
         identity_resolved_at=utc_now() if cnic else None,
         device_serial=evidence.terminal_serial,
@@ -133,7 +229,9 @@ def deliver_observation(
             "major": observation.major,
             "minor": observation.minor,
             "mapping_revision": policy.mapping_revision,
-            "identity_source": "TERMINAL_NAME_CNIC" if cnic else "MISSING_NAME_CNIC",
+            "identity_source": identity_source,
+            "identity_profile_version": user.row_version if user else None,
+            "identity_snapshot_revision": user.snapshot_revision if user else None,
             "timezone_assumed": observation.timezone_assumed,
         },
         ords_status=status,

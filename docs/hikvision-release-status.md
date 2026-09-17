@@ -11,7 +11,9 @@ version control in `local-data/hikvision/`.
 
 The operator explicitly accepted five-second polling instead of event streaming
 for this release. They also specified the existing ZKT identity convention:
-`name-CNIC` permits Oracle delivery; names without a valid CNIC remain held.
+`name-CNIC` permits Oracle delivery. A historical event with a plain name uses
+the exact employee number in a complete verified terminal-profile snapshot;
+missing mappings and observed employee-number reuse remain held.
 `name-S-CNIC` preserves the existing shift-worker convention. Neither names nor
 CNICs enter the deterministic event UID. A conflicting CNIC for an already
 received source event is quarantined for controlled identity repair.
@@ -113,3 +115,20 @@ empty snapshots. PostgreSQL upgrade through revision 0030 and schema comparison
 pass. The Hikvision ESP image builds with the periodic/manual profile reader;
 profile requests take precedence over full history while polling retains priority.
 These are build/host results, not a claim of flashed hardware acceptance.
+
+## Historical profile identity correction
+
+The retained 19,320-record diagnostic contains no CNIC-encoded event names,
+including its 3,641 face-code records. The name-CNIC rule therefore also resolves
+against the exact employee number in ADD's verified complete profile snapshot.
+Leading zeros remain significant, and names are never matched by similarity.
+Observed identifier reuse, conflicting identities, missing profiles and incomplete
+snapshots remain held. A bounded worker releases previously unmapped, unattempted
+outbox rows when verified profiles arrive; non-null attendance identities stay
+pinned. Snapshot references and profile versions are retained in attendance
+provenance without changing event UIDs.
+
+The Mac later switched to 172.20.10.3; the last verified terminal at
+192.168.18.31 became unreachable. Reconnection to the terminal LAN was requested.
+This prevents current physical end-to-end verification; earlier reachability does
+not establish current access.
