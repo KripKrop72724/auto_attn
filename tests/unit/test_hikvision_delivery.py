@@ -97,6 +97,34 @@ def test_encoded_name_does_not_require_a_separate_mapping_and_shift_is_preserved
     assert decrypt_cnic(row.cnic_encrypted) == "1234512345671"
 
 
+def test_oracle_worker_claims_encoded_identity_without_snapshot_or_mapping(db, monkeypatch):
+    from contextlib import contextmanager
+    from zk_add import worker
+    from zk_add.settings import settings
+
+    session, connector = db
+    policy(session, connector)
+    preserve_observation(session, connector, payload(name="Test-S-1234512345671"))
+    preserve_observation(session, connector, payload(serial=124, name="Unmapped"))
+    session.commit()
+    monkeypatch.setattr(settings, "identity_snapshot_gate_enabled", True)
+
+    @contextmanager
+    def local_session():
+        yield session
+        session.commit()
+
+    monkeypatch.setattr(worker, "session_scope", local_session)
+    claims = worker.claim_ords_batch(10)
+    assert len(claims) == 1
+    valid = session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 123))
+    held = session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 124))
+    assert claims[0][1]["event_uid"] == valid.event_uid
+    assert valid.device_user_id is None
+    assert session.get(OrdsOutbox, claims[0][0]).status == "IN_FLIGHT"
+    assert held.ords_status == "BLOCKED_IDENTITY"
+
+
 def test_same_source_with_a_different_encoded_cnic_is_held(db):
     session, connector = db
     policy(session, connector)
