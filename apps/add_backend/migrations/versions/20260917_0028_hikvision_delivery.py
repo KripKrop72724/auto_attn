@@ -9,6 +9,8 @@ depends_on = None
 
 
 def upgrade():
+    if "add_hikvision_policies" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "add_hikvision_policies",
         sa.Column("connector_id", sa.Integer(), sa.ForeignKey("add_connectors.id"), primary_key=True),

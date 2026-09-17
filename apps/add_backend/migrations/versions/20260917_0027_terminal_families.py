@@ -9,14 +9,20 @@ depends_on = None
 
 
 def upgrade():
+    inspector = sa.inspect(op.get_bind())
+    columns = {column["name"] for column in inspector.get_columns("add_connectors")}
     for name, size, default in (
         ("firmware_family", 16, "zkt"),
         ("terminal_vendor", 16, "zkt"),
         ("terminal_protocol", 24, "zkt_tcp"),
     ):
-        op.add_column("add_connectors", sa.Column(
-            name, sa.String(size), nullable=False, server_default=default,
-        ))
+        if name not in columns:
+            op.add_column("add_connectors", sa.Column(
+                name, sa.String(size), nullable=False, server_default=default,
+            ))
+    # Revision 0001 uses current metadata for fresh installations.
+    if "add_hikvision_evidence" in inspector.get_table_names():
+        return
     op.create_table(
         "add_hikvision_evidence",
         sa.Column("id", sa.Integer(), primary_key=True),
