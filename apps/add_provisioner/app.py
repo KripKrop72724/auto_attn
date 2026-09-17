@@ -113,6 +113,9 @@ def _factory_bundle(body: PackageRequest) -> tuple[dict, Path]:
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     if not hmac.compare_digest(hashlib.sha256(canonical).hexdigest(), body.bundle_manifest_sha256):
         raise ValueError("Factory manifest digest mismatch")
+    family = manifest.get("firmware_family", "zkt")
+    if family not in {"zkt", "hikvision"} or family != body.configuration.get("firmware_family", "zkt"):
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     if manifest.get("bundle_id") != body.bundle_id:
         raise ValueError("Factory bundle identity mismatch")
     if manifest.get("setup_password_supplied") is not True:
@@ -151,7 +154,8 @@ def _build_request(body: PackageRequest) -> dict:
         "recipient_public_key_b64": body.recipient_public_key,
         "wifi_ssid": config.get("wifi_ssid"),
         "wifi_password": config.get("wifi_password"),
-        "zkt_comm_key": config.get("communication_key"),
+        "firmware_family": config.get("firmware_family", "zkt"),
+        "zkt_comm_key": config.get("communication_key") or 0,
         "zkt_port": config.get("zkt_port", 4370),
         "zkt_preferred_ip": config.get("preferred_ip", "0.0.0.0"),
         "zkt_expected_serial": "",
@@ -160,6 +164,11 @@ def _build_request(body: PackageRequest) -> dict:
         "zone_name": config.get("zone_name"),
         "zkt_recovery_enabled": False,
     }
+    if values["firmware_family"] == "hikvision":
+        for key in ("hik_host", "hik_port", "hik_transport", "hik_username", "hik_password",
+                    "hik_expected_serial", "hik_profile", "hik_source_epoch", "hik_ca_pem"):
+            if key in config:
+                values[key] = config[key]
     return validate_request(values)
 
 

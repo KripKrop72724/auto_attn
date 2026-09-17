@@ -55,6 +55,25 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
             cJSON_AddNumberToObject(r, "serialNo", 30001 + (mode == 1 ? i : offset + i) * 2);
             cJSON_AddItemToArray(list, r);
         }
+    } else if (strstr(path, "/UserInfo/Search") && mode >= 20) {
+        cJSON *cond = cJSON_GetObjectItem(req, "UserInfoSearchCond");
+        unsigned position = (unsigned)cJSON_GetObjectItem(cond, "searchResultPosition")->valuedouble;
+        unsigned total = mode == 23 ? 0 : 33;
+        unsigned count = total ? (position ? 13 : 20) : 0;
+        cJSON *page = cJSON_AddObjectToObject(out, "UserInfoSearch");
+        cJSON_AddStringToObject(page, "searchID", cJSON_GetObjectItem(cond, "searchID")->valuestring);
+        cJSON_AddNumberToObject(page, "numOfMatches", count);
+        cJSON_AddNumberToObject(page, "totalMatches", mode == 21 && position ? 34 : total);
+        cJSON_AddStringToObject(page, "responseStatusStrg", !total ? "NO MATCH" : position ? "OK" : "MORE");
+        cJSON *list = cJSON_AddArrayToObject(page, "UserInfo");
+        for (unsigned i = 0; i < count; i++) {
+            cJSON *user = cJSON_CreateObject(); char employee[16];
+            snprintf(employee, sizeof(employee), "%05u", mode == 22 ? 1 : position + i + 1);
+            cJSON_AddStringToObject(user, "employeeNo", employee);
+            cJSON_AddStringToObject(user, "name", "Test profile");
+            cJSON_AddStringToObject(user, "userType", "normal");
+            cJSON_AddItemToArray(list, user);
+        }
     } else if (strstr(path, "/UserInfo/Search")) {
         cJSON *cond = cJSON_GetObjectItem(req, "UserInfoSearchCond");
         cJSON *page = cJSON_AddObjectToObject(out, "UserInfoSearch");
@@ -87,8 +106,32 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
     if (timeout_after_write && !strstr(path, "/Search") && !strstr(path, "/AcsEvent?")) return HIK_NETWORK;
     return HIK_OK;
 }
+static bool save_user(void *context, const char *raw, size_t length)
+{
+    if (context) return false;
+    cJSON *user = cJSON_ParseWithLength(raw, length); assert(user);
+    const char *employee = cJSON_GetObjectItem(user, "employeeNo")->valuestring;
+    assert(strlen(employee) == 5 && employee[0] == '0');
+    received++; cJSON_Delete(user); return true;
+}
+static void test_user_pages(void)
+{
+    hik_search_t scan; mode = 20; received = 0; hik_search_init(&scan, 1, 1);
+    assert(hik_user_page(&scan, save_user, (void *)1) == HIK_CUSTODY && !scan.position);
+    assert(hik_user_page(&scan, save_user, NULL) == HIK_OK && scan.position == 20 && !scan.complete);
+    mode = 21;
+    assert(hik_user_page(&scan, save_user, NULL) == HIK_PARSE && scan.position == 20);
+    mode = 20;
+    assert(hik_user_page(&scan, save_user, NULL) == HIK_OK && scan.complete && received == 33);
+    mode = 22; hik_search_init(&scan, 1, 1);
+    assert(hik_user_page(&scan, save_user, NULL) == HIK_PARSE && !scan.position);
+    mode = 23; hik_search_init(&scan, 1, 1);
+    assert(hik_user_page(&scan, save_user, NULL) == HIK_OK && scan.complete && !scan.total);
+    mode = 0; received = 0;
+}
 int main(void)
 {
+    test_user_pages();
     hik_search_t s;
     hik_search_init(&s, 30001, 330000);
     while (!s.complete) assert(hik_history_page(&s, saved, NULL) == HIK_OK);

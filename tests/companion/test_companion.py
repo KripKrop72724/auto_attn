@@ -148,6 +148,18 @@ def test_factory_manifest_signature_and_exact_inventory_are_verified():
         public_key_pem_b64=base64.b64encode(public_pem).decode(),
         expected_manifest_sha256=hashlib.sha256(canonical).hexdigest(),
     )
+    artifact["provisioning_manifest"] = {"aad": {"firmware_family": "hikvision"}}
+    try:
+        _verify_factory_artifact(
+            artifact,
+            public_key_pem_b64=base64.b64encode(public_pem).decode(),
+            expected_manifest_sha256=hashlib.sha256(canonical).hexdigest(),
+        )
+    except RuntimeError as error:
+        assert str(error) == "FIRMWARE_FAMILY_MISMATCH"
+    else:
+        raise AssertionError("Hikvision credentials paired with a ZKT image were accepted")
+    del artifact["provisioning_manifest"]
     artifact["images"][0]["offset"] = 0x21000
     try:
         _verify_factory_artifact(

@@ -25,6 +25,7 @@ import type { FirmwareSection } from '../types'
 type Toast = ReturnType<typeof useToast>
 
 const bundleSchema = z.object({
+  firmware_family: z.enum(['zkt', 'hikvision']).default('zkt'),
   bundle_id: z.string(),
   hardware_profile: z.string(),
   version: z.string(),
@@ -193,6 +194,23 @@ export const provisioningConfigurationSchema = z.object({
       'Use 1–120 UTF-8 bytes with no leading, trailing or control characters.',
     ),
 })
+export const hikvisionConfigurationSchema = provisioningConfigurationSchema.extend({
+  communication_key: z.string(),
+  hik_host: provisioningConfigurationSchema.shape.preferred_ip.refine(value => value !== '0.0.0.0', 'Enter the terminal address.'),
+  hik_port: provisioningConfigurationSchema.shape.zkt_port,
+  hik_transport: z.enum(['https', 'http_digest']),
+  hik_username: z.string().min(1).max(63),
+  hik_password: z.string().min(1).max(127),
+  hik_expected_serial: z.string().min(1).max(119),
+  hik_profile: z.string().min(1).max(79),
+  hik_source_epoch: z.string().min(1).max(64),
+  hik_ca_pem: z.string().max(4095),
+})
+const initialHikvision = {
+  hik_host: '', hik_port: '443', hik_transport: 'https' as 'https' | 'http_digest',
+  hik_username: '', hik_password: '', hik_expected_serial: '',
+  hik_profile: '', hik_source_epoch: '', hik_ca_pem: '',
+}
 type Configuration = z.infer<typeof provisioningConfigurationSchema>
 
 const terminalStates = new Set([
@@ -287,6 +305,9 @@ export default function FirmwareProvisioning({
   const [terminalPassword, setTerminalPassword] = useState('')
   const [typedMac, setTypedMac] = useState('')
   const [labelAcknowledged, setLabelAcknowledged] = useState(false)
+  const [firmwareFamily, setFirmwareFamily] = useState<'zkt' | 'hikvision'>('zkt')
+  const [hikvision, setHikvision] = useState(initialHikvision)
+  const family = current?.bundle?.firmware_family ?? firmwareFamily
   const [showWifi, setShowWifi] = useState(false)
   const [showCommKey, setShowCommKey] = useState(false)
   const [ipMode, setIpMode] = useState<'automatic' | 'fixed'>('automatic')
@@ -313,7 +334,7 @@ export default function FirmwareProvisioning({
     try {
       const [rawCapabilities, rawCompanions, rawSessions, rawDevices] =
         await Promise.all([
-          api<unknown>('/api/v1/provisioning/capabilities'),
+          api<unknown>(`/api/v1/provisioning/capabilities?firmware_family=${firmwareFamily}`),
           api<unknown>('/api/v1/provisioning/companions'),
           api<unknown>('/api/v1/provisioning/sessions?mine_only=true&limit=25'),
           api<unknown>('/api/v1/devices?limit=200'),
@@ -376,7 +397,7 @@ export default function FirmwareProvisioning({
     } finally {
       setLoading(false)
     }
-  }, [current, newSessionRequested, platform, toast, username])
+  }, [current, newSessionRequested, platform, toast, username, firmwareFamily])
 
   const refreshCurrent = useCallback(async () => {
     if (!current) return
@@ -431,6 +452,7 @@ export default function FirmwareProvisioning({
         wifi_password: '',
         communication_key: '',
       }))
+      setHikvision(value => ({ ...value, hik_password: '' }))
       setAdminPassword('')
       setPairingPassword('')
       setTerminalPassword('')
@@ -471,6 +493,7 @@ export default function FirmwareProvisioning({
           method: 'POST',
           body: JSON.stringify({
             companion_id: online.companion_id,
+            firmware_family: firmwareFamily,
             idempotency_key: idempotency('provisioning-session'),
           }),
         }),
@@ -509,8 +532,9 @@ export default function FirmwareProvisioning({
 
   const configure = async (event: FormEvent) => {
     event.preventDefault()
-    const parsed = provisioningConfigurationSchema.safeParse({
+    const parsed = (family === 'hikvision' ? hikvisionConfigurationSchema : provisioningConfigurationSchema).safeParse({
       ...draft,
+      ...hikvision,
       preferred_ip: ipMode === 'automatic' ? '0.0.0.0' : draft.preferred_ip,
     })
     if (!parsed.success) {
@@ -533,7 +557,9 @@ export default function FirmwareProvisioning({
             method: 'POST',
             body: JSON.stringify({
               ...parsed.data,
-              communication_key: Number(parsed.data.communication_key),
+              firmware_family: family,
+              ...(family === 'hikvision' ? { ...hikvision, hik_port: Number(hikvision.hik_port) } : {}),
+              communication_key: family === 'hikvision' ? null : Number(parsed.data.communication_key),
               zkt_port: Number(parsed.data.zkt_port),
             }),
           },
@@ -544,6 +570,7 @@ export default function FirmwareProvisioning({
         wifi_password: '',
         communication_key: '',
       }))
+      setHikvision(value => ({ ...value, hik_password: '' }))
       setCurrent(result)
     } catch (error) {
       if (error instanceof ApiError && Object.keys(error.fieldErrors).length)
@@ -748,13 +775,14 @@ export default function FirmwareProvisioning({
     : 0
   const updateDraft = (key: keyof Configuration, value: string) =>
     setDraft((currentValue) => ({ ...currentValue, [key]: value }))
-  const fieldError = (key: keyof Configuration) =>
+  const fieldError = (key: keyof Configuration | keyof typeof initialHikvision) =>
     errors[key] ? (
       <small id={`provision-${key}-error`} className="field-error">
         {errors[key]}
       </small>
     ) : null
   const beginAnother = () => {
+    setHikvision(initialHikvision)
     setNewSessionRequested(true)
     setCurrent(null)
     setErrors({})
@@ -1159,6 +1187,11 @@ export default function FirmwareProvisioning({
                   <span className="usb-line" />
                 </div>
                 <p className="eyebrow">STEP 2 · CONNECT</p>
+                <label>Terminal vendor
+                  <select value={firmwareFamily} onChange={event => setFirmwareFamily(event.target.value as 'zkt' | 'hikvision')}>
+                    <option value="zkt">ZKT</option><option value="hikvision">Hikvision</option>
+                  </select>
+                </label>
                 <h2 tabIndex={-1} ref={headingRef}>
                   {online
                     ? 'Plug in one ESP32-S3'
@@ -1298,7 +1331,28 @@ export default function FirmwareProvisioning({
                   {fieldError('wifi_password')}
                 </label>
               </fieldset>
-              <fieldset>
+              {family === 'hikvision' ? <fieldset>
+                <legend>Hikvision terminal</legend>
+                <p>Use the terminal's device account. Polling runs every five seconds.</p>
+                <label>Transport
+                  <select value={hikvision.hik_transport} onChange={event => setHikvision(value => ({ ...value, hik_transport: event.target.value as 'https' | 'http_digest', hik_port: event.target.value === 'https' ? '443' : '80' }))}>
+                    <option value="https">HTTPS</option><option value="http_digest">HTTP Digest — trusted LAN only</option>
+                  </select>
+                </label>
+                {([
+                  ['hik_host', 'Terminal IPv4 address'], ['hik_port', 'Terminal port'],
+                  ['hik_username', 'Device username'], ['hik_password', 'Device password'],
+                  ['hik_expected_serial', 'Expected terminal serial'],
+                  ['hik_profile', 'Qualified installation profile'],
+                  ['hik_source_epoch', 'Verified history epoch'],
+                ] as const).map(([key, label]) => <label key={key}>{label}
+                  <input id={`provision-${key}`} type={key === 'hik_password' ? 'password' : 'text'} autoComplete="off" value={hikvision[key]} onChange={event => setHikvision(value => ({ ...value, [key]: event.target.value }))} aria-invalid={Boolean(errors[key])} />
+                  {fieldError(key)}
+                </label>)}
+                {hikvision.hik_transport === 'https' && <label>Terminal CA certificate (PEM, if private)
+                  <textarea value={hikvision.hik_ca_pem} onChange={event => setHikvision(value => ({ ...value, hik_ca_pem: event.target.value }))} />
+                </label>}
+              </fieldset> : <fieldset>
                 <legend>ZKT terminal</legend>
                 <label>
                   Communication key
@@ -1396,7 +1450,7 @@ export default function FirmwareProvisioning({
                     {fieldError('preferred_ip')}
                   </label>
                 )}
-              </fieldset>
+              </fieldset>}
               <fieldset>
                 <legend>Site identity</legend>
                 <div className="form-grid">

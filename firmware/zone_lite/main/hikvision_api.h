@@ -14,6 +14,8 @@ hik_result_t hik_history_page(hik_search_t *, hik_record_fn, void *);
 hik_result_t hik_history_bounds(uint32_t *first, uint32_t *last, uint32_t *count);
 hik_result_t hik_history_response(const cJSON *request, cJSON **response);
 hik_result_t hik_user_read(const char *employee, cJSON **profile);
+/* Bounded profile enumeration. A caller publishes only a complete stable scan. */
+hik_result_t hik_user_page(hik_search_t *, hik_record_fn, void *);
 /* desired_profile is the approved installation profile, not inferred rights.
  * A failed write response requires readback before a caller retries. */
 hik_result_t hik_user_create(const cJSON *desired_profile, bool *verified);

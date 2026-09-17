@@ -206,6 +206,58 @@ hik_result_t hik_user_read(const char *employee, cJSON **profile)
     cJSON_Delete(response);
     return result;
 }
+hik_result_t hik_user_page(hik_search_t *search, hik_record_fn fn, void *context)
+{
+    if (!search || !fn || !search->search_id[0] || search->position > 3000) return HIK_CONFIGURATION;
+    if (search->complete) return HIK_OK;
+    cJSON *body = cJSON_CreateObject();
+    cJSON *condition = body ? cJSON_AddObjectToObject(body, "UserInfoSearchCond") : NULL;
+    bool valid = condition && cJSON_AddStringToObject(condition, "searchID", search->search_id) &&
+        cJSON_AddNumberToObject(condition, "searchResultPosition", search->position) &&
+        cJSON_AddNumberToObject(condition, "maxResults", 20);
+    cJSON *response = NULL;
+    hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
+        "/ISAPI/AccessControl/UserInfo/Search?format=json", body, &response) : HIK_NETWORK;
+    cJSON_Delete(body);
+    if (result != HIK_OK) return result;
+    cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "UserInfoSearch");
+    cJSON *users = cJSON_GetObjectItemCaseSensitive(page, "UserInfo");
+    const char *id = string(page, "searchID"), *status = string(page, "responseStatusStrg");
+    uint32_t count = 0, total = 0;
+    valid = id && !strcmp(id, search->search_id) && status &&
+        integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) &&
+        integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &total) &&
+        total <= 3000 && count <= 20 && search->position + count <= total &&
+        count == (uint32_t)cJSON_GetArraySize(users) &&
+        (!count || cJSON_IsArray(users)) &&
+        (!search->total_known || search->total == total);
+    if (valid) {
+        bool last = search->position + count == total;
+        valid = !total ? !strcmp(status, "NO MATCH") :
+            count && !strcmp(status, last ? "OK" : "MORE");
+    }
+    for (uint32_t i = 0; valid && i < count; i++) {
+        cJSON *user = cJSON_GetArrayItem(users, (int)i);
+        const char *employee = string(user, "employeeNo"), *name = string(user, "name");
+        valid = employee_valid(employee) && name && strlen(name) <= 128;
+        for (uint32_t j = 0; valid && j < i; j++) {
+            const char *other = string(cJSON_GetArrayItem(users, (int)j), "employeeNo");
+            valid = other && strcmp(other, employee);
+        }
+    }
+    if (!valid) result = HIK_PARSE;
+    for (uint32_t i = 0; result == HIK_OK && i < count; i++) {
+        char *raw = cJSON_PrintUnformatted(cJSON_GetArrayItem(users, (int)i));
+        if (!raw || !fn(context, raw, strlen(raw))) result = HIK_CUSTODY;
+        free(raw);
+    }
+    if (result == HIK_OK) {
+        search->total = total; search->total_known = true;
+        search->position += count; search->complete = search->position == total;
+    }
+    cJSON_Delete(response);
+    return result;
+}
 static hik_result_t submit(esp_http_client_method_t method, const char *path, const char *root_name, const cJSON *value)
 {
     cJSON *body = cJSON_CreateObject();

@@ -75,6 +75,26 @@ def test_shared_configuration_boundaries_and_public_metadata():
     )
 
 
+def test_hikvision_provisioning_requires_binding_and_preserves_protected_fields():
+    values = valid_configuration(
+        firmware_family="hikvision", communication_key=None,
+        hik_host="192.168.10.20", hik_port=80, hik_transport="http_digest",
+        hik_username="test-user", hik_password="test-only-device-password",
+        hik_expected_serial="terminal-1", hik_profile="qualified-profile",
+        hik_source_epoch="verified-epoch-1",
+    )
+    configuration = ProvisioningConfiguration.model_validate(values)
+    assert configuration.model_dump()["hik_password"] == values["hik_password"]
+    assert "hik_password" not in configuration.public_metadata()
+    assert values["hik_password"] not in repr(configuration)
+    assert configuration.public_metadata()["firmware_family"] == "hikvision"
+    for override in ({"hik_source_epoch": ""}, {"hik_expected_serial": ""},
+                     {"hik_host": "8.8.8.8"}, {"hik_password": ""},
+                     {"firmware_family": "zkt", "communication_key": 0}):
+        with pytest.raises(ValidationError):
+            ProvisioningConfiguration.model_validate({**values, **override})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

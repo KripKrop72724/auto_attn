@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { provisioningActiveStep, provisioningConfigurationSchema } from './FirmwareProvisioning'
+import { provisioningActiveStep, provisioningConfigurationSchema, hikvisionConfigurationSchema } from './FirmwareProvisioning'
 
 const valid = {
   wifi_ssid: 'State Life Office', wifi_password: 'correct horse battery staple',
@@ -30,5 +30,27 @@ describe('physical provisioning contract', () => {
     ['zone_id', 'has spaces'], ['zone_name', ' trailing '],
   ])('rejects unsafe %s values', (field, value) => {
     expect(provisioningConfigurationSchema.safeParse({ ...valid, [field]: value }).success).toBe(false)
+  })
+})
+
+
+describe('Hikvision provisioning', () => {
+  const hikvision = { ...valid, communication_key: '', hik_host: '192.168.10.20',
+    hik_port: '80', hik_transport: 'http_digest', hik_username: 'admin',
+    hik_password: 'test-only-secret', hik_expected_serial: 'terminal-1',
+    hik_profile: 'qualified-profile', hik_source_epoch: 'verified-epoch', hik_ca_pem: '',
+  }
+  it('accepts device credentials without a ZKT communication key', () => {
+    expect(hikvisionConfigurationSchema.safeParse(hikvision).success).toBe(true)
+  })
+  it.each(['hik_expected_serial', 'hik_source_epoch', 'hik_password', 'hik_profile'])(
+    'requires %s before preflight', key => {
+      expect(hikvisionConfigurationSchema.safeParse({ ...hikvision, [key]: '' }).success).toBe(false)
+    },
+  )
+  it('rejects automatic discovery and public addresses', () => {
+    for (const hik_host of ['0.0.0.0', '8.8.8.8']) {
+      expect(hikvisionConfigurationSchema.safeParse({ ...hikvision, hik_host }).success).toBe(false)
+    }
   })
 })

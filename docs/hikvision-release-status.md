@@ -42,7 +42,11 @@ instead of the two streaming gates. Other release gates have not been waived.
   holds, same-source identity conflict quarantine and no fabricated IN/OUT.
 - Dashboard polling health, queue depth, last successful check and source serial;
   ZKT-only COMM Key and restart controls are hidden on Hikvision devices.
-- Verified low-level user CRUD helpers and bounded multipart parsing exist.
+- Physical provisioning now selects a firmware family end to end, validates Hikvision
+  LAN/credential/binding fields, forwards them to encrypted NVS, and rejects
+  cross-family artifacts in both the worker and USB companion. The dashboard
+  provides a Hikvision installation form.
+- Verified low-level user CRUD helpers, bounded paginated profile reads and multipart parsing exist.
   Full vendor-profile snapshot/CRUD dispatch and its UI workflow remain incomplete.
 
 ## Hardware observations
@@ -64,7 +68,7 @@ synthetic and transaction/replay tests; it has not completed a production job.
 - Exact-device ESP polling, restart/power-loss recovery, contention, heap/storage
   pressure, signed OTA rollback, end-to-end ADD/Oracle receipts and full source job.
 - Complete user snapshot and verified CRUD dispatch, profile qualification,
-  capability-driven user controls and physical provisioning API/UI integration.
+  capability-driven user controls, and hardware validation of the provisioning path.
 - Final hardware qualification and the required 72-hour soak.
 
 ## Concrete release dependency
@@ -82,3 +86,20 @@ is not an AVAILABLE production release.
 
 See [hardware observations](hikvision-ds-k1t342efwx-v3.3.5-observations.md) and
 [qualification procedure](hikvision-qualification.md).
+
+## CI correction and latest verification
+
+The fresh PostgreSQL migration failure was caused by historical revision 0001
+creating current model metadata before the additive Hikvision revisions ran.
+Revisions 0027–0029 now inspect existing columns/tables consistently with the
+repository's bootstrap convention. Fresh PostgreSQL upgrade and Alembic schema
+checks pass; regression tests cover both bootstrap and existing-install shapes.
+GitHub run 35242434114 passed all five checks for commit bfd34dc.
+
+Subsequent provisioning integration passes local regression (711 tests before the
+additional protected-worker test, which also passes), 106 frontend tests, frontend
+build and scoped lint. The connected ESP was reidentified at USB port
+`/dev/cu.usbmodem1101` with the expected MAC; no flash or eFuse write was performed.
+The serial-bound Hikvision terminal remains reachable. Full verified CRUD dispatch,
+physical end-to-end delivery/recovery, retained-history job completion and 72-hour
+soak remain release gates. Green CI alone does not prove those results.
