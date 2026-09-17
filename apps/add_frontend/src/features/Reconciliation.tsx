@@ -467,11 +467,11 @@ function JobDetailDrawer({
               </div>
               <div>
                 <dt>Source epoch</dt>
-                <dd>{job.recovery?.source_epoch ?? 1}</dd>
+                <dd>{job.mode === 'HIKVISION_SERIAL_HISTORY' ? job.recovery?.source_epoch_id || 'Pending' : job.recovery?.source_epoch ?? 1}</dd>
               </div>
               <div>
-                <dt>Committed next ordinal</dt>
-                <dd>{job.checkpoint?.next_ordinal?.toLocaleString() ?? '—'}</dd>
+                <dt>{job.mode === 'HIKVISION_SERIAL_HISTORY' ? 'Committed source serial' : 'Committed next ordinal'}</dt>
+                <dd>{(job.checkpoint?.source_serial ?? job.checkpoint?.next_ordinal)?.toLocaleString() ?? '—'}</dd>
               </div>
               <div>
                 <dt>Chain digest</dt>
@@ -1719,7 +1719,7 @@ export function ReconciliationView({
                       }
                     />
                     <span>
-                      <strong>ZKT terminal</strong>
+                      <strong>{selected.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'ZKT terminal'}</strong>
                       <small>
                         {preflight.terminal?.connection_state ||
                           'No terminal evidence'}{' '}
@@ -1730,28 +1730,28 @@ export function ReconciliationView({
                   <article>
                     <Icon
                       name={
-                        preflight.terminal?.range_resume_verified
+                        (preflight.source_protocol === 'hikvision-isapi-v1' ? preflight.terminal?.serial_search_enabled : preflight.terminal?.range_resume_verified)
                           ? 'check'
                           : 'alert'
                       }
                     />
                     <span>
-                      <strong>Range-resume firmware</strong>
+                      <strong>{preflight.source_protocol === 'hikvision-isapi-v1' ? 'Serial-source search' : 'Range-resume firmware'}</strong>
                       <small>
-                        {preflight.terminal?.range_resume_verified
-                          ? 'Verified for restart-safe reads'
+                        {(preflight.source_protocol === 'hikvision-isapi-v1' ? preflight.terminal?.serial_search_enabled : preflight.terminal?.range_resume_verified)
+                          ? (preflight.source_protocol === 'hikvision-isapi-v1' ? 'Enabled; coverage verified per job' : 'Verified for restart-safe reads')
                           : 'Not verified'}
                       </small>
                     </span>
                   </article>
                   <article>
                     <Icon
-                      name={selected.zkt?.snapshot_complete ? 'check' : 'alert'}
+                      name={selected.firmware_family === 'hikvision' || selected.zkt?.snapshot_complete ? 'check' : 'alert'}
                     />
                     <span>
-                      <strong>Identity snapshot</strong>
+                      <strong>{selected.firmware_family === 'hikvision' ? 'Name-CNIC identity' : 'Identity snapshot'}</strong>
                       <small>
-                        {selected.zkt?.snapshot_complete
+                        {selected.firmware_family === 'hikvision' ? 'Valid name-CNIC records may proceed; missing identities are held' : selected.zkt?.snapshot_complete
                           ? 'Complete snapshot available'
                           : 'Incomplete; identity safety may block'}
                       </small>
@@ -2079,13 +2079,13 @@ export function ReconciliationView({
                       <div>
                         <dt>Checkpoint</dt>
                         <dd>
-                          {job.checkpoint?.next_ordinal?.toLocaleString() ??
+                          {(job.checkpoint?.source_serial ?? job.checkpoint?.next_ordinal)?.toLocaleString() ??
                             job.progress.scanned.toLocaleString()}
                         </dd>
                       </div>
                       <div>
                         <dt>Source epoch</dt>
-                        <dd>{job.recovery?.source_epoch ?? 1}</dd>
+                        <dd>{job.mode === 'HIKVISION_SERIAL_HISTORY' ? job.recovery?.source_epoch_id || 'Pending' : job.recovery?.source_epoch ?? 1}</dd>
                       </div>
                       <div>
                         <dt>Assignment</dt>

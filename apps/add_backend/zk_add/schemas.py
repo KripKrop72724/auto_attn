@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -18,6 +18,7 @@ class StepUpRequest(BaseModel):
 
 
 class OnboardRequest(BaseModel):
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
     hardware_id: str = Field(min_length=17, max_length=17)
     zone_id: str = Field(min_length=1, max_length=100)
     zone_name: str = Field(min_length=1, max_length=255)
@@ -108,7 +109,33 @@ class FirmwareDiagnostics(BaseModel):
     committed_source_cursor: int | None = Field(default=None, ge=0)
 
 
+class HikvisionTerminalPayload(BaseModel):
+    schema_version: Literal[2]
+    vendor: Literal["hikvision"]
+    protocol: Literal["isapi"]
+    serial: str = Field(min_length=1, max_length=120)
+    ip_address: str = Field(max_length=64)
+    capability_profile: str = Field(max_length=80)
+    qualification_state: Literal["NOT_QUALIFIED"]
+    online: bool
+    connection_state: Literal["ONLINE", "OFFLINE"]
+    stream_open: bool
+    stream_error: int = Field(ge=0)
+    current_event_count: int = Field(ge=0)
+    replay_event_count: int = Field(ge=0)
+    last_stream_message_epoch: int = Field(ge=0)
+    source_storage_failures: int = Field(ge=0)
+    source_queue_depth: int | None = Field(default=None, ge=0)
+    capture_mode: Literal["stream", "poll"] = "stream"
+    poll_interval_seconds: Literal[5] | None = None
+    last_successful_poll_epoch: int | None = Field(default=None, ge=0)
+    poll_error: int | None = Field(default=None, ge=0)
+    durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
+    full_history_required: bool = True
+
+
 class HeartbeatPayload(BaseModel):
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
     firmware_version: str | None = None
     config_version: int = 1
     comm_key_management: bool = False
@@ -122,6 +149,15 @@ class HeartbeatPayload(BaseModel):
     ota: OtaHeartbeatPayload = Field(default_factory=OtaHeartbeatPayload)
     diagnostics: FirmwareDiagnostics | None = None
     zkt: dict[str, Any] = Field(default_factory=dict)
+    terminal: HikvisionTerminalPayload | None = None
+
+    @model_validator(mode="after")
+    def family_payload(self):
+        if self.firmware_family == "hikvision" and (self.terminal is None or self.zkt):
+            raise ValueError("Hikvision requires a versioned terminal payload")
+        if self.firmware_family == "zkt" and self.terminal is not None:
+            raise ValueError("Legacy ZKT does not accept Hikvision terminal metadata")
+        return self
 
 
 class UserSnapshotRow(BaseModel):
@@ -804,3 +840,15 @@ class CommandUpdate(BaseModel):
 
 class AlertAcknowledgeRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
+
+
+class HikvisionPolicyRequest(BaseModel):
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    source_epoch: str = Field(min_length=1, max_length=64)
+    profile_id: str = Field(min_length=1, max_length=80)
+    success_codes: list[list[StrictInt]] = Field(min_length=1, max_length=32)
+    excluded_codes: list[list[StrictInt]] = Field(default_factory=list, max_length=256)
+    enabled: bool = False
+    reason: str = Field(min_length=10, max_length=500)
+    password: SecretStr
+    idempotency_key: str = Field(min_length=8, max_length=120)

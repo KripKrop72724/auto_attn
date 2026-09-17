@@ -51,7 +51,7 @@ export function DeviceDrawer({
       api<Device>(`/api/v1/devices/${seed.connector_id}`),
       api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=250`),
       api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=40`),
-      api<CommKeyState>(`/api/v1/devices/${seed.connector_id}/comm-key`),
+      seed.firmware_family === 'hikvision' ? Promise.resolve(null) : api<CommKeyState>(`/api/v1/devices/${seed.connector_id}/comm-key`),
     ])
     setDevice(detail)
     setLogs(logResult.rows)
@@ -263,7 +263,17 @@ export function DeviceDrawer({
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">ZKT TERMINAL</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
-          <article className="detail-card">
+          {device.firmware_family === 'hikvision' ? <article className="detail-card">
+            <p className="eyebrow">HIKVISION CAPTURE HEALTH</p>
+            <h3>{device.hikvision?.capture_mode === 'poll' ? '5-second polling' : 'Awaiting capture telemetry'}</h3>
+            <dl>
+              <div><dt>Last successful check</dt><dd>{device.hikvision?.last_successful_poll_epoch ? relativeTime(new Date(device.hikvision.last_successful_poll_epoch * 1000).toISOString()) : 'Not reported'}</dd></div>
+              <div><dt>Queued source records</dt><dd>{device.hikvision?.source_queue_depth ?? 'Not reported'}</dd></div>
+              <div><dt>Saved event serial</dt><dd>{device.hikvision?.durable_poll_cursor ?? 'Not reported'}</dd></div>
+              <div><dt>Polling status</dt><dd>{device.hikvision?.poll_error === 0 ? 'Healthy' : 'Awaiting a successful check'}</dd></div>
+            </dl>
+            <p>Full retained-history coverage and Oracle assurance are reported in Reconciliation.</p>
+          </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
             <h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3>
             <p>{device.zkt?.user_count ?? '—'} users{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : ` · Last full reconciliation ${relativeTime(device.zkt?.last_reconcile_at)}`}</p>
@@ -288,14 +298,14 @@ export function DeviceDrawer({
                 <dd>{Number(device.zkt?.capabilities.history_failed_windows || 0)}</dd>
               </div>
             </dl>}
-          </article>
+          </article>}
           <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} />
           {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
         </div>}
         {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${statusPattern(row.level)}`}><time>{dateTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}
         {tab === 'control' && <div className="control-stack">
-          <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
+          <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>{device.firmware_family === 'hikvision' ? 'Manage employee profiles and ADD identity mappings. Biometric enrollment takes place on the terminal.' : 'Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.'}</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
           <article className="control-card"><span><Icon name="refresh" /></span><div><h3>Refresh terminal users</h3><p>Request two matching terminal reads. Current verified revision: {device.zkt?.identity_snapshot_revision || 'none'} · {device.zkt?.identity_snapshot_stable ? 'stable' : 'awaiting verification'}{device.zkt?.identity_snapshot_observed_at ? ` · ${relativeTime(device.zkt.identity_snapshot_observed_at)}` : ''}.</p></div><button className="button secondary" onClick={() => void refreshUsers()}>Request verified reread</button></article>
           {terminalReplacementNeeded && <article className="control-card pattern-blocked"><span><Icon name="shield" /></span><div>
             <h3>Replace terminal binding</h3>
@@ -304,7 +314,7 @@ export function DeviceDrawer({
             <label>Type <strong>REPLACE {device.connector_id} {currentBindingSerial} {observedTerminalSerial}</strong><input value={replacementConfirmation} onChange={(event) => setReplacementConfirmation(event.target.value)} /></label>
             <label>Confirm administrator password<input type="password" autoComplete="current-password" value={replacementPassword} onChange={(event) => setReplacementPassword(event.target.value)} /></label>
           </div><button className="button destructive" disabled={busy} onClick={() => void replaceTerminalBinding()}>{busy ? 'Authorizing…' : 'Replace binding'}</button></article>}
-          <article className="control-card comm-key-card"><span><Icon name="shield" /></span><div>
+          {device.firmware_family !== 'hikvision' && <article className="control-card comm-key-card"><span><Icon name="shield" /></span><div>
             <h3>COMM Key recovery</h3>
             <p>
               State <strong>{commKeyState?.management_state || 'LOADING'}</strong> · applied revision {commKeyState?.applied_revision ?? 0} · desired revision {commKeyState?.desired_revision ?? 0}
@@ -341,8 +351,8 @@ export function DeviceDrawer({
                 <button className="button secondary" disabled={busy} onClick={() => void revealCommKey()}>Reveal for 15 seconds</button>
               </>}
             </div>}
-          </div></article>
-          <article className="control-card pattern-blocked"><span><Icon name="power" /></span><div><h3>Restart ZKT terminal</h3><p>Issues an authenticated protocol restart. Active enrollment leases block this operation.</p><label>Reason<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label></div><button className="button destructive" disabled={busy} onClick={() => void restart()}>{busy ? 'Queuing…' : 'Restart terminal'}</button></article>
+          </div></article>}
+          {device.firmware_family !== 'hikvision' && <article className="control-card pattern-blocked"><span><Icon name="power" /></span><div><h3>Restart ZKT terminal</h3><p>Issues an authenticated protocol restart. Active enrollment leases block this operation.</p><label>Reason<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label></div><button className="button destructive" disabled={busy} onClick={() => void restart()}>{busy ? 'Queuing…' : 'Restart terminal'}</button></article>}
           {device.active_command && <CommandProgress command={device.active_command} onCancel={cancelCommand} />}
         </div>}
       </div>

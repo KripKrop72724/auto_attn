@@ -286,6 +286,15 @@ jobs:
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
           bash -lc 'rm -rf build-ci && idf.py -B build-ci -D SDKCONFIG=/tmp/zone-lite-ci-sdkconfig build'
+      - name: Build dedicated Hikvision ESP32-S3 firmware
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project/firmware/zone_lite
+          espressif/idf:v5.5.3
+          bash -lc 'idf.py -B build-ci-hikvision -D SDKCONFIG=/tmp/zone-lite-ci-hikvision-sdkconfig -D ZONE_LITE_FAMILY=hikvision build'
+      - name: Check Hikvision application family descriptor
+        run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-hikvision/zone_lite_hikvision.bin --family hikvision
       - name: Upload non-provisioned firmware build (best effort)
         # The build above is the release gate. Artifact retention is convenient for
         # diagnostics, but GitHub storage exhaustion must not block an unrelated ADD

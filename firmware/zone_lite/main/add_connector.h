@@ -7,13 +7,13 @@
 typedef struct {
     char command_id[48];
     char command_type[32];
-    char uid[16];
-    char user_id[32];
+    char uid[41];
+    char user_id[101];
     char user_key[48];
-    char name[64];
+    char name[257];
     char lease_id[48];
     char expected_serial[80];
-    char expected_name[64];
+    char expected_name[257];
     char expected_terminal_identity_fingerprint[65];
     char expected_terminal_state_fingerprint[65];
     char tombstone_display_name[256];
@@ -147,6 +147,8 @@ bool add_connector_has_pending_config_command(void);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
 bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out);
+/* JSON assignment is bounded independently of the ZKT ordinal contract. */
+bool add_connector_take_hikvision_assignment(char out[2048]);
 bool add_connector_has_reconcile_assignment(void);
 bool add_connector_take_source_coverage(add_source_coverage_t *out);
 void add_connector_command_retry(const char *command_id);

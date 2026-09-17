@@ -34,6 +34,9 @@ from zk_add.db import Base
 from zk_add.models import Connector, utc_column
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
+from zk_add.terminal_families import (
+    firmware_family, release_family, require_production_qualification,
+)
 
 HARDWARE_PROFILE = "esp32s3-16mb-zone-lite-v1"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -482,7 +485,8 @@ def semver_key(value: str) -> tuple[int, int, int, int, tuple[tuple[int, str], .
     )
 
 
-def latest_factory_bundle(session: Session) -> FactoryFirmwareBundle | None:
+def latest_factory_bundle(session: Session, family: str = "zkt") -> FactoryFirmwareBundle | None:
+    family = firmware_family(family)
     sync_factory_bundle_store(session)
     rows = session.scalars(
         select(FactoryFirmwareBundle).where(
@@ -491,7 +495,8 @@ def latest_factory_bundle(session: Session) -> FactoryFirmwareBundle | None:
             FactoryFirmwareBundle.setup_password_supplied.is_(True),
         )
     ).all()
-    return max(rows, key=lambda row: semver_key(row.version), default=None)
+    compatible = [row for row in rows if release_family(row.manifest) == family]
+    return max(compatible, key=lambda row: semver_key(row.version), default=None)
 
 
 def _verify_factory_manifest(manifest: dict[str, Any], signature: str) -> None:
@@ -524,6 +529,7 @@ def sync_factory_bundle_store(session: Session) -> None:
         signature_path = manifest_path.with_name("manifest.sig")
         signature = signature_path.read_text(encoding="ascii").strip()
         _verify_factory_manifest(manifest, signature)
+        release_family(manifest)
         if manifest.get("hardware_profile") != settings.provisioning_hardware_profile:
             continue
         if manifest.get("partition_layout") != "zone-lite-factory-v1":
@@ -563,6 +569,8 @@ def sync_factory_bundle_store(session: Session) -> None:
             raise RuntimeError("Factory bundle identity or semantic version is invalid.")
         marker = manifest_path.with_name(".hil-only.json")
         desired_state = "HIL_ONLY" if marker.is_file() else "AVAILABLE"
+        if desired_state == "AVAILABLE":
+            require_production_qualification(manifest)
         key = (settings.provisioning_hardware_profile, version)
         if desired_state == "AVAILABLE" and key in observed_available:
             raise RuntimeError("More than one AVAILABLE factory bundle exists for a version.")

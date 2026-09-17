@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$UnsignedDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitSha
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitSha,
+    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,7 +86,10 @@ foreach ($path in @($cipherPath, $entropyPath, $publicPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Firmware vault is missing $path" }
 }
 
-$sourceImage = Join-Path $unsigned 'zone_lite.bin'
+$projectName = $(if ($FirmwareFamily -eq 'hikvision') { 'zone_lite_hikvision' } else { 'zone_lite' })
+$sourceImage = Join-Path $unsigned "$projectName.bin"
+& python scripts/check_firmware_identity.py $sourceImage --family $FirmwareFamily --version $Version
+if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release metadata' }
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
@@ -131,6 +135,7 @@ try {
         application_sha256 = $applicationHash
         created_at = [DateTime]::UtcNow.ToString('o')
         esp_idf_version = '5.5.3'
+        firmware_family = $FirmwareFamily
         git_sha = $GitSha
         hardware = 'esp32-s3-zone-lite'
         image_name = "zone-lite-$Version.bin"
@@ -138,7 +143,8 @@ try {
         image_size = $size
         minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
-        release_id = "zone-lite-$Version"
+        project_name = $projectName
+        release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
         schema_version = 2
         secure_boot = 'v2'
         signing_key_id = $keyId

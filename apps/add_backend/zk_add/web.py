@@ -31,6 +31,8 @@ from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add.audit import append_audit
+from zk_add.hikvision_evidence import ObservationIn, preserve_observation
+from zk_add.schemas import HikvisionPolicyRequest
 from zk_add.attendance_batches import (
     attendance_quarantine_item,
     attendance_quarantine_summary,
@@ -580,6 +582,7 @@ async def onboard(
         zone_name=body.zone_name,
         device_id=body.device_id,
         firmware_version=body.firmware_version,
+        firmware_family=body.firmware_family,
         expected_serial=body.expected_serial,
         actor=f"esp:{header_mac}",
         ip_address=client_ip(request),
@@ -1090,6 +1093,27 @@ def reconciliation_or_404(db: Session, job_id: str) -> ReconciliationJob:
     if row is None:
         raise HTTPException(status_code=404, detail="Reconciliation job not found.")
     return row
+
+
+@app.put("/api/v1/devices/{connector_id}/hikvision-policy")
+def configure_hikvision_policy(
+    connector_id: str,
+    body: HikvisionPolicyRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hikvision_delivery import configure_policy
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        policy = configure_policy(db, connector, actor=context.username,
+                                  **body.model_dump(exclude={"password"}))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {"enabled": policy.enabled, "profile_id": policy.profile_id,
+            "mapping_revision": policy.mapping_revision, "capture_mode": "poll",
+            "poll_interval_seconds": 5, "identity_rule": "name-cnic"}
 
 
 @app.get("/api/v1/devices/{connector_id}/reconciliations/preflight")
@@ -3305,6 +3329,16 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
             )
+        elif envelope.type == "hikvision_history_page":
+            from zk_add.hikvision_reconciliation import apply_page
+            receipt = apply_page(db, connector, envelope.payload)
+            ack_payload = {"type": "ack", "message_id": envelope.message_id, **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        elif envelope.type == "hikvision_observation":
+            receipt = preserve_observation(db, connector, ObservationIn.model_validate(envelope.payload))
+            ack_payload = {"type": "hikvision_observation_ack", "message_id": envelope.message_id,
+                           **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         elif envelope.type == "queue_evidence":
             evidence = preserve_queue_evidence(
                 db, connector, QueueEvidenceRequest.model_validate(envelope.payload)

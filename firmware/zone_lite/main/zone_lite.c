@@ -59,6 +59,10 @@
 #include "runtime_checkpoint.h"
 #include "legacy_queue.h"
 #include "queue_store.h"
+#include "firmware_family.h"
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+#include "hikvision_runtime.h"
+#endif
 
 #ifndef ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED
 #define ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED 0
@@ -9153,6 +9157,10 @@ static bool process_pending_comm_key_command(void)
 
 static void gateway_task(void *arg)
 {
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    hikvision_gateway_task(arg);
+    return;
+#endif
     (void)arg;
     uint32_t discovery_failures = 0;
     int64_t last_zkt_reboot_ms = 0;

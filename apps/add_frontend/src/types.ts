@@ -157,7 +157,21 @@ export interface FirmwareDiagnostics {
   committed_source_cursor?: number | null
 }
 
+export interface HikvisionHealth {
+  capture_mode: 'stream' | 'poll'
+  poll_interval_seconds?: number
+  last_successful_poll_epoch?: number
+  poll_error?: number
+  durable_poll_cursor?: number
+  source_queue_depth?: number
+  full_history_required?: boolean
+  qualification_state: string
+}
+
 export interface Device {
+  firmware_family?: 'zkt' | 'hikvision'
+  terminal_vendor?: 'zkt' | 'hikvision'
+  hikvision?: HikvisionHealth | null
   connector_id: string
   hardware_id: string
   zone_id: string
@@ -257,6 +271,7 @@ export interface Overview {
 }
 
 export interface ReconciliationPreflight {
+  source_protocol?: string
   eligible: boolean
   ready_now: boolean
   hard_blockers: Array<{ code: string; message: string }>
@@ -268,6 +283,7 @@ export interface ReconciliationPreflight {
     user_count: number | null
     connection_state: string
     range_resume_verified: boolean
+    serial_search_enabled?: boolean
   }
   coverage: ReconciliationCoverage | null
 }
@@ -442,7 +458,9 @@ export interface ReconciliationJob {
     auto_retry_count?: number
   }
   checkpoint?: {
-    next_ordinal: number
+    next_ordinal: number | null
+    source_serial?: number | null
+    source_pass?: string
     chain_digest: string | null
     last_progress_at: string | null
   }

@@ -17,7 +17,7 @@ static SemaphoreHandle_t budget_lock;
 static qs_health_t health;
 static storage_budget_t budget;
 static char storage_generation[33];
-static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe"};
+static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe", "qh"};
 static bool ensure_storage_generation(void)
 {
     if (storage_generation[0]) return true;

@@ -2,17 +2,20 @@
 from pathlib import Path
 import shutil
 import subprocess
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_installer_persists_before_slot_selection_and_restores_bad_images(tmp_path):
+@pytest.mark.parametrize("hikvision", [0, 1])
+def test_installer_persists_before_slot_selection_and_restores_bad_images(tmp_path, hikvision):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "ota_manager.c").read_text()
     start = source.index("static bool perform_update(void)\n{")
     production = source[start:source.index("static void wait_for_zkt_safepoint(void)\n{", start)]
     harness = r'''
 #include "ota_checkpoint.h"
+#include "firmware_family.h"
 #include <assert.h>
 #include <stdio.h>
 #define ESP_OK 0
@@ -38,7 +41,7 @@ static int esp_ota_set_boot_partition(const esp_partition_t *p){assert(p==&runni
 static int esp_https_ota_begin(const esp_https_ota_config_t *c,esp_https_ota_handle_t *h)
 {assert(c->http_config->url);if(stage==1)return -1;handle_live=true;*h=&target;return 0;}
 static int esp_https_ota_get_img_desc(esp_https_ota_handle_t h,esp_app_desc_t *d)
-{assert(h && handle_live);strcpy(d->project_name,"zone_lite");strcpy(d->version,"2.6.0");return stage==2?-1:0;}
+{assert(h && handle_live);strcpy(d->project_name,stage==9 ? "wrong_family" : ZONE_LITE_PROJECT_NAME);strcpy(d->version,"2.6.0");return stage==2?-1:0;}
 static int esp_https_ota_perform(esp_https_ota_handle_t h)
 {assert(h && handle_live);if(stage==3)return -1;return ++performs==1?ESP_ERR_HTTPS_OTA_IN_PROGRESS:ESP_OK;}
 static int esp_https_ota_get_image_len_read(esp_https_ota_handle_t h){assert(h && handle_live);return 65536;}
@@ -67,7 +70,7 @@ static void reset(void)
 int main(void)
 {
     reset();assert(perform_update() && reboots==1 && finishes==1 && !handle_live);
-    for(stage=1;stage<=8;++stage){
+    for(stage=1;stage<=9;++stage){
         reset();assert(!perform_update() && !reboots && !handle_live);
         if(stage==6 || stage==7)assert(restores==1 && !selected);
         if(stage==8)assert(!strcmp(s_last_error,"BOOT_SELECTION_RECOVERY_FAILED"));
@@ -83,6 +86,6 @@ int main(void)
     subprocess.run([
         shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(firmware),
-        str(unit), "-o", str(executable),
+        f"-DZONE_LITE_HIKVISION={hikvision}", str(unit), "-o", str(executable),
     ], check=True)
     subprocess.run([str(executable)], cwd=tmp_path, check=True)

@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--vault-manifest", type=Path, required=True)
+    parser.add_argument("--firmware-family", choices=("zkt", "hikvision"), default="zkt")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         raise SystemExit("Factory version must be SemVer")
@@ -45,6 +46,8 @@ def main() -> None:
         )
     manifest = {
         "schema_version": 1,
+        "firmware_family": args.firmware_family,
+        "project_name": "zone_lite_hikvision" if args.firmware_family == "hikvision" else "zone_lite",
         "bundle_id": f"zone-lite-{args.version}-{args.git_sha[:12]}",
         "hardware_profile": "esp32s3-16mb-zone-lite-v1",
         "version": args.version,

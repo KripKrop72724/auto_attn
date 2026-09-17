@@ -8,6 +8,8 @@ from sqlalchemy import engine_from_config, pool
 from zk_add.db import Base
 from zk_add.settings import settings
 import zk_add.models  # noqa: F401
+import zk_add.hikvision_evidence  # noqa: F401
+import zk_add.hikvision_reconciliation  # noqa: F401
 
 
 config = context.config

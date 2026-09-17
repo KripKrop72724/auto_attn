@@ -1,4 +1,8 @@
 #include "add_connector.h"
+#include "firmware_family.h"
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+#include "hikvision_runtime.h"
+#endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
 #include "ota_manager.h"
@@ -154,7 +158,7 @@ typedef struct {
 } add_inbound_message_t;
 
 typedef struct {
-    char uid[32];
+    char uid[41];
     char user_id[64];
     char display_name[96];
     char cnic[16];
@@ -166,6 +170,9 @@ static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
 static QueueHandle_t s_config_commands;
 static QueueHandle_t s_reconcile_assignments;
+#ifdef ZONE_LITE_HIKVISION
+static QueueHandle_t s_hikvision_assignments;
+#endif
 static QueueHandle_t s_source_coverage;
 static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
@@ -184,6 +191,8 @@ static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
 static bool s_waiting_evidence;
+static bool s_waiting_hikvision;
+static char s_hikvision_expected[65];
 static evidence_receipt_t s_evidence_expected;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
@@ -456,6 +465,12 @@ static bool send_payload(
     }
     evidence_receipt_t expected = {0};
     bool evidence = strcmp(type, "queue_evidence") == 0;
+    bool hikvision = strcmp(type, "hikvision_observation") == 0;
+    cJSON *hik_hash = cJSON_GetObjectItemCaseSensitive(payload, "observation_sha256");
+    if (hikvision && (!cJSON_IsString(hik_hash) || strlen(hik_hash->valuestring) != 64 || sanitized_bytes)) {
+        cJSON_Delete(payload);
+        return false;
+    }
     if (evidence && !evidence_identity(payload, &expected, false)) {
         cJSON_Delete(payload);
         return false;
@@ -504,6 +519,8 @@ static bool send_payload(
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             strlcpy(s_waiting_ack, message_id, sizeof(s_waiting_ack));
             s_waiting_evidence = evidence;
+            s_waiting_hikvision = hikvision;
+            if (hikvision) strlcpy(s_hikvision_expected, hik_hash->valuestring, sizeof(s_hikvision_expected));
             s_evidence_expected = expected;
             s_ack_matched = false;
             xSemaphoreGive(s_lock);
@@ -1804,6 +1821,17 @@ static void parse_inbound(const char *data, size_t len)
         return;
     }
     cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+#ifdef ZONE_LITE_HIKVISION
+    if (cJSON_IsString(type) && !strcmp(type->valuestring, "hikvision_history_assignment")) {
+        char *text = cJSON_PrintUnformatted(root);
+        if (text && strlen(text) < 2048 && s_hikvision_assignments) {
+            char assignment[2048] = {0};
+            strlcpy(assignment, text, sizeof(assignment));
+            xQueueOverwrite(s_hikvision_assignments, assignment);
+        }
+        free(text); cJSON_Delete(root); return;
+    }
+#endif
     if (cJSON_IsString(type) &&
         (strcmp(type->valuestring, "ack") == 0 ||
          strcmp(type->valuestring, "reconcile_anchor_ack") == 0 ||
@@ -1811,7 +1839,8 @@ static void parse_inbound(const char *data, size_t len)
          strcmp(type->valuestring, "reconcile_manifest_ack") == 0 ||
          strcmp(type->valuestring, "source_probe_ack") == 0 ||
          strcmp(type->valuestring, "source_tail_ack") == 0 ||
-         strcmp(type->valuestring, "queue_evidence_ack") == 0)) {
+         strcmp(type->valuestring, "queue_evidence_ack") == 0 ||
+         strcmp(type->valuestring, "hikvision_observation_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
@@ -1946,6 +1975,12 @@ static void parse_inbound(const char *data, size_t len)
                     s_ack_matched = strcmp(type->valuestring, "queue_evidence_ack") == 0 &&
                         evidence_identity(root, &receipt, true) &&
                         evidence_receipt_matches(&s_evidence_expected, &receipt);
+                } else if (s_waiting_hikvision) {
+                    cJSON *hash = cJSON_GetObjectItemCaseSensitive(root, "observation_sha256");
+                    cJSON *durable = cJSON_GetObjectItemCaseSensitive(root, "durable");
+                    s_ack_matched = !strcmp(type->valuestring, "hikvision_observation_ack") &&
+                        cJSON_IsTrue(durable) && cJSON_IsString(hash) &&
+                        !strcmp(hash->valuestring, s_hikvision_expected);
                 } else s_ack_matched = true;
                 xSemaphoreGive(s_ack_sem);
             }
@@ -2432,6 +2467,7 @@ static void heartbeat_task(void *arg)
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
             cJSON_AddStringToObject(payload, "firmware_version", firmware_version());
+            cJSON_AddStringToObject(payload, "firmware_family", ZONE_LITE_FIRMWARE_FAMILY);
             cJSON_AddNumberToObject(payload, "config_version", 3);
             cJSON_AddBoolToObject(payload, "comm_key_management", true);
             cJSON_AddNumberToObject(
@@ -2524,6 +2560,9 @@ static void heartbeat_task(void *arg)
                 history,
                 "failed_windows",
                 zkt.history_failed_windows);
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+            hikvision_append_telemetry(payload);
+#endif
             char *json = cJSON_PrintUnformatted(payload);
             cJSON_Delete(payload);
             if (json) {
@@ -3681,6 +3720,9 @@ void add_connector_init(void)
         ADD_CONFIG_COMMAND_QUEUE_DEPTH,
         sizeof(add_command_t));
     s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
+#ifdef ZONE_LITE_HIKVISION
+    s_hikvision_assignments = xQueueCreate(1, 2048);
+#endif
     s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
@@ -3776,9 +3818,14 @@ static bool perform_onboarding(void)
     cJSON_AddStringToObject(root, "zone_name", runtime->zone_name);
     cJSON_AddStringToObject(root, "device_id", runtime->zone_device_id);
     cJSON_AddStringToObject(root, "firmware_version", firmware_version());
+    cJSON_AddStringToObject(root, "firmware_family", ZONE_LITE_FIRMWARE_FAMILY);
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    cJSON_AddStringToObject(root, "expected_serial", runtime->hik_expected_serial);
+#else
     if (runtime->zkt_expected_serial[0]) {
         cJSON_AddStringToObject(root, "expected_serial", runtime->zkt_expected_serial);
     }
+#endif
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!body) return false;
@@ -4429,4 +4476,13 @@ bool add_connector_log(
     bool ok = json && add_connector_send_payload("log", json);
     free(json);
     return ok;
+}
+
+bool add_connector_take_hikvision_assignment(char out[2048])
+{
+#ifdef ZONE_LITE_HIKVISION
+    return out && s_hikvision_assignments && xQueueReceive(s_hikvision_assignments, out, 0) == pdTRUE;
+#else
+    (void)out; return false;
+#endif
 }

@@ -1,4 +1,5 @@
 #include "ota_manager.h"
+#include "firmware_family.h"
 #include "ota_checkpoint.h"
 #include "setup_portal.h"
 
@@ -315,7 +316,11 @@ static bool fetch_assignment(void)
     cJSON *sha = root ? cJSON_GetObjectItemCaseSensitive(root, "image_sha256") : NULL;
     cJSON *url = root ? cJSON_GetObjectItemCaseSensitive(root, "download_url") : NULL;
     cJSON *size = root ? cJSON_GetObjectItemCaseSensitive(root, "image_size") : NULL;
-    bool valid = cJSON_IsString(deployment) && cJSON_IsString(release) && cJSON_IsString(version) &&
+    cJSON *family = root ? cJSON_GetObjectItemCaseSensitive(root, "firmware_family") : NULL;
+    const char *offered_family = cJSON_IsString(family) ? family->valuestring : "zkt";
+    bool valid = !strcmp(offered_family, ZONE_LITE_FIRMWARE_FAMILY) &&
+                 (!family || cJSON_IsString(family)) &&
+                 cJSON_IsString(deployment) && cJSON_IsString(release) && cJSON_IsString(version) &&
                  cJSON_IsString(sha) && strlen(sha->valuestring) == 64 && cJSON_IsString(url) &&
                  cJSON_IsNumber(size) && size->valuedouble > 0 &&
                  size->valuedouble <= OTA_APPLICATION_MAX_BYTES &&
@@ -382,7 +387,7 @@ static bool perform_update(void)
     }
     esp_app_desc_t descriptor;
     if (esp_https_ota_get_img_desc(handle, &descriptor) != ESP_OK ||
-        strcmp(descriptor.project_name, "zone_lite") != 0 ||
+        strcmp(descriptor.project_name, ZONE_LITE_PROJECT_NAME) != 0 ||
         strcmp(descriptor.version, s_journal.target_version) != 0) {
         esp_https_ota_abort(handle);
         strlcpy(s_last_error, "IMAGE_DESCRIPTOR_MISMATCH", sizeof(s_last_error));

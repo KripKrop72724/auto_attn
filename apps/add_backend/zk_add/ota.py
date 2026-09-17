@@ -36,6 +36,7 @@ from zk_add.db import Base
 from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
+from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.storage_contract import CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, validate_storage_contract
 
@@ -442,6 +443,10 @@ def _campaign_scope(
             hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" else "",
             minimum_version=release.minimum_bootstrap_version,
         )
+        try:
+            require_family_match(connector.firmware_family, release.manifest or {})
+        except ValueError:
+            reason = "FIRMWARE_FAMILY_MISMATCH"
         if ordered_target and not target_matches(ordered_target, connector):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
         if not reason:
@@ -589,6 +594,7 @@ def sync_release_store(session: Session) -> None:
             continue
         signature = manifest_path.with_name("manifest.sig").read_text(encoding="ascii").strip()
         _verify_manifest(manifest, signature)
+        release_family(manifest)
         validate_storage_contract(manifest, str(manifest.get("version", "")))
         image_name = os.path.basename(str(manifest["image_name"]))
         image = manifest_path.parent / image_name
@@ -626,6 +632,8 @@ def sync_release_store(session: Session) -> None:
             if str(marker.get("image_sha256") or "") != digest:
                 raise RuntimeError(f"Firmware release {release_id} HIL marker has a different image hash.")
             desired_state = "HIL_ONLY"
+        if desired_state == "AVAILABLE":
+            require_production_qualification(manifest)
         stored_manifest = {
             **manifest,
             "_publication_mode": desired_state,
@@ -755,6 +763,12 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         return None
+    try:
+        require_family_match(connector.firmware_family, release.manifest or {})
+        if release.state == "AVAILABLE":
+            require_production_qualification(release.manifest or {})
+    except ValueError:
+        return None
     if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
         return None
     if _storage_predecessor_exclusion(session, release, connector):
@@ -794,6 +808,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         "version": release.version, "image_sha256": application_digest,
         "artifact_sha256": release.image_sha256, "image_size": release.image_size,
         "partition_layout": release.partition_layout,
+        "firmware_family": release_family(release.manifest or {}),
         "download_url": f"{public_base}/device/v2/firmware/download/{token}"}
 
 

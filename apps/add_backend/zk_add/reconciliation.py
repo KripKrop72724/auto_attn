@@ -139,6 +139,9 @@ def _active_or_new_source_epoch(
 
 
 def preflight_reconciliation(session: Session, connector: Connector) -> dict:
+    if connector.firmware_family == "hikvision":
+        from zk_add.hikvision_reconciliation import preflight
+        return preflight(session, connector)
     hard: list[dict[str, str]] = []
     waitable: list[dict[str, str]] = []
     zkt = connector.zkt_device
@@ -341,7 +344,7 @@ def create_reconciliation_job(
     zkt = connector.zkt_device
     assert zkt is not None
     generation = max(1, connector.onboarding_generation)
-    source_epoch = _active_or_new_source_epoch(
+    source_epoch = None if connector.firmware_family == "hikvision" else _active_or_new_source_epoch(
         session,
         zkt_device_id=zkt.id,
         terminal_generation=generation,
@@ -360,7 +363,7 @@ def create_reconciliation_job(
         wait_reason=(waitable[0]["code"] if waitable else None),
         terminal_serial=zkt.serial,
         terminal_generation=generation,
-        source_epoch_id=source_epoch.id,
+        source_epoch_id=source_epoch.id if source_epoch else None,
         operation_id=operation_id,
         firmware_version=connector.firmware_version,
         identity_snapshot_id=zkt.identity_snapshot_id,
@@ -368,6 +371,9 @@ def create_reconciliation_job(
     )
     session.add(job)
     session.flush()
+    if connector.firmware_family == "hikvision":
+        from zk_add.hikvision_reconciliation import initialize
+        initialize(session, job, connector)
     _event(session, job, "QUEUED", {"wait_reason": job.wait_reason})
     append_audit(
         session,
@@ -1442,6 +1448,9 @@ def refresh_reconciliation_assurance(
     job = locked
     if job.status in TERMINAL_JOB_STATES:
         return job
+    if job.mode == "HIKVISION_SERIAL_HISTORY":
+        from zk_add.hikvision_reconciliation import refresh_assurance
+        return refresh_assurance(session, job)
     manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
         TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
         TerminalRecordManifest.generation == job.terminal_generation,
@@ -1794,6 +1803,14 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             continue
         slots_owned += 1
         job.wait_reason = None
+        if job.mode == "HIKVISION_SERIAL_HISTORY":
+            from zk_add.hikvision_reconciliation import assignment
+            if job.next_retry_at and ensure_utc(job.next_retry_at) > now:
+                continue
+            message = assignment(session, job, connector)
+            if message:
+                assignments.append((connector.connector_id, message))
+            continue
         if job.phase != "VERIFYING_SOURCE_CHANGE":
             job.phase = "ANCHORING" if job.cutoff_count is None else "SCANNING_TERMINAL"
         zkt = connector.zkt_device
@@ -2038,7 +2055,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         .where(ReconciliationDivergence.job_id == job.id)
         .order_by(ReconciliationDivergence.id.desc())
     )
-    source_epoch = session.get(TerminalSourceEpoch, job.source_epoch_id)
+    source_epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
     operator_state, operator_message = _operator_status(job, connected=bool(connector and connector.connected))
     exception_assurance = source_exception_assurance(session, job)
     result = {
@@ -2131,6 +2148,19 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         "completed_at": job.completed_at,
         "updated_at": job.updated_at,
     }
+    if job.mode == "HIKVISION_SERIAL_HISTORY":
+        from zk_add.hikvision_reconciliation import HikvisionReconciliationState
+        hik_state = session.get(HikvisionReconciliationState, job.id)
+        source = hik_state.data if hik_state else {}
+        checkpoint = source.get("checkpoint", {})
+        result["source_protocol"] = "hikvision-isapi-v1"
+        result["checkpoint"] = {"next_ordinal": None,
+                                "source_serial": checkpoint.get("last_serial"),
+                                "source_pass": source.get("phase"),
+                                "chain_digest": checkpoint.get("chain_digest"),
+                                "last_progress_at": job.last_progress_at}
+        result["recovery"]["source_epoch_id"] = hik_state.source_epoch if hik_state else None
+        result["terminal"].update(first_serial=source.get("first_serial"), cutoff_serial=source.get("last_serial"))
     if include_events:
         result["events"] = [
             {"state": row.state, "details": row.details, "created_at": row.created_at}
@@ -2351,6 +2381,8 @@ def _sealed_evidence(evidence: dict) -> dict:
 
 
 def _device_job(session: Session, connector: Connector, job_id: str) -> ReconciliationJob:
+    if connector.firmware_family == "hikvision":
+        raise ValueError("Hikvision reconciliation requires serial-source page evidence.")
     job = session.scalar(
         select(ReconciliationJob)
         .where(

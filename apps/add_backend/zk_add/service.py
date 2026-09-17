@@ -279,10 +279,15 @@ def onboard_connector(
     expected_serial: str | None,
     actor: str,
     ip_address: str | None,
+    firmware_family: str = "zkt",
 ) -> tuple[Connector, str, bool]:
+    from zk_add.terminal_families import firmware_family as validate_family
+    firmware_family = validate_family(firmware_family)
     site = ensure_site(session, zone_id, zone_name)
     connector = session.scalar(select(Connector).where(Connector.hardware_id == hardware_id))
     created = connector is None
+    if connector is not None and validate_family(connector.firmware_family) != firmware_family:
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     if connector is None:
         connector = Connector(
             connector_id=str(uuid4()),
@@ -293,6 +298,9 @@ def onboard_connector(
             device_id=device_id,
             display_name=zone_name,
             firmware_version=firmware_version,
+            firmware_family=firmware_family,
+            terminal_vendor=firmware_family,
+            terminal_protocol="isapi" if firmware_family == "hikvision" else "zkt_tcp",
             lifecycle_state="ONBOARDING",
         )
         session.add(connector)
@@ -440,6 +448,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         }
         return
 
+    if (connector.firmware_family or "zkt") != "zkt":
+        return
     record_size = int((zkt.capability_profile or {}).get("observed_user_record_bytes", 0))
     fingerprint = f"{zkt.serial}|{zkt.model or ''}|{zkt.platform or ''}|{record_size}"
     if zkt.certification_fingerprint != fingerprint:
@@ -531,6 +541,8 @@ def update_heartbeat(
     sequence: int,
     payload: HeartbeatPayload,
 ) -> dict:
+    if (connector.firmware_family or "zkt") != payload.firmware_family:
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     now = utc_now()
     connector.connected = True
     connector.lifecycle_state = "ONLINE"
@@ -548,7 +560,12 @@ def update_heartbeat(
     # stale, so resolve it immediately when the connector reports again.
     resolve_alert(session, connector, code="ESP_OFFLINE")
     zkt = connector.zkt_device
-    zkt_payload = payload.zkt
+    zkt_payload = (payload.terminal.model_dump(exclude_none=True)
+                   if payload.firmware_family == "hikvision" and payload.terminal else payload.zkt)
+    if zkt and payload.terminal:
+        zkt.capability_profile = {**(zkt.capability_profile or {}),
+                                  "source_protocol": "hikvision-isapi-v1",
+                                  "hikvision_health": zkt_payload}
     if zkt:
         previous_terminal_serial = zkt.serial
         previous_attendance_count = zkt.attendance_count
@@ -852,6 +869,8 @@ def update_heartbeat(
 def replace_user_snapshot(
     session: Session, *, connector: Connector, snapshot: UserSnapshotRequest
 ) -> int:
+    if connector.firmware_family == "hikvision":
+        raise ValueError("Hikvision snapshots require the vendor profile contract.")
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
@@ -2462,6 +2481,11 @@ def enrich_undelivered_attendance(
     user: DeviceUser,
     snapshot: DeviceUserSnapshot | None = None,
 ) -> int:
+    owner = session.get(Connector, zkt.connector_id)
+    if owner is not None and owner.firmware_family == "hikvision":
+        # Hikvision uses its preserved source record for name-CNIC identity.
+        # A newer ZKT-style snapshot must not silently rewrite older punches.
+        return 0
     cnic = decrypt_cnic(user.cnic_encrypted)
     if not cnic:
         return 0
@@ -2883,6 +2907,8 @@ def block_undelivered_attendance(
 def ingest_attendance(
     session: Session, *, connector: Connector, events: list[AttendanceEventIn]
 ) -> tuple[list[str], list[str]]:
+    if connector.firmware_family == "hikvision":
+        raise ValueError("Hikvision attendance requires source-evidence ingestion.")
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
@@ -4498,6 +4524,11 @@ def serialize_connector(connector: Connector) -> dict:
         "state": connector.lifecycle_state,
         "connected": connector.connected,
         "firmware_version": connector.firmware_version,
+        "firmware_family": connector.firmware_family or "zkt",
+        "terminal_vendor": connector.terminal_vendor or "zkt",
+        "terminal_protocol": connector.terminal_protocol or "zkt_tcp",
+        "hikvision": (zkt.capability_profile or {}).get("hikvision_health")
+        if zkt and connector.firmware_family == "hikvision" else None,
         "firmware_diagnostics": connector.firmware_diagnostics,
         "firmware_diagnostics_at": connector.firmware_diagnostics_at,
         "ota_capable": connector.ota_capable,
