@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "mbedtls/sha256.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -24,7 +25,9 @@ static atomic_bool reachable, stream_open;
 static atomic_long last_message, last_poll;
 static atomic_uint poll_error, poll_cursor;
 static atomic_bool history_required = true;
+static atomic_bool profiles_active;
 static SemaphoreHandle_t request_lock;
+static QueueHandle_t profile_commands;
 static int64_t next_poll_due;
 /* A single encrypted NVS blob commits the cursor and its source binding. Queue
  * persistence always precedes this write. A failed commit replays observations. */
@@ -176,7 +179,7 @@ static void history_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        if (next_poll_due - esp_timer_get_time() < 2000000 ||
+        if (atomic_load(&profiles_active) || next_poll_due - esp_timer_get_time() < 2000000 ||
             !add_connector_take_hikvision_assignment(assignment)) {
             xSemaphoreGive(request_lock); continue;
         }
@@ -207,6 +210,73 @@ static void history_task(void *arg)
             }
         } else ESP_LOGW(TAG, "History request incomplete, reason=%u", (unsigned)result);
         cJSON_Delete(response); cJSON_Delete(message);
+    }
+}
+static bool collect_profile(void *context, const char *body, size_t length)
+{
+    if (!length || length > 4096 || memchr(body, 0, length)) return false;
+    cJSON *value = cJSON_CreateString(body);
+    if (!value) return false;
+    if (!cJSON_AddItemToArray(context, value)) { cJSON_Delete(value); return false; }
+    return true;
+}
+static void profile_task(void *arg)
+{
+    (void)arg;
+    TickType_t wait = 0;
+    for (;;) {
+        add_command_t command = {0};
+        bool requested = xQueueReceive(profile_commands, &command, wait) == pdTRUE;
+        if (requested && command.expires_epoch > 0 && time(NULL) >= command.expires_epoch) {
+            if (add_connector_command_update(command.command_id, "EXPIRED", "COMMAND_EXPIRED",
+                    "Profile refresh expired before execution", "{}"))
+                (void)add_connector_command_complete(command.command_id);
+            else add_connector_command_retry(command.command_id);
+            wait = pdMS_TO_TICKS(30000); continue;
+        }
+        hik_search_t scan; hik_search_init(&scan, 1, 1);
+        atomic_store(&profiles_active, true);
+        char snapshot_id[33]; memcpy(snapshot_id, scan.search_id, sizeof(snapshot_id));
+        bool failed = false;
+        for (unsigned phase = 1; phase <= 2 && !failed; phase++) {
+            if (phase == 2) hik_search_init(&scan, 1, 1);
+            while (!scan.complete && !failed) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                if (!add_connector_is_connected()) { failed = true; break; }
+                if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
+                if (next_poll_due - esp_timer_get_time() < 2000000) {
+                    xSemaphoreGive(request_lock); continue;
+                }
+                cJSON *body = cJSON_CreateObject();
+                cJSON *rows = body ? cJSON_AddArrayToObject(body, "records") : NULL;
+                uint32_t position = scan.position;
+                hik_result_t result = rows ? hik_http_verify_identity() : HIK_NETWORK;
+                if (result == HIK_OK) result = hik_user_page(&scan, collect_profile, rows);
+                xSemaphoreGive(request_lock);
+                bool valid = result == HIK_OK &&
+                    cJSON_AddStringToObject(body, "snapshot_id", snapshot_id) &&
+                    cJSON_AddStringToObject(body, "terminal_serial", zone_config_get()->hik_expected_serial) &&
+                    cJSON_AddNumberToObject(body, "phase", phase) &&
+                    cJSON_AddNumberToObject(body, "position", position) &&
+                    cJSON_AddNumberToObject(body, "total", scan.total);
+                char *payload = valid ? cJSON_PrintUnformatted(body) : NULL;
+                /* No local publication on partial reads. ADD stages encrypted
+                 * pages and publishes only two complete matching inventories. */
+                failed = !payload || !add_connector_send_payload_acknowledged(
+                    "hikvision_profile_page", payload, 10000);
+                free(payload); cJSON_Delete(body);
+            }
+        }
+        atomic_store(&profiles_active, false);
+        if (requested) {
+            bool stored = add_connector_command_update(command.command_id,
+                failed ? "RETRYING" : "SUCCEEDED", failed ? "HIK_PROFILE_REFRESH_PENDING" : NULL,
+                failed ? "Complete matching profile scans are still required" : NULL,
+                failed ? "{}" : "{\"complete\":true,\"stable\":true}");
+            if (!failed && stored) (void)add_connector_command_complete(command.command_id);
+            else add_connector_command_retry(command.command_id);
+        }
+        wait = pdMS_TO_TICKS(failed ? 30000 : 900000);
     }
 }
 void hikvision_append_telemetry(cJSON *payload)
@@ -263,13 +333,29 @@ static void source_uploader(void *arg)
 void hikvision_gateway_task(void *argument)
 {
     (void)argument;
-    TaskHandle_t stream = NULL, uploader = NULL, history = NULL;
+    TaskHandle_t stream = NULL, uploader = NULL, history = NULL, profiles = NULL;
     request_lock = xSemaphoreCreateMutex();
-    if (!request_lock) { ESP_LOGE(TAG, "Request worker allocation failed"); vTaskDelete(NULL); return; }
+    profile_commands = xQueueCreate(1, sizeof(add_command_t));
+    if (!request_lock || !profile_commands) { ESP_LOGE(TAG, "Request worker allocation failed"); vTaskDelete(NULL); return; }
     for (;;) {
         if (!stream && xTaskCreate(poll_task, "hik_poll", 8192, NULL, 5, &stream) != pdPASS) stream = NULL;
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
+        if (!profiles && xTaskCreate(profile_task, "hik_profiles", 8192, NULL, 2, &profiles) != pdPASS) profiles = NULL;
         if (!uploader && xTaskCreate(source_uploader, "hik_evidence", 8192, NULL, 4, &uploader) != pdPASS) uploader = NULL;
+        if (profiles && uxQueueSpacesAvailable(profile_commands)) {
+            add_command_t command;
+            if (add_connector_take_command(&command)) {
+                if (!strcmp(command.command_type, "REFRESH_USERS")) {
+                    if (xQueueSend(profile_commands, &command, 0) != pdTRUE)
+                        add_connector_command_retry(command.command_id);
+                } else {
+                    if (add_connector_command_update(command.command_id, "FAILED", "HIK_COMMAND_UNAVAILABLE",
+                            "This command is not enabled in the current Hikvision image", "{}"))
+                        (void)add_connector_command_complete(command.command_id);
+                    else add_connector_command_retry(command.command_id);
+                }
+            }
+        }
         add_connector_set_activity("HIKVISION_POLL_5S");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }

@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, inspect
 from zk_add.db import Base
 import zk_add.hikvision_evidence  # noqa: F401
 import zk_add.hikvision_reconciliation  # noqa: F401
+import zk_add.hikvision_profiles  # noqa: F401
 
 
 @pytest.mark.parametrize("existing_install", [False, True])

@@ -47,7 +47,10 @@ instead of the two streaming gates. Other release gates have not been waived.
   cross-family artifacts in both the worker and USB companion. The dashboard
   provides a Hikvision installation form.
 - Verified low-level user CRUD helpers, bounded paginated profile reads and multipart parsing exist.
-  Full vendor-profile snapshot/CRUD dispatch and its UI workflow remain incomplete.
+  Profile snapshots now use two matching paginated scans, encrypted ADD staging
+  and atomic publication into the existing user workspace. Explicit user refresh
+  commands use the same path; interrupted reads do not imply deletion.
+  Verified create/edit/delete command dispatch remains incomplete.
 
 ## Hardware observations
 
@@ -67,7 +70,7 @@ synthetic and transaction/replay tests; it has not completed a production job.
 
 - Exact-device ESP polling, restart/power-loss recovery, contention, heap/storage
   pressure, signed OTA rollback, end-to-end ADD/Oracle receipts and full source job.
-- Complete user snapshot and verified CRUD dispatch, profile qualification,
+- Complete verified CRUD dispatch, profile qualification,
   capability-driven user controls, and hardware validation of the provisioning path.
 - Final hardware qualification and the required 72-hour soak.
 
@@ -103,3 +106,10 @@ build and scoped lint. The connected ESP was reidentified at USB port
 The serial-bound Hikvision terminal remains reachable. Full verified CRUD dispatch,
 physical end-to-end delivery/recovery, retained-history job completion and 72-hour
 soak remain release gates. Green CI alone does not prove those results.
+
+Profile integration follow-up: 715 backend/firmware-host/companion tests pass,
+including snapshot interruption, duplicate pages, changed inventories and two-pass
+empty snapshots. PostgreSQL upgrade through revision 0030 and schema comparison
+pass. The Hikvision ESP image builds with the periodic/manual profile reader;
+profile requests take precedence over full history while polling retains priority.
+These are build/host results, not a claim of flashed hardware acceptance.

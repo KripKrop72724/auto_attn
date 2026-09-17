@@ -3329,6 +3329,11 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
             )
+        elif envelope.type == "hikvision_profile_page":
+            from zk_add.hikvision_profiles import accept_profile_page
+            receipt = accept_profile_page(db, connector, envelope.payload)
+            ack_payload = {"type": "ack", "message_id": envelope.message_id, **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         elif envelope.type == "hikvision_history_page":
             from zk_add.hikvision_reconciliation import apply_page
             receipt = apply_page(db, connector, envelope.payload)

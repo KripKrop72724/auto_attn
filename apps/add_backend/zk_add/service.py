@@ -871,6 +871,12 @@ def replace_user_snapshot(
 ) -> int:
     if connector.firmware_family == "hikvision":
         raise ValueError("Hikvision snapshots require the vendor profile contract.")
+    return _replace_user_snapshot(session, connector=connector, snapshot=snapshot)
+
+
+def _replace_user_snapshot(
+    session: Session, *, connector: Connector, snapshot: UserSnapshotRequest
+) -> int:
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
