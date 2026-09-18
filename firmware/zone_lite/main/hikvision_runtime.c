@@ -31,7 +31,22 @@ static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
 static atomic_uint uploader_tick;
 static SemaphoreHandle_t request_lock;
 static QueueHandle_t profile_commands;
-static int64_t next_poll_due;
+/* Protected by request_lock: at most one bounded background page per poll. */
+static bool background_slot;
+static bool take_background_slot(void)
+{
+    bool available = background_slot;
+    background_slot = false;
+    return available;
+}
+static uint32_t poll_delay_ms(int64_t elapsed_us)
+{
+    int64_t remaining = 5000000 - elapsed_us;
+    /* Slow terminals must still allow the 200ms profile / 100ms history worker
+     * to acquire one slot. Requests never overlap; five seconds is the target,
+     * not a reason to starve all background progress after an overrun. */
+    return remaining > 250000 ? (uint32_t)(remaining / 1000) : 250;
+}
 /* A single encrypted NVS blob commits the cursor and its source binding. Queue
  * persistence always precedes this write. A failed commit replays observations. */
 typedef struct {
@@ -109,11 +124,23 @@ static bool preserve(void *context, const char *body, size_t length)
     if (!ok) atomic_fetch_add(&source_failures, 1);
     return ok;
 }
-typedef struct { unsigned char digest[32]; unsigned count; bool store; } page_context_t;
+typedef struct {
+    unsigned char digest[32];
+    const unsigned char *expected_anchor;
+    unsigned count;
+    bool anchor_seen, anchor_conflict;
+} page_context_t;
 static bool poll_record(void *context, const char *body, size_t length)
 {
     page_context_t *page = context;
-    if (page->store && !preserve("POLL", body, length)) return false;
+    if (page->expected_anchor && !page->anchor_seen) {
+        unsigned char digest[32];
+        mbedtls_sha256((const unsigned char *)body, length, digest, 0);
+        page->anchor_conflict = memcmp(digest, page->expected_anchor, 32) != 0;
+        page->anchor_seen = !page->anchor_conflict;
+        return page->anchor_seen;
+    }
+    if (!preserve("POLL", body, length)) return false;
     mbedtls_sha256((const unsigned char *)body, length, page->digest, 0);
     page->count++;
     return true;
@@ -126,14 +153,18 @@ static void poll_task(void *arg)
     for (;;) {
         xSemaphoreTake(request_lock, portMAX_DELAY);
         int64_t started = esp_timer_get_time();
-        next_poll_due = started + 5000000;
+        background_slot = false;
         hik_result_t result = HIK_OK;
         if (!loaded) {
             loaded = checkpoint_load(&cursor, &present);
             if (!loaded) result = HIK_CUSTODY;
         }
         if (result == HIK_OK) result = hik_http_verify_identity();
-        uint32_t begin = cursor.serial + 1;
+        /* Include the committed anchor in the same ordered source page as new
+         * records. Validate it before any new evidence enters the queue. This
+         * keeps reset/reuse protection without a second slow history search on
+         * every empty poll, which can starve profiles and reconciliation. */
+        uint32_t begin = present && cursor.serial ? cursor.serial : 1;
         if (result == HIK_OK && !present) {
             uint32_t first, last, count;
             result = hik_history_bounds(&first, &last, &count);
@@ -141,17 +172,14 @@ static void poll_task(void *arg)
              * remains explicitly outstanding for the independent full job. */
             if (result == HIK_OK) begin = count ? (last - first >= 19 ? last - 19 : first) : 1;
         }
-        if (result == HIK_OK && present && cursor.serial) {
-            hik_search_t anchor; hik_search_init(&anchor, cursor.serial, cursor.serial);
-            page_context_t check = {0};
-            result = hik_history_page(&anchor, poll_record, &check);
-            if (result == HIK_OK && (check.count != 1 || memcmp(check.digest, cursor.anchor, 32)))
-                result = HIK_BINDING; /* retention loss or ambiguous reset/reuse */
-        }
         if (result == HIK_OK && begin <= 3000000000U) {
             hik_search_t search; hik_search_init(&search, begin, 3000000000U);
-            page_context_t page = {.store = true};
+            page_context_t page = {
+                .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
+            };
             result = hik_history_page(&search, poll_record, &page);
+            if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen))
+                result = HIK_BINDING;
             if (result == HIK_OK && (page.count || !present)) {
                 poll_checkpoint_t next = cursor;
                 if (page.count) {
@@ -172,10 +200,9 @@ static void poll_task(void *arg)
             led_status_set(known && !depth && add_connector_is_connected()
                 ? LED_STATUS_HEALTHY : LED_STATUS_BACKLOG);
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
+        background_slot = true;
         xSemaphoreGive(request_lock);
-        int64_t remaining = 5000000 - (esp_timer_get_time() - started);
-        /* Start-to-start cadence, never overlapping requests or busy retrying. */
-        vTaskDelay(pdMS_TO_TICKS(remaining > 1000 ? (uint32_t)(remaining / 1000) : 1));
+        vTaskDelay(pdMS_TO_TICKS(poll_delay_ms(esp_timer_get_time() - started)));
     }
 }
 static void history_task(void *arg)
@@ -186,10 +213,11 @@ static void history_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        if (atomic_load(&profiles_active) || next_poll_due - esp_timer_get_time() < 2000000 ||
+        if (atomic_load(&profiles_active) || !background_slot ||
             !add_connector_take_hikvision_assignment(assignment)) {
             xSemaphoreGive(request_lock); continue;
         }
+        (void)take_background_slot();
         cJSON *message = cJSON_Parse(assignment);
         cJSON *serial = cJSON_GetObjectItemCaseSensitive(message, "terminal_serial");
         cJSON *epoch = cJSON_GetObjectItemCaseSensitive(message, "source_epoch");
@@ -251,7 +279,7 @@ static void profile_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(200));
                 if (!add_connector_is_connected()) { failed = true; break; }
                 if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-                if (next_poll_due - esp_timer_get_time() < 2000000) {
+                if (!take_background_slot()) {
                     xSemaphoreGive(request_lock); continue;
                 }
                 cJSON *body = cJSON_CreateObject();
@@ -293,8 +321,9 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON *workers = cJSON_GetObjectItemCaseSensitive(diagnostics, "workers");
     cJSON *worker = cJSON_IsArray(workers) ? cJSON_CreateObject() : NULL;
     if (worker) {
+        uint32_t tick = atomic_load(&uploader_tick);
         int64_t now = esp_timer_get_time() / 1000;
-        uint32_t age = (uint32_t)now - atomic_load(&uploader_tick);
+        uint32_t age = (uint32_t)now - tick;
         bool started = atomic_load(&uploader_started);
         bool ok = cJSON_AddStringToObject(worker, "name", "hikvision_source") &&
             cJSON_AddStringToObject(worker, "state", !started ? "STOPPED" : age > 90000 ? "FAULT" :
@@ -330,6 +359,10 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddNumberToObject(terminal, "source_storage_failures", atomic_load(&source_failures));
     uint32_t depth;
     if (qs_snapshot(QS_HIK_SOURCE, &depth)) cJSON_AddNumberToObject(terminal, "source_queue_depth", depth);
+    /* The common heartbeat started before queue/worker sampling. Stamp its
+     * uptime after collection so a later worker tick is not in its future. */
+    cJSON *uptime = cJSON_GetObjectItemCaseSensitive(payload, "uptime_seconds");
+    if (cJSON_IsNumber(uptime)) cJSON_SetNumberValue(uptime, esp_timer_get_time() / 1000000);
 }
 static void source_uploader(void *arg)
 {
