@@ -321,8 +321,9 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON *workers = cJSON_GetObjectItemCaseSensitive(diagnostics, "workers");
     cJSON *worker = cJSON_IsArray(workers) ? cJSON_CreateObject() : NULL;
     if (worker) {
+        uint32_t tick = atomic_load(&uploader_tick);
         int64_t now = esp_timer_get_time() / 1000;
-        uint32_t age = (uint32_t)now - atomic_load(&uploader_tick);
+        uint32_t age = (uint32_t)now - tick;
         bool started = atomic_load(&uploader_started);
         bool ok = cJSON_AddStringToObject(worker, "name", "hikvision_source") &&
             cJSON_AddStringToObject(worker, "state", !started ? "STOPPED" : age > 90000 ? "FAULT" :
@@ -358,6 +359,10 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddNumberToObject(terminal, "source_storage_failures", atomic_load(&source_failures));
     uint32_t depth;
     if (qs_snapshot(QS_HIK_SOURCE, &depth)) cJSON_AddNumberToObject(terminal, "source_queue_depth", depth);
+    /* The common heartbeat started before queue/worker sampling. Stamp its
+     * uptime after collection so a later worker tick is not in its future. */
+    cJSON *uptime = cJSON_GetObjectItemCaseSensitive(payload, "uptime_seconds");
+    if (cJSON_IsNumber(uptime)) cJSON_SetNumberValue(uptime, esp_timer_get_time() / 1000000);
 }
 static void source_uploader(void *arg)
 {
