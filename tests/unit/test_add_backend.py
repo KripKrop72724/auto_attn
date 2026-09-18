@@ -6044,3 +6044,20 @@ def test_queue_evidence_admin_reveal_requires_csrf_and_step_up(db):
     assert result.json()["raw_b64"] == payload["raw_b64"]
     assert result.json()["disposition"] == "PRESERVED_UNRESOLVED"
     assert db.scalar(select(AuditEvent).where(AuditEvent.action == "QUEUE_EVIDENCE_REVEALED")) is not None
+
+
+def test_factory_boot_heartbeat_is_accepted_without_relaxing_partition_names(db: Session):
+    connector = connector_fixture(db)
+    payload = HeartbeatPayload(
+        firmware_version="zone-lite-3.0.2",
+        ota={"running_partition": "factory", "running_version": "3.0.2",
+             "secure_boot": True, "rollback_enabled": True},
+    )
+    update_heartbeat(db, connector=connector, boot_id="factory-bootstrap", sequence=1,
+                     payload=payload)
+    db.flush()
+    assert connector.connected
+    assert payload.ota.running_partition == "factory"
+    assert connector.firmware_version == "zone-lite-3.0.2"
+    with pytest.raises(ValueError):
+        HeartbeatPayload(ota={"running_partition": "nvs"})

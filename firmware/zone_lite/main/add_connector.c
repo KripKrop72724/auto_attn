@@ -2440,7 +2440,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         }
     }
     const char *segmented_names[QS_COUNT] = {"segmented_live", "segmented_bulk", "segmented_ords",
-        "segmented_blocked", "segmented_receipts", "segmented_evidence"};
+        "segmented_blocked", "segmented_receipts", "segmented_evidence", "hikvision_source"};
     for (unsigned i = 0; i < QS_COUNT; i++) {
         cJSON *queue = cJSON_CreateObject();
         if (!queue) goto failed;

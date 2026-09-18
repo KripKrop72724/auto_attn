@@ -68,6 +68,21 @@ static hik_result_t open_request(esp_http_client_method_t method, const char *pa
         result = HIK_AUTH;
         /* Explicit Digest only; never let IDF downgrade a challenge to Basic. */
         if (!headers->digest || attempt == 2 || esp_http_client_add_auth(client) != ESP_OK) break;
+        /* fetch_headers may cache part/all of the 401 body. close() alone does
+         * not clear that cache in IDF; drain it before the authenticated reply
+         * so XML error text cannot be prepended to successful JSON. */
+        size_t discarded = 0;
+        int64_t deadline = esp_timer_get_time() + 15000000;
+        bool drained = false;
+        for (;;) {
+            char discard[512];
+            int n = esp_http_client_read(client, discard, sizeof(discard));
+            if (n < 0 || esp_timer_get_time() > deadline) break;
+            if (!n) { drained = esp_http_client_is_complete_data_received(client); break; }
+            discarded += (size_t)n;
+            if (discarded > 16384) break;
+        }
+        if (!drained) { result = HIK_NETWORK; break; }
         esp_http_client_close(client);
     }
     esp_http_client_cleanup(client);
