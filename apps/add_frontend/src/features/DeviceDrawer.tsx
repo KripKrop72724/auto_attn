@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { api } from '../api'
 import {
   CommandProgress, Dialog, StatusBadge, dateTime, drawerTabs, idempotency,
@@ -60,7 +60,8 @@ export function DeviceDrawer({
     setCommKeySerial((current) => current || detail.zkt?.confirmed_serial || detail.zkt?.expected_serial || detail.zkt?.serial || '')
   }, [seed.connector_id])
   useEffect(() => { void load() }, [load, revision])
-  useEffect(() => {
+  // Install hiding handlers before the revealed value can be painted.
+  useLayoutEffect(() => {
     if (!revealedKey) return
     const hide = () => setRevealedKey(null)
     const hideWhenBackgrounded = () => { if (document.visibilityState !== 'visible') hide() }
