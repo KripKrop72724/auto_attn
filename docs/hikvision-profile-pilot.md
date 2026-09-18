@@ -48,3 +48,12 @@ not replace end-to-end ADD → signed ESP → terminal command checks. Record th
 checks after deployment. Full retained-history reconciliation, fault testing and
 the 72-hour soak remain separate release gates. Keep general qualification
 `NOT_QUALIFIED` and factory artifacts `HIL_ONLY` until those gates pass.
+
+## Create readback normalization
+
+The first signed ESP command created its disposable profile but correctly withheld
+success because the terminal canonicalized disabled validity dates to
+`1970-01-01T00:00:00`. Firmware 3.0.7 accepts this one observed normalization only
+when validity remains disabled and all other requested fields match. Arbitrary
+date changes, enabled validity, changed rights and changed timezone are rejected.
+The regression harness now returns the hardware-observed normalized response.

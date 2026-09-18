@@ -271,6 +271,34 @@ static hik_result_t submit(esp_http_client_method_t method, const char *path, co
     cJSON_Delete(response); cJSON_Delete(body);
     return result;
 }
+bool hik_user_matches_created_profile(const cJSON *actual, const cJSON *desired)
+{
+    const cJSON *field;
+    cJSON_ArrayForEach(field, desired) {
+        if (!field->string) return false;
+        const cJSON *observed = cJSON_GetObjectItemCaseSensitive(actual, field->string);
+        if (cJSON_Compare(field, observed, true)) continue;
+        /* This exact pilot firmware canonicalizes disabled validity dates to
+         * the epoch. Accept only that observed normalization, not arbitrary
+         * changed rights, enabled validity, or other field differences. */
+        if (strcmp(field->string, "Valid") ||
+            !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(field, "enable"))) return false;
+        cJSON *canonical = cJSON_Duplicate(field, true);
+        if (!canonical) return false;
+        const char *dates[] = {"beginTime", "endTime"};
+        bool valid = true;
+        for (unsigned i = 0; i < 2; i++) {
+            cJSON *epoch = cJSON_CreateString("1970-01-01T00:00:00");
+            if (!epoch || !cJSON_ReplaceItemInObjectCaseSensitive(canonical, dates[i], epoch)) {
+                cJSON_Delete(epoch); valid = false; break;
+            }
+        }
+        valid = valid && cJSON_Compare(canonical, observed, true);
+        cJSON_Delete(canonical);
+        if (!valid) return false;
+    }
+    return true;
+}
 hik_result_t hik_user_create(const cJSON *desired, bool *verified)
 {
     *verified = false;
@@ -286,11 +314,7 @@ hik_result_t hik_user_create(const cJSON *desired, bool *verified)
     cJSON *after = NULL;
     hik_result_t read = hik_user_read(employee, &after);
     if (read == HIK_OK && after) {
-        *verified = true;
-        const cJSON *field;
-        cJSON_ArrayForEach(field, desired) {
-            if (!field->string || !cJSON_Compare(field, cJSON_GetObjectItemCaseSensitive(after, field->string), true)) *verified = false;
-        }
+        *verified = hik_user_matches_created_profile(after, desired);
     }
     cJSON_Delete(after);
     return *verified ? HIK_OK : result == HIK_OK ? HIK_CUSTODY : result;
