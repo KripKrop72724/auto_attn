@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_digest_retry_drains_cached_challenge_body(tmp_path):
-    (tmp_path / 'esp_err.h').write_text('#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n')
+    (tmp_path / 'esp_err.h').write_text('#pragma once\n#include <stddef.h>\nsize_t hik_test_strlcpy(char *, const char *, size_t);\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n')
     (tmp_path / 'esp_timer.h').write_text('#include <stdint.h>\nint64_t esp_timer_get_time(void);\n')
     (tmp_path / 'esp_crt_bundle.h').write_text('int esp_crt_bundle_attach(void *);\n')
     (tmp_path / 'esp_http_client.h').write_text('''
@@ -37,7 +37,7 @@ int esp_http_client_cleanup(esp_http_client_handle_t);
     main = ROOT / 'firmware/zone_lite/main'
     executable = tmp_path / 'hik-http'
     subprocess.run([shutil.which('cc'), '-std=c11', '-g', '-O1', '-Wall', '-Wextra',
-                    '-Werror', '-fsanitize=address,undefined', '-I', str(tmp_path), '-I', str(main),
+                    '-Werror', '-Dstrlcpy=hik_test_strlcpy', '-fsanitize=address,undefined', '-I', str(tmp_path), '-I', str(main),
                     str(main / 'hikvision_http.c'), str(main / 'hikvision_stream.c'),
                     str(ROOT / 'tests/firmware/hikvision_http_host.c'), '-o', str(executable)], check=True)
     subprocess.run([str(executable)], check=True, timeout=30)

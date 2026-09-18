@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+size_t hik_test_strlcpy(char *dst,const char *src,size_t cap){size_t n=strlen(src);if(cap){size_t copy=n<cap-1?n:cap-1;memcpy(dst,src,copy);dst[copy]=0;}return n;}
 struct client {esp_http_client_config_t cfg; unsigned attempt; char cache[20000]; size_t bytes;};
 static unsigned challenges, auth_calls, closes;
 static bool basic, oversized, incomplete;
