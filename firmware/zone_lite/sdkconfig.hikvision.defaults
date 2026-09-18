@@ -1,0 +1,6 @@
+# ISAPI requires Digest authentication; ESP-IDF disables it by default.
+CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH=y
+
+# Concurrent history/profile workers leave insufficient internal heap for TLS.
+# Use the board's configured malloc policy (internal first, PSRAM fallback).
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
