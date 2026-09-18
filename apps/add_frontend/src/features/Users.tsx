@@ -50,8 +50,9 @@ export function UserOperationDialog({
   const editRequiresCnic = conflictRequiresCnic || missingCnicRequiresCnic
   const permanentElevation = state.mode === 'edit' && user?.privilege !== 14 && privilege === 14
   const elevationConfirmation = user ? `ELEVATE ${user.user_id} ON ${device.device_id}` : ''
+  const nameByteLimit = Number(device.zkt?.capabilities.name_bytes || 24)
   const preview = cnic
-    ? buildMachinePreview(displayName, cnic, shiftWorker)
+    ? buildMachinePreview(displayName, cnic, shiftWorker, nameByteLimit)
     : editRequiresCnic
       ? 'Enter the verified CNIC to generate a safe terminal preview.'
       : user?.machine_name_preview || 'CNIC is preserved and never returned to the browser.'
@@ -170,7 +171,7 @@ export function UserOperationDialog({
   }
 
   const copy = {
-    create: ['Add user to selected terminal', 'Creates a regular user on this ZKT only.'],
+    create: ['Add user to selected terminal', 'Creates a regular user on this terminal only.'],
     edit: ['Edit device user', 'Name, replacement CNIC, shift status, and permanent role are verified after write.'],
     delete: ['Delete user from terminal', 'The user is removed; punches and identity history remain permanently preserved.'],
     lease: ['Grant enrollment access', 'The selected regular user becomes administrator for 10 minutes, then reverts automatically.'],
@@ -179,22 +180,23 @@ export function UserOperationDialog({
   return (
     <Dialog titleId="user-operation-title" title={title} description={description} onClose={onClose}>
       <form className="dialog-body" onSubmit={submit}>
+        {state.mode === 'delete' && device.firmware_family === 'hikvision' && device.zkt?.capabilities.delete_face_qualified === true && <p className="info-copy">Deleting this profile also removes its enrolled face; that face will no longer authenticate. Attendance and identity history are retained. Profiles with fingerprints or cards cannot yet be deleted through this pilot.</p>}
         {(state.mode === 'create' || state.mode === 'edit') && (
           <>
             <div className="form-grid">
               <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} aria-invalid={Boolean(fieldErrors.display_name)} />{fieldErrors.display_name?.[0] && <small className="field-error">{fieldErrors.display_name[0]}</small>}</label>
               <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : missingCnicRequiresCnic ? 'Replacement CNIC (required for missing CNIC)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={editRequiresCnic} aria-invalid={Boolean(fieldErrors.cnic)} />{fieldErrors.cnic?.[0] && <small className="field-error">{fieldErrors.cnic[0]}</small>}</label>
               {state.mode === 'create' && <label>Employee/user ID override (optional)<input inputMode="numeric" value={userIdOverride} onChange={(event) => setUserIdOverride(event.target.value.replace(/\D/g, '').slice(0, device.firmware_family === 'hikvision' ? 32 : 24))} aria-invalid={Boolean(fieldErrors.user_id_override)} />{fieldErrors.user_id_override?.[0] && <small className="field-error">{fieldErrors.user_id_override[0]}</small>}</label>}
-              {state.mode === 'edit' && <label>Terminal role<select value={privilege} onChange={(event) => { setPrivilege(Number(event.target.value) as 0 | 14); setConfirmation(''); setElevationReason('') }}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select><small>Prefer the separate 10-minute enrollment lease for routine fingerprint enrollment.</small></label>}
+              {state.mode === 'edit' && <label>Terminal role<select value={privilege} onChange={(event) => { setPrivilege(Number(event.target.value) as 0 | 14); setConfirmation(''); setElevationReason('') }}><option value={0}>Regular user</option><option value={14}>Permanent administrator</option></select><small>{device.firmware_family === 'hikvision' ? 'Changes local terminal administrator access. Temporary enrollment leases are unavailable on Hikvision.' : 'Prefer the separate 10-minute enrollment lease for routine fingerprint enrollment.'}</small></label>}
             </div>
             <label className="check-field"><input type="checkbox" checked={shiftWorker} onChange={(event) => setShiftWorker(event.target.checked)} /><span><strong>Shift worker</strong><small>Adds the -S- identity marker used for raw-punch handling.</small></span></label>
-            <div className="preview-box"><span>Exact ZKT 24-byte name preview</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / 24 UTF-8 bytes` : editRequiresCnic ? 'Verified CNIC is required before this update can be queued.' : 'Stored CNIC remains write-only.'}</small></div>
+            <div className="preview-box"><span>Exact terminal name preview ({nameByteLimit} bytes)</span><code>{preview}</code><small>{cnic ? `${utf8Length(preview)} / ${nameByteLimit} UTF-8 bytes` : editRequiresCnic ? 'Verified CNIC is required before this update can be queued.' : 'Stored CNIC remains write-only.'}</small></div>
           </>
         )}
         {state.mode === 'delete' && (
           <div className="destructive-copy pattern-blocked">
             <Icon name="trash" />
-            <div><h3>{state.user.display_name}</h3><p>UID {state.user.uid} · User ID {state.user.user_id}</p><p>ADD and ZKT attendance records will not be deleted.</p></div>
+            <div><h3>{state.user.display_name}</h3><p>UID {state.user.uid} · User ID {state.user.user_id}</p><p>ADD and terminal attendance records will not be deleted.</p></div>
           </div>
         )}
         {state.mode === 'lease' && (
@@ -806,7 +808,8 @@ export function UsersView({
   }
 
   const writable = Boolean(
-    selected?.zkt?.certification_state === 'CERTIFIED' &&
+    (selected?.zkt?.certification_state === 'CERTIFIED' ||
+      (selected?.firmware_family === 'hikvision' && selected.zkt?.certification_state === 'PROFILE_PILOT')) &&
       selected.zkt.snapshot_complete &&
       selected.zkt.capabilities.user_write,
   )
@@ -855,7 +858,7 @@ export function UsersView({
       <div><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>
       <div className="row-actions">
         <button className="icon-button" disabled={!writable} onClick={() => setDialog({ mode: 'edit', user })} aria-label={`Edit ${user.display_name}`}><Icon name="edit" /></button>
-        <button className="icon-button" disabled={!writable || user.privilege !== 0} onClick={() => setDialog({ mode: 'lease', user })} aria-label={`Grant enrollment access to ${user.display_name}`}><Icon name="shield" /></button>
+        <button className="icon-button" disabled={!writable || !selected?.zkt?.capabilities.admin_lease || user.privilege !== 0} onClick={() => setDialog({ mode: 'lease', user })} aria-label={`Grant enrollment access to ${user.display_name}`}><Icon name="shield" /></button>
         <button className="icon-button" disabled={!writable || user.privilege === 14} onClick={() => setDialog({ mode: 'delete', user })} aria-label={`Delete ${user.display_name}`}><Icon name="trash" /></button>
       </div>
     </article>

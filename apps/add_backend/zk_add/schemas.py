@@ -132,6 +132,7 @@ class HikvisionTerminalPayload(BaseModel):
     poll_error: int | None = Field(default=None, ge=0)
     durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
     full_history_required: bool = True
+    profile_command_version: Literal[1] | None = None
 
 
 class HeartbeatPayload(BaseModel):
@@ -849,6 +850,7 @@ class HikvisionPolicyRequest(BaseModel):
     success_codes: list[list[StrictInt]] = Field(min_length=1, max_length=32)
     excluded_codes: list[list[StrictInt]] = Field(default_factory=list, max_length=256)
     enabled: bool = False
+    profile_commands_enabled: bool = False
     reason: str = Field(min_length=10, max_length=500)
     password: SecretStr
     idempotency_key: str = Field(min_length=8, max_length=120)

@@ -3705,7 +3705,10 @@ def serialize_user(
         "observed_at": row.observed_at,
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
-        "read_only": bool(zkt and zkt.certification_state != "CERTIFIED"),
+        "read_only": bool(zkt and not (
+            zkt.certification_state == "CERTIFIED" or
+            (zkt.connector.firmware_family == "hikvision" and zkt.certification_state == "PROFILE_PILOT")
+        )),
     }
 
 

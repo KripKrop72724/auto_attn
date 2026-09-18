@@ -431,14 +431,26 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         return
 
     if connector.firmware_family == "hikvision":
-        # ZKT binary-record stability is not an ISAPI qualification. Keep the
-        # shared serial quarantine above, but never confer write capability from
-        # a Hikvision heartbeat or a coincidental ZKT-shaped metadata field.
-        zkt.certification_state = "READ_ONLY"
-        zkt.writes_disabled_reason = "HIKVISION_WRITE_QUALIFICATION_PENDING"
+        profile = zkt.capability_profile or {}
+        approval = profile.get("hikvision_profile_approval") or {}
+        health = profile.get("hikvision_health") or {}
+        writable = (
+            approval.get("enabled") is True
+            and approval.get("terminal_serial") == zkt.serial == zkt.confirmed_serial
+            and approval.get("profile_id") == health.get("capability_profile")
+            == "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1"
+            and health.get("profile_command_version") == 1
+            and zkt.terminal_binding_state == "CONFIRMED"
+            and zkt.snapshot_complete and zkt.identity_snapshot_stable
+        )
+        # Limited profile pilot capability is not full attendance/OTA certification.
+        zkt.certification_state = "PROFILE_PILOT" if writable else "READ_ONLY"
+        zkt.writes_disabled_reason = None if writable else "HIKVISION_WRITE_QUALIFICATION_PENDING"
         zkt.capability_profile = {
-            **(zkt.capability_profile or {}),
-            "user_write": False, "create_user": False, "delete_user": False,
+            **profile,
+            "user_write": bool(writable), "create_user": bool(writable), "delete_user": bool(writable),
+            "user_role_write": bool(writable), "delete_face_qualified": True, "delete_fingerprint_card_qualified": False,
+            "name_bytes": 128,
             "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
         }
         return
@@ -3624,13 +3636,19 @@ def command_payload_summary(payload: dict) -> dict:
     return {key: value for key, value in payload.items() if key in allowed}
 
 
+def user_profile_is_writable(connector: Connector, zkt: ZKTDevice) -> bool:
+    return zkt.certification_state == "CERTIFIED" or (
+        connector.firmware_family == "hikvision" and zkt.certification_state == "PROFILE_PILOT"
+    )
+
+
 def require_writable_user_profile(connector: Connector, capability: str) -> ZKTDevice:
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("No assigned ZKT device.")
     if connector.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL":
         raise ValueError("This connector is quarantined because its ZKT serial is duplicated.")
-    if zkt.certification_state != "CERTIFIED" or not zkt.capability_profile.get(
+    if not user_profile_is_writable(connector, zkt) or not zkt.capability_profile.get(
         capability, False
     ):
         reason = zkt.writes_disabled_reason or "DEVICE_NOT_WRITE_CERTIFIED"
@@ -4006,6 +4024,9 @@ def update_device_user_command(
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker
     next_privilege = user.privilege if privilege is None else privilege
+    if (connector.firmware_family == "hikvision" and next_privilege != user.privilege
+            and not zkt.capability_profile.get("user_role_write")):
+        raise ValueError("Hikvision role changes are not qualified on this connector.")
     fingerprint_preconditions = terminal_fingerprint_preconditions(user)
     machine_name = build_machine_name(
         display_name=next_display,
@@ -4886,7 +4907,30 @@ def apply_command_update(
         raise ValueError("Unknown command ID.")
     if command.status in TERMINAL_COMMAND_STATES:
         return command
-    if status == "SUCCEEDED" and command.command_type == "DELETE_USER":
+    hik_profile = connector.firmware_family == "hikvision" and command.command_type in {
+        "CREATE_USER", "UPDATE_USER", "DELETE_USER"
+    }
+    if status == "SUCCEEDED" and hik_profile:
+        payload = decrypt_json(command.payload_encrypted)
+        expected = decrypt_json(command.expected_state_encrypted)
+        identity = hashlib.sha256(
+            f"{expected.get('serial', '')}\n{payload.get('user_id', '')}".encode()
+        ).hexdigest()
+        state = result.get("verified_terminal_state_fingerprint")
+        valid = result.get("verified") is True and result.get(
+            "verified_terminal_identity_fingerprint"
+        ) == identity
+        if command.command_type == "DELETE_USER":
+            valid = valid and result.get("user_absent") is True
+        else:
+            valid = valid and isinstance(state, str) and len(state) == 64 and all(
+                char in "0123456789abcdef" for char in state
+            )
+        if not valid:
+            status = "FAILED"
+            error_code = "HIK_PROFILE_POSTCONDITION_FAILED"
+            error_message = "Terminal profile verification did not satisfy command postconditions."
+    if status == "SUCCEEDED" and command.command_type == "DELETE_USER" and not hik_profile:
         before_count = result.get("attendance_count_before")
         after_count = result.get("attendance_count_after")
         if result.get("user_absent") is not True or before_count != after_count:

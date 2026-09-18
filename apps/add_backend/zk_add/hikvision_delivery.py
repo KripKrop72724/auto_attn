@@ -263,6 +263,7 @@ def configure_policy(
     actor,
     reason,
     idempotency_key,
+    profile_commands_enabled=False,
 ):
     from zk_add.audit import append_audit
     from zk_add.models import AuditEvent
@@ -278,6 +279,8 @@ def configure_policy(
         raise ValueError("HIKVISION_TERMINAL_BINDING_REQUIRED")
     if not source_epoch or len(source_epoch) > 64 or not profile_id or len(profile_id) > 80:
         raise ValueError("HIKVISION_PROFILE_REQUIRED")
+    if profile_commands_enabled and profile_id != "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1":
+        raise ValueError("HIKVISION_PROFILE_COMMANDS_NOT_QUALIFIED")
     if not success_codes or len(success_codes) > 32 or len(excluded_codes) > 256:
         raise ValueError("INVALID_EVENT_MAPPING")
     for code in [*success_codes, *excluded_codes]:
@@ -303,6 +306,8 @@ def configure_policy(
         "identity_rule": "name-cnic",
         "reason": reason,
     }
+    if profile_commands_enabled:
+        request["profile_commands_enabled"] = True
     prior = session.scalar(
         select(AuditEvent).where(
             AuditEvent.action == "HIKVISION_POLICY_CONFIGURED",
@@ -332,6 +337,16 @@ def configure_policy(
     policy.excluded_codes = request["excluded_codes"]
     policy.enabled = bool(enabled)
     policy.mapping_revision += 1
+    # An audited ADD approval is required in addition to signed firmware support.
+    # A heartbeat cannot grant its own user-write qualification.
+    terminal.capability_profile = {
+        **(terminal.capability_profile or {}),
+        "hikvision_profile_approval": {
+            "enabled": bool(enabled and profile_commands_enabled),
+            "terminal_serial": terminal_serial,
+            "profile_id": profile_id,
+        },
+    }
     append_audit(
         session,
         actor=actor,

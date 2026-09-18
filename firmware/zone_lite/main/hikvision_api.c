@@ -297,6 +297,10 @@ hik_result_t hik_user_create(const cJSON *desired, bool *verified)
 }
 hik_result_t hik_user_rename(const cJSON *expected, const char *name, bool *verified)
 {
+    return hik_user_edit(expected, name, false, false, verified);
+}
+hik_result_t hik_user_edit(const cJSON *expected, const char *name, bool change_admin, bool admin, bool *verified)
+{
     *verified = false;
     const char *employee = string(expected, "employeeNo");
     if (!employee_valid(employee) || !name || !*name || strlen(name) > 128) return HIK_CONFIGURATION;
@@ -307,6 +311,7 @@ hik_result_t hik_user_rename(const cJSON *expected, const char *name, bool *veri
     if (!before || !cJSON_Compare(before, expected, true)) { cJSON_Delete(before); return HIK_BINDING; }
     cJSON *update = cJSON_CreateObject();
     bool valid = update && cJSON_AddStringToObject(update, "employeeNo", employee) && cJSON_AddStringToObject(update, "name", name);
+    if (change_admin) valid = valid && cJSON_AddBoolToObject(update, "localUIRight", admin);
     result = valid ? submit(HTTP_METHOD_PUT, "/ISAPI/AccessControl/UserInfo/Modify?format=json", "UserInfo", update) : HIK_NETWORK;
     cJSON_Delete(update);
     cJSON *after = NULL;
@@ -314,6 +319,11 @@ hik_result_t hik_user_rename(const cJSON *expected, const char *name, bool *veri
     cJSON *new_name = cJSON_CreateString(name);
     bool changed = new_name && cJSON_ReplaceItemInObjectCaseSensitive(before, "name", new_name);
     if (!changed) cJSON_Delete(new_name);
+    if (changed && change_admin) {
+        cJSON *right = cJSON_CreateBool(admin);
+        changed = right && cJSON_ReplaceItemInObjectCaseSensitive(before, "localUIRight", right);
+        if (!changed) cJSON_Delete(right);
+    }
     *verified = changed && read == HIK_OK && after && cJSON_Compare(before, after, true);
     cJSON_Delete(after); cJSON_Delete(before);
     return *verified ? HIK_OK : result == HIK_OK ? HIK_CUSTODY : result;
