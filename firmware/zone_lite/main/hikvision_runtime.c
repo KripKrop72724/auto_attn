@@ -109,11 +109,23 @@ static bool preserve(void *context, const char *body, size_t length)
     if (!ok) atomic_fetch_add(&source_failures, 1);
     return ok;
 }
-typedef struct { unsigned char digest[32]; unsigned count; bool store; } page_context_t;
+typedef struct {
+    unsigned char digest[32];
+    const unsigned char *expected_anchor;
+    unsigned count;
+    bool anchor_seen, anchor_conflict;
+} page_context_t;
 static bool poll_record(void *context, const char *body, size_t length)
 {
     page_context_t *page = context;
-    if (page->store && !preserve("POLL", body, length)) return false;
+    if (page->expected_anchor && !page->anchor_seen) {
+        unsigned char digest[32];
+        mbedtls_sha256((const unsigned char *)body, length, digest, 0);
+        page->anchor_conflict = memcmp(digest, page->expected_anchor, 32) != 0;
+        page->anchor_seen = !page->anchor_conflict;
+        return page->anchor_seen;
+    }
+    if (!preserve("POLL", body, length)) return false;
     mbedtls_sha256((const unsigned char *)body, length, page->digest, 0);
     page->count++;
     return true;
@@ -133,7 +145,11 @@ static void poll_task(void *arg)
             if (!loaded) result = HIK_CUSTODY;
         }
         if (result == HIK_OK) result = hik_http_verify_identity();
-        uint32_t begin = cursor.serial + 1;
+        /* Include the committed anchor in the same ordered source page as new
+         * records. Validate it before any new evidence enters the queue. This
+         * keeps reset/reuse protection without a second slow history search on
+         * every empty poll, which can starve profiles and reconciliation. */
+        uint32_t begin = present && cursor.serial ? cursor.serial : 1;
         if (result == HIK_OK && !present) {
             uint32_t first, last, count;
             result = hik_history_bounds(&first, &last, &count);
@@ -141,17 +157,14 @@ static void poll_task(void *arg)
              * remains explicitly outstanding for the independent full job. */
             if (result == HIK_OK) begin = count ? (last - first >= 19 ? last - 19 : first) : 1;
         }
-        if (result == HIK_OK && present && cursor.serial) {
-            hik_search_t anchor; hik_search_init(&anchor, cursor.serial, cursor.serial);
-            page_context_t check = {0};
-            result = hik_history_page(&anchor, poll_record, &check);
-            if (result == HIK_OK && (check.count != 1 || memcmp(check.digest, cursor.anchor, 32)))
-                result = HIK_BINDING; /* retention loss or ambiguous reset/reuse */
-        }
         if (result == HIK_OK && begin <= 3000000000U) {
             hik_search_t search; hik_search_init(&search, begin, 3000000000U);
-            page_context_t page = {.store = true};
+            page_context_t page = {
+                .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
+            };
             result = hik_history_page(&search, poll_record, &page);
+            if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen))
+                result = HIK_BINDING;
             if (result == HIK_OK && (page.count || !present)) {
                 poll_checkpoint_t next = cursor;
                 if (page.count) {
@@ -186,7 +199,7 @@ static void history_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        if (atomic_load(&profiles_active) || next_poll_due - esp_timer_get_time() < 2000000 ||
+        if (atomic_load(&profiles_active) || next_poll_due <= esp_timer_get_time() ||
             !add_connector_take_hikvision_assignment(assignment)) {
             xSemaphoreGive(request_lock); continue;
         }
@@ -251,7 +264,7 @@ static void profile_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(200));
                 if (!add_connector_is_connected()) { failed = true; break; }
                 if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-                if (next_poll_due - esp_timer_get_time() < 2000000) {
+                if (next_poll_due <= esp_timer_get_time()) {
                     xSemaphoreGive(request_lock); continue;
                 }
                 cJSON *body = cJSON_CreateObject();

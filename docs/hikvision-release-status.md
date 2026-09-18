@@ -1,7 +1,33 @@
-# Hikvision 3.0.0 development status
+# Hikvision pilot status
 
-Status on 2026-09-18: **development integration implemented in part; not deployed,
-not flashed, and not certified for production**.
+Status on 2026-09-18: **ADD deployed; signed 3.0.3 flashed to the authorized
+LF-ZONE-BLD9-03 ESP; pilot delivery observed; full release qualification incomplete.**
+
+## Current hardware evidence
+
+- PRs 162–165 are merged. CI 35317698044 passed all five checks; production
+  deployment 35318320760 and its public checks passed. Signing 35318318234
+  published the 3.0.3 HIL_ONLY bundle. The ZKT firmware rollout remains disabled.
+- Application-only flash preserved provisioning and storage. Secure Boot verified
+  the new application signature; ADD reports the expected hardware identity and
+  firmware. The terminal is reachable and the durable polling cursor reached 173664.
+- Three recent-tail attendance rows have ADD custody and Oracle confirmation.
+  This is recovery/poll delivery evidence, not a measured fresh-punch latency result.
+- The source queue drained with no reported read/write failures. After the serial
+  capture reboot, persistence proof awaits a new durable write; the previous
+  durability alarm remains latched rather than being manually cleared.
+- Profile publication and full reconciliation have not yet passed. Hardware timing
+  exposed starvation: checking the predecessor and new range in separate searches
+  can consume the whole five-second interval. Version 3.0.4 combines the committed
+  anchor and new records in one ordered search, verifying the anchor before any
+  new record is admitted. It is pending signed hardware verification.
+- ESP profile create/edit/delete dispatch and the 72-hour soak remain incomplete.
+  The capability profile remains NOT_QUALIFIED; no AVAILABLE promotion is claimed.
+- Historical CNIC-correction preview/execution remain temporarily disabled by
+  operator authorization. Normal Oracle attendance delivery remains enabled.
+
+The following development notes describe earlier milestones; statements that no
+merge, deployment or flash occurred refer to those earlier milestones only.
 
 Installation: `LF-ZONE-BLD9-03` (zone ID and device name), ESP32-S3 and serial-bound
 DS-K1T342EFWX V3.3.5 build 220310. Protected installation data remains outside
