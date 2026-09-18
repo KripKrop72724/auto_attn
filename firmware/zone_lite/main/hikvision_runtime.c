@@ -5,6 +5,7 @@
 #include "zone_config.h"
 #include "queue_store.h"
 #include "add_connector.h"
+#include "led_status.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -26,6 +27,8 @@ static atomic_long last_message, last_poll;
 static atomic_uint poll_error, poll_cursor;
 static atomic_bool history_required = true;
 static atomic_bool profiles_active;
+static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
+static atomic_uint uploader_tick;
 static SemaphoreHandle_t request_lock;
 static QueueHandle_t profile_commands;
 static int64_t next_poll_due;
@@ -164,6 +167,10 @@ static void poll_task(void *arg)
         if (result == HIK_OK) {
             atomic_store(&last_poll, time(NULL));
             atomic_store(&poll_cursor, cursor.serial);
+            uint32_t depth = 0;
+            bool known = qs_snapshot(QS_HIK_SOURCE, &depth);
+            led_status_set(known && !depth && add_connector_is_connected()
+                ? LED_STATUS_HEALTHY : LED_STATUS_BACKLOG);
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
         xSemaphoreGive(request_lock);
         int64_t remaining = 5000000 - (esp_timer_get_time() - started);
@@ -282,6 +289,20 @@ static void profile_task(void *arg)
 void hikvision_append_telemetry(cJSON *payload)
 {
     const zone_config_t *cfg = zone_config_get();
+    cJSON *diagnostics = cJSON_GetObjectItemCaseSensitive(payload, "diagnostics");
+    cJSON *workers = cJSON_GetObjectItemCaseSensitive(diagnostics, "workers");
+    cJSON *worker = cJSON_IsArray(workers) ? cJSON_CreateObject() : NULL;
+    if (worker) {
+        int64_t now = esp_timer_get_time() / 1000;
+        uint32_t age = (uint32_t)now - atomic_load(&uploader_tick);
+        bool started = atomic_load(&uploader_started);
+        bool ok = cJSON_AddStringToObject(worker, "name", "hikvision_source") &&
+            cJSON_AddStringToObject(worker, "state", !started ? "STOPPED" : age > 90000 ? "FAULT" :
+                !atomic_load(&uploader_buffer_ready) ? "WAITING_RESOURCE" :
+                atomic_load(&uploader_waiting) ? "WAITING_NETWORK" : "RUNNING") &&
+            (!started || cJSON_AddNumberToObject(worker, "last_activity_uptime_ms", (double)(now - age)));
+        if (!ok || !cJSON_AddItemToArray(workers, worker)) cJSON_Delete(worker);
+    }
     cJSON_DeleteItemFromObjectCaseSensitive(payload, "zkt");
     cJSON_DeleteItemFromObjectCaseSensitive(payload, "comm_key_management");
     cJSON_AddBoolToObject(payload, "comm_key_management", false);
@@ -315,17 +336,22 @@ static void source_uploader(void *arg)
     (void)arg;
     char *payload = NULL;
     for (;;) {
+        atomic_store(&uploader_started, true);
+        atomic_store(&uploader_tick, (uint32_t)(esp_timer_get_time() / 1000));
         if (!payload) payload = malloc(DQ_MAX_RECORD_BYTES + 1);
+        atomic_store(&uploader_buffer_ready, payload != NULL);
         if (!payload) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         size_t length = 0;
         dq_token_t token;
         dq_result_t state = qs_peek(QS_HIK_SOURCE, payload, DQ_MAX_RECORD_BYTES, &length, &token);
         if (state == DQ_OK) {
             payload[length] = 0;
+            atomic_store(&uploader_waiting, true);
             if (add_connector_send_payload_acknowledged("hikvision_observation", payload, 10000)) {
                 if (qs_settle(QS_HIK_SOURCE, &token) != DQ_OK)
                     ESP_LOGW(TAG, "Source evidence receipt is awaiting durable checkpoint");
             }
+            atomic_store(&uploader_waiting, false);
         }
         vTaskDelay(pdMS_TO_TICKS(state == DQ_OK ? 50 : 1000));
     }
@@ -342,6 +368,7 @@ void hikvision_gateway_task(void *argument)
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
         if (!profiles && xTaskCreate(profile_task, "hik_profiles", 8192, NULL, 2, &profiles) != pdPASS) profiles = NULL;
         if (!uploader && xTaskCreate(source_uploader, "hik_evidence", 8192, NULL, 4, &uploader) != pdPASS) uploader = NULL;
+        if (!stream || !history || !profiles || !uploader) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         if (profiles && uxQueueSpacesAvailable(profile_commands)) {
             add_command_t command;
             if (add_connector_take_command(&command)) {

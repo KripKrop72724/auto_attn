@@ -11,7 +11,9 @@
 #endif
 const char *storage_upgrade_contract(void)
 {
-#if ZONE_LITE_SEGMENTED_WRITES
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return "ZONE_HIKVISION_STORAGE_CONTRACT_V1:SOURCE:READ=2:LANES=7F";
+#elif ZONE_LITE_SEGMENTED_WRITES
     return "ZONE_STORAGE_CONTRACT_V1:SEGMENTED:READ=2:LANES=3F:COMPAT=2.5.4";
 #else
     return "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4";
@@ -25,6 +27,15 @@ bool storage_upgrade_init(void)
 {
     ready = segmented = false;
     const esp_app_desc_t *running = esp_app_get_description();
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    /* Hikvision starts with its own source lane; it never upgrades ZKT's
+     * legacy lanes to segmented writers or fabricates a ZKT predecessor proof.
+     * qs_init still validates/replays every existing queue before use. */
+    if (!running || strcmp(running->project_name, "zone_lite_hikvision"))
+        return failed("STORAGE_APPLICATION_UNKNOWN");
+    if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
+    error_code = ""; ready = true; return true;
+#endif
     if (!running || strcmp(running->project_name, "zone_lite")) return failed("STORAGE_APPLICATION_UNKNOWN");
     if (!ZONE_LITE_SEGMENTED_WRITES && strcmp(running->version, UG_COMPAT_VERSION)) {
         error_code = ""; ready = true; return true;

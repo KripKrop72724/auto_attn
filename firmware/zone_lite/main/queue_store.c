@@ -179,6 +179,10 @@ bool qs_init(void)
         } else ok = false;
         xSemaphoreGive(lane->mutex);
     }
+    if (xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        health.recovery_complete = ok;
+        xSemaphoreGive(budget_lock);
+    } else ok = false;
     return ok;
 }
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
@@ -189,7 +193,11 @@ dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 }
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy)
 {
-    if (!storage_upgrade_segmented_writes() || (unsigned)policy > QS_ADMIT_RECOVERY) return DQ_IO;
+    bool writable = storage_upgrade_segmented_writes();
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    if (lane == QS_HIK_SOURCE) writable = storage_upgrade_ready();
+#endif
+    if (!writable || (unsigned)policy > QS_ADMIT_RECOVERY) return DQ_IO;
     if (!lock(lane)) return DQ_IO;
     lanes[lane].admission = policy;
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -198,6 +206,7 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     errno = 0;
     dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
+    if (result == DQ_OK) health.persistence_verified = true;
     record_queue_result(result, "segment_append", true);
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);

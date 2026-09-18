@@ -61,7 +61,16 @@ int nvs_commit(int handle){assert(handle==1);++commits;if(failure==3)return -1;d
 void nvs_close(int handle){assert(handle==1);}
 int main(void)
 {
-#if ZONE_LITE_SEGMENTED_WRITES
+#if ZONE_LITE_HIKVISION
+    assert(!storage_upgrade_init()); /* Reject a ZKT application. */
+    strcpy(app.project_name,"zone_lite_hikvision");strcpy(app.version,"3.0.3");
+    assert(storage_upgrade_init() && storage_upgrade_ready());
+    assert(!storage_upgrade_segmented_writes() && !writes && !commits);
+    assert(strstr(storage_upgrade_contract(),"HIKVISION_STORAGE_CONTRACT"));
+    secure=false;assert(!storage_upgrade_init() && !storage_upgrade_ready());secure=true;
+    assert(storage_upgrade_init());
+    strcpy(app.project_name,"unknown");assert(!storage_upgrade_init());
+#elif ZONE_LITE_SEGMENTED_WRITES
     FILE *file=fopen("compatibility-proof.bin","rb");assert(file);
     assert(fread(&durable,sizeof(durable),1,file)==1);assert(!fclose(file));
     strcpy(app.version,UG_CANDIDATE_VERSION);
@@ -95,12 +104,12 @@ int main(void)
 '''
     unit = tmp_path / "upgrade.c"
     unit.write_text(harness)
-    for mode in (0, 1):
-        executable = tmp_path / f"upgrade-{mode}"
+    for mode, hikvision in ((0, 0), (1, 0), (0, 1)):
+        executable = tmp_path / f"upgrade-{mode}-{hikvision}"
         subprocess.run([
             shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-            f"-DZONE_LITE_SEGMENTED_WRITES={mode}", "-I", str(tmp_path), "-I", str(firmware),
+            f"-DZONE_LITE_SEGMENTED_WRITES={mode}", f"-DZONE_LITE_HIKVISION={hikvision}", "-I", str(tmp_path), "-I", str(firmware),
             str(unit), str(firmware / "storage_upgrade.c"), str(firmware / "upgrade_guard.c"),
             str(firmware / "durable_queue.c"), "-o", str(executable),
         ], check=True)
