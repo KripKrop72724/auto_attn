@@ -83,6 +83,20 @@ describe('DeviceDrawer COMM Key controls', () => {
     vi.unstubAllGlobals()
   })
 
+  it('shows the reported Hikvision cadence and measured interval', async () => {
+    activeDevice = { ...device, firmware_family: 'hikvision', hikvision: {
+      capture_mode: 'poll', poll_interval_seconds: 2, last_poll_interval_ms: 2150,
+      qualification_state: 'NOT_QUALIFIED', poll_error: 0, source_queue_depth: 0,
+    } }
+    const toast = { notice: vi.fn(), error: vi.fn() } as unknown as ReturnType<typeof useToast>
+    render(<DeviceDrawer seed={activeDevice} revision={0} onClose={vi.fn()}
+      onManageUsers={vi.fn()} onInventoryChanged={vi.fn()} toast={toast} />)
+    expect(await screen.findByText('2-second polling')).toBeTruthy()
+    expect(screen.getByText('2.1 seconds')).toBeTruthy()
+    expect(screen.getByText('HIKVISION TERMINAL')).toBeTruthy()
+    expect(screen.getByText(/Live polling continues during reconciliation/)).toBeTruthy()
+  })
+
   it('requires the break-glass workflow and hides the revealed key on blur', async () => {
     const toast = { notice: vi.fn(), error: vi.fn() } as unknown as ReturnType<typeof useToast>
     render(

@@ -5,6 +5,8 @@ import math
 import re
 from typing import Any, Literal
 
+from zk_add.hikvision_clock import HikvisionClockSample
+
 from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
 
 
@@ -127,7 +129,11 @@ class HikvisionTerminalPayload(BaseModel):
     source_storage_failures: int = Field(ge=0)
     source_queue_depth: int | None = Field(default=None, ge=0)
     capture_mode: Literal["stream", "poll"] = "stream"
-    poll_interval_seconds: Literal[5] | None = None
+    poll_interval_seconds: Literal[2, 5] | None = None
+    clock_sample: HikvisionClockSample | None = None
+    poll_count: int | None = Field(default=None, ge=0)
+    last_poll_interval_ms: int | None = Field(default=None, ge=0)
+    history_page_count: int | None = Field(default=None, ge=0)
     last_successful_poll_epoch: int | None = Field(default=None, ge=0)
     poll_error: int | None = Field(default=None, ge=0)
     durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)

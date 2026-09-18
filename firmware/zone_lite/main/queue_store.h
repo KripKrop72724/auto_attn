@@ -12,6 +12,8 @@ typedef struct {
     const char *last_operation;
 } qs_health_t;
 bool qs_init(void);
+/* Boot recovery must have succeeded; proves filesystem and encrypted NVS writes. */
+bool qs_verify_persistence(void);
 bool qs_generation(char output[33]);
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length);
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy);

@@ -751,12 +751,23 @@ def update_heartbeat(
                 resolve_alert(session, connector, code="ZKT_CONNECTION_FLAPPING")
         elif reported_state == "SESSION_REFRESH":
             connector.lifecycle_state = "ONLINE"
+        if payload.firmware_family == "hikvision":
+            clock = payload.terminal.clock_sample if payload.terminal else None
+            # A missing/stale sample must not leave the previous clock looking live.
+            if clock and 0 <= now.timestamp() - clock.sampled_epoch <= 180:
+                zkt_payload["device_time"] = datetime.fromtimestamp(clock.device_epoch, timezone.utc).isoformat()
+                zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(clock.sampled_epoch, timezone.utc).isoformat()
+            else:
+                zkt.sampled_device_time = None
+                zkt.device_time_sampled_at = None
+                zkt.device_time_drift_seconds = None
         sample = zkt_payload.get("device_time")
         sampled_at = zkt_payload.get("device_time_sampled_at")
         if sample:
             zkt.sampled_device_time = parse_datetime(sample)
         if sampled_at:
             zkt.device_time_sampled_at = parse_datetime(sampled_at)
+        clock_alert = "HIK_CLOCK_DRIFT" if payload.firmware_family == "hikvision" else "ZKT_CLOCK_DRIFT"
         if zkt.sampled_device_time and zkt.device_time_sampled_at:
             zkt.device_time_drift_seconds = (
                 zkt.sampled_device_time - zkt.device_time_sampled_at
@@ -765,13 +776,13 @@ def update_heartbeat(
                 upsert_alert(
                     session,
                     connector,
-                    code="ZKT_CLOCK_DRIFT",
+                    code=clock_alert,
                     severity="WARNING",
-                    message="ZKT terminal clock differs from trusted connector time by more than two minutes.",
+                    message="Terminal clock differs from trusted connector time by more than two minutes.",
                     details={"drift_seconds": zkt.device_time_drift_seconds},
                 )
             else:
-                resolve_alert(session, connector, code="ZKT_CLOCK_DRIFT")
+                resolve_alert(session, connector, code=clock_alert)
         if zkt.expected_serial and zkt.serial and zkt.expected_serial != zkt.serial:
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = "ZKT_SERIAL_MISMATCH"

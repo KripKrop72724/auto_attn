@@ -4483,6 +4483,12 @@ bool add_connector_command_update(
     return ok;
 }
 
+bool add_connector_delivery_healthy(void)
+{
+    return s_outbox_task_handle && s_outbox_buffer_ready && !s_worker_start_failed &&
+        (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) <= 90000U;
+}
+
 bool add_connector_log(
     const char *level,
     const char *subsystem,

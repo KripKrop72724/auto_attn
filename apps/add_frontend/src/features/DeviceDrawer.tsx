@@ -262,18 +262,19 @@ export function DeviceDrawer({
             <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
           </article>
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
-          <article className="detail-card"><p className="eyebrow">ZKT TERMINAL</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
+          <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
           {device.firmware_family === 'hikvision' ? <article className="detail-card">
             <p className="eyebrow">HIKVISION CAPTURE HEALTH</p>
-            <h3>{device.hikvision?.capture_mode === 'poll' ? '5-second polling' : 'Awaiting capture telemetry'}</h3>
+            <h3>{device.hikvision?.capture_mode === 'poll' ? `${device.hikvision.poll_interval_seconds ?? 'Unknown'}-second polling` : 'Awaiting capture telemetry'}</h3>
             <dl>
               <div><dt>Last successful check</dt><dd>{device.hikvision?.last_successful_poll_epoch ? relativeTime(new Date(device.hikvision.last_successful_poll_epoch * 1000).toISOString()) : 'Not reported'}</dd></div>
               <div><dt>Queued source records</dt><dd>{device.hikvision?.source_queue_depth ?? 'Not reported'}</dd></div>
               <div><dt>Saved event serial</dt><dd>{device.hikvision?.durable_poll_cursor ?? 'Not reported'}</dd></div>
+              <div><dt>Last polling interval</dt><dd>{device.hikvision?.last_poll_interval_ms ? `${(device.hikvision.last_poll_interval_ms / 1000).toFixed(1)} seconds` : 'Not reported'}</dd></div>
               <div><dt>Polling status</dt><dd>{device.hikvision?.poll_error === 0 ? 'Healthy' : 'Awaiting a successful check'}</dd></div>
             </dl>
-            <p>Full retained-history coverage and Oracle assurance are reported in Reconciliation.</p>
+            <p>Live polling continues during reconciliation. Slow terminal responses can extend the target interval. Full history and Oracle assurance are reported in Reconciliation.</p>
           </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
             <h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3>

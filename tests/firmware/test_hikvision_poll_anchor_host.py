@@ -70,7 +70,8 @@ int main(void){
  assert(!take_background_slot());
  background_slot=true;
  assert(take_background_slot());assert(!take_background_slot());
- assert(poll_delay_ms(1000000)==4000);
+ assert(poll_delay_ms(1000000)==1000);
+ assert(poll_delay_ms(0)==2000);
  assert(poll_delay_ms(4800000)==250);
  assert(poll_delay_ms(7000000)==250);
  background_slot=true;assert(take_background_slot());

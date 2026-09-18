@@ -160,6 +160,9 @@ export interface FirmwareDiagnostics {
 export interface HikvisionHealth {
   capture_mode: 'stream' | 'poll'
   poll_interval_seconds?: number
+  last_poll_interval_ms?: number
+  poll_count?: number
+  history_page_count?: number
   last_successful_poll_epoch?: number
   poll_error?: number
   durable_poll_cursor?: number

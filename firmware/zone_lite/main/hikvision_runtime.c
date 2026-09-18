@@ -1,6 +1,7 @@
 #include "hikvision_runtime.h"
 #include "hikvision_http.h"
 #include "hikvision_api.h"
+#include "hikvision_clock.h"
 #include "hikvision_commands.h"
 #include "nvs.h"
 #include "zone_config.h"
@@ -25,11 +26,60 @@ static const char *TAG = "hikvision";
 static atomic_uint current_events, replay_events, source_failures, stream_error;
 static atomic_bool reachable, stream_open;
 static atomic_long last_message, last_poll;
-static atomic_uint poll_error, poll_cursor;
+static atomic_uint poll_error, poll_cursor, poll_count, last_poll_interval_ms, history_page_count;
 static atomic_bool history_required = true;
 static atomic_bool profiles_active;
 static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
 static atomic_uint uploader_tick;
+typedef struct { int64_t device_epoch, sampled_epoch, sampled_us; bool valid; } clock_sample_t;
+static clock_sample_t clock_sample;
+static portMUX_TYPE clock_mux = portMUX_INITIALIZER_UNLOCKED;
+static clock_sample_t read_clock_sample(void)
+{
+    portENTER_CRITICAL(&clock_mux);
+    clock_sample_t sample = clock_sample;
+    portEXIT_CRITICAL(&clock_mux);
+    if (esp_timer_get_time() - sample.sampled_us > 120000000) sample.valid = false;
+    return sample;
+}
+static void sample_terminal_clock(void)
+{
+    char response[2048]; size_t length = 0;
+    int64_t started = esp_timer_get_time();
+    hik_result_t result = hik_http_request(HTTP_METHOD_GET, "/ISAPI/System/time", NULL,
+        response, sizeof(response), &length);
+    clock_sample_t sample = {.sampled_epoch = time(NULL), .sampled_us = esp_timer_get_time()};
+    if (result == HIK_OK && length < sizeof(response)) {
+        response[length] = 0;
+        char *begin = strstr(response, "<localTime>");
+        char *end = begin ? strstr(begin + 11, "</localTime>") : NULL;
+        if (begin && end && !strstr(end + 12, "<localTime>") && end - (begin + 11) <= 25) {
+            char value[26]; size_t size = (size_t)(end - (begin + 11));
+            memcpy(value, begin + 11, size); value[size] = 0;
+            sample.valid = hik_clock_parse(value, &sample.device_epoch) &&
+                sample.sampled_epoch >= 1577836800 && sample.sampled_us - started <= 2000000;
+        }
+    }
+    portENTER_CRITICAL(&clock_mux);
+    clock_sample = sample;
+    portEXIT_CRITICAL(&clock_mux);
+    char message[160];
+    snprintf(message, sizeof(message), "Terminal clock %s; drift=%lld seconds; request=%u",
+        sample.valid ? "sampled" : "unverified", (long long)(sample.valid ? sample.device_epoch - sample.sampled_epoch : 0),
+        (unsigned)result);
+    ESP_LOGI(TAG, "%s", message);
+    (void)add_connector_log(sample.valid ? "INFO" : "WARN", "hikvision", "HIK_CLOCK_SAMPLE", message);
+}
+static void append_clock_evidence(cJSON *root)
+{
+    clock_sample_t sample = read_clock_sample();
+    if (!sample.valid) return;
+    cJSON *clock = cJSON_AddObjectToObject(root, "clock_sample");
+    if (clock) {
+        cJSON_AddNumberToObject(clock, "device_epoch", (double)sample.device_epoch);
+        cJSON_AddNumberToObject(clock, "sampled_epoch", (double)sample.sampled_epoch);
+    }
+}
 static SemaphoreHandle_t request_lock;
 static QueueHandle_t profile_commands;
 /* Protected by request_lock: at most one bounded background page per poll. */
@@ -42,9 +92,9 @@ static bool take_background_slot(void)
 }
 static uint32_t poll_delay_ms(int64_t elapsed_us)
 {
-    int64_t remaining = 5000000 - elapsed_us;
+    int64_t remaining = 2000000 - elapsed_us;
     /* Slow terminals must still allow the 200ms profile / 100ms history worker
-     * to acquire one slot. Requests never overlap; five seconds is the target,
+     * to acquire one slot. Requests never overlap; two seconds is the target,
      * not a reason to starve all background progress after an overrun. */
     return remaining > 250000 ? (uint32_t)(remaining / 1000) : 250;
 }
@@ -113,6 +163,7 @@ static bool preserve(void *context, const char *body, size_t length)
         cJSON_AddStringToObject(root, "channel", channel) &&
         cJSON_AddStringToObject(root, "observation_sha256", hex) &&
         cJSON_AddNumberToObject(root, "captured_epoch", (double)time(NULL));
+    if (ok) append_clock_evidence(root);
     /* Hash binds the original bytes, not a reserialized JSON representation. */
     if (ok) ok = cJSON_AddStringToObject(root, "raw", body) != NULL;
     char *payload = ok ? cJSON_PrintUnformatted(root) : NULL;
@@ -151,9 +202,15 @@ static void poll_task(void *arg)
     (void)arg;
     poll_checkpoint_t cursor = {0};
     bool loaded = false, present = false;
+    int64_t clock_checked_us = -60000000, last_report_us = -60000000, last_start_us = 0;
+    hik_result_t previous_result = HIK_CONFIGURATION;
+    led_status_t previous_led = LED_STATUS_BOOTING;
     for (;;) {
         xSemaphoreTake(request_lock, portMAX_DELAY);
         int64_t started = esp_timer_get_time();
+        if (last_start_us) atomic_store(&last_poll_interval_ms, (unsigned)((started - last_start_us) / 1000));
+        last_start_us = started;
+        atomic_fetch_add(&poll_count, 1);
         background_slot = false;
         hik_result_t result = HIK_OK;
         if (!loaded) {
@@ -161,6 +218,10 @@ static void poll_task(void *arg)
             if (!loaded) result = HIK_CUSTODY;
         }
         if (result == HIK_OK) result = hik_http_verify_identity();
+        if (result == HIK_OK && started - clock_checked_us >= 60000000) {
+            sample_terminal_clock();
+            clock_checked_us = started;
+        }
         /* Include the committed anchor in the same ordered source page as new
          * records. Validate it before any new evidence enters the queue. This
          * keeps reset/reuse protection without a second slow history search on
@@ -193,14 +254,32 @@ static void poll_task(void *arg)
         } else if (result == HIK_OK) result = HIK_BINDING;
         atomic_store(&reachable, result == HIK_OK);
         atomic_store(&poll_error, (unsigned)result);
+        uint32_t depth = 0;
+        bool known = qs_snapshot(QS_HIK_SOURCE, &depth);
+        qs_health_t storage = qs_health();
+        uint32_t worker_age = (uint32_t)(esp_timer_get_time() / 1000) - atomic_load(&uploader_tick);
+        bool workers_ready = add_connector_delivery_healthy() && atomic_load(&uploader_started) && atomic_load(&uploader_buffer_ready) && worker_age <= 90000;
+        led_status_t status = LED_STATUS_BACKLOG;
         if (result == HIK_OK) {
             atomic_store(&last_poll, time(NULL));
             atomic_store(&poll_cursor, cursor.serial);
-            uint32_t depth = 0;
-            bool known = qs_snapshot(QS_HIK_SOURCE, &depth);
-            led_status_set(known && !depth && add_connector_is_connected()
-                ? LED_STATUS_HEALTHY : LED_STATUS_BACKLOG);
+            bool durable = storage.observed && storage.available && storage.recovery_complete &&
+                storage.persistence_verified && !storage.last_error;
+            status = known && !depth && add_connector_is_connected() && durable && workers_ready
+                ? LED_STATUS_HEALTHY : LED_STATUS_BACKLOG;
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
+        led_status_set(status);
+        if (result != previous_result || status != previous_led || started - last_report_us >= 60000000) {
+            char message[240];
+            snprintf(message, sizeof(message), "Poll %s; reason=%u; cursor=%lu; queued=%lu; storage=%s; source_worker=%s",
+                result == HIK_OK ? "OK" : "retrying", (unsigned)result, (unsigned long)cursor.serial,
+                (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
+                workers_ready ? "running" : "waiting");
+            ESP_LOGI(TAG, "%s", message);
+            if (add_connector_log(result == HIK_OK ? "INFO" : "WARN", "hikvision", "HIK_POLL_STATUS", message)) {
+                previous_result = result; previous_led = status; last_report_us = started;
+            }
+        }
         background_slot = true;
         xSemaphoreGive(request_lock);
         vTaskDelay(pdMS_TO_TICKS(poll_delay_ms(esp_timer_get_time() - started)));
@@ -241,10 +320,19 @@ static void history_task(void *arg)
             if (body) {
                 /* ADD commits page evidence and source checkpoint before ACK.
                  * A lost receipt is retried under the same ADD-owned token. */
-                (void)add_connector_send_payload_acknowledged("hikvision_history_page", body, 10000);
+                bool accepted = add_connector_send_payload_acknowledged("hikvision_history_page", body, 10000);
+                if (accepted) atomic_fetch_add(&history_page_count, 1);
+                (void)add_connector_log(accepted ? "INFO" : "WARN", "hikvision",
+                    accepted ? "HIK_HISTORY_PAGE_ACCEPTED" : "HIK_HISTORY_RECEIPT_PENDING",
+                    accepted ? "Reconciliation page accepted by ADD; live polling remains active"
+                             : "Reconciliation receipt pending; live polling remains active");
                 free(body);
             }
-        } else ESP_LOGW(TAG, "History request incomplete, reason=%u", (unsigned)result);
+        } else {
+            ESP_LOGW(TAG, "History request incomplete, reason=%u", (unsigned)result);
+            char message[80]; snprintf(message, sizeof(message), "History request retrying; reason=%u", (unsigned)result);
+            (void)add_connector_log("WARN", "hikvision", "HIK_HISTORY_RETRY", message);
+        }
         cJSON_Delete(response); cJSON_Delete(message);
     }
 }
@@ -364,6 +452,7 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddBoolToObject(payload, "comm_key_management", false);
     cJSON *terminal = cJSON_AddObjectToObject(payload, "terminal");
     cJSON_AddNumberToObject(terminal, "schema_version", 2);
+    append_clock_evidence(terminal);
     cJSON_AddStringToObject(terminal, "vendor", "hikvision");
     cJSON_AddStringToObject(terminal, "protocol", "isapi");
     cJSON_AddStringToObject(terminal, "serial", cfg->hik_expected_serial);
@@ -373,7 +462,10 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddBoolToObject(terminal, "online", atomic_load(&reachable));
     cJSON_AddStringToObject(terminal, "connection_state", atomic_load(&reachable) ? "ONLINE" : "OFFLINE");
     cJSON_AddStringToObject(terminal, "capture_mode", "poll");
-    cJSON_AddNumberToObject(terminal, "poll_interval_seconds", 5);
+    cJSON_AddNumberToObject(terminal, "poll_interval_seconds", 2);
+    cJSON_AddNumberToObject(terminal, "poll_count", atomic_load(&poll_count));
+    cJSON_AddNumberToObject(terminal, "last_poll_interval_ms", atomic_load(&last_poll_interval_ms));
+    cJSON_AddNumberToObject(terminal, "history_page_count", atomic_load(&history_page_count));
     cJSON_AddNumberToObject(terminal, "profile_command_version", 2);
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));
@@ -447,7 +539,7 @@ void hikvision_gateway_task(void *argument)
                 }
             }
         }
-        add_connector_set_activity("HIKVISION_POLL_5S");
+        add_connector_set_activity("HIKVISION_POLL_2S");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
