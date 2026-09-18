@@ -1363,6 +1363,25 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
         return false;
     }
     memset(command, 0, sizeof(*command));
+#ifdef ZONE_LITE_HIKVISION
+    /* Reject oversized identifiers before strlcpy can turn one employee into
+     * another. ZKT's legacy numeric/binary command format remains separate. */
+    const char *fields[] = {"uid", "user_id", "name"};
+    const size_t limits[] = {32, 32, 128};
+    for (unsigned i = 0; i < 3; i++) {
+        cJSON *field = cJSON_GetObjectItemCaseSensitive(payload, fields[i]);
+        if (field && (!cJSON_IsString(field) || strlen(field->valuestring) > limits[i])) return false;
+        if (field && i < 2) {
+            const char *p = field->valuestring;
+            if (!*p) return false;
+            for (; *p; p++) if (*p < '0' || *p > '9') return false;
+        }
+    }
+    cJSON *serial = cJSON_GetObjectItemCaseSensitive(expected, "serial");
+    if (serial && (!cJSON_IsString(serial) || strlen(serial->valuestring) >= sizeof(command->expected_serial))) return false;
+    if (strlen(command_id->valuestring) >= sizeof(command->command_id) ||
+        strlen(command_type->valuestring) >= sizeof(command->command_type)) return false;
+#endif
     strlcpy(command->command_id, command_id->valuestring, sizeof(command->command_id));
     strlcpy(command->command_type, command_type->valuestring, sizeof(command->command_type));
     cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_epoch");

@@ -505,7 +505,7 @@ class UserCreateRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=255)
     cnic: str = Field(min_length=13, max_length=15)
     shift_worker: bool = False
-    user_id_override: str | None = Field(default=None, min_length=1, max_length=24)
+    user_id_override: str | None = Field(default=None, min_length=1, max_length=32)
     password: str = Field(min_length=1, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
 

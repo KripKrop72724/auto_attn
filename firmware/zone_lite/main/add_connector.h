@@ -12,7 +12,7 @@ typedef struct {
     char user_key[48];
     char name[257];
     char lease_id[48];
-    char expected_serial[80];
+    char expected_serial[121];
     char expected_name[257];
     char expected_terminal_identity_fingerprint[65];
     char expected_terminal_state_fingerprint[65];

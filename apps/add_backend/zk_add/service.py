@@ -430,6 +430,19 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             )
         return
 
+    if connector.firmware_family == "hikvision":
+        # ZKT binary-record stability is not an ISAPI qualification. Keep the
+        # shared serial quarantine above, but never confer write capability from
+        # a Hikvision heartbeat or a coincidental ZKT-shaped metadata field.
+        zkt.certification_state = "READ_ONLY"
+        zkt.writes_disabled_reason = "HIKVISION_WRITE_QUALIFICATION_PENDING"
+        zkt.capability_profile = {
+            **(zkt.capability_profile or {}),
+            "user_write": False, "create_user": False, "delete_user": False,
+            "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
+        }
+        return
+
     if (
         zkt.terminal_binding_state != "CONFIRMED"
         or not zkt.confirmed_serial
@@ -3742,6 +3755,25 @@ def allocate_device_identifiers(
     rows = session.scalars(
         select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)
     ).all()
+    if zkt.connector.firmware_family == "hikvision":
+        # Hikvision has one string employee number, not a second 16-bit ZKT UID.
+        # Include tombstones and failed reservations so identifiers are never
+        # automatically reassigned to a different identity.
+        used = {row.user_id for row in rows}
+        if user_id_override is not None:
+            employee = user_id_override
+        else:
+            employee = str(max((int(value) for value in used
+                                if value.isascii() and value.isdigit()), default=0) + 1)
+        if (not employee.isascii() or not employee.isdigit() or len(employee) > 32):
+            raise ValueError("Hikvision employee numbers require 1–32 ASCII digits.")
+        if employee in used:
+            raise ValueError("That employee/user ID has already been used on this terminal.")
+        if zkt.user_count is not None and zkt.user_count >= 3000:
+            raise ValueError("The qualified Hikvision profile capacity has been reached.")
+        return employee, employee
+    if user_id_override is not None and len(user_id_override) > 24:
+        raise ValueError("ZKT employee/user IDs cannot exceed 24 characters.")
     used_uids = {int(row.uid) for row in rows if row.uid.isdigit()}
     uid = max(used_uids, default=0) + 1
     if uid > 65535:

@@ -1,6 +1,6 @@
 # Hikvision 3.0.0 development status
 
-Status on 2026-09-17: **development integration implemented in part; not deployed,
+Status on 2026-09-18: **development integration implemented in part; not deployed,
 not flashed, and not certified for production**.
 
 Installation: `LF-ZONE-BLD9-03` (zone ID and device name), ESP32-S3 and serial-bound
@@ -82,7 +82,11 @@ The working base is `codex/firmware-reliability-islamabad-hil`, associated with
 [draft PR 161](https://github.com/KripKrop72724/auto_attn/pull/161). Its durable queue
 foundation is not present in production `main`. That draft explicitly records
 outstanding hardware/recovery/soak work; its green CI does not satisfy those gates.
-The Hikvision change must not silently promote the entire unrelated HIL rollout.
+On September 18 the operator authorized preparing the combined change for production
+review while keeping the Islamabad ZKT firmware rollout disabled. PR 162 now targets
+`main` and includes this dependency. PR 161 remains draft. This is preparation of
+the combined source/backend change, not acceptance of the unfinished hardware gates.
+Firmware publication/promotion workflows remain manual; none was dispatched.
 
 The existing factory signing workflow requires an exact green commit already on
 `main`. No signing/provisioning workflow, merge, production deployment, eFuse change
@@ -128,7 +132,27 @@ outbox rows when verified profiles arrive; non-null attendance identities stay
 pinned. Snapshot references and profile versions are retained in attendance
 provenance without changing event UIDs.
 
-The Mac later switched to 172.20.10.3; the last verified terminal at
-192.168.18.31 became unreachable. Reconnection to the terminal LAN was requested.
-This prevents current physical end-to-end verification; earlier reachability does
-not establish current access.
+## September 18 reconnection and combined review
+
+The Mac is back on the terminal LAN. A new authenticated identity read verified the
+configured terminal serial, DS-K1T342EFWX model and V3.3.5 firmware. The connected
+ESP was independently read through `/dev/cu.usbmodem1101` and matches the intended
+`ac:27:6e:a4:e9:74` ESP32-S3. No flash or eFuse write was performed.
+
+GitHub Actions run 35246202822 passed repository-contract, backend, frontend,
+firmware and containers for commit 605e60c. The combined PR is mergeable against
+main. Follow-up fixes separate Hikvision string employee-number allocation from
+ZKT's 16-bit UID, retain used/deleted identifiers, allow 32-digit overrides end
+to end, and reject oversized/non-ASCII command identifiers before truncation.
+Hikvision cannot acquire ZKT write certification from heartbeat metadata.
+
+The read-only retained-history diagnostic resumed from its durable checkpoint;
+this remains qualification evidence, not an ADD production reconciliation job.
+The production release still requires complete verified CRUD dispatch, signed
+factory qualification and physical ADD/Oracle delivery evidence. Preparing the
+combined PR does not waive those requirements or enable a ZKT firmware rollout.
+
+Combined-review follow-up validation: 721 backend, firmware-host and companion
+tests pass (one existing Starlette deprecation warning). Both Hikvision and ZKT
+ESP-IDF builds pass. These are local build/regression results, not hardware
+acceptance or signed production artifacts.

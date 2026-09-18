@@ -71,3 +71,50 @@ def test_empty_first_pass_does_not_delete_existing_profiles(db):
     assert session.scalar(select(DeviceUser)).present
     assert accept_profile_page(session, connector, {**request, "phase": 2})["published"]
     assert not session.scalar(select(DeviceUser)).present
+
+
+def test_employee_reservations_preserve_strings_and_never_reuse_tombstones(db):
+    from zk_add.service import allocate_device_identifiers
+
+    session, connector = db
+    accept_profile_page(session, connector, page(employee="00065536"))
+    accept_profile_page(session, connector, page(phase=2, employee="00065536"))
+    session.commit()
+    user = session.scalar(select(DeviceUser))
+    user.present = False
+    user.lifecycle_state = "DELETED"
+    session.flush()
+    zkt = connector.zkt_device
+    assert allocate_device_identifiers(session, zkt=zkt, user_id_override=None) == ("65537", "65537")
+    employee = "0" * 31 + "1"
+    assert allocate_device_identifiers(session, zkt=zkt, user_id_override=employee) == (employee, employee)
+    with pytest.raises(ValueError, match="already been used"):
+        allocate_device_identifiers(session, zkt=zkt, user_id_override="00065536")
+    for invalid in ("", "1" * 33, "１２３", "12a"):
+        with pytest.raises(ValueError, match="ASCII digits"):
+            allocate_device_identifiers(session, zkt=zkt, user_id_override=invalid)
+
+
+def test_hikvision_cannot_inherit_zkt_write_certification(db):
+    from zk_add.service import auto_certify_zkt
+
+    session, connector = db
+    terminal = connector.zkt_device
+    terminal.online = True
+    terminal.certification_state = "CERTIFIED"
+    terminal.capability_profile = {"observed_user_record_bytes": 72, "user_write": True,
+                                   "create_user": True, "admin_lease": True}
+    auto_certify_zkt(session, connector, terminal)
+    assert terminal.certification_state == "READ_ONLY"
+    assert terminal.writes_disabled_reason == "HIKVISION_WRITE_QUALIFICATION_PENDING"
+    assert not terminal.capability_profile["create_user"]
+    assert not terminal.capability_profile["admin_lease"]
+
+
+def test_zkt_employee_length_limit_remains_unchanged(db):
+    from zk_add.service import allocate_device_identifiers
+
+    session, connector = db
+    connector.firmware_family = "zkt"
+    with pytest.raises(ValueError, match="24 characters"):
+        allocate_device_identifiers(session, zkt=connector.zkt_device, user_id_override="1" * 25)
