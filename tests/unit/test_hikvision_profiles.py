@@ -118,3 +118,77 @@ def test_zkt_employee_length_limit_remains_unchanged(db):
     connector.firmware_family = "zkt"
     with pytest.raises(ValueError, match="24 characters"):
         allocate_device_identifiers(session, zkt=connector.zkt_device, user_id_override="1" * 25)
+
+
+def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db):
+    from zk_add.hikvision_delivery import configure_policy
+    from zk_add.service import auto_certify_zkt, require_writable_user_profile
+
+    session, connector = db
+    terminal = connector.zkt_device
+    profile = 'ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1'
+    terminal.online = True
+    terminal.terminal_binding_state = 'CONFIRMED'
+    terminal.snapshot_complete = terminal.identity_snapshot_stable = True
+    terminal.capability_profile = {'hikvision_health': {
+        'capability_profile': profile, 'profile_command_version': 1,
+    }}
+    auto_certify_zkt(session, connector, terminal)
+    assert terminal.certification_state == 'READ_ONLY'
+    configure_policy(session, connector, terminal_serial='terminal', source_epoch='epoch',
+                     profile_id=profile, success_codes=[[5, 75]], excluded_codes=[], enabled=True,
+                     profile_commands_enabled=True, actor='test', reason='Qualified disposable profile operations',
+                     idempotency_key='profile-pilot-approval')
+    auto_certify_zkt(session, connector, terminal)
+    assert terminal.certification_state == 'PROFILE_PILOT'
+    assert require_writable_user_profile(connector, 'user_write') is terminal
+    assert terminal.capability_profile['user_role_write']
+    assert not terminal.capability_profile['admin_lease']
+    with pytest.raises(ValueError, match='read-only'):
+        require_writable_user_profile(connector, 'admin_lease')
+    terminal.identity_snapshot_stable = False
+    auto_certify_zkt(session, connector, terminal)
+    assert not terminal.capability_profile['user_write']
+    terminal.identity_snapshot_stable = True
+    terminal.capability_profile = {**terminal.capability_profile, 'hikvision_health': {'capability_profile': profile}}
+    auto_certify_zkt(session, connector, terminal)
+    assert terminal.certification_state == 'READ_ONLY'
+
+
+def test_unknown_hikvision_profile_cannot_receive_write_approval(db):
+    from zk_add.hikvision_delivery import configure_policy
+
+    session, connector = db
+    with pytest.raises(ValueError, match='NOT_QUALIFIED'):
+        configure_policy(session, connector, terminal_serial='terminal', source_epoch='epoch',
+                         profile_id='unqualified', success_codes=[[5, 75]], excluded_codes=[], enabled=True,
+                         profile_commands_enabled=True, actor='test', reason='Invalid profile approval attempt',
+                         idempotency_key='profile-pilot-invalid')
+
+
+@pytest.mark.parametrize('operation', ['CREATE_USER', 'UPDATE_USER', 'DELETE_USER'])
+@pytest.mark.parametrize('evidence', ['valid', 'missing', 'wrong_terminal', 'missing_postcondition'])
+def test_hikvision_commands_require_bound_readback_receipts(db, operation, evidence):
+    import hashlib
+    from zk_add.service import create_command, apply_command_update
+
+    session, connector = db
+    command = create_command(session, connector=connector, command_type=operation,
+                             payload={'user_id': '000123'}, expected_state={'serial': 'terminal'},
+                             desired_state={}, idempotency_key='receipt', actor='test')
+    session.flush()
+    result = {
+        'verified': True,
+        'verified_terminal_identity_fingerprint': hashlib.sha256(b'terminal\n000123').hexdigest(),
+        'verified_terminal_state_fingerprint': 'a' * 64,
+        'user_absent': True,
+    }
+    if evidence == 'missing':
+        result = {}
+    elif evidence == 'wrong_terminal':
+        result['verified_terminal_identity_fingerprint'] = 'b' * 64
+    elif evidence == 'missing_postcondition':
+        result.pop('user_absent' if operation == 'DELETE_USER' else 'verified_terminal_state_fingerprint')
+    applied = apply_command_update(session, connector=connector, command_id=command.command_id,
+                                   status='SUCCEEDED', result=result, error_code=None, error_message=None)
+    assert applied.status == ('SUCCEEDED' if evidence == 'valid' else 'FAILED')

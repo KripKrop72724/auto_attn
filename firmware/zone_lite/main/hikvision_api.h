@@ -20,4 +20,5 @@ hik_result_t hik_user_page(hik_search_t *, hik_record_fn, void *);
  * A failed write response requires readback before a caller retries. */
 hik_result_t hik_user_create(const cJSON *desired_profile, bool *verified);
 hik_result_t hik_user_rename(const cJSON *expected_profile, const char *name, bool *verified);
+hik_result_t hik_user_edit(const cJSON *expected_profile, const char *name, bool change_admin, bool admin, bool *verified);
 hik_result_t hik_user_delete(const cJSON *expected_profile, bool *verified);

@@ -1,6 +1,7 @@
 #include "hikvision_runtime.h"
 #include "hikvision_http.h"
 #include "hikvision_api.h"
+#include "hikvision_commands.h"
 #include "nvs.h"
 #include "zone_config.h"
 #include "queue_store.h"
@@ -269,8 +270,34 @@ static void profile_task(void *arg)
             else add_connector_command_retry(command.command_id);
             wait = pdMS_TO_TICKS(30000); continue;
         }
-        hik_search_t scan; hik_search_init(&scan, 1, 1);
         atomic_store(&profiles_active, true);
+        if (requested && strcmp(command.command_type, "REFRESH_USERS")) {
+            for (;;) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                if (!add_connector_is_connected()) break;
+                if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
+                if (!take_background_slot()) { xSemaphoreGive(request_lock); continue; }
+                cJSON *receipt = NULL;
+                hik_result_t result = command.expires_epoch > 0 && time(NULL) >= command.expires_epoch
+                    ? HIK_CONFIGURATION : hik_profile_command(&command, &receipt);
+                xSemaphoreGive(request_lock);
+                char *body = receipt ? cJSON_PrintUnformatted(receipt) : NULL;
+                bool done = result == HIK_OK && body;
+                bool rejected = result == HIK_BINDING || result == HIK_CONFIGURATION;
+                bool sent = add_connector_command_update(command.command_id,
+                    done ? "SUCCEEDED" : rejected ? "FAILED" : "RETRYING",
+                    done ? NULL : rejected ? "HIK_PROFILE_PRECONDITION_FAILED" : "HIK_PROFILE_VERIFICATION_PENDING",
+                    done ? NULL : rejected ? "Profile changed or this operation is not qualified; refresh before retrying" : "Terminal readback remains pending",
+                    body ? body : "{}");
+                free(body); cJSON_Delete(receipt);
+                if ((done || rejected) && sent) (void)add_connector_command_complete(command.command_id);
+                else add_connector_command_retry(command.command_id);
+                requested = false;
+                break;
+            }
+            if (requested) { add_connector_command_retry(command.command_id); requested = false; }
+        }
+        hik_search_t scan; hik_search_init(&scan, 1, 1);
         char snapshot_id[33]; memcpy(snapshot_id, scan.search_id, sizeof(snapshot_id));
         bool failed = false;
         for (unsigned phase = 1; phase <= 2 && !failed; phase++) {
@@ -347,6 +374,7 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddStringToObject(terminal, "connection_state", atomic_load(&reachable) ? "ONLINE" : "OFFLINE");
     cJSON_AddStringToObject(terminal, "capture_mode", "poll");
     cJSON_AddNumberToObject(terminal, "poll_interval_seconds", 5);
+    cJSON_AddNumberToObject(terminal, "profile_command_version", 1);
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));
     cJSON_AddNumberToObject(terminal, "durable_poll_cursor", atomic_load(&poll_cursor));
@@ -405,7 +433,10 @@ void hikvision_gateway_task(void *argument)
         if (profiles && uxQueueSpacesAvailable(profile_commands)) {
             add_command_t command;
             if (add_connector_take_command(&command)) {
-                if (!strcmp(command.command_type, "REFRESH_USERS")) {
+                if (!strcmp(command.command_type, "REFRESH_USERS") ||
+                    !strcmp(command.command_type, "CREATE_USER") ||
+                    !strcmp(command.command_type, "UPDATE_USER") ||
+                    !strcmp(command.command_type, "DELETE_USER")) {
                     if (xQueueSend(profile_commands, &command, 0) != pdTRUE)
                         add_connector_command_retry(command.command_id);
                 } else {

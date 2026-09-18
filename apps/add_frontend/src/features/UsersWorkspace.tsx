@@ -576,7 +576,7 @@ export function UsersView({
     }
   }
 
-  const baseWritable = Boolean(selected?.zkt?.certification_state === 'CERTIFIED' && selected.zkt.snapshot_complete)
+  const baseWritable = Boolean(selected?.zkt?.snapshot_complete && (selected.zkt.certification_state === 'CERTIFIED' || (selected.firmware_family === 'hikvision' && selected.zkt.certification_state === 'PROFILE_PILOT')))
   const terminalBindingNeedsAction = Boolean(
     selected?.zkt?.serial
     && (selected.zkt.terminal_binding_state === 'SERIAL_CONFIRMATION_REQUIRED'
@@ -598,7 +598,7 @@ export function UsersView({
     TERMINAL_SERIAL_PENDING_DEVICE_ACK: 'Terminal binding is waiting for verified device acknowledgement.',
     TERMINAL_SERIAL_PIN_FAILED: 'The previous terminal confirmation was not verified. Review the serial and retry.',
     STABILITY_CERTIFICATION_PENDING: 'Terminal binding succeeded; safety observations are still in progress.',
-    HIKVISION_WRITE_QUALIFICATION_PENDING: 'Terminal identity is verified. Hikvision profile editing and deletion are awaiting firmware support and device qualification; repeating serial verification will not enable them.',
+    HIKVISION_WRITE_QUALIFICATION_PENDING: 'Terminal identity is verified. Hikvision profile controls are awaiting firmware support and device qualification; repeating serial verification will not enable them.',
     FULL_USER_SNAPSHOT_REQUIRED: 'A complete terminal user snapshot is required before user writes can begin.',
     USER_SNAPSHOT_TRUNCATED: 'The latest terminal user snapshot was incomplete. Synchronize the terminal and retry.',
     LEGACY_28_BYTE_RECORD: 'This terminal record format does not support certified user editing.',
