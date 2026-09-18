@@ -26,6 +26,11 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
     cJSON *out = cJSON_CreateObject();
     if (strstr(path, "/AcsEvent?") && mode >= 10) {
         cJSON *cond = cJSON_GetObjectItem(req, "AcsEventCond");
+        if (mode == 30) {
+            assert(!strcmp(cJSON_GetObjectItem(cond, "employeeNoString")->valuestring, "00111"));
+            assert(cJSON_GetObjectItem(cond, "beginSerialNo")->valuedouble == 1);
+            assert(cJSON_GetObjectItem(cond, "endSerialNo")->valuedouble == 30009);
+        }
         unsigned position = (unsigned)cJSON_GetObjectItem(cond, "searchResultPosition")->valuedouble;
         cJSON *page = cJSON_AddObjectToObject(out, "AcsEvent");
         cJSON_AddStringToObject(page, "searchID", cJSON_GetObjectItem(cond, "searchID")->valuestring);
@@ -170,5 +175,9 @@ int main(void)
     cJSON *response = NULL;
     assert(hik_history_response(bad, &response) == HIK_CONFIGURATION && !response);
     cJSON_Delete(bad);
+    mode = 30;
+    cJSON *filtered = cJSON_Parse("{\"AcsEventCond\":{\"searchID\":\"filtered\",\"searchResultPosition\":0,\"maxResults\":20,\"major\":0,\"minor\":0,\"picEnable\":false,\"beginSerialNo\":1,\"endSerialNo\":30009,\"employeeNoString\":\"00111\"}}");
+    assert(hik_history_response(filtered, &response) == HIK_OK && response);
+    cJSON_Delete(response); cJSON_Delete(filtered);
     puts("150000 bounded source records, custody failures and verified CRUD passed");
 }
