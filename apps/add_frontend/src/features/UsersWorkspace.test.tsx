@@ -87,6 +87,21 @@ describe('Selected-terminal users workspace', () => {
     window.history.replaceState(null, '', '/')
   })
 
+  it('distinguishes confirmed Hikvision binding from unavailable profile writes', async () => {
+    const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
+      ...device.zkt!, model: null, terminal_binding_state: 'CONFIRMED',
+      certification_state: 'READ_ONLY', writes_disabled_reason: 'HIKVISION_WRITE_QUALIFICATION_PENDING',
+      capabilities: { read_users: true, user_write: false, create_user: false, delete_user: false, admin_lease: false },
+    } }
+    vi.stubGlobal('fetch', workspaceFetch({ selectedDevice: hik }))
+    render(<UsersHarness selectedDevice={hik} />)
+    expect(await screen.findByRole('region', { name: 'Terminal identity verified' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Confirm terminal serial/i })).toBeNull()
+    expect(screen.getAllByText(/repeating serial verification will not enable them/i).length).toBeGreaterThan(0)
+    expect((screen.getByRole('button', { name: /Add user/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText(/Hikvision terminal/)).toBeTruthy()
+  })
+
   it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
     const missingCnic = user({
       id: 10,
