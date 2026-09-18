@@ -53,7 +53,8 @@ int main(void){
 '''
     # Exercise the real adapter entry point; this wrapper matches its public default.
     harness = harness.replace('/* PRODUCTION */', body + '\ndq_result_t qs_append(qs_lane_t lane,const void *data,size_t n){return qs_append_with_policy(lane,data,n,QS_ADMIT_LIVE);}\n')
-    unit = tmp_path / 'admission.c'; unit.write_text(harness)
+    unit = tmp_path / 'admission.c'
+    unit.write_text(harness)
     exe = tmp_path / 'admission'
     subprocess.run([shutil.which('cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', f'-DZONE_LITE_HIKVISION={hikvision}',
