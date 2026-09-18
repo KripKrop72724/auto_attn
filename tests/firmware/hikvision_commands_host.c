@@ -47,6 +47,9 @@ hik_result_t hik_http_request(esp_http_client_method_t method,const char *path,
    if(strstr(path,"/Record")){
     assert(method==HTTP_METHOD_POST && !person);
     person=cJSON_Duplicate(cJSON_GetObjectItem(req,"UserInfo"),true);
+    cJSON *validity=cJSON_GetObjectItem(person,"Valid");
+    field(validity,"beginTime",cJSON_CreateString("1970-01-01T00:00:00"));
+    field(validity,"endTime",cJSON_CreateString("1970-01-01T00:00:00"));
     cJSON_AddBoolToObject(person,"localUIRight",false);
     cJSON_AddNumberToObject(person,"numOfFace",0);cJSON_AddNumberToObject(person,"numOfFP",0);cJSON_AddNumberToObject(person,"numOfCard",0);
    }else if(strstr(path,"/Modify")){
@@ -90,6 +93,12 @@ int main(void){
  ignore_write=true;assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt && !person);
  ignore_write=false;timeout_write=true;
  assert(hik_profile_command(&c,&receipt)==HIK_OK && receipt);cJSON_Delete(receipt);
+ cJSON *desired=cJSON_Parse("{\"Valid\":{\"enable\":false,\"beginTime\":\"2026-01-01T00:00:00\",\"endTime\":\"2036-01-01T00:00:00\",\"timeType\":\"local\"}}");
+ assert(hik_user_matches_created_profile(person,desired));
+ cJSON *actual=cJSON_Duplicate(person,true),*v=cJSON_GetObjectItem(actual,"Valid");
+ field(v,"enable",cJSON_CreateBool(true));assert(!hik_user_matches_created_profile(actual,desired));
+ field(v,"enable",cJSON_CreateBool(false));field(v,"endTime",cJSON_CreateString("1971-01-01T00:00:00"));
+ assert(!hik_user_matches_created_profile(actual,desired));cJSON_Delete(actual);cJSON_Delete(desired);
  unsigned prior=writes;assert(hik_profile_command(&c,&receipt)==HIK_OK && writes==prior);cJSON_Delete(receipt);
  field(person,"numOfFace",cJSON_CreateNumber(1));
  assert(hik_profile_command(&c,&receipt)==HIK_BINDING && !receipt && writes==prior);

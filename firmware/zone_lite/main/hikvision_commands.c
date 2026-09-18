@@ -61,14 +61,6 @@ static cJSON *new_profile(const add_command_t *command)
     }
     return profile;
 }
-static bool contains_desired(const cJSON *actual, const cJSON *desired)
-{
-    const cJSON *field;
-    cJSON_ArrayForEach(field, desired) {
-        if (!field->string || !cJSON_Compare(field, cJSON_GetObjectItemCaseSensitive(actual, field->string), true)) return false;
-    }
-    return true;
-}
 hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
 {
     *receipt = NULL;
@@ -104,7 +96,7 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
         if (before) {
             /* Lost write ACK: read the reserved employee before retrying. Never
              * adopt a profile with credentials or elevated local access. */
-            verified = regular(before) && credential_free(before) && contains_desired(before, desired);
+            verified = regular(before) && credential_free(before) && hik_user_matches_created_profile(before, desired);
             result = verified ? HIK_OK : HIK_BINDING;
         } else result = hik_user_create(desired, &verified);
     } else if (remove && !before) {
@@ -143,7 +135,7 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
     result = hik_user_read(command->user_id, &after);
     if (result != HIK_OK) goto done;
     if ((remove && after) || (!remove && !after)) { result = HIK_CUSTODY; goto done; }
-    if (create && (!regular(after) || !credential_free(after) || !contains_desired(after, desired))) {
+    if (create && (!regular(after) || !credential_free(after) || !hik_user_matches_created_profile(after, desired))) {
         result = HIK_BINDING; goto done;
     }
     if (update) {

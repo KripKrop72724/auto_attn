@@ -18,6 +18,7 @@ hik_result_t hik_user_read(const char *employee, cJSON **profile);
 hik_result_t hik_user_page(hik_search_t *, hik_record_fn, void *);
 /* desired_profile is the approved installation profile, not inferred rights.
  * A failed write response requires readback before a caller retries. */
+bool hik_user_matches_created_profile(const cJSON *actual, const cJSON *desired);
 hik_result_t hik_user_create(const cJSON *desired_profile, bool *verified);
 hik_result_t hik_user_rename(const cJSON *expected_profile, const char *name, bool *verified);
 hik_result_t hik_user_edit(const cJSON *expected_profile, const char *name, bool change_admin, bool admin, bool *verified);
