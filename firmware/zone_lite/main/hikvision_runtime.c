@@ -287,7 +287,7 @@ static void profile_task(void *arg)
                 bool sent = add_connector_command_update(command.command_id,
                     done ? "SUCCEEDED" : rejected ? "FAILED" : "RETRYING",
                     done ? NULL : rejected ? "HIK_PROFILE_PRECONDITION_FAILED" : "HIK_PROFILE_VERIFICATION_PENDING",
-                    done ? NULL : rejected ? "Profile changed or this operation is not qualified; refresh before retrying" : "Terminal readback remains pending",
+                    done ? NULL : rejected ? "Terminal identity, profile state, or requested fields failed validation; refresh before retrying" : "Terminal readback remains pending",
                     body ? body : "{}");
                 free(body); cJSON_Delete(receipt);
                 if ((done || rejected) && sent) (void)add_connector_command_complete(command.command_id);
@@ -374,7 +374,7 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddStringToObject(terminal, "connection_state", atomic_load(&reachable) ? "ONLINE" : "OFFLINE");
     cJSON_AddStringToObject(terminal, "capture_mode", "poll");
     cJSON_AddNumberToObject(terminal, "poll_interval_seconds", 5);
-    cJSON_AddNumberToObject(terminal, "profile_command_version", 1);
+    cJSON_AddNumberToObject(terminal, "profile_command_version", 2);
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));
     cJSON_AddNumberToObject(terminal, "durable_poll_cursor", atomic_load(&poll_cursor));

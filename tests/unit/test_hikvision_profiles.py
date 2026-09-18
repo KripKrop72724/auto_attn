@@ -120,7 +120,8 @@ def test_zkt_employee_length_limit_remains_unchanged(db):
         allocate_device_identifiers(session, zkt=connector.zkt_device, user_id_override="1" * 25)
 
 
-def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db):
+@pytest.mark.parametrize('command_version', [1, 2])
+def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db, command_version):
     from zk_add.hikvision_delivery import configure_policy
     from zk_add.service import auto_certify_zkt, require_writable_user_profile
 
@@ -131,7 +132,7 @@ def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db):
     terminal.terminal_binding_state = 'CONFIRMED'
     terminal.snapshot_complete = terminal.identity_snapshot_stable = True
     terminal.capability_profile = {'hikvision_health': {
-        'capability_profile': profile, 'profile_command_version': 1,
+        'capability_profile': profile, 'profile_command_version': command_version,
     }}
     auto_certify_zkt(session, connector, terminal)
     assert terminal.certification_state == 'READ_ONLY'
@@ -143,6 +144,8 @@ def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db):
     assert terminal.certification_state == 'PROFILE_PILOT'
     assert require_writable_user_profile(connector, 'user_write') is terminal
     assert terminal.capability_profile['user_role_write']
+    assert terminal.capability_profile['delete_all_credentials'] is (command_version == 2)
+    assert 'delete_fingerprint_card_qualified' not in terminal.capability_profile
     assert not terminal.capability_profile['admin_lease']
     with pytest.raises(ValueError, match='read-only'):
         require_writable_user_profile(connector, 'admin_lease')

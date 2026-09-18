@@ -33,17 +33,6 @@ static bool credential_free(const cJSON *profile)
     }
     return true;
 }
-static bool deletion_qualified(const cJSON *profile)
-{
-    /* Face removal and retained punches verified on the exact pilot firmware.
-     * Fingerprint/card deletion consequences still require hardware evidence. */
-    const cJSON *face = cJSON_GetObjectItemCaseSensitive(profile, "numOfFace");
-    const cJSON *finger = cJSON_GetObjectItemCaseSensitive(profile, "numOfFP");
-    const cJSON *card = cJSON_GetObjectItemCaseSensitive(profile, "numOfCard");
-    return cJSON_IsNumber(face) && (face->valuedouble == 0 || face->valuedouble == 1) &&
-        cJSON_IsNumber(finger) && finger->valuedouble == 0 &&
-        cJSON_IsNumber(card) && card->valuedouble == 0;
-}
 static bool regular(const cJSON *profile)
 {
     const char *type = text(profile, "userType");
@@ -128,8 +117,6 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
             command->privilege != command->expected_privilege, command->privilege == 14, &verified);
     } else if (!state_matches(before, command->expected_terminal_state_fingerprint) || !regular(before)) {
         result = HIK_BINDING;
-    } else if (!deletion_qualified(before)) {
-        result = HIK_CONFIGURATION;
     } else result = hik_user_delete(before, &verified);
     if (!verified) goto done;
     result = hik_user_read(command->user_id, &after);

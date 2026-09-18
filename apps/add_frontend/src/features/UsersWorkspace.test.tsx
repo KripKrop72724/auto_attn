@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useToast } from '../App'
 import type { Device, DeviceUser } from '../types'
 import { UsersView } from './UsersWorkspace'
+import { UserOperationDialog } from './Users'
 
 const device: Device = {
   connector_id: 'connector-one', hardware_id: 'hw-one', zone_id: 'ZONE-ONE', zone_name: 'Islamabad',
@@ -85,6 +86,19 @@ describe('Selected-terminal users workspace', () => {
     cleanup()
     vi.unstubAllGlobals()
     window.history.replaceState(null, '', '/')
+  })
+
+  it.each([true, false])('explains whole-profile deletion according to firmware capability: %s', (allCredentials) => {
+    const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
+      ...device.zkt!, capabilities: { delete_user: true, delete_all_credentials: allCredentials },
+    } }
+    function DialogHarness() {
+      const toast = useToast()
+      return <UserOperationDialog state={{ mode: 'delete', user: user() }} device={hik} onClose={() => {}} onCommand={() => {}} toast={toast} />
+    }
+    render(<DialogHarness />)
+    expect(screen.getByText(allCredentials ? /all enrolled fingerprints, PIN\/password, cards, and faces/ : /older firmware that restricts deletion/)).toBeTruthy()
+    if (allCredentials) expect(screen.getByText(/Attendance and identity history are retained/)).toBeTruthy()
   })
 
   it('distinguishes confirmed Hikvision binding from unavailable profile writes', async () => {
