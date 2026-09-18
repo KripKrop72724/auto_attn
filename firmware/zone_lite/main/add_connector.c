@@ -2412,15 +2412,20 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     // recovery/write result is available, report UNKNOWN rather than healthy.
     const char *led = led_status_current_name();
     const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
-        ? "DEGRADED" : "UNKNOWN";
+        ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
+        ? "HEALTHY" : "UNKNOWN";
     if (!cJSON_AddStringToObject(storage, "durability", durability) ||
+        !cJSON_AddBoolToObject(storage, "persistence_verified", measured_health.persistence_verified) ||
+        !cJSON_AddBoolToObject(storage, "recovery_complete", measured_health.recovery_complete) ||
         !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
         !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
         !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready())) goto failed;
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
-            s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE) ||
-        !append_worker_diagnostic(workers, "ords_delivery", s_ords_worker_started,
+            s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (!append_worker_diagnostic(workers, "ords_delivery", s_ords_worker_started,
             s_ords_worker_tick_ms, s_ords_worker_operation)) goto failed;
+#endif
     add_outbox_t *outboxes[] = {&s_live_outbox, &s_bulk_outbox};
     const char *names[] = {"live", "bulk"};
     for (size_t i = 0; i < 2; i++) {

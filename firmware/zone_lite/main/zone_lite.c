@@ -9320,8 +9320,12 @@ void app_main(void)
     add_connector_start();
     // Retain handles and retry startup from the existing app task. Delivery
     // allocation failure must not reboot a healthy capture task repeatedly.
-    TaskHandle_t ords_handle = NULL, gateway_handle = NULL;
-    worker_retry_t ords_retry = {0}, gateway_retry = {0};
+    TaskHandle_t gateway_handle = NULL;
+    worker_retry_t gateway_retry = {0};
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    TaskHandle_t ords_handle = NULL;
+    worker_retry_t ords_retry = {0};
+#endif
     for (;;) {
         uint32_t now = (uint32_t)uptime_ms();
         if (!gateway_handle && worker_retry_allow(&gateway_retry, now)) {
@@ -9331,6 +9335,9 @@ void app_main(void)
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             }
         }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        /* Hikvision transfers evidence to ADD's independent Oracle outbox;
+         * only ZKT uses this local direct-ORDS worker. */
         if (!ords_handle && worker_retry_allow(&ords_retry, now)) {
             if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, &ords_handle) != pdPASS) {
                 ords_handle = NULL;
@@ -9339,8 +9346,13 @@ void app_main(void)
             }
             add_connector_report_ords_start(ords_handle != NULL, ords_retry.total);
         }
+#endif
         if (!g_queue_store_ready) g_queue_store_ready = qs_init();
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+        if (!gateway_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+#else
         if (!gateway_handle || !ords_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+#endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

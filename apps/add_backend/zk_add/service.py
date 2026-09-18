@@ -517,8 +517,9 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
         for row in workers
     )
+    required_workers = {"add_delivery", "hikvision_source" if connector.firmware_family == "hikvision" else "ords_delivery"}
     workers_verified = (
-        {row.name for row in workers} >= {"add_delivery", "ords_delivery"}
+        {row.name for row in workers} >= required_workers
         and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
     )
     for code, failed, verified, message in (

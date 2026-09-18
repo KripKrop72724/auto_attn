@@ -6061,3 +6061,31 @@ def test_factory_boot_heartbeat_is_accepted_without_relaxing_partition_names(db:
     assert connector.firmware_version == "zone-lite-3.0.2"
     with pytest.raises(ValueError):
         HeartbeatPayload(ota={"running_partition": "nvs"})
+
+
+@pytest.mark.parametrize("family,source_worker,other_worker", [
+    ("hikvision", "hikvision_source", "ords_delivery"),
+    ("zkt", "ords_delivery", "hikvision_source"),
+])
+def test_worker_recovery_requires_fresh_workers_for_the_device_family(db, family, source_worker, other_worker):
+    from zk_add.service import apply_firmware_diagnostics
+    connector = connector_fixture(db)
+    connector.firmware_family = family
+    def apply(workers):
+        apply_firmware_diagnostics(db, connector=connector, payload=HeartbeatPayload(
+            uptime_seconds=100, diagnostics={"workers": workers}))
+        db.flush()
+    def worker(name, state="RUNNING", at=99000):
+        return {"name": name, "state": state, "last_activity_uptime_ms": at}
+    def alert():
+        return db.scalar(select(DeviceAlert).where(
+            DeviceAlert.connector_id == connector.id,
+            DeviceAlert.code == "ESP_DELIVERY_WORKER_FAULT"))
+    apply([worker(source_worker, "STOPPED")])
+    assert alert().state == "OPEN"
+    apply([worker("add_delivery"), worker(other_worker)])
+    assert alert().state == "OPEN"
+    apply([worker("add_delivery"), worker(source_worker, at=1000)])
+    assert alert().state == "OPEN"
+    apply([worker("add_delivery"), worker(source_worker)])
+    assert alert().state == "RESOLVED"

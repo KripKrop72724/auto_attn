@@ -60,7 +60,7 @@ int main(void){
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
- cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==8);
+ cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==9);
  cJSON *unknown=cJSON_GetArrayItem(queues,2+QS_BLOCKED);assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(unknown,"count_known")));
  assert(!cJSON_HasObjectItem(unknown,"records"));cJSON_Delete(payload);
  for(size_t i=1;i<=total;i++){
