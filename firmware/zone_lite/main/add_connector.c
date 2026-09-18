@@ -4171,12 +4171,17 @@ bool add_connector_claim_ota_restart(void)
     if (!s_lock) return false;
     bool claimed = false;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+#ifdef ZONE_LITE_HIKVISION
+        bool restart_ready = !s_ota_restart_claimed && hikvision_claim_ota_restart();
+#else
         bool activity_is_safe =
             strcmp(s_activity, "LIVE_CAPTURE") == 0 ||
             strcmp(s_activity, "ONLINE") == 0;
         bool terminal_is_stable =
             s_zkt.online && strcmp(s_zkt.connection_state, "ONLINE") == 0;
-        if (!s_ota_restart_claimed && activity_is_safe && terminal_is_stable) {
+        bool restart_ready = !s_ota_restart_claimed && activity_is_safe && terminal_is_stable;
+#endif
+        if (restart_ready) {
             s_ota_restart_claimed = true;
             strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));
             claimed = true;

@@ -52,7 +52,7 @@ static bool s_started;
 static bool s_busy;
 static char s_last_error[64];
 
-static void wait_for_zkt_safepoint(void);
+static void wait_for_capture_safepoint(void);
 static bool acknowledge_pending_success(void);
 
 static void hex_bytes(const unsigned char *input, size_t length, char *output)
@@ -440,18 +440,22 @@ static bool perform_update(void)
         return false;
     }
     (void)report_state("READY_TO_BOOT", NULL);
-    wait_for_zkt_safepoint();
+    wait_for_capture_safepoint();
     esp_restart();
     return true;
 }
 
-static void wait_for_zkt_safepoint(void)
+static void wait_for_capture_safepoint(void)
 {
     int64_t last_report = 0;
     while (!add_connector_claim_ota_restart()) {
         int64_t now = esp_timer_get_time() / 1000000;
         if (last_report == 0 || now - last_report >= OTA_SAFEPOINT_REPORT_SECONDS) {
+#ifdef ZONE_LITE_HIKVISION
+            (void)report_state("READY_TO_BOOT", "WAITING_FOR_HIK_SAFEPOINT");
+#else
             (void)report_state("READY_TO_BOOT", "WAITING_FOR_ZKT_SAFEPOINT");
+#endif
             last_report = now;
         }
         vTaskDelay(pdMS_TO_TICKS(1000));

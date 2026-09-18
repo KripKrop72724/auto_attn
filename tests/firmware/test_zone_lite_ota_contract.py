@@ -42,7 +42,7 @@ def test_ota_restart_waits_for_an_atomic_zkt_safepoint() -> None:
     ]
     assert "while (!add_connector_claim_ota_restart())" in update
     assert 'report_state("READY_TO_BOOT", "WAITING_FOR_ZKT_SAFEPOINT")' in update
-    assert update.index("wait_for_zkt_safepoint();") < update.index("esp_restart();")
+    assert update.index("wait_for_capture_safepoint();") < update.index("esp_restart();")
     assert "static bool s_ota_restart_claimed;" in connector
     assert 'strlcpy(s_activity, "OTA_RESTART"' in connector
     assert 'strcmp(s_activity, "LIVE_CAPTURE") == 0' in connector

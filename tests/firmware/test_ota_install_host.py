@@ -12,7 +12,7 @@ def test_installer_persists_before_slot_selection_and_restores_bad_images(tmp_pa
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "ota_manager.c").read_text()
     start = source.index("static bool perform_update(void)\n{")
-    production = source[start:source.index("static void wait_for_zkt_safepoint(void)\n{", start)]
+    production = source[start:source.index("static void wait_for_capture_safepoint(void)\n{", start)]
     harness = r'''
 #include "ota_checkpoint.h"
 #include "firmware_family.h"
@@ -56,7 +56,7 @@ static bool save_journal(void)
 {if(++saves==fail_save)return false;if(!strcmp(s_journal.state,"READY_TO_BOOT")){assert(s_journal.bytes_written==s_journal.image_size);boot_checkpoint=true;}return true;}
 static bool report_state(const char *state,const char *error){(void)error;assert(state[0]);return true;}
 static void vTaskDelay(unsigned ms){(void)ms;}
-static void wait_for_zkt_safepoint(void){assert(selected && boot_checkpoint);}
+static void wait_for_capture_safepoint(void){assert(selected && boot_checkpoint);}
 static void esp_restart(void){assert(selected && boot_checkpoint);++reboots;}
 /* PRODUCTION */
 static void reset(void)

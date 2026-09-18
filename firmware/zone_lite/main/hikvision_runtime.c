@@ -83,7 +83,7 @@ static void append_clock_evidence(cJSON *root)
         cJSON_AddNumberToObject(clock, "sampled_epoch", (double)sample.sampled_epoch);
     }
 }
-static SemaphoreHandle_t request_lock;
+static SemaphoreHandle_t request_lock, source_upload_lock;
 static QueueHandle_t profile_commands;
 /* Protected by request_lock: at most one bounded background page per poll. */
 static bool background_slot;
@@ -648,6 +648,7 @@ static void source_uploader(void *arg)
         if (!payload) payload = malloc(DQ_MAX_RECORD_BYTES + 1);
         atomic_store(&uploader_buffer_ready, payload != NULL);
         if (!payload) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        xSemaphoreTake(source_upload_lock, portMAX_DELAY);
         size_t length = 0;
         dq_token_t token;
         dq_result_t state = qs_peek(QS_HIK_SOURCE, payload, DQ_MAX_RECORD_BYTES, &length, &token);
@@ -660,6 +661,7 @@ static void source_uploader(void *arg)
             }
             atomic_store(&uploader_waiting, false);
         }
+        xSemaphoreGive(source_upload_lock);
         vTaskDelay(pdMS_TO_TICKS(state == DQ_OK ? 50 : 1000));
     }
 }
@@ -668,8 +670,9 @@ void hikvision_gateway_task(void *argument)
     (void)argument;
     TaskHandle_t stream = NULL, uploader = NULL, history = NULL, profiles = NULL;
     request_lock = xSemaphoreCreateMutex();
+    source_upload_lock = xSemaphoreCreateMutex();
     profile_commands = xQueueCreate(1, sizeof(add_command_t));
-    if (!request_lock || !profile_commands) { ESP_LOGE(TAG, "Request worker allocation failed"); vTaskDelete(NULL); return; }
+    if (!request_lock || !source_upload_lock || !profile_commands) { ESP_LOGE(TAG, "Request worker allocation failed"); vTaskDelete(NULL); return; }
     for (;;) {
         if (!stream && xTaskCreate(poll_task, "hik_poll", 8192, NULL, 5, &stream) != pdPASS) stream = NULL;
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
@@ -697,6 +700,29 @@ void hikvision_gateway_task(void *argument)
         add_connector_set_activity("HIKVISION_POLL_2S");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+}
+
+/* Called only by the OTA task immediately before esp_restart. Retain both
+ * mutexes until reset: terminal writes/pages and source settlement have ended,
+ * and no new operation can race the reboot. A durable backlog may replay after
+ * boot; external terminal reachability is not a restart requirement. */
+bool hikvision_claim_ota_restart(void)
+{
+    if (!request_lock || !source_upload_lock || !atomic_load(&checkpoint_ready) ||
+        !atomic_load(&runtime_workers_started)) return false;
+    if (xSemaphoreTake(request_lock, 0) != pdTRUE) return false;
+    if (xSemaphoreTake(source_upload_lock, 0) != pdTRUE) {
+        xSemaphoreGive(request_lock);
+        return false;
+    }
+    qs_health_t storage = qs_health();
+    if (!storage.observed || !storage.available || !storage.recovery_complete ||
+        !storage.persistence_verified || storage.last_error) {
+        xSemaphoreGive(source_upload_lock);
+        xSemaphoreGive(request_lock);
+        return false;
+    }
+    return true;
 }
 
 /* OTA proves the installed application and recovered custody independently of
