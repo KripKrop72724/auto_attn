@@ -97,6 +97,9 @@ def validate_inputs(
 
     provisioning = json.loads(provisioning_manifest.read_text(encoding="utf-8"))
     aad = provisioning.get("aad", {})
+    family = aad.get("firmware_family", "zkt")
+    if family not in {"zkt", "hikvision"} or bootstrap.get("firmware_family", "zkt") != family:
+        raise RuntimeError("Provisioning and signed bootstrap firmware families do not match")
     if normalize_mac(str(aad.get("target_mac", ""))) != mac:
         raise RuntimeError("Provisioning NVS target MAC does not match attached ESP")
     if sha256(provision_nvs) != aad.get("nvs_sha256"):

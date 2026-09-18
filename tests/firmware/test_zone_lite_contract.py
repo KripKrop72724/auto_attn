@@ -225,8 +225,8 @@ def test_reconcile_and_restart_cadence_are_production_defaults():
     assert "ZONE_LITE_RESTART_SLOT_1_HOUR 2" in source
     assert "ZONE_LITE_RESTART_SLOT_2_HOUR 12" in source
     assert "ZONE_LITE_RESTART_SLOT_3_HOUR 22" in source
-    assert 'nvs_set_i32(handle, "attn_count", g_last_synced_attendance_count)' in source
-    assert 'nvs_set_i64(handle, "truth_epoch", g_last_full_truth_reconcile_epoch)' in source
+    assert 'state.attendance_count = g_last_synced_attendance_count;' in source
+    assert 'state.truth_epoch = g_last_full_truth_reconcile_epoch;' in source
     assert "g_last_full_truth_reconcile_epoch" in source
     assert "g_last_full_truth_reconcile_ms" in source
     assert "ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (15 * 60 * 1000)" in source
@@ -325,7 +325,7 @@ def test_recoverable_truth_memory_pressure_never_latches_fatal_led():
     ]
     sender = source[
         source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
-        source.index("static void append_acked_uid_from_json_to_file(")
+        source.index("static bool add_enqueue_json_receipts(")
     ]
     assert "one transient JSON row at a time" in payload
     assert 'event_to_json(&events[i], "MANUAL_REPROCESS")' in payload
@@ -345,9 +345,9 @@ def test_runtime_failures_self_heal_and_heartbeat_reports_the_real_led():
     runtime_before_app_main = runtime[: runtime.index("void app_main(void)")]
     assert "led_status_fault(LED_STATUS_FATAL)" not in runtime_before_app_main
     assert "LED_STATUS_LOCAL_FAILURE" in runtime_before_app_main
-    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" in runtime_before_app_main
-    assert "runtime_start_failed" in app_main
-    assert "esp_restart();" in app_main
+    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" not in runtime_before_app_main
+    assert "worker_retry_allow(&ords_retry, now)" in app_main
+    assert "esp_restart();" not in app_main
     assert "expire_recoverable_fault" in led
     assert 'return "LOCAL_FAILURE";' in led
     assert 'cJSON_AddStringToObject(payload, "led_state", led_status_current_name());' in connector
@@ -401,7 +401,7 @@ def test_truth_reconcile_uses_bounded_authoritative_day_windows():
     ]
     sender = source[
         source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
-        source.index("static void append_acked_uid_from_json_to_file(")
+        source.index("static bool add_enqueue_json_receipts(")
     ]
     assert "zk_timestamp_in_window(timestamp, year, month, start_day, end_day)" in collector
     assert "if (count >= capacity)" in collector
@@ -480,7 +480,8 @@ def test_firmware_version_change_forces_immediate_truth_reconcile():
     success = source.index("g_force_truth_reconcile = false;")
     save = source.index("nvs_save_runtime_state();", success)
     assert success < save
-    assert 'nvs_set_str(handle, "truth_ver", version)' in source
+    assert 'nvs_set_blob(handle, "runtime_v1", &state, sizeof(state))' in source
+    assert 'strlcpy(state.truth_version, description ? description->version' in source
 
 
 def test_user_integrity_interval_starts_after_refresh_completion():
@@ -512,9 +513,9 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
     ).read_text(encoding="utf-8")
 
     assert "ZONE_LITE_HISTORY_SCHEMA_VERSION 2" in source
-    assert 'nvs_set_i32(handle, "hist_year", g_history_cursor_year)' in source
-    assert 'nvs_set_i32(handle, "hist_month", g_history_cursor_month)' in source
-    assert 'nvs_set_u8(handle, "hist_pending"' in source
+    assert 'state.history_year = g_history_cursor_year;' in source
+    assert 'state.history_month = g_history_cursor_month;' in source
+    assert 'state.history_pending = g_history_backfill_pending;' in source
     assert "find_attendance_month_bounds(" in source
     assert "find_next_attendance_month(" in source
     assert '"HISTORY_EMPTY_MONTHS_SKIPPED"' in source
@@ -550,7 +551,7 @@ def test_historical_truth_cursor_is_persisted_bounded_and_fail_closed():
     ]
     sender = source[
         source.index("static bool oracle_send_reconcile(\n", source.index(payload)) :
-        source.index("static void append_acked_uid_from_json_to_file(")
+        source.index("static bool add_enqueue_json_receipts(")
     ]
     assert '"api_version\\":2' in payload
     assert '"terminal_event_count\\":%u' in payload
@@ -881,7 +882,7 @@ def test_identity_catalog_has_bounded_memory_fallback_under_storage_pressure():
         connector.index("bool add_connector_persist_command_tombstone(")
     ]
     lookup = connector[
-        connector.index("bool add_connector_lookup_identity(") :
+        connector.index("static bool add_connector_lookup_identity_locked(") :
         connector.index("uint32_t add_connector_identity_catalog_generation(")
     ]
 
@@ -897,35 +898,34 @@ def test_identity_catalog_has_bounded_memory_fallback_under_storage_pressure():
     )
 
 
-def test_blocked_identity_recovery_uses_verified_add_alias_catalog():
+def test_blocked_identity_recovery_requires_terminal_and_identity_provenance():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     recovery = source[
         source.index("static bool recover_blocked_events_from_snapshot(") :
         source.index("static void storage_init(")
     ]
-    assert "add_connector_lookup_identity(" in recovery
-    assert "recovered_cnic" in recovery
-    assert "recovered_name" in recovery
-    assert "recovered_shift_worker" in recovery
-    assert recovery.index("add_connector_lookup_identity(") < recovery.index(
-        "cJSON_AddStringToObject(root, \"cnic\", recovered_cnic)"
+    assert "rel_identity_matches(" in recovery
+    assert "_terminal_identity_fingerprint" in recovery
+    assert "device_serial" in recovery
+    assert "add_connector_lookup_identity(" not in recovery
+    assert recovery.index("rel_identity_matches(") < recovery.index(
+        'cJSON_AddStringToObject(root, "cnic", user->cnic)'
     )
-    assert "verified ADD identity alias" in recovery
+    assert "output && append_line(PENDING_PATH, output)" in recovery
+    assert recovery.index("append_line(PENDING_PATH, output)") < recovery.index("settle_blocked_locked(&token, false)")
 
 
-def test_large_blocked_identity_backlog_is_deferred_before_storage_lock():
+def test_blocked_identity_recovery_uses_bounded_persistent_reads():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
-    assert "#define ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES (64 * 1024)" in source
+    assert "ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES" not in source
     recovery = source[
         source.index("static bool recover_blocked_events_from_snapshot(") :
         source.index("static void storage_init(")
     ]
-    size_gate = recovery.index("blocked_stat.st_size > ZONE_LITE_BLOCKED_RECOVERY_MAX_BYTES")
-    storage_lock = recovery.index("xSemaphoreTake(g_storage_lock")
-    assert size_gate < storage_lock
-    assert '"BLOCKED_IDENTITY_RECOVERY_DEFERRED"' in recovery
-    assert "records remain preserved for bounded truth recovery" in recovery
-    assert recovery.index("return true;", size_gate) < storage_lock
+    assert "read_blocked_locked(" in recovery
+    assert "char line[MAX_EVENT_JSON]" in recovery
+    assert "BLOCKED_RECOVERY_TMP_PATH" not in recovery
+    assert "settle_blocked_locked(" in recovery
 
 
 def test_fragmented_identity_catalog_is_reassembled_applied_and_forces_truth():
@@ -991,7 +991,7 @@ def test_large_identity_catalog_is_committed_as_bounded_encrypted_rows():
     assert "fflush(file) != 0 || fsync(fileno(file)) != 0" in connector
     assert "activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH)" in connector
     assert "ADD_IDENTITY_CATALOG_BACKUP_PATH" in connector
-    assert "backup_result == 0" in connector
+    assert "ft_replace(ADD_IDENTITY_CATALOG_PATH" in connector
     assert "errno != ENOENT" in connector
     assert "access(ADD_IDENTITY_CATALOG_PATH" not in connector
     assert '"IDENTITY_CATALOG_PERSIST_FAILED"' in connector
@@ -1106,8 +1106,11 @@ def test_live_capture_counts_only_durable_or_acknowledged_events():
     assert '"LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED"' in connector
     assert '"LIVE_DIRECT_ACK_FALLBACK_FAILED"' in connector
     assert "result == ENQUEUE_PENDING || result == ENQUEUE_ACKNOWLEDGED" in live
-    assert "if (result != ENQUEUE_STORAGE_ERROR)" in live
-    assert live.index("if (result != ENQUEUE_STORAGE_ERROR)") < live.index("observed++;")
+    assert "result == ENQUEUE_BLOCKED" in live
+    assert "result == ENQUEUE_DUPLICATE" in live
+    assert "ENQUEUE_RESOURCE_ERROR" in enqueue
+    assert "g_force_truth_reconcile = true" in live
+    assert live.index("result == ENQUEUE_BLOCKED") < live.index("observed++;")
 
 
 def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
@@ -1122,9 +1125,7 @@ def test_identity_blocked_truth_does_not_create_a_reconnect_flap_loop():
             runtime.index("if (!historical_reconcile && identity_blocked)"),
         )
     ]
-    assert "g_last_synced_attendance_count = refreshed_records;" in identity_blocked
-    assert "live_events_since_sync = 0;" in identity_blocked
-    assert "nvs_save_runtime_state();" in identity_blocked
+    assert "commit_reconcile_count(refreshed_records, &live_events_since_sync)" in identity_blocked
     assert "g_last_full_truth_reconcile_epoch = current_epoch;" in runtime
     assert "truth_retry_session = true;" in runtime
     assert (
@@ -1182,7 +1183,7 @@ def test_reconcile_timeout_is_isolated_from_live_and_bulk_delivery():
     bulk = source[bulk_start : source.index("static int days_in_month(", bulk_start)]
     sender = source[
         source.index("static bool oracle_send_reconcile(") :
-        source.index("static void append_acked_uid_from_json_to_file(")
+        source.index("static bool add_enqueue_json_receipts(")
     ]
     assert "http_post_json(url, normalized_event, &body)" in live
     assert "http_post_json(url, payload, &body)" in bulk
@@ -1204,14 +1205,11 @@ def test_oracle_receipts_are_durable_before_ords_rows_are_retired():
     assert "add_connector_enqueue_oracle_receipts" in header_source
     assert '"FIRMWARE_LIVE"' in zone_source
     assert '"FIRMWARE_BULK"' in zone_source
-    live_receipt = zone_source.index(
-        "add_enqueue_json_receipts(\n                        live_event"
-    )
-    live_retire = zone_source.index(
-        "append_acked_uid_from_json_to_file(line, acked_file)",
-        live_receipt,
-    )
-    assert live_receipt < live_retire
+    drain = zone_source[zone_source.index("static void oracle_drain_pending(bool live_first)"):
+                        zone_source.index("static void ords_uploader_task(")]
+    assert drain.index("add_enqueue_json_receipts(events, count") < drain.index("lq_settle(")
+    assert drain.index("xSemaphoreGive(g_storage_lock)") < drain.index("oracle_send_live(")
+    assert 'if (settled)' in drain
 
 
 def test_large_truth_stream_delegates_confirmation_to_durable_add_delivery():
@@ -1311,36 +1309,20 @@ def test_oracle_receipt_batches_collapse_duplicate_terminal_event_uids():
     assert "cJSON_CreateString" not in receipt_enqueue
     assert "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT" in receipt_enqueue
     assert "ADD_OUTBOX_LINE_BYTES - used" in receipt_enqueue
-    assert "add_connector_enqueue_validated_line(" in receipt_enqueue
+    assert "add_connector_enqueue_validated_line_with_policy(line, true, QS_ADMIT_RECOVERY)" in receipt_enqueue
 
 
 def test_ords_drain_preserves_authoritative_outbox_under_storage_pressure():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
-    drain = source[
-        source.index("static bool pending_rewrite_write(") :
-        source.index("static void oracle_drain_pending(bool live_first)")
-    ]
-
-    assert "ORDS_DRAIN_STORAGE_BACKPRESSURE" in drain
-    assert "g_ords_drain_retry_not_before_ms" in drain
-    assert "ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS" in drain
-    assert 'ords_drain_preserved_deferred("open", open_error)' in drain
-    assert 'ords_drain_preserved_deferred("allocate", ENOMEM)' in drain
-    assert 'ords_drain_preserved_deferred("write", rewrite_error)' in drain
-    assert 'ords_drain_preserved_deferred("commit", rewrite_error)' in drain
-    assert 'ords_drain_preserved_deferred("replace", replace_error)' in drain
-    assert "pending_rewrite_write(" in drain
-    assert "fflush(out)" in drain
-    assert "fsync(fileno(out))" in drain
-    assert "if (!rewrite_ok)" in drain
-    replacement = drain.index("replace_pending_with_backup(")
-    durable_flush = drain.index("fsync(fileno(out))")
-    assert durable_flush < replacement
-    assert "original pending outbox remains unchanged" in drain
-    assert "without deleting a queue" in drain
-    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);" in drain
-    assert "authoritative_source_preserved" in drain
-    assert "led_status_fault(LED_STATUS_LOCAL_FAILURE);" in drain
+    drain = source[source.index("static void oracle_drain_pending(bool live_first)"):
+                   source.index("static void ords_uploader_task(")]
+    assert "lq_peek(" in drain
+    assert "lq_settle(" in drain
+    assert "lq_reclaim(" in drain
+    assert "PENDING_TMP_PATH" not in drain
+    assert "g_legacy_probe_head ? 1 : 100" in drain
+    assert "ords_drain_preserved_deferred" in drain
+    assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" not in drain
 
 
 def test_full_reconcile_arbitrates_outbox_before_downloading_zkt_dump():
@@ -1496,20 +1478,17 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "is_attendance ? &attendance_ack : NULL" in connector
     assert "ADD durably quarantined %lu attendance row(s) without blocking" in connector
     assert "ADD_OUTBOX_RETRY_MAX_MS" in connector
-    assert "esp_random() % 1000U" in connector
+    assert "ds_complete(&scheduler" in connector
+    assert "esp_random()" in connector
 
-    corrupt = connector[
-        connector.index("static bool preserve_corrupt_outbox_row(") :
-        connector.index("static char *outbox_record_line(")
-    ]
-    assert "ADD_CORRUPT_OUTBOX_MAX_BYTES" in corrupt
-    assert "ADD_CORRUPT_OUTBOX_BACKUP_PATH" in corrupt
-    assert "fsync(fileno(file)) == 0" in corrupt
     worker = connector[
         connector.index("static void outbox_task(") :
         connector.index("void add_connector_init(")
     ]
-    assert worker.index("preserve_corrupt_outbox_row(line)") < worker.index(
-        "advance_outbox_locked(outbox, row_end)"
+    assert worker.index("add_connector_transfer_queue_evidence(") < worker.index(
+        "advance_outbox_locked(outbox, row_end, true)"
     )
-    assert "protect newer attendance" in worker
+    assert "if (preserved)" in worker
+    assert "!memchr(line, 0, raw_length)" in worker
+    assert "syntax_valid && !record" in worker
+    assert "valid && !payload_json" in worker

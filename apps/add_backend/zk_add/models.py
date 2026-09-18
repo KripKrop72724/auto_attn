@@ -52,6 +52,11 @@ class Connector(Base):
     device_id: Mapped[str] = mapped_column(String(120), index=True)
     display_name: Mapped[str] = mapped_column(String(255))
     firmware_version: Mapped[str | None] = mapped_column(String(80))
+    firmware_family: Mapped[str] = mapped_column(String(16), default="zkt", server_default="zkt")
+    terminal_vendor: Mapped[str] = mapped_column(String(16), default="zkt", server_default="zkt")
+    terminal_protocol: Mapped[str] = mapped_column(String(24), default="zkt_tcp", server_default="zkt_tcp")
+    firmware_diagnostics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    firmware_diagnostics_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ota_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     ota_secure_boot: Mapped[bool] = mapped_column(Boolean, default=False)
     ota_rollback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -1614,3 +1619,23 @@ class AttendanceRepairWorkerHeartbeat(Base):
 # drift checks always see the complete production metadata.
 from zk_add import ota as _ota_models  # noqa: E402,F401
 from zk_add import provisioning as _provisioning_models  # noqa: E402,F401
+
+
+class QueueEvidence(Base):
+    __tablename__ = "add_queue_evidence"
+    __table_args__ = (
+        UniqueConstraint("connector_id", "queue", "queue_generation", "record_id",
+                         name="uq_add_queue_evidence_identity"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    queue: Mapped[str] = mapped_column(String(40))
+    queue_generation: Mapped[str] = mapped_column(String(80))
+    record_id: Mapped[str] = mapped_column(String(120))
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    provenance_digest: Mapped[str] = mapped_column(String(64))
+    byte_count: Mapped[int] = mapped_column(Integer)
+    protected_evidence: Mapped[str] = mapped_column(Text)
+    disposition: Mapped[str] = mapped_column(String(40), default="PRESERVED_UNRESOLVED")
+    created_at: Mapped[datetime] = utc_column()

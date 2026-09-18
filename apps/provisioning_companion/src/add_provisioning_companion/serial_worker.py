@@ -207,6 +207,10 @@ def _verify_factory_artifact(
         )
     except Exception as exc:
         raise RuntimeError("FACTORY_MANIFEST_SIGNATURE_MISMATCH") from exc
+    family = factory.get("firmware_family", "zkt")
+    provisioned_family = artifact.get("provisioning_manifest", {}).get("aad", {}).get("firmware_family", "zkt")
+    if family not in {"zkt", "hikvision"} or family != provisioned_family:
+        raise RuntimeError("FIRMWARE_FAMILY_MISMATCH")
     declared = {
         item["name"]: (int(item["offset"]), int(item["size"]), item["sha256"])
         for item in factory.get("images", [])

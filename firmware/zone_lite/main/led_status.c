@@ -39,6 +39,7 @@ typedef struct {
     led_status_t latched_fault;
     int64_t latched_until_ms;
     bool has_latched_fault;
+    bool local_failure; /* Cleared only by verified storage recovery, never a timer. */
     bool has_backlog;
     bool live_flash;
     int64_t live_flash_until_ms;
@@ -136,6 +137,8 @@ static led_status_t select_status(const led_state_t *state, int64_t tick_ms, boo
         priority_for_status(state->latched_fault) > priority_for_status(selected)) {
         selected = state->latched_fault;
     }
+    if (state->local_failure && priority_for_status(LED_STATUS_LOCAL_FAILURE) > priority_for_status(selected))
+        selected = LED_STATUS_LOCAL_FAILURE;
     if (state->live_flash && tick_ms < state->live_flash_until_ms &&
         priority_for_status(selected) <= priority_for_status(LED_STATUS_BACKLOG)) {
         *live_flash = true;
@@ -304,6 +307,7 @@ void led_status_fault(led_status_t status)
         return;
     }
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (status == LED_STATUS_LOCAL_FAILURE) s_state.local_failure = true;
         s_state.latched_fault = status;
         s_state.has_latched_fault = true;
         s_state.latched_until_ms = now_ms() + ZONE_LITE_LED_FAULT_LATCH_MS;
@@ -320,6 +324,7 @@ void led_status_clear_fault(led_status_t status)
         return;
     }
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (status == LED_STATUS_LOCAL_FAILURE) s_state.local_failure = false;
         if (s_state.has_latched_fault && s_state.latched_fault == status) {
             s_state.has_latched_fault = false;
         }

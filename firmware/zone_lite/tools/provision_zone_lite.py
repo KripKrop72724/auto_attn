@@ -13,6 +13,7 @@ import hmac
 import csv
 import hashlib
 import json
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -156,6 +157,9 @@ def read_mac(esptool: str, port: str) -> str:
 
 
 def nvs_rows(config: dict, bootstrap_secret: str) -> list[list[object]]:
+    family = config.get("firmware_family", "zkt")
+    if family not in {"zkt", "hikvision"}:
+        raise ValueError("Unknown firmware family")
     required = (
         "wifi_ssid",
         "wifi_password",
@@ -171,6 +175,7 @@ def nvs_rows(config: dict, bootstrap_secret: str) -> list[list[object]]:
         raise ValueError(f"Missing provisioning values: {', '.join(missing)}")
     values: list[tuple[str, str, str, object]] = [
         ("zone_cfg", "namespace", "", ""),
+        ("fw_family", "data", "string", family),
         ("provisioned", "data", "u8", 1),
         ("wifi_ssid", "data", "string", config["wifi_ssid"]),
         ("wifi_pass", "data", "string", config["wifi_password"]),
@@ -205,6 +210,38 @@ def nvs_rows(config: dict, bootstrap_secret: str) -> list[list[object]]:
         ("conn_id", "data", "string", ""),
         ("dev_token", "data", "string", ""),
     ]
+    if family == "hikvision":
+        def text(key: str, maximum: int, optional: bool = False) -> str:
+            value = config.get(key, "")
+            if (not isinstance(value, str) or (not value and not optional)
+                    or len(value.encode()) > maximum or "\x00" in value):
+                raise ValueError(f"Invalid Hikvision provisioning field: {key}")
+            return value
+
+        host = text("hik_host", 63)
+        address = ipaddress.ip_address(host)
+        if not address.is_private or address.is_loopback or address.is_unspecified or address.is_multicast:
+            raise ValueError("Hikvision host must be a LAN address")
+        if address.version != 4 or address.is_link_local:
+            raise ValueError("Hikvision installation currently requires an IPv4 LAN address")
+        mode = config.get("hik_transport", "https")
+        if mode not in {"https", "http_digest"}:
+            raise ValueError("Explicit Hikvision transport is required")
+        port = config.get("hik_port", 443 if mode == "https" else 80)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("Invalid Hikvision port")
+        values.extend([
+            ("hik_host", "data", "string", host),
+            ("hik_port", "data", "u16", port),
+            ("hik_https", "data", "u8", int(mode == "https")),
+            ("hik_http", "data", "u8", int(mode == "http_digest")),
+            ("hik_user", "data", "string", text("hik_username", 63)),
+            ("hik_pass", "data", "string", text("hik_password", 127)),
+            ("hik_serial", "data", "string", text("hik_expected_serial", 119)),
+            ("hik_profile", "data", "string", text("hik_profile", 79)),
+            ("hik_epoch", "data", "string", text("hik_source_epoch", 64)),
+            ("hik_ca", "data", "string", text("hik_ca_pem", 4095, optional=True)),
+        ])
     return [[key, kind, encoding, value] for key, kind, encoding, value in values]
 
 

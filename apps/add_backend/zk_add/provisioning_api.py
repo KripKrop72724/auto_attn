@@ -229,6 +229,7 @@ class PasswordBody(BaseModel):
 
 
 class SessionCreate(BaseModel):
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
     companion_id: str
     idempotency_key: str = Field(min_length=8, max_length=120)
 
@@ -308,10 +309,11 @@ def _serialize_companion(row: ProvisioningCompanion, *, online: bool) -> dict[st
 
 @router.get("/api/v1/provisioning/capabilities")
 def provisioning_capabilities(
+    firmware_family: Literal["zkt", "hikvision"] = "zkt",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    bundle = latest_factory_bundle(db) if settings.provisioning_enabled else None
+    bundle = latest_factory_bundle(db, firmware_family) if settings.provisioning_enabled else None
     return {
         "enabled": settings.provisioning_enabled,
         "supported_platforms": ["windows-x64", "macos-arm64"],
@@ -553,7 +555,7 @@ async def create_session(
             status_code=409,
             detail=f"Companion already has active session {active.session_id}.",
         )
-    bundle = latest_factory_bundle(db)
+    bundle = latest_factory_bundle(db, body.firmware_family)
     if not bundle:
         raise HTTPException(status_code=409, detail="No approved factory bundle is available.")
     now = utc_now()
@@ -680,6 +682,9 @@ async def preflight_session(
     bundle = db.get(FactoryFirmwareBundle, row.bundle_id)
     if not bundle or bundle.state != "AVAILABLE":
         raise HTTPException(status_code=409, detail="Selected factory bundle is unavailable.")
+    from zk_add.terminal_families import release_family
+    if release_family(bundle.manifest) != body.firmware_family:
+        raise HTTPException(status_code=409, detail="FIRMWARE_FAMILY_MISMATCH")
     try:
         existing = ensure_assignment_available(
             db,
@@ -742,6 +747,9 @@ async def _prepare_package(
     bundle: FactoryFirmwareBundle,
     configuration: ProvisioningConfiguration,
 ) -> dict[str, Any]:
+    from zk_add.terminal_families import release_family
+    if release_family(bundle.manifest) != configuration.firmware_family:
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     token = settings.provisioning_internal_token
     if not token:
         raise RuntimeError("Protected provisioner token is unavailable.")

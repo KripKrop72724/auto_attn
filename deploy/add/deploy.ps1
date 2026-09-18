@@ -455,6 +455,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
     $environment["ADD_FIRMWARE_HIL_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGETS_JSON)) {
+    $environment["ADD_FIRMWARE_HIL_TARGETS_JSON"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGETS_JSON
+}
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) {
     $environment["ADD_FIRMWARE_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC
 }

@@ -72,6 +72,11 @@ validation evidence, and the required `complete=true` acceptance markers.
 
 ## Repository layout
 
+Hikvision support uses operator-approved five-second polling and is in qualification, not released. The read-only diagnostic and
+hardware gates for DS-K1T342EFWX are documented in
+[Hikvision qualification](docs/hikvision-qualification.md). No Hikvision firmware
+image is currently certified by this repository.
+
 ```text
 apps/add_backend/       FastAPI control plane, migrations, command worker
 apps/add_frontend/      React dashboard and State Life assets

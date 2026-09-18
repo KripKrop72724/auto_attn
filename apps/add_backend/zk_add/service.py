@@ -60,6 +60,7 @@ from zk_add.schemas import (
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
 from zk_add.identity_states import PINNED_IDENTITY_RESOLUTION_STATUSES
+from zk_add.identity_provenance import historical_identity_is_supported
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
@@ -278,10 +279,15 @@ def onboard_connector(
     expected_serial: str | None,
     actor: str,
     ip_address: str | None,
+    firmware_family: str = "zkt",
 ) -> tuple[Connector, str, bool]:
+    from zk_add.terminal_families import firmware_family as validate_family
+    firmware_family = validate_family(firmware_family)
     site = ensure_site(session, zone_id, zone_name)
     connector = session.scalar(select(Connector).where(Connector.hardware_id == hardware_id))
     created = connector is None
+    if connector is not None and validate_family(connector.firmware_family) != firmware_family:
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     if connector is None:
         connector = Connector(
             connector_id=str(uuid4()),
@@ -292,6 +298,9 @@ def onboard_connector(
             device_id=device_id,
             display_name=zone_name,
             firmware_version=firmware_version,
+            firmware_family=firmware_family,
+            terminal_vendor=firmware_family,
+            terminal_protocol="isapi" if firmware_family == "hikvision" else "zkt_tcp",
             lifecycle_state="ONBOARDING",
         )
         session.add(connector)
@@ -421,6 +430,19 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             )
         return
 
+    if connector.firmware_family == "hikvision":
+        # ZKT binary-record stability is not an ISAPI qualification. Keep the
+        # shared serial quarantine above, but never confer write capability from
+        # a Hikvision heartbeat or a coincidental ZKT-shaped metadata field.
+        zkt.certification_state = "READ_ONLY"
+        zkt.writes_disabled_reason = "HIKVISION_WRITE_QUALIFICATION_PENDING"
+        zkt.capability_profile = {
+            **(zkt.capability_profile or {}),
+            "user_write": False, "create_user": False, "delete_user": False,
+            "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
+        }
+        return
+
     if (
         zkt.terminal_binding_state != "CONFIRMED"
         or not zkt.confirmed_serial
@@ -439,6 +461,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         }
         return
 
+    if (connector.firmware_family or "zkt") != "zkt":
+        return
     record_size = int((zkt.capability_profile or {}).get("observed_user_record_bytes", 0))
     fingerprint = f"{zkt.serial}|{zkt.model or ''}|{zkt.platform or ''}|{record_size}"
     if zkt.certification_fingerprint != fingerprint:
@@ -475,6 +499,53 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         resolve_alert(session, connector, code="USER_SNAPSHOT_TRUNCATED")
 
 
+def apply_firmware_diagnostics(session: Session, connector: Connector, payload: HeartbeatPayload) -> None:
+    diagnostics = payload.diagnostics
+    connector.firmware_diagnostics = diagnostics.model_dump(mode="json") if diagnostics else None
+    connector.firmware_diagnostics_at = utc_now() if diagnostics else None
+    storage = diagnostics.storage if diagnostics else None
+    storage_failed = storage is not None and storage.durability in {"DEGRADED", "FULL"}
+    storage_verified = bool(storage and storage.durability == "HEALTHY"
+                            and storage.persistence_verified and storage.recovery_complete)
+    workers = diagnostics.workers if diagnostics else []
+    def activity_fresh(row) -> bool:
+        return (payload.uptime_seconds is not None and row.last_activity_uptime_ms is not None
+                and 0 <= payload.uptime_seconds * 1000 - row.last_activity_uptime_ms <= 90_000)
+
+    workers_failed = any(
+        row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
+        or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
+        for row in workers
+    )
+    workers_verified = (
+        {row.name for row in workers} >= {"add_delivery", "ords_delivery"}
+        and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
+    )
+    for code, failed, verified, message in (
+        ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
+         "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
+        ("ESP_DELIVERY_WORKER_FAULT", workers_failed, workers_verified,
+         "An attendance delivery worker is stopped or waiting for resources."),
+    ):
+        if failed:
+            upsert_alert(session, connector, code=code, severity="HIGH", message=message,
+                         details={"diagnostics_schema_version": 1})
+        elif verified:
+            resolve_alert(session, connector, code=code)
+            if connector.last_error_code == code:
+                connector.last_error_code = None
+                connector.last_error_message = None
+        unresolved = None if verified and not failed else session.scalar(select(DeviceAlert.id).where(
+            DeviceAlert.connector_id == connector.id, DeviceAlert.code == code,
+            DeviceAlert.state == "OPEN",
+        ))
+        if failed or unresolved:
+            if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
+                connector.lifecycle_state = "DEGRADED"
+            connector.last_error_code = code
+            connector.last_error_message = message
+
+
 def update_heartbeat(
     session: Session,
     *,
@@ -483,6 +554,8 @@ def update_heartbeat(
     sequence: int,
     payload: HeartbeatPayload,
 ) -> dict:
+    if (connector.firmware_family or "zkt") != payload.firmware_family:
+        raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     now = utc_now()
     connector.connected = True
     connector.lifecycle_state = "ONLINE"
@@ -500,7 +573,12 @@ def update_heartbeat(
     # stale, so resolve it immediately when the connector reports again.
     resolve_alert(session, connector, code="ESP_OFFLINE")
     zkt = connector.zkt_device
-    zkt_payload = payload.zkt
+    zkt_payload = (payload.terminal.model_dump(exclude_none=True)
+                   if payload.firmware_family == "hikvision" and payload.terminal else payload.zkt)
+    if zkt and payload.terminal:
+        zkt.capability_profile = {**(zkt.capability_profile or {}),
+                                  "source_protocol": "hikvision-isapi-v1",
+                                  "hikvision_health": zkt_payload}
     if zkt:
         previous_terminal_serial = zkt.serial
         previous_attendance_count = zkt.attendance_count
@@ -764,6 +842,7 @@ def update_heartbeat(
         if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
             connector.last_error_code = None
             connector.last_error_message = None
+    apply_firmware_diagnostics(session, connector, payload)
     apply_ota_heartbeat_diagnostics(
         session,
         connector=connector,
@@ -801,6 +880,14 @@ def update_heartbeat(
 
 
 def replace_user_snapshot(
+    session: Session, *, connector: Connector, snapshot: UserSnapshotRequest
+) -> int:
+    if connector.firmware_family == "hikvision":
+        raise ValueError("Hikvision snapshots require the vendor profile contract.")
+    return _replace_user_snapshot(session, connector=connector, snapshot=snapshot)
+
+
+def _replace_user_snapshot(
     session: Session, *, connector: Connector, snapshot: UserSnapshotRequest
 ) -> int:
     zkt = connector.zkt_device
@@ -2413,6 +2500,11 @@ def enrich_undelivered_attendance(
     user: DeviceUser,
     snapshot: DeviceUserSnapshot | None = None,
 ) -> int:
+    owner = session.get(Connector, zkt.connector_id)
+    if owner is not None and owner.firmware_family == "hikvision":
+        # Hikvision uses its preserved source record for name-CNIC identity.
+        # A newer ZKT-style snapshot must not silently rewrite older punches.
+        return 0
     cnic = decrypt_cnic(user.cnic_encrypted)
     if not cnic:
         return 0
@@ -2427,6 +2519,10 @@ def enrich_undelivered_attendance(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.user_id == user.user_id,
             AttendanceEvent.ords_status.in_(eligible_statuses),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
             or_(
                 AttendanceEvent.identity_resolution_status.is_(None),
                 AttendanceEvent.identity_resolution_status.not_in(
@@ -2537,6 +2633,10 @@ def repair_verified_tombstone_backlog(
         select(AttendanceEvent)
         .where(
             AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
             AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
             eligible_tombstone,
         )
@@ -2667,6 +2767,10 @@ def repair_verified_active_identity_backlog(
             .where(
                 AttendanceEvent.zkt_device_id == zkt.id,
                 AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+                or_(
+                    AttendanceEvent.identity_resolution_status.is_(None),
+                    AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+                ),
                 AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
                 AttendanceEvent.device_event_time >= identity_change_at,
                 DeviceUser.lifecycle_state == "ACTIVE",
@@ -2783,6 +2887,10 @@ def block_undelivered_attendance(
             AttendanceEvent.ords_status.in_(eligible_statuses),
             or_(
                 AttendanceEvent.identity_resolution_status.is_(None),
+                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
+            ),
+            or_(
+                AttendanceEvent.identity_resolution_status.is_(None),
                 AttendanceEvent.identity_resolution_status.not_in(
                     PINNED_IDENTITY_RESOLUTION_STATUSES
                 ),
@@ -2818,6 +2926,8 @@ def block_undelivered_attendance(
 def ingest_attendance(
     session: Session, *, connector: Connector, events: list[AttendanceEventIn]
 ) -> tuple[list[str], list[str]]:
+    if connector.firmware_family == "hikvision":
+        raise ValueError("Hikvision attendance requires source-evidence ingestion.")
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT device.")
@@ -2962,6 +3072,35 @@ def ingest_attendance(
             cnic = decrypt_cnic(tombstone.cnic_encrypted)
             display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
             shift_worker = tombstone.shift_worker
+        historical = incoming.source not in {"LIVE", "LIVE_POLL"}
+        namespace_mismatch = bool(
+            incoming.terminal_serial and incoming.terminal_serial != zkt.serial
+        )
+        provenance_blocked = namespace_mismatch or (
+            historical
+            and not historical_identity_is_supported(
+                serial=incoming.terminal_serial,
+                bound_serial=zkt.serial,
+                confirmed_serial=zkt.confirmed_serial,
+                uid=incoming.uid,
+                expected_uid=user.uid if user else None,
+                fingerprint=incoming.terminal_identity_fingerprint,
+                expected_fingerprint=user.terminal_identity_fingerprint if user else None,
+                event_time=incoming.device_event_time,
+                continuity_started=zkt.last_identity_change_at,
+                snapshot_observed=zkt.identity_snapshot_observed_at,
+                snapshot_stable=snapshot_verified,
+                tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
+            )
+        )
+        if provenance_blocked:
+            # Keep the raw row, but never attach a current person or tombstone
+            # merely because a historical user ID/UID was reused.
+            cnic = cnic_encrypted = cnic_hash = cnic_last4 = None
+            user = tombstone = identity_resolution = None
+            display_name = parsed.display_name or incoming.raw_name
+            snapshot_verified = False
+            shift_worker = False
         receipt = receipts_by_uid.get(incoming.event_uid)
         receipt_matches_connector = bool(
             receipt is not None and receipt.connector_id == connector.id
@@ -3008,7 +3147,9 @@ def ingest_attendance(
                 else incoming.terminal_identity_fingerprint
             ),
             identity_resolution_status=(
-                "RESOLVED"
+                "BLOCKED_PROVENANCE"
+                if provenance_blocked
+                else "RESOLVED"
                 if cnic
                 else (
                     "WAITING_FOR_SNAPSHOT"
@@ -3017,7 +3158,7 @@ def ingest_attendance(
                 )
             ),
             identity_resolved_at=utc_now() if cnic else None,
-            device_serial=zkt.serial,
+            device_serial=incoming.terminal_serial or (None if historical else zkt.serial),
             uid=incoming.uid,
             user_id=incoming.user_id,
             display_name=display_name,
@@ -3614,6 +3755,25 @@ def allocate_device_identifiers(
     rows = session.scalars(
         select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id)
     ).all()
+    if zkt.connector.firmware_family == "hikvision":
+        # Hikvision has one string employee number, not a second 16-bit ZKT UID.
+        # Include tombstones and failed reservations so identifiers are never
+        # automatically reassigned to a different identity.
+        used = {row.user_id for row in rows}
+        if user_id_override is not None:
+            employee = user_id_override
+        else:
+            employee = str(max((int(value) for value in used
+                                if value.isascii() and value.isdigit()), default=0) + 1)
+        if (not employee.isascii() or not employee.isdigit() or len(employee) > 32):
+            raise ValueError("Hikvision employee numbers require 1–32 ASCII digits.")
+        if employee in used:
+            raise ValueError("That employee/user ID has already been used on this terminal.")
+        if zkt.user_count is not None and zkt.user_count >= 3000:
+            raise ValueError("The qualified Hikvision profile capacity has been reached.")
+        return employee, employee
+    if user_id_override is not None and len(user_id_override) > 24:
+        raise ValueError("ZKT employee/user IDs cannot exceed 24 characters.")
     used_uids = {int(row.uid) for row in rows if row.uid.isdigit()}
     uid = max(used_uids, default=0) + 1
     if uid > 65535:
@@ -4402,6 +4562,13 @@ def serialize_connector(connector: Connector) -> dict:
         "state": connector.lifecycle_state,
         "connected": connector.connected,
         "firmware_version": connector.firmware_version,
+        "firmware_family": connector.firmware_family or "zkt",
+        "terminal_vendor": connector.terminal_vendor or "zkt",
+        "terminal_protocol": connector.terminal_protocol or "zkt_tcp",
+        "hikvision": (zkt.capability_profile or {}).get("hikvision_health")
+        if zkt and connector.firmware_family == "hikvision" else None,
+        "firmware_diagnostics": connector.firmware_diagnostics,
+        "firmware_diagnostics_at": connector.firmware_diagnostics_at,
         "ota_capable": connector.ota_capable,
         "ota_state": connector.ota_state,
         "ota_partition_layout": connector.ota_partition_layout,

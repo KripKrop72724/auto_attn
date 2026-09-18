@@ -2956,6 +2956,58 @@ def test_tombstone_lookup_fails_closed_when_exact_user_id_uid_is_ambiguous(
     assert row.ords_status == "BLOCKED_IDENTITY"
 
 
+def test_durability_fault_survives_connected_heartbeat_until_verified_recovery(db: Session):
+    connector = connector_fixture(db)
+    heartbeat = {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}}
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=1,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "DEGRADED", "write_failures": 1},
+                     }))
+    db.flush()
+    assert connector.connected
+    assert connector.lifecycle_state == "DEGRADED"
+    assert connector.firmware_diagnostics["storage"]["used_bytes"] is None
+    assert connector.firmware_diagnostics_at is not None
+    # Older/missing diagnostics cannot manufacture a successful storage check.
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=2,
+                     payload=HeartbeatPayload(**heartbeat))
+    db.flush()
+    assert connector.firmware_diagnostics is None
+    assert connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=3,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "HEALTHY"},
+                     }))
+    assert connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="reliability", sequence=4,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={
+                         "storage": {"durability": "HEALTHY", "persistence_verified": True,
+                                     "recovery_complete": True},
+                     }))
+    db.flush()
+    assert connector.lifecycle_state == "ONLINE"
+    fault = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ESP_DURABILITY_FAULT"))
+    assert fault.state == "RESOLVED"
+
+
+def test_worker_failure_is_independent_of_network_connectivity(db: Session):
+    connector = connector_fixture(db)
+    heartbeat = {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}}
+    update_heartbeat(db, connector=connector, boot_id="worker", sequence=1,
+                     payload=HeartbeatPayload(**heartbeat, diagnostics={"workers": [
+                         {"name": "add_delivery", "state": "WAITING_RESOURCE"},
+                         {"name": "ords_delivery", "state": "RUNNING"},
+                     ]}))
+    db.flush()
+    assert connector.connected and connector.lifecycle_state == "DEGRADED"
+    update_heartbeat(db, connector=connector, boot_id="worker", sequence=2,
+                     payload=HeartbeatPayload(**heartbeat, uptime_seconds=100, diagnostics={"workers": [
+                         {"name": "add_delivery", "state": "WAITING_NETWORK", "last_activity_uptime_ms": 90_000},
+                         {"name": "ords_delivery", "state": "RUNNING", "last_activity_uptime_ms": 90_000},
+                     ]}))
+    assert connector.lifecycle_state == "ONLINE"
+
+
 def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     connector = connector_fixture(db)
     payload = HeartbeatPayload(
@@ -4572,6 +4624,43 @@ def test_oracle_receipt_batch_cannot_poison_another_connectors_event(db: Session
     )
 
 
+def test_rejected_oracle_receipt_never_acknowledges_source_retirement(db: Session, monkeypatch):
+    owner = connector_fixture(db)
+    snapshot_user(db, owner)
+    uid = "9" * 64
+    ingest_attendance(db, connector=owner, events=[event(event_uid=uid)])
+    reporter = connector_fixture(db, hardware_id="e0:72:a1:d6:f3:29", expected_serial="OTHER")
+    db.flush()
+    committed = False
+
+    @contextmanager
+    def tracked_scope():
+        nonlocal committed
+        yield db
+        db.commit()
+        committed = True
+
+    class Socket:
+        messages = []
+
+        async def send_json(self, message):
+            assert committed
+            self.messages.append(message)
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    socket = Socket()
+    asyncio.run(add_web.handle_envelope(reporter.id, Envelope(
+        message_id="rejected-receipt", connector_id=reporter.connector_id, boot_id="receipt-test",
+        seq=1, sent_at=utc_now(), type="oracle_receipt_batch", payload={
+            "confirmation_path": "FIRMWARE_LIVE", "oracle_observed_at": utc_now().isoformat(),
+            "event_uids": [uid],
+        },
+    ), socket))
+    assert socket.messages[0]["type"] == "error"
+    assert socket.messages[0]["code"] == "ORACLE_RECEIPT_REJECTED"
+    assert not any(message["type"] == "ack" for message in socket.messages)
+
+
 def test_ords_membership_response_is_fail_closed():
     requested = {"a" * 64, "b" * 64}
     assert ords_membership_missing(
@@ -5833,3 +5922,125 @@ def test_staged_comm_key_secret_is_destroyed_when_capability_window_expires(db: 
     assert operation.status == "EXPIRED"
     assert state is not None and state.pending_secret_encrypted is None
     assert state.desired_revision == state.applied_revision == 0
+
+
+def queue_evidence_payload(connector, raw=b'original damaged bytes\x00'):
+    return {
+        "schema_version": 1, "connector_id": connector.connector_id,
+        "queue": "blocked", "queue_generation": "generation-1", "record_id": "segment:1:16",
+        "payload_digest": hashlib.sha256(raw).hexdigest(),
+        "raw_b64": base64.b64encode(raw).decode(),
+        "provenance": {"terminal_serial": "OLD-TERMINAL", "reason": "IDENTITY_UNRESOLVED",
+                       "encoding": "LEGACY_ROW", "source_offset": 16},
+    }
+
+
+def test_queue_evidence_is_encrypted_idempotent_and_not_identity_resolution(db):
+    from zk_add.models import QueueEvidence
+    from zk_add.queue_evidence import QueueEvidenceRequest, preserve_queue_evidence
+    connector = connector_fixture(db)
+    request = QueueEvidenceRequest.model_validate(queue_evidence_payload(connector))
+    row = preserve_queue_evidence(db, connector, request)
+    db.commit()
+    retry = preserve_queue_evidence(db, connector, request)
+    assert retry.receipt_id == row.receipt_id
+    assert db.scalar(select(func.count()).select_from(QueueEvidence)) == 1
+    assert request.raw_b64 not in row.protected_evidence
+    assert decrypt_json(row.protected_evidence)["raw_b64"] == request.raw_b64
+    assert row.disposition == "PRESERVED_UNRESOLVED"
+    assert db.scalar(select(func.count()).select_from(AttendanceEvent)) == 0
+    changed = QueueEvidenceRequest.model_validate(queue_evidence_payload(connector, b'changed bytes'))
+    with pytest.raises(ValueError, match="reused"):
+        preserve_queue_evidence(db, connector, changed)
+    changed = request.model_copy(update={"provenance": request.provenance.model_copy(update={"terminal_serial": "NEW"})})
+    with pytest.raises(ValueError, match="reused"):
+        preserve_queue_evidence(db, connector, changed)
+
+
+def test_queue_evidence_rejects_wrong_owner_digest_and_oversized_record(db):
+    from zk_add.queue_evidence import QueueEvidenceRequest, preserve_queue_evidence
+    connector = connector_fixture(db)
+    payload = queue_evidence_payload(connector)
+    for invalid in ({**payload, "payload_digest": "0" * 64},
+                    {**payload, "raw_b64": "!!!!"},
+                    queue_evidence_payload(connector, b'x' * 8193)):
+        with pytest.raises(ValueError):
+            QueueEvidenceRequest.model_validate(invalid)
+    request = QueueEvidenceRequest.model_validate({**payload, "connector_id": "different"})
+    with pytest.raises(ValueError, match="ownership"):
+        preserve_queue_evidence(db, connector, request)
+
+
+def test_queue_evidence_ack_follows_commit_and_failure_never_acknowledges(db, monkeypatch):
+    connector = connector_fixture(db)
+    committed = False
+    fail = False
+
+    @contextmanager
+    def tracked_scope():
+        nonlocal committed
+        try:
+            yield db
+            if fail:
+                raise RuntimeError("injected commit failure")
+            db.commit()
+            committed = True
+        except Exception:
+            db.rollback()
+            raise
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, message):
+            assert committed
+            self.messages.append(message)
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    envelope = Envelope(message_id="custody", connector_id=connector.connector_id, boot_id="evidence-test",
+                        seq=1, sent_at=utc_now(), type="queue_evidence", payload=queue_evidence_payload(connector))
+    socket = Socket()
+    asyncio.run(add_web.handle_envelope(connector.id, envelope, socket))
+    assert socket.messages[0]["type"] == "queue_evidence_ack"
+    assert socket.messages[0]["disposition"] == "PRESERVED_UNRESOLVED"
+    assert socket.messages[0]["payload_digest"] == envelope.payload["payload_digest"]
+    socket = Socket()
+    committed = False
+    fail = True
+    with pytest.raises(RuntimeError, match="commit failure"):
+        asyncio.run(add_web.handle_envelope(connector.id, envelope.model_copy(update={"seq": 2}), socket))
+    assert socket.messages == []
+
+
+def test_queue_evidence_admin_reveal_requires_csrf_and_step_up(db):
+    from zk_add.queue_evidence import QueueEvidenceRequest, preserve_queue_evidence
+    connector = connector_fixture(db)
+    payload = queue_evidence_payload(connector)
+    row = preserve_queue_evidence(db, connector, QueueEvidenceRequest.model_validate(payload))
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    listing = f"/api/v1/devices/{connector.connector_id}/queue-evidence"
+    path = f"/api/v1/queue-evidence/{row.receipt_id}/reveal"
+    assert client.get(listing).status_code == 401
+    raw_session, admin = create_admin_session(db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest")
+    db.commit()
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    metadata = client.get(listing)
+    assert metadata.status_code == 200
+    assert payload["raw_b64"] not in metadata.text
+    body = {"reason": "Inspect preserved original bytes", "password": "wrong-password", "idempotency_key": "evidence-inspection"}
+    assert client.post(path, json=body).status_code == 403
+    assert client.post(path, json=body, headers={"X-CSRF-Token": admin.csrf_token}).status_code == 403
+    body["password"] = "correct-password"
+    result = client.post(path, json=body, headers={"X-CSRF-Token": admin.csrf_token})
+    assert result.status_code == 200
+    assert result.headers["cache-control"] == "no-store, max-age=0"
+    assert result.json()["raw_b64"] == payload["raw_b64"]
+    assert result.json()["disposition"] == "PRESERVED_UNRESOLVED"
+    assert db.scalar(select(AuditEvent).where(AuditEvent.action == "QUEUE_EVIDENCE_REVEALED")) is not None

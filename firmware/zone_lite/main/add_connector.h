@@ -7,13 +7,13 @@
 typedef struct {
     char command_id[48];
     char command_type[32];
-    char uid[16];
-    char user_id[32];
+    char uid[41];
+    char user_id[101];
     char user_key[48];
-    char name[64];
+    char name[257];
     char lease_id[48];
-    char expected_serial[80];
-    char expected_name[64];
+    char expected_serial[121];
+    char expected_name[257];
     char expected_terminal_identity_fingerprint[65];
     char expected_terminal_state_fingerprint[65];
     char tombstone_display_name[256];
@@ -112,6 +112,11 @@ typedef struct {
     int64_t backoff_until_epoch;
     int64_t stability_since_epoch;
     int64_t last_reconcile_epoch;
+    int64_t last_light_check_uptime_ms;
+    int64_t last_tail_audit_uptime_ms;
+    bool committed_source_known;
+    uint32_t committed_source_generation;
+    uint32_t committed_source_cursor;
     int64_t next_restart_epoch;
     char history_backfill_state[24];
     int32_t history_cursor_year;
@@ -128,6 +133,7 @@ void add_connector_init(void);
 void add_connector_start(void);
 bool add_connector_is_connected(void);
 bool add_connector_boot_health_ready(void);
+bool add_connector_ota_reconcile_ready(void);
 bool add_connector_consume_connected_edge(void);
 uint32_t add_connector_outbox_depth(void);
 bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out);
@@ -141,6 +147,8 @@ bool add_connector_has_pending_config_command(void);
 void add_connector_set_zkt(const add_zkt_telemetry_t *telemetry);
 bool add_connector_take_command(add_command_t *out);
 bool add_connector_take_reconcile_assignment(add_reconcile_assignment_t *out);
+/* JSON assignment is bounded independently of the ZKT ordinal contract. */
+bool add_connector_take_hikvision_assignment(char out[2048]);
 bool add_connector_has_reconcile_assignment(void);
 bool add_connector_take_source_coverage(add_source_coverage_t *out);
 void add_connector_command_retry(const char *command_id);
@@ -175,6 +183,12 @@ bool add_connector_send_source_tail_acknowledged(
     uint32_t timeout_ms,
     add_source_tail_ack_t *ack_out);
 bool add_connector_enqueue_attendance(const char *payload_json);
+typedef enum {
+    ADD_WORKER_IDLE, ADD_WORKER_READING, ADD_WORKER_NETWORK,
+    ADD_WORKER_COMMITTING, ADD_WORKER_RESOURCE
+} add_worker_operation_t;
+void add_connector_report_ords_worker(add_worker_operation_t operation);
+void add_connector_report_ords_start(bool started, uint32_t attempts);
 bool add_connector_enqueue_attendance_priority(const char *payload_json);
 bool add_connector_deliver_attendance_acknowledged(const char *payload_json);
 bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t count);
@@ -187,3 +201,8 @@ bool add_connector_log(
     const char *subsystem,
     const char *code,
     const char *message);
+
+/* True only after ADD durably accepts exact bytes and unresolved provenance. */
+bool add_connector_transfer_queue_evidence(
+    const char *queue, const char *generation, const char *record_id,
+    const void *raw, size_t raw_length, const char *terminal_serial, const char *reason);

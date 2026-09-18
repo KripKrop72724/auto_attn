@@ -42,3 +42,26 @@ def test_liveness_does_not_require_provisioning_configuration(monkeypatch):
 
     assert client.get("/health/live").status_code == 200
     assert client.get("/health/ready").status_code == 503
+
+
+def test_hikvision_device_configuration_reaches_encrypted_nvs_builder():
+    provisioner = load_provisioner_module()
+    from types import SimpleNamespace
+    configuration = {
+        "firmware_family": "hikvision", "wifi_ssid": "test-lan",
+        "wifi_password": "test-only-network-password", "communication_key": None,
+        "device_id": "HIK-TEST", "zone_id": "TEST", "zone_name": "Test zone",
+        "hik_host": "192.168.10.20", "hik_port": 80, "hik_transport": "http_digest",
+        "hik_username": "test-user", "hik_password": "test-only-terminal-password",
+        "hik_expected_serial": "terminal-test", "hik_profile": "test-profile",
+        "hik_source_epoch": "test-epoch", "hik_ca_pem": "",
+    }
+    request = provisioner._build_request(SimpleNamespace(
+        configuration=configuration, session_id="test-session-123",
+        hardware_mac="00:11:22:33:44:55", recipient_public_key="test-public-key",
+    ))
+    assert request["firmware_family"] == "hikvision"
+    for key, value in configuration.items():
+        if key.startswith("hik_"):
+            assert request[key] == value
+    assert request["zkt_comm_key"] == 0

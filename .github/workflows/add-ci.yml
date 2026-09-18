@@ -23,6 +23,9 @@ jobs:
           persist-credentials: false
       - name: Enforce ADD and Zone Lite consolidation
         run: python3 scripts/check_repository_contract.py
+      - name: Exercise immutable ordered HIL publication
+        shell: pwsh
+        run: ./tests/firmware/test_hil_publication.ps1
       - name: Parse production PowerShell scripts
         shell: pwsh
         run: |
@@ -265,6 +268,17 @@ jobs:
           grep -q 'nvs.*0x11000.*0x6000' firmware/zone_lite/partitions.csv
           grep -q 'ota_0.*0x2A0000.*0x280000' firmware/zone_lite/partitions.csv
           grep -q 'ota_1.*0x520000.*0x280000' firmware/zone_lite/partitions.csv
+      - name: Fault-test attendance serialization with the pinned cJSON
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project
+          espressif/idf:v5.5.3
+          python tests/firmware/tools/check_json_allocations.py
+          python tests/firmware/tools/check_command_journal.py
+          python tests/firmware/tools/check_catalog_storage.py
+          python tests/firmware/tools/check_catalog_tombstones.py
+          python tests/firmware/tools/check_diagnostics_allocations.py
       - name: Build ESP32-S3 production firmware with ESP-IDF 5.5.3
         run: >-
           docker run --rm
@@ -272,6 +286,15 @@ jobs:
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
           bash -lc 'rm -rf build-ci && idf.py -B build-ci -D SDKCONFIG=/tmp/zone-lite-ci-sdkconfig build'
+      - name: Build dedicated Hikvision ESP32-S3 firmware
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project/firmware/zone_lite
+          espressif/idf:v5.5.3
+          bash -lc 'idf.py -B build-ci-hikvision -D SDKCONFIG=/tmp/zone-lite-ci-hikvision-sdkconfig -D ZONE_LITE_FAMILY=hikvision build'
+      - name: Check Hikvision application family descriptor
+        run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-hikvision/zone_lite_hikvision.bin --family hikvision
       - name: Upload non-provisioned firmware build (best effort)
         # The build above is the release gate. Artifact retention is convenient for
         # diagnostics, but GitHub storage exhaustion must not block an unrelated ADD

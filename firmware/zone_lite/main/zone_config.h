@@ -7,6 +7,17 @@
 
 typedef struct {
     bool provisioned;
+    char firmware_family[16];
+    char hik_host[64];
+    uint16_t hik_port;
+    bool hik_https;
+    bool hik_http_digest_allowed;
+    char hik_username[64];
+    char hik_password[128];
+    char hik_expected_serial[120];
+    char hik_profile[80];
+    char hik_source_epoch[65];
+    char hik_ca_pem[4096];
     char wifi_ssid[33];
     char wifi_password[65];
     uint16_t zkt_port;

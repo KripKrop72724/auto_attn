@@ -31,6 +31,8 @@ from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add.audit import append_audit
+from zk_add.hikvision_evidence import ObservationIn, preserve_observation
+from zk_add.schemas import HikvisionPolicyRequest
 from zk_add.attendance_batches import (
     attendance_quarantine_item,
     attendance_quarantine_summary,
@@ -38,6 +40,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
+from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence
+from zk_add.models import QueueEvidence
+from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
 from zk_add.identity_conflicts import (
     build_identity_conflict_report,
@@ -577,6 +582,7 @@ async def onboard(
         zone_name=body.zone_name,
         device_id=body.device_id,
         firmware_version=body.firmware_version,
+        firmware_family=body.firmware_family,
         expected_serial=body.expected_serial,
         actor=f"esp:{header_mac}",
         ip_address=client_ip(request),
@@ -1089,6 +1095,27 @@ def reconciliation_or_404(db: Session, job_id: str) -> ReconciliationJob:
     return row
 
 
+@app.put("/api/v1/devices/{connector_id}/hikvision-policy")
+def configure_hikvision_policy(
+    connector_id: str,
+    body: HikvisionPolicyRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hikvision_delivery import configure_policy
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        policy = configure_policy(db, connector, actor=context.username,
+                                  **body.model_dump(exclude={"password"}))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return {"enabled": policy.enabled, "profile_id": policy.profile_id,
+            "mapping_revision": policy.mapping_revision, "capture_mode": "poll",
+            "poll_interval_seconds": 5, "identity_rule": "name-cnic"}
+
+
 @app.get("/api/v1/devices/{connector_id}/reconciliations/preflight")
 def reconciliation_preflight(
     connector_id: str,
@@ -1490,6 +1517,62 @@ def reveal_source_exception_endpoint(
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return result
+
+
+@app.get("/api/v1/devices/{connector_id}/queue-evidence")
+def list_queue_evidence(
+    connector_id: str,
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+    if connector is None:
+        raise HTTPException(status_code=404, detail="Connector not found.")
+    query = select(QueueEvidence).where(QueueEvidence.connector_id == connector.id)
+    if before is not None:
+        query = query.where(QueueEvidence.id < before)
+    rows = list(db.scalars(query.order_by(QueueEvidence.id.desc()).limit(limit + 1)))
+    return {
+        "rows": [{"receipt_id": row.receipt_id, "queue": row.queue,
+                  "queue_generation": row.queue_generation, "record_id": row.record_id,
+                  "payload_digest": row.payload_digest, "byte_count": row.byte_count,
+                  "disposition": row.disposition, "created_at": row.created_at}
+                 for row in rows[:limit]],
+        "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
+    }
+
+
+@app.post("/api/v1/queue-evidence/{receipt_id}/reveal")
+def reveal_queue_evidence(
+    receipt_id: str,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    row = db.scalar(select(QueueEvidence).where(QueueEvidence.receipt_id == receipt_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Queue evidence not found.")
+    protected = decrypt_json(row.protected_evidence)
+    connector = db.get(Connector, row.connector_id)
+    try:
+        validated = QueueEvidenceRequest.model_validate({
+            "connector_id": connector.connector_id, "queue": row.queue,
+            "queue_generation": row.queue_generation, "record_id": row.record_id,
+            "payload_digest": row.payload_digest, **protected,
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="Protected queue evidence failed verification.") from exc
+    append_audit(db, actor=context.username, action="QUEUE_EVIDENCE_REVEALED",
+                 target_type="queue_evidence", target_id=row.receipt_id, outcome="SUCCESS",
+                 after={"reason": body.reason.strip()}, request_id=body.idempotency_key)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return {"receipt_id": row.receipt_id, "disposition": row.disposition,
+            "raw_b64": validated.raw_b64, "provenance": validated.provenance.model_dump()}
 
 
 @app.get("/api/v1/reconciliation-divergences/{divergence_id}")
@@ -3246,6 +3329,28 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
             )
+        elif envelope.type == "hikvision_profile_page":
+            from zk_add.hikvision_profiles import accept_profile_page
+            receipt = accept_profile_page(db, connector, envelope.payload)
+            ack_payload = {"type": "ack", "message_id": envelope.message_id, **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        elif envelope.type == "hikvision_history_page":
+            from zk_add.hikvision_reconciliation import apply_page
+            receipt = apply_page(db, connector, envelope.payload)
+            ack_payload = {"type": "ack", "message_id": envelope.message_id, **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        elif envelope.type == "hikvision_observation":
+            receipt = preserve_observation(db, connector, ObservationIn.model_validate(envelope.payload))
+            ack_payload = {"type": "hikvision_observation_ack", "message_id": envelope.message_id,
+                           **receipt}
+            event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        elif envelope.type == "queue_evidence":
+            evidence = preserve_queue_evidence(
+                db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
+            )
+            ack_payload = evidence_ack(evidence, connector, envelope.message_id)
+            event_payload = {"connector_id": connector.connector_id,
+                             "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}
         elif envelope.type == "oracle_receipt_batch":
             receipt_batch = OracleReceiptBatchRequest.model_validate(envelope.payload)
             applied, awaiting_event, rejected = record_oracle_receipts(
@@ -3260,6 +3365,14 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
                 "rejected": rejected,
                 "confirmation_path": receipt_batch.confirmation_path,
             }
+            if rejected:
+                # A generic acknowledgement must not retire firmware proof
+                # that this connector was not authorized to settle.
+                ack_payload = {
+                    "type": "error", "message_id": envelope.message_id,
+                    "code": "ORACLE_RECEIPT_REJECTED",
+                    "detail": "Receipt ownership could not be verified; retain source evidence.",
+                }
         elif envelope.type == "reconcile_anchor":
             anchor = ReconciliationAnchorRequest.model_validate(envelope.payload)
             job = apply_reconciliation_anchor(db, connector=connector, payload=anchor)
@@ -3727,6 +3840,59 @@ from zk_add.ota import (  # noqa: E402
     version_at_least as _firmware_version_at_least,
 )
 from zk_add.time_utils import utc_now as _ota_utc_now  # noqa: E402
+
+
+from zk_add.hil_scope import HilTarget as _HilTarget  # noqa: E402
+from zk_add.hil_runs import (  # noqa: E402
+    start_run as _start_hil_run, cancel_run as _cancel_hil_run, serialize_run as _serialize_hil_run,
+)
+from zk_add.ota import FirmwareHilRun as _FirmwareHilRun  # noqa: E402
+
+
+class _HilRunIn(_BaseModel):
+    deployment_id: str = _Field(min_length=1, max_length=100)
+    target: _HilTarget
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+
+@app.post("/api/v1/firmware/hil-runs", status_code=201)
+def start_firmware_hil_run(
+    body: _HilRunIn, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        run = _start_hil_run(db, deployment_id=body.deployment_id, target=body.target,
+                             actor=context.username, idempotency_key=body.idempotency_key)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_HIL_STARTED", target_type="connector",
+                  target_id=body.target.connector_id, outcome=run.status, after={"run_id": run.run_id})
+    db.commit()
+    return _serialize_hil_run(run)
+
+
+@app.get("/api/v1/firmware/hil-runs/{run_id}")
+def get_firmware_hil_run(run_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _ = auth
+    run = db.scalar(_select(_FirmwareHilRun).where(_FirmwareHilRun.run_id == run_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="HIL observation not found")
+    return _serialize_hil_run(run)
+
+
+@app.post("/api/v1/firmware/hil-runs/{run_id}/cancel")
+def cancel_firmware_hil_run(
+    run_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        run = _cancel_hil_run(db, run_id, actor=context.username)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_HIL_CANCELLED", target_type="connector",
+                  target_id=run.target["connector_id"], outcome=run.status, after={"run_id": run.run_id})
+    db.commit()
+    return _serialize_hil_run(run)
 
 
 class _FirmwareCapabilityIn(_BaseModel):

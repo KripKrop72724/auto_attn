@@ -12,12 +12,17 @@ on:
         required: true
         type: string
       device_mac:
-        description: Exact locally attached HIL ESP MAC
-        required: true
+        description: Legacy single-target ESP MAC; leave empty for ordered targets
+        required: false
+        type: string
+      targets_json:
+        description: Ordered exact targets as JSON (connector_id, mac, terminal_serial); mutually exclusive with device_mac
+        required: false
         type: string
 
 permissions:
   contents: read
+  checks: read
 
 concurrency:
   group: zone-lite-hil-candidate
@@ -29,24 +34,63 @@ jobs:
     outputs:
       sha: ${{ steps.provenance.outputs.sha }}
       mac: ${{ steps.provenance.outputs.mac }}
+      targets: ${{ steps.provenance.outputs.targets }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
       - id: provenance
-        name: Require exact main SHA, version, and ESP MAC
+        name: Require exact green main SHA, version, and HIL scope
         shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.commit_sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_MAC: ${{ inputs.device_mac }}
+          INPUT_TARGETS: ${{ inputs.targets_json }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          mac="$(tr '[:upper:]' '[:lower:]' <<<"${{ inputs.device_mac }}")"
-          [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]
+          [[ "$INPUT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           git fetch origin main
-          sha="$(git rev-parse '${{ inputs.commit_sha }}^{commit}')"
+          sha="$(git rev-parse "$INPUT_SHA^{commit}")"
           git merge-base --is-ancestor "$sha" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" > /tmp/hil-checks.json
+          python3 - <<'PYCODE'
+          import json, os, re
+          checks = json.load(open('/tmp/hil-checks.json'))['check_runs']
+          for name in ('repository-contract', 'firmware', 'backend', 'frontend', 'containers'):
+              matching = [row for row in checks if row['name'] == name and row['app']['slug'] == 'github-actions']
+              if not matching or max(matching, key=lambda row: row['id'])['conclusion'] != 'success':
+                  raise SystemExit(f'Exact-commit CI is not green: {name}')
+          mac = os.environ['INPUT_MAC'].strip().lower()
+          raw = os.environ['INPUT_TARGETS'].strip()
+          if bool(mac) == bool(raw):
+              raise SystemExit('Supply legacy MAC or ordered targets, not both')
+          if mac and not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
+              raise SystemExit('Invalid HIL MAC')
+          targets = json.loads(raw) if raw else None
+          if targets is not None:
+              if not isinstance(targets, list) or not 1 <= len(targets) <= 8:
+                  raise SystemExit('Invalid ordered target list')
+              for row in targets:
+                  if not isinstance(row, dict) or set(row) != {'connector_id', 'mac', 'terminal_serial'}:
+                      raise SystemExit('Invalid target fields')
+                  for key, limit in (('connector_id', 100), ('terminal_serial', 120), ('mac', 17)):
+                      value = row[key]
+                      if not isinstance(value, str) or not 1 <= len(value) <= limit or value != value.strip() or any(ord(c) < 32 for c in value):
+                          raise SystemExit('Invalid exact target identity')
+                  row['mac'] = row['mac'].lower()
+                  if not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', row['mac']):
+                      raise SystemExit('Invalid target MAC')
+              if any(len({row[key] for row in targets}) != len(targets) for key in targets[0]):
+                  raise SystemExit('Duplicate target identity')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('mac=' + mac + '\n')
+              output.write('targets=' + (json.dumps(targets, separators=(',', ':')) if targets else '') + '\n')
+          PYCODE
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "mac=$mac" >> "$GITHUB_OUTPUT"
 
   build:
     needs: provenance
@@ -65,18 +109,23 @@ jobs:
       - name: Run Oracle reconcile load preflight
         run: python3 tests/firmware/test_oracle_reconcile_load_preflight.py
       - name: Build the exact unsigned candidate
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
         working-directory: firmware/zone_lite
         shell: bash
         run: |
           set -euo pipefail
           test -n "$ZONE_LITE_SETUP_PASSWORD"
-          test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "${{ inputs.version }}"
+          test "$(sed -n 's/^project(zone_lite VERSION \([^ )]*\).*/\1/p' CMakeLists.txt)" = "$EXPECTED_VERSION"
+          storage_mode=OFF
+          if [[ "$EXPECTED_VERSION" == "2.6.0" ]]; then storage_mode=ON; fi
           docker run --rm \
+            -e ZONE_LITE_SEGMENTED_WRITES="$storage_mode" \
             -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig build'
+            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" build'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
@@ -103,6 +152,9 @@ jobs:
           name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
           path: unsigned
       - name: Sign the immutable HIL candidate with the ADD vault
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ needs.provenance.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
@@ -112,8 +164,8 @@ jobs:
             -VaultDirectory $vault `
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
-            -Version '${{ inputs.version }}' `
-            -GitSha '${{ needs.provenance.outputs.sha }}'
+            -Version $env:RELEASE_VERSION `
+            -GitSha $env:RELEASE_SHA
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-${{ inputs.version }}-hil-only
@@ -137,15 +189,19 @@ jobs:
         with:
           name: zone-lite-${{ inputs.version }}-hil-only
           path: firmware-release
-      - name: Atomically publish for one exact HIL ESP
+      - name: Atomically publish for the exact HIL scope
         shell: powershell
         env:
           ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          HIL_TARGET_MAC: ${{ needs.provenance.outputs.mac }}
+          HIL_TARGETS_JSON: ${{ needs.provenance.outputs.targets }}
         run: |
           if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw "ADD_FIRMWARE_STORE_HOST_PATH is not configured" }
           ./deploy/add/publish-firmware.ps1 `
             -SourceDirectory firmware-release `
             -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
-            -Version "${{ inputs.version }}" `
+            -Version $env:RELEASE_VERSION `
             -PublicationMode HIL_ONLY `
-            -HilTargetMac '${{ needs.provenance.outputs.mac }}'
+            -HilTargetMac $env:HIL_TARGET_MAC `
+            -HilTargetsJson $env:HIL_TARGETS_JSON

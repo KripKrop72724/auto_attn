@@ -36,7 +36,7 @@ def test_comm_key_recovery_reuses_the_proven_gateway_task_stack() -> None:
     app_main = RUNTIME[RUNTIME.index("void app_main(void)") :]
     uploader = app_main.index('xTaskCreate(ords_uploader_task, "ords_uploader"')
     gateway = app_main.index('xTaskCreate(gateway_task, "zone_gateway"')
-    assert uploader < gateway
+    assert gateway < uploader  # Preserve capture allocation before delivery retries.
     assert '"comm_key_mgr"' not in app_main
     assert "ZONE_LITE_COMM_KEY_MANAGER_STACK_BYTES" not in RUNTIME
     gateway_task = RUNTIME[

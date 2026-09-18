@@ -23,6 +23,7 @@ from zk_add.provisioning import (
     ProvisioningSession,
     ProvisioningState,
     append_provisioning_event,
+    latest_factory_bundle,
     sanitize_event_details,
     semver_key,
 )
@@ -72,6 +73,26 @@ def test_shared_configuration_boundaries_and_public_metadata():
     ProvisioningConfiguration.model_validate(
         valid_configuration(preferred_ip="192.168.20.4")
     )
+
+
+def test_hikvision_provisioning_requires_binding_and_preserves_protected_fields():
+    values = valid_configuration(
+        firmware_family="hikvision", communication_key=None,
+        hik_host="192.168.10.20", hik_port=80, hik_transport="http_digest",
+        hik_username="test-user", hik_password="test-only-device-password",
+        hik_expected_serial="terminal-1", hik_profile="qualified-profile",
+        hik_source_epoch="verified-epoch-1",
+    )
+    configuration = ProvisioningConfiguration.model_validate(values)
+    assert configuration.model_dump()["hik_password"] == values["hik_password"]
+    assert "hik_password" not in configuration.public_metadata()
+    assert values["hik_password"] not in repr(configuration)
+    assert configuration.public_metadata()["firmware_family"] == "hikvision"
+    for override in ({"hik_source_epoch": ""}, {"hik_expected_serial": ""},
+                     {"hik_host": "8.8.8.8"}, {"hik_password": ""},
+                     {"firmware_family": "zkt", "communication_key": 0}):
+        with pytest.raises(ValidationError):
+            ProvisioningConfiguration.model_validate({**values, **override})
 
 
 @pytest.mark.parametrize(
@@ -256,6 +277,23 @@ def test_factory_bundle_identity_is_immutable_shape(provisioning_db: Session):
     provisioning_db.add(bundle)
     provisioning_db.flush()
     assert bundle.setup_password_supplied
+
+
+def test_factory_selection_keeps_newer_hikvision_out_of_legacy_zkt_flow(provisioning_db, monkeypatch):
+    monkeypatch.setattr(settings, "provisioning_enabled", False)
+    for index, family in enumerate(("zkt", "hikvision")):
+        provisioning_db.add(FactoryFirmwareBundle(
+            bundle_id=f"test-{family}", hardware_profile=settings.provisioning_hardware_profile,
+            version=f"{index + 2}.0.0", git_sha="a" * 40,
+            partition_layout="zone-lite-factory-v1", manifest_sha256=str(index) * 64,
+            manifest={"firmware_family": family,
+                      "project_name": "zone_lite_hikvision" if index else "zone_lite"},
+            manifest_signature="test", signing_key_ids=[], setup_password_supplied=True,
+            state="AVAILABLE", storage_prefix=f"test-{family}",
+        ))
+    provisioning_db.flush()
+    assert latest_factory_bundle(provisioning_db).bundle_id == "test-zkt"
+    assert latest_factory_bundle(provisioning_db, "hikvision").bundle_id == "test-hikvision"
 
 
 def test_latest_companion_release_uses_highest_verified_semver(

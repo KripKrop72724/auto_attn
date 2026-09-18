@@ -8,7 +8,7 @@ import json
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,6 +34,9 @@ from zk_add.db import Base
 from zk_add.models import Connector, utc_column
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
+from zk_add.terminal_families import (
+    firmware_family, release_family, require_production_qualification,
+)
 
 HARDWARE_PROFILE = "esp32s3-16mb-zone-lite-v1"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -312,7 +315,42 @@ class ProvisioningConfiguration(BaseModel):
 
     wifi_ssid: str
     wifi_password: str
-    communication_key: int = Field(ge=0, le=4_294_967_295)
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
+    communication_key: int | None = Field(default=None, ge=0, le=4_294_967_295)
+    hik_host: str = ""
+    hik_port: int = Field(default=443, ge=1, le=65535)
+    hik_transport: Literal["https", "http_digest"] = "https"
+    hik_username: str = Field(default="", repr=False)
+    hik_password: str = Field(default="", repr=False)
+    hik_expected_serial: str = ""
+    hik_profile: str = ""
+    hik_source_epoch: str = ""
+    hik_ca_pem: str = Field(default="", repr=False)
+
+    @model_validator(mode="after")
+    def validate_terminal_family(self):
+        if self.firmware_family == "zkt":
+            if self.communication_key is None:
+                raise ValueError("ZKT communication key is required.")
+            if any(getattr(self, key) for key in type(self).model_fields if key.startswith("hik_")
+                   and key not in {"hik_port", "hik_transport"}):
+                raise ValueError("Hikvision configuration requires the Hikvision family.")
+            return self
+        if self.communication_key not in {None, 0}:
+            raise ValueError("Hikvision does not use a ZKT communication key.")
+        try:
+            address = ipaddress.IPv4Address(self.hik_host)
+        except ipaddress.AddressValueError as exc:
+            raise ValueError("Hikvision host must be a private IPv4 address.") from exc
+        if not any(address in network for network in RFC1918_NETWORKS):
+            raise ValueError("Hikvision host must be a private IPv4 address.")
+        for key, limit in (("hik_username", 63), ("hik_password", 127),
+                           ("hik_expected_serial", 119), ("hik_profile", 79),
+                           ("hik_source_epoch", 64), ("hik_ca_pem", 4095)):
+            value = getattr(self, key)
+            if (not value and key != "hik_ca_pem") or len(value.encode()) > limit or "\x00" in value:
+                raise ValueError(f"Invalid Hikvision configuration field: {key}")
+        return self
     zkt_port: int = Field(default=4370, ge=1, le=65_535)
     preferred_ip: str = "0.0.0.0"
     device_id: str
@@ -383,6 +421,7 @@ class ProvisioningConfiguration(BaseModel):
             "device_id": self.device_id,
             "preferred_ip": self.preferred_ip,
             "zkt_port": self.zkt_port,
+            "firmware_family": self.firmware_family,
             "wifi_ssid_sha256": hashlib.sha256(self.wifi_ssid.encode()).hexdigest(),
         }
 
@@ -482,7 +521,8 @@ def semver_key(value: str) -> tuple[int, int, int, int, tuple[tuple[int, str], .
     )
 
 
-def latest_factory_bundle(session: Session) -> FactoryFirmwareBundle | None:
+def latest_factory_bundle(session: Session, family: str = "zkt") -> FactoryFirmwareBundle | None:
+    family = firmware_family(family)
     sync_factory_bundle_store(session)
     rows = session.scalars(
         select(FactoryFirmwareBundle).where(
@@ -491,7 +531,8 @@ def latest_factory_bundle(session: Session) -> FactoryFirmwareBundle | None:
             FactoryFirmwareBundle.setup_password_supplied.is_(True),
         )
     ).all()
-    return max(rows, key=lambda row: semver_key(row.version), default=None)
+    compatible = [row for row in rows if release_family(row.manifest) == family]
+    return max(compatible, key=lambda row: semver_key(row.version), default=None)
 
 
 def _verify_factory_manifest(manifest: dict[str, Any], signature: str) -> None:
@@ -524,6 +565,7 @@ def sync_factory_bundle_store(session: Session) -> None:
         signature_path = manifest_path.with_name("manifest.sig")
         signature = signature_path.read_text(encoding="ascii").strip()
         _verify_factory_manifest(manifest, signature)
+        release_family(manifest)
         if manifest.get("hardware_profile") != settings.provisioning_hardware_profile:
             continue
         if manifest.get("partition_layout") != "zone-lite-factory-v1":
@@ -563,6 +605,8 @@ def sync_factory_bundle_store(session: Session) -> None:
             raise RuntimeError("Factory bundle identity or semantic version is invalid.")
         marker = manifest_path.with_name(".hil-only.json")
         desired_state = "HIL_ONLY" if marker.is_file() else "AVAILABLE"
+        if desired_state == "AVAILABLE":
+            require_production_qualification(manifest)
         key = (settings.provisioning_hardware_profile, version)
         if desired_state == "AVAILABLE" and key in observed_available:
             raise RuntimeError("More than one AVAILABLE factory bundle exists for a version.")
@@ -719,6 +763,7 @@ def serialize_bundle(row: FactoryFirmwareBundle | None) -> dict[str, Any] | None
     images = (row.manifest or {}).get("images", [])
     return {
         "bundle_id": row.bundle_id,
+        "firmware_family": release_family(row.manifest),
         "hardware_profile": row.hardware_profile,
         "version": row.version,
         "git_sha": row.git_sha,

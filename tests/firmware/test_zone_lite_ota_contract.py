@@ -79,7 +79,9 @@ def test_ota_success_is_durable_and_same_version_is_never_downloaded_again() -> 
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "acknowledge_pending_success" in text
     assert 'strcmp(s_journal.state, "RECONCILING") != 0' in text
-    assert 'if (report_state("SUCCEEDED", NULL)) {' in text
+    assert 'if (!report_state("SUCCEEDED", NULL)) {' in text
+    assert "add_connector_ota_reconcile_ready()" in text
+    assert "pdMS_TO_TICKS(45000)" not in text
     assert "ADD did not acknowledge OTA success; retaining journal for retry" in text
     assert 'strcmp(running->version, version->valuestring) == 0' in text
     assert '(void)perform_update();' in text

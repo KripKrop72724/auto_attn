@@ -46,6 +46,10 @@ def validate_request(values: dict) -> dict:
     if not isinstance(values, dict):
         raise ValueError("Provisioning request must be a JSON object")
     values = dict(values)
+    family = values.get("firmware_family", "zkt")
+    if family not in {"zkt", "hikvision"}:
+        raise ValueError("Unknown firmware family")
+    values["firmware_family"] = family
     request_id = required_text(values, "request_id", 96)
     if not REQUEST_ID_PATTERN.fullmatch(request_id):
         raise ValueError("Invalid provisioning request ID")
@@ -73,6 +77,8 @@ def validate_request(values: dict) -> dict:
         raise ValueError("Invalid ZKT communication key")
     values["zkt_port"] = port
     values["zkt_comm_key"] = comm_key
+    if family == "hikvision":
+        values.setdefault("zkt_preferred_ip", "0.0.0.0")
     preferred_ip = required_text(values, "zkt_preferred_ip", 15)
     if preferred_ip != "0.0.0.0":
         try:
@@ -170,6 +176,7 @@ def main() -> None:
             raise RuntimeError("Generated NVS partition has the wrong size")
         aad = {
             "schema_version": 1,
+            "firmware_family": request["firmware_family"],
             "request_id": request["request_id"],
             "target_mac": request["target_mac"],
             "zone_id": request["zone_id"],

@@ -1,4 +1,5 @@
 #include "zone_config.h"
+#include "firmware_family.h"
 
 #include <string.h>
 
@@ -183,6 +184,27 @@ esp_err_t zone_config_init(void)
     uint8_t provisioned = 0;
     (void)nvs_get_u8(handle, "provisioned", &provisioned);
     s_config.provisioned = provisioned == 1;
+    copy_default(s_config.firmware_family, sizeof(s_config.firmware_family), "zkt");
+    read_string(handle, "fw_family", s_config.firmware_family, sizeof(s_config.firmware_family));
+    if (strcmp(s_config.firmware_family, ZONE_LITE_FIRMWARE_FAMILY)) {
+        nvs_close(handle);
+        s_config.provisioned = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    read_string(handle, "hik_host", s_config.hik_host, sizeof(s_config.hik_host));
+    (void)nvs_get_u16(handle, "hik_port", &s_config.hik_port);
+    uint8_t hik_flag = 0;
+    (void)nvs_get_u8(handle, "hik_https", &hik_flag);
+    s_config.hik_https = hik_flag == 1;
+    hik_flag = 0;
+    (void)nvs_get_u8(handle, "hik_http", &hik_flag);
+    s_config.hik_http_digest_allowed = hik_flag == 1;
+    read_string(handle, "hik_user", s_config.hik_username, sizeof(s_config.hik_username));
+    read_string(handle, "hik_pass", s_config.hik_password, sizeof(s_config.hik_password));
+    read_string(handle, "hik_serial", s_config.hik_expected_serial, sizeof(s_config.hik_expected_serial));
+    read_string(handle, "hik_profile", s_config.hik_profile, sizeof(s_config.hik_profile));
+    read_string(handle, "hik_epoch", s_config.hik_source_epoch, sizeof(s_config.hik_source_epoch));
+    read_string(handle, "hik_ca", s_config.hik_ca_pem, sizeof(s_config.hik_ca_pem));
     read_string(handle, "wifi_ssid", s_config.wifi_ssid, sizeof(s_config.wifi_ssid));
     read_string(handle, "wifi_pass", s_config.wifi_password, sizeof(s_config.wifi_password));
     (void)nvs_get_u16(handle, "zkt_port", &s_config.zkt_port);

@@ -117,7 +117,61 @@ export interface ZktDevice {
   next_restart_at: string | null
 }
 
+export interface FirmwareDiagnostics {
+  schema_version: 1
+  storage?: {
+    upgrade_contract?: string | null
+    upgrade_error?: string | null
+    upgrade_ready?: boolean | null
+    total_bytes?: number | null
+    used_bytes?: number | null
+    admission_reserve_bytes?: number | null
+    write_failures?: number | null
+    read_failures?: number | null
+    durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
+    persistence_verified: boolean
+    recovery_complete: boolean
+    error_operation?: string | null
+    error_code?: number | null
+  } | null
+  queues: Array<{
+    name: string
+    bytes?: number | null
+    records?: number | null
+    count_known: boolean
+    oldest_pending_age_seconds?: number | null
+    last_progress_uptime_ms?: number | null
+  }>
+  workers: Array<{
+    name: string
+    state: 'RUNNING' | 'WAITING_NETWORK' | 'WAITING_RESOURCE' | 'STOPPED' | 'FAULT' | 'UNKNOWN'
+    last_activity_uptime_ms?: number | null
+    operation?: string | null
+    restart_count?: number | null
+    restart_attempts?: number | null
+  }>
+  reconciliation_mode?: string | null
+  last_light_check_uptime_ms?: number | null
+  last_tail_audit_uptime_ms?: number | null
+  source_generation?: number | null
+  committed_source_cursor?: number | null
+}
+
+export interface HikvisionHealth {
+  capture_mode: 'stream' | 'poll'
+  poll_interval_seconds?: number
+  last_successful_poll_epoch?: number
+  poll_error?: number
+  durable_poll_cursor?: number
+  source_queue_depth?: number
+  full_history_required?: boolean
+  qualification_state: string
+}
+
 export interface Device {
+  firmware_family?: 'zkt' | 'hikvision'
+  terminal_vendor?: 'zkt' | 'hikvision'
+  hikvision?: HikvisionHealth | null
   connector_id: string
   hardware_id: string
   zone_id: string
@@ -127,6 +181,8 @@ export interface Device {
   state: DeviceState
   connected: boolean
   firmware_version: string | null
+  firmware_diagnostics?: FirmwareDiagnostics | null
+  firmware_diagnostics_at?: string | null
   comm_key_capable?: boolean
   comm_key_revision?: number
   ota_capable?: boolean
@@ -215,6 +271,7 @@ export interface Overview {
 }
 
 export interface ReconciliationPreflight {
+  source_protocol?: string
   eligible: boolean
   ready_now: boolean
   hard_blockers: Array<{ code: string; message: string }>
@@ -226,6 +283,7 @@ export interface ReconciliationPreflight {
     user_count: number | null
     connection_state: string
     range_resume_verified: boolean
+    serial_search_enabled?: boolean
   }
   coverage: ReconciliationCoverage | null
 }
@@ -400,7 +458,9 @@ export interface ReconciliationJob {
     auto_retry_count?: number
   }
   checkpoint?: {
-    next_ordinal: number
+    next_ordinal: number | null
+    source_serial?: number | null
+    source_pass?: string
     chain_digest: string | null
     last_progress_at: string | null
   }
@@ -480,6 +540,12 @@ export interface ReconciliationListResponse {
   totals: ReconciliationJobTotals
 }
 
+export interface HilTarget {
+  connector_id: string
+  mac: string
+  terminal_serial: string
+}
+
 export interface FirmwareRelease {
   release_id: string
   version: string
@@ -494,6 +560,9 @@ export interface FirmwareRelease {
   revoked_at?: string | null
   revoked_by?: string | null
   hil_target_mac: string | null
+  hil_targets?: HilTarget[] | null
+  hil_next_target?: HilTarget | null
+  hil_scope_message?: string | null
 }
 
 export interface FirmwareCampaign {

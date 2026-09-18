@@ -52,7 +52,7 @@ class IdentityCatalogRolloutPreflight(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn("access(ADD_IDENTITY_CATALOG_PATH", connector)
-        self.assertIn("backup_result == 0", connector)
+        self.assertIn("ft_replace(ADD_IDENTITY_CATALOG_PATH", connector)
         self.assertIn("errno != ENOENT", connector)
         self.assertIn("ADD_IDENTITY_CATALOG_BACKUP_PATH", connector)
         self.assertIn("activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH)", connector)
@@ -66,11 +66,16 @@ class IdentityCatalogRolloutPreflight(unittest.TestCase):
         self.assertIn("row_count != (size_t)expected_rows", connector)
         self.assertIn("s_identity_catalog_generation = 1", connector)
         websocket = connector.index("static void start_websocket(void)")
-        heartbeat = connector.index(
-            'xTaskCreate(heartbeat_task, "add_heartbeat"', websocket
-        )
-        restored = connector.index("restore_valid_identity_catalog();", heartbeat)
-        self.assertLess(heartbeat, restored)
+        ready = connector.index("s_outboxes_initialized = true;", websocket)
+        restored = connector.index("restore_valid_identity_catalog();", websocket)
+        self.assertLess(ready, restored)
+        supervisor = connector[
+            connector.index("static void delivery_supervisor_task(void *arg)") :
+            connector.index("void add_connector_init(")
+        ]
+        self.assertIn("s_client && s_outboxes_initialized", supervisor)
+        self.assertIn('xTaskCreate(heartbeat_task, "add_heartbeat"', supervisor)
+        self.assertIn("!= pdPASS", supervisor)
         restore_function = connector[
             connector.index("static bool restore_valid_identity_catalog(void)") :
             connector.index("static bool activate_identity_catalog")
@@ -90,11 +95,11 @@ class IdentityCatalogRolloutPreflight(unittest.TestCase):
         recovery_function = connector[
             connector.index(
                 "static void recover_identity_catalog_backup_if_active_missing(void)"
-            ) : connector.index("static bool restore_valid_identity_catalog(void)")
+            ) : connector.index("static bool restore_valid_identity_catalog_locked(void)")
         ]
-        self.assertIn("stat(ADD_IDENTITY_CATALOG_PATH", recovery_function)
-        self.assertIn("errno != ENOENT", recovery_function)
-        self.assertIn("ADD_IDENTITY_CATALOG_BACKUP_PATH", recovery_function)
+        self.assertIn("catalog_transaction_load(NULL, &checkpoint)", recovery_function)
+        self.assertIn("else if (!checkpoint.phase)", recovery_function)
+        self.assertIn("ft_recover(ADD_IDENTITY_CATALOG_PATH", recovery_function)
         self.assertNotIn("decrypt_storage_line", recovery_function)
         self.assertNotIn("remove(", recovery_function)
 

@@ -1,7 +1,14 @@
 #include "add_connector.h"
+#include "firmware_family.h"
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+#include "hikvision_runtime.h"
+#endif
+#include "evidence_receipt.h"
+#include "file_transaction.h"
 #include "ota_manager.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -20,6 +27,7 @@
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "esp_wifi.h"
@@ -33,6 +41,13 @@
 #include "mbedtls/sha256.h"
 
 #include "zone_config.h"
+#include "reliability.h"
+#include "legacy_queue.h"
+#include "queue_store.h"
+#include "storage_upgrade.h"
+#include "worker_retry.h"
+#include "delivery_scheduler.h"
+#include "nvs.h"
 #include "led_status.h"
 
 #include "zone_lite_config.example.h"
@@ -68,6 +83,7 @@
 #define ADD_SEND_TIMEOUT_MS 5000
 #define ADD_MAX_INBOUND_BYTES (512 * 1024)
 #define ADD_IDENTITY_CATALOG_MAX_ROWS 4096
+#define ADD_IDENTITY_CATALOG_MAX_BYTES (2U * 1024U * 1024U)
 #define ADD_OUTBOX_ACK_TIMEOUT_MS 10000
 #define ADD_PRIORITY_ACK_TIMEOUT_MS 10000
 #define ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS 12000
@@ -98,11 +114,14 @@
 #define ADD_CORRUPT_OUTBOX_MAX_BYTES (128 * 1024)
 #define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
 #define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
+#define ADD_COMMAND_INBOX_BACKUP_PATH "/storage/add_commands.bak"
+#define ADD_COMMAND_INBOX_MAX_BYTES (64U * 1024U)
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
 #define ADD_IDENTITY_CATALOG_TMP_PATH "/storage/add_identities.tmp"
 #define ADD_IDENTITY_CATALOG_STAGE_PATH "/storage/add_identities.stage"
 #define ADD_IDENTITY_CATALOG_BACKUP_PATH "/storage/add_identities.backup"
+#define ADD_IDENTITY_CATALOG_COMMIT_PATH "/storage/add_identities.commit"
 #define ADD_CANCELLED_COMMANDS_PATH "/storage/add_cancelled.txt"
 
 typedef struct {
@@ -114,9 +133,12 @@ typedef struct {
     off_t max_bytes;
     off_t offset;
     uint32_t depth;
+    bool depth_known;
     uint32_t ack_since_checkpoint;
     const char *label;
     SemaphoreHandle_t lock;
+    legacy_queue_t legacy;
+    lq_token_t pending_token;
 } add_outbox_t;
 
 typedef struct {
@@ -136,7 +158,7 @@ typedef struct {
 } add_inbound_message_t;
 
 typedef struct {
-    char uid[32];
+    char uid[41];
     char user_id[64];
     char display_name[96];
     char cnic[16];
@@ -148,6 +170,9 @@ static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_commands;
 static QueueHandle_t s_config_commands;
 static QueueHandle_t s_reconcile_assignments;
+#ifdef ZONE_LITE_HIKVISION
+static QueueHandle_t s_hikvision_assignments;
+#endif
 static QueueHandle_t s_source_coverage;
 static QueueHandle_t s_inbound_messages;
 static SemaphoreHandle_t s_lock;
@@ -155,6 +180,7 @@ static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
 static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
+static SemaphoreHandle_t s_catalog_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
 static bool s_ota_restart_claimed;
@@ -164,6 +190,10 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+static bool s_waiting_evidence;
+static bool s_waiting_hikvision;
+static char s_hikvision_expected[65];
+static evidence_receipt_t s_evidence_expected;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
 static add_source_tail_ack_t s_source_tail_ack;
@@ -211,6 +241,24 @@ static add_outbox_t s_live_outbox = {
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
 static volatile uint32_t s_priority_delivery_until_ms;
+
+static TaskHandle_t s_outbox_task_handle;
+static atomic_bool s_background_ack_waiting;
+static atomic_uint_least32_t s_background_ack_since_ms;
+static TaskHandle_t s_heartbeat_task_handle;
+static volatile uint32_t s_outbox_tick_ms;
+static volatile uint32_t s_outbox_progress_ms;
+static volatile bool s_outbox_buffer_ready;
+static volatile bool s_worker_start_failed;
+static worker_retry_t s_outbox_retry, s_heartbeat_retry;
+static volatile uint32_t s_ords_start_attempts;
+static volatile bool s_outboxes_initialized;
+static volatile uint32_t s_ords_worker_tick_ms;
+static volatile bool s_ords_worker_started;
+static volatile add_worker_operation_t s_ords_worker_operation;
+static volatile add_worker_operation_t s_add_worker_operation;
+static void outbox_task(void *arg);
+static void heartbeat_task(void *arg);
 
 static bool attendance_event_uid_is_valid(const char *value);
 
@@ -358,6 +406,43 @@ static bool send_root_locked(cJSON *root)
     return ok;
 }
 
+static bool evidence_identity(const cJSON *payload, evidence_receipt_t *out, bool receipt)
+{
+    memset(out, 0, sizeof(*out));
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(payload, "schema_version");
+    if (!cJSON_IsNumber(version) || version->valuedouble != 1) return false;
+    out->version = 1;
+    const char *names[] = {"connector_id", "queue", "queue_generation", "record_id", "payload_digest", "receipt_id", "disposition"};
+    char *destinations[] = {out->connector_id, out->queue, out->generation, out->record_id, out->digest, out->receipt_id, out->disposition};
+    size_t capacities[] = {sizeof(out->connector_id), sizeof(out->queue), sizeof(out->generation), sizeof(out->record_id), sizeof(out->digest), sizeof(out->receipt_id), sizeof(out->disposition)};
+    for (unsigned i = 0; i < (receipt ? 7U : 5U); ++i) {
+        const cJSON *field = cJSON_GetObjectItemCaseSensitive(payload, names[i]);
+        if (!cJSON_IsString(field) || !field->valuestring[0] || strlen(field->valuestring) >= capacities[i]) return false;
+        strlcpy(destinations[i], field->valuestring, capacities[i]);
+    }
+    return strlen(out->digest) == 64;
+}
+
+/* Takes ownership of payload on every outcome. An incomplete envelope is retryable. */
+static cJSON *message_envelope(cJSON *payload, const char *type, const char *message_id,
+    const char *connector_id, const char *boot_id, uint64_t seq, const char *sent_at)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root || !cJSON_AddStringToObject(root, "schema_version", "2") ||
+        !cJSON_AddStringToObject(root, "message_id", message_id) ||
+        !cJSON_AddStringToObject(root, "connector_id", connector_id) ||
+        !cJSON_AddStringToObject(root, "boot_id", boot_id) ||
+        !cJSON_AddNumberToObject(root, "seq", (double)seq) ||
+        !cJSON_AddStringToObject(root, "sent_at", sent_at) ||
+        !cJSON_AddStringToObject(root, "type", type) ||
+        !cJSON_AddItemToObject(root, "payload", payload)) {
+        cJSON_Delete(payload);
+        cJSON_Delete(root);
+        return NULL;
+    }
+    return root;
+}
+
 static bool send_payload(
     const char *type,
     const char *payload_json,
@@ -375,6 +460,18 @@ static bool send_payload(
     cJSON *payload = cJSON_Parse(safe_payload_json);
     free(safe_payload_json);
     if (!payload || !cJSON_IsObject(payload)) {
+        cJSON_Delete(payload);
+        return false;
+    }
+    evidence_receipt_t expected = {0};
+    bool evidence = strcmp(type, "queue_evidence") == 0;
+    bool hikvision = strcmp(type, "hikvision_observation") == 0;
+    cJSON *hik_hash = cJSON_GetObjectItemCaseSensitive(payload, "observation_sha256");
+    if (hikvision && (!cJSON_IsString(hik_hash) || strlen(hik_hash->valuestring) != 64 || sanitized_bytes)) {
+        cJSON_Delete(payload);
+        return false;
+    }
+    if (evidence && !evidence_identity(payload, &expected, false)) {
         cJSON_Delete(payload);
         return false;
     }
@@ -410,20 +507,21 @@ static bool send_payload(
     time(&now);
     char sent_at[32];
     iso_utc(now, sent_at);
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "schema_version", "2");
-    cJSON_AddStringToObject(root, "message_id", message_id);
-    cJSON_AddStringToObject(root, "connector_id", zone_config_get()->connector_id);
-    cJSON_AddStringToObject(root, "boot_id", s_boot_id);
-    cJSON_AddNumberToObject(root, "seq", (double)seq);
-    cJSON_AddStringToObject(root, "sent_at", sent_at);
-    cJSON_AddStringToObject(root, "type", type);
-    cJSON_AddItemToObject(root, "payload", payload);
+    cJSON *root = message_envelope(payload, type, message_id, zone_config_get()->connector_id,
+        s_boot_id, seq, sent_at);
+    if (!root) {
+        xSemaphoreGive(s_send_lock);
+        return false;
+    }
     if (wait_for_ack) {
         while (xSemaphoreTake(s_ack_sem, 0) == pdTRUE) {
         }
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             strlcpy(s_waiting_ack, message_id, sizeof(s_waiting_ack));
+            s_waiting_evidence = evidence;
+            s_waiting_hikvision = hikvision;
+            if (hikvision) strlcpy(s_hikvision_expected, hik_hash->valuestring, sizeof(s_hikvision_expected));
+            s_evidence_expected = expected;
             s_ack_matched = false;
             xSemaphoreGive(s_lock);
         } else {
@@ -451,8 +549,20 @@ static bool send_payload_and_wait_for_ack(
     add_reconcile_chunk_ack_t *reconcile_ack_out,
     add_attendance_settlement_ack_t *attendance_ack_out)
 {
+    bool background = s_outbox_task_handle && xTaskGetCurrentTaskHandle() == s_outbox_task_handle;
+    if (background) {
+        atomic_store(&s_background_ack_since_ms, (uint32_t)monotonic_ms());
+        atomic_store(&s_background_ack_waiting, true);
+    } else if (atomic_load(&s_background_ack_waiting) &&
+        (uint32_t)((uint32_t)monotonic_ms() - atomic_load(&s_background_ack_since_ms)) < 90000U) {
+        // A higher-priority direct sender must not reacquire the ACK mutex
+        // before the scheduled background attempt gets service. Returning a
+        // retry leaves its local record or authoritative source pending.
+        return false;
+    }
     if (!s_ack_wait_lock ||
         xSemaphoreTake(s_ack_wait_lock, lock_timeout) != pdTRUE) {
+        if (background) atomic_store(&s_background_ack_waiting, false);
         return false;
     }
     char message_id[80] = {0};
@@ -476,6 +586,7 @@ static bool send_payload_and_wait_for_ack(
         xSemaphoreGive(s_lock);
     }
     xSemaphoreGive(s_ack_wait_lock);
+    if (background) atomic_store(&s_background_ack_waiting, false);
     return acknowledged;
 }
 
@@ -560,7 +671,9 @@ static char *encrypt_storage_json(const char *plain)
         memcpy(raw + 1 + index, &value, 4);
     }
     unsigned char key[32];
-    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    if (mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0) != 0) {
+        free(raw); return NULL;
+    }
     mbedtls_gcm_context context;
     mbedtls_gcm_init(&context);
     int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
@@ -619,8 +732,11 @@ static char *decrypt_storage_line(const char *line)
     }
     size_t plain_len = raw_len - 29;
     unsigned char *plain = calloc(1, plain_len + 1);
+    if (!plain) { free(raw); return NULL; }
     unsigned char key[32];
-    mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0);
+    if (mbedtls_sha256((const unsigned char *)material, strlen(material), key, 0) != 0) {
+        free(raw); free(plain); return NULL;
+    }
     mbedtls_gcm_context context;
     mbedtls_gcm_init(&context);
     int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256);
@@ -646,11 +762,69 @@ static char *decrypt_storage_line(const char *line)
     return (char *)plain;
 }
 
+static int catalog_transaction_load(void *context, ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, "catalog", checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool catalog_transaction_commit(void *context, const ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, "catalog", checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+static const ft_port_t catalog_transaction_port = {catalog_transaction_load, catalog_transaction_commit, NULL};
+
+static bool recover_catalog_transaction_locked(void)
+{
+    bool ok = ft_recover(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
+    // Only a fully written producer stage is renamed to the canonical commit
+    // path. A first installation interrupted before prepare can finish here.
+    if (!ok) ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
+}
+
+static FILE *create_catalog_stage(const char *path)
+{
+    if (!qs_local_begin(QS_ADMIT_HISTORICAL, 4096)) return NULL;
+    FILE *file = fopen(path, "w");
+    int captured = file ? 0 : errno;
+    qs_local_end(file != NULL, captured);
+    if (!file) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return file;
+}
+
 static bool write_encrypted_json_line(FILE *file, cJSON *value)
 {
     char *plain = value ? cJSON_PrintUnformatted(value) : NULL;
     char *encrypted = encrypt_storage_json(plain);
-    bool ok = file && encrypted && fprintf(file, "%s\n", encrypted) > 0;
+    size_t bytes = encrypted ? strlen(encrypted) + 1 : 0;
+    long position = file && fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    bool admitted = encrypted && bytes <= DQ_MAX_RECORD_BYTES && position >= 0 &&
+        (uint64_t)position <= ADD_IDENTITY_CATALOG_MAX_BYTES &&
+        bytes <= ADD_IDENTITY_CATALOG_MAX_BYTES - (size_t)position &&
+        qs_local_begin(QS_ADMIT_HISTORICAL, bytes);
+    bool ok = admitted && fprintf(file, "%s\n", encrypted) > 0 &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(plain);
     free(encrypted);
     return ok;
@@ -658,34 +832,24 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
 
 static void recover_identity_catalog_backup_if_active_missing(void)
 {
-    struct stat active = {0};
-    errno = 0;
-    if (stat(ADD_IDENTITY_CATALOG_PATH, &active) == 0) {
-        return;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        led_status_fault(LED_STATUS_LOCAL_FAILURE); return;
     }
-    if (errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not inspect the active ADD identity catalog");
-        return;
-    }
-
-    // Finish only the interrupted active-to-backup transaction before the
-    // WebSocket can deliver a fresh catalog.  This rename is constant-time and
-    // does not parse or decrypt catalog rows, so it cannot hide the first boot
-    // heartbeat.  Once transport starts, restore_valid_identity_catalog()
-    // validates the recovered bytes and exact row count before publishing a
-    // non-zero generation to the OTA health gate.
-    errno = 0;
-    if (rename(
-            ADD_IDENTITY_CATALOG_BACKUP_PATH,
-            ADD_IDENTITY_CATALOG_PATH) == 0) {
-        ESP_LOGW(TAG, "Recovered interrupted ADD identity catalog transaction");
-    } else if (errno != ENOENT) {
-        ESP_LOGW(TAG, "Could not recover the ADD identity catalog backup");
-    }
+    ft_checkpoint_t checkpoint = {0};
+    int loaded = catalog_transaction_load(NULL, &checkpoint);
+    bool valid = loaded == 0 || (loaded == 1 && checkpoint.version == 1 && checkpoint.generation &&
+        checkpoint.phase <= 2 && checkpoint.crc == dq_crc32(&checkpoint, offsetof(ft_checkpoint_t, crc)));
+    if (!valid) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    // Prepared generations require bounded-buffer content verification. Defer
+    // that scan until transport and its independent heartbeat have started.
+    else if (!checkpoint.phase) (void)ft_recover(ADD_IDENTITY_CATALOG_PATH,
+        ADD_IDENTITY_CATALOG_COMMIT_PATH, ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
+    xSemaphoreGive(s_catalog_lock);
 }
 
-static bool restore_valid_identity_catalog(void)
+static bool restore_valid_identity_catalog_locked(void)
 {
+    if (!recover_catalog_transaction_locked()) return false;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     bool ok = file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file);
@@ -741,7 +905,7 @@ static bool restore_valid_identity_catalog(void)
     }
     if (file && ferror(file)) ok = false;
     if (ok && row_count != (size_t)expected_rows) ok = false;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     free(line);
     if (!ok) {
         ESP_LOGW(TAG, "No complete encrypted ADD identity catalog was restored");
@@ -760,34 +924,29 @@ static bool restore_valid_identity_catalog(void)
     return true;
 }
 
-static bool activate_identity_catalog(const char *staged_path)
+static bool restore_valid_identity_catalog(void)
 {
-    if (!staged_path) return false;
-    (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    // Some ESP-IDF VFS backends do not implement access() even though rename()
-    // is supported.  Treat a successful rename as the authoritative existence
-    // check; ENOENT is the only valid "no active catalog yet" result.
-    errno = 0;
-    int backup_result = rename(
-        ADD_IDENTITY_CATALOG_PATH,
-        ADD_IDENTITY_CATALOG_BACKUP_PATH);
-    bool had_active = backup_result == 0;
-    if (!had_active && errno != ENOENT) {
-        return false;
-    }
-    if (rename(staged_path, ADD_IDENTITY_CATALOG_PATH) == 0) {
-        (void)remove(ADD_IDENTITY_CATALOG_BACKUP_PATH);
-        return true;
-    }
-    if (had_active) {
-        (void)rename(
-            ADD_IDENTITY_CATALOG_BACKUP_PATH,
-            ADD_IDENTITY_CATALOG_PATH);
-    }
-    return false;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = restore_valid_identity_catalog_locked();
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
 }
 
-static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
+static bool activate_identity_catalog(const char *staged_path)
+{
+    if (!staged_path || !recover_catalog_transaction_locked()) return false;
+    // The checked transaction is idle. A leftover canonical stage is an
+    // uncommitted producer result; the active/backup generations were verified.
+    errno = 0;
+    if (remove(ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0 && errno != ENOENT) return false;
+    if (rename(staged_path, ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0) return false;
+    bool ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+        ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
+}
+
+static bool persist_identity_catalog_locked(cJSON *root, size_t *row_count_out)
 {
     cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
     int row_count = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
@@ -799,14 +958,14 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
     // payload and cJSON tree already account for the catalog once; duplicating
     // both on large terminals can exhaust internal heap before boot health can
     // acknowledge the freshly delivered catalog.
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_TMP_PATH, "w");
+    FILE *file = create_catalog_stage(ADD_IDENTITY_CATALOG_TMP_PATH);
     cJSON *metadata = cJSON_CreateObject();
     bool ok = file && metadata;
     if (ok) {
-        cJSON_AddStringToObject(metadata, "schema_version", "3");
-        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
-        cJSON_AddNumberToObject(metadata, "rows_count", row_count);
-        ok = write_encrypted_json_line(file, metadata);
+        ok = cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+            cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+            cJSON_AddNumberToObject(metadata, "rows_count", row_count) &&
+            write_encrypted_json_line(file, metadata);
     }
     cJSON_Delete(metadata);
     cJSON *row = NULL;
@@ -816,14 +975,27 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
         }
     }
     if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) ok = false;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     if (ok) {
         ok = activate_identity_catalog(ADD_IDENTITY_CATALOG_TMP_PATH);
     }
     if (!ok) (void)remove(ADD_IDENTITY_CATALOG_TMP_PATH);
+    if (ok) {
+        // Catalog readers share s_catalog_lock: a committed flash generation
+        // supersedes any older volatile aliases, including tombstone updates.
+        s_identity_catalog_active_memory_valid = false;
+    }
     if (ok && row_count_out) {
         *row_count_out = (size_t)row_count;
     }
+    return ok;
+}
+
+static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = persist_identity_catalog_locked(root, row_count_out);
+    xSemaphoreGive(s_catalog_lock);
     return ok;
 }
 
@@ -915,18 +1087,18 @@ static bool identity_catalog_stage_begin(cJSON *root)
             s_identity_catalog_stage_alias_capacity = (size_t)expected;
         }
     }
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "w");
+    FILE *file = create_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     cJSON *metadata = cJSON_CreateObject();
     bool ok = file && metadata;
     if (ok) {
-        cJSON_AddStringToObject(metadata, "schema_version", "3");
-        cJSON_AddStringToObject(metadata, "type", "identity_catalog");
-        cJSON_AddNumberToObject(metadata, "rows_count", expected);
-        ok = write_encrypted_json_line(file, metadata) &&
+        ok = cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+            cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+            cJSON_AddNumberToObject(metadata, "rows_count", expected) &&
+            write_encrypted_json_line(file, metadata) &&
             fflush(file) == 0 && fsync(fileno(file)) == 0;
     }
     cJSON_Delete(metadata);
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     s_identity_catalog_stage_file_ok = ok;
     if (!ok) {
         (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -985,7 +1157,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     if (!rows_ok) return false;
 
     if (s_identity_catalog_stage_file_ok) {
-        FILE *file = fopen(ADD_IDENTITY_CATALOG_STAGE_PATH, "a");
+        FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
         bool file_ok = file != NULL;
         cJSON_ArrayForEach(row, rows) {
             if (file_ok && !write_encrypted_json_line(file, row)) {
@@ -995,7 +1167,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
         if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
             file_ok = false;
         }
-        if (file) fclose(file);
+        if (file && fclose(file) != 0) file_ok = false;
         if (!file_ok) {
             s_identity_catalog_stage_file_ok = false;
             (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -1008,7 +1180,7 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     return false;
 }
 
-static bool identity_catalog_stage_commit(
+static bool identity_catalog_stage_commit_locked(
     cJSON *root,
     size_t *row_count_out,
     bool *volatile_fallback_out)
@@ -1063,87 +1235,119 @@ static bool identity_catalog_stage_commit(
     return ok;
 }
 
-bool add_connector_persist_command_tombstone(const add_command_t *command)
+static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out, bool *volatile_fallback_out)
 {
-    if (!command || !command->has_tombstone || !command->user_id[0]) return false;
-    cJSON *root = NULL;
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = identity_catalog_stage_commit_locked(root, row_count_out, volatile_fallback_out);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
+}
+
+static cJSON *load_catalog_for_tombstone(void)
+{
+    errno = 0;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    if (!file) {
+        if (errno != ENOENT) return NULL;
+        cJSON *empty = cJSON_CreateObject();
+        if (!empty || !cJSON_AddArrayToObject(empty, "rows")) {
+            cJSON_Delete(empty); return NULL;
+        }
+        return empty;
+    }
+    struct stat st;
+    bool ok = fstat(fileno(file), &st) == 0 && st.st_size > 0 &&
+        st.st_size <= ADD_IDENTITY_CATALOG_MAX_BYTES;
+    char *line = ok ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    cJSON *root = NULL;
+    if (line && fgets(line, ADD_COMMAND_LINE_BYTES, file) && strchr(line, '\n')) {
         char *plain = decrypt_storage_line(line);
         root = plain ? cJSON_Parse(plain) : NULL;
         free(plain);
-        cJSON *legacy_rows = root
-            ? cJSON_GetObjectItemCaseSensitive(root, "rows")
-            : NULL;
-        if (root && !cJSON_IsArray(legacy_rows)) {
-            cJSON_Delete(root);
-            root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "schema_version", "3");
-            cJSON_AddStringToObject(root, "type", "identity_catalog");
-            cJSON *stream_rows = cJSON_AddArrayToObject(root, "rows");
-            while (stream_rows && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
-                char *row_plain = decrypt_storage_line(line);
-                cJSON *row = row_plain ? cJSON_Parse(row_plain) : NULL;
-                free(row_plain);
-                if (!cJSON_IsObject(row)) {
-                    cJSON_Delete(row);
-                    cJSON_Delete(root);
-                    root = NULL;
-                    break;
-                }
-                cJSON_AddItemToArray(stream_rows, row);
+    }
+    ok = ok && cJSON_IsObject(root);
+    cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+    if (ok && !cJSON_IsArray(rows)) {
+        cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "rows_count");
+        int expected = cJSON_IsNumber(count) ? count->valueint : -1;
+        ok = expected >= 0 && expected <= ADD_IDENTITY_CATALOG_MAX_ROWS;
+        rows = ok ? cJSON_AddArrayToObject(root, "rows") : NULL;
+        ok = ok && rows;
+        int seen = 0;
+        while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+            if (!strchr(line, '\n') || seen >= expected) { ok = false; break; }
+            char *plain = decrypt_storage_line(line);
+            cJSON *row = plain ? cJSON_Parse(plain) : NULL;
+            free(plain);
+            if (!cJSON_IsObject(row) || !cJSON_AddItemToArray(rows, row)) {
+                cJSON_Delete(row); ok = false; break;
             }
+            seen++;
         }
+        ok = ok && seen == expected;
+    } else if (ok) {
+        // Legacy single-object catalogs cannot hide extra or truncated rows.
+        ok = fgetc(file) == EOF && cJSON_GetArraySize(rows) <= ADD_IDENTITY_CATALOG_MAX_ROWS;
     }
-    if (file) fclose(file);
+    if (ferror(file)) ok = false;
+    if (fclose(file) != 0) ok = false;
     free(line);
-    if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "schema_version", "2");
-        cJSON_AddStringToObject(root, "type", "identity_catalog");
-        cJSON_AddArrayToObject(root, "rows");
-    }
+    if (!ok) { cJSON_Delete(root); return NULL; }
+    return root;
+}
+
+static bool add_connector_persist_command_tombstone_locked(const add_command_t *command)
+{
+    if (!command || !command->has_tombstone || !command->user_id[0]) return false;
+    if (!recover_catalog_transaction_locked()) return false;
+    cJSON *root = load_catalog_for_tombstone();
+    if (!root) return false; // OOM or a failed read must never become an empty catalog.
     cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
-    if (!cJSON_IsArray(rows)) {
-        cJSON_DeleteItemFromObjectCaseSensitive(root, "rows");
-        rows = cJSON_AddArrayToObject(root, "rows");
-    }
     cJSON *target = NULL;
     cJSON *row = NULL;
     cJSON_ArrayForEach(row, rows) {
         cJSON *user_id = cJSON_GetObjectItemCaseSensitive(row, "user_id");
-        if (cJSON_IsString(user_id) && strcmp(user_id->valuestring, command->user_id) == 0) {
-            target = row;
-            break;
+        cJSON *uid = cJSON_GetObjectItemCaseSensitive(row, "uid");
+        if (cJSON_IsString(user_id) && cJSON_IsString(uid) &&
+            !strcmp(user_id->valuestring, command->user_id) && !strcmp(uid->valuestring, command->uid)) {
+            target = row; break;
         }
     }
     if (!target) {
         target = cJSON_CreateObject();
-        cJSON_AddItemToArray(rows, target);
+        if (!target || !cJSON_AddItemToArray(rows, target)) {
+            cJSON_Delete(target); cJSON_Delete(root); return false;
+        }
     }
     cJSON_DeleteItemFromObjectCaseSensitive(target, "uid");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "user_id");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "display_name");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "cnic");
     cJSON_DeleteItemFromObjectCaseSensitive(target, "shift_worker");
-    cJSON_AddStringToObject(target, "uid", command->uid);
-    cJSON_AddStringToObject(target, "user_id", command->user_id);
-    cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name);
-    cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic);
-    cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker);
-    bool ok = persist_identity_catalog(root, NULL);
+    bool ok = cJSON_AddStringToObject(target, "uid", command->uid) &&
+        cJSON_AddStringToObject(target, "user_id", command->user_id) &&
+        cJSON_AddStringToObject(target, "display_name", command->tombstone_display_name) &&
+        cJSON_AddStringToObject(target, "cnic", command->tombstone_cnic) &&
+        cJSON_AddBoolToObject(target, "shift_worker", command->tombstone_shift_worker) &&
+        persist_identity_catalog_locked(root, NULL);
     cJSON_Delete(root);
+    return ok;
+}
+
+bool add_connector_persist_command_tombstone(const add_command_t *command)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = add_connector_persist_command_tombstone_locked(command);
+    xSemaphoreGive(s_catalog_lock);
     return ok;
 }
 
 static bool append_cancelled_command(const char *command_id)
 {
-    FILE *file = fopen(ADD_CANCELLED_COMMANDS_PATH, "a");
+    FILE *file = rel_open_append(ADD_CANCELLED_COMMANDS_PATH);
     bool ok = file && fprintf(file, "%s\n", command_id) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
     return ok;
 }
 
@@ -1159,6 +1363,25 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
         return false;
     }
     memset(command, 0, sizeof(*command));
+#ifdef ZONE_LITE_HIKVISION
+    /* Reject oversized identifiers before strlcpy can turn one employee into
+     * another. ZKT's legacy numeric/binary command format remains separate. */
+    const char *fields[] = {"uid", "user_id", "name"};
+    const size_t limits[] = {32, 32, 128};
+    for (unsigned i = 0; i < 3; i++) {
+        cJSON *field = cJSON_GetObjectItemCaseSensitive(payload, fields[i]);
+        if (field && (!cJSON_IsString(field) || strlen(field->valuestring) > limits[i])) return false;
+        if (field && i < 2) {
+            const char *p = field->valuestring;
+            if (!*p) return false;
+            for (; *p; p++) if (*p < '0' || *p > '9') return false;
+        }
+    }
+    cJSON *serial = cJSON_GetObjectItemCaseSensitive(expected, "serial");
+    if (serial && (!cJSON_IsString(serial) || strlen(serial->valuestring) >= sizeof(command->expected_serial))) return false;
+    if (strlen(command_id->valuestring) >= sizeof(command->command_id) ||
+        strlen(command_type->valuestring) >= sizeof(command->command_type)) return false;
+#endif
     strlcpy(command->command_id, command_id->valuestring, sizeof(command->command_id));
     strlcpy(command->command_type, command_type->valuestring, sizeof(command->command_type));
     cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_epoch");
@@ -1414,23 +1637,64 @@ static bool parse_reconcile_assignment(
     return true;
 }
 
-static bool command_journal_contains_locked(const char *command_id)
+static int command_transaction_load(void *context, ft_checkpoint_t *checkpoint)
 {
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, "commands", checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool command_transaction_commit(void *context, const ft_checkpoint_t *checkpoint)
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("file_tx", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, "commands", checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+
+static const ft_port_t command_transaction_port = {command_transaction_load, command_transaction_commit, NULL};
+static bool command_journal_recover_locked(void)
+{
+    bool ok = ft_recover(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
+        ADD_COMMAND_INBOX_BACKUP_PATH, command_transaction_port);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    return ok;
+}
+
+/* -1 means unavailable; it is never permission to append a duplicate command. */
+static int command_journal_contains_locked(const char *command_id)
+{
+    if (!command_journal_recover_locked()) return -1;
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
-    if (!file) return false;
+    if (!file) return errno == ENOENT ? 0 : -1;
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    bool found = false;
+    int found = line ? 0 : -1;
     while (line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { found = -1; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
-        if (cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0) found = true;
+        if (!cJSON_IsString(id)) found = -1;
+        else if (strcmp(id->valuestring, command_id) == 0) found = 1;
         cJSON_Delete(root);
         free(plain);
         if (found) break;
     }
     free(line);
-    fclose(file);
+    if (ferror(file)) found = -1;
+    if (fclose(file) != 0) found = -1;
     return found;
 }
 
@@ -1439,16 +1703,26 @@ static bool command_journal_append(cJSON *root, const char *command_id)
     if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return false;
     }
-    if (command_journal_contains_locked(command_id)) {
+    int existing = command_journal_contains_locked(command_id);
+    if (existing != 0) {
         xSemaphoreGive(s_command_lock);
-        return true;
+        return existing == 1;
     }
     char *plain = cJSON_PrintUnformatted(root);
     char *line = encrypt_storage_json(plain);
-    FILE *file = line ? fopen(ADD_COMMAND_INBOX_PATH, "a") : NULL;
+    struct stat st;
+    int stat_result = stat(ADD_COMMAND_INBOX_PATH, &st);
+    bool known = stat_result == 0 || errno == ENOENT;
+    size_t bytes = line ? strlen(line) + 1 : 0;
+    size_t existing_bytes = stat_result == 0 && st.st_size >= 0 ? (size_t)st.st_size : 0;
+    bool admitted = line && known && existing_bytes <= ADD_COMMAND_INBOX_MAX_BYTES &&
+        bytes <= ADD_COMMAND_INBOX_MAX_BYTES - existing_bytes && qs_local_begin(QS_ADMIT_RECOVERY, bytes);
+    FILE *file = admitted ? rel_open_append(ADD_COMMAND_INBOX_PATH) : NULL;
     bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
-    if (file) fclose(file);
+    if (file && fclose(file) != 0) ok = false;
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(line);
     free(plain);
     xSemaphoreGive(s_command_lock);
@@ -1517,10 +1791,18 @@ static void restore_command_inbox(void)
         xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return;
     }
+    if (!command_journal_recover_locked()) {
+        xSemaphoreGive(s_command_lock);
+        return;
+    }
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    bool complete = file != NULL || errno == ENOENT;
+    char *line = file ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    if (file && !line) complete = false;
     uint32_t restored = 0;
-    while (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    while (complete && file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { complete = false; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         add_command_t command = {0};
@@ -1528,17 +1810,20 @@ static void restore_command_inbox(void)
         QueueHandle_t target = parsed && strcmp(command.command_type, "APPLY_CONFIG") == 0
             ? s_config_commands
             : s_commands;
-        if (parsed && target && command.command_id[0] &&
-            xQueueSend(target, &command, 0) == pdTRUE) {
-            command_mark_queued_locked(command.command_id);
-            restored++;
+        if (!parsed || !command.command_id[0]) complete = false;
+        else if (!command_is_scheduled_locked(command.command_id)) {
+            if (target && xQueueSend(target, &command, 0) == pdTRUE) {
+                command_mark_queued_locked(command.command_id);
+                restored++;
+            } else complete = false;
         }
         cJSON_Delete(root);
         free(plain);
     }
-    if (file) fclose(file);
+    if (file && ferror(file)) complete = false;
+    if (file && fclose(file) != 0) complete = false;
     free(line);
-    s_command_inbox_restored = true;
+    s_command_inbox_restored = complete;
     xSemaphoreGive(s_command_lock);
     if (restored > 0) {
         ESP_LOGW(TAG, "Restored %lu durable ADD command(s) after boot", (unsigned long)restored);
@@ -1555,13 +1840,26 @@ static void parse_inbound(const char *data, size_t len)
         return;
     }
     cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+#ifdef ZONE_LITE_HIKVISION
+    if (cJSON_IsString(type) && !strcmp(type->valuestring, "hikvision_history_assignment")) {
+        char *text = cJSON_PrintUnformatted(root);
+        if (text && strlen(text) < 2048 && s_hikvision_assignments) {
+            char assignment[2048] = {0};
+            strlcpy(assignment, text, sizeof(assignment));
+            xQueueOverwrite(s_hikvision_assignments, assignment);
+        }
+        free(text); cJSON_Delete(root); return;
+    }
+#endif
     if (cJSON_IsString(type) &&
         (strcmp(type->valuestring, "ack") == 0 ||
          strcmp(type->valuestring, "reconcile_anchor_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_chunk_ack") == 0 ||
          strcmp(type->valuestring, "reconcile_manifest_ack") == 0 ||
          strcmp(type->valuestring, "source_probe_ack") == 0 ||
-         strcmp(type->valuestring, "source_tail_ack") == 0)) {
+         strcmp(type->valuestring, "source_tail_ack") == 0 ||
+         strcmp(type->valuestring, "queue_evidence_ack") == 0 ||
+         strcmp(type->valuestring, "hikvision_observation_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
@@ -1691,7 +1989,18 @@ static void parse_inbound(const char *data, size_t len)
                     }
                 }
                 s_waiting_ack[0] = '\0';
-                s_ack_matched = true;
+                if (s_waiting_evidence) {
+                    evidence_receipt_t receipt;
+                    s_ack_matched = strcmp(type->valuestring, "queue_evidence_ack") == 0 &&
+                        evidence_identity(root, &receipt, true) &&
+                        evidence_receipt_matches(&s_evidence_expected, &receipt);
+                } else if (s_waiting_hikvision) {
+                    cJSON *hash = cJSON_GetObjectItemCaseSensitive(root, "observation_sha256");
+                    cJSON *durable = cJSON_GetObjectItemCaseSensitive(root, "durable");
+                    s_ack_matched = !strcmp(type->valuestring, "hikvision_observation_ack") &&
+                        cJSON_IsTrue(durable) && cJSON_IsString(hash) &&
+                        !strcmp(hash->valuestring, s_hikvision_expected);
+                } else s_ack_matched = true;
                 xSemaphoreGive(s_ack_sem);
             }
             xSemaphoreGive(s_lock);
@@ -2035,6 +2344,129 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     }
 }
 
+void add_connector_report_ords_start(bool started, uint32_t attempts)
+{
+    s_ords_start_attempts = attempts;
+    if (!started) s_ords_worker_started = false;
+}
+
+void add_connector_report_ords_worker(add_worker_operation_t operation)
+{
+    s_ords_worker_operation = operation;
+    s_ords_worker_tick_ms = (uint32_t)monotonic_ms();
+    s_ords_worker_started = true;
+}
+
+static bool append_worker_diagnostic(cJSON *workers, const char *name,
+                                     bool started, uint32_t tick,
+                                     add_worker_operation_t operation)
+{
+    int64_t now = monotonic_ms();
+    uint32_t age = (uint32_t)now - tick;
+    const char *state = !started ? "STOPPED" : age > 90000 ? "FAULT" :
+        operation == ADD_WORKER_RESOURCE ? "WAITING_RESOURCE" :
+        operation == ADD_WORKER_NETWORK ? "WAITING_NETWORK" : "RUNNING";
+    const char *operation_name = operation == ADD_WORKER_READING ? "reading queue" :
+        operation == ADD_WORKER_NETWORK ? "waiting for acknowledgement" :
+        operation == ADD_WORKER_COMMITTING ? "committing receipt" :
+        operation == ADD_WORKER_RESOURCE ? "allocating delivery buffer" : "idle";
+    cJSON *worker = cJSON_CreateObject();
+    if (!worker) return false;
+    if (!cJSON_AddItemToArray(workers, worker)) { cJSON_Delete(worker); return false; }
+    return cJSON_AddStringToObject(worker, "name", name) &&
+        cJSON_AddStringToObject(worker, "state", state) &&
+        cJSON_AddStringToObject(worker, "operation", operation_name) &&
+        cJSON_AddNumberToObject(worker, "restart_attempts", !strcmp(name, "add_delivery")
+            ? (s_outbox_retry.total ? s_outbox_retry.total - 1U : 0U)
+            : (s_ords_start_attempts ? s_ords_start_attempts - 1U : 0U)) &&
+        (!started || cJSON_AddNumberToObject(worker, "last_activity_uptime_ms", (double)(now - age)));
+}
+
+static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_t *zkt, const char *activity)
+{
+    cJSON *diagnostics = cJSON_CreateObject();
+    if (!diagnostics) return;
+    cJSON *storage = cJSON_AddObjectToObject(diagnostics, "storage");
+    cJSON *workers = cJSON_AddArrayToObject(diagnostics, "workers");
+    cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
+    if (!storage || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1)) goto failed;
+    size_t total = 0, used = 0;
+    esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
+    if (measured == ESP_OK) {
+        if (!cJSON_AddNumberToObject(storage, "total_bytes", (double)total) ||
+            !cJSON_AddNumberToObject(storage, "used_bytes", (double)used)) goto failed;
+    } else {
+        if (!cJSON_AddStringToObject(storage, "error_operation", "filesystem_info") ||
+            !cJSON_AddNumberToObject(storage, "error_code", measured)) goto failed;
+    }
+    qs_health_t measured_health = qs_health();
+    if (measured_health.observed) {
+        if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
+            !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
+            !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
+        if (measured == ESP_OK && measured_health.last_error &&
+            (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
+             !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
+    }
+    // A connected heartbeat does not prove persistence. Until a checked
+    // recovery/write result is available, report UNKNOWN rather than healthy.
+    const char *led = led_status_current_name();
+    const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
+        ? "DEGRADED" : "UNKNOWN";
+    if (!cJSON_AddStringToObject(storage, "durability", durability) ||
+        !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
+        !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
+        !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready())) goto failed;
+    if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
+            s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE) ||
+        !append_worker_diagnostic(workers, "ords_delivery", s_ords_worker_started,
+            s_ords_worker_tick_ms, s_ords_worker_operation)) goto failed;
+    add_outbox_t *outboxes[] = {&s_live_outbox, &s_bulk_outbox};
+    const char *names[] = {"live", "bulk"};
+    for (size_t i = 0; i < 2; i++) {
+        cJSON *queue = cJSON_CreateObject();
+        if (!queue) goto failed;
+        if (!cJSON_AddItemToArray(queues, queue)) { cJSON_Delete(queue); goto failed; }
+        if (!cJSON_AddStringToObject(queue, "name", names[i])) goto failed;
+        add_outbox_t *outbox = outboxes[i];
+        if (outbox->lock && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            bool fields_ok = cJSON_AddBoolToObject(queue, "count_known", outbox->depth_known) &&
+                (!outbox->depth_known || cJSON_AddNumberToObject(queue, "records", outbox->depth));
+            struct stat st;
+            if (stat(outbox->path, &st) == 0) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
+            else if (errno == ENOENT) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", 0);
+            xSemaphoreGive(outbox->lock);
+            if (!fields_ok) goto failed;
+        }
+    }
+    const char *segmented_names[QS_COUNT] = {"segmented_live", "segmented_bulk", "segmented_ords",
+        "segmented_blocked", "segmented_receipts", "segmented_evidence"};
+    for (unsigned i = 0; i < QS_COUNT; i++) {
+        cJSON *queue = cJSON_CreateObject();
+        if (!queue) goto failed;
+        if (!cJSON_AddItemToArray(queues, queue)) { cJSON_Delete(queue); goto failed; }
+        uint32_t depth = 0;
+        bool known = qs_snapshot((qs_lane_t)i, &depth);
+        if (!cJSON_AddStringToObject(queue, "name", segmented_names[i]) ||
+            !cJSON_AddBoolToObject(queue, "count_known", known) ||
+            (known && !cJSON_AddNumberToObject(queue, "records", depth))) goto failed;
+    }
+    const char *mode = activity;
+    if (!strcmp(activity, "LIVE_CAPTURE") || !strcmp(activity, "ONLINE"))
+        mode = zkt->add_source_coverage_certified ? "APPEND_TAIL_ASSURANCE" : "IDLE";
+    if (!cJSON_AddStringToObject(diagnostics, "reconciliation_mode", mode) ||
+        (zkt->last_light_check_uptime_ms > 0 && !cJSON_AddNumberToObject(diagnostics,
+            "last_light_check_uptime_ms", (double)zkt->last_light_check_uptime_ms)) ||
+        (zkt->last_tail_audit_uptime_ms > 0 && !cJSON_AddNumberToObject(diagnostics,
+            "last_tail_audit_uptime_ms", (double)zkt->last_tail_audit_uptime_ms)) ||
+        (zkt->committed_source_known &&
+            (!cJSON_AddNumberToObject(diagnostics, "source_generation", zkt->committed_source_generation) ||
+             !cJSON_AddNumberToObject(diagnostics, "committed_source_cursor", zkt->committed_source_cursor)))) goto failed;
+    if (cJSON_AddItemToObject(payload, "diagnostics", diagnostics)) return;
+failed:
+    cJSON_Delete(diagnostics);
+}
+
 static void heartbeat_task(void *arg)
 {
     (void)arg;
@@ -2054,6 +2486,7 @@ static void heartbeat_task(void *arg)
             int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
             cJSON *payload = cJSON_CreateObject();
             cJSON_AddStringToObject(payload, "firmware_version", firmware_version());
+            cJSON_AddStringToObject(payload, "firmware_family", ZONE_LITE_FIRMWARE_FAMILY);
             cJSON_AddNumberToObject(payload, "config_version", 3);
             cJSON_AddBoolToObject(payload, "comm_key_management", true);
             cJSON_AddNumberToObject(
@@ -2064,6 +2497,7 @@ static void heartbeat_task(void *arg)
             cJSON_AddNumberToObject(payload, "rssi", rssi);
             cJSON_AddNumberToObject(payload, "free_heap", esp_get_free_heap_size());
             cJSON_AddNumberToObject(payload, "outbox_depth", add_connector_outbox_depth());
+            append_firmware_diagnostics(payload, &zkt, activity);
             ota_manager_append_telemetry(payload);
             cJSON_AddStringToObject(payload, "current_activity", activity);
             cJSON_AddStringToObject(payload, "led_state", led_status_current_name());
@@ -2145,6 +2579,9 @@ static void heartbeat_task(void *arg)
                 history,
                 "failed_windows",
                 zkt.history_failed_windows);
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+            hikvision_append_telemetry(payload);
+#endif
             char *json = cJSON_PrintUnformatted(payload);
             cJSON_Delete(payload);
             if (json) {
@@ -2181,7 +2618,7 @@ static bool write_outbox_cursor(const add_outbox_t *outbox, off_t offset)
     if (!file) return false;
     bool ok = fprintf(file, "%lld\n", (long long)offset) > 0 &&
               fflush(file) == 0 && fsync(fileno(file)) == 0;
-    fclose(file);
+    if (fclose(file) != 0) ok = false;
     if (!ok) {
         (void)remove(outbox->cursor_tmp_path);
         return false;
@@ -2199,175 +2636,136 @@ static bool write_outbox_cursor(const add_outbox_t *outbox, off_t offset)
 
 static void restore_outbox_if_needed(add_outbox_t *outbox)
 {
-    struct stat pending = {0};
-    struct stat backup = {0};
-    bool has_pending = stat(outbox->path, &pending) == 0;
-    bool has_backup = stat(outbox->backup_path, &backup) == 0;
-    if (!has_pending && has_backup) {
-        if (rename(outbox->backup_path, outbox->path) == 0) {
-            ESP_LOGW(TAG, "Recovered ADD %s outbox after interrupted compaction", outbox->label);
-            has_pending = true;
+    struct stat st;
+    if (stat(outbox->path, &st) == 0) return;
+    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    const char *generations[] = {outbox->backup_path, outbox->tmp_path};
+    for (size_t i = 0; i < 2; i++) {
+        if (stat(generations[i], &st) == 0) {
+            if (rename(generations[i], outbox->path) != 0)
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            outbox->depth_known = false;
+            return;
         }
+        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
     }
-    if (has_pending) (void)remove(outbox->backup_path);
-    (void)remove(outbox->tmp_path);
-    (void)remove(outbox->cursor_tmp_path);
+    // Each surviving generation is streamed independently. Existence of a
+    // newer active file is never permission to discard an older backup/temp.
+}
+
+static int add_legacy_load(void *context, lq_checkpoint_t *checkpoint)
+{
+    add_outbox_t *outbox = context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("add_legacy", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t size = sizeof(*checkpoint);
+    result = nvs_get_blob(handle, outbox->label, checkpoint, &size);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && size == sizeof(*checkpoint) ? 1 : -1;
+}
+
+static bool add_legacy_commit(void *context, const lq_checkpoint_t *checkpoint)
+{
+    add_outbox_t *outbox = context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("add_legacy", NVS_READWRITE, &handle);
+    if (result != ESP_OK) return false;
+    result = nvs_set_blob(handle, outbox->label, checkpoint, sizeof(*checkpoint));
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
 }
 
 static off_t load_outbox_cursor(add_outbox_t *outbox)
 {
-    struct stat st = {0};
-    if (stat(outbox->path, &st) != 0 || st.st_size <= 0) {
-        (void)remove(outbox->cursor_path);
+    lq_port_t port = {add_legacy_load, add_legacy_commit, outbox};
+    dq_result_t result = lq_open_step(&outbox->legacy, outbox->path, port);
+    if (result != DQ_OK) {
+        outbox->depth_known = false;
+        if (result != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return 0;
     }
-    FILE *cursor = fopen(outbox->cursor_path, "r");
-    long long value = 0;
-    bool parsed = cursor && fscanf(cursor, "%lld", &value) == 1;
-    if (cursor) fclose(cursor);
-    if (!parsed || value < 0 || value > (long long)st.st_size) {
-        (void)remove(outbox->cursor_path);
-        return 0;
-    }
-    if (value > 0) {
-        FILE *file = fopen(outbox->path, "r");
-        int preceding = EOF;
-        if (file && fseek(file, (long)value - 1, SEEK_SET) == 0) preceding = fgetc(file);
-        if (file) fclose(file);
-        if (preceding != '\n') {
-            ESP_LOGW(TAG, "Ignoring invalid ADD %s outbox cursor", outbox->label);
-            (void)remove(outbox->cursor_path);
-            return 0;
-        }
-    }
-    return (off_t)value;
+    // The old text cursor is not sufficient generation evidence. A first
+    // upgrade conservatively replays the file; ADD settles existing UIDs once.
+    return (off_t)outbox->legacy.checkpoint.offset;
 }
 
-static uint32_t count_outbox_rows(add_outbox_t *outbox)
+static rel_scan_result_t count_outbox_rows(add_outbox_t *outbox)
 {
+    outbox->depth_known = false;
+    if (!outbox->legacy.ready) return REL_SCAN_ERROR;
+    errno = 0;
     FILE *file = fopen(outbox->path, "r");
-    if (!file) return 0;
-    if (outbox->offset > 0 && fseek(file, (long)outbox->offset, SEEK_SET) != 0) {
-        fclose(file);
-        outbox->offset = 0;
-        (void)remove(outbox->cursor_path);
-        file = fopen(outbox->path, "r");
-        if (!file) return 0;
+    if (!file) {
+        if (errno != ENOENT) return REL_SCAN_ERROR;
+        outbox->depth = 0;
+        outbox->depth_known = true;
+        return REL_SCAN_EMPTY;
     }
-    char *line = allocate_outbox_line_buffer();
-    if (!line) {
+    if (fseeko(file, outbox->offset, SEEK_SET) != 0) {
         fclose(file);
-        ESP_LOGE(TAG, "Could not allocate ADD outbox scan buffer");
-        return 0;
+        return REL_SCAN_ERROR;
     }
     uint32_t count = 0;
-    while (fgets(line, ADD_OUTBOX_LINE_BYTES, file)) {
-        if (line[0] != '\0') count++;
+    rel_scan_result_t result = rel_count_rows(file, &count);
+    if (fclose(file) != 0) result = REL_SCAN_ERROR;
+    if (result != REL_SCAN_ERROR) {
+        outbox->depth = count;
+        outbox->depth_known = true;
     }
-    free(line);
-    fclose(file);
-    return count;
+    return result;
 }
 
 static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
 {
-    if (outbox->offset <= 0) return true;
-    struct stat st = {0};
-    if (stat(outbox->path, &st) != 0) {
-        outbox->offset = 0;
-        outbox->depth = 0;
-        outbox->ack_since_checkpoint = 0;
-        (void)remove(outbox->cursor_path);
-        return true;
-    }
-    if (!force && (outbox->offset < ADD_OUTBOX_COMPACT_MIN_BYTES ||
-        outbox->offset < st.st_size / 2)) {
-        return true;
-    }
-    if (outbox->depth == 0 || outbox->offset >= st.st_size) {
-        (void)remove(outbox->path);
-        (void)remove(outbox->cursor_path);
-        outbox->offset = 0;
-        outbox->depth = 0;
-        outbox->ack_since_checkpoint = 0;
-        return true;
-    }
-
-    FILE *in = fopen(outbox->path, "r");
-    FILE *out = fopen(outbox->tmp_path, "w");
-    char *buffer = allocate_outbox_line_buffer();
-    if (!in || !out || !buffer || fseek(in, (long)outbox->offset, SEEK_SET) != 0) {
-        if (in) fclose(in);
-        if (out) fclose(out);
-        free(buffer);
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    bool ok = true;
-    size_t read = 0;
-    while ((read = fread(buffer, 1, ADD_OUTBOX_LINE_BYTES, in)) > 0) {
-        if (fwrite(buffer, 1, read, out) != read) {
-            ok = false;
-            break;
-        }
-    }
-    if (ferror(in) || fflush(out) != 0 || fsync(fileno(out)) != 0) ok = false;
-    fclose(in);
-    fclose(out);
-    free(buffer);
-    if (!ok || !write_outbox_cursor(outbox, 0)) {
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    (void)remove(outbox->backup_path);
-    if (rename(outbox->path, outbox->backup_path) != 0) {
-        (void)remove(outbox->tmp_path);
-        return false;
-    }
-    if (rename(outbox->tmp_path, outbox->path) != 0) {
-        (void)rename(outbox->backup_path, outbox->path);
-        return false;
-    }
-    (void)remove(outbox->backup_path);
+    (void)force;
+    if (!outbox->legacy.ready) return false;
+    struct stat st;
+    if (stat(outbox->path, &st) != 0) return errno == ENOENT && !outbox->legacy.checkpoint.offset;
+    if ((uint64_t)st.st_size != outbox->legacy.checkpoint.offset) return true;
+    // No suffix rewrite or second copy. Clear the predecessor's text cursor
+    // before retiring a fully settled file so rollback cannot skip a new file.
+    if (!write_outbox_cursor(outbox, 0) || lq_reclaim(&outbox->legacy) != DQ_OK) return false;
     outbox->offset = 0;
+    outbox->depth = 0;
+    outbox->depth_known = true;
     outbox->ack_since_checkpoint = 0;
-    ESP_LOGI(TAG, "Compacted acknowledged prefix from ADD %s outbox", outbox->label);
+    restore_outbox_if_needed(outbox);
+    if (stat(outbox->path, &st) == 0) outbox->depth_known = false;
     return true;
 }
 
-static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end)
+static bool advance_outbox_locked(add_outbox_t *outbox, off_t row_end, bool custody)
 {
-    if (row_end <= outbox->offset) return false;
-    outbox->offset = row_end;
-    if (outbox->depth > 0) outbox->depth--;
-    outbox->ack_since_checkpoint++;
-    if (outbox->depth == 0) {
-        // Every row in this generation has been acknowledged, so deleting the
-        // file is itself the durable checkpoint.
-        (void)remove(outbox->path);
-        (void)remove(outbox->cursor_path);
-        outbox->offset = 0;
-        outbox->ack_since_checkpoint = 0;
-        return true;
+    if (row_end <= outbox->offset || row_end != (off_t)outbox->pending_token.end) return false;
+    if ((custody ? lq_settle_evidence(&outbox->legacy, &outbox->pending_token) :
+        lq_settle(&outbox->legacy, &outbox->pending_token)) != DQ_OK) {
+        outbox->depth_known = false;
+        return false;
     }
-    // Checkpoint in small groups to limit flash wear.  A power loss before a
-    // checkpoint only replays already-acknowledged event UIDs.
-    if (outbox->ack_since_checkpoint >= 16 && write_outbox_cursor(outbox, row_end)) {
-        outbox->ack_since_checkpoint = 0;
-    }
+    outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
+    if (outbox->depth_known && outbox->depth) outbox->depth--;
     return compact_outbox_locked(outbox, false);
 }
 
 static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_end)
 {
-    FILE *file = fopen(outbox->path, "r");
-    if (!file) return false;
-    bool ok = fseek(file, (long)outbox->offset, SEEK_SET) == 0 &&
-              fgets(line, ADD_OUTBOX_LINE_BYTES, file) != NULL;
-    long end = ok ? ftell(file) : -1;
-    fclose(file);
-    if (!ok || end <= (long)outbox->offset) return false;
-    *row_end = (off_t)end;
+    if (!outbox->legacy.ready) outbox->offset = load_outbox_cursor(outbox);
+    if (!outbox->legacy.ready) return false;
+    dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
+    if (result == DQ_EMPTY) {
+        if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return false;
+    }
+    if (result != DQ_OK) {
+        outbox->depth_known = false;
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return false;
+    }
+    *row_end = (off_t)outbox->pending_token.end;
     return true;
 }
 
@@ -2573,33 +2971,47 @@ static bool oracle_receipt_payload_is_valid(const cJSON *payload)
     return true;
 }
 
-static bool preserve_corrupt_outbox_row(const char *line)
+bool add_connector_transfer_queue_evidence(
+    const char *queue, const char *generation, const char *record_id,
+    const void *raw, size_t raw_length, const char *terminal_serial,
+    const char *reason)
 {
-    if (!line) return false;
-    size_t required = strlen(line) + 1;
-    if (required > ADD_CORRUPT_OUTBOX_MAX_BYTES) return false;
-    struct stat current = {0};
-    off_t current_bytes = stat(ADD_CORRUPT_OUTBOX_PATH, &current) == 0
-        ? current.st_size
-        : 0;
-    bool rotated = false;
-    if (current_bytes + (off_t)required > ADD_CORRUPT_OUTBOX_MAX_BYTES) {
-        (void)remove(ADD_CORRUPT_OUTBOX_BACKUP_PATH);
-        if (rename(
-                ADD_CORRUPT_OUTBOX_PATH,
-                ADD_CORRUPT_OUTBOX_BACKUP_PATH) != 0) {
-            return false;
-        }
-        rotated = true;
+    if (!raw || !raw_length || raw_length > 8192 || !queue || !generation || !record_id || !reason)
+        return false;
+    unsigned char digest[32];
+    if (mbedtls_sha256(raw, raw_length, digest, 0) != 0) return false;
+    char hex[65];
+    for (size_t i = 0; i < sizeof(digest); ++i) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    size_t encoded_capacity = ((raw_length + 2) / 3) * 4 + 1;
+    unsigned char *encoded = malloc(encoded_capacity);
+    size_t encoded_length = 0;
+    if (!encoded || mbedtls_base64_encode(encoded, encoded_capacity, &encoded_length, raw, raw_length) != 0) {
+        free(encoded); return false;
     }
-    FILE *file = fopen(ADD_CORRUPT_OUTBOX_PATH, "a");
-    bool ok = file && fprintf(file, "%s\n", line) > 0 &&
-        fflush(file) == 0 && fsync(fileno(file)) == 0;
-    if (file && fclose(file) != 0) ok = false;
-    if (!ok && rotated) {
-        (void)remove(ADD_CORRUPT_OUTBOX_PATH);
-        (void)rename(ADD_CORRUPT_OUTBOX_BACKUP_PATH, ADD_CORRUPT_OUTBOX_PATH);
+    encoded[encoded_length] = 0;
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *provenance = cJSON_CreateObject();
+    bool ok = payload && provenance &&
+        cJSON_AddNumberToObject(payload, "schema_version", 1) &&
+        cJSON_AddStringToObject(payload, "connector_id", zone_config_get()->connector_id) &&
+        cJSON_AddStringToObject(payload, "queue", queue) &&
+        cJSON_AddStringToObject(payload, "queue_generation", generation) &&
+        cJSON_AddStringToObject(payload, "record_id", record_id) &&
+        cJSON_AddStringToObject(payload, "payload_digest", hex) &&
+        cJSON_AddStringToObject(payload, "raw_b64", (const char *)encoded) &&
+        cJSON_AddStringToObject(provenance, "reason", reason) &&
+        cJSON_AddStringToObject(provenance, "encoding", "LEGACY_ROW");
+    if (ok && terminal_serial && terminal_serial[0])
+        ok = cJSON_AddStringToObject(provenance, "terminal_serial", terminal_serial) != NULL;
+    if (ok) {
+        ok = cJSON_AddItemToObject(payload, "provenance", provenance);
+        if (ok) provenance = NULL;
     }
+    char *json = ok ? cJSON_PrintUnformatted(payload) : NULL;
+    cJSON_Delete(provenance); cJSON_Delete(payload); free(encoded);
+    ok = json && send_payload_and_wait_for_ack("queue_evidence", json,
+        pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+    free(json);
     return ok;
 }
 
@@ -2643,8 +3055,12 @@ static char *outbox_record_line(
         cJSON_Delete(payload);
         return NULL;
     }
-    cJSON_AddStringToObject(record, "type", type);
-    cJSON_AddItemToObject(record, "payload", payload);
+    if (!cJSON_AddStringToObject(record, "type", type) ||
+        !cJSON_AddItemToObject(record, "payload", payload)) {
+        cJSON_Delete(payload);
+        cJSON_Delete(record);
+        return NULL;
+    }
     char *line = cJSON_PrintUnformatted(record);
     cJSON_Delete(record);
     size_t line_len = line ? strlen(line) : 0;
@@ -2751,9 +3167,13 @@ static void refresh_capacity_deadline_on_progress(
     *last_depth = outbox->depth;
 }
 
-static bool add_connector_enqueue_validated_line(const char *line, bool live)
+static bool add_connector_enqueue_validated_line_with_policy(const char *line, bool live, qs_admission_t policy)
 {
     if (!line) return false;
+    if (storage_upgrade_segmented_writes()) {
+        qs_lane_t lane = policy == QS_ADMIT_RECOVERY ? QS_RECEIPTS : live ? QS_LIVE : QS_BULK;
+        return qs_append_with_policy(lane, line, strlen(line), policy) == DQ_OK;
+    }
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
@@ -2774,13 +3194,18 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
                 current = stat(outbox->path, &st) == 0 ? st.st_size : 0;
             }
             if (current + (off_t)strlen(line) + 1 <= outbox->max_bytes) {
-                FILE *file = fopen(outbox->path, "a");
-                if (file) {
-                    ok = fprintf(file, "%s\n", line) > 0 &&
-                        fflush(file) == 0 &&
-                        fsync(fileno(file)) == 0;
-                    fclose(file);
+                if (qs_local_begin(policy, strlen(line) + 1)) {
+                    errno = 0;
+                    FILE *file = rel_open_append(outbox->path);
+                    int error = file ? 0 : errno;
+                    if (file) {
+                        ok = fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 && fsync(fileno(file)) == 0;
+                        if (!ok) error = errno;
+                        if (fclose(file) != 0) { ok = false; if (!error) error = errno; }
+                    }
+                    qs_local_end(ok, error);
                     if (ok) outbox->depth++;
+                    else outbox->depth_known = false;
                 }
             }
             xSemaphoreGive(outbox->lock);
@@ -2803,6 +3228,12 @@ static bool add_connector_enqueue_validated_line(const char *line, bool live)
             outbox->label);
     }
     return ok;
+}
+
+static bool add_connector_enqueue_validated_line(const char *line, bool live)
+{
+    return add_connector_enqueue_validated_line_with_policy(line, live,
+        live ? QS_ADMIT_LIVE : QS_ADMIT_HISTORICAL);
 }
 
 static bool add_connector_enqueue_record(const char *type, const char *payload_json)
@@ -2959,9 +3390,19 @@ bool add_connector_enqueue_oracle_receipts(
             (unsigned long)duplicate_count);
     }
 
-    bool ok = add_connector_enqueue_validated_line(
-        line,
-        strcmp(confirmation_path, "FIRMWARE_LIVE") == 0);
+    bool ok = add_connector_enqueue_validated_line_with_policy(line, true, QS_ADMIT_RECOVERY);
+    // Receipt preservation has a bounded local attempt even for historical
+    // delivery. A full legacy filesystem can still drain if ADD durably takes
+    // responsibility for the Oracle proof. This caller owns no storage lock.
+    if (!ok && add_connector_is_connected()) {
+        cJSON *record = cJSON_Parse(line);
+        cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
+        char *json = cJSON_IsObject(payload) ? cJSON_PrintUnformatted(payload) : NULL;
+        if (json) ok = send_payload_and_wait_for_ack("oracle_receipt_batch", json,
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+        free(json);
+        cJSON_Delete(record);
+    }
     free(line);
     return ok;
 }
@@ -2974,6 +3415,16 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         return false;
     }
 
+    if (storage_upgrade_segmented_writes()) {
+        for (size_t i = 0; i < count; ++i) {
+            bool live = false;
+            char *line = attendance_outbox_record_line(payloads[i], &live);
+            bool ok = line && !live && qs_append_with_policy(QS_BULK, line, strlen(line), QS_ADMIT_HISTORICAL) == DQ_OK;
+            free(line);
+            if (!ok) return false; // Partial durable batches may replay idempotently.
+        }
+        return true;
+    }
     size_t required_bytes = 0;
     for (size_t i = 0; i < count; i++) {
         if (!payloads[i]) return false;
@@ -3035,8 +3486,10 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
             continue;
         }
 
-        bool ok = true;
-        FILE *file = fopen(s_bulk_outbox.path, "a");
+        bool admitted = qs_local_begin(QS_ADMIT_HISTORICAL, required_bytes);
+        bool ok = admitted;
+        errno = 0;
+        FILE *file = admitted ? rel_open_append(s_bulk_outbox.path) : NULL;
         if (!file) ok = false;
         uint32_t written = 0;
         for (size_t i = 0; ok && i < count; i++) {
@@ -3058,11 +3511,17 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         }
         if (file) {
             if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
-            fclose(file);
+            if (fclose(file) != 0) ok = false;
         }
-        s_bulk_outbox.depth += written;
+        int captured_error = errno;
+        if (admitted) qs_local_end(ok, captured_error);
+        if (ok) s_bulk_outbox.depth += written;
+        else {
+            s_bulk_outbox.depth_known = false;
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        }
         xSemaphoreGive(s_bulk_outbox.lock);
-        if (written > 0) {
+        if (ok && written > 0) {
             ESP_LOGI(
                 TAG,
                 "Durably appended %lu ADD reconcile batch(es) with one flash sync",
@@ -3085,104 +3544,180 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
 static void outbox_task(void *arg)
 {
     (void)arg;
-    uint32_t retry_ms = ADD_OUTBOX_RETRY_MS;
-    char *line = allocate_outbox_line_buffer();
-    if (!line) {
-        ESP_LOGE(TAG, "Could not allocate ADD outbox worker buffer");
-        vTaskDelete(NULL);
-        return;
-    }
-    while (true) {
-        if (priority_delivery_hold_active()) {
-            vTaskDelay(pdMS_TO_TICKS(250));
+    delivery_scheduler_t scheduler = {0};
+    char *line = NULL;
+    int64_t priority_started = 0;
+    const qs_lane_t lanes[] = {QS_LIVE, QS_LIVE, QS_BULK, QS_BULK, QS_RECEIPTS, QS_EVIDENCE};
+    for (;;) {
+        int64_t now = monotonic_ms();
+        s_outbox_tick_ms = (uint32_t)now;
+        s_add_worker_operation = ADD_WORKER_READING;
+        if (!line) line = allocate_outbox_line_buffer();
+        s_outbox_buffer_ready = line != NULL;
+        if (!line) {
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            vTaskDelay(pdMS_TO_TICKS(ADD_OUTBOX_RETRY_MS));
             continue;
         }
-        bool have_row = false;
-        add_outbox_t *outbox = NULL;
-        off_t row_end = 0;
-        uint32_t live_depth = 0;
-        if (s_live_outbox.lock && xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            live_depth = s_live_outbox.depth;
-            xSemaphoreGive(s_live_outbox.lock);
-        }
-        outbox = live_depth > 0 ? &s_live_outbox : &s_bulk_outbox;
-        if (add_connector_is_connected() && outbox->lock &&
-            xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            have_row = outbox->depth > 0 && read_outbox_row_locked(outbox, line, &row_end);
-            xSemaphoreGive(outbox->lock);
-        }
-        if (!have_row) {
+        if (!add_connector_is_connected()) {
+            s_add_worker_operation = ADD_WORKER_IDLE;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        line[strcspn(line, "\r\n")] = '\0';
-        cJSON *record = cJSON_Parse(line);
+        bool background_due = false;
+        if (priority_delivery_hold_active()) {
+            if (!priority_started) priority_started = now;
+            if (now - priority_started < ADD_PRIORITY_HOLD_MS) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+            background_due = true;
+        }
+        priority_started = 0;
+        unsigned ready = 0;
+        for (unsigned i = 0; i < 6; i++) {
+            uint32_t depth = 0;
+            if (i == 0 || i == 2) {
+                add_outbox_t *legacy = i == 0 ? &s_live_outbox : &s_bulk_outbox;
+                if (legacy->lock && xSemaphoreTake(legacy->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    if (!legacy->depth_known || legacy->depth) ready |= 1U << i;
+                    xSemaphoreGive(legacy->lock);
+                }
+            } else if (!qs_snapshot(lanes[i], &depth) || depth) ready |= 1U << i;
+        }
+        int selected = ds_pick(&scheduler, ready, (uint64_t)now, background_due);
+        if (selected < 0) {
+            s_add_worker_operation = ADD_WORKER_IDLE;
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+        bool segmented = selected != 0 && selected != 2;
+        add_outbox_t *outbox = selected == 0 ? &s_live_outbox : &s_bulk_outbox;
+        off_t row_end = 0;
+        dq_token_t token = {0};
+        lq_token_t legacy_token = {0};
+        size_t raw_length = 0;
+        bool have_row = false;
+        if (segmented) {
+            size_t length = 0;
+            dq_result_t read = qs_peek(lanes[selected], line, ADD_OUTBOX_LINE_BYTES - 1, &length, &token);
+            have_row = read == DQ_OK;
+            if (have_row) { line[length] = 0; raw_length = length; }
+            else if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        } else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            have_row = read_outbox_row_locked(outbox, line, &row_end);
+            if (have_row) {
+                legacy_token = outbox->pending_token;
+                raw_length = legacy_token.end - legacy_token.offset;
+            }
+            xSemaphoreGive(outbox->lock);
+        }
+        if (!have_row) {
+            scheduler.retry_at[selected] = (uint64_t)monotonic_ms() + 1000;
+            continue;
+        }
+        ds_attempted(&scheduler, (unsigned)selected);
+        bool syntax_valid = (segmented || !legacy_token.evidence_required) && !memchr(line, 0, raw_length) && rel_json_syntax_valid(line, raw_length);
+        cJSON *record = syntax_valid ? cJSON_Parse(line) : NULL;
+        if (syntax_valid && !record) {
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
+            continue;
+        }
         cJSON *type = record ? cJSON_GetObjectItemCaseSensitive(record, "type") : NULL;
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
+        evidence_receipt_t evidence_identity_fields;
         bool valid = cJSON_IsString(type) && cJSON_IsObject(payload) &&
-            ((strcmp(type->valuestring, "attendance_batch") == 0 &&
-              attendance_payload_is_valid(payload)) ||
-             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 &&
-              oracle_receipt_payload_is_valid(payload)));
+            ((strcmp(type->valuestring, "attendance_batch") == 0 && attendance_payload_is_valid(payload)) ||
+             (strcmp(type->valuestring, "oracle_receipt_batch") == 0 && oracle_receipt_payload_is_valid(payload)) ||
+             (strcmp(type->valuestring, "queue_evidence") == 0 && evidence_identity(payload, &evidence_identity_fields, false)));
         char *payload_json = valid ? cJSON_PrintUnformatted(payload) : NULL;
-        if (!valid || !payload_json) {
+        if (valid && !payload_json) {
+            cJSON_Delete(record);
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), false, esp_random());
+            continue;
+        }
+        if (!valid) {
             cJSON_Delete(record);
             free(payload_json);
-            ESP_LOGE(TAG, "Preserving and skipping a corrupt ADD %s outbox row", outbox->label);
-            if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                bool preserved = preserve_corrupt_outbox_row(line);
-                if (!preserved) {
-                    ESP_LOGE(
-                        TAG,
-                        "Bounded corrupt-row evidence storage was unavailable; skipping the unusable %s row to protect newer attendance",
-                        outbox->label);
-                }
-                if (!advance_outbox_locked(outbox, row_end)) {
-                    ESP_LOGE(TAG, "Could not skip corrupt ADD %s outbox row", outbox->label);
-                }
-                xSemaphoreGive(outbox->lock);
+            char instance[33], generation[80], record_id[80];
+            bool have_identity = qs_generation(instance);
+            if (segmented) {
+                snprintf(generation, sizeof(generation), "%s-segmented-v2", have_identity ? instance : "");
+                snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)token.segment,
+                    (unsigned long)token.offset, (unsigned long)token.sequence);
+            } else {
+                snprintf(generation, sizeof(generation), "%s-legacy-%lu", have_identity ? instance : "",
+                    (unsigned long)legacy_token.generation);
+                snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)legacy_token.offset,
+                    (unsigned long)legacy_token.crc);
             }
-            retry_ms = ADD_OUTBOX_RETRY_MS;
+            const char *queue_names[] = {"add_live_legacy", "add_live", "add_bulk_legacy", "add_bulk", "receipts", "evidence"};
+            s_add_worker_operation = ADD_WORKER_NETWORK;
+            bool preserved = have_identity && add_connector_transfer_queue_evidence(
+                queue_names[selected], generation, record_id, line, raw_length, NULL, "MALFORMED");
+            s_add_worker_operation = ADD_WORKER_COMMITTING;
+            if (preserved) {
+                if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
+                else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                    preserved = advance_outbox_locked(outbox, row_end, true);
+                    xSemaphoreGive(outbox->lock);
+                } else preserved = false;
+            }
+            // Failed custody transfer leaves the exact original row in place.
+            if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), preserved, esp_random());
             continue;
         }
         add_attendance_settlement_ack_t attendance_ack = {0};
         bool is_attendance = strcmp(type->valuestring, "attendance_batch") == 0;
-        bool acknowledged = send_payload_and_wait_for_ack(
-            type->valuestring,
-            payload_json,
-            portMAX_DELAY,
-            pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
-            NULL,
-            is_attendance ? &attendance_ack : NULL);
-        if (acknowledged && is_attendance &&
-            !attendance_settlement_matches_payload(payload_json, &attendance_ack)) {
+        s_add_worker_operation = ADD_WORKER_NETWORK;
+        bool acknowledged = send_payload_and_wait_for_ack(type->valuestring, payload_json,
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
+            NULL, is_attendance ? &attendance_ack : NULL);
+        if (acknowledged && is_attendance && !attendance_settlement_matches_payload(payload_json, &attendance_ack))
             acknowledged = false;
-        }
         cJSON_Delete(record);
         free(payload_json);
         if (acknowledged && attendance_ack.valid && attendance_ack.quarantined > 0) {
-            ESP_LOGW(
-                TAG,
-                "ADD durably quarantined %lu attendance row(s) without blocking receipt=%s outcome=%s accepted=%lu duplicates=%lu",
-                (unsigned long)attendance_ack.quarantined,
-                attendance_ack.receipt_id,
-                attendance_ack.outcome,
-                (unsigned long)attendance_ack.accepted,
-                (unsigned long)attendance_ack.duplicates);
+            ESP_LOGW(TAG, "ADD durably quarantined %lu attendance row(s) without blocking",
+                (unsigned long)attendance_ack.quarantined);
         }
-        if (acknowledged && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            if (!advance_outbox_locked(outbox, row_end)) {
-                ESP_LOGE(TAG, "Could not advance acknowledged ADD %s attendance outbox", outbox->label);
+        s_add_worker_operation = ADD_WORKER_COMMITTING;
+        bool committed = false;
+        if (acknowledged) {
+            if (segmented) committed = qs_settle(lanes[selected], &token) == DQ_OK;
+            else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                committed = advance_outbox_locked(outbox, row_end, false);
+                xSemaphoreGive(outbox->lock);
             }
-            xSemaphoreGive(outbox->lock);
-            retry_ms = ADD_OUTBOX_RETRY_MS;
-        } else {
-            uint32_t delay_ms = retry_ms + (esp_random() % 1000U);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            retry_ms = retry_ms >= ADD_OUTBOX_RETRY_MAX_MS / 2
-                ? ADD_OUTBOX_RETRY_MAX_MS
-                : retry_ms * 2;
+            if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         }
+        if (committed) s_outbox_progress_ms = (uint32_t)monotonic_ms();
+        ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), committed, esp_random());
+    }
+}
+
+static void delivery_supervisor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint32_t now = (uint32_t)monotonic_ms();
+        if (s_client && s_outboxes_initialized) {
+            if (!s_heartbeat_task_handle && worker_retry_allow(&s_heartbeat_retry, now) &&
+                xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, &s_heartbeat_task_handle) != pdPASS)
+                s_heartbeat_task_handle = NULL;
+            if (!s_outbox_task_handle && worker_retry_allow(&s_outbox_retry, now) &&
+                xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, &s_outbox_task_handle) != pdPASS)
+                s_outbox_task_handle = NULL;
+            s_worker_start_failed = !s_outbox_task_handle || !s_heartbeat_task_handle;
+        }
+        if (s_worker_start_failed || (s_outbox_tick_ms &&
+            (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) > 90000U))
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        restore_command_inbox();
+        // Do not asynchronously delete a task which might own a mutex.
+        // Buffer failures self-retry; stalled operations are independently visible.
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -3198,11 +3733,15 @@ void add_connector_init(void)
     s_ack_sem = xSemaphoreCreateBinary();
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
+    s_catalog_lock = xSemaphoreCreateMutex();
     s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
     s_config_commands = xQueueCreate(
         ADD_CONFIG_COMMAND_QUEUE_DEPTH,
         sizeof(add_command_t));
     s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
+#ifdef ZONE_LITE_HIKVISION
+    s_hikvision_assignments = xQueueCreate(1, 2048);
+#endif
     s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
     s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
@@ -3216,11 +3755,16 @@ void add_connector_init(void)
     s_zkt.user_count = -1;
     s_zkt.attendance_count = -1;
     s_started = s_lock && s_send_lock && s_live_outbox.lock && s_bulk_outbox.lock &&
-                s_ack_sem && s_ack_wait_lock && s_command_lock && s_commands &&
+                s_ack_sem && s_ack_wait_lock && s_command_lock && s_catalog_lock && s_commands &&
                 s_config_commands &&
                 s_reconcile_assignments &&
                 s_source_coverage &&
                 s_inbound_messages;
+    if (s_started && xTaskCreate(delivery_supervisor_task, "add_supervisor", 4096, NULL, 4, NULL) != pdPASS) {
+        s_started = false;
+        s_worker_start_failed = true;
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    }
     if (s_started &&
         xTaskCreate(inbound_message_task, "add_inbound", 12288, NULL, 4, NULL) != pdPASS) {
         s_started = false;
@@ -3293,9 +3837,14 @@ static bool perform_onboarding(void)
     cJSON_AddStringToObject(root, "zone_name", runtime->zone_name);
     cJSON_AddStringToObject(root, "device_id", runtime->zone_device_id);
     cJSON_AddStringToObject(root, "firmware_version", firmware_version());
+    cJSON_AddStringToObject(root, "firmware_family", ZONE_LITE_FIRMWARE_FAMILY);
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    cJSON_AddStringToObject(root, "expected_serial", runtime->hik_expected_serial);
+#else
     if (runtime->zkt_expected_serial[0]) {
         cJSON_AddStringToObject(root, "expected_serial", runtime->zkt_expected_serial);
     }
+#endif
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!body) return false;
@@ -3413,13 +3962,15 @@ static void start_websocket(void)
     if (xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_live_outbox);
         s_live_outbox.offset = load_outbox_cursor(&s_live_outbox);
-        s_live_outbox.depth = count_outbox_rows(&s_live_outbox);
+        (void)count_outbox_rows(&s_live_outbox);
+        if (s_live_outbox.depth_known && !s_live_outbox.depth) (void)compact_outbox_locked(&s_live_outbox, true);
         xSemaphoreGive(s_live_outbox.lock);
     }
     if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_bulk_outbox);
         s_bulk_outbox.offset = load_outbox_cursor(&s_bulk_outbox);
-        s_bulk_outbox.depth = count_outbox_rows(&s_bulk_outbox);
+        (void)count_outbox_rows(&s_bulk_outbox);
+        if (s_bulk_outbox.depth_known && !s_bulk_outbox.depth) (void)compact_outbox_locked(&s_bulk_outbox, true);
         xSemaphoreGive(s_bulk_outbox.lock);
     }
     ESP_LOGI(
@@ -3427,8 +3978,8 @@ static void start_websocket(void)
         "ADD outboxes restored live=%lu reconcile=%lu",
         (unsigned long)s_live_outbox.depth,
         (unsigned long)s_bulk_outbox.depth);
-    xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, NULL);
-    xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, NULL);
+    s_outboxes_initialized = true;
+    // The independent supervisor checks creation results and retries boundedly.
     // Start transport and heartbeat visibility before scanning the encrypted
     // catalog.  The scan is bounded and fail-closed, but SPIFFS latency must
     // never delay OTA boot supervision or make an otherwise running connector
@@ -3485,6 +4036,7 @@ bool add_connector_is_connected(void)
 bool add_connector_boot_health_ready(void)
 {
     bool ready = false;
+    if (!storage_upgrade_ready()) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         time_t now = time(NULL);
         bool authenticated_stability_elapsed =
@@ -3503,11 +4055,28 @@ bool add_connector_boot_health_ready(void)
         bool identity_ready = s_identity_catalog_generation > 0 ||
             (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
         ready = s_connected
+            && s_outbox_task_handle && s_heartbeat_task_handle && s_outbox_buffer_ready
+            && !s_worker_start_failed && s_ords_worker_started
+            && s_ords_worker_operation != ADD_WORKER_RESOURCE
+            && (uint32_t)((uint32_t)monotonic_ms() - s_ords_worker_tick_ms) < 90000U
+            && (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) < 90000U
             && identity_ready
             && s_zkt.online
             && stable_terminal_session
             && s_zkt.user_count >= 0
             && s_zkt.attendance_count >= 0;
+        xSemaphoreGive(s_lock);
+    }
+    return ready;
+}
+
+bool add_connector_ota_reconcile_ready(void)
+{
+    if (!add_connector_boot_health_ready()) return false;
+    bool ready = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ready = s_zkt.add_source_coverage_certified && s_zkt.attendance_count >= 0 &&
+            s_zkt.add_source_coverage_cursor == (uint32_t)s_zkt.attendance_count;
         xSemaphoreGive(s_lock);
     }
     return ready;
@@ -3545,7 +4114,11 @@ bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out)
         return false;
     }
     *depth_out = s_bulk_outbox.depth;
+    bool known = s_bulk_outbox.depth_known;
     xSemaphoreGive(s_bulk_outbox.lock);
+    uint32_t segmented = 0;
+    if (!known || !qs_snapshot(QS_BULK, &segmented) || segmented > UINT32_MAX - *depth_out) return false;
+    *depth_out += segmented;
     return true;
 }
 
@@ -3690,42 +4263,51 @@ void add_connector_command_retry(const char *command_id)
 bool add_connector_command_complete(const char *command_id)
 {
     if (!command_id || !s_command_lock ||
-        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        return false;
-    }
-    if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
-    command_unmark_queued_locked(command_id);
+        xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
+    if (!command_journal_recover_locked()) { xSemaphoreGive(s_command_lock); return false; }
     FILE *input = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!input) {
+        bool absent = errno == ENOENT;
+        if (absent && strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
         xSemaphoreGive(s_command_lock);
-        return true;
+        return absent;
     }
-    FILE *output = fopen(ADD_COMMAND_INBOX_TMP_PATH, "w");
-    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    struct stat st;
+    bool bounded = fstat(fileno(input), &st) == 0 && st.st_size >= 0 && st.st_size <= ADD_COMMAND_INBOX_MAX_BYTES;
+    bool admitted = bounded && qs_local_begin(QS_ADMIT_RECOVERY, (size_t)st.st_size);
+    FILE *output = admitted ? fopen(ADD_COMMAND_INBOX_TMP_PATH, "w") : NULL;
+    char *line = output ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
     bool ok = output && line;
     while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, input)) {
+        size_t length = strlen(line);
+        if (!length || line[length - 1] != '\n') { ok = false; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
-        bool remove = cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0;
+        if (!cJSON_IsString(id)) ok = false; // allocation/decryption errors retain the old generation
+        bool remove_row = cJSON_IsString(id) && strcmp(id->valuestring, command_id) == 0;
         cJSON_Delete(root);
         free(plain);
-        if (!remove && fputs(line, output) == EOF) ok = false;
+        if (ok && !remove_row && fputs(line, output) == EOF) ok = false;
     }
+    if (ferror(input)) ok = false;
     if (output && (fflush(output) != 0 || fsync(fileno(output)) != 0)) ok = false;
-    fclose(input);
-    if (output) fclose(output);
+    if (fclose(input) != 0) ok = false;
+    if (output && fclose(output) != 0) ok = false;
     free(line);
+    if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
+        ADD_COMMAND_INBOX_BACKUP_PATH, ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
+    // Never remove a staged generation after an uncertain NVS commit.
+    if (admitted) qs_local_end(ok, ok ? 0 : errno);
     if (ok) {
-        (void)remove(ADD_COMMAND_INBOX_PATH);
-        ok = rename(ADD_COMMAND_INBOX_TMP_PATH, ADD_COMMAND_INBOX_PATH) == 0;
-    }
-    if (!ok) (void)remove(ADD_COMMAND_INBOX_TMP_PATH);
+        if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
+        command_unmark_queued_locked(command_id);
+    } else led_status_fault(LED_STATUS_LOCAL_FAILURE);
     xSemaphoreGive(s_command_lock);
     return ok;
 }
 
-bool add_connector_lookup_identity(
+static bool add_connector_lookup_identity_locked(
     const char *user_id,
     const char *uid,
     char *display_name,
@@ -3767,6 +4349,7 @@ bool add_connector_lookup_identity(
     // an alias that the latest verified catalog deliberately removed.
     if (memory_catalog_valid) return found;
 
+    if (!recover_catalog_transaction_locked()) return false;
     FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
     if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
@@ -3848,6 +4431,16 @@ bool add_connector_lookup_identity(
     return found;
 }
 
+bool add_connector_lookup_identity(const char *user_id, const char *uid,
+    char *display_name, size_t display_name_size, char *cnic, size_t cnic_size, bool *shift_worker)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = add_connector_lookup_identity_locked(user_id, uid, display_name, display_name_size,
+        cnic, cnic_size, shift_worker);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
+}
+
 uint32_t add_connector_identity_catalog_generation(size_t *row_count)
 {
     uint32_t generation = 0;
@@ -3902,4 +4495,13 @@ bool add_connector_log(
     bool ok = json && add_connector_send_payload("log", json);
     free(json);
     return ok;
+}
+
+bool add_connector_take_hikvision_assignment(char out[2048])
+{
+#ifdef ZONE_LITE_HIKVISION
+    return out && s_hikvision_assignments && xQueueReceive(s_hikvision_assignments, out, 0) == pdTRUE;
+#else
+    (void)out; return false;
+#endif
 }

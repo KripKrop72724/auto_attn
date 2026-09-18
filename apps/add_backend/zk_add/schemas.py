@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -18,6 +18,7 @@ class StepUpRequest(BaseModel):
 
 
 class OnboardRequest(BaseModel):
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
     hardware_id: str = Field(min_length=17, max_length=17)
     zone_id: str = Field(min_length=1, max_length=100)
     zone_name: str = Field(min_length=1, max_length=255)
@@ -48,6 +49,9 @@ class Envelope(BaseModel):
 class OtaHeartbeatPayload(BaseModel):
     """Bounded OTA runtime evidence emitted by Zone Lite heartbeats."""
 
+    running_version: str | None = Field(default=None, min_length=1, max_length=80)
+    running_partition: Literal["ota_0", "ota_1"] | None = None
+    image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     capable: bool = False
     secure_boot: bool = False
     rollback_enabled: bool = False
@@ -59,7 +63,79 @@ class OtaHeartbeatPayload(BaseModel):
     last_error: str = Field(default="", max_length=64)
 
 
+class QueueDiagnostics(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    bytes: int | None = Field(default=None, ge=0)
+    records: int | None = Field(default=None, ge=0)
+    count_known: bool = False
+    oldest_pending_age_seconds: int | None = Field(default=None, ge=0)
+    last_progress_uptime_ms: int | None = Field(default=None, ge=0)
+
+
+class WorkerDiagnostics(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    state: Literal["RUNNING", "WAITING_NETWORK", "WAITING_RESOURCE", "STOPPED", "FAULT", "UNKNOWN"]
+    last_activity_uptime_ms: int | None = Field(default=None, ge=0)
+    operation: str | None = Field(default=None, max_length=80)
+    restart_count: int | None = Field(default=None, ge=0)
+    restart_attempts: int | None = Field(default=None, ge=0)
+
+
+class StorageDiagnostics(BaseModel):
+    upgrade_contract: str | None = Field(default=None, max_length=100)
+    upgrade_error: str | None = Field(default=None, max_length=80)
+    upgrade_ready: bool | None = None
+    total_bytes: int | None = Field(default=None, ge=0)
+    used_bytes: int | None = Field(default=None, ge=0)
+    admission_reserve_bytes: int | None = Field(default=None, ge=0)
+    write_failures: int | None = Field(default=None, ge=0)
+    read_failures: int | None = Field(default=None, ge=0)
+    durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"] = "UNKNOWN"
+    persistence_verified: bool = False
+    recovery_complete: bool = False
+    error_operation: str | None = Field(default=None, max_length=80)
+    error_code: int | None = None
+
+
+class FirmwareDiagnostics(BaseModel):
+    schema_version: Literal[1] = 1
+    storage: StorageDiagnostics | None = None
+    queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
+    workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
+    reconciliation_mode: str | None = Field(default=None, max_length=40)
+    last_light_check_uptime_ms: int | None = Field(default=None, ge=0)
+    last_tail_audit_uptime_ms: int | None = Field(default=None, ge=0)
+    source_generation: int | None = Field(default=None, ge=0)
+    committed_source_cursor: int | None = Field(default=None, ge=0)
+
+
+class HikvisionTerminalPayload(BaseModel):
+    schema_version: Literal[2]
+    vendor: Literal["hikvision"]
+    protocol: Literal["isapi"]
+    serial: str = Field(min_length=1, max_length=120)
+    ip_address: str = Field(max_length=64)
+    capability_profile: str = Field(max_length=80)
+    qualification_state: Literal["NOT_QUALIFIED"]
+    online: bool
+    connection_state: Literal["ONLINE", "OFFLINE"]
+    stream_open: bool
+    stream_error: int = Field(ge=0)
+    current_event_count: int = Field(ge=0)
+    replay_event_count: int = Field(ge=0)
+    last_stream_message_epoch: int = Field(ge=0)
+    source_storage_failures: int = Field(ge=0)
+    source_queue_depth: int | None = Field(default=None, ge=0)
+    capture_mode: Literal["stream", "poll"] = "stream"
+    poll_interval_seconds: Literal[5] | None = None
+    last_successful_poll_epoch: int | None = Field(default=None, ge=0)
+    poll_error: int | None = Field(default=None, ge=0)
+    durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
+    full_history_required: bool = True
+
+
 class HeartbeatPayload(BaseModel):
+    firmware_family: Literal["zkt", "hikvision"] = "zkt"
     firmware_version: str | None = None
     config_version: int = 1
     comm_key_management: bool = False
@@ -71,7 +147,17 @@ class HeartbeatPayload(BaseModel):
     current_activity: str | None = None
     led_state: str | None = None
     ota: OtaHeartbeatPayload = Field(default_factory=OtaHeartbeatPayload)
+    diagnostics: FirmwareDiagnostics | None = None
     zkt: dict[str, Any] = Field(default_factory=dict)
+    terminal: HikvisionTerminalPayload | None = None
+
+    @model_validator(mode="after")
+    def family_payload(self):
+        if self.firmware_family == "hikvision" and (self.terminal is None or self.zkt):
+            raise ValueError("Hikvision requires a versioned terminal payload")
+        if self.firmware_family == "zkt" and self.terminal is not None:
+            raise ValueError("Legacy ZKT does not accept Hikvision terminal metadata")
+        return self
 
 
 class UserSnapshotRow(BaseModel):
@@ -108,6 +194,7 @@ class UserSnapshotRequest(BaseModel):
 
 
 class AttendanceEventIn(BaseModel):
+    terminal_serial: str | None = Field(default=None, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
     event_uid: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     uid: str | None = Field(default=None, max_length=40)
     terminal_identity_fingerprint: str | None = Field(
@@ -418,7 +505,7 @@ class UserCreateRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=255)
     cnic: str = Field(min_length=13, max_length=15)
     shift_worker: bool = False
-    user_id_override: str | None = Field(default=None, min_length=1, max_length=24)
+    user_id_override: str | None = Field(default=None, min_length=1, max_length=32)
     password: str = Field(min_length=1, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
 
@@ -753,3 +840,15 @@ class CommandUpdate(BaseModel):
 
 class AlertAcknowledgeRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
+
+
+class HikvisionPolicyRequest(BaseModel):
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    source_epoch: str = Field(min_length=1, max_length=64)
+    profile_id: str = Field(min_length=1, max_length=80)
+    success_codes: list[list[StrictInt]] = Field(min_length=1, max_length=32)
+    excluded_codes: list[list[StrictInt]] = Field(default_factory=list, max_length=256)
+    enabled: bool = False
+    reason: str = Field(min_length=10, max_length=500)
+    password: SecretStr
+    idempotency_key: str = Field(min_length=8, max_length=120)

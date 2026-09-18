@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$UnsignedDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha,
+    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,8 @@ function Clear-PlaintextFile {
 }
 
 $unsigned = (Resolve-Path $UnsignedDirectory).Path
+& python scripts/check_firmware_identity.py (Join-Path $unsigned 'zone_lite.bin') --family $FirmwareFamily
+if ($LASTEXITCODE -ne 0) { throw 'Factory application identity does not match firmware family' }
 foreach ($required in @('bootloader.bin', 'zone_lite.bin', 'partition-table.bin', 'ota_data_initial.bin', 'flasher_args.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $unsigned $required) -PathType Leaf)) {
         throw "Unsigned firmware package is missing $required"
@@ -217,6 +220,7 @@ try {
     Copy-Item -LiteralPath $vaultManifest -Destination (Join-Path $output 'vault-manifest.json')
     $package = @{
         schema_version = 1
+        firmware_family = $FirmwareFamily
         target_mac = $DeviceMac.ToLowerInvariant()
         git_sha = $GitSha
         created_at = [DateTime]::UtcNow.ToString('o')
@@ -229,6 +233,7 @@ try {
             --bundle $output `
             --version $env:ADD_FACTORY_VERSION `
             --git-sha $GitSha `
+            --firmware-family $FirmwareFamily `
             --vault-manifest (Join-Path $output 'vault-manifest.json')
         if ($LASTEXITCODE -ne 0) { throw 'Factory manifest generation failed' }
         $signatureBinary = Join-Path $output 'manifest.sig.bin'
