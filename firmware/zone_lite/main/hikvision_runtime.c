@@ -362,7 +362,7 @@ void hikvision_append_telemetry(cJSON *payload)
     /* The common heartbeat started before queue/worker sampling. Stamp its
      * uptime after collection so a later worker tick is not in its future. */
     cJSON *uptime = cJSON_GetObjectItemCaseSensitive(payload, "uptime_seconds");
-    if (cJSON_IsNumber(uptime)) cJSON_SetNumberValue(uptime, esp_timer_get_time() / 1000000);
+    if (cJSON_IsNumber(uptime)) cJSON_SetNumberValue(uptime, (esp_timer_get_time() / 1000000));
 }
 static void source_uploader(void *arg)
 {
