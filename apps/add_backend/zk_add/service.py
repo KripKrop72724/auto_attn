@@ -510,7 +510,9 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
     workers = diagnostics.workers if diagnostics else []
     def activity_fresh(row) -> bool:
         return (payload.uptime_seconds is not None and row.last_activity_uptime_ms is not None
-                and 0 <= payload.uptime_seconds * 1000 - row.last_activity_uptime_ms <= 90_000)
+                # Heartbeat uptime is truncated to seconds; a real worker tick
+                # in that same second can be up to 999 ms ahead of its floor.
+                and -999 <= payload.uptime_seconds * 1000 - row.last_activity_uptime_ms <= 90_000)
 
     workers_failed = any(
         row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}

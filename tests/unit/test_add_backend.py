@@ -6087,5 +6087,7 @@ def test_worker_recovery_requires_fresh_workers_for_the_device_family(db, family
     assert alert().state == "OPEN"
     apply([worker("add_delivery"), worker(source_worker, at=1000)])
     assert alert().state == "OPEN"
-    apply([worker("add_delivery"), worker(source_worker)])
+    apply([worker("add_delivery"), worker(source_worker, at=110000)])
+    assert alert().state == "OPEN"
+    apply([worker("add_delivery", at=100500), worker(source_worker, at=100999)])
     assert alert().state == "RESOLVED"
