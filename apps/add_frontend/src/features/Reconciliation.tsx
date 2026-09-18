@@ -1198,6 +1198,7 @@ export function ReconciliationView({
   const [preflightLoading, setPreflightLoading] = useState(false)
   const [preflightError, setPreflightError] = useState('')
   const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
+  const [historyScope, setHistoryScope] = useState<'ACTIVE_USERS' | 'ALL_RECORDS'>('ACTIVE_USERS')
   const [jobDrawer, setJobDrawer] = useState<ReconciliationJob | null>(null)
   const jobDrawerReturnFocusRef = useRef<HTMLButtonElement>(null)
   const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(
@@ -1486,12 +1487,15 @@ export function ReconciliationView({
             confirmation,
             password,
             idempotency_key: idempotency('full-history'),
+            scope: selected.firmware_family === 'hikvision' ? historyScope : 'ALL_RECORDS',
           }),
         },
       )
       closeDialog()
       toast.notice(
-        'Durable start-of-time reconciliation queued. ADD now owns its checkpoint.',
+        selected.firmware_family === 'hikvision' && historyScope === 'ACTIVE_USERS'
+          ? 'Active-user history queued. ADD freezes the current user list and preserves resumable checkpoints.'
+          : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
       )
       await loadJobs({ quiet: true })
     } catch (error) {
@@ -1534,12 +1538,16 @@ export function ReconciliationView({
     }
   }
 
+  const isHikvision = selected?.firmware_family === 'hikvision'
+  const activeUsersOnly = isHikvision && historyScope === 'ACTIVE_USERS'
+  const startConfirmation = `RECONCILE ${selected?.device_id} ${activeUsersOnly ? 'ACTIVE USERS' : 'FROM START'}`
   const canOpenStart = Boolean(selected && enabled && preflight?.eligible)
   const canStart = Boolean(
     canOpenStart &&
+      (!activeUsersOnly || preflight?.active_user_history?.eligible !== false) &&
       reason.trim().length >= 10 &&
       password &&
-      confirmation === `RECONCILE ${selected?.device_id} FROM START`,
+      confirmation === startConfirmation,
   )
   const activeJobCount =
     jobTotals.active +
@@ -1596,7 +1604,7 @@ export function ReconciliationView({
               >
                 <Icon name="plus" />{' '}
                 {preflight?.ready_now
-                  ? 'Start complete reconcile'
+                  ? isHikvision ? 'Reconcile attendance' : 'Start complete reconcile'
                   : preflight?.eligible
                     ? 'Queue when safe'
                     : 'New complete reconcile'}
@@ -1948,8 +1956,9 @@ export function ReconciliationView({
             <div className="reconciliation-job-list" aria-live="polite">
               {rows.map((job) => {
                 const cutoff = job.terminal.cutoff_count || 0
-                const capturePercent = cutoff
-                  ? Math.min(
+                const capturePercent = job.scope === 'ACTIVE_USERS' && job.active_user_scope?.user_count
+                  ? job.capture_certified_at ? 100 : Math.min(99, Math.round(100 * job.active_user_scope.completed_users / job.active_user_scope.user_count))
+                  : cutoff ? Math.min(
                       100,
                       Math.round((job.progress.scanned / cutoff) * 100),
                     )
@@ -2002,6 +2011,9 @@ export function ReconciliationView({
                           {job.connector?.zone_id || 'UNKNOWN ZONE'}
                         </p>
                         <h3>{job.connector?.display_name || job.job_id}</h3>
+                        {job.mode === 'HIKVISION_SERIAL_HISTORY' && <p>{job.scope === 'ACTIVE_USERS'
+                          ? `Active-user history · ${job.active_user_scope?.completed_users ?? 0}/${job.active_user_scope?.user_count ?? 0} users verified · excludes former users`
+                          : 'Full terminal audit · all records'}</p>}
                         <small>
                           {job.terminal.serial || 'serial pending'} · requested{' '}
                           {dateTime(job.requested_at)}
@@ -2026,7 +2038,7 @@ export function ReconciliationView({
                     <div className="reconciliation-progress-grid">
                       <section>
                         <div>
-                          <strong>Terminal capture</strong>
+                          <strong>{job.scope === 'ACTIVE_USERS' ? 'User history verified' : 'Terminal capture'}</strong>
                           <span>{capturePercent}%</span>
                         </div>
                         <div
@@ -2646,7 +2658,7 @@ export function ReconciliationView({
           title={
             dialog.mode === 'start'
               ? preflight?.ready_now
-                ? 'Start complete terminal reconciliation'
+                ? activeUsersOnly ? 'Reconcile active users — all retained history' : 'Full terminal audit — all records'
                 : 'Queue reconciliation when safe'
               : `${humanize(dialog.action)} reconciliation`
           }
@@ -2675,6 +2687,24 @@ export function ReconciliationView({
                 </p>
               </div>
             </div>
+            {dialog.mode === 'start' && isHikvision && (
+              <label>
+                History scope
+                <select value={historyScope} onChange={(event) => {
+                  setHistoryScope(event.target.value as 'ACTIVE_USERS' | 'ALL_RECORDS')
+                  setConfirmation('')
+                }}>
+                  <option value="ACTIVE_USERS">Active users — all retained history (recommended)</option>
+                  <option value="ALL_RECORDS">Full terminal audit — all records</option>
+                </select>
+                {activeUsersOnly && preflight?.active_user_history && <p>{preflight.active_user_history.eligible
+                  ? `${preflight.active_user_history.user_count} active users in the verified snapshot.`
+                  : preflight.active_user_history.reason}</p>}
+                <small>{activeUsersOnly
+                  ? 'Freezes the current complete user snapshot. Searches only those employees’ retained history; former users are excluded. Refresh terminal users first if the snapshot is older than 15 minutes. No records are deleted.'
+                  : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
+              </label>
+            )}
             <label>
               Audited reason
               <textarea
@@ -2686,7 +2716,7 @@ export function ReconciliationView({
             </label>
             {dialog.mode === 'start' && selected && (
               <label>
-                Type <code>{`RECONCILE ${selected.device_id} FROM START`}</code>
+                Type <code>{startConfirmation}</code>
                 <input
                   value={confirmation}
                   onChange={(event) => setConfirmation(event.target.value)}

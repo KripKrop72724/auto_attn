@@ -18,10 +18,111 @@ from zk_add.hikvision_history import (
     record_digest,
     coverage_certificate,
 )
-from zk_add.models import ReconciliationJob, AttendanceEvent
-from zk_add.time_utils import utc_now
+from zk_add.models import ReconciliationJob, AttendanceEvent, DeviceUser, DeviceUserSnapshot
+from zk_add.time_utils import utc_now, ensure_utc
 
 MODE = "HIKVISION_SERIAL_HISTORY"
+ACTIVE_SCOPE = "ACTIVE_USERS"
+# This exact profile must pass the live employee-filter/serial-seek qualification.
+EMPLOYEE_FILTER_PROFILE = "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1"
+
+
+def active_user_snapshot(session, connector):
+    terminal = connector.zkt_device
+    policy = session.get(HikvisionPolicy, connector.id)
+    if not policy or policy.profile_id != EMPLOYEE_FILTER_PROFILE:
+        raise ValueError("Active-user history is not qualified for this terminal profile.")
+    snapshot = (
+        session.get(DeviceUserSnapshot, terminal.identity_snapshot_id)
+        if terminal and terminal.identity_snapshot_id
+        else None
+    )
+    if (
+        not terminal
+        or not terminal.snapshot_complete
+        or not terminal.identity_snapshot_stable
+        or not snapshot
+        or not snapshot.complete
+        or not snapshot.stable
+        or snapshot.zkt_device_id != terminal.id
+        or snapshot.revision != terminal.identity_snapshot_revision
+        or utc_now() - ensure_utc(snapshot.received_at) > timedelta(minutes=15)
+    ):
+        raise ValueError(
+            "Refresh terminal users: a complete, stable snapshot from the last 15 minutes is required."
+        )
+    users = list(
+        session.scalars(
+            select(DeviceUser)
+            .where(
+                DeviceUser.zkt_device_id == terminal.id,
+                DeviceUser.present.is_(True),
+                DeviceUser.lifecycle_state == "ACTIVE",
+                DeviceUser.snapshot_revision == snapshot.revision,
+            )
+            .order_by(DeviceUser.user_id)
+        )
+    )
+    employees = [u.user_id for u in users]
+    if (
+        not employees
+        or len(employees) != snapshot.user_count
+        or len(set(employees)) != len(employees)
+        or any(not e.isascii() or not e.isdigit() or len(e) > 32 for e in employees)
+    ):
+        raise ValueError("The active-user snapshot is empty or incomplete; refresh terminal users.")
+    return {
+        "scope": ACTIVE_SCOPE,
+        "employee_numbers": employees,
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_revision": snapshot.revision,
+        "snapshot_received_at": ensure_utc(snapshot.received_at).isoformat(),
+        "snapshot_digest": record_digest({"employee_numbers": employees}),
+        "user_index": 0,
+        "completed_records": 0,
+        "user_certificates": [],
+        "phase": "SCOPE_FIRST",
+    }
+
+
+def _finish_active_user(job, data, certificate):
+    employee = data["employee_numbers"][data["user_index"]]
+    certificates = list(data["user_certificates"])
+    certificates.append({"employee_number": employee, **certificate})
+    data["user_certificates"] = certificates
+    data["completed_records"] += certificate["record_count"]
+    data["user_index"] += 1
+    job.scanned_count = job.add_durable_count = data["completed_records"]
+    if data["user_index"] == len(data["employee_numbers"]):
+        job.cutoff_count = data["completed_records"]
+        job.capture_certificate = {
+            "source_protocol": "hikvision-isapi-v1",
+            "scope": ACTIVE_SCOPE,
+            "search_strategy": "employee-filtered-serial-seek-v1",
+            "snapshot_id": data["snapshot_id"],
+            "snapshot_digest": data["snapshot_digest"],
+            "employee_numbers": data["employee_numbers"],
+            "user_count": data["user_index"],
+            "cutoff_serial": data["scope_cutoff"],
+            "record_count": data["completed_records"],
+            "user_certificates": certificates,
+            "oracle_assurance": "NOT_EVALUATED",
+            "excluded_history": "Employees outside the frozen active-user snapshot were not scanned.",
+        }
+        data["phase"] = "SCOPE_VERIFY"
+    else:
+        for key in (
+            "first_serial",
+            "last_serial",
+            "initial_count",
+            "first_anchor",
+            "last_anchor",
+            "checkpoint",
+            "first_pass",
+            "second_pass",
+        ):
+            data.pop(key, None)
+        data["phase"] = "FIRST"
 
 
 class HikvisionReconciliationState(Base):
@@ -87,28 +188,45 @@ def preflight(session, connector):
         waiting.append(
             {"code": "WAITING_FOR_DEVICE", "message": "Waiting for the terminal and ESP."}
         )
+    try:
+        snapshot = active_user_snapshot(session, connector)
+        active_scope = {
+            "eligible": not hard,
+            "user_count": len(snapshot["employee_numbers"]),
+            "snapshot_received_at": snapshot["snapshot_received_at"],
+            "reason": None,
+        }
+    except ValueError as exc:
+        active_scope = {"eligible": False, "user_count": None, "reason": str(exc)}
     return {
+        "active_user_history": active_scope,
         "eligible": not hard,
         "ready_now": not hard and not waiting,
         "hard_blockers": hard,
         "waitable_blockers": waiting,
         "connector": {"connector_id": connector.connector_id, "device_id": connector.device_id},
-        "terminal": {"serial": terminal.serial, "model": terminal.model,
-                     "connection_state": terminal.connection_state,
-                     "attendance_count": terminal.attendance_count, "user_count": terminal.user_count,
-                     "range_resume_verified": False, "serial_search_enabled": bool(policy and policy.enabled)} if terminal else None,
+        "terminal": {
+            "serial": terminal.serial,
+            "model": terminal.model,
+            "connection_state": terminal.connection_state,
+            "attendance_count": terminal.attendance_count,
+            "user_count": terminal.user_count,
+            "range_resume_verified": False,
+            "serial_search_enabled": bool(policy and policy.enabled),
+        }
+        if terminal
+        else None,
         "coverage": None,
         "source_protocol": "hikvision-isapi-v1",
     }
 
 
-def initialize(session, job, connector):
+def initialize(session, job, connector, scope="ALL_RECORDS"):
+    data = active_user_snapshot(session, connector) if scope == ACTIVE_SCOPE else {"phase": "FIRST"}
     policy = session.get(HikvisionPolicy, connector.id)
     job.mode = MODE
     session.add(
-        HikvisionReconciliationState(
-            job_id=job.id, source_epoch=policy.source_epoch, data={"phase": "FIRST"}
-        )
+        HikvisionReconciliationState(job_id=job.id, source_epoch=policy.source_epoch, data=data)
     )
 
 
@@ -130,7 +248,9 @@ def assignment(session, job, connector):
             }
         }
         cond = request["AcsEventCond"]
-        if phase == "LAST":
+        if phase == "SCOPE_LAST":
+            cond["searchResultPosition"] = data["scope_initial_count"] - 1
+        elif phase == "LAST":
             cond["searchResultPosition"] = data["initial_count"] - 1
         elif phase in {"SCAN1", "SCAN2"}:
             request = SerialCheckpoint(**data["checkpoint"]).request(20)
@@ -141,6 +261,16 @@ def assignment(session, job, connector):
             pass
         elif phase == "VERIFY_LAST":
             cond.update(beginSerialNo=data["last_serial"], endSerialNo=data["last_serial"])
+        if data.get("scope") == ACTIVE_SCOPE and phase not in {
+            "SCOPE_FIRST",
+            "SCOPE_LAST",
+            "SCOPE_VERIFY",
+            "SCOPE_EMPTY_VERIFY",
+        }:
+            cond = request["AcsEventCond"]
+            cond["employeeNoString"] = data["employee_numbers"][data["user_index"]]
+            cond.setdefault("beginSerialNo", 1)
+            cond.setdefault("endSerialNo", data["scope_cutoff"])
         data.update(request=request, token=str(uuid4()))
         state.data = data
     job.status = "RUNNING"
@@ -209,10 +339,36 @@ def apply_page(session: Session, connector, payload: dict):
         or page.get("searchID") != request["searchID"]
     ):
         raise CoverageError("INVALID_SOURCE_PAGE")
+    phase = data["phase"]
+    scoped = data.get("scope") == ACTIVE_SCOPE
+    employee = request.get("employeeNoString")
     evidence_ids = []
+    if employee is not None and any(
+        not isinstance(row, dict)
+        or row.get("employeeNoString") != employee
+        or type(row.get("serialNo")) is not int
+        or not request["beginSerialNo"] <= row["serialNo"] <= request["endSerialNo"]
+        for row in rows
+    ):
+        job.status, job.phase = "NEEDS_ATTENTION", "SAFETY_HOLD"
+        job.review_required, job.error_code = True, "EMPLOYEE_FILTER_OR_SCOPE_MISMATCH"
+        job.wait_reason = "SOURCE_COVERAGE_REVIEW"
+        data.pop("request", None)
+        data.pop("token", None)
+        state.data = data
+        # Retain the response digest but never release an out-of-scope observation.
+        session.add(
+            HikvisionReconciliationPage(
+                job_id=job.id, token=token, response_digest=digest, evidence_ids=[], phase=phase
+            )
+        )
+        session.flush()
+        return {"job_id": job.job_id, "token": token, "durable": True}
     # Preserve raw observations before interpreting record fields. Invalid-time or
     # identity records remain evidenced and do not stop later valid source records.
-    for raw in rows:
+    for raw in (
+        [] if phase in {"SCOPE_FIRST", "SCOPE_LAST", "SCOPE_VERIFY", "SCOPE_EMPTY_VERIFY"} else rows
+    ):
         text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         sha = hashlib.sha256(text.encode()).hexdigest()
         preserve_observation(
@@ -239,14 +395,56 @@ def apply_page(session: Session, connector, payload: dict):
         )
     phase = data["phase"]
     try:
-        if phase in {"SCAN1", "SCAN2"}:
+        if (
+            phase in {"SCOPE_FIRST", "SCOPE_EMPTY_VERIFY"}
+            and count == 0
+            and total == 0
+            and page.get("responseStatusStrg") == "NO MATCH"
+        ):
+            if phase == "SCOPE_FIRST":
+                data["phase"] = "SCOPE_EMPTY_VERIFY"
+            else:
+                data["scope_cutoff"] = 0
+                for _ in data["employee_numbers"]:
+                    _finish_active_user(
+                        job, data, {"record_count": 0, "matching_empty_observations": 2}
+                    )
+                job.capture_certified_at = utc_now()
+                data["phase"] = "SEALED"
+        elif phase == "SCOPE_VERIFY":
+            if count != 1 or record_digest(rows[0]) != data["scope_first_anchor"]:
+                raise CoverageError("RETAINED_BOUNDARY_CHANGED")
+            job.capture_certified_at = utc_now()
+            data["phase"] = "SEALED"
+        elif phase == "SCOPE_FIRST":
+            if count != 1 or type(rows[0].get("serialNo")) is not int:
+                raise CoverageError("GLOBAL_BOUNDARY_NOT_AVAILABLE")
+            data.update(
+                scope_first=rows[0]["serialNo"],
+                scope_first_anchor=record_digest(rows[0]),
+                scope_initial_count=total,
+                phase="SCOPE_LAST",
+            )
+        elif phase == "SCOPE_LAST":
+            if (
+                count != 1
+                or type(rows[0].get("serialNo")) is not int
+                or total < data["scope_initial_count"]
+                or rows[0]["serialNo"] < data["scope_first"]
+            ):
+                raise CoverageError("GLOBAL_BOUNDARY_CHANGED")
+            data.update(scope_cutoff=rows[0]["serialNo"], phase="FIRST")
+        elif phase in {"SCAN1", "SCAN2"}:
             _, checkpoint = SerialCheckpoint(**data["checkpoint"]).stage_page(
                 data["request"], response
             )
             data["checkpoint"] = asdict(checkpoint)
-            job.scanned_count = checkpoint.committed_count
+            base = data.get("completed_records", 0)
+            job.scanned_count = base + (
+                checkpoint.committed_count if phase == "SCAN1" else checkpoint.retained_count
+            )
             if phase == "SCAN1":
-                job.add_durable_count = checkpoint.committed_count
+                job.add_durable_count = base + checkpoint.committed_count
             if checkpoint.enumeration_complete:
                 if phase == "SCAN1":
                     data["first_pass"] = asdict(checkpoint)
@@ -269,16 +467,21 @@ def apply_page(session: Session, connector, payload: dict):
         ):
             if phase == "FIRST":
                 data["phase"] = "VERIFY_EMPTY"
-                job.cutoff_count = 0
+                if not scoped:
+                    job.cutoff_count = 0
             else:
-                job.capture_certificate = {
+                certificate = {
                     "source_protocol": "hikvision-isapi-v1",
                     "record_count": 0,
                     "matching_empty_observations": 2,
                     "oracle_assurance": "NOT_EVALUATED",
                 }
-                job.capture_certified_at = utc_now()
-                data["phase"] = "SEALED"
+                if scoped:
+                    _finish_active_user(job, data, certificate)
+                else:
+                    job.capture_certificate = certificate
+                    job.capture_certified_at = utc_now()
+                    data["phase"] = "SEALED"
         else:
             if (
                 count != 1
@@ -307,7 +510,8 @@ def apply_page(session: Session, connector, payload: dict):
                     ),
                     phase="SCAN1",
                 )
-                job.cutoff_count = total
+                if not scoped:
+                    job.cutoff_count = total
             elif phase == "VERIFY_FIRST":
                 if serial != data["first_serial"] or record_digest(rows[0]) != data["first_anchor"]:
                     raise CoverageError("RETAINED_BOUNDARY_CHANGED")
@@ -321,9 +525,12 @@ def apply_page(session: Session, connector, payload: dict):
                     last_anchor_before=data["last_anchor"],
                     last_anchor_after=record_digest(rows[0]),
                 )
-                job.capture_certificate = certificate
-                job.capture_certified_at = utc_now()
-                data["phase"] = "SEALED"
+                if scoped:
+                    _finish_active_user(job, data, certificate)
+                else:
+                    job.capture_certificate = certificate
+                    job.capture_certified_at = utc_now()
+                    data["phase"] = "SEALED"
             else:
                 raise CoverageError("UNKNOWN_SOURCE_PHASE")
     except CoverageError as exc:
@@ -357,7 +564,12 @@ def apply_page(session: Session, connector, payload: dict):
 
 
 def refresh_assurance(session, job):
-    if not job.capture_certified_at or job.status in {"PAUSED", "NEEDS_ATTENTION", "CANCELLED", "INVALIDATED"}:
+    if not job.capture_certified_at or job.status in {
+        "PAUSED",
+        "NEEDS_ATTENTION",
+        "CANCELLED",
+        "INVALIDATED",
+    }:
         return job
     # Membership comes from committed pages, never a serial gap or event-count guess.
     ids = set()
@@ -408,6 +620,7 @@ def refresh_assurance(session, job):
     if not holds and not pending and len(ids) == job.cutoff_count:
         job.oracle_certificate = {
             "source_protocol": "hikvision-isapi-v1",
+            "scope": (job.capture_certificate or {}).get("scope", "ALL_RECORDS"),
             "confirmed": confirmed,
             "non_attendance": len(ids) - targets,
         }
