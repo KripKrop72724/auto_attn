@@ -172,3 +172,15 @@ def test_hil_assignment_is_fail_closed_to_one_hardware_id() -> None:
     assert "row.hardware_id.lower() == hil_target_mac" in ota
     assert "connector.hardware_id.lower() != target" in ota
     assert "HIL campaign requires exactly one eligible connector" in ota
+
+
+def test_hikvision_canary_has_independent_exact_target(monkeypatch):
+    from zk_add.ota import FirmwareRelease, configured_hil_mac
+    monkeypatch.setattr(settings, 'firmware_hil_target_mac', 'aa:bb:cc:dd:ee:01')
+    monkeypatch.setattr(settings, 'firmware_hikvision_hil_target_mac', 'aa:bb:cc:dd:ee:02')
+    hik = FirmwareRelease(manifest={'firmware_family': 'hikvision', 'project_name': 'zone_lite_hikvision'})
+    zkt = FirmwareRelease(manifest={})
+    assert configured_hil_mac(hik) == 'aa:bb:cc:dd:ee:02'
+    assert configured_hil_mac(zkt) == 'aa:bb:cc:dd:ee:01'
+    monkeypatch.setattr(settings, 'firmware_hikvision_hil_target_mac', None)
+    assert configured_hil_mac(hik) == ''  # cannot borrow the ZKT permission

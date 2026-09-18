@@ -1,3 +1,4 @@
+import { deviceActivity } from '../hikvisionHealth'
 import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { api } from '../api'
 import {
@@ -231,7 +232,7 @@ export function DeviceDrawer({
   )
   return (
     <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
-      <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} /><span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${device.current_activity || 'Idle'} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
+      <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} /><span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${deviceActivity(device)} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
       <div className="tabs" role="tablist" aria-label="Device details">
         {drawerTabs.map((item, index) => (
           <button
@@ -262,18 +263,27 @@ export function DeviceDrawer({
             <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
           </article>
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
-          <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || 'Awaiting terminal'}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
+          <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
           {device.firmware_family === 'hikvision' ? <article className="detail-card">
             <p className="eyebrow">HIKVISION CAPTURE HEALTH</p>
+            <p>{deviceActivity(device)}</p>
             <h3>{device.hikvision?.capture_mode === 'poll' ? `${device.hikvision.poll_interval_seconds ?? 'Unknown'}-second polling` : 'Awaiting capture telemetry'}</h3>
             <dl>
               <div><dt>Last successful check</dt><dd>{device.hikvision?.last_successful_poll_epoch ? relativeTime(new Date(device.hikvision.last_successful_poll_epoch * 1000).toISOString()) : 'Not reported'}</dd></div>
               <div><dt>Queued source records</dt><dd>{device.hikvision?.source_queue_depth ?? 'Not reported'}</dd></div>
               <div><dt>Saved event serial</dt><dd>{device.hikvision?.durable_poll_cursor ?? 'Not reported'}</dd></div>
               <div><dt>Last polling interval</dt><dd>{device.hikvision?.last_poll_interval_ms ? `${(device.hikvision.last_poll_interval_ms / 1000).toFixed(1)} seconds` : 'Not reported'}</dd></div>
-              <div><dt>Polling status</dt><dd>{device.hikvision?.poll_error === 0 ? 'Healthy' : 'Awaiting a successful check'}</dd></div>
+              {device.hikvision?.poll_stage && <div><dt>Last request stage</dt><dd>{device.hikvision.poll_stage.replaceAll('_', ' ')} · HTTP {device.hikvision.poll_http_status || 'no response'}</dd></div>}
+              {device.hikvision?.consecutive_poll_failures != null && <div><dt>Consecutive failed checks</dt><dd>{device.hikvision.consecutive_poll_failures}</dd></div>}
+              <div><dt>Polling status</dt><dd>{deviceActivity(device)}</dd></div>
             </dl>
+            {device.hikvision?.light_reconcile && <dl aria-label="Automatic light reconciliation">
+              <div><dt>Light history audit</dt><dd>{device.hikvision.light_reconcile.state.replaceAll('_', ' ').toLowerCase()}</dd></div>
+              <div><dt>Records preserved this sweep</dt><dd>{device.hikvision.light_reconcile.scanned}</dd></div>
+              <div><dt>Last completed sweep</dt><dd>{device.hikvision.light_reconcile.last_completed_epoch ? dateTime(new Date(device.hikvision.light_reconcile.last_completed_epoch * 1000).toISOString()) : 'Not yet completed'}</dd></div>
+              <div><dt>Audit policy</dt><dd>20 records per page, at most one page every 30 seconds. Repeats six hours after completion.</dd></div>
+            </dl>}
             <p>Live polling continues during reconciliation. Slow terminal responses can extend the target interval. Full history and Oracle assurance are reported in Reconciliation.</p>
           </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>

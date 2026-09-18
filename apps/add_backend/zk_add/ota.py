@@ -278,6 +278,13 @@ def version_at_least(running: str | None, minimum: str) -> bool:
     return bool(running_version and minimum_version and running_version >= minimum_version)
 
 
+def configured_hil_mac(release: FirmwareRelease) -> str:
+    value = (settings.firmware_hikvision_hil_target_mac
+             if release_family(release.manifest or {}) == "hikvision"
+             else settings.firmware_hil_target_mac)
+    return (value or "").strip().lower()
+
+
 def _scope_exclusion_reason(
     connector: Connector, *, hil_target_mac: str = "", minimum_version: str = "2.2.0"
 ) -> str | None:
@@ -423,7 +430,7 @@ def _campaign_scope(
     if ordered_target:
         hil_target_mac = ordered_target.mac
     elif release.state == "HIL_ONLY":
-        configured_target = (settings.firmware_hil_target_mac or "").strip().lower()
+        configured_target = configured_hil_mac(release)
         if not settings.firmware_hil_enabled or not configured_target:
             raise ValueError("Firmware HIL quarantine is disabled.")
         if hil_target_mac != configured_target:
@@ -785,7 +792,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
                 return None
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-            configured = (settings.firmware_hil_target_mac or "").strip().lower()
+            configured = configured_hil_mac(release)
             if not settings.firmware_hil_enabled or not target or target != configured:
                 return None
             if connector.hardware_id.lower() != target:
@@ -890,6 +897,8 @@ def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]
     return {
         "release_id": row.release_id,
         "version": row.version,
+        "firmware_family": release_family(row.manifest or {}),
+        "display_name": f"{'HIK' if release_family(row.manifest or {}) == 'hikvision' else 'ZKT'} Zone Lite {row.version}",
         "git_sha": row.git_sha,
         "image_sha256": row.image_sha256,
         "image_size": row.image_size,
@@ -1270,7 +1279,7 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         if campaign is None or campaign.status != "ACTIVE" or deployment.status not in ACTIVE_DEPLOYMENT_STATES:
             raise ValueError("HIL firmware campaign is not active.")
         target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-        configured = (settings.firmware_hil_target_mac or "").strip().lower()
+        configured = configured_hil_mac(release)
         connector = session.get(Connector, grant.connector_id)
         ordered_target = _ordered_hil_target(session, release)
         if ordered_target:

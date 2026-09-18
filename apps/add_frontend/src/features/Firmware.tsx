@@ -1,3 +1,6 @@
+const firmwareName = (release: { release_id?: string; version?: string | null; firmware_family?: string }) =>
+  `${release.firmware_family === 'hikvision' || release.release_id?.includes('hikvision') ? 'HIK' : 'ZKT'} Zone Lite ${release.version || 'unknown'}`
+
 import {
   useCallback,
   useEffect,
@@ -823,7 +826,7 @@ function CampaignCreator({
                   .filter((release) => release.state !== 'REVOKED')
                   .map((release) => (
                     <option key={release.release_id} value={release.release_id}>
-                      Zone Lite {release.version} ·{' '}
+                      {firmwareName(release)} ·{' '}
                       {release.state === 'HIL_ONLY'
                         ? 'HIL-only exact MAC'
                         : 'Production'}
@@ -1424,7 +1427,7 @@ export function FirmwareView({
                 <p className="eyebrow">NATIONAL PRODUCTION CHANNEL</p>
                 <h2>
                   {productionRelease
-                    ? `Zone Lite ${productionRelease.version}`
+                    ? firmwareName(productionRelease)
                     : 'No production release available'}
                 </h2>
                 <p>
@@ -1453,7 +1456,7 @@ export function FirmwareView({
               <p className="eyebrow">HIL QUARANTINE</p>
               <h3>
                 {hilRelease
-                  ? `Zone Lite ${hilRelease.version}`
+                  ? firmwareName(hilRelease)
                   : 'No active HIL candidate'}
               </h3>
               <p>
@@ -1639,7 +1642,7 @@ export function FirmwareView({
                           ? 'EXACT-MAC HIL CANDIDATE'
                           : 'REVOKED RELEASE'}
                     </p>
-                    <h3>Zone Lite {release.version}</h3>
+                    <h3>{firmwareName(release)}</h3>
                     <small>{release.release_id}</small>
                   </span>
                   <StatusBadge state={release.state} />
@@ -1853,7 +1856,7 @@ export function FirmwareView({
                 <option value="">All releases</option>
                 {catalogReleases.map((release) => (
                   <option key={release.release_id} value={release.release_id}>
-                    Zone Lite {release.version}
+                    {firmwareName(release)}
                   </option>
                 ))}
               </select>
@@ -2095,7 +2098,7 @@ export function FirmwareView({
       {revokeRelease && (
         <Dialog
           titleId="revoke-firmware-title"
-          title={`Revoke Zone Lite ${revokeRelease.version}`}
+          title={`Revoke ${firmwareName(revokeRelease)}`}
           description="Revocation blocks new offers and pauses active campaigns for these exact signed bytes."
           onClose={() => {
             setRevokeRelease(null)

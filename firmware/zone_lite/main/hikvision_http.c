@@ -7,6 +7,9 @@
 #include <strings.h>
 #include <stdio.h>
 
+static int last_http_status;
+int hik_http_last_status(void) { return last_http_status; }
+
 typedef struct { bool digest; char content_type[300]; } headers_t;
 static esp_err_t header_event(esp_http_client_event_t *e)
 {
@@ -33,6 +36,7 @@ static hik_result_t open_request(esp_http_client_method_t method, const char *pa
     const char *body, headers_t *headers, esp_http_client_handle_t *out)
 {
     *out = NULL;
+    last_http_status = 0;
     if (!config_valid() || !path || strncmp(path, "/ISAPI/", 7) || strlen(path) > 180) return HIK_CONFIGURATION;
     const zone_config_t *c = zone_config_get();
     char url[300];
@@ -63,6 +67,7 @@ static hik_result_t open_request(esp_http_client_method_t method, const char *pa
         }
         if (sent != size || esp_http_client_fetch_headers(client) < 0) break;
         int status = esp_http_client_get_status_code(client);
+        last_http_status = status;
         if (status == 200) { *out = client; return HIK_OK; }
         if (status != 401) { result = HIK_HTTP_STATUS; break; }
         result = HIK_AUTH;

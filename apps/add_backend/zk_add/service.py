@@ -752,6 +752,43 @@ def update_heartbeat(
         elif reported_state == "SESSION_REFRESH":
             connector.lifecycle_state = "ONLINE"
         if payload.firmware_family == "hikvision":
+            # Transport heartbeats prove ESP connectivity, not terminal capture.
+            reasons = {
+                1: ("CONFIGURATION", "Hikvision terminal configuration is incomplete or invalid."),
+                2: ("NETWORK", "ESP is connected to ADD, but the Hikvision terminal is unreachable or its request timed out."),
+                3: ("AUTH", "Hikvision terminal rejected authentication; check its configured credentials."),
+                4: ("HTTP_STATUS", "Hikvision terminal returned an unsuccessful HTTP response."),
+                5: ("OVERSIZED", "Hikvision terminal response exceeds the supported size."),
+                6: ("SOURCE_CHANGED", "Hikvision identity or saved history anchor changed; source review is required."),
+                7: ("INVALID_RESPONSE", "Hikvision terminal returned an invalid or inconsistent response."),
+                8: ("STORAGE", "Hikvision records could not be committed to local storage."),
+            }
+            error = int(zkt_payload.get("poll_error") or 0)
+            healthy = reported_state == "ONLINE" and error == 0
+            if not healthy:
+                suffix, message = reasons.get(error, ("WAITING", "ESP is connected; waiting for the first successful Hikvision terminal check."))
+                code = "HIK_" + suffix
+                connector.lifecycle_state = "DEGRADED"
+                connector.last_error_code, connector.last_error_message = code, message
+                upsert_alert(session, connector, code="HIK_CAPTURE_UNHEALTHY", severity="WARNING",
+                             message=message, details={"reason": code, "poll_error": error,
+                             "terminal_address": zkt.ip_address})
+            else:
+                resolve_alert(session, connector, code="HIK_CAPTURE_UNHEALTHY")
+                if (connector.last_error_code or "").startswith("HIK_"):
+                    connector.last_error_code = None
+                    connector.last_error_message = None
+            audit = payload.terminal.light_reconcile if payload.terminal else None
+            if audit and audit.state == "BLOCKED":
+                message = "Automatic Hikvision history audit is blocked; inspect its source or storage error in live logs."
+                upsert_alert(session, connector, code="HIK_LIGHT_RECONCILE_BLOCKED", severity="WARNING",
+                             message=message, details=audit.model_dump())
+                connector.lifecycle_state = "DEGRADED"
+                if healthy:
+                    connector.last_error_code = "HIK_LIGHT_RECONCILE_BLOCKED"
+                    connector.last_error_message = message
+            elif audit and audit.state in {"SCANNING", "COMPLETE"}:
+                resolve_alert(session, connector, code="HIK_LIGHT_RECONCILE_BLOCKED")
             clock = payload.terminal.clock_sample if payload.terminal else None
             # A missing/stale sample must not leave the previous clock looking live.
             if clock and 0 <= now.timestamp() - clock.sampled_epoch <= 180:
@@ -4619,6 +4656,7 @@ def serialize_connector(connector: Connector) -> dict:
         "last_seen_at": connector.last_seen_at,
         "current_activity": connector.current_activity,
         "last_error_code": connector.last_error_code,
+        "last_error_message": connector.last_error_message,
         "is_spare": connector.is_spare,
         "zkt": None
         if zkt is None

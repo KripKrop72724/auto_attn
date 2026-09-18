@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $source = (Resolve-Path $SourceDirectory).Path
 New-Item -ItemType Directory -Path $StoreDirectory -Force | Out-Null
 $store = (Resolve-Path $StoreDirectory).Path
-$required = @('manifest.json', 'manifest.sig', "zone-lite-$Version.bin", 'SHA256SUMS')
+$required = @('manifest.json', 'manifest.sig', 'SHA256SUMS')
 foreach ($name in $required) {
     if (-not (Test-Path (Join-Path $source $name) -PathType Leaf)) {
         throw "Firmware package is missing $name"
@@ -20,7 +20,8 @@ foreach ($name in $required) {
 
 $manifest = Get-Content (Join-Path $source 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $Version) { throw 'Manifest version does not match requested version' }
-if ($manifest.image_name -ne "zone-lite-$Version.bin") { throw 'Manifest image name is invalid' }
+$expectedImage = $(if ($manifest.firmware_family -eq 'hikvision') { "zone-lite-hikvision-$Version.bin" } else { "zone-lite-$Version.bin" })
+if ($manifest.image_name -ne $expectedImage) { throw 'Manifest image name is invalid' }
 $image = Join-Path $source $manifest.image_name
 $actualHash = (Get-FileHash $image -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualHash -ne $manifest.image_sha256) { throw 'Firmware image SHA-256 does not match manifest' }

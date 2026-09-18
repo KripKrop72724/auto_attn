@@ -4040,6 +4040,11 @@ bool add_connector_is_connected(void)
 
 bool add_connector_boot_health_ready(void)
 {
+#ifdef ZONE_LITE_HIKVISION
+    return storage_upgrade_ready() && add_connector_is_connected() &&
+        s_heartbeat_task_handle && add_connector_delivery_healthy() &&
+        hikvision_boot_health_ready();
+#else
     bool ready = false;
     if (!storage_upgrade_ready()) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -4073,11 +4078,19 @@ bool add_connector_boot_health_ready(void)
         xSemaphoreGive(s_lock);
     }
     return ready;
+#endif
 }
 
 bool add_connector_ota_reconcile_ready(void)
 {
     if (!add_connector_boot_health_ready()) return false;
+#ifdef ZONE_LITE_HIKVISION
+    /* Boot recovery has validated source custody and its persisted checkpoint.
+     * Empty means all retained local observations have an ADD durable receipt;
+     * it does not certify terminal history or Oracle coverage. */
+    uint32_t pending;
+    return qs_snapshot(QS_HIK_SOURCE, &pending) && pending == 0;
+#else
     bool ready = false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         ready = s_zkt.add_source_coverage_certified && s_zkt.attendance_count >= 0 &&
@@ -4085,6 +4098,7 @@ bool add_connector_ota_reconcile_ready(void)
         xSemaphoreGive(s_lock);
     }
     return ready;
+#endif
 }
 
 bool add_connector_consume_connected_edge(void)

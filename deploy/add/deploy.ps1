@@ -458,6 +458,12 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_ENABLED)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGETS_JSON)) {
     $environment["ADD_FIRMWARE_HIL_TARGETS_JSON"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGETS_JSON
 }
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIKVISION_HIL_TARGET_MAC)) {
+    if ($env:ADD_DEPLOY_FIRMWARE_HIKVISION_HIL_TARGET_MAC -notmatch '^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$') {
+        throw 'Hikvision OTA canary requires an exact ESP MAC.'
+    }
+    $environment["ADD_FIRMWARE_HIKVISION_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIKVISION_HIL_TARGET_MAC
+}
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC)) {
     $environment["ADD_FIRMWARE_HIL_TARGET_MAC"] = $env:ADD_DEPLOY_FIRMWARE_HIL_TARGET_MAC
 }
