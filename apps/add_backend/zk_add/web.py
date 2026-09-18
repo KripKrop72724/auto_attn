@@ -1145,6 +1145,7 @@ async def start_full_history_reconciliation(
             reason=body.reason,
             confirmation=body.confirmation,
             idempotency_key=body.idempotency_key,
+            scope=body.scope,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

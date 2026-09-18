@@ -211,12 +211,12 @@ const scheduler = {
   history_backlog_limit: 20000,
 }
 
-function Harness() {
+function Harness({ terminal = device }: { terminal?: Device } = {}) {
   const toast = useToast()
   return (
     <>
       <ReconciliationView
-        devices={[device]}
+        devices={[terminal]}
         revision={0}
         toast={toast}
       />
@@ -431,5 +431,45 @@ describe('Reviewed source-exception continuation', () => {
       ),
     )
     expect(screen.queryByRole('tab', { name: /Employee repair/i })).toBeNull()
+  })
+})
+
+
+describe('Hikvision reconciliation scope', () => {
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+  it.each(['ACTIVE_USERS', 'ALL_RECORDS'] as const)('submits explicit %s scope with matching confirmation', async (scope) => {
+    window.history.replaceState(null, '', '/reconciliation')
+    const hik = { ...device, firmware_family: 'hikvision' as const }
+    const fallback = reconciliationFetch()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(hik)
+      if (path.endsWith('/reconciliations/preflight')) return json({
+        eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+        terminal: null, coverage: null, source_protocol: 'hikvision-isapi-v1',
+      })
+      if (path.endsWith('/reconciliations/full-history')) return json(job())
+      return fallback(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness terminal={hik} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
+    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(start)
+    const select = screen.getByLabelText(/History scope/)
+    expect((select as HTMLSelectElement).value).toBe('ACTIVE_USERS')
+    if (scope === 'ALL_RECORDS') fireEvent.change(select, { target: { value: scope } })
+    const confirmation = `RECONCILE ${device.device_id} ${scope === 'ACTIVE_USERS' ? 'ACTIVE USERS' : 'FROM START'}`
+    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover the requested user history' } })
+    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start durable reconcile' }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope, confirmation })
+    })
   })
 })

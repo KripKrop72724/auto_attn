@@ -271,6 +271,7 @@ export interface Overview {
 }
 
 export interface ReconciliationPreflight {
+  active_user_history?: { eligible: boolean; user_count: number | null; reason: string | null }
   source_protocol?: string
   eligible: boolean
   ready_now: boolean
@@ -415,6 +416,15 @@ export interface ReconciliationDivergenceReveal {
 }
 
 export interface ReconciliationJob {
+  scope?: 'ACTIVE_USERS' | 'ALL_RECORDS'
+  active_user_scope?: {
+    user_count: number
+    completed_users: number
+    snapshot_id: string
+    snapshot_received_at: string
+    cutoff_serial: number | null
+    all_terminal_records: false
+  }
   job_id: string
   mode: string
   status: string

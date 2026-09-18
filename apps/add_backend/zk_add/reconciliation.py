@@ -89,12 +89,12 @@ def _version_tuple(value: str | None) -> tuple[int, int, int]:
     return tuple(int(item) for item in match.groups()) if match else (0, 0, 0)
 
 
-def _request_digest(*, connector: Connector, reason: str, confirmation: str) -> str:
+def _request_digest(*, connector: Connector, reason: str, confirmation: str, scope: str = "ALL_RECORDS") -> str:
     material = json.dumps(
         {
             "connector_id": connector.connector_id,
             "confirmation": confirmation,
-            "mode": "FULL_HISTORY_BASELINE",
+            "mode": "ACTIVE_USERS" if scope == "ACTIVE_USERS" else "FULL_HISTORY_BASELINE",
             "reason": reason.strip(),
         },
         separators=(",", ":"),
@@ -307,7 +307,10 @@ def create_reconciliation_job(
     reason: str,
     confirmation: str,
     idempotency_key: str,
+    scope: str = "ALL_RECORDS",
 ) -> ReconciliationJob:
+    if scope not in {"ALL_RECORDS", "ACTIVE_USERS"} or (scope == "ACTIVE_USERS" and connector.firmware_family != "hikvision"):
+        raise ValueError("Active-user history is supported only for qualified Hikvision terminals.")
     locked_connector = session.scalar(
         select(Connector).where(Connector.id == connector.id).with_for_update()
     )
@@ -315,7 +318,7 @@ def create_reconciliation_job(
         raise ValueError("Connector no longer exists.")
     connector = locked_connector
     digest = _request_digest(
-        connector=connector, reason=reason, confirmation=confirmation
+        connector=connector, reason=reason, confirmation=confirmation, scope=scope
     )
     existing = session.scalar(
         select(ReconciliationJob).where(
@@ -327,7 +330,7 @@ def create_reconciliation_job(
         if existing.request_digest != digest:
             raise ValueError("That idempotency key was used for a different request.")
         return existing
-    expected = f"RECONCILE {connector.device_id} FROM START"
+    expected = f"RECONCILE {connector.device_id} " + ("ACTIVE USERS" if scope == "ACTIVE_USERS" else "FROM START")
     if confirmation != expected:
         raise ValueError(f"Type {expected} exactly to confirm this operation.")
     preflight = preflight_reconciliation(session, connector)
@@ -373,7 +376,7 @@ def create_reconciliation_job(
     session.flush()
     if connector.firmware_family == "hikvision":
         from zk_add.hikvision_reconciliation import initialize
-        initialize(session, job, connector)
+        initialize(session, job, connector, scope)
     _event(session, job, "QUEUED", {"wait_reason": job.wait_reason})
     append_audit(
         session,
@@ -382,7 +385,7 @@ def create_reconciliation_job(
         target_type="connector",
         target_id=connector.connector_id,
         outcome="QUEUED",
-        after={"job_id": job.job_id, "reason": reason.strip()},
+        after={"job_id": job.job_id, "reason": reason.strip(), "scope": scope},
     )
     return job
 
@@ -2153,6 +2156,18 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         hik_state = session.get(HikvisionReconciliationState, job.id)
         source = hik_state.data if hik_state else {}
         checkpoint = source.get("checkpoint", {})
+        result["scope"] = source.get("scope", "ALL_RECORDS")
+        if result["scope"] == "ACTIVE_USERS":
+            result["active_user_scope"] = {
+                "user_count": len(source["employee_numbers"]),
+                "completed_users": source["user_index"],
+                "snapshot_id": source["snapshot_id"],
+                "snapshot_received_at": source["snapshot_received_at"],
+                "cutoff_serial": source.get("scope_cutoff"),
+                "all_terminal_records": False,
+            }
+            if not job.capture_certified_at:
+                result["progress"]["remaining"] = None
         result["source_protocol"] = "hikvision-isapi-v1"
         result["checkpoint"] = {"next_ordinal": None,
                                 "source_serial": checkpoint.get("last_serial"),
