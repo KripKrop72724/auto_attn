@@ -111,16 +111,34 @@ int main(void){
  assert(hik_profile_command(&c,&receipt)==HIK_BINDING && !receipt && writes==prior);
  c=existing_command("UPDATE_USER");c.privilege=0;
  assert(hik_profile_command(&c,&receipt)==HIK_OK);cJSON_Delete(receipt);
- field(person,"numOfFP",cJSON_CreateNumber(1));
+ /* Editing a profile preserves every enrolled credential; deletion removes
+  * the complete profile regardless of modality or optional count fields. */
+ field(person,"numOfFace",cJSON_CreateNumber(2));
+ field(person,"numOfFP",cJSON_CreateNumber(2));
+ field(person,"numOfCard",cJSON_CreateNumber(1));
+ cJSON_AddStringToObject(person,"password","fixture-pin");
+ c=existing_command("UPDATE_USER");strcpy(c.name,"Mixed credentials");
+ assert(hik_profile_command(&c,&receipt)==HIK_OK);cJSON_Delete(receipt);
+ assert(cJSON_GetObjectItem(person,"numOfFace")->valueint==2);
+ assert(cJSON_GetObjectItem(person,"numOfFP")->valueint==2);
+ assert(cJSON_GetObjectItem(person,"numOfCard")->valueint==1);
+ assert(!strcmp(cJSON_GetObjectItem(person,"password")->valuestring,"fixture-pin"));
  c=existing_command("DELETE_USER");prior=writes;
- assert(hik_profile_command(&c,&receipt)==HIK_CONFIGURATION && !receipt && writes==prior);
- field(person,"numOfFP",cJSON_CreateNumber(0));
- field(person,"numOfCard",cJSON_CreateNumber(1));c=existing_command("DELETE_USER");
- assert(hik_profile_command(&c,&receipt)==HIK_CONFIGURATION && !receipt && writes==prior);
- field(person,"numOfCard",cJSON_CreateNumber(0));c=existing_command("DELETE_USER");delete_pending=true;
+ field(person,"numOfFP",cJSON_CreateNumber(3));
+ assert(hik_profile_command(&c,&receipt)==HIK_BINDING && !receipt && writes==prior);
+ c=existing_command("DELETE_USER");delete_pending=true;
  assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt && person);
  delete_pending=false;assert(hik_profile_command(&c,&receipt)==HIK_OK && !person);cJSON_Delete(receipt);
  prior=writes;assert(hik_profile_command(&c,&receipt)==HIK_OK && writes==prior);cJSON_Delete(receipt);
+ const char *credential_types[]={"numOfFP","numOfCard","numOfFace","password","missing_counts"};
+ for(unsigned i=0;i<5;i++){
+  c=create_command();assert(hik_profile_command(&c,&receipt)==HIK_OK);cJSON_Delete(receipt);
+  if(i<3)field(person,credential_types[i],cJSON_CreateNumber(2));
+  else if(i==3)cJSON_AddStringToObject(person,"password","fixture-pin");
+  else {cJSON_DeleteItemFromObject(person,"numOfFP");cJSON_DeleteItemFromObject(person,"numOfCard");cJSON_DeleteItemFromObject(person,"numOfFace");}
+  c=existing_command("DELETE_USER");assert(hik_profile_command(&c,&receipt)==HIK_OK && !person);
+  assert(cJSON_IsTrue(cJSON_GetObjectItem(receipt,"user_absent")));cJSON_Delete(receipt);
+ }
  c=create_command();assert(hik_profile_command(&c,&receipt)==HIK_OK);cJSON_Delete(receipt);
  c=existing_command("UPDATE_USER");strcpy(c.name,"Changed");corrupt_write=true;
  assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt);

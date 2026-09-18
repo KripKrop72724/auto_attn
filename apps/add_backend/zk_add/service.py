@@ -431,7 +431,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         return
 
     if connector.firmware_family == "hikvision":
-        profile = zkt.capability_profile or {}
+        profile = {key: value for key, value in (zkt.capability_profile or {}).items()
+                   if key not in {"delete_face_qualified", "delete_fingerprint_card_qualified"}}
         approval = profile.get("hikvision_profile_approval") or {}
         health = profile.get("hikvision_health") or {}
         writable = (
@@ -439,7 +440,7 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             and approval.get("terminal_serial") == zkt.serial == zkt.confirmed_serial
             and approval.get("profile_id") == health.get("capability_profile")
             == "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1"
-            and health.get("profile_command_version") == 1
+            and health.get("profile_command_version") in {1, 2}
             and zkt.terminal_binding_state == "CONFIRMED"
             and zkt.snapshot_complete and zkt.identity_snapshot_stable
         )
@@ -449,7 +450,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         zkt.capability_profile = {
             **profile,
             "user_write": bool(writable), "create_user": bool(writable), "delete_user": bool(writable),
-            "user_role_write": bool(writable), "delete_face_qualified": True, "delete_fingerprint_card_qualified": False,
+            "user_role_write": bool(writable),
+            "delete_all_credentials": bool(writable and health.get("profile_command_version") == 2),
             "name_bytes": 128,
             "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
         }

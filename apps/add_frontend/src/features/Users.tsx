@@ -180,7 +180,9 @@ export function UserOperationDialog({
   return (
     <Dialog titleId="user-operation-title" title={title} description={description} onClose={onClose}>
       <form className="dialog-body" onSubmit={submit}>
-        {state.mode === 'delete' && device.firmware_family === 'hikvision' && device.zkt?.capabilities.delete_face_qualified === true && <p className="info-copy">Deleting this profile also removes its enrolled face; that face will no longer authenticate. Attendance and identity history are retained. Profiles with fingerprints or cards cannot yet be deleted through this pilot.</p>}
+        {state.mode === 'delete' && device.firmware_family === 'hikvision' && <p className="info-copy">{device.zkt?.capabilities.delete_all_credentials === true
+          ? 'Deletes the entire terminal profile, including all enrolled fingerprints, PIN/password, cards, and faces. Those credentials will no longer authenticate this user. Attendance and identity history are retained.'
+          : 'This connector has older firmware that restricts deletion of enrolled fingerprints or cards. Update the Hikvision connector firmware to delete the entire profile and its credentials.'}</p>}
         {(state.mode === 'create' || state.mode === 'edit') && (
           <>
             <div className="form-grid">

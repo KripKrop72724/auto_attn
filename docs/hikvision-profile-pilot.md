@@ -18,12 +18,16 @@ before/after profiles. They are excluded from Git and diagnostic exports.
   and both historical records remained byte-for-byte unchanged in the returned
   source representation. The tester then confirmed face authentication was
   rejected/unrecognized.
-- Fingerprint/card removal and profiles with more than one face are not qualified.
-  Firmware rejects their deletion. Permanent administrators must be demoted first.
+- The operator subsequently required whole-profile deletion regardless of enrolled
+  credentials. Firmware 3.0.8 removes the modality/count gate and uses the same
+  targeted person-deletion endpoint for fingerprints, PIN/password, cards and faces.
+  Face removal has hardware evidence above; other credential types remain distinct
+  acceptance evidence, not software blockers. Permanent administrators must still
+  be demoted first.
 
 ## Implementation guarantees
 
-Signed Hikvision firmware advertises profile command protocol version 1. ADD
+Signed Hikvision firmware advertises profile command protocol version 2 (3.0.8 onwards). ADD
 requires an audited, password-confirmed policy approval for the bound terminal,
 exact profile, confirmed identity and complete stable user snapshot before enabling
 `PROFILE_PILOT` controls. Heartbeats cannot self-approve writes. Temporary admin
@@ -37,8 +41,9 @@ ADD validates the terminal/employee-bound readback receipt before marking any
 profile command successful. Hikvision deletion does not reuse the ZKT assumption
 that a global attendance count must be unchanged while concurrent punches arrive.
 
-The deletion confirmation explains face removal, retained attendance and remaining
-fingerprint/card restrictions. Device Users shows the already-confirmed terminal
+The deletion confirmation explains whole-profile credential removal and retained
+attendance. ADD advertises `delete_all_credentials` only when the connector reports
+command protocol version 2; older connectors retain their accurate limited message. Device Users shows the already-confirmed terminal
 identity instead of suggesting another serial confirmation will enable commands.
 
 ## Remaining release evidence
@@ -57,3 +62,8 @@ success because the terminal canonicalized disabled validity dates to
 when validity remains disabled and all other requested fields match. Arbitrary
 date changes, enabled validity, changed rights and changed timezone are rejected.
 The regression harness now returns the hardware-observed normalized response.
+
+Profile edits do not reject fingerprints, PINs, cards or faces, and preserve their
+associations. New credential enrollment remains outside profile editing. Native
+regressions cover each modality, mixed credentials, absent optional count fields,
+stale-state rejection, asynchronous deletion and lost acknowledgements.
