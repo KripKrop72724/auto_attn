@@ -32,7 +32,8 @@ int esp_http_client_fetch_headers(esp_http_client_handle_t c){
 int esp_http_client_get_status_code(esp_http_client_handle_t c){return c->attempt<=challenges?401:200;}
 int esp_http_client_add_auth(esp_http_client_handle_t c){(void)c;auth_calls++;return 0;}
 int esp_http_client_read(esp_http_client_handle_t c,char*b,int n){
- if((size_t)n>c->bytes)n=(int)c->bytes;memcpy(b,c->cache,n);memmove(c->cache,c->cache+n,c->bytes-n);c->bytes-=n;return n;}
+ if ((size_t)n > c->bytes) { n = (int)c->bytes; }
+ memcpy(b,c->cache,n);memmove(c->cache,c->cache+n,c->bytes-n);c->bytes-=n;return n;}
 bool esp_http_client_is_complete_data_received(esp_http_client_handle_t c){(void)c;return !incomplete;}
 int esp_http_client_close(esp_http_client_handle_t c){
  /* IDF close retains cached body; retry must consume it, even when the
