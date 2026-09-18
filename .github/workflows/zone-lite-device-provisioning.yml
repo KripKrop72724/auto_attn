@@ -7,7 +7,7 @@ on:
         description: Protected operation to perform
         required: true
         type: choice
-        options: [attest-hmac, build-package]
+        options: [attest-hmac, build-package, inspect-ords-contract]
       target_mac:
         description: Exact physical ESP32-S3 Wi-Fi MAC
         required: true
@@ -21,7 +21,7 @@ on:
         required: false
         type: string
       confirmation:
-        description: Type ATTEST EXISTING HMAC or BUILD ENCRYPTED NVS
+        description: Type ATTEST EXISTING HMAC, BUILD ENCRYPTED NVS, or INSPECT ORDS CONTRACT
         required: true
         type: string
 
@@ -33,6 +33,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  inspect-ords-contract:
+    if: ${{ inputs.operation == 'inspect-ords-contract' && inputs.confirmation == 'INSPECT ORDS CONTRACT' }}
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Read only the Oracle repair capability contract
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $api = @(& docker ps --filter 'ancestor=state-life/add-api:production' --format '{{.ID}}')
+          if ($LASTEXITCODE -ne 0 -or $api.Count -ne 1) { throw 'Expected one running production ADD API container' }
+          $script = @'
+          import json, os, urllib.error, urllib.request
+
+          url = os.environ['ADD_ORDS_BASE_URL'].rstrip('/') + '/raw-captures/identity-repairs/capabilities'
+          request = urllib.request.Request(url, headers={
+              'X-API-Username': os.environ['ADD_ATTENDANCE_REPAIR_ORDS_USERNAME'],
+              'X-API-Password': os.environ['ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD'],
+          })
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          try:
+              with urllib.request.build_opener(NoRedirect).open(request, timeout=15) as response:
+                  data = response.read(65537)
+                  if len(data) > 65536:
+                      raise ValueError('oversized')
+                  result = json.loads(data)
+                  if not isinstance(result, dict):
+                      raise ValueError('shape')
+                  # Never print bodies, headers, credentials, URLs or identities.
+                  summary = {'http_status': response.status}
+                  for field in ('add_only_auth', 'execution_ready'):
+                      value = result.get(field)
+                      summary[field] = value if type(value) is bool else 'MISSING_OR_WRONG_TYPE'
+                  value = result.get('batch_limit')
+                  summary['batch_limit'] = value if type(value) is int else 'MISSING_OR_WRONG_TYPE'
+                  value = result.get('contract_version')
+                  summary['contract_version_matches_v1'] = type(value) in (str, int) and str(value) == '1'
+                  print(json.dumps(summary, sort_keys=True))
+          except urllib.error.HTTPError as error:
+              raise SystemExit('Oracle capability HTTP status: ' + str(error.code))
+          except Exception as error:
+              raise SystemExit('Oracle capability diagnostic failed: ' + type(error).__name__)
+          '@
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
+          & docker exec $api[0] python -c "import base64;exec(base64.b64decode('$encoded'))"
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only Oracle capability inspection failed' }
+
   attest-hmac:
     if: ${{ inputs.operation == 'attest-hmac' && inputs.confirmation == 'ATTEST EXISTING HMAC' }}
     runs-on: [self-hosted, Windows, X64]
