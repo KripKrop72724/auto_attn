@@ -86,6 +86,7 @@ foreach ($path in @($cipherPath, $entropyPath, $publicPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Firmware vault is missing $path" }
 }
 
+$imageName = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version.bin" } else { "zone-lite-$Version.bin" })
 $projectName = $(if ($FirmwareFamily -eq 'hikvision') { 'zone_lite_hikvision' } else { 'zone_lite' })
 $sourceImage = Join-Path $unsigned "$projectName.bin"
 & python scripts/check_firmware_identity.py $sourceImage --family $FirmwareFamily --version $Version
@@ -121,16 +122,16 @@ try {
     Invoke-Docker @(
         'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
         'espsecure.py', 'sign_data', '--version', '2', '--keyfile', '/work/active-key.pem',
-        '--output', "/work/zone-lite-$Version.bin", '/work/zone_lite.bin'
+        '--output', "/work/$imageName", '/work/zone_lite.bin'
     )
-    $signedImage = Join-Path $work "zone-lite-$Version.bin"
+    $signedImage = Join-Path $work $imageName
     $size = (Get-Item -LiteralPath $signedImage).Length
     $guardedLimit = 0x280000 - (128 * 1024)
     if ($size -gt $guardedLimit) { throw "Signed image $size exceeds guarded slot limit $guardedLimit" }
-    Copy-Item -LiteralPath $signedImage -Destination (Join-Path $output "zone-lite-$Version.bin")
+    Copy-Item -LiteralPath $signedImage -Destination (Join-Path $output $imageName)
     Copy-Item -LiteralPath $publicPath -Destination (Join-Path $output 'manifest-public-key.pem')
-    $imageHash = (Get-FileHash -LiteralPath (Join-Path $output "zone-lite-$Version.bin") -Algorithm SHA256).Hash.ToLowerInvariant()
-    $applicationHash = Get-EspApplicationSha256 -Path (Join-Path $output "zone-lite-$Version.bin")
+    $imageHash = (Get-FileHash -LiteralPath (Join-Path $output $imageName) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $applicationHash = Get-EspApplicationSha256 -Path (Join-Path $output $imageName)
     $manifest = [ordered]@{
         application_sha256 = $applicationHash
         created_at = [DateTime]::UtcNow.ToString('o')
@@ -138,7 +139,7 @@ try {
         firmware_family = $FirmwareFamily
         git_sha = $GitSha
         hardware = 'esp32-s3-zone-lite'
-        image_name = "zone-lite-$Version.bin"
+        image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
         minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } else { '2.2.0' })
@@ -178,7 +179,7 @@ try {
         (New-Object Text.UTF8Encoding($false))
     )
     $sumLines = @()
-    foreach ($name in @("zone-lite-$Version.bin", 'manifest.json', 'manifest.sig', 'manifest-public-key.pem')) {
+    foreach ($name in @($imageName, 'manifest.json', 'manifest.sig', 'manifest-public-key.pem')) {
         $hash = (Get-FileHash -LiteralPath (Join-Path $output $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         $sumLines += "$hash  $name"
     }

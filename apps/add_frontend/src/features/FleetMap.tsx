@@ -1,3 +1,4 @@
+import { deviceActivity } from '../hikvisionHealth'
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import pakistanMapUrl from '../assets/pakistan-operations-map.svg'
 import { groupFleetLocations, type FleetLocationGroup, type FleetLocationId } from '../fleetLocations'
@@ -46,7 +47,7 @@ function DeviceRows({
           <span className="fleet-location-device-icon"><Icon name="server" /></span>
           <span className="fleet-location-device-copy">
             <strong>{device.display_name}</strong>
-            <small>{device.zkt?.model || 'Awaiting terminal identity'} · {device.current_activity || 'Idle'}</small>
+            <small>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal identity')} · {deviceActivity(device)}</small>
             <span>{device.zone_id} · {formatRelativeTime(device.last_seen_at)}</span>
           </span>
           <MapStatus pattern={pattern} label={normalizedStatus(device.state).replaceAll('_', ' ')} />

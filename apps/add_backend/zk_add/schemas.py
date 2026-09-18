@@ -111,6 +111,15 @@ class FirmwareDiagnostics(BaseModel):
     committed_source_cursor: int | None = Field(default=None, ge=0)
 
 
+class HikvisionLightReconcile(BaseModel):
+    state: Literal["WAITING", "SCANNING", "WAITING_DELIVERY", "WAITING_TERMINAL", "RETRYING", "COMPLETE", "BLOCKED"]
+    policy: Literal["retained_history_20_records_30s_repeat_6h"]
+    scanned: int = Field(ge=0, le=150000)
+    cursor: int = Field(ge=0, le=3_000_000_000)
+    last_completed_epoch: int = Field(ge=0)
+    error: int = Field(ge=0, le=8)
+
+
 class HikvisionTerminalPayload(BaseModel):
     schema_version: Literal[2]
     vendor: Literal["hikvision"]
@@ -136,9 +145,14 @@ class HikvisionTerminalPayload(BaseModel):
     history_page_count: int | None = Field(default=None, ge=0)
     last_successful_poll_epoch: int | None = Field(default=None, ge=0)
     poll_error: int | None = Field(default=None, ge=0)
+    poll_stage: Literal["checkpoint", "identity", "history_bounds", "events", "checkpoint_commit"] | None = None
+    poll_http_status: int | None = Field(default=None, ge=0, le=599)
+    poll_duration_ms: int | None = Field(default=None, ge=0)
+    consecutive_poll_failures: int | None = Field(default=None, ge=0)
     durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
     full_history_required: bool = True
     profile_command_version: Literal[1, 2] | None = None
+    light_reconcile: HikvisionLightReconcile | None = None
 
 
 class HeartbeatPayload(BaseModel):

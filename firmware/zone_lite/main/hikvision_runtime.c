@@ -27,10 +27,13 @@ static atomic_uint current_events, replay_events, source_failures, stream_error;
 static atomic_bool reachable, stream_open;
 static atomic_long last_message, last_poll;
 static atomic_uint poll_error, poll_cursor, poll_count, last_poll_interval_ms, history_page_count;
+static atomic_uint poll_stage, poll_http_status, poll_duration_ms, poll_failures;
+static const char *poll_stages[] = {"checkpoint", "identity", "history_bounds", "events", "checkpoint_commit"};
 static atomic_bool history_required = true;
 static atomic_bool profiles_active;
 static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
-static atomic_uint uploader_tick;
+static atomic_uint uploader_tick, poll_tick, history_tick;
+static atomic_bool checkpoint_ready, runtime_workers_started;
 typedef struct { int64_t device_epoch, sampled_epoch, sampled_us; bool valid; } clock_sample_t;
 static clock_sample_t clock_sample;
 static portMUX_TYPE clock_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -176,8 +179,16 @@ static bool preserve(void *context, const char *body, size_t length)
     if (!ok) atomic_fetch_add(&source_failures, 1);
     return ok;
 }
+static const char *hik_reason(hik_result_t result)
+{
+    static const char *reasons[] = {"ok", "invalid_configuration", "network_timeout_or_unreachable",
+        "authentication_rejected", "http_error", "response_too_large", "identity_or_history_changed",
+        "invalid_response", "durable_storage_failed"};
+    return (unsigned)result < sizeof(reasons) / sizeof(reasons[0]) ? reasons[result] : "unknown";
+}
 typedef struct {
     unsigned char digest[32];
+    const char *channel;
     const unsigned char *expected_anchor;
     unsigned count;
     bool anchor_seen, anchor_conflict;
@@ -192,7 +203,7 @@ static bool poll_record(void *context, const char *body, size_t length)
         page->anchor_seen = !page->anchor_conflict;
         return page->anchor_seen;
     }
-    if (!preserve("POLL", body, length)) return false;
+    if (!preserve(page->channel ? page->channel : "POLL", body, length)) return false;
     mbedtls_sha256((const unsigned char *)body, length, page->digest, 0);
     page->count++;
     return true;
@@ -213,11 +224,13 @@ static void poll_task(void *arg)
         atomic_fetch_add(&poll_count, 1);
         background_slot = false;
         hik_result_t result = HIK_OK;
+        unsigned stage = 0;
         if (!loaded) {
             loaded = checkpoint_load(&cursor, &present);
             if (!loaded) result = HIK_CUSTODY;
+            else { atomic_store(&poll_cursor, cursor.serial); atomic_store(&checkpoint_ready, true); }
         }
-        if (result == HIK_OK) result = hik_http_verify_identity();
+        if (result == HIK_OK) { stage = 1; result = hik_http_verify_identity(); }
         if (result == HIK_OK && started - clock_checked_us >= 60000000) {
             sample_terminal_clock();
             clock_checked_us = started;
@@ -229,6 +242,7 @@ static void poll_task(void *arg)
         uint32_t begin = present && cursor.serial ? cursor.serial : 1;
         if (result == HIK_OK && !present) {
             uint32_t first, last, count;
+            stage = 2;
             result = hik_history_bounds(&first, &last, &count);
             /* First install starts at the recent tail. Earlier retained history
              * remains explicitly outstanding for the independent full job. */
@@ -239,6 +253,7 @@ static void poll_task(void *arg)
             page_context_t page = {
                 .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
             };
+            stage = 3;
             result = hik_history_page(&search, poll_record, &page);
             if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen))
                 result = HIK_BINDING;
@@ -248,10 +263,16 @@ static void poll_task(void *arg)
                     next.serial = search.previous_serial;
                     memcpy(next.anchor, page.digest, sizeof(next.anchor));
                 }
+                stage = 4;
                 if (!checkpoint_save(&next)) result = HIK_CUSTODY;
                 else { cursor = next; present = true; }
             }
         } else if (result == HIK_OK) result = HIK_BINDING;
+        atomic_store(&poll_stage, stage);
+        atomic_store(&poll_http_status, stage ? hik_http_last_status() : 0);
+        atomic_store(&poll_duration_ms, (unsigned)((esp_timer_get_time() - started) / 1000));
+        if (result == HIK_OK) atomic_store(&poll_failures, 0);
+        else atomic_fetch_add(&poll_failures, 1);
         atomic_store(&reachable, result == HIK_OK);
         atomic_store(&poll_error, (unsigned)result);
         uint32_t depth = 0;
@@ -270,9 +291,11 @@ static void poll_task(void *arg)
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
         led_status_set(status);
         if (result != previous_result || status != previous_led || started - last_report_us >= 60000000) {
-            char message[240];
-            snprintf(message, sizeof(message), "Poll %s; reason=%u; cursor=%lu; queued=%lu; storage=%s; source_worker=%s",
-                result == HIK_OK ? "OK" : "retrying", (unsigned)result, (unsigned long)cursor.serial,
+            char message[384];
+            snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s",
+                result == HIK_OK ? "OK" : "retrying", hik_reason(result), poll_stages[stage], atomic_load(&poll_http_status),
+                atomic_load(&poll_failures), zone_config_get()->hik_host,
+                (unsigned long)((esp_timer_get_time() - started) / 1000), (unsigned long)cursor.serial,
                 (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
                 workers_ready ? "running" : "waiting");
             ESP_LOGI(TAG, "%s", message);
@@ -280,21 +303,139 @@ static void poll_task(void *arg)
                 previous_result = result; previous_led = status; last_report_us = started;
             }
         }
+        atomic_store(&poll_tick, (uint32_t)(esp_timer_get_time() / 1000));
         background_slot = true;
         xSemaphoreGive(request_lock);
         vTaskDelay(pdMS_TO_TICKS(poll_delay_ms(esp_timer_get_time() - started)));
     }
 }
+/* Low-rate independent audit. It preserves retained records through the same
+ * durable source queue without advancing the live poll checkpoint or claiming
+ * full-history/Oracle certification. A page is checkpointed only after custody. */
+typedef struct {
+    uint32_t version, first, last, cursor, scanned, completed_epoch;
+    unsigned char binding[32], anchor[32];
+} light_checkpoint_t;
+static light_checkpoint_t light_checkpoint;
+static bool light_loaded;
+static int64_t light_next_us = 60000000;
+static atomic_uint light_state, light_scanned, light_cursor, light_completed, light_error;
+enum { LIGHT_WAITING, LIGHT_SCANNING, LIGHT_DELIVERY, LIGHT_TERMINAL, LIGHT_RETRY, LIGHT_COMPLETE, LIGHT_BLOCKED };
+static const char *light_names[] = {"WAITING", "SCANNING", "WAITING_DELIVERY", "WAITING_TERMINAL", "RETRYING", "COMPLETE", "BLOCKED"};
+static bool light_store(const light_checkpoint_t *state)
+{
+    nvs_handle_t h;
+    if (nvs_open("hik_light", NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_blob(h, "checkpoint", state, sizeof(*state));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h); return err == ESP_OK;
+}
+static bool light_load(void)
+{
+    poll_checkpoint_t live; bool present;
+    if (!checkpoint_load(&live, &present)) return false;
+    light_checkpoint_t state = {.version = 1};
+    memcpy(state.binding, live.binding, 32);
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("hik_light", NVS_READONLY, &h);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err != ESP_OK) return false;
+        light_checkpoint_t stored; size_t size = sizeof(stored);
+        err = nvs_get_blob(h, "checkpoint", &stored, &size); nvs_close(h);
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            if (err != ESP_OK || size != sizeof(stored) || stored.version != 1 ||
+                memcmp(stored.binding, state.binding, 32) || stored.last > 3000000000U ||
+                stored.cursor > stored.last || (stored.last && (!stored.first || stored.first > stored.last))) return false;
+            state = stored;
+        }
+    }
+    light_checkpoint = state;
+    atomic_store(&light_scanned, state.scanned);
+    atomic_store(&light_cursor, state.cursor);
+    atomic_store(&light_completed, state.completed_epoch);
+    return true;
+}
+static void light_report(unsigned state, hik_result_t result)
+{
+    unsigned previous = atomic_exchange(&light_state, state);
+    unsigned old_error = atomic_exchange(&light_error, result);
+    if (previous == state && old_error == (unsigned)result) return;
+    char message[224];
+    snprintf(message, sizeof(message), "Light audit %s; reason=%s; range=%lu..%lu; saved_cursor=%lu; preserved=%lu; live polling remains active",
+        light_names[state], hik_reason(result), (unsigned long)light_checkpoint.first,
+        (unsigned long)light_checkpoint.last, (unsigned long)light_checkpoint.cursor,
+        (unsigned long)light_checkpoint.scanned);
+    ESP_LOGI(TAG, "%s", message);
+    (void)add_connector_log(result == HIK_OK ? "INFO" : "WARN", "hikvision", "HIK_LIGHT_RECONCILE", message);
+}
+static void light_step(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (now < light_next_us) return;
+    light_next_us = now + 30000000; /* at most one page every 30 seconds */
+    if (!light_loaded) {
+        if (!light_load()) { light_report(LIGHT_BLOCKED, HIK_CUSTODY); return; }
+        light_loaded = true;
+    }
+    if (!atomic_load(&reachable)) { light_report(LIGHT_TERMINAL, HIK_NETWORK); return; }
+    uint32_t depth;
+    if (!add_connector_is_connected() || !qs_snapshot(QS_HIK_SOURCE, &depth) || depth >= 40) {
+        light_report(LIGHT_DELIVERY, HIK_OK); return;
+    }
+    light_checkpoint_t next = light_checkpoint;
+    time_t epoch = time(NULL);
+    if (!next.last) {
+        /* Persisted completion survives reboot; bad wall time never starts a
+         * rapid loop. Monotonic page pacing remains in force during recovery. */
+        if (next.completed_epoch && (epoch < next.completed_epoch || epoch - next.completed_epoch < 21600)) {
+            light_report(LIGHT_COMPLETE, HIK_OK); return;
+        }
+        uint32_t first, last, count;
+        hik_result_t result = hik_history_bounds(&first, &last, &count);
+        if (result != HIK_OK) { light_report(LIGHT_RETRY, result); return; }
+        uint32_t live_cursor = atomic_load(&poll_cursor);
+        if (count && (!live_cursor || first > live_cursor)) { light_report(LIGHT_WAITING, HIK_OK); return; }
+        next.first = first; next.last = last < live_cursor ? last : live_cursor;
+        next.cursor = next.scanned = 0; memset(next.anchor, 0, 32);
+        if (!count) { next.first = next.last = 0; next.completed_epoch = epoch; }
+        if (!light_store(&next)) { light_report(LIGHT_RETRY, HIK_CUSTODY); return; }
+        light_checkpoint = next;
+        atomic_store(&light_scanned, 0); atomic_store(&light_cursor, 0);
+        if (!count) { atomic_store(&light_completed, epoch); light_report(LIGHT_COMPLETE, HIK_OK); return; }
+        light_report(LIGHT_SCANNING, HIK_OK);
+        return;
+    }
+    hik_search_t search; hik_search_init(&search, next.cursor ? next.cursor : next.first, next.last);
+    page_context_t page = {.channel = "HISTORY", .expected_anchor = next.cursor ? next.anchor : NULL};
+    hik_result_t result = hik_history_page(&search, poll_record, &page);
+    if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen)) result = HIK_BINDING;
+    if (result != HIK_OK) { light_report(result == HIK_BINDING ? LIGHT_BLOCKED : LIGHT_RETRY, result); return; }
+    if (page.count) { next.cursor = search.previous_serial; memcpy(next.anchor, page.digest, 32); next.scanned += page.count; }
+    if (search.complete) { next.first = next.last = next.cursor = 0; next.completed_epoch = epoch; }
+    if (!light_store(&next)) { light_report(LIGHT_RETRY, HIK_CUSTODY); return; }
+    light_checkpoint = next;
+    atomic_store(&light_scanned, next.scanned); atomic_store(&light_cursor, next.cursor);
+    atomic_store(&light_completed, next.completed_epoch);
+    light_report(search.complete ? LIGHT_COMPLETE : LIGHT_SCANNING, HIK_OK);
+}
+
 static void history_task(void *arg)
 {
     (void)arg;
     char *assignment = malloc(2048);
     if (!assignment) { vTaskDelete(NULL); return; }
     for (;;) {
+        atomic_store(&history_tick, (uint32_t)(esp_timer_get_time() / 1000));
         vTaskDelay(pdMS_TO_TICKS(100));
         if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        if (atomic_load(&profiles_active) || !background_slot ||
-            !add_connector_take_hikvision_assignment(assignment)) {
+        if (atomic_load(&profiles_active) || !background_slot) {
+            xSemaphoreGive(request_lock); continue;
+        }
+        if (!add_connector_take_hikvision_assignment(assignment)) {
+            if (esp_timer_get_time() >= light_next_us) {
+                (void)take_background_slot();
+                light_step();
+            }
             xSemaphoreGive(request_lock); continue;
         }
         (void)take_background_slot();
@@ -330,7 +471,7 @@ static void history_task(void *arg)
             }
         } else {
             ESP_LOGW(TAG, "History request incomplete, reason=%u", (unsigned)result);
-            char message[80]; snprintf(message, sizeof(message), "History request retrying; reason=%u", (unsigned)result);
+            char message[80]; snprintf(message, sizeof(message), "History request retrying; reason=%s", hik_reason(result));
             (void)add_connector_log("WARN", "hikvision", "HIK_HISTORY_RETRY", message);
         }
         cJSON_Delete(response); cJSON_Delete(message);
@@ -466,9 +607,22 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddNumberToObject(terminal, "poll_count", atomic_load(&poll_count));
     cJSON_AddNumberToObject(terminal, "last_poll_interval_ms", atomic_load(&last_poll_interval_ms));
     cJSON_AddNumberToObject(terminal, "history_page_count", atomic_load(&history_page_count));
+    cJSON *light = cJSON_AddObjectToObject(terminal, "light_reconcile");
+    if (light) {
+        cJSON_AddStringToObject(light, "state", light_names[atomic_load(&light_state)]);
+        cJSON_AddStringToObject(light, "policy", "retained_history_20_records_30s_repeat_6h");
+        cJSON_AddNumberToObject(light, "scanned", atomic_load(&light_scanned));
+        cJSON_AddNumberToObject(light, "cursor", atomic_load(&light_cursor));
+        cJSON_AddNumberToObject(light, "last_completed_epoch", atomic_load(&light_completed));
+        cJSON_AddNumberToObject(light, "error", atomic_load(&light_error));
+    }
     cJSON_AddNumberToObject(terminal, "profile_command_version", 2);
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));
+    cJSON_AddStringToObject(terminal, "poll_stage", poll_stages[atomic_load(&poll_stage)]);
+    cJSON_AddNumberToObject(terminal, "poll_http_status", atomic_load(&poll_http_status));
+    cJSON_AddNumberToObject(terminal, "poll_duration_ms", atomic_load(&poll_duration_ms));
+    cJSON_AddNumberToObject(terminal, "consecutive_poll_failures", atomic_load(&poll_failures));
     cJSON_AddNumberToObject(terminal, "durable_poll_cursor", atomic_load(&poll_cursor));
     cJSON_AddBoolToObject(terminal, "full_history_required", atomic_load(&history_required));
     cJSON_AddBoolToObject(terminal, "stream_open", atomic_load(&stream_open));
@@ -521,6 +675,7 @@ void hikvision_gateway_task(void *argument)
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
         if (!profiles && xTaskCreate(profile_task, "hik_profiles", 8192, NULL, 2, &profiles) != pdPASS) profiles = NULL;
         if (!uploader && xTaskCreate(source_uploader, "hik_evidence", 8192, NULL, 4, &uploader) != pdPASS) uploader = NULL;
+        atomic_store(&runtime_workers_started, stream && history && profiles && uploader);
         if (!stream || !history || !profiles || !uploader) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         if (profiles && uxQueueSpacesAvailable(profile_commands)) {
             add_command_t command;
@@ -542,4 +697,19 @@ void hikvision_gateway_task(void *argument)
         add_connector_set_activity("HIKVISION_POLL_2S");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+}
+
+/* OTA proves the installed application and recovered custody independently of
+ * a powered-off external terminal. Capture faults remain reported to ADD. */
+bool hikvision_boot_health_ready(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    qs_health_t storage = qs_health();
+    return atomic_load(&runtime_workers_started) && atomic_load(&checkpoint_ready) &&
+        atomic_load(&poll_tick) && now - atomic_load(&poll_tick) <= 90000U &&
+        atomic_load(&history_tick) && now - atomic_load(&history_tick) <= 90000U &&
+        atomic_load(&uploader_started) && atomic_load(&uploader_buffer_ready) &&
+        now - atomic_load(&uploader_tick) <= 90000U &&
+        storage.observed && storage.available && storage.recovery_complete &&
+        storage.persistence_verified && !storage.last_error;
 }

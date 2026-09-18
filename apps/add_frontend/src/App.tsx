@@ -1,3 +1,4 @@
+import { deviceActivity } from './hikvisionHealth'
 import {
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
@@ -495,8 +496,8 @@ function FleetView({
                 <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
                   <span className="device-symbol"><Icon name="server" /></span>
                   <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
-                  <span className="device-terminal"><strong>{device.zkt?.model || 'Awaiting terminal identity'}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
-                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : (device.current_activity || 'Idle')}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <span className="device-terminal"><strong>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal identity')}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
+                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : (deviceActivity(device))}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
                   <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
                   <Icon name="chevron" />
                 </button>

@@ -87,3 +87,23 @@ def test_hikvision_recovery_clears_fault_only_after_proof_and_clock_expires(db):
     assert connector.zkt_device.sampled_device_time is None
     update(heartbeat(dict(device_epoch=now-10,sampled_epoch=now)),6)
     assert session.scalar(select(DeviceAlert).where(DeviceAlert.code=='HIK_CLOCK_DRIFT')).state=='RESOLVED'
+
+@pytest.mark.parametrize('error,code', [(1,'HIK_CONFIGURATION'), (2,'HIK_NETWORK'), (3,'HIK_AUTH'),
+ (4,'HIK_HTTP_STATUS'), (5,'HIK_OVERSIZED'), (6,'HIK_SOURCE_CHANGED'), (7,'HIK_INVALID_RESPONSE'), (8,'HIK_STORAGE')])
+def test_hik_terminal_failure_explained_despite_live_heartbeat(db,error,code):
+    session,connector=db
+    p=heartbeat()
+    p.terminal.online=False
+    p.terminal.connection_state='OFFLINE'
+    p.terminal.poll_error=error
+    update_heartbeat(session,connector=connector,boot_id='terminal-fault',sequence=1,payload=p)
+    assert connector.connected
+    assert connector.lifecycle_state=='DEGRADED'
+    assert connector.last_error_code==code
+    assert connector.last_error_message
+    p.terminal.online=True
+    p.terminal.connection_state='ONLINE'
+    p.terminal.poll_error=0
+    update_heartbeat(session,connector=connector,boot_id='terminal-fault',sequence=2,payload=p)
+    assert connector.lifecycle_state=='ONLINE'
+    assert connector.last_error_code is None

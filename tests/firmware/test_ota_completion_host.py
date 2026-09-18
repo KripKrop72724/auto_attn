@@ -69,3 +69,54 @@ int main(void)
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", str(unit), "-o", str(executable),
     ], check=True)
     subprocess.run([str(executable)], cwd=tmp_path, check=True)
+
+
+def test_hikvision_ota_requires_recovered_storage_workers_and_empty_custody(tmp_path):
+    firmware = ROOT / 'firmware/zone_lite/main'
+    source = (firmware / 'hikvision_runtime.c').read_text()
+    health = source[source.index('bool hikvision_boot_health_ready(void)'):]
+    source = (firmware / 'add_connector.c').read_text()
+    gates = source[source.index('bool add_connector_boot_health_ready(void)'):source.index('bool add_connector_consume_connected_edge(void)')]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#define ZONE_LITE_HIKVISION 1
+#define QS_HIK_SOURCE 7
+static atomic_uint poll_tick=1000,history_tick=1000,uploader_tick=1000;
+static atomic_bool runtime_workers_started=true,checkpoint_ready=true,uploader_started=true,uploader_buffer_ready=true;
+typedef struct {bool observed,available,recovery_complete,persistence_verified;int last_error;} qs_health_t;
+static qs_health_t storage={true,true,true,true,0};
+static uint32_t now=2000,pending;
+static bool snapshot_ok=true,connected=true,delivery=true,upgrade=true;
+static int s_heartbeat_task_handle=1;
+static uint64_t esp_timer_get_time(void){return now*1000ULL;}
+static qs_health_t qs_health(void){return storage;}
+static bool storage_upgrade_ready(void){return upgrade;}
+static bool add_connector_is_connected(void){return connected;}
+static bool add_connector_delivery_healthy(void){return delivery;}
+static bool qs_snapshot(int lane,uint32_t *depth){assert(lane==7);*depth=pending;return snapshot_ok;}
+/* PRODUCTION */
+int main(void){
+ assert(add_connector_boot_health_ready()&&add_connector_ota_reconcile_ready());
+ pending=1;assert(add_connector_boot_health_ready()&&!add_connector_ota_reconcile_ready());pending=0;
+ snapshot_ok=false;assert(!add_connector_ota_reconcile_ready());snapshot_ok=true;
+ storage.persistence_verified=false;assert(!add_connector_boot_health_ready());storage.persistence_verified=true;
+ storage.last_error=1;assert(!add_connector_boot_health_ready());storage.last_error=0;
+ storage.recovery_complete=false;assert(!add_connector_boot_health_ready());storage.recovery_complete=true;
+ checkpoint_ready=false;assert(!add_connector_boot_health_ready());checkpoint_ready=true;
+ runtime_workers_started=false;assert(!add_connector_boot_health_ready());runtime_workers_started=true;
+ uploader_buffer_ready=false;assert(!add_connector_boot_health_ready());uploader_buffer_ready=true;
+ connected=false;assert(!add_connector_boot_health_ready());connected=true;
+ delivery=false;assert(!add_connector_boot_health_ready());delivery=true;
+ now=92000;assert(!add_connector_boot_health_ready());now=2000;
+ assert(add_connector_ota_reconcile_ready());
+ return 0;
+}
+'''
+    unit=tmp_path/'hik-ota.c'
+    unit.write_text(harness.replace('/* PRODUCTION */',health+gates))
+    exe=tmp_path/'hik-ota'
+    subprocess.run([shutil.which('cc'),'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(unit),'-o',str(exe)],check=True)
+    subprocess.run([str(exe)],check=True)

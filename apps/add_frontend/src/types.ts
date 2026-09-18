@@ -158,6 +158,15 @@ export interface FirmwareDiagnostics {
 }
 
 export interface HikvisionHealth {
+  light_reconcile?: {
+    state: string
+    policy: string
+    scanned: number
+    cursor: number
+    last_completed_epoch: number
+    error: number
+  }
+
   capture_mode: 'stream' | 'poll'
   poll_interval_seconds?: number
   last_poll_interval_ms?: number
@@ -165,6 +174,10 @@ export interface HikvisionHealth {
   history_page_count?: number
   last_successful_poll_epoch?: number
   poll_error?: number
+  poll_stage?: string
+  poll_http_status?: number
+  poll_duration_ms?: number
+  consecutive_poll_failures?: number
   durable_poll_cursor?: number
   source_queue_depth?: number
   full_history_required?: boolean
@@ -198,6 +211,7 @@ export interface Device {
   last_onboarded_at: string | null
   last_seen_at: string | null
   current_activity: string | null
+  last_error_message?: string | null
   last_error_code: string | null
   is_spare?: boolean
   zkt: ZktDevice | null
@@ -226,6 +240,7 @@ export interface CommKeyState {
   desired_revision: number
   last_verified_at: string | null
   verified_terminal_serial: string | null
+  last_error_message?: string | null
   last_error_code: string | null
   managed: boolean
   capabilities: {
@@ -560,6 +575,8 @@ export interface HilTarget {
 }
 
 export interface FirmwareRelease {
+  firmware_family?: 'zkt' | 'hikvision'
+  display_name?: string
   release_id: string
   version: string
   git_sha: string
@@ -790,7 +807,8 @@ export interface AttendanceRepairPreflight {
       last_started_at: string | null
       last_completed_at: string | null
       last_error_at: string | null
-      last_error_code: string | null
+      last_error_message?: string | null
+  last_error_code: string | null
     } | null
     release_v2?: {
       queue_oldest_age_seconds: number
