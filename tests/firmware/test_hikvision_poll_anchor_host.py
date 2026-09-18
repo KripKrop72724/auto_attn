@@ -55,3 +55,31 @@ int main(void){
     subprocess.run([shutil.which("cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", str(unit), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_slow_poll_yields_one_bounded_background_slot(tmp_path):
+    source = (ROOT / "firmware/zone_lite/main/hikvision_runtime.c").read_text()
+    start = source.index("static bool background_slot;")
+    body = source[start:source.index("/* A single encrypted", start)]
+    harness = """
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+/* PRODUCTION */
+int main(void){
+ assert(!take_background_slot());
+ background_slot=true;
+ assert(take_background_slot());assert(!take_background_slot());
+ assert(poll_delay_ms(1000000)==4000);
+ assert(poll_delay_ms(4800000)==250);
+ assert(poll_delay_ms(7000000)==250);
+ background_slot=true;assert(take_background_slot());
+ return 0;
+}
+"""
+    unit = tmp_path / "poll-schedule.c"
+    unit.write_text(harness.replace("/* PRODUCTION */", body))
+    exe = tmp_path / "poll-schedule"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=address,undefined", str(unit), "-o", str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

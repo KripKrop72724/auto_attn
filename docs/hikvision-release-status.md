@@ -20,7 +20,10 @@ LF-ZONE-BLD9-03 ESP; pilot delivery observed; full release qualification incompl
   exposed starvation: checking the predecessor and new range in separate searches
   can consume the whole five-second interval. Version 3.0.4 combines the committed
   anchor and new records in one ordered search, verifying the anchor before any
-  new record is admitted. It is pending signed hardware verification.
+  new record is admitted. One bounded background page is admitted between polls,
+  including after slow requests; five seconds remains the target start interval.
+  Exact-device latency under load still needs measurement. Signed hardware
+  verification is pending.
 - ESP profile create/edit/delete dispatch and the 72-hour soak remain incomplete.
   The capability profile remains NOT_QUALIFIED; no AVAILABLE promotion is claimed.
 - Historical CNIC-correction preview/execution remain temporarily disabled by

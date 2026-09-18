@@ -31,7 +31,22 @@ static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
 static atomic_uint uploader_tick;
 static SemaphoreHandle_t request_lock;
 static QueueHandle_t profile_commands;
-static int64_t next_poll_due;
+/* Protected by request_lock: at most one bounded background page per poll. */
+static bool background_slot;
+static bool take_background_slot(void)
+{
+    bool available = background_slot;
+    background_slot = false;
+    return available;
+}
+static uint32_t poll_delay_ms(int64_t elapsed_us)
+{
+    int64_t remaining = 5000000 - elapsed_us;
+    /* Slow terminals must still allow the 200ms profile / 100ms history worker
+     * to acquire one slot. Requests never overlap; five seconds is the target,
+     * not a reason to starve all background progress after an overrun. */
+    return remaining > 250000 ? (uint32_t)(remaining / 1000) : 250;
+}
 /* A single encrypted NVS blob commits the cursor and its source binding. Queue
  * persistence always precedes this write. A failed commit replays observations. */
 typedef struct {
@@ -138,7 +153,7 @@ static void poll_task(void *arg)
     for (;;) {
         xSemaphoreTake(request_lock, portMAX_DELAY);
         int64_t started = esp_timer_get_time();
-        next_poll_due = started + 5000000;
+        background_slot = false;
         hik_result_t result = HIK_OK;
         if (!loaded) {
             loaded = checkpoint_load(&cursor, &present);
@@ -185,10 +200,9 @@ static void poll_task(void *arg)
             led_status_set(known && !depth && add_connector_is_connected()
                 ? LED_STATUS_HEALTHY : LED_STATUS_BACKLOG);
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
+        background_slot = true;
         xSemaphoreGive(request_lock);
-        int64_t remaining = 5000000 - (esp_timer_get_time() - started);
-        /* Start-to-start cadence, never overlapping requests or busy retrying. */
-        vTaskDelay(pdMS_TO_TICKS(remaining > 1000 ? (uint32_t)(remaining / 1000) : 1));
+        vTaskDelay(pdMS_TO_TICKS(poll_delay_ms(esp_timer_get_time() - started)));
     }
 }
 static void history_task(void *arg)
@@ -199,10 +213,11 @@ static void history_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        if (atomic_load(&profiles_active) || next_poll_due <= esp_timer_get_time() ||
+        if (atomic_load(&profiles_active) || !background_slot ||
             !add_connector_take_hikvision_assignment(assignment)) {
             xSemaphoreGive(request_lock); continue;
         }
+        (void)take_background_slot();
         cJSON *message = cJSON_Parse(assignment);
         cJSON *serial = cJSON_GetObjectItemCaseSensitive(message, "terminal_serial");
         cJSON *epoch = cJSON_GetObjectItemCaseSensitive(message, "source_epoch");
@@ -264,7 +279,7 @@ static void profile_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(200));
                 if (!add_connector_is_connected()) { failed = true; break; }
                 if (xSemaphoreTake(request_lock, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-                if (next_poll_due <= esp_timer_get_time()) {
+                if (!take_background_slot()) {
                     xSemaphoreGive(request_lock); continue;
                 }
                 cJSON *body = cJSON_CreateObject();
