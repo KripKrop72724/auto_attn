@@ -6,6 +6,7 @@
 #include <string.h>
 #include "esp_random.h"
 #include <stdio.h>
+#include <unistd.h>
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -183,6 +184,52 @@ bool qs_init(void)
         health.recovery_complete = ok;
         xSemaphoreGive(budget_lock);
     } else ok = false;
+    return ok;
+}
+bool qs_verify_persistence(void)
+{
+    if (!storage_upgrade_ready() || !budget_lock ||
+        xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    /* Never erase a fault from an unrelated operation. A failed recovery stays
+     * degraded. This proof covers an otherwise clean boot with no new records. */
+    if (!health.recovery_complete || health.last_error) {
+        xSemaphoreGive(budget_lock); return false;
+    }
+    if (health.persistence_verified) { xSemaphoreGive(budget_lock); return true; }
+    unsigned char expected[32], actual[32];
+    esp_fill_random(expected, sizeof(expected));
+    const char *path = "/storage/persistence-probe";
+    bool ok = measure() && storage_budget_admit(&budget, health.total_bytes,
+        health.used_bytes, 4096, SB_RECOVERY);
+    FILE *f = ok ? fopen(path, "wb") : NULL;
+    ok = f && fwrite(expected, 1, sizeof(expected), f) == sizeof(expected) &&
+        fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (f && fclose(f) != 0) ok = false;
+    f = ok ? fopen(path, "rb") : NULL;
+    ok = f && fread(actual, 1, sizeof(actual), f) == sizeof(actual) &&
+        fgetc(f) == EOF && !ferror(f) && !memcmp(actual, expected, sizeof(actual));
+    if (f && fclose(f) != 0) ok = false;
+    if (ok && unlink(path) != 0) ok = false;
+    nvs_handle_t h;
+    if (ok) {
+        ok = nvs_open("durable_queue", NVS_READWRITE, &h) == ESP_OK;
+        if (ok) {
+            ok = nvs_set_blob(h, "write_proof", expected, sizeof(expected)) == ESP_OK && nvs_commit(h) == ESP_OK;
+            nvs_close(h);
+        }
+        if (ok) {
+            ok = nvs_open("durable_queue", NVS_READONLY, &h) == ESP_OK;
+            if (ok) {
+                size_t size = sizeof(actual);
+                ok = nvs_get_blob(h, "write_proof", actual, &size) == ESP_OK &&
+                    size == sizeof(actual) && !memcmp(actual, expected, size);
+                nvs_close(h);
+            }
+        }
+    }
+    health.persistence_verified = ok;
+    if (!ok) record_queue_result(DQ_IO, "persistence_probe", true);
+    xSemaphoreGive(budget_lock);
     return ok;
 }
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)

@@ -46,7 +46,7 @@ def require_production_qualification(manifest: dict) -> None:
     if (proof.get("model") != "DS-K1T342EFWX"
             or mode not in {"stream", "poll"}
             or (mode == "poll" and (type(proof.get("poll_interval_seconds")) is not int
-                                   or proof["poll_interval_seconds"] != 5))
+                                   or proof["poll_interval_seconds"] not in {2, 5}))
             or not proof.get("terminal_firmware") or not proof.get("profile_id")
             or type(proof.get("soak_seconds")) is not int or proof["soak_seconds"] < 259200
             or not isinstance(digest, str) or len(digest) != 64

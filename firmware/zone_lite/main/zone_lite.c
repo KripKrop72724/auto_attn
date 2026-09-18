@@ -2969,6 +2969,9 @@ static void storage_init(void)
     if (!storage_upgrade_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     g_queue_store_ready = qs_init();
     if (!g_queue_store_ready) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    if (g_queue_store_ready && !qs_verify_persistence()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+#endif
     restore_pending_backup_if_needed();
     (void)restore_blocked_backup_if_needed();
     load_seen_from_file(PENDING_PATH);

@@ -72,7 +72,7 @@ validation evidence, and the required `complete=true` acceptance markers.
 
 ## Repository layout
 
-Hikvision support uses operator-approved five-second polling and is in qualification, not released. The read-only diagnostic and
+Hikvision support uses operator-approved two-second target polling and is in qualification, not released. The read-only diagnostic and
 hardware gates for DS-K1T342EFWX are documented in
 [Hikvision qualification](docs/hikvision-qualification.md). No Hikvision firmware
 image is currently certified by this repository.

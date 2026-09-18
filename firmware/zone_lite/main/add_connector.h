@@ -196,6 +196,7 @@ bool add_connector_enqueue_oracle_receipts(
     const char *const *event_uids,
     size_t count,
     const char *confirmation_path);
+bool add_connector_delivery_healthy(void);
 bool add_connector_log(
     const char *level,
     const char *subsystem,

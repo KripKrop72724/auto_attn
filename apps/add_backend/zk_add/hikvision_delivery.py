@@ -106,7 +106,7 @@ def _hold_existing(session, row, code):
 
 
 def deliver_observation(
-    session: Session, connector: Connector, evidence, observation, raw_payload=None
+    session: Session, connector: Connector, evidence, observation, raw_payload=None, *, clock_sample=None
 ) -> None:
     """Same transaction as raw custody; never call ORDS inside this transaction."""
     from zk_add.service import attendance_device_time_is_plausible
@@ -199,6 +199,9 @@ def deliver_observation(
         if not valid_time
         else ("PENDING" if cnic else "BLOCKED_IDENTITY")
     )
+    from zk_add.hikvision_clock import clock_evidence
+    quality, drift = clock_evidence(clock_sample, event_time, evidence.captured_epoch,
+                                    evidence.channel, observation.timezone_assumed)
     row = AttendanceEvent(
         event_uid=observation.event_uid,
         connector_id=connector.id,
@@ -220,7 +223,8 @@ def deliver_observation(
         status=observation.attendance_status,
         punch=None,
         raw_punch=bool(cnic and parsed.shift_worker),
-        clock_quality="UNKNOWN" if valid_time else "INVALID",
+        clock_quality=quality if valid_time else "INVALID",
+        clock_drift_seconds=drift if valid_time else None,
         sequence=observation.serial_no,
         raw_event={
             "source_protocol": "hikvision-isapi-v1",
@@ -233,6 +237,8 @@ def deliver_observation(
             "identity_profile_version": user.row_version if user else None,
             "identity_snapshot_revision": user.snapshot_revision if user else None,
             "timezone_assumed": observation.timezone_assumed,
+            "clock_sample": clock_sample.model_dump() if clock_sample else None,
+            "clock_verification": "CONTEMPORANEOUS_SAMPLE" if drift is not None else "NO_CONTEMPORANEOUS_SAMPLE",
         },
         ords_status=status,
     )
@@ -302,7 +308,7 @@ def configure_policy(
         "excluded_codes": [list(code) for code in excluded_codes],
         "enabled": bool(enabled),
         "capture_mode": "poll",
-        "poll_interval_seconds": 5,
+        "poll_interval_seconds": 2,
         "identity_rule": "name-cnic",
         "reason": reason,
     }

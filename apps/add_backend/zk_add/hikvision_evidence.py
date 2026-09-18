@@ -3,6 +3,8 @@ import hashlib
 import json
 from typing import Literal
 
+from zk_add.hikvision_clock import HikvisionClockSample
+
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import BigInteger, ForeignKey, Integer, String, Text, UniqueConstraint, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -43,6 +45,7 @@ class ObservationIn(BaseModel):
     channel: Literal["STREAM", "HISTORY", "PUSH", "POLL"]
     raw: str = Field(min_length=1, max_length=8192)
     captured_epoch: int = Field(ge=0, le=4_294_967_295)
+    clock_sample: HikvisionClockSample | None = None
 
     @field_validator("raw", "terminal_serial", "source_epoch")
     @classmethod
@@ -114,7 +117,7 @@ def preserve_observation(session: Session, connector: Connector, payload: Observ
     )
     session.add(evidence)
     session.flush()
-    deliver_observation(session, connector, evidence, observation, data)
+    deliver_observation(session, connector, evidence, observation, data, clock_sample=payload.clock_sample)
     session.flush()
     # Caller sends this receipt only after the surrounding DB transaction commits.
     return {"observation_sha256": payload.observation_sha256, "durable": True}

@@ -1113,7 +1113,7 @@ def configure_hikvision_policy(
     db.commit()
     return {"enabled": policy.enabled, "profile_id": policy.profile_id,
             "mapping_revision": policy.mapping_revision, "capture_mode": "poll",
-            "poll_interval_seconds": 5, "identity_rule": "name-cnic"}
+            "poll_interval_seconds": 2, "identity_rule": "name-cnic"}
 
 
 @app.get("/api/v1/devices/{connector_id}/reconciliations/preflight")
