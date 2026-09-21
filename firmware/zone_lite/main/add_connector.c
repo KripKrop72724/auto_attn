@@ -123,6 +123,7 @@
 #define ADD_IDENTITY_CATALOG_BACKUP_PATH "/storage/add_identities.backup"
 #define ADD_IDENTITY_CATALOG_COMMIT_PATH "/storage/add_identities.commit"
 #define ADD_CANCELLED_COMMANDS_PATH "/storage/add_cancelled.txt"
+#define ADD_COMMAND_RECEIPT_CACHE_BYTES (64U * 1024U)
 
 typedef struct {
     const char *path;
@@ -1344,11 +1345,17 @@ bool add_connector_persist_command_tombstone(const add_command_t *command)
 
 static bool append_cancelled_command(const char *command_id)
 {
-    FILE *file = rel_open_append(ADD_CANCELLED_COMMANDS_PATH);
-    bool ok = file && fprintf(file, "%s\n", command_id) > 0 && fflush(file) == 0 &&
-              fsync(fileno(file)) == 0;
-    if (file && fclose(file) != 0) ok = false;
-    return ok;
+    rel_id_result_t existing = rel_id_file_contains(
+        ADD_CANCELLED_COMMANDS_PATH,
+        command_id,
+        sizeof(((add_command_t *)0)->command_id));
+    if (existing == REL_ID_PRESENT) return true;
+    if (existing == REL_ID_ERROR) return false;
+    return rel_append_bounded_id(
+        ADD_CANCELLED_COMMANDS_PATH,
+        command_id,
+        ADD_COMMAND_RECEIPT_CACHE_BYTES,
+        sizeof(((add_command_t *)0)->command_id));
 }
 
 static bool parse_command_object(cJSON *root, add_command_t *command)
@@ -1360,6 +1367,11 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
     cJSON *expected = cJSON_GetObjectItemCaseSensitive(root, "expected_state");
     if (!command || !cJSON_IsString(type) || strcmp(type->valuestring, "command") != 0 ||
         !cJSON_IsString(command_id) || !cJSON_IsString(command_type) || !cJSON_IsObject(payload)) {
+        return false;
+    }
+    if (strlen(command_id->valuestring) == 0 ||
+        strlen(command_id->valuestring) >= sizeof(command->command_id) ||
+        strpbrk(command_id->valuestring, "\r\n") != NULL) {
         return false;
     }
     memset(command, 0, sizeof(*command));
@@ -2168,6 +2180,14 @@ static void parse_inbound(const char *data, size_t len)
                     "The command was cancelled before terminal execution.",
                     "{}");
                 (void)add_connector_command_complete(command_id->valuestring);
+            } else {
+                (void)add_connector_command_update(
+                    command_id->valuestring,
+                    "RETRYING",
+                    "COMMAND_RECEIPT_PERSIST_FAILED",
+                    "Cancellation was not durably recorded; it will be retried.",
+                    "{}");
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
             }
         }
         cJSON_Delete(root);

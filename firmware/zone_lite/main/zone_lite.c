@@ -172,6 +172,8 @@
 #define ACKED_PATH STORAGE_BASE "/acked_uids.txt"
 #define PROCESSED_COMMANDS_PATH STORAGE_BASE "/processed_commands.txt"
 #define CANCELLED_COMMANDS_PATH STORAGE_BASE "/add_cancelled.txt"
+#define COMMAND_RECEIPT_CACHE_BYTES (64U * 1024U)
+#define COMMAND_ID_MAX_BYTES 96U
 #define MAX_USERS 2048
 #define SEEN_UID_CAPACITY 65536
 #define MAX_EVENT_JSON 1024
@@ -7346,40 +7348,23 @@ static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
     return true;
 }
 
-static bool command_was_processed(const char *command_id)
+static rel_id_result_t command_was_processed(const char *command_id)
 {
-    FILE *file = fopen(PROCESSED_COMMANDS_PATH, "r");
-    if (!file) return false;
-    char line[96];
-    bool found = false;
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strcmp(line, command_id) == 0) { found = true; break; }
-    }
-    fclose(file);
-    return found;
+    return rel_id_file_contains(PROCESSED_COMMANDS_PATH, command_id, COMMAND_ID_MAX_BYTES);
 }
 
-static bool command_was_cancelled(const char *command_id)
+static rel_id_result_t command_was_cancelled(const char *command_id)
 {
-    FILE *file = fopen(CANCELLED_COMMANDS_PATH, "r");
-    if (!file) return false;
-    char line[96];
-    bool found = false;
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strcmp(line, command_id) == 0) {
-            found = true;
-            break;
-        }
-    }
-    fclose(file);
-    return found;
+    return rel_id_file_contains(CANCELLED_COMMANDS_PATH, command_id, COMMAND_ID_MAX_BYTES);
 }
 
-static void mark_command_processed(const char *command_id)
+static bool mark_command_processed(const char *command_id)
 {
-    if (!command_was_processed(command_id)) (void)append_line(PROCESSED_COMMANDS_PATH, command_id);
+    rel_id_result_t state = command_was_processed(command_id);
+    if (state == REL_ID_PRESENT) return true;
+    if (state == REL_ID_ERROR) return false;
+    return rel_append_bounded_id(
+        PROCESSED_COMMANDS_PATH, command_id, COMMAND_RECEIPT_CACHE_BYTES, COMMAND_ID_MAX_BYTES);
 }
 
 static bool temp_admin_clear(void)
@@ -7530,7 +7515,15 @@ static bool process_add_commands(
 {
     add_command_t command;
     while (add_connector_take_command(&command)) {
-        if (command_was_cancelled(command.command_id)) {
+        rel_id_result_t cancelled = command_was_cancelled(command.command_id);
+        if (cancelled == REL_ID_ERROR) {
+            (void)add_connector_command_update(command.command_id, "RETRYING",
+                "COMMAND_RECEIPT_READ_FAILED",
+                "The command receipt store could not be read safely; execution was held.", "{}");
+            add_connector_command_retry(command.command_id);
+            continue;
+        }
+        if (cancelled == REL_ID_PRESENT) {
             (void)add_connector_command_update(
                 command.command_id,
                 "CANCELLED",
@@ -7552,7 +7545,15 @@ static bool process_add_commands(
             (void)add_connector_command_complete(command.command_id);
             continue;
         }
-        if (command_was_processed(command.command_id)) {
+        rel_id_result_t processed = command_was_processed(command.command_id);
+        if (processed == REL_ID_ERROR) {
+            (void)add_connector_command_update(command.command_id, "RETRYING",
+                "COMMAND_RECEIPT_READ_FAILED",
+                "The command receipt store could not be read safely; execution was held.", "{}");
+            add_connector_command_retry(command.command_id);
+            continue;
+        }
+        if (processed == REL_ID_PRESENT) {
             char duplicate_result[192] = "{\"duplicate\":true}";
             if (strcmp(command.command_type, "GRANT_TEMP_ADMIN") == 0 &&
                 g_temp_admin_active && g_temp_admin_uid == (uint16_t)strtoul(command.uid, NULL, 10)) {
@@ -7856,7 +7857,16 @@ static bool process_add_commands(
                 strcmp(command.command_type, "DELETE_USER") == 0) {
                 (void)add_send_user_snapshot(users);
             }
-            mark_command_processed(command.command_id);
+            if (!mark_command_processed(command.command_id)) {
+                (void)add_connector_command_update(command.command_id, "FAILED",
+                    "COMMAND_RECEIPT_PERSIST_FAILED",
+                    "The terminal change completed but its durable receipt could not be stored; manual review is required.",
+                    "{\"receipt_persisted\":false}");
+                (void)add_connector_command_complete(command.command_id);
+                led_status_fault(LED_STATUS_ZKT_FAILURE);
+                continue;
+            }
+
             (void)add_connector_command_update(command.command_id, "SUCCEEDED", NULL, NULL, result);
             (void)add_connector_command_complete(command.command_id);
             if (strcmp(command.command_type, "RESTART_ZKT") == 0) return true;
@@ -8999,7 +9009,16 @@ static bool process_pending_comm_key_command(void)
         add_connector_set_activity("ONLINE");
         return false;
     }
-    if (command_was_cancelled(command.command_id)) {
+    rel_id_result_t cancelled = command_was_cancelled(command.command_id);
+    if (cancelled == REL_ID_ERROR) {
+        (void)add_connector_command_update(command.command_id, "RETRYING",
+            "COMMAND_RECEIPT_READ_FAILED",
+            "The command receipt store could not be read safely; execution was held.", "{}");
+        add_connector_command_retry(command.command_id);
+        add_connector_set_activity("ONLINE");
+        return true;
+    }
+    if (cancelled == REL_ID_PRESENT) {
         (void)add_connector_command_update(
             command.command_id,
             "CANCELLED",
@@ -9107,7 +9126,17 @@ static bool process_pending_comm_key_command(void)
         error_code = comm_probe_error_code(ZK_COMM_PROBE_VERIFIED);
         error_message = comm_probe_error_message(ZK_COMM_PROBE_VERIFIED);
     }
-    mark_command_processed(command.command_id);
+    if (!mark_command_processed(command.command_id)) {
+        (void)add_connector_command_update(command.command_id, "FAILED",
+            "COMMAND_RECEIPT_PERSIST_FAILED",
+            "The diagnostic completed but its durable receipt could not be stored; manual review is required.",
+            "{\"receipt_persisted\":false}");
+        (void)add_connector_command_complete(command.command_id);
+        led_status_fault(LED_STATUS_ZKT_FAILURE);
+        add_connector_set_activity("ONLINE");
+        return true;
+    }
+
     (void)add_connector_command_update(
         command.command_id, "FAILED", error_code, error_message, diagnostic_result);
     (void)add_connector_command_complete(command.command_id);
@@ -9122,7 +9151,16 @@ static bool process_pending_comm_key_command(void)
     if (error_code == NULL) {
         g_last_authenticated_zkt_ip = verified_ip;
         strlcpy(g_device_serial, verified_serial, sizeof(g_device_serial));
-        mark_command_processed(command.command_id);
+        if (!mark_command_processed(command.command_id)) {
+            error_code = "COMMAND_RECEIPT_PERSIST_FAILED";
+            error_message = "The key change completed but its durable receipt could not be stored; manual review is required.";
+            (void)add_connector_command_update(command.command_id, "FAILED", error_code, error_message,
+                "{\"receipt_persisted\":false}");
+            (void)add_connector_command_complete(command.command_id);
+            led_status_fault(LED_STATUS_ZKT_FAILURE);
+            add_connector_set_activity("ONLINE");
+            return true;
+        }
         char result[256];
         snprintf(
             result,
