@@ -564,6 +564,65 @@ def test_full_history_reconciliation_is_contiguous_resumable_and_separately_cert
     assert coverage.oracle_state == "ORACLE_MEMBERSHIP_CERTIFIED"
 
 
+def test_complete_reconcile_binds_legacy_events_without_terminal_serial(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify legacy history event terminal provenance.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="legacy-event-terminal-0001",
+    )
+    raw_digest = hashlib.sha256(RAW_RECORD).hexdigest()
+    apply_reconciliation_anchor(
+        session,
+        connector=connector,
+        payload=ReconciliationAnchorRequest(
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation,
+            cutoff_count=1,
+            latest_terminal_count=1,
+            record_size=8,
+            source_total_bytes=12,
+            first_anchor_digest=raw_digest,
+        ),
+    )
+    source = _source_record().model_copy(
+        update={"event": _source_record().event.model_copy(update={"terminal_serial": None})}
+    )
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        sequence=0,
+        start_ordinal=0,
+        end_ordinal=1,
+        chunk_digest="0" * 64,
+        previous_chain_digest=None,
+        resulting_chain_digest="0" * 64,
+        records=[source],
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    request = draft.model_copy(
+        update={
+            "chunk_digest": chunk_digest,
+            "resulting_chain_digest": reconciliation_chain_digest(
+                None, start_ordinal=0, end_ordinal=1, chunk_digest=chunk_digest
+            ),
+        }
+    )
+    apply_reconciliation_chunk(session, connector=connector, payload=request)
+    row = session.scalar(select(AttendanceEvent))
+    assert row is not None
+    assert row.device_serial == SERIAL
+    assert row.identity_resolution_status == "RESOLVED"
+    assert row.ords_status == "PENDING"
+
+
 def test_final_source_exception_review_resumes_assurance_without_rescan(
     reconciliation_db,
 ):

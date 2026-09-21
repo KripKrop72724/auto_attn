@@ -545,6 +545,49 @@ def apply_reconciliation_anchor(
     return job
 
 
+def _bound_source_attendance(session, *, connector, terminal_serial, records):
+    """Bind nested events to the verified source envelope, including legacy rows."""
+    zkt = connector.zkt_device
+    if not terminal_serial or not zkt or terminal_serial != zkt.serial:
+        raise ValueError("Source terminal no longer matches the connector binding.")
+    events = []
+    for source in records:
+        incoming = source.event
+        if incoming is None:
+            continue
+        if incoming.terminal_serial not in {None, terminal_serial}:
+            raise ValueError("Attendance terminal differs from its source envelope.")
+        if incoming.source not in {"FULL_HISTORY", "CURRENT_RECONCILE"}:
+            raise ValueError("Source history must use a historical capture type.")
+        events.append(incoming.model_copy(update={"terminal_serial": terminal_serial}))
+    if events:
+        from zk_add.service import recover_verified_source_identity
+
+        existing = session.scalars(select(AttendanceEvent).where(
+            AttendanceEvent.event_uid.in_([event.event_uid for event in events])
+        )).all()
+        by_uid = {event.event_uid: event for event in events}
+        for row in existing:
+            incoming = by_uid[row.event_uid]
+            if (row.connector_id != connector.id or row.zkt_device_id != zkt.id
+                    or row.device_serial not in {None, terminal_serial}
+                    or row.user_id != incoming.user_id
+                    or ensure_utc(row.device_event_time) != ensure_utc(incoming.device_event_time)):
+                raise ValueError("Replayed attendance conflicts with retained source ownership.")
+            # Do not rewrite immutable facts used by an existing repair approval.
+            from zk_add.models import AttendanceRepairItem
+            reviewed = session.scalar(select(AttendanceRepairItem.id).where(
+                AttendanceRepairItem.attendance_event_id == row.id
+            ).limit(1))
+            if row.device_serial is None and reviewed is None:
+                row.device_serial = terminal_serial
+                row.raw_event = {**(row.raw_event or {}),
+                                 "terminal_provenance": "VERIFIED_SOURCE_REPLAY"}
+            if reviewed is None:
+                recover_verified_source_identity(session, connector=connector, row=row)
+    return events
+
+
 def apply_reconciliation_chunk(
     session: Session,
     *,
@@ -680,11 +723,11 @@ def apply_reconciliation_chunk(
 
     from zk_add.service import ingest_attendance
 
-    attendance = [
-        row.event
-        for row in payload.records
-        if row.event is not None and row.ordinal not in interpretation_drift_ordinals
-    ]
+    attendance = _bound_source_attendance(
+        session, connector=connector, terminal_serial=job.terminal_serial,
+        records=[row for row in payload.records
+                 if row.ordinal not in interpretation_drift_ordinals],
+    )
     accepted_uids: set[str] = set()
     duplicate_uids: set[str] = set()
     if attendance:
@@ -1117,7 +1160,10 @@ def apply_source_tail_chunk(
 
     from zk_add.service import ingest_attendance, upsert_alert
 
-    attendance = [row.event for row in payload.records if row.event is not None]
+    attendance = _bound_source_attendance(
+        session, connector=connector, terminal_serial=coverage.terminal_serial,
+        records=payload.records,
+    )
     if attendance:
         ingest_attendance(session, connector=connector, events=attendance)
     session.flush()

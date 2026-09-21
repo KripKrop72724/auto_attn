@@ -2988,6 +2988,59 @@ def block_undelivered_attendance(
     return changed
 
 
+def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
+    """Recover a provenance hold only when retained identity proves continuity."""
+    zkt = connector.zkt_device
+    if (zkt is None or row.ords_status != "BLOCKED_IDENTITY"
+            or row.identity_resolution_status != "BLOCKED_PROVENANCE"
+            or row.cnic_lookup_hash or row.identity_content_status == "VERIFIED"
+            or row.clock_quality != "OK"):
+        return False
+    user = session.scalar(select(DeviceUser).where(
+        DeviceUser.zkt_device_id == zkt.id,
+        DeviceUser.user_id == row.user_id,
+        DeviceUser.uid == row.uid,
+        DeviceUser.lifecycle_state == "ACTIVE",
+        DeviceUser.present.is_(True),
+        DeviceUser.identity_conflict_code.is_(None),
+    ))
+    if not user or not user.cnic_lookup_hash:
+        return False
+    if not historical_identity_is_supported(
+        serial=row.device_serial, bound_serial=zkt.serial,
+        confirmed_serial=zkt.confirmed_serial,
+        uid=row.uid, expected_uid=user.uid,
+        fingerprint=row.identity_terminal_fingerprint,
+        expected_fingerprint=user.terminal_identity_fingerprint,
+        event_time=row.device_event_time, continuity_started=zkt.last_identity_change_at,
+        snapshot_observed=zkt.identity_snapshot_observed_at,
+        snapshot_stable=bool(zkt.snapshot_complete and zkt.identity_snapshot_stable
+                             and zkt.identity_snapshot_id),
+        tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
+    ):
+        return False
+    row.device_user_id = user.id
+    row.identity_snapshot_id = zkt.identity_snapshot_id
+    row.identity_resolution_status = "RESOLVED_CURRENT_SNAPSHOT"
+    row.identity_resolved_at = row.identity_repaired_at = utc_now()
+    row.identity_repair_reason = "VERIFIED_SOURCE_REPLAY_CONTINUITY"
+    row.display_name = user.display_name
+    row.cnic_encrypted = user.cnic_encrypted
+    row.cnic_lookup_hash = user.cnic_lookup_hash
+    row.cnic_last4 = user.cnic_last4
+    row.ords_status = "PENDING"
+    outbox = session.scalar(select(OrdsOutbox).where(
+        OrdsOutbox.attendance_event_id == row.id
+    ))
+    if outbox is None:
+        session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING",
+                               delivery_type="FULL_HISTORY"))
+    elif outbox.status == "BLOCKED_IDENTITY":
+        outbox.status = "PENDING"
+        outbox.next_attempt_at = None
+    return True
+
+
 def ingest_attendance(
     session: Session, *, connector: Connector, events: list[AttendanceEventIn]
 ) -> tuple[list[str], list[str]]:
