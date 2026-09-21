@@ -33,14 +33,13 @@ if (-not [string]::IsNullOrWhiteSpace($HilTargetsJson)) {
     $parsedTargets = @($HilTargetsJson | ConvertFrom-Json)
     if ($parsedTargets.Count -lt 1 -or $parsedTargets.Count -gt 8) { throw 'HIL requires one to eight ordered exact targets' }
     foreach ($target in $parsedTargets) {
-        # PowerShell versions differ in how a deserialized JSON property
-        # collection is enumerated. Validate the set and count explicitly so
-        # a valid exact target cannot be rejected because of collection shape.
-        $keys = @($target.PSObject.Properties | ForEach-Object { [string]$_.Name })
-        $requiredKeys = @('connector_id', 'mac', 'terminal_serial')
-        if ($keys.Count -ne 3 -or
-            @($requiredKeys | Where-Object { $_ -notin $keys }).Count -ne 0) {
-            throw 'HIL target must contain only connector_id, mac and terminal_serial'
+        # Validate required properties directly.  Windows PowerShell can
+        # expose a deserialized JSON property collection with a different
+        # enumeration shape; direct property lookup is stable across runners.
+        foreach ($required in @('connector_id', 'mac', 'terminal_serial')) {
+            if ($null -eq $target.PSObject.Properties[$required]) {
+                throw 'HIL target must contain connector_id, mac and terminal_serial'
+            }
         }
         foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
             if ($target.$field -isnot [string]) { throw "HIL $field must be text" }
