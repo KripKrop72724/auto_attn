@@ -698,6 +698,26 @@ def test_oracle_live_insert_recomputes_daily_flags_without_delete():
     assert "delete from hr_raw_attn_capture_events d" in migration
 
 
+def test_raw_capture_trigger_repair_is_schema_guarded_and_data_free():
+    migration = (
+        ROOT
+        / "deploy"
+        / "add"
+        / "oracle"
+        / "20260921_fix_raw_attn_sync_trigger_columns.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "HR_EMPLOYEE_ATTENDANCE" in migration
+    assert "CREATED_IP" in migration
+    assert "UPDATED_IP" in migration
+    assert "attendance_rows_changed=0" in migration
+    assert "INSERT INTO HR_RAW_ATTN_CAPTURE_EVENTS" not in migration.upper()
+    assert "UPDATE HR_RAW_ATTN_CAPTURE_EVENTS" not in migration.upper()
+    assert "DELETE FROM HR_RAW_ATTN_CAPTURE_EVENTS" not in migration.upper()
+    assert "MERGE INTO HR_RAW_ATTN_CAPTURE_EVENTS" not in migration.upper()
+    assert "execute immediate l_previous_ddl" in migration
+
+
 def test_oracle_reconcile_recomputes_whole_day_flags_without_transient_true_rows():
     oracle = (
         ROOT / "deploy" / "add" / "oracle" / "slic_zkt_truth_api.sql"

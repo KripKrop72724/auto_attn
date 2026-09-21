@@ -51,6 +51,7 @@ from zk_add.service import (
     queue_due_revokes,
     reconcile_admin_lease_command,
     reconcile_admin_lease_states,
+    repair_missing_terminal_provenance,
     repair_verified_active_identity_backlog,
     repair_verified_source_identity_backlog,
     repair_verified_tombstone_backlog,
@@ -426,6 +427,7 @@ def prepare_maintenance_tick(
                     )
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
+        repair_missing_terminal_provenance(session)
         repair_verified_tombstone_backlog(session)
         repair_verified_active_identity_backlog(session)
         repair_verified_source_identity_backlog(session)
