@@ -55,7 +55,14 @@ from zk_add.schemas import (
     UserSnapshotRequest,
     UserSnapshotRow,
 )
-from zk_add.service import onboard_connector, replace_user_snapshot, ingest_attendance, repair_verified_active_identity_backlog, repair_verified_tombstone_backlog
+from zk_add.service import (
+    ingest_attendance,
+    onboard_connector,
+    repair_missing_terminal_provenance,
+    repair_verified_active_identity_backlog,
+    repair_verified_tombstone_backlog,
+    replace_user_snapshot,
+)
 from zk_add.source_exceptions import (
     list_source_exceptions,
     reveal_source_exception,
@@ -625,6 +632,74 @@ def test_complete_reconcile_binds_legacy_events_without_terminal_serial(
     assert row.device_serial == SERIAL
     assert row.identity_resolution_status == "RESOLVED"
     assert row.ords_status == "PENDING"
+
+
+def test_reconnect_capture_binds_legacy_missing_serial_to_confirmed_connector(
+    reconciliation_db,
+):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.terminal_binding_state = "CONFIRMED"
+    zkt.serial_confirmed_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    incoming = _source_record().event.model_copy(
+        update={
+            "event_uid": hashlib.sha256(b"reconnect-missing-serial").hexdigest(),
+            "terminal_serial": None,
+            "source": "DUMP_RECONNECT",
+            "captured_at": datetime(2026, 8, 5, tzinfo=timezone.utc),
+        }
+    )
+    ingest_attendance(session, connector=connector, events=[incoming])
+    session.flush()
+    row = session.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+    assert row is not None
+    assert row.device_serial == SERIAL
+    assert row.raw_event["terminal_provenance"] == "VERIFIED_CONNECTOR_BINDING"
+
+
+def test_manual_reprocess_missing_serial_stays_unresolved(reconciliation_db):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.terminal_binding_state = "CONFIRMED"
+    zkt.serial_confirmed_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    incoming = _source_record().event.model_copy(
+        update={
+            "event_uid": hashlib.sha256(b"manual-missing-serial").hexdigest(),
+            "terminal_serial": None,
+            "source": "MANUAL_REPROCESS",
+        }
+    )
+    ingest_attendance(session, connector=connector, events=[incoming])
+    session.flush()
+    row = session.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+    assert row is not None
+    assert row.device_serial is None
+
+
+def test_terminal_provenance_backfill_is_bounded_and_audited(reconciliation_db):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.terminal_binding_state = "CONFIRMED"
+    zkt.serial_confirmed_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    row = AttendanceEvent(
+        event_uid=hashlib.sha256(b"backfill-missing-serial").hexdigest(),
+        connector_id=connector.id,
+        zkt_device_id=zkt.id,
+        user_id="1007",
+        device_event_time=datetime(2026, 8, 4, tzinfo=timezone.utc),
+        captured_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        source="DUMP_RECONNECT",
+        raw_event={"legacy": True},
+        ords_status="BLOCKED_IDENTITY",
+    )
+    session.add(row)
+    session.flush()
+    assert repair_missing_terminal_provenance(session) == 1
+    assert row.device_serial == SERIAL
+    assert repair_missing_terminal_provenance(session) == 0
 
 
 def test_final_source_exception_review_resumes_assurance_without_rescan(

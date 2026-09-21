@@ -30,6 +30,7 @@ from zk_add.identity_conflicts import (
 )
 from zk_add.models import (
     AttendanceEvent,
+    AttendanceRepairItem,
     Connector,
     ConnectorCredential,
     DeviceAlert,
@@ -75,6 +76,46 @@ ACTIVE_COMMAND_STATES = {
     "RUNNING",
     "CANCEL_REQUESTED",
 }
+
+# These captures are created by the authenticated connector itself.  They may
+# omit the per-row serial on older firmware, but the connector's confirmed
+# binding is still usable as provenance when the capture was received after
+# that binding was established.  Operator/manual replay is deliberately not
+# included: a manually supplied row must carry its own terminal evidence.
+CONNECTOR_OWNED_CAPTURE_SOURCES = frozenset(
+    {"DUMP_STARTUP", "DUMP_RECONNECT", "RECONCILE_15M"}
+)
+
+
+def trusted_capture_terminal_serial(
+    *,
+    zkt: ZKTDevice,
+    source: str,
+    supplied_serial: str | None,
+    captured_at: datetime,
+) -> tuple[str | None, str | None]:
+    """Return a terminal serial only when its provenance is independently bound.
+
+    An explicit serial remains authoritative for the normal namespace check;
+    this helper only fills the legacy missing-serial case.  The timestamp gate
+    prevents a current connector assignment from being projected onto an old
+    punch captured before the terminal was confirmed (for example after a
+    hardware replacement).
+    """
+    if supplied_serial:
+        return supplied_serial, "PAYLOAD"
+    if source not in CONNECTOR_OWNED_CAPTURE_SOURCES:
+        return None, None
+    serial = zkt.serial
+    if not (
+        serial
+        and zkt.terminal_binding_state == "CONFIRMED"
+        and zkt.confirmed_serial == serial
+        and zkt.serial_confirmed_at is not None
+        and ensure_utc(captured_at) >= ensure_utc(zkt.serial_confirmed_at)
+    ):
+        return None, None
+    return serial, "VERIFIED_CONNECTOR_BINDING"
 TERMINAL_COMMAND_STATES = {
     "SUCCEEDED",
     "FAILED",
@@ -3056,6 +3097,69 @@ def recover_verified_source_identity(session: Session, *, connector: Connector, 
     return True
 
 
+def repair_missing_terminal_provenance(
+    session: Session,
+    *,
+    limit: int = 500,
+) -> int:
+    """Fill legacy connector-owned rows from a still-valid serial binding.
+
+    This is intentionally narrower than identity repair.  It changes only the
+    nullable display/provenance column; attendance facts, identity fields,
+    Oracle status, and repair approvals are untouched.  A row is eligible only
+    when its connector owns the same ZKT device, the device serial is confirmed
+    and unchanged, and the row was captured after that confirmation.  Rows
+    protected by an attendance repair item or lacking those proofs remain
+    unresolved for operator review instead of being guessed.
+    """
+    bounded_limit = max(1, min(int(limit), 500))
+    candidates = session.execute(
+        select(AttendanceEvent, ZKTDevice)
+        .join(ZKTDevice, ZKTDevice.id == AttendanceEvent.zkt_device_id)
+        .where(
+            AttendanceEvent.device_serial.is_(None),
+            AttendanceEvent.source.in_(tuple(CONNECTOR_OWNED_CAPTURE_SOURCES)),
+            AttendanceEvent.connector_id == ZKTDevice.connector_id,
+            ZKTDevice.serial.is_not(None),
+            ZKTDevice.confirmed_serial == ZKTDevice.serial,
+            ZKTDevice.terminal_binding_state == "CONFIRMED",
+            ZKTDevice.serial_confirmed_at.is_not(None),
+            AttendanceEvent.captured_at >= ZKTDevice.serial_confirmed_at,
+            ~select(AttendanceRepairItem.id)
+            .where(AttendanceRepairItem.attendance_event_id == AttendanceEvent.id)
+            .exists(),
+        )
+        .order_by(AttendanceEvent.id.asc())
+        .limit(bounded_limit)
+        .with_for_update(skip_locked=True)
+    ).all()
+    repaired = 0
+    serials: set[str] = set()
+    for row, zkt in candidates:
+        serial, _source = trusted_capture_terminal_serial(
+            zkt=zkt,
+            source=row.source,
+            supplied_serial=row.device_serial,
+            captured_at=row.captured_at,
+        )
+        if not serial:
+            continue
+        row.device_serial = serial
+        serials.add(serial)
+        repaired += 1
+    if repaired:
+        append_audit(
+            session,
+            actor="SYSTEM",
+            action="ATTENDANCE_TERMINAL_PROVENANCE_REPAIRED",
+            target_type="attendance_events",
+            target_id="bounded-maintenance-pass",
+            outcome="REPAIRED",
+            after={"count": repaired, "serial_count": len(serials)},
+        )
+    return repaired
+
+
 def repair_verified_source_identity_backlog(session: Session, *, limit: int = 1000) -> int:
     """Release reconcile rows whose exact terminal user ID is now verifiable."""
     candidates = session.execute(
@@ -3233,13 +3337,19 @@ def ingest_attendance(
             display_name = decrypt_text(tombstone.display_name_encrypted) or display_name
             shift_worker = tombstone.shift_worker
         historical = incoming.source not in {"LIVE", "LIVE_POLL"}
+        effective_terminal_serial, terminal_serial_source = trusted_capture_terminal_serial(
+            zkt=zkt,
+            source=incoming.source,
+            supplied_serial=incoming.terminal_serial,
+            captured_at=incoming.captured_at,
+        )
         namespace_mismatch = bool(
-            incoming.terminal_serial and incoming.terminal_serial != zkt.serial
+            effective_terminal_serial and effective_terminal_serial != zkt.serial
         )
         provenance_blocked = namespace_mismatch or (
             historical
             and not historical_identity_is_supported(
-                serial=incoming.terminal_serial,
+                serial=effective_terminal_serial,
                 bound_serial=zkt.serial,
                 confirmed_serial=zkt.confirmed_serial,
                 uid=incoming.uid,
@@ -3291,6 +3401,12 @@ def ingest_attendance(
                 ),
                 details={"event_uid_prefix": incoming.event_uid[:12]},
             )
+        raw_event = sanitize_raw_event(incoming.raw_event)
+        if terminal_serial_source == "VERIFIED_CONNECTOR_BINDING":
+            raw_event = {
+                **raw_event,
+                "terminal_provenance": "VERIFIED_CONNECTOR_BINDING",
+            }
         row = AttendanceEvent(
             event_uid=incoming.event_uid,
             connector_id=connector.id,
@@ -3320,7 +3436,7 @@ def ingest_attendance(
                 )
             ),
             identity_resolved_at=utc_now() if cnic else None,
-            device_serial=incoming.terminal_serial or (None if historical else zkt.serial),
+            device_serial=effective_terminal_serial or (None if historical else zkt.serial),
             uid=incoming.uid,
             user_id=incoming.user_id,
             display_name=display_name,
@@ -3339,7 +3455,7 @@ def ingest_attendance(
             ),
             boot_id=incoming.boot_id,
             sequence=incoming.sequence,
-            raw_event=sanitize_raw_event(incoming.raw_event),
+            raw_event=raw_event,
             ords_status=(
                 "QUARANTINED_INVALID_DEVICE_TIME"
                 if not plausible_device_time
