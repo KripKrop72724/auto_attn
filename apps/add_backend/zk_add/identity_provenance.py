@@ -19,23 +19,28 @@ def historical_identity_is_supported(
     snapshot_observed: datetime | None,
     snapshot_stable: bool,
     tolerance_seconds: int,
+    allow_user_id_only: bool = False,
+    expected_user_id: str | None = None,
 ) -> bool:
     if not (
         serial
         and bound_serial
         and confirmed_serial
-        and uid
-        and expected_uid
-        and fingerprint
-        and expected_fingerprint
         and continuity_started
         and snapshot_observed
         and snapshot_stable
     ):
         return False
-    if not (
-        serial == bound_serial
-        and serial == confirmed_serial
+    if serial != bound_serial or serial != confirmed_serial:
+        return False
+    if allow_user_id_only and not uid and not fingerprint:
+        if not expected_user_id:
+            return False
+    elif not (
+        uid
+        and expected_uid
+        and fingerprint
+        and expected_fingerprint
         and uid == expected_uid
         and len(fingerprint) == 64
         and len(expected_fingerprint) == 64

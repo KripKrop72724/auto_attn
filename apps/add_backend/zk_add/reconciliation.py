@@ -559,7 +559,13 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
             raise ValueError("Attendance terminal differs from its source envelope.")
         if incoming.source not in {"FULL_HISTORY", "CURRENT_RECONCILE"}:
             raise ValueError("Source history must use a historical capture type.")
-        events.append(incoming.model_copy(update={"terminal_serial": terminal_serial}))
+        events.append(incoming.model_copy(update={
+            "terminal_serial": terminal_serial,
+            "raw_event": {
+                **(incoming.raw_event or {}),
+                "reconciliation_source": "VERIFIED_TERMINAL_SOURCE",
+            },
+        }))
     if events:
         from zk_add.service import recover_verified_source_identity
 

@@ -593,7 +593,11 @@ def test_complete_reconcile_binds_legacy_events_without_terminal_serial(
         ),
     )
     source = _source_record().model_copy(
-        update={"event": _source_record().event.model_copy(update={"terminal_serial": None})}
+        update={"event": _source_record().event.model_copy(update={
+            "terminal_serial": None,
+            "uid": None,
+            "terminal_identity_fingerprint": None,
+        })}
     )
     draft = ReconciliationChunkRequest(
         job_id=job.job_id,

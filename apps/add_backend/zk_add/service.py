@@ -47,6 +47,7 @@ from zk_add.models import (
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
+    TerminalRecordManifest,
     UserDeletionItem,
     UserDeletionJob,
     ZKTDevice,
@@ -2991,7 +2992,17 @@ def block_undelivered_attendance(
 def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
     """Recover a provenance hold only when retained identity proves continuity."""
     zkt = connector.zkt_device
-    if (zkt is None or row.ords_status != "BLOCKED_IDENTITY"
+    source_manifest = session.scalar(select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.attendance_event_id == row.id,
+        TerminalRecordManifest.connector_id == connector.id,
+        TerminalRecordManifest.zkt_device_id == zkt.id if zkt else False,
+        TerminalRecordManifest.canonical_source.is_(True),
+    ).limit(1)) if zkt is not None else None
+    source_attested = bool(
+        source_manifest is not None
+        or (row.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE"
+    )
+    if (zkt is None or not source_attested or row.ords_status != "BLOCKED_IDENTITY"
             or row.identity_resolution_status != "BLOCKED_PROVENANCE"
             or row.cnic_lookup_hash or row.identity_content_status == "VERIFIED"
             or row.clock_quality != "OK"):
@@ -3017,6 +3028,8 @@ def recover_verified_source_identity(session: Session, *, connector: Connector, 
         snapshot_stable=bool(zkt.snapshot_complete and zkt.identity_snapshot_stable
                              and zkt.identity_snapshot_id),
         tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
+        allow_user_id_only=not row.uid and not row.identity_terminal_fingerprint,
+        expected_user_id=user.user_id,
     ):
         return False
     row.device_user_id = user.id
@@ -3039,6 +3052,29 @@ def recover_verified_source_identity(session: Session, *, connector: Connector, 
         outbox.status = "PENDING"
         outbox.next_attempt_at = None
     return True
+
+
+def repair_verified_source_identity_backlog(session: Session, *, limit: int = 1000) -> int:
+    """Release reconcile rows whose exact terminal user ID is now verifiable."""
+    candidates = session.execute(
+        select(AttendanceEvent, Connector)
+        .join(Connector, Connector.id == AttendanceEvent.connector_id)
+        .where(
+            AttendanceEvent.source.in_(("FULL_HISTORY", "CURRENT_RECONCILE")),
+            AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+            AttendanceEvent.identity_resolution_status == "BLOCKED_PROVENANCE",
+            AttendanceEvent.device_serial.is_not(None),
+        )
+        .order_by(AttendanceEvent.id.asc())
+        .limit(max(1, min(int(limit), 5000)))
+        .with_for_update(skip_locked=True)
+    ).all()
+    repaired = 0
+    for row, connector in candidates:
+        repaired += int(recover_verified_source_identity(
+            session, connector=connector, row=row
+        ))
+    return repaired
 
 
 def ingest_attendance(
@@ -3113,6 +3149,10 @@ def ingest_attendance(
             incoming.captured_at,
         )
         parsed = parse_machine_name(incoming.raw_name)
+        source_attested = bool(
+            incoming.raw_event.get("reconciliation_source")
+            == "VERIFIED_TERMINAL_SOURCE"
+        )
         active_user = users_by_id.get(incoming.user_id)
         user = active_user
         # A terminal user ID is not an identity by itself: ZKT terminals can
@@ -3122,9 +3162,9 @@ def ingest_attendance(
         if (
             user is not None
             and (
-                not incoming.uid
+                (not incoming.uid and not source_attested)
                 or not user.uid
-                or not secrets.compare_digest(incoming.uid, user.uid)
+                    or (incoming.uid and not secrets.compare_digest(incoming.uid, user.uid))
                 or (
                     incoming.terminal_identity_fingerprint
                     and user.terminal_identity_fingerprint
@@ -3209,6 +3249,8 @@ def ingest_attendance(
                 snapshot_observed=zkt.identity_snapshot_observed_at,
                 snapshot_stable=snapshot_verified,
                 tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
+                allow_user_id_only=source_attested,
+                expected_user_id=user.user_id if user else None,
             )
         )
         if provenance_blocked:
