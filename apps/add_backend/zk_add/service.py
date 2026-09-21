@@ -2992,12 +2992,14 @@ def block_undelivered_attendance(
 def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
     """Recover a provenance hold only when retained identity proves continuity."""
     zkt = connector.zkt_device
-    source_manifest = session.scalar(select(TerminalRecordManifest.id).where(
-        TerminalRecordManifest.attendance_event_id == row.id,
-        TerminalRecordManifest.connector_id == connector.id,
-        TerminalRecordManifest.zkt_device_id == zkt.id if zkt else False,
-        TerminalRecordManifest.canonical_source.is_(True),
-    ).limit(1)) if zkt is not None else None
+    source_manifest = None
+    if zkt is not None:
+        source_manifest = session.scalar(select(TerminalRecordManifest.id).where(
+            TerminalRecordManifest.attendance_event_id == row.id,
+            TerminalRecordManifest.connector_id == connector.id,
+            TerminalRecordManifest.zkt_device_id == zkt.id,
+            TerminalRecordManifest.canonical_source.is_(True),
+        ).limit(1))
     source_attested = bool(
         source_manifest is not None
         or (row.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE"
