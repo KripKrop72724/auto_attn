@@ -2,9 +2,47 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+rel_id_result_t rel_id_file_contains(const char *path, const char *id, size_t max_id_length)
+{
+    if (!path || !id || !*id || strlen(id) >= max_id_length) return REL_ID_ERROR;
+    FILE *file = fopen(path, "rb");
+    if (!file) return errno == ENOENT ? REL_ID_ABSENT : REL_ID_ERROR;
+    char line[128];
+    rel_id_result_t result = REL_ID_ABSENT;
+    while (fgets(line, sizeof(line), file)) {
+        if (!strchr(line, '\n')) {
+            result = REL_ID_ERROR;
+            break;
+        }
+        size_t length = strcspn(line, "\r\n");
+        line[length] = '\0';
+        if (!strcmp(line, id)) { result = REL_ID_PRESENT; break; }
+    }
+    if (ferror(file)) result = REL_ID_ERROR;
+    if (fclose(file) != 0) result = REL_ID_ERROR;
+    return result;
+}
+
+bool rel_append_bounded_id(const char *path, const char *id, size_t max_bytes, size_t max_id_length)
+{
+    if (!path || !id || !*id || strlen(id) >= max_id_length || strlen(id) + 1 > max_bytes) {
+        errno = EINVAL;
+        return false;
+    }
+    FILE *file = rel_open_append(path);
+    if (!file) return false;
+    struct stat st;
+    bool ok = fstat(fileno(file), &st) == 0 && st.st_size >= 0 &&
+        (uintmax_t)st.st_size <= max_bytes - (strlen(id) + 1);
+    if (ok) ok = fprintf(file, "%s\n", id) > 0 && fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (fclose(file) != 0) ok = false;
+    return ok;
+}
 
 FILE *rel_open_append(const char *path)
 {

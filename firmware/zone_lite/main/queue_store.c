@@ -19,6 +19,10 @@ static qs_health_t health;
 static storage_budget_t budget;
 static char storage_generation[33];
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe", "qh"};
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static dq_audit_t recovery_audits[QS_COUNT];
+static uint8_t recovery_buffer[DQ_MAX_RECORD_BYTES];
+#endif
 static bool ensure_storage_generation(void)
 {
     if (storage_generation[0]) return true;
@@ -181,10 +185,45 @@ bool qs_init(void)
         xSemaphoreGive(lane->mutex);
     }
     if (xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
         health.recovery_complete = ok;
+#else
+        /* A valid checkpoint is not proof that its pending records survived. */
+        health.recovery_complete = false;
+        memset(recovery_audits, 0, sizeof(recovery_audits));
+#endif
         xSemaphoreGive(budget_lock);
     } else ok = false;
     return ok;
+}
+bool qs_recover_step(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return false; /* Hikvision retains its existing independent recovery path. */
+#else
+    bool complete = true;
+    for (unsigned i = 0; i < QS_COUNT; ++i) {
+        if (!lock((qs_lane_t)i)) return false;
+        if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            xSemaphoreGive(lanes[i].mutex); return false;
+        }
+        errno = 0;
+        dq_result_t result = reopen(&lanes[i]);
+        if (result == DQ_OK && !recovery_audits[i].complete)
+            result = dq_audit_step(&lanes[i].queue, &recovery_audits[i],
+                recovery_buffer, sizeof(recovery_buffer));
+        if (result != DQ_OK) complete = false;
+        if (result != DQ_PENDING) record_queue_result(result, "segment_verify", false);
+        xSemaphoreGive(budget_lock);
+        xSemaphoreGive(lanes[i].mutex);
+    }
+    if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        health.recovery_complete = complete && !health.last_error;
+        complete = health.recovery_complete;
+        xSemaphoreGive(budget_lock);
+    } else complete = false;
+    return complete;
+#endif
 }
 bool qs_verify_persistence(void)
 {

@@ -25,6 +25,16 @@ typedef struct {
     bool ready;
 } durable_queue_t;
 typedef struct { uint32_t segment, offset, end, sequence, crc; } dq_token_t;
+typedef struct {
+    uint32_t generation, segment, offset, remaining, sequence;
+    bool started, complete;
+} dq_audit_t;
+
+/* Validate one pending record per call without committing or retiring anything.
+ * Caller owns the queue lock and releases it between DQ_PENDING calls. Changes
+ * to the authoritative checkpoint restart the audit conservatively. */
+dq_result_t dq_audit_step(const durable_queue_t *queue, dq_audit_t *audit,
+                          void *buffer, size_t capacity);
 
 uint32_t dq_crc32(const void *data, size_t length);
 dq_result_t dq_open(durable_queue_t *queue, const char *prefix, dq_port_t port);

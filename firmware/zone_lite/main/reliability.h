@@ -12,6 +12,18 @@ bool rel_json_syntax_valid(const char *text, size_t length);
 /* Never append a valid record onto an interrupted, unterminated legacy row. */
 FILE *rel_open_append(const char *path);
 
+typedef enum {
+    REL_ID_ERROR = -1,
+    REL_ID_ABSENT = 0,
+    REL_ID_PRESENT = 1,
+} rel_id_result_t;
+
+/* A command receipt is a bounded, newline-delimited durable identifier.  A
+ * missing file is an empty set; read and durability failures are errors and
+ * must never be treated as a cache miss. */
+rel_id_result_t rel_id_file_contains(const char *path, const char *id, size_t max_id_length);
+bool rel_append_bounded_id(const char *path, const char *id, size_t max_bytes, size_t max_id_length);
+
 typedef struct {
     char user_id[32];
     uint8_t status, punch;

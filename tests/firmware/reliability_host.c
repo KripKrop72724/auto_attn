@@ -16,6 +16,19 @@ int main(void)
     assert(strcmp(preserved, "settled\ninterrupted") == 0);
     assert(fclose(append) == 0);
     assert(remove("legacy-append") == 0);
+
+    assert(rel_id_file_contains("command-receipts", "cmd-1", 96) == REL_ID_ABSENT);
+    assert(rel_append_bounded_id("command-receipts", "cmd-1", 16, 96));
+    assert(rel_id_file_contains("command-receipts", "cmd-1", 96) == REL_ID_PRESENT);
+    assert(rel_id_file_contains("command-receipts", "cmd-2", 96) == REL_ID_ABSENT);
+    /* The bound is checked before the write and a failed append cannot make a
+       later read look like a missing receipt. */
+    assert(!rel_append_bounded_id("command-receipts", "cmd-22", 12, 96));
+    assert(rel_id_file_contains("command-receipts", "cmd-22", 96) == REL_ID_ABSENT);
+    FILE *broken = fopen("command-receipts", "ab"); assert(broken);
+    assert(fputs("unterminated", broken) >= 0); assert(fclose(broken) == 0);
+    assert(rel_id_file_contains("command-receipts", "cmd-3", 96) == REL_ID_ERROR);
+    assert(remove("command-receipts") == 0);
     const char *valid[] = {"{}", "[]", "null", "-12.30e+4", "{\"a\":[true,false,null,\"x\\n\",{}]}", " \"\\u0041\" "};
     const char *invalid[] = {"", "{", "[1,]", "{\"a\":}", "01", "+1", "1.", "1e", "true false", "\"x\n\"", "\"\\x\"", "[}"};
     for (size_t i = 0; i < sizeof(valid)/sizeof(*valid); i++) assert(rel_json_syntax_valid(valid[i], strlen(valid[i])));

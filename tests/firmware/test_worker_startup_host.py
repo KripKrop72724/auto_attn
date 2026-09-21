@@ -1,4 +1,5 @@
 """The production startup loop preserves running capture during delivery failures."""
+
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ def test_startup_retries_do_not_reboot_or_recreate_healthy_capture(tmp_path, hik
     source = (firmware / "zone_lite.c").read_text()
     start = source.index("    // Retain handles and retry startup")
     body = source[start:]
-    harness = r'''
+    harness = r"""
 #include "worker_retry.h"
 #include <assert.h>
 #include <setjmp.h>
@@ -42,6 +43,8 @@ static int xTaskCreate(void (*task)(void *),const char *name,unsigned stack,void
 void add_connector_report_ords_start(bool started,uint32_t attempts){assert(started==ords_created);reported_attempts=attempts;}
 static bool g_queue_store_ready=true;
 static bool qs_init(void){return true;}
+bool qs_recover_step(void){return true;}
+bool qs_verify_persistence(void){return true;}
 static void led_status_fault(int state){assert(state==1);++faults;}
 static void vTaskDelay(unsigned ms){if(gateway_created)++capture_ticks;now+=ms;if(now>=stop_at)longjmp(done,1);}
 static void launch(void)
@@ -66,13 +69,29 @@ int main(void)
 #endif
     return 0;
 }
-'''
+"""
     unit = tmp_path / "startup.c"
     unit.write_text(harness.replace("/* PRODUCTION */", body))
     executable = tmp_path / "startup"
-    subprocess.run([
-        shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-        f"-DZONE_LITE_HIKVISION={hikvision}", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(firmware),
-        str(unit), str(firmware / "worker_retry.c"), "-o", str(executable),
-    ], check=True)
+    subprocess.run(
+        [
+            shutil.which("cc"),
+            "-std=c11",
+            "-g",
+            "-O1",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            f"-DZONE_LITE_HIKVISION={hikvision}",
+            "-fsanitize=address,undefined",
+            "-fno-omit-frame-pointer",
+            "-I",
+            str(firmware),
+            str(unit),
+            str(firmware / "worker_retry.c"),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
     subprocess.run([str(executable)], cwd=tmp_path, check=True)

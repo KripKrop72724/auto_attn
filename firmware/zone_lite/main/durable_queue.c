@@ -213,6 +213,44 @@ dq_result_t dq_peek(durable_queue_t *q, void *data, size_t capacity, size_t *len
                           decode32(header + 8), decode32(header + 12)};
     return DQ_OK;
 }
+dq_result_t dq_audit_step(const durable_queue_t *q, dq_audit_t *audit,
+                          void *buffer, size_t capacity)
+{
+    if (!q || !q->ready || !audit || !buffer) return DQ_IO;
+    const dq_checkpoint_t *cp = &q->checkpoint;
+    if (!checkpoint_valid(cp) || !cp->next_sequence || cp->depth >= cp->next_sequence)
+        return DQ_CORRUPT;
+    if (!audit->started || audit->generation != cp->generation) {
+        *audit = (dq_audit_t){.generation=cp->generation, .segment=cp->read_segment,
+            .offset=cp->read_offset, .remaining=cp->depth,
+            .sequence=cp->next_sequence-cp->depth, .started=true};
+    }
+    if (!audit->remaining) {
+        if (audit->segment != cp->write_segment || audit->offset != cp->write_offset)
+            return DQ_CORRUPT;
+        audit->complete = true;
+        return DQ_OK;
+    }
+    durable_queue_t view = *q;
+    view.checkpoint.read_segment = audit->segment;
+    view.checkpoint.read_offset = audit->offset;
+    view.checkpoint.depth = audit->remaining;
+    dq_token_t token;
+    size_t length;
+    dq_result_t result = dq_peek(&view, buffer, capacity, &length, &token);
+    if (result != DQ_OK) return result == DQ_EMPTY ? DQ_CORRUPT : result;
+    if (token.sequence != audit->sequence) return DQ_CORRUPT;
+    audit->segment = token.segment; audit->offset = token.end;
+    audit->remaining--; audit->sequence++;
+    if (!audit->remaining) {
+        if (audit->segment != cp->write_segment || audit->offset != cp->write_offset)
+            return DQ_CORRUPT;
+        audit->complete = true;
+        return DQ_OK;
+    }
+    return DQ_PENDING;
+}
+
 dq_result_t dq_settle(durable_queue_t *q, const dq_token_t *token)
 {
     if (!q || !q->ready || !token) return DQ_IO;
