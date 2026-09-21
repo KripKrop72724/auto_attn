@@ -12,6 +12,8 @@ typedef struct {
     const char *last_operation;
 } qs_health_t;
 bool qs_init(void);
+/* ZKT supervisor: bounded verification of pending segmented records. */
+bool qs_recover_step(void);
 /* Boot recovery must have succeeded; proves filesystem and encrypted NVS writes. */
 bool qs_verify_persistence(void);
 bool qs_generation(char output[33]);

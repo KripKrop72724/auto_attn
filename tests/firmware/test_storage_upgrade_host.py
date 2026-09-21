@@ -1,4 +1,5 @@
 """Actual predecessor guard with injected NVS/partition failures in both modes."""
+
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_compatibility_proof_precedes_segmented_activation(tmp_path):
     firmware = ROOT / "firmware/zone_lite/main"
-    headers = r'''
+    headers = r"""
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,11 +34,17 @@ int nvs_get_blob(int,const char *,void *,size_t *);
 int nvs_set_blob(int,const char *,const void *,size_t);
 int nvs_commit(int);
 void nvs_close(int);
-'''
+"""
     (tmp_path / "ports.h").write_text(headers)
-    for header in ("esp_app_desc.h", "esp_ota_ops.h", "esp_partition.h", "esp_secure_boot.h", "nvs.h"):
+    for header in (
+        "esp_app_desc.h",
+        "esp_ota_ops.h",
+        "esp_partition.h",
+        "esp_secure_boot.h",
+        "nvs.h",
+    ):
         (tmp_path / header).write_text('#include "ports.h"\n')
-    harness = r'''
+    harness = r"""
 #include "ports.h"
 #include "storage_upgrade.h"
 #include "upgrade_guard.h"
@@ -90,6 +97,7 @@ int main(void)
     secure=false;assert(!storage_upgrade_init());secure=true;
     assert(storage_upgrade_init() && storage_upgrade_segmented_writes());
 #else
+    strcpy(app.version,"2.5.2");assert(storage_upgrade_init() && !writes && !storage_upgrade_segmented_writes());
     strcpy(app.version,"2.5.4");
     assert(storage_upgrade_init() && writes == 1 && commits == 1 && !storage_upgrade_segmented_writes());
     strcpy(app.version,UG_COMPAT_VERSION);
@@ -102,16 +110,36 @@ int main(void)
 #endif
     puts("storage predecessor guard regressions passed");
 }
-'''
+"""
     unit = tmp_path / "upgrade.c"
     unit.write_text(harness)
     for mode, hikvision in ((0, 0), (1, 0), (0, 1)):
         executable = tmp_path / f"upgrade-{mode}-{hikvision}"
-        subprocess.run([
-            shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-            "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-            f"-DZONE_LITE_SEGMENTED_WRITES={mode}", f"-DZONE_LITE_HIKVISION={hikvision}", "-I", str(tmp_path), "-I", str(firmware),
-            str(unit), str(firmware / "storage_upgrade.c"), str(firmware / "upgrade_guard.c"),
-            str(firmware / "durable_queue.c"), "-o", str(executable),
-        ], check=True)
+        subprocess.run(
+            [
+                shutil.which("cc"),
+                "-std=c11",
+                "-D_POSIX_C_SOURCE=200809L",
+                "-g",
+                "-O1",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fsanitize=address,undefined",
+                "-fno-omit-frame-pointer",
+                f"-DZONE_LITE_SEGMENTED_WRITES={mode}",
+                f"-DZONE_LITE_HIKVISION={hikvision}",
+                "-I",
+                str(tmp_path),
+                "-I",
+                str(firmware),
+                str(unit),
+                str(firmware / "storage_upgrade.c"),
+                str(firmware / "upgrade_guard.c"),
+                str(firmware / "durable_queue.c"),
+                "-o",
+                str(executable),
+            ],
+            check=True,
+        )
         subprocess.run([str(executable)], cwd=tmp_path, check=True)

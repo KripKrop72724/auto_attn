@@ -9355,6 +9355,8 @@ void app_main(void)
         if (!gateway_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #else
         if (!gateway_handle || !ords_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence())
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
