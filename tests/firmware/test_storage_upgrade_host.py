@@ -90,7 +90,8 @@ int main(void)
     secure=false;assert(!storage_upgrade_init());secure=true;
     assert(storage_upgrade_init() && storage_upgrade_segmented_writes());
 #else
-    strcpy(app.version,"2.5.2");assert(storage_upgrade_init() && !writes && !storage_upgrade_segmented_writes());
+    strcpy(app.version,"2.5.4");
+    assert(storage_upgrade_init() && writes == 1 && commits == 1 && !storage_upgrade_segmented_writes());
     strcpy(app.version,UG_COMPAT_VERSION);
     for(failure=1;failure<=3;++failure){assert(!storage_upgrade_init() && !storage_upgrade_ready());}
     failure=0;secure=false;assert(!storage_upgrade_init());secure=true;
