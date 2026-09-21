@@ -18,6 +18,12 @@ DOWNSTREAM_STATUS_FIX = (
 DOWNSTREAM_RECEIPT_ORDER_FIX = (
     ROOT / "deploy/add/oracle/20260904_fix_downstream_status_receipt_order.sql"
 )
+DOWNSTREAM_COMPILE_FIX = (
+    ROOT / "deploy/add/oracle/20260921_validate_downstream_repair_compile.sql"
+)
+CHECK_HANDLER_FIX = (
+    ROOT / "deploy/add/oracle/20260921_canonicalize_raw_attn_check_handler.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -180,6 +186,31 @@ def test_downstream_status_uses_atomic_operation_binding_not_impossible_time_ord
     assert "update hr_raw_attn_capture_events" not in source
     assert "delete from hr_employee_attendance" not in source
     assert "update hr_employee_attendance" not in source
+
+
+def test_downstream_repair_compile_migration_is_data_free_and_validates_body() -> None:
+    source = DOWNSTREAM_COMPILE_FIX.read_text().lower()
+    assert "alter package slic_zkt_downstream_repair compile body" in source
+    assert "user_errors" in source
+    assert "slic_zkt_downstream_repair=valid" in source
+    assert "attendance_rows_changed=0" in source
+    assert "insert into hr_" not in source
+    assert "update hr_" not in source
+    assert "delete from hr_" not in source
+    assert "merge into hr_" not in source
+
+
+def test_membership_handler_migration_is_guarded_and_data_free() -> None:
+    source = CHECK_HANDLER_FIX.read_text().lower()
+    assert "slic_zkt_truth_api.post_check" in source
+    assert "json_table" in source
+    assert "automatic restoration also failed" in source
+    assert "dbms_lob.compare" in source
+    assert "attendance_rows_changed=0" in source
+    assert "insert into hr_" not in source
+    assert "update hr_" not in source
+    assert "delete from hr_" not in source
+    assert "merge into hr_" not in source
 
 
 def test_existing_full_history_reconcile_delete_paths_remain_gated() -> None:
