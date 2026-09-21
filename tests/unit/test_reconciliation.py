@@ -1549,6 +1549,111 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     assert job.completion_outcome == "CURRENT_TRUTH_CERTIFIED_WITH_SOURCE_CHANGE"
 
 
+def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db):
+    """A stable replacement different from the first observation must recover."""
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "source_divergence_probe_v1": True,
+    }
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify a replacement digest stabilizes after multiple rewrites.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="source-divergence-third-digest-0001",
+    )
+    changed_raw = bytes.fromhex("0800000102030400")
+    stable_raw = bytes.fromhex("0800000102030401")
+    changed = _source_record().model_copy(
+        update={
+            "raw_record_digest": hashlib.sha256(changed_raw).hexdigest(),
+            "terminal_record_key": hashlib.sha256(b"changed-terminal-record").hexdigest(),
+            "raw_record_b64": base64.b64encode(changed_raw).decode(),
+        }
+    )
+    stable = changed.model_copy(
+        update={
+            "raw_record_digest": hashlib.sha256(stable_raw).hexdigest(),
+            "terminal_record_key": hashlib.sha256(b"stable-terminal-record").hexdigest(),
+            "raw_record_b64": base64.b64encode(stable_raw).decode(),
+        }
+    )
+    job.status = "RUNNING"
+    job.cutoff_count = 1
+    job.record_size = 8
+    job.first_anchor_digest = changed.raw_record_digest
+    session.add(
+        TerminalRecordManifest(
+            job_id=None,
+            chunk_id=None,
+            connector_id=connector.id,
+            zkt_device_id=zkt.id,
+            terminal_serial=SERIAL,
+            generation=job.terminal_generation,
+            source_epoch_id=job.source_epoch_id,
+            ordinal=0,
+            source_kind="TAIL",
+            canonical_source=True,
+            record_size=8,
+            raw_record_digest=hashlib.sha256(RAW_RECORD).hexdigest(),
+            terminal_record_key=hashlib.sha256(b"terminal-record-0").hexdigest(),
+            occurrence_index=1,
+            disposition="EVENT",
+            protected_raw_record="protected-existing-evidence",
+        )
+    )
+    session.flush()
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        sequence=0,
+        start_ordinal=0,
+        end_ordinal=1,
+        chunk_digest="0" * 64,
+        previous_chain_digest=None,
+        resulting_chain_digest="0" * 64,
+        records=[changed],
+    )
+    chunk_digest = reconciliation_chunk_digest(draft)
+    request = draft.model_copy(
+        update={
+            "chunk_digest": chunk_digest,
+            "resulting_chain_digest": reconciliation_chain_digest(
+                None,
+                start_ordinal=0,
+                end_ordinal=1,
+                chunk_digest=chunk_digest,
+            ),
+        }
+    )
+    held, _chunk, _duplicate = apply_reconciliation_chunk(
+        session, connector=connector, payload=request
+    )
+    assert held.phase == "VERIFYING_SOURCE_CHANGE"
+    divergence = session.scalar(select(ReconciliationDivergence))
+    assert divergence is not None
+    probe = SourceProbeResultRequest(
+        job_id=job.job_id,
+        generation=job.terminal_generation,
+        terminal_serial=SERIAL,
+        latest_terminal_count=1,
+        record_size=8,
+        ordinal=0,
+        record=stable,
+    )
+    for _ in range(3):
+        apply_source_probe_result(session, connector=connector, payload=probe)
+
+    assert divergence.state == "CONFIRMED_NEW_EPOCH"
+    assert divergence.new_raw_digest == stable.raw_record_digest
+    assert job.status == "QUEUED"
+
+
 @pytest.mark.parametrize("changes", [
     {"terminal_serial": None},
     {"terminal_serial": "REPLACED-TERMINAL"},

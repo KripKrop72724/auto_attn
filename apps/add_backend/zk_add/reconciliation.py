@@ -2581,13 +2581,33 @@ def apply_source_probe_result(
             "SOURCE_DIVERGENCE_TRANSIENT_RECOVERED",
             {"divergence_id": divergence.divergence_id, "ordinal": divergence.ordinal},
         )
-    elif (
-        len(observations) >= 3
-        and all(
-            item.get("raw_record_digest") == divergence.new_raw_digest
-            for item in observations[-3:]
-        )
+    elif len(observations) >= 3 and all(
+        item.get("raw_record_digest") == divergence.new_raw_digest
+        for item in observations[-3:]
     ):
+        _activate_recovery_epoch(
+            session,
+            job=job,
+            divergence=divergence,
+            now=now,
+        )
+    elif len(recent_probe_digests) >= 3 and len(set(recent_probe_digests[-3:])) == 1:
+        # A terminal may rewrite a record more than once while its clock or
+        # history index settles. Three consecutive fresh reads agreeing with
+        # each other are the stable replacement, even when that replacement
+        # differs from the first changed read. Preserve every earlier digest
+        # in observations and promote the verified candidate before recovery.
+        stable_digest = recent_probe_digests[-1]
+        stable_observation = next(
+            item
+            for item in reversed(observations)
+            if item.get("kind") == "FRESH_SOURCE_PROBE"
+            and item.get("raw_record_digest") == stable_digest
+        )
+        divergence.new_raw_digest = stable_digest
+        divergence.new_disposition = stable_observation.get(
+            "disposition", divergence.new_disposition
+        )
         _activate_recovery_epoch(
             session,
             job=job,
