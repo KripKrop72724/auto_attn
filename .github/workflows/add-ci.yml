@@ -14,6 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-publication:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Exercise publisher on production Windows PowerShell
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
+          ./tests/firmware/test_hil_publication.ps1
+
   repository-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -313,7 +326,7 @@ jobs:
             firmware/zone_lite/build-ci/flasher_args.json
 
   containers:
-    needs: [repository-contract, backend, frontend, firmware]
+    needs: [repository-contract, windows-publication, backend, frontend, firmware]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
