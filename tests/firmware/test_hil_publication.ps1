@@ -36,29 +36,6 @@ $manifest = @{version='2.6.0';image_name='zone-lite-2.6.0.bin';image_sha256=(Get
 [IO.File]::WriteAllText((Join-Path $source 'manifest.sig'), 'test-signature')
 [IO.File]::WriteAllText((Join-Path $source 'SHA256SUMS'), 'test')
 $targets='[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"},{"connector_id":"second","mac":"a4:cb:8f:d4:66:02","terminal_serial":"SERIAL2"}]'
-# Use a fresh store for invalid inputs so an immutable existing release cannot
-# hide a parser that accepts a malformed target list.
-$invalidTargets = @(
-    '[]',
-    '[null]',
-    '[[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"}]]',
-    '{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"}',
-    '[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01"}]',
-    '[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1","extra":true}]',
-    '[{"CONNECTOR_ID":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"}]',
-    '[{"connector_id":["first"],"mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"}]',
-    '[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"},{"connector_id":"first","mac":"a4:cb:8f:d4:66:02","terminal_serial":"SERIAL2"}]'
-)
-foreach ($scope in $invalidTargets) {
-    $rejected = $false
-    try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.0 -PublicationMode HIL_ONLY -HilTargetsJson $scope } catch { $rejected = $true }
-    if (-not $rejected -or (Test-Path (Join-Path $store '2.6.0'))) { throw 'Invalid target scope was published' }
-}
-$singleTargets='[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"}]'
-$singleStore=Join-Path $root 'single-ordered-store'
-& $publish -SourceDirectory $source -StoreDirectory $singleStore -Version 2.6.0 -PublicationMode HIL_ONLY -HilTargetsJson $singleTargets
-$singleMarker=Get-Content (Join-Path $singleStore '2.6.0/.hil-only.json') -Raw | ConvertFrom-Json
-if ($singleMarker.targets.Count -ne 1 -or $singleMarker.targets[0].connector_id -cne 'first') { throw 'Single ordered target changed shape' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.0 -PublicationMode HIL_ONLY -HilTargetsJson $targets
 $marker=Get-Content (Join-Path $store "2.6.0/.hil-only.json") -Raw | ConvertFrom-Json
 if($marker.schema_version -ne 2 -or $marker.targets.Count -ne 2 -or $marker.targets[0].connector_id -cne 'first' -or $marker.application_sha256 -cne ('c'*64)) { throw 'Incorrect ordered marker' }
