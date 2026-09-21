@@ -30,16 +30,15 @@ $targets = @()
 if (-not [string]::IsNullOrWhiteSpace($HilTargetsJson)) {
     if (-not [string]::IsNullOrWhiteSpace($HilTargetMac)) { throw 'Choose legacy MAC or ordered targets, not both' }
     if (-not $HilTargetsJson.Trim().StartsWith('[')) { throw 'Ordered HIL targets must be a JSON array' }
-    $parsedTargets = @($HilTargetsJson | ConvertFrom-Json)
+    # Windows PowerShell 5.1 emits a JSON array as one pipeline object. Do not
+    # wrap that pipeline in @(), which creates a nested array on that runtime.
+    $parsedTargets = ConvertFrom-Json -InputObject $HilTargetsJson
+    $parsedTargets = @($parsedTargets)
     if ($parsedTargets.Count -lt 1 -or $parsedTargets.Count -gt 8) { throw 'HIL requires one to eight ordered exact targets' }
     foreach ($target in $parsedTargets) {
-        # PowerShell versions differ in how a deserialized JSON property
-        # collection is enumerated. Validate the set and count explicitly so
-        # a valid exact target cannot be rejected because of collection shape.
         $keys = @($target.PSObject.Properties | ForEach-Object { [string]$_.Name })
-        $requiredKeys = @('connector_id', 'mac', 'terminal_serial')
-        if ($keys.Count -ne 3 -or
-            @($requiredKeys | Where-Object { $_ -notin $keys }).Count -ne 0) {
+        if ($keys.Count -ne 3 -or $keys -cnotcontains 'connector_id' -or
+            $keys -cnotcontains 'mac' -or $keys -cnotcontains 'terminal_serial') {
             throw 'HIL target must contain only connector_id, mac and terminal_serial'
         }
         foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
