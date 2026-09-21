@@ -20,7 +20,7 @@ COMM_KEYS = (ROOT / "apps" / "add_backend" / "zk_add" / "comm_keys.py").read_tex
 
 
 def test_diagnostic_is_compile_time_off_for_nationwide_firmware() -> None:
-    assert "project(zone_lite VERSION 2.5.4)" in (FIRMWARE / "CMakeLists.txt").read_text()
+    assert "project(zone_lite VERSION 2.6.0)" in (FIRMWARE / "CMakeLists.txt").read_text()
     assert "#define ZONE_LITE_QUETTA_DIAGNOSTIC 0" in RUNTIME
     assert "if(ZONE_LITE_QUETTA_DIAGNOSTIC)" in COMPONENT
     assert "ZONE_LITE_QUETTA_DIAGNOSTIC=1" not in NORMAL_HIL

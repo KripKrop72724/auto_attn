@@ -9,7 +9,7 @@ CONFIG = (FIRMWARE / "main" / "zone_config.c").read_text(encoding="utf-8")
 
 
 def test_252_advertises_esp_management_but_fail_closes_terminal_writes() -> None:
-    assert "project(zone_lite VERSION 2.5.4)" in (FIRMWARE / "CMakeLists.txt").read_text()
+    assert "project(zone_lite VERSION 2.6.0)" in (FIRMWARE / "CMakeLists.txt").read_text()
     assert 'cJSON_AddBoolToObject(payload, "comm_key_management", true)' in CONNECTOR
     assert 'cJSON_AddBoolToObject(zkt_json, "comm_key_write_v1", false)' in CONNECTOR
     assert '"COMM_KEY_TERMINAL_WRITE_UNSUPPORTED"' in RUNTIME
