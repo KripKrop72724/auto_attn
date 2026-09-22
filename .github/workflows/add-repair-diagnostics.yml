@@ -1,0 +1,56 @@
+name: ADD read-only repair diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: add-repair-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read container state and bounded database counters
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $api = 'attendance-device-dashboard-add-api-1'
+          $web = 'attendance-device-dashboard-add-web-1'
+          foreach ($container in @($api, $web)) {
+            & docker inspect --format '{{.Name}} status={{.State.Status}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' $container
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect an ADD container.' }
+          }
+          & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
+          $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
+          $script | & docker exec -i $api python -
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
+
+      - name: Summarize HTTP failures without exposing raw logs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $api = 'attendance-device-dashboard-add-api-1'
+          $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
+          $runner = "import base64;exec(base64.b64decode('$encoded'))"
+          foreach ($container in @($api, 'attendance-device-dashboard-add-web-1')) {
+            # cmd combines native stdout/stderr before PowerShell receives it.
+            # Raw text stays in memory and is never written to workflow output.
+            $raw = @(& cmd /c "docker logs --since 15m --tail 5000 $container 2>&1")
+            if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container logs.' }
+            Write-Host "Allowlisted summary: $container"
+            $raw | & docker exec -i $api python -c $runner --logs
+            if ($LASTEXITCODE -ne 0) { throw 'Log summarization failed.' }
+          }
