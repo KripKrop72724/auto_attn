@@ -1055,3 +1055,191 @@
     forced-color-adjust: none;
   }
 }
+
+/* Bulk attendance recovery workspace */
+.reconciliation-recovery {
+  display: grid;
+  gap: 18px;
+}
+.recovery-action-panel,
+.recovery-identity-panel,
+.recovery-correction-panel,
+.recovery-job-panel {
+  overflow: hidden;
+}
+.recovery-action-panel .panel-header,
+.recovery-identity-panel .panel-header,
+.recovery-correction-panel .panel-header,
+.recovery-job-panel .panel-header {
+  padding: 20px;
+}
+.recovery-action-description {
+  margin: 0;
+  padding: 0 20px 13px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.recovery-confirm-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(220px, 0.6fr);
+  gap: 12px;
+  padding: 0 20px 15px;
+}
+.recovery-confirm-fields label,
+.recovery-preview label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.recovery-confirm-fields textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+.recovery-action-panel .dialog-actions,
+.recovery-correction-panel .dialog-actions {
+  padding: 0 20px 18px;
+}
+.recovery-preview {
+  display: grid;
+  gap: 12px;
+  margin: 0 20px 20px;
+  padding: 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--recon-soft);
+}
+.recovery-preview > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.recovery-preview-counts,
+.recovery-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: baseline;
+  color: var(--muted);
+  font-size: 11px;
+}
+.recovery-preview-counts strong,
+.recovery-progress strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+.recovery-preview code {
+  overflow-wrap: anywhere;
+  color: var(--brand-700);
+}
+.recovery-candidate-table {
+  display: grid;
+  gap: 1px;
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--line);
+}
+.recovery-candidate-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  background: #fff;
+  font-size: 11px;
+}
+.recovery-candidate-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recovery-candidate-row small,
+.recovery-correction-row small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.recovery-identity-panel {
+  border-left: 4px solid var(--warning);
+}
+.recovery-identity-panel .info-copy {
+  margin: 0 20px 20px;
+}
+.recovery-correction-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.8fr) 220px;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 20px;
+  border-top: 1px solid var(--line);
+  background: #fff;
+}
+.recovery-correction-heading {
+  margin: 14px 20px 0;
+  color: var(--navy-900);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.recovery-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+}
+.recovery-checkbox span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recovery-rejected {
+  margin: 0;
+  color: var(--critical);
+  font-size: 11px;
+}
+.recovery-progress {
+  margin: 0 20px 20px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--recon-soft);
+}
+.recovery-control-confirm {
+  display: grid;
+  gap: 5px;
+  margin: 0 20px 14px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.recovery-control-confirm label {
+  display: grid;
+  gap: 6px;
+  max-width: 560px;
+}
+.recovery-control-confirm small {
+  font-weight: 500;
+}
+@media (max-width: 760px) {
+  .recovery-confirm-fields,
+  .recovery-correction-row {
+    grid-template-columns: 1fr;
+  }
+  .recovery-candidate-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .recovery-candidate-row small {
+    grid-column: 2;
+  }
+}
+
+.recovery-inline-check { display: flex; align-items: center; gap: 8px; padding-top: 26px; white-space: nowrap; }
+.recovery-inline-check input { width: 18px; height: 18px; }
+.recovery-job-controls { flex-wrap: wrap; margin-top: 14px; }
+.recovery-disabled-reason { display: block; color: var(--text-muted); margin-top: 8px; }

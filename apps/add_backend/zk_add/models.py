@@ -884,6 +884,151 @@ class AttendanceDeliverySweep(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class AttendanceRecoveryJob(Base):
+    """Durable, auditable operator recovery batch.
+
+    Recovery jobs never rewrite source evidence.  They freeze a candidate
+    digest, then revalidate each item immediately before the requested action
+    so a long-running batch cannot act on stale attendance state.
+    """
+
+    __tablename__ = "add_attendance_recovery_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key", name="uq_add_attendance_recovery_job_idempotency"
+        ),
+        Index(
+            "ix_add_attendance_recovery_jobs_status_updated",
+            "status",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    action: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    scope: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_digest: Mapped[str] = mapped_column(String(64), index=True)
+    preview_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(120), index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    requested_count: Mapped[int] = mapped_column(Integer, default=0)
+    eligible_count: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_count: Mapped[int] = mapped_column(Integer, default=0)
+    identity_held_count: Mapped[int] = mapped_column(Integer, default=0)
+    review_count: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceRecoveryItem(Base):
+    """One frozen recovery candidate and its immutable outcome."""
+
+    __tablename__ = "add_attendance_recovery_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "source_kind",
+            "source_ref",
+            name="uq_add_attendance_recovery_item_source",
+        ),
+        Index(
+            "ix_add_attendance_recovery_items_job_status",
+            "job_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_recovery_jobs.id"), index=True
+    )
+    source_kind: Mapped[str] = mapped_column(String(40), index=True)
+    source_ref: Mapped[str] = mapped_column(String(160), index=True)
+    connector_id: Mapped[int | None] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    attendance_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_attendance_events.id"), index=True
+    )
+    manifest_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_record_manifest.id"), index=True
+    )
+    hikvision_evidence_id: Mapped[int | None] = mapped_column(index=True)
+    expected_state_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    lane: Mapped[str] = mapped_column(String(40), index=True)
+    outcome: Mapped[str | None] = mapped_column(String(80), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    corrected_device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = utc_column()
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceSourceCorrection(Base):
+    """Append-only timestamp correction lineage for a source exception."""
+
+    __tablename__ = "add_attendance_source_corrections"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_kind",
+            "source_ref",
+            "correction_version",
+            name="uq_add_attendance_source_correction_version",
+        ),
+        UniqueConstraint(
+            "idempotency_key", name="uq_add_attendance_source_correction_idempotency"
+        ),
+        Index(
+            "ix_add_att_src_corr_derived_event",
+            "derived_attendance_event_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    correction_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    source_kind: Mapped[str] = mapped_column(String(40), index=True)
+    source_ref: Mapped[str] = mapped_column(String(160), index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    manifest_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_record_manifest.id"), index=True
+    )
+    hikvision_evidence_id: Mapped[int | None] = mapped_column(index=True)
+    original_digest: Mapped[str] = mapped_column(String(64), index=True)
+    correction_version: Mapped[int] = mapped_column(Integer, default=1)
+    corrected_device_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(40), default="CREATED", index=True)
+    derived_event_uid: Mapped[str | None] = mapped_column(String(128), index=True)
+    derived_attendance_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_attendance_events.id")
+    )
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
 class OracleReceipt(Base):
     __tablename__ = "add_oracle_receipts"
 

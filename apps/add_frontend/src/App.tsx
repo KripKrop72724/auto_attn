@@ -378,6 +378,7 @@ function FleetView({
   onInspect,
   onManageUsers,
   onNavigateAlerts,
+  onNavigateReconciliation,
 }: {
   devices: Device[]
   overview: Overview
@@ -385,6 +386,7 @@ function FleetView({
   onInspect: (device: Device) => void
   onManageUsers: (device: Device) => void
   onNavigateAlerts: () => void
+  onNavigateReconciliation: () => void
 }) {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('ALL')
@@ -436,6 +438,14 @@ function FleetView({
           detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`}
           icon="clock"
           tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 ? 'warning' : 'positive'}
+        />
+        <Metric
+          label="Attendance recovery"
+          value={overview.attendance_recovery?.delivery.safe_retryable ?? 0}
+          detail={`${overview.attendance_recovery?.delivery.identity_held ?? 0} identity-held · ${overview.attendance_recovery?.delivery.permanent_review ?? 0} review-only`}
+          icon="refresh"
+          tone={(overview.attendance_recovery?.delivery.safe_retryable ?? 0) > 0 ? 'warning' : 'positive'}
+          onClick={onNavigateReconciliation}
         />
         <Metric label="Enrollment access" value={overview.active_leases} detail="Active temporary administrator leases" icon="shield" tone={overview.active_leases ? 'warning' : 'neutral'} />
       </section> : <section className="spare-inventory-banner" aria-label="Spare inventory monitoring policy">
@@ -804,7 +814,7 @@ function DashboardApp() {
   return (
     <>
       <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
-        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} />}
+        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} />}
         {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}

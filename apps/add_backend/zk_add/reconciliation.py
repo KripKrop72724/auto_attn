@@ -16,6 +16,7 @@ from zk_add.audit import append_audit
 from zk_add.crypto import encrypt_text
 from zk_add.models import (
     AttendanceEvent,
+    AttendanceSourceCorrection,
     Connector,
     DeviceCommand,
     OrdsOutbox,
@@ -1297,11 +1298,15 @@ def source_exception_assurance(
     empty = {
         "total": 0,
         "reviewed": 0,
+        "corrected": 0,
         "open": 0,
         "invalid_time": 0,
         "malformed": 0,
         "state": "NONE",
         "cohort_digest": None,
+        "review_evidence_digest": None,
+        "review_ids": [],
+        "correction_ids": [],
     }
     if not job.quarantined_count:
         return empty
@@ -1335,6 +1340,17 @@ def source_exception_assurance(
     invalid_time = sum(row.disposition == "INVALID_TIME" for row in manifests)
     malformed = sum(row.disposition == "MALFORMED" for row in manifests)
     reviewed = len(earliest_reviews)
+    corrections = session.scalars(
+        select(AttendanceSourceCorrection)
+        .where(
+            AttendanceSourceCorrection.manifest_id.in_(manifest_ids),
+            AttendanceSourceCorrection.status == "CREATED",
+        )
+        .order_by(AttendanceSourceCorrection.id.asc())
+    ).all() if manifest_ids else []
+    corrected_manifest_ids = {row.manifest_id for row in corrections if row.manifest_id is not None}
+    corrected = len(corrected_manifest_ids)
+    resolved_manifest_ids = set(earliest_reviews) | corrected_manifest_ids
     cohort_material = {
         "job_id": job.job_id,
         "terminal_serial": job.terminal_serial,
@@ -1366,6 +1382,10 @@ def source_exception_assurance(
             for row in manifests
             if row.id in earliest_reviews
         ],
+        "corrections": [
+            {"manifest_id": row.manifest_id, "correction_id": row.correction_id}
+            for row in corrections
+        ],
     }
     review_evidence_digest = hashlib.sha256(
         json.dumps(review_material, separators=(",", ":"), sort_keys=True).encode()
@@ -1373,7 +1393,8 @@ def source_exception_assurance(
     result = {
         "total": len(manifests),
         "reviewed": reviewed,
-        "open": max(0, len(manifests) - reviewed),
+        "corrected": corrected,
+        "open": max(0, len(manifests) - len(resolved_manifest_ids)),
         "invalid_time": invalid_time,
         "malformed": malformed,
         "state": "REVIEW_REQUIRED",
@@ -1384,11 +1405,12 @@ def source_exception_assurance(
             for row in manifests
             if row.id in earliest_reviews
         ],
+        "correction_ids": [row.correction_id for row in corrections],
         "mismatch_reasons": [],
     }
     if job.capture_certified_at is None:
         if not result["open"]:
-            result["state"] = "REVIEWED_EXCLUSIONS"
+            result["state"] = "CORRECTED_DERIVED_EVENTS" if corrected else "REVIEWED_EXCLUSIONS"
         return result
 
     mismatches: list[str] = []
@@ -1430,14 +1452,21 @@ def source_exception_assurance(
     if mismatches:
         result["state"] = "SCOPE_MISMATCH"
     elif not result["open"]:
-        result["state"] = "REVIEWED_EXCLUSIONS"
+        result["state"] = "CORRECTED_DERIVED_EVENTS" if corrected else "REVIEWED_EXCLUSIONS"
     return result
 
 
 def _source_review_gate_evidence(
     session: Session, job: ReconciliationJob, assurance: dict
 ) -> dict:
-    idempotency_key = f"source-review-gate:{assurance['cohort_digest']}"
+    # The cohort digest identifies the immutable source set, while the review
+    # evidence digest identifies which rows have been reviewed or corrected.
+    # Include both so a later timestamp correction produces a new sealed gate
+    # record instead of reusing the earlier review-only evidence.
+    evidence_key = hashlib.sha256(
+        f"{assurance['cohort_digest']}:{assurance['review_evidence_digest']}".encode()
+    ).hexdigest()
+    idempotency_key = f"source-review-gate:{evidence_key}"
     existing = session.scalar(
         select(ReconciliationEvent).where(
             ReconciliationEvent.job_id == job.id,
@@ -1514,9 +1543,27 @@ def refresh_reconciliation_assurance(
         TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
         TerminalRecordManifest.attendance_event_id.is_not(None),
     ).distinct()
+    corrected_events = (
+        select(AttendanceSourceCorrection.derived_attendance_event_id)
+        .join(
+            TerminalRecordManifest,
+            TerminalRecordManifest.id == AttendanceSourceCorrection.manifest_id,
+        )
+        .where(
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+            TerminalRecordManifest.generation == job.terminal_generation,
+            TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
+            AttendanceSourceCorrection.status == "CREATED",
+            AttendanceSourceCorrection.derived_attendance_event_id.is_not(None),
+        )
+        .distinct()
+    )
+    event_ids = manifest_events.union(corrected_events).subquery()
     status_rows = session.execute(
         select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id))
-        .where(AttendanceEvent.id.in_(manifest_events))
+        .where(AttendanceEvent.id.in_(select(event_ids.c.attendance_event_id)))
         .group_by(AttendanceEvent.ords_status)
     ).all()
     status_counts: dict[str, int] = {}
@@ -1625,7 +1672,7 @@ def refresh_reconciliation_assurance(
             "automatically from the existing checkpoint."
         )
     else:
-        if source_assurance["state"] == "REVIEWED_EXCLUSIONS":
+        if source_assurance["state"] in {"REVIEWED_EXCLUSIONS", "CORRECTED_DERIVED_EVENTS"}:
             gate_evidence = _source_review_gate_evidence(
                 session, job, source_assurance
             )
@@ -1703,10 +1750,12 @@ def refresh_reconciliation_assurance(
             if gate_evidence is not None:
                 evidence_body["reviewed_source_exceptions"] = {
                     "count": source_assurance["total"],
+                    "corrected": source_assurance.get("corrected", 0),
                     "cohort_digest": source_assurance["cohort_digest"],
                     "review_evidence_digest": source_assurance[
                         "review_evidence_digest"
                     ],
+                    "correction_ids": source_assurance.get("correction_ids", []),
                     "gate_evidence_signature": gate_evidence.get(
                         "evidence_signature"
                     ),
@@ -1721,7 +1770,9 @@ def refresh_reconciliation_assurance(
             job.wait_reason = None
             if gate_evidence is not None:
                 job.completion_outcome = (
-                    "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS"
+                    "CERTIFIED_WITH_CORRECTED_SOURCE_EXCEPTIONS"
+                    if source_assurance["state"] == "CORRECTED_DERIVED_EVENTS"
+                    else "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS"
                 )
             if managed_oracle_hold or managed_source_hold:
                 job.error_code = None
@@ -2124,15 +2175,18 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         "operator_state": operator_state,
         "operator_message": operator_message,
         "completion_outcome": job.completion_outcome,
+        "assurance_outcome": _assurance_outcome(job),
         "review_required": job.review_required,
         "source_exception_assurance": {
             "total": exception_assurance["total"],
             "reviewed": exception_assurance["reviewed"],
+            "corrected": exception_assurance.get("corrected", 0),
             "open": exception_assurance["open"],
             "invalid_time": exception_assurance["invalid_time"],
             "malformed": exception_assurance["malformed"],
             "state": exception_assurance["state"],
             "cohort_digest": exception_assurance.get("cohort_digest"),
+            "correction_ids": exception_assurance.get("correction_ids", []),
         },
         "connector": None if connector is None else {
             "connector_id": connector.connector_id,
@@ -2834,6 +2888,28 @@ def _event(
     )
 
 
+def _assurance_outcome(job: ReconciliationJob) -> str | None:
+    """Return a stable operator-facing assurance outcome.
+
+    ``completion_outcome`` predates the recovery workflow and is retained for
+    compatibility with existing certificates.  This derived value gives the
+    UI and API the explicit lanes promised by the recovery contract without
+    rewriting historical job rows.
+    """
+
+    if job.status != "COMPLETED":
+        return "REVIEW_REQUIRED" if job.status == "NEEDS_ATTENTION" else None
+    if job.completion_outcome == "CERTIFIED_WITH_CORRECTED_SOURCE_EXCEPTIONS":
+        return "COMPLETED_WITH_CORRECTIONS"
+    if job.completion_outcome == "COMPLETED_WITH_IDENTITY_HOLDS":
+        return "COMPLETED_WITH_IDENTITY_HOLDS"
+    if job.completion_outcome == "CERTIFIED_WITH_REVIEWED_SOURCE_EXCEPTIONS":
+        return "COMPLETED_WITH_REVIEW"
+    if job.blocked_identity_count and not job.ords_review_count:
+        return "COMPLETED_WITH_IDENTITY_HOLDS"
+    return "ALL_CONFIRMED"
+
+
 def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, str]:
     if job.status in {"PAUSED", "PAUSE_REQUESTED"}:
         return (
@@ -2877,6 +2953,16 @@ def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, s
         return (
             "COMPLETED_WITH_REVIEW",
             "Terminal source coverage and Oracle membership are certified. Reviewed invalid or malformed source records remain preserved and excluded fail-closed.",
+        )
+    if job.status == "COMPLETED" and _assurance_outcome(job) == "COMPLETED_WITH_IDENTITY_HOLDS":
+        return (
+            "COMPLETED_WITH_IDENTITY_HOLDS",
+            "Terminal source coverage and confirmed Oracle deliveries completed. Identity-held punches remain preserved for exact identity review and were not bulk released.",
+        )
+    if job.status == "COMPLETED" and _assurance_outcome(job) == "COMPLETED_WITH_CORRECTIONS":
+        return (
+            "COMPLETED_WITH_CORRECTIONS",
+            "Terminal source coverage and Oracle membership are certified. Corrected events are linked to immutable source evidence and delivered through the normal outbox.",
         )
     if job.status == "COMPLETED" and job.review_required:
         return (

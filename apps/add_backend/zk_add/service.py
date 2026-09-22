@@ -2662,7 +2662,12 @@ def enrich_undelivered_attendance(
         # Hikvision uses its preserved source record for name-CNIC identity.
         # A newer ZKT-style snapshot must not silently rewrite older punches.
         return 0
-    cnic = decrypt_cnic(user.cnic_encrypted)
+    try:
+        cnic = decrypt_cnic(user.cnic_encrypted)
+    except Exception:
+        # A damaged protected identity must remain held without interrupting
+        # the bounded historical sweep for every other event.
+        return 0
     if not cnic:
         return 0
     eligible_statuses = {
@@ -2796,11 +2801,9 @@ def repair_attendance_delivery_backlog(
 ) -> dict[str, int | str]:
     """Drain every retained eligible event in oldest-first, restart-safe pages.
 
-    The query intentionally starts from the oldest unresolved event on every
-    pass.  A later identity snapshot can therefore make an old event eligible
-    without depending on an in-memory cursor.  The persisted sweep row is
-    operational evidence and checkpoint telemetry, while row-level idempotency
-    remains the source of truth.
+    The durable cursor advances past held rows so they cannot starve later
+    events. It wraps after each full pass to reconsider newly available identity
+    evidence, while row-level idempotency remains the source of truth.
     """
     bounded_limit = max(1, min(int(limit), 500))
     now = utc_now()
@@ -2821,9 +2824,8 @@ def repair_attendance_delivery_backlog(
         select(AttendanceEvent)
         .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
         .where(
-            ~AttendanceEvent.ords_status.in_(
-                tuple(ORDS_DELIVERY_ACKED_STATUSES | ORDS_DELIVERY_QUARANTINE_STATUSES)
-            ),
+            AttendanceEvent.id > (sweep.last_event_id or 0),
+            AttendanceEvent.ords_status.in_(("PENDING", "FAILED_RETRYABLE", "RETRYING", "BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
             or_(
                 OrdsOutbox.id.is_(None),
                 AttendanceEvent.ords_status.in_(
@@ -2834,7 +2836,7 @@ def repair_attendance_delivery_backlog(
         )
         .order_by(AttendanceEvent.id.asc())
         .limit(bounded_limit)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=AttendanceEvent)
     ).all()
 
     repaired = 0
@@ -2874,8 +2876,21 @@ def repair_attendance_delivery_backlog(
             ):
                 repaired += 1
             else:
-                unresolved += 1
-                continue
+                # The recovery contract also accepts a current, exact UID/user
+                # match when the durable event itself carries a verified serial
+                # and the identity snapshot proves continuity.  Keep this
+                # fallback inside the row lock; ambiguous or stale history
+                # remains fail-closed.
+                from zk_add.attendance_recovery import _apply_verified_identity
+                outbox = session.scalar(
+                    select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+                )
+                if connector is None or not _apply_verified_identity(
+                    session, row, outbox, connector
+                ):
+                    unresolved += 1
+                    continue
+                repaired += 1
 
         if row.cnic_lookup_hash and row.identity_resolution_status in VERIFIED_IDENTITY_RESOLUTION_STATUSES:
             row.ords_status = "PENDING"
@@ -2911,6 +2926,8 @@ def repair_attendance_delivery_backlog(
         ensure_attendance_ords_outbox(session, row, status=row.ords_status)
         unresolved += 1
 
+    if not candidates:
+        sweep.last_event_id = 0
     sweep.pages += 1
     sweep.repaired_count += repaired
     sweep.outbox_created_count += created
@@ -3297,6 +3314,18 @@ def recover_verified_source_identity(session: Session, *, connector: Connector, 
         DeviceUser.identity_conflict_code.is_(None),
     ))
     if not user or not user.cnic_lookup_hash:
+        return False
+    if (
+        user.snapshot_revision is None
+        or zkt.identity_snapshot_revision is None
+        or user.snapshot_revision != zkt.identity_snapshot_revision
+    ):
+        return False
+    try:
+        cnic = decrypt_cnic(user.cnic_encrypted)
+        if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
+            return False
+    except Exception:
         return False
     if not historical_identity_is_supported(
         serial=row.device_serial, bound_serial=zkt.serial,

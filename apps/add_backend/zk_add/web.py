@@ -55,6 +55,7 @@ from zk_add.db import SessionLocal, init_db, session_scope
 from zk_add.models import (
     AdminSession,
     AttendanceEvent,
+    AttendanceRecoveryJob,
     Connector,
     CommKeyOperation,
     DeviceAlert,
@@ -93,6 +94,11 @@ from zk_add.schemas import (
     OnboardRequest,
     DeviceLogIn,
     DeviceSpareUpdateRequest,
+    AttendanceRecoveryControlRequest,
+    AttendanceRecoveryCreateRequest,
+    AttendanceRecoveryPreviewRequest,
+    AttendanceSourceCorrectionCreateRequest,
+    AttendanceSourceCorrectionPreviewRequest,
     LogBatchRequest,
     OracleReceiptBatchRequest,
     RestartRequest,
@@ -168,7 +174,23 @@ from zk_add.comm_keys import (
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
-from zk_add.time_utils import parse_datetime, utc_now
+from zk_add.attendance_recovery import (
+    RecoveryError,
+    build_recovery_preview,
+    build_source_correction_preview,
+    control_recovery_job,
+    create_recovery_job,
+    create_source_correction_job,
+    list_source_correction_candidates,
+    hikvision_source_evidence_detail,
+    reveal_hikvision_source_evidence,
+    list_recovery_items,
+    recovery_summary,
+    serialize_recovery_job,
+    sign_recovery_preview,
+    verify_recovery_preview,
+)
+from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.reconciliation import (
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
@@ -508,7 +530,222 @@ def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     result = fleet_counts(db)
     result["ords_delivery"] = ords_delivery_metrics(db)
     result["attendance_repair"] = repair_worker_metrics(db)
+    result["attendance_recovery"] = recovery_summary(db)
     return result
+
+
+def _recovery_job_or_404(db: Session, job_id: str) -> AttendanceRecoveryJob:
+    job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Attendance recovery job not found.")
+    return job
+
+
+@app.get("/api/v2/attendance-recovery/summary")
+def attendance_recovery_summary(
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return recovery_summary(db)
+
+
+@app.post("/api/v2/attendance-recovery/preview")
+def attendance_recovery_preview(
+    body: AttendanceRecoveryPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, context = auth
+    try:
+        result = build_recovery_preview(
+            db,
+            action=body.action,
+            filters=body.filters,
+        )
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    result["preview_signature"] = sign_recovery_preview(digest=result["candidate_digest"], expires_at=result["preview_expires_at"], actor=context.username, action=body.action)
+    result.pop("_candidate_rows", None)
+    result["confirmation"] = f"RECOVER {result['counts']['eligible']} EVENTS"
+    return result
+
+
+@app.post("/api/v2/attendance-recovery/jobs", status_code=201)
+def create_attendance_recovery_job(
+    body: AttendanceRecoveryCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        require_step_up(body.password, db, context)
+        existing = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.idempotency_key == body.idempotency_key))
+        if existing:
+            if existing.actor != context.username or existing.action != body.action or existing.candidate_digest != body.candidate_digest or existing.reason != body.reason.strip():
+                raise RecoveryError("Idempotency key was already used for a different batch.", "IDEMPOTENCY_CONFLICT")
+            return serialize_recovery_job(db, existing, include_items=True)
+        verify_recovery_preview(digest=body.candidate_digest, expires_at=body.preview_expires_at, actor=context.username, action=body.action, signature=body.preview_signature)
+        preview = build_recovery_preview(db, action=body.action, filters=body.filters)
+        if ensure_utc(body.preview_expires_at) <= utc_now():
+            raise RecoveryError("The recovery preview has expired; generate a new preview.", "PREVIEW_EXPIRED")
+        expected_confirmation = f"RECOVER {preview['counts']['eligible']} EVENTS"
+        if body.typed_confirmation.strip() != expected_confirmation:
+            raise RecoveryError("Typed confirmation does not match the frozen recovery scope.", "CONFIRMATION_MISMATCH")
+        job = create_recovery_job(
+            db,
+            action=body.action,
+            filters=body.filters,
+            candidate_digest=body.candidate_digest,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            preview_expires_at=body.preview_expires_at,
+        )
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    db.flush()
+    return serialize_recovery_job(db, job, include_items=True)
+
+
+@app.get("/api/v2/attendance-recovery/jobs/{job_id}")
+def get_attendance_recovery_job(
+    job_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return serialize_recovery_job(db, _recovery_job_or_404(db, job_id), include_items=True)
+
+
+@app.get("/api/v2/attendance-recovery/jobs/{job_id}/items")
+def get_attendance_recovery_items(
+    job_id: str,
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return list_recovery_items(db, _recovery_job_or_404(db, job_id), limit=limit, cursor=cursor)
+
+
+@app.post("/api/v2/attendance-recovery/jobs/{job_id}/control")
+def control_attendance_recovery_job(
+    job_id: str,
+    body: AttendanceRecoveryControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        job = control_recovery_job(
+            db,
+            job=_recovery_job_or_404(db, job_id),
+            candidate_digest=body.candidate_digest,
+            typed_confirmation=body.typed_confirmation,
+            action=body.action,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    db.flush()
+    return serialize_recovery_job(db, job, include_items=True)
+
+
+@app.post("/api/v2/source-corrections/preview")
+def source_correction_preview(
+    body: AttendanceSourceCorrectionPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, context = auth
+    try:
+        result = build_source_correction_preview(db, body.corrections)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    result["preview_signature"] = sign_recovery_preview(digest=result["candidate_digest"], expires_at=result["preview_expires_at"], actor=context.username, action="CREATE_TIMESTAMP_CORRECTION")
+    result.pop("_candidate_rows", None)
+    result["confirmation"] = f"CORRECT {result['counts']['eligible']} SOURCE TIMESTAMPS"
+    return result
+
+
+@app.get("/api/v2/source-corrections/candidates")
+def source_correction_candidates(
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return list_source_correction_candidates(db, limit=limit)
+
+
+@app.get("/api/v2/source-corrections/evidence/{evidence_id}")
+def source_correction_evidence_detail(
+    evidence_id: int,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    try:
+        return hikvision_source_evidence_detail(db, evidence_id)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.post("/api/v2/source-corrections/evidence/{evidence_id}/reveal")
+def reveal_source_correction_evidence(
+    evidence_id: int,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = reveal_hikvision_source_evidence(
+            db,
+            evidence_id=evidence_id,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except RecoveryError as exc:
+        status = 404 if exc.code == "SOURCE_MISSING" else 409
+        raise HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)}) from exc
+    db.flush()
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return result
+
+
+@app.post("/api/v2/source-corrections/jobs", status_code=201)
+def create_source_correction_recovery_job(
+    body: AttendanceSourceCorrectionCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        require_step_up(body.password, db, context)
+        existing = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.idempotency_key == body.idempotency_key))
+        if existing:
+            if existing.actor != context.username or existing.action != "CREATE_TIMESTAMP_CORRECTION" or existing.candidate_digest != body.candidate_digest or existing.reason != body.reason.strip():
+                raise RecoveryError("Idempotency key was already used for a different batch.", "IDEMPOTENCY_CONFLICT")
+            return serialize_recovery_job(db, existing, include_items=True)
+        verify_recovery_preview(digest=body.candidate_digest, expires_at=body.preview_expires_at, actor=context.username, action="CREATE_TIMESTAMP_CORRECTION", signature=body.preview_signature)
+        preview = build_source_correction_preview(db, body.corrections)
+        if ensure_utc(body.preview_expires_at) <= utc_now():
+            raise RecoveryError("The correction preview has expired; generate a new preview.", "PREVIEW_EXPIRED")
+        expected_confirmation = f"CORRECT {preview['counts']['eligible']} SOURCE TIMESTAMPS"
+        if body.typed_confirmation.strip() != expected_confirmation:
+            raise RecoveryError("Typed confirmation does not match the frozen correction scope.", "CONFIRMATION_MISMATCH")
+        job = create_source_correction_job(
+            db,
+            corrections=body.corrections,
+            candidate_digest=body.candidate_digest,
+            actor=context.username,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            preview_expires_at=body.preview_expires_at,
+        )
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    db.flush()
+    return serialize_recovery_job(db, job, include_items=True)
 
 
 @app.post("/device/v2/onboard")
@@ -1355,11 +1592,13 @@ def source_exceptions(
                 for key in (
                     "total",
                     "reviewed",
+                    "corrected",
                     "open",
                     "invalid_time",
                     "malformed",
                     "state",
                     "cohort_digest",
+                    "correction_ids",
                 )
             },
         }
@@ -3732,10 +3971,26 @@ def serialize_attendance(
     row: AttendanceEvent,
     release: dict | None = None,
 ) -> dict:
+    raw_provenance = (row.raw_event or {}).get("terminal_provenance")
+    if raw_provenance == "VERIFIED_CONNECTOR_BINDING":
+        provenance_state = "VERIFIED_CONNECTOR_BINDING"
+        provenance_explanation = "Terminal serial was bound to this connector at capture time."
+    elif row.device_serial:
+        provenance_state = "SERIAL_PRESENT"
+        provenance_explanation = "The retained event includes a terminal serial; connector binding is shown in terminal details."
+    else:
+        provenance_state = "MISSING_TERMINAL_PROVENANCE"
+        provenance_explanation = "The retained event has no verified terminal serial, so it is excluded from automatic delivery."
     result = {
         "id": row.id,
         "event_uid": row.event_uid,
         "device_serial": row.device_serial,
+        "terminal_provenance": {
+            "state": provenance_state,
+            "serial": row.device_serial,
+            "confidence": "VERIFIED" if provenance_state == "VERIFIED_CONNECTOR_BINDING" else "REVIEW_REQUIRED",
+            "explanation": provenance_explanation,
+        },
         "uid": row.uid,
         "user_id": row.user_id,
         "display_name": row.display_name,
