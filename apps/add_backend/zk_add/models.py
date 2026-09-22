@@ -857,6 +857,33 @@ class OrdsOutbox(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class AttendanceDeliverySweep(Base):
+    """Durable progress and health record for the historical ORDS drain.
+
+    The sweep is intentionally a singleton.  Its cursor is advisory telemetry;
+    unresolved rows are always selected by event id so a row that becomes
+    provable after a later identity snapshot cannot be skipped.
+    """
+
+    __tablename__ = "add_attendance_delivery_sweeps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    state: Mapped[str] = mapped_column(String(30), default="IDLE", index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_event_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    pages: Mapped[int] = mapped_column(Integer, default=0)
+    scanned_count: Mapped[int] = mapped_column(Integer, default=0)
+    repaired_count: Mapped[int] = mapped_column(Integer, default=0)
+    outbox_created_count: Mapped[int] = mapped_column(Integer, default=0)
+    unresolved_count: Mapped[int] = mapped_column(Integer, default=0)
+    quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
 class OracleReceipt(Base):
     __tablename__ = "add_oracle_receipts"
 

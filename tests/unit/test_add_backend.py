@@ -47,6 +47,7 @@ from zk_add.identity_conflicts import (
     create_same_employee_resolution,
 )
 from zk_add.models import (
+    AttendanceDeliverySweep,
     AttendanceBatchItem,
     AttendanceBatchReceipt,
     AttendanceEvent,
@@ -114,6 +115,7 @@ from zk_add.service import (
     oracle_payload,
     repair_verified_active_identity_backlog,
     repair_verified_tombstone_backlog,
+    repair_attendance_delivery_backlog,
     replace_user_snapshot,
     resolve_message_rejection,
     record_oracle_receipts,
@@ -163,6 +165,52 @@ def test_ords_delivery_defaults_drain_retry_backlog_in_bounded_batches():
     assert 1 <= ORDS_DELIVERY_CONCURRENCY <= ORDS_DELIVERY_BATCH_SIZE
     assert ORDS_DELIVERY_BATCH_SIZE <= 500
     assert 1 <= ORDS_FIRMWARE_AUDIT_BATCH_SIZE <= 500
+
+
+def test_historical_delivery_sweep_recreates_missing_outbox_idempotently(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    accepted, duplicates = ingest_attendance(
+        db, connector=connector, events=[event(event_uid="e" * 64)]
+    )
+    assert accepted == ["e" * 64] and duplicates == []
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == "e" * 64))
+    assert row is not None
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    assert outbox is not None
+    db.delete(outbox)
+    db.flush()
+
+    first = repair_attendance_delivery_backlog(db, limit=10)
+    db.flush()
+    restored = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    assert restored is not None
+    assert restored.status == "PENDING"
+    assert first["outbox_created"] == 1
+
+    second = repair_attendance_delivery_backlog(db, limit=10)
+    assert second["outbox_created"] == 0
+    assert db.scalar(select(AttendanceDeliverySweep).where(AttendanceDeliverySweep.id == 1))
+
+
+def test_historical_delivery_sweep_does_not_reset_ords_retry_backoff(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    ingest_attendance(db, connector=connector, events=[event(event_uid="f" * 64)])
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == "f" * 64))
+    assert row is not None
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    assert outbox is not None
+    outbox.status = "FAILED_RETRYABLE"
+    outbox.next_attempt_at = utc_now() + timedelta(minutes=5)
+    outbox.last_error = "HTTP_503"
+    db.flush()
+
+    repair_attendance_delivery_backlog(db, limit=10)
+    assert outbox.status == "FAILED_RETRYABLE"
+    assert outbox.last_error == "HTTP_503"
 
 
 def test_ords_transport_circuit_uses_bounded_exponential_backoff(monkeypatch):
