@@ -353,6 +353,7 @@ def _scan(session: Session, job: Job, limit: int) -> int:
             ]
         )
         job.status = "CHECKED"
+        job.last_error = None
         job.preview_expires_at = utc_now() + timedelta(minutes=15)
         job.requested_count = sum(t.checked_count for t in tasks)
         job.eligible_count = (
@@ -555,7 +556,8 @@ def delivery_proof_valid(session: Session, event: AttendanceEvent, connector: Co
     )
 
 
-def _observe(session: Session, job: Job, limit: int) -> None:
+def _observe(session: Session, job: Job, limit: int) -> int:
+    progressed = 0
     waiting = session.scalars(
         select(Item)
         .where(Item.job_id == job.id, Item.status == "WAITING_ORACLE")
@@ -565,6 +567,7 @@ def _observe(session: Session, job: Job, limit: int) -> None:
     for item in waiting:
         event = session.get(AttendanceEvent, item.attendance_event_id)
         if event.oracle_confirmed_at and event.ords_status in ORDS_ACKNOWLEDGED_STATUSES:
+            progressed += 1
             item.status, item.outcome = "CONFIRMED", "ORACLE_CONFIRMED"
             item.completed_at = utc_now()
             item.result = {
@@ -581,6 +584,7 @@ def _observe(session: Session, job: Job, limit: int) -> None:
             }
         item.updated_at = utc_now()
     session.flush()
+    return progressed
 
 
 def counts(session: Session, job: Job) -> dict:
@@ -631,7 +635,7 @@ def advance_once(session: Session) -> int:
                 job.last_error = str(exc)
                 job.status = "EXPIRED"
     else:
-        _observe(session, job, limit)
+        progress = _observe(session, job, limit)
         if job.status == "STOPPING":
             for item in session.scalars(
                 select(Item)
@@ -666,7 +670,7 @@ def advance_once(session: Session) -> int:
                         select(Task).where(Task.job_id == job.id, Task.connector_id == connector_id)
                     )
                     task.updated_at = utc_now()
-                    progress = len(items)
+                    progress += len(items)
                     job.scope = {**job.scope, "last_progress_at": utc_now().isoformat()}
                     break
         session.flush()
@@ -694,7 +698,9 @@ def advance_once(session: Session) -> int:
         ):
             job.last_error = "No repair progress for 10 minutes. Saved attendance is preserved; check delivery and worker health."
             for connector_id in session.scalars(
-                select(Task.connector_id).where(Task.job_id == job.id)
+                select(Item.connector_id)
+                .where(Item.job_id == job.id, Item.status.in_({"READY", "WAITING_ORACLE"}))
+                .distinct()
             ).all():
                 upsert_alert(
                     session,
@@ -704,8 +710,18 @@ def advance_once(session: Session) -> int:
                     message=job.last_error,
                     details={"job_id": job.job_id},
                 )
-    if progress:
+    if progress or job.status in TERMINAL:
         job.last_error = None
+        from zk_add.models import DeviceAlert
+
+        for alert in session.scalars(
+            select(DeviceAlert).where(
+                DeviceAlert.code == "ATTENDANCE_REPAIR_STALLED", DeviceAlert.state == "OPEN"
+            )
+        ).all():
+            if (alert.details or {}).get("job_id") == job.job_id:
+                alert.state = "RESOLVED"
+                alert.resolved_at = utc_now()
     job.updated_at = utc_now()
     return progress
 

@@ -507,3 +507,41 @@ def test_automatic_sweeps_do_not_duplicate_unrepairable_record_storage(store, mo
         assert repair.counts(db, job)["review"] == 1
         assert db.scalar(select(func.count(AttendanceRecoveryItem.id))) == 0
         assert db.scalar(select(func.count(AttendanceEvent.id))) == 1
+
+
+def test_stall_alert_clears_after_a_real_oracle_receipt(store):
+    from zk_add.models import DeviceAlert
+
+    sessions, connector_id, uid = store
+    job_id = check(sessions, connector_id)
+    start(sessions, job_id)
+    tick(sessions)
+    with sessions() as db:
+        job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id))
+        job.scope = {
+            **job.scope,
+            "last_progress_at": (utc_now() - timedelta(minutes=11)).isoformat(),
+        }
+        db.commit()
+    tick(sessions)
+    with sessions() as db:
+        assert (
+            db.scalar(
+                select(DeviceAlert).where(DeviceAlert.code == "ATTENDANCE_REPAIR_STALLED")
+            ).state
+            == "OPEN"
+        )
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        event.ords_status, event.oracle_confirmed_at = "ACKED_CHECK", utc_now()
+        db.commit()
+    tick(sessions)
+    with sessions() as db:
+        job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id))
+        assert job.status == "COMPLETED"
+        assert job.last_error is None
+        assert (
+            db.scalar(
+                select(DeviceAlert).where(DeviceAlert.code == "ATTENDANCE_REPAIR_STALLED")
+            ).state
+            == "RESOLVED"
+        )

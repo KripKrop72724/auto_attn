@@ -198,3 +198,67 @@ def test_100000_saved_records_restart_cursor_and_live_delivery(postgres_store):
         assert db.scalar(select(func.count(OrdsOutbox.id))) == 2
         job.updated_at = utc_now() - timedelta(minutes=11)
         assert "10 minutes" in repair.serialize(db, job, "operator")["last_error"]
+
+
+def test_large_deliverable_backlog_does_not_hide_behind_live_traffic(postgres_store):
+    from zk_add.models import OrdsOutbox
+    from zk_add.worker import claim_ords_batch
+
+    sessions, _ = postgres_store
+    with sessions() as db:
+        original = db.scalar(select(AttendanceEvent))
+        user = db.get(DeviceUser, original.device_user_id)
+        next_id = 2
+        for page in range(101):
+            rows = []
+            for offset in range(1000):
+                index = page * 1000 + offset
+                rows.append(
+                    dict(
+                        id=next_id + index,
+                        event_uid=hashlib.sha256(f"delivery-load-{index}".encode()).hexdigest(),
+                        connector_id=original.connector_id,
+                        zkt_device_id=original.zkt_device_id,
+                        device_serial=original.device_serial,
+                        user_id=original.user_id,
+                        uid=original.uid,
+                        source="FULL_HISTORY" if page < 100 else "LIVE",
+                        identity_resolution_status="RESOLVED",
+                        cnic_encrypted=user.cnic_encrypted,
+                        cnic_lookup_hash=user.cnic_lookup_hash,
+                        clock_quality="OK",
+                        device_event_time=utc_now(),
+                        captured_at=utc_now(),
+                        ords_status="PENDING",
+                    )
+                )
+            db.execute(AttendanceEvent.__table__.insert(), rows)
+            db.execute(
+                OrdsOutbox.__table__.insert(),
+                [
+                    dict(
+                        attendance_event_id=row["id"],
+                        delivery_type="FULL_HISTORY" if page < 100 else "LIVE",
+                        status="PENDING",
+                    )
+                    for row in rows
+                ],
+            )
+        db.commit()
+    # Live traffic remains present in every slice; the historical queue still
+    # receives its reserved share despite 100,000 older deliverable rows.
+    for _ in range(3):
+        claims = claim_ords_batch(50)
+        assert len(claims) == 50
+        with sessions() as db:
+            types = dict(
+                db.execute(
+                    select(OrdsOutbox.delivery_type, func.count(OrdsOutbox.id))
+                    .where(OrdsOutbox.id.in_([claim[0] for claim in claims]))
+                    .group_by(OrdsOutbox.delivery_type)
+                ).all()
+            )
+            assert types == {"LIVE": 40, "FULL_HISTORY": 10}
+    with sessions() as db:
+        assert db.scalar(select(func.count(AttendanceEvent.id))) == 101001
+        assert db.scalar(select(func.count(OrdsOutbox.id))) == 101000
