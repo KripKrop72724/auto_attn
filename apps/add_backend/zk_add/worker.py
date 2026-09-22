@@ -600,6 +600,20 @@ def prepare_maintenance_tick(
     )
 
 
+def prepare_reconciliation_dispatch() -> list[tuple[str, dict]]:
+    """Grant pending terminal scans in an isolated recovery transaction.
+
+    The general maintenance tick owns several independent repairers.  A
+    failure in any one of those repairers must not prevent a queued
+    reconciliation from receiving its terminal assignment.  This fallback is
+    deliberately idempotent: an already leased job is ignored by
+    ``assignment_rows`` and no source or delivery rows are changed here.
+    """
+
+    with session_scope() as session:
+        return assignment_rows(session)
+
+
 def mark_command_dispatched(command_id: str) -> None:
     with session_scope() as session:
         command = session.scalar(
@@ -622,13 +636,39 @@ def mark_command_dispatched(command_id: str) -> None:
 
 
 async def maintenance_tick() -> None:
-    (
-        dispatch,
-        connector_updates,
-        reconciliation_updates,
-        reconciliation_dispatch,
-        provisioning_updates,
-    ) = await asyncio.to_thread(prepare_maintenance_tick, utc_now())
+    try:
+        (
+            dispatch,
+            connector_updates,
+            reconciliation_updates,
+            reconciliation_dispatch,
+            provisioning_updates,
+        ) = await asyncio.to_thread(prepare_maintenance_tick, utc_now())
+    except Exception as exc:
+        # Keep the control-plane error visible, but still give queued
+        # reconciliation jobs an independent chance to acquire a scan lease.
+        # Without this guard, an unrelated repair failure can leave a job in
+        # QUEUED/PREFLIGHT with no assignment indefinitely.
+        await browser_events.publish(
+            "backend_error", {"code": "MAINTENANCE_LOOP_ERROR", "message": str(exc)[:500]}
+        )
+        dispatch = []
+        connector_updates = []
+        reconciliation_updates = []
+        provisioning_updates = []
+        reconciliation_dispatch = []
+        try:
+            reconciliation_dispatch = await asyncio.to_thread(
+                prepare_reconciliation_dispatch
+            )
+        except Exception as dispatch_exc:
+            await browser_events.publish(
+                "backend_error",
+                {
+                    "code": "RECONCILIATION_DISPATCH_ERROR",
+                    "message": str(dispatch_exc)[:500],
+                },
+            )
     for connector_id, update in dispatch:
         if await connector_hub.send(connector_id, update):
             await asyncio.to_thread(mark_command_dispatched, update["command_id"])
