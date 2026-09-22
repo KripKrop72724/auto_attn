@@ -109,6 +109,12 @@ workflow passes them through explicitly:
 Production canary acceptance is a separate operational receipt. Passing software
 tests or a completed check does not establish that a production repair ran.
 
+If check requests fail, the **ADD read-only repair diagnostics** GitHub workflow
+reports bounded database wait/progress counters, container resource use and
+allowlisted HTTP/exception counts. It runs only from `main` on the protected
+production runner. It does not change repair flags, attendance, sessions or
+delivery state, and never publishes raw logs, payloads or employee identities.
+
 ## Qualification
 
 `test_safe_attendance_repair.py` covers read-only checks, identity conflicts and
