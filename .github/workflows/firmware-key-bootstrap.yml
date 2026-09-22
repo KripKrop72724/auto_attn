@@ -46,7 +46,7 @@ jobs:
           import os
           from pathlib import Path
 
-          image = Path("firmware/zone_lite/build-bootstrap/zone_lite.bin").read_bytes()
+          image = Path("firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin").read_bytes()
           configured = os.environ["ZONE_LITE_SETUP_PASSWORD"].encode()
           if configured not in image or b"SLIC-CI-ONLY" in image:
               raise SystemExit("Protected setup-password build provenance is invalid")
@@ -60,7 +60,7 @@ jobs:
             firmware/zone_lite/build-bootstrap/bootloader/bootloader.bin
             firmware/zone_lite/build-bootstrap/partition_table/partition-table.bin
             firmware/zone_lite/build-bootstrap/ota_data_initial.bin
-            firmware/zone_lite/build-bootstrap/zone_lite.bin
+            firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin
             firmware/zone_lite/build-bootstrap/flasher_args.json
 
   generate-and-sign:
@@ -87,7 +87,7 @@ jobs:
           New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
           Copy-Item -LiteralPath (Join-Path $artifact 'bootloader\bootloader.bin') -Destination (Join-Path $unsigned 'bootloader.bin')
           Copy-Item -LiteralPath (Join-Path $artifact 'partition_table\partition-table.bin') -Destination (Join-Path $unsigned 'partition-table.bin')
-          foreach ($name in @('ota_data_initial.bin', 'zone_lite.bin', 'flasher_args.json')) {
+          foreach ($name in @('ota_data_initial.bin', 'zone_lite_hikvision.bin', 'flasher_args.json')) {
             Copy-Item -LiteralPath (Join-Path $artifact $name) -Destination (Join-Path $unsigned $name)
           }
           $output = Join-Path $PWD 'signed-bootstrap'
