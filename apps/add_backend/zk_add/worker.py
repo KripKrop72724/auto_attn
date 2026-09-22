@@ -16,6 +16,7 @@ from zk_add.db import session_scope
 from zk_add.crypto import decrypt_cnic
 from zk_add.models import (
     AttendanceEvent,
+    AttendanceDeliverySweep,
     Connector,
     ConnectorCredential,
     ConnectorNonce,
@@ -52,6 +53,7 @@ from zk_add.service import (
     reconcile_admin_lease_command,
     reconcile_admin_lease_states,
     repair_missing_terminal_provenance,
+    repair_attendance_delivery_backlog,
     repair_verified_active_identity_backlog,
     repair_verified_source_identity_backlog,
     repair_verified_tombstone_backlog,
@@ -220,6 +222,20 @@ def ords_delivery_metrics(session: Session) -> dict:
         for status, count in counts.items()
         if status.upper() in ORDS_ACKNOWLEDGED_STATUSES
     )
+    sweep = session.get(AttendanceDeliverySweep, 1)
+    missing_outbox = int(
+        session.scalar(
+            select(func.count(AttendanceEvent.id))
+            .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
+            .where(
+                OrdsOutbox.id.is_(None),
+                ~AttendanceEvent.ords_status.in_(
+                    tuple(ORDS_ACKNOWLEDGED_STATUSES)
+                ),
+            )
+        )
+        or 0
+    )
     return {
         "backlog": active_outbox + blocked_identity,
         "pending": counts.get("pending", 0),
@@ -235,6 +251,18 @@ def ords_delivery_metrics(session: Session) -> dict:
         "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
+        "missing_outbox": missing_outbox,
+        "historical_sweep": {
+            "state": sweep.state if sweep else "NOT_STARTED",
+            "last_event_id": sweep.last_event_id if sweep else None,
+            "pages": sweep.pages if sweep else 0,
+            "scanned": sweep.scanned_count if sweep else 0,
+            "repaired": sweep.repaired_count if sweep else 0,
+            "outbox_created": sweep.outbox_created_count if sweep else 0,
+            "unresolved": sweep.unresolved_count if sweep else 0,
+            "quarantined": sweep.quarantined_count if sweep else 0,
+            "updated_at": sweep.updated_at if sweep else None,
+        },
     }
 
 
@@ -433,6 +461,7 @@ def prepare_maintenance_tick(
         repair_verified_source_identity_backlog(session)
         from zk_add.hikvision_delivery import repair_profile_identity_holds
         repair_profile_identity_holds(session)
+        repair_attendance_delivery_backlog(session, limit=ORDS_DELIVERY_BATCH_SIZE)
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
         from zk_add.comm_keys import expire_staged_comm_key_operations

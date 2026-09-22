@@ -30,6 +30,7 @@ from zk_add.identity_conflicts import (
 )
 from zk_add.models import (
     AttendanceEvent,
+    AttendanceDeliverySweep,
     AttendanceRepairItem,
     Connector,
     ConnectorCredential,
@@ -61,7 +62,10 @@ from zk_add.schemas import (
 )
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
-from zk_add.identity_states import PINNED_IDENTITY_RESOLUTION_STATUSES
+from zk_add.identity_states import (
+    PINNED_IDENTITY_RESOLUTION_STATUSES,
+    VERIFIED_IDENTITY_RESOLUTION_STATUSES,
+)
 from zk_add.identity_provenance import historical_identity_is_supported
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -84,6 +88,20 @@ ACTIVE_COMMAND_STATES = {
 # included: a manually supplied row must carry its own terminal evidence.
 CONNECTOR_OWNED_CAPTURE_SOURCES = frozenset(
     {"DUMP_STARTUP", "DUMP_RECONNECT", "RECONCILE_15M"}
+)
+
+ORDS_DELIVERY_ACKED_STATUSES = frozenset(
+    {"ACKED", "ACKED_CHECK", "ACKED_FIRMWARE"}
+)
+ORDS_DELIVERY_QUARANTINE_STATUSES = frozenset(
+    {
+        "QUARANTINED_INVALID_EVENT_UID",
+        "QUARANTINED_INVALID_DEVICE_TIME",
+        "QUARANTINED_IDENTITY_REUSE",
+        "QUARANTINED_SOURCE_CONFLICT",
+        "QUARANTINED_MISSING_TERMINAL_PROVENANCE",
+        "QUARANTINED_ORDS_REJECTED",
+    }
 )
 
 
@@ -2691,6 +2709,194 @@ def enrich_undelivered_attendance(
             outbox.last_error = None
         changed += 1
     return changed
+
+
+def _ords_delivery_type_for_event(row: AttendanceEvent) -> str:
+    if row.source == "LIVE" or row.source == "LIVE_POLL":
+        return "LIVE"
+    if row.source in {
+        "CURRENT_RECONCILE",
+        "DUMP_RECONNECT",
+        "DUMP_STARTUP",
+        "RECONCILE_15M",
+    }:
+        return "CURRENT_RECONCILE"
+    return "FULL_HISTORY"
+
+
+def ensure_attendance_ords_outbox(
+    session: Session,
+    row: AttendanceEvent,
+    *,
+    status: str | None = None,
+) -> tuple[OrdsOutbox, bool]:
+    """Create the single durable ORDS row for an attendance event.
+
+    This helper is deliberately idempotent and is used by both normal
+    ingestion repairs and the historical sweep.  It never creates an ORDS
+    delivery row for a second time and never changes an acknowledged row.
+    """
+    outbox = session.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+    )
+    created = outbox is None
+    if outbox is None:
+        outbox = OrdsOutbox(
+            attendance_event_id=row.id,
+            delivery_type=_ords_delivery_type_for_event(row),
+            status=status or row.ords_status,
+        )
+        session.add(outbox)
+    elif status and outbox.status not in ORDS_DELIVERY_ACKED_STATUSES:
+        outbox.status = status
+        outbox.next_attempt_at = None
+        if status == "PENDING":
+            outbox.last_http_status = None
+            outbox.last_error = None
+    return outbox, created
+
+
+def repair_attendance_delivery_backlog(
+    session: Session,
+    *,
+    limit: int = 100,
+    sweep_owner: str = "maintenance",
+) -> dict[str, int | str]:
+    """Drain every retained eligible event in oldest-first, restart-safe pages.
+
+    The query intentionally starts from the oldest unresolved event on every
+    pass.  A later identity snapshot can therefore make an old event eligible
+    without depending on an in-memory cursor.  The persisted sweep row is
+    operational evidence and checkpoint telemetry, while row-level idempotency
+    remains the source of truth.
+    """
+    bounded_limit = max(1, min(int(limit), 500))
+    now = utc_now()
+    sweep = session.scalar(
+        select(AttendanceDeliverySweep).where(AttendanceDeliverySweep.id == 1).with_for_update()
+    )
+    if sweep is None:
+        sweep = AttendanceDeliverySweep(id=1, state="RUNNING", started_at=now)
+        session.add(sweep)
+        session.flush()
+    sweep.state = "RUNNING"
+    sweep.lease_owner = sweep_owner
+    sweep.lease_until = now + timedelta(seconds=30)
+    sweep.last_error = None
+    sweep.updated_at = now
+
+    candidates = session.scalars(
+        select(AttendanceEvent)
+        .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
+        .where(
+            ~AttendanceEvent.ords_status.in_(
+                tuple(ORDS_DELIVERY_ACKED_STATUSES | ORDS_DELIVERY_QUARANTINE_STATUSES)
+            ),
+            or_(
+                OrdsOutbox.id.is_(None),
+                AttendanceEvent.ords_status.in_(
+                    ("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")
+                ),
+                OrdsOutbox.status == "BLOCKED_IDENTITY",
+            ),
+        )
+        .order_by(AttendanceEvent.id.asc())
+        .limit(bounded_limit)
+        .with_for_update(skip_locked=True)
+    ).all()
+
+    repaired = 0
+    created = 0
+    unresolved = 0
+    quarantined = 0
+    for row in candidates:
+        sweep.last_event_id = row.id
+        sweep.scanned_count += 1
+        event_uid_valid = bool(re.fullmatch(r"[0-9a-f]{64}", row.event_uid or ""))
+        if not event_uid_valid:
+            row.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+            row.identity_resolution_status = "BLOCKED_INVALID_EVENT_UID"
+            ensure_attendance_ords_outbox(
+                session, row, status="QUARANTINED_INVALID_EVENT_UID"
+            )
+            quarantined += 1
+            continue
+
+        if row.clock_quality == "INVALID" or not attendance_device_time_is_plausible(
+            row.device_event_time, row.captured_at
+        ):
+            row.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+            ensure_attendance_ords_outbox(
+                session, row, status="QUARANTINED_INVALID_DEVICE_TIME"
+            )
+            quarantined += 1
+            continue
+
+        # Reconcile/source rows may be released only after retained source
+        # evidence proves continuity.  This is also the HIK/ZKT boundary that
+        # prevents a current user ID from silently claiming reused history.
+        if row.identity_resolution_status == "BLOCKED_PROVENANCE":
+            connector = session.get(Connector, row.connector_id)
+            if connector is not None and recover_verified_source_identity(
+                session, connector=connector, row=row
+            ):
+                repaired += 1
+            else:
+                unresolved += 1
+                continue
+
+        if row.cnic_lookup_hash and row.identity_resolution_status in VERIFIED_IDENTITY_RESOLUTION_STATUSES:
+            row.ords_status = "PENDING"
+            outbox, was_created = ensure_attendance_ords_outbox(
+                session, row, status="PENDING"
+            )
+            created += int(was_created)
+            repaired += int(was_created or outbox.status == "PENDING")
+            continue
+
+        connector = session.get(Connector, row.connector_id)
+        zkt = session.get(ZKTDevice, row.zkt_device_id)
+        if connector is not None and zkt is not None and connector.firmware_family != "hikvision":
+            user = session.scalar(
+                select(DeviceUser).where(
+                    DeviceUser.zkt_device_id == zkt.id,
+                    DeviceUser.user_id == row.user_id,
+                    DeviceUser.lifecycle_state == "ACTIVE",
+                )
+            )
+            if user is not None:
+                repaired += enrich_undelivered_attendance(
+                    session, zkt=zkt, user=user
+                )
+                if row.cnic_lookup_hash and row.identity_resolution_status in VERIFIED_IDENTITY_RESOLUTION_STATUSES:
+                    outbox, was_created = ensure_attendance_ords_outbox(
+                        session, row, status="PENDING"
+                    )
+                    created += int(was_created)
+                    repaired += int(was_created)
+                    continue
+
+        ensure_attendance_ords_outbox(session, row, status=row.ords_status)
+        unresolved += 1
+
+    sweep.pages += 1
+    sweep.repaired_count += repaired
+    sweep.outbox_created_count += created
+    sweep.unresolved_count += unresolved
+    sweep.quarantined_count += quarantined
+    sweep.completed_at = now if not candidates else None
+    sweep.state = "IDLE" if not candidates else "RUNNING"
+    sweep.lease_owner = None
+    sweep.lease_until = None
+    sweep.updated_at = utc_now()
+    return {
+        "scanned": len(candidates),
+        "repaired": repaired,
+        "outbox_created": created,
+        "unresolved": unresolved,
+        "quarantined": quarantined,
+        "state": sweep.state,
+    }
 
 
 def repair_verified_tombstone_backlog(
