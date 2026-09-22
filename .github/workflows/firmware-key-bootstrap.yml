@@ -90,6 +90,7 @@ jobs:
           foreach ($name in @('ota_data_initial.bin', 'zone_lite_hikvision.bin', 'flasher_args.json')) {
             Copy-Item -LiteralPath (Join-Path $artifact $name) -Destination (Join-Path $unsigned $name)
           }
+          Copy-Item -LiteralPath (Join-Path $unsigned 'zone_lite_hikvision.bin') -Destination (Join-Path $unsigned 'zone_lite.bin')
           $output = Join-Path $PWD 'signed-bootstrap'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
           ./deploy/add/bootstrap-firmware-signing.ps1 `
