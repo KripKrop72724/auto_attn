@@ -121,6 +121,7 @@ def main() -> int:
     expected_workflows = {
         ".github/workflows/add-ci.yml",
         ".github/workflows/add-deploy.yml",
+        ".github/workflows/add-repair-diagnostics.yml",
         ".github/workflows/firmware-canary-promote.yml",
         ".github/workflows/firmware-hil-candidate.yml",
         ".github/workflows/firmware-hil.yml",
