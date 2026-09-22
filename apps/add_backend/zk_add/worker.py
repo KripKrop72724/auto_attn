@@ -474,7 +474,6 @@ def prepare_maintenance_tick(
         from zk_add.comm_keys import expire_staged_comm_key_operations
 
         expire_staged_comm_key_operations(session)
-        reconciliation_updates = refresh_all_reconciliation_assurance(session)
         for provisioning in session.scalars(
             select(ProvisioningSession).where(
                 ProvisioningSession.expires_at <= now,
@@ -577,7 +576,21 @@ def prepare_maintenance_tick(
             connector = session.get(Connector, command.connector_id)
             if connector:
                 dispatch.append((connector.connector_id, serialize_command(command)))
+        # Grant terminal-history assignments in the short control-plane
+        # transaction.  Assurance refresh can scan large immutable manifests
+        # and must never hold this transaction open; otherwise a new job can
+        # remain QUEUED/PREFLIGHT with no assignment even while its terminal is
+        # online.  The assignment and checkpoint are committed before the
+        # slower assurance pass below starts.
         reconciliation_dispatch = assignment_rows(session)
+
+    # Oracle assurance is deliberately isolated from assignment dispatch.  A
+    # large historical job can require indexed manifest/status aggregation;
+    # it must not starve new terminal captures or make the scheduler appear
+    # idle.  A fresh session also prevents assurance locks from delaying the
+    # connector dispatch transaction above.
+    with session_scope() as assurance_session:
+        reconciliation_updates = refresh_all_reconciliation_assurance(assurance_session)
     return (
         dispatch,
         connector_updates,
