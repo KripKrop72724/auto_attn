@@ -41,7 +41,7 @@ jobs:
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
           python - <<'PY'
           import os
           from pathlib import Path
