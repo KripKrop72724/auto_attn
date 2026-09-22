@@ -213,8 +213,6 @@ def apply_ota_heartbeat_diagnostics(
     target_version = ota.target_version.strip()
     runtime_state = ota.state.strip().upper()
     reported_error = ota.last_error.strip().upper()
-    if not target_version or (not runtime_state and not reported_error):
-        return
 
     # Keep imports local: OTA models already depend on the connector model and
     # service imports are also used by migration/bootstrap tooling.
@@ -237,7 +235,41 @@ def apply_ota_heartbeat_diagnostics(
         )
         .order_by(FirmwareDeployment.id.desc())
     )
-    if deployment is None or not _versions_match(
+    if deployment is None:
+        return
+
+    from zk_add.ota import previous_firmware_return_evidence
+
+    evidence = previous_firmware_return_evidence(
+        session, connector=connector, deployment=deployment, payload=payload,
+    )
+    if evidence is not None:
+        rollback_code = "PREVIOUS_FIRMWARE_OBSERVED"
+        rollback_message = (
+            "The ESP has returned to its previous firmware after a verified "
+            "target boot. Two fresh heartbeats confirm the return; the reset "
+            "cause was not reported. The campaign remains paused for review."
+        )
+        record_progress(
+            session, connector=connector,
+            deployment_public_id=deployment.deployment_id,
+            state="ROLLED_BACK", bytes_written=deployment.bytes_written,
+            running_version=payload.firmware_version,
+            running_partition=ota.running_partition,
+            image_sha256=ota.image_sha256,
+            error_code=rollback_code, error_message=rollback_message,
+        )
+        connector.last_error_code = f"OTA_{rollback_code}"
+        connector.last_error_message = rollback_message
+        upsert_alert(
+            session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
+            message=rollback_message, details=evidence,
+        )
+        return
+
+    # A heartbeat for another target, or a heartbeat with no OTA evidence,
+    # must not affect the current deployment.
+    if not target_version or not _versions_match(
         target_version, deployment.target_version
     ):
         return

@@ -59,6 +59,7 @@ from zk_add.models import (
     DeviceAlert,
     DeviceCommand,
     DeviceConnectionEvent,
+    DeviceTelemetry,
     DeviceUser,
     HistoricalCurrentIdentityResolution,
     IdentityConflictResolution,
@@ -76,6 +77,7 @@ from zk_add.ota import (
     FirmwareDeployment,
     FirmwareEvent,
     FirmwareRelease,
+    previous_firmware_return_evidence,
 )
 from zk_add.protocol import body_sha256, sign_request, signature_material
 from zk_add.schemas import (
@@ -3448,6 +3450,92 @@ def test_heartbeat_ignores_stale_error_during_new_same_target_transfer(
     assert campaign.status == "ACTIVE"
     assert connector.ota_state == "UPDATING"
     assert connector.last_error_code is None
+
+
+def test_previous_firmware_return_requires_two_fresh_same_boot_heartbeats(db: Session):
+    connector = connector_fixture(db)
+    now = utc_now()
+    release = FirmwareRelease(
+        release_id="release-two-heartbeats",
+        version="2.5.4",
+        git_sha="a" * 40,
+        image_sha256="b" * 64,
+        image_size=1024,
+        signing_key_id="production-key",
+        partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.2.0",
+        storage_name="two-heartbeats/firmware.bin",
+        manifest={"application_sha256": "c" * 64},
+        manifest_signature="test-signature",
+        state="HIL_ONLY",
+    )
+    db.add(release)
+    db.flush()
+    campaign = FirmwareCampaign(
+        campaign_id="campaign-two-heartbeats",
+        release_id=release.id,
+        zone_id=connector.zone_id,
+        status="PAUSED",
+        actor="StateHealthAdmin",
+        idempotency_key="two-heartbeats-key",
+        reason="Require fresh rollback evidence",
+        typed_confirmation="2.5.4",
+        eligible_count=1,
+        legacy_skipped_count=0,
+    )
+    db.add(campaign)
+    db.flush()
+    deployment = FirmwareDeployment(
+        deployment_id="deployment-two-heartbeats",
+        campaign_id=campaign.id,
+        release_id=release.id,
+        connector_id=connector.id,
+        status="BOOTED_PENDING",
+        previous_version="zone-lite-2.4.12",
+        target_version="2.5.4",
+        bytes_written=1024,
+    )
+    db.add(deployment)
+    db.flush()
+    db.add(
+        FirmwareEvent(
+            deployment_id=deployment.id,
+            state="BOOTED_PENDING",
+            details={
+                "running_version": "zone-lite-2.5.4",
+                "running_partition": "ota_1",
+                "image_sha256": "c" * 64,
+            },
+            created_at=now - timedelta(seconds=120),
+        )
+    )
+    db.add(
+        DeviceTelemetry(
+            connector_id=connector.id,
+            boot_id="new-boot",
+            sequence=1,
+            uptime_seconds=60,
+            payload={
+                "firmware_version": "zone-lite-2.4.12",
+                "ota": {"state": "", "target_version": "2.5.4"},
+                "uptime_seconds": 60,
+            },
+            created_at=now - timedelta(seconds=30),
+        )
+    )
+    db.flush()
+    connector.boot_id = "new-boot"
+    connector.last_sequence = 2
+    evidence = previous_firmware_return_evidence(
+        db,
+        connector=connector,
+        deployment=deployment,
+        payload=HeartbeatPayload(
+            firmware_version="zone-lite-2.4.12",
+            uptime_seconds=90,
+        ),
+    )
+    assert evidence and evidence["reset_cause"] == "not_reported"
 
 
 def test_admin_lease_result_is_durable(db: Session):
