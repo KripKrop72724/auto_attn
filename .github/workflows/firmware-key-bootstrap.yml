@@ -98,7 +98,8 @@ jobs:
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
             -DeviceMac '${{ inputs.device_mac }}' `
-            -GitSha '${{ github.sha }}'
+            -GitSha '${{ github.sha }}' `
+            -FirmwareFamily 'hikvision'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-signed-bootstrap-${{ github.sha }}
