@@ -1,3 +1,4 @@
+import { SafeAttendanceRepair } from './SafeAttendanceRepair'
 import {
   useCallback,
   useEffect,
@@ -532,7 +533,7 @@ export function AttendanceView({
         <PageHeader
           eyebrow="CONTROLLED ORDS RELEASE"
           title={mode === 'needs-review' ? 'Attendance · Needs review' : 'Attendance · Release history'}
-          description={mode === 'needs-review' ? 'Review exact identity-held punches for one current employee and terminal at a time.' : 'Trace approvals, Oracle receipts, retries, downstream proof and every per-punch outcome.'}
+          description={mode === 'needs-review' ? 'Repair verified attendance and review records that need more evidence.' : 'Trace approvals, Oracle receipts, retries, downstream proof and every per-punch outcome.'}
         />
       )}
       <nav className="attendance-view-tabs" role="tablist" aria-label="Attendance views">
@@ -559,6 +560,7 @@ export function AttendanceView({
         aria-labelledby={`attendance-${mode}-tab`}
       >
         {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} />}
+        {mode === 'needs-review' && <SafeAttendanceRepair devices={devices} toast={safeToast} />}
         {mode === 'needs-review' && <AttendanceReleaseReview devices={devices} revision={revision} toast={safeToast} initialConnectorId={reviewConnectorId} initialUserKey={reviewUserKey} onOpenHistory={(jobId) => navigateMode('release-history', { jobId })} />}
         {mode === 'release-history' && <AttendanceReleaseHistory devices={devices} revision={revision} toast={safeToast} initialJobId={releaseJobId} />}
       </div>

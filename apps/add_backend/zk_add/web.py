@@ -534,6 +534,60 @@ def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     return result
 
 
+from zk_add import attendance_safe_repair as safe_repair  # noqa: E402
+from zk_add.attendance_safe_repair_schemas import (  # noqa: E402
+    SafeRepairCheckRequest, SafeRepairStartRequest, SafeRepairControlRequest,
+)
+
+
+@app.get("/api/v2/attendance-recovery/coverage")
+def attendance_saved_coverage(
+    connector_id: str | None = Query(default=None, max_length=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return safe_repair.delivery_coverage(db, connector_id)
+
+
+@app.get("/api/v2/attendance-recovery/checks")
+def list_safe_repair_checks(
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=50),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, context = auth
+    query = select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.action == safe_repair.ACTION)
+    if before:
+        query = query.where(AttendanceRecoveryJob.id < before)
+    rows = db.scalars(query.order_by(AttendanceRecoveryJob.id.desc()).limit(limit + 1)).all()
+    return {"enabled": settings.attendance_safe_repair_preview_enabled,
+            "rows": [safe_repair.serialize(db, row, context.username) for row in rows[:limit]],
+            "next_cursor": rows[limit - 1].id if len(rows) > limit else None}
+
+
+@app.post("/api/v2/attendance-recovery/checks", status_code=202)
+def create_safe_repair_check(
+    body: SafeRepairCheckRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    try:
+        row = safe_repair.create_check(db, actor=context.username, key=body.idempotency_key,
+                                      connector_ids=body.connector_ids)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return safe_repair.serialize(db, row, context.username)
+
+
+@app.get("/api/v2/attendance-recovery/checks/{check_id}")
+def get_safe_repair_check(check_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, context = auth
+    row = _recovery_job_or_404(db, check_id)
+    if row.action != safe_repair.ACTION:
+        raise HTTPException(status_code=404, detail="Repair check not found.")
+    return safe_repair.serialize(db, row, context.username)
+
+
 def _recovery_job_or_404(db: Session, job_id: str) -> AttendanceRecoveryJob:
     job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id))
     if job is None:
@@ -571,10 +625,20 @@ def attendance_recovery_preview(
 
 @app.post("/api/v2/attendance-recovery/jobs", status_code=201)
 def create_attendance_recovery_job(
-    body: AttendanceRecoveryCreateRequest,
+    body: AttendanceRecoveryCreateRequest | SafeRepairStartRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    if isinstance(body, SafeRepairStartRequest):
+        require_step_up(body.password.get_secret_value(), db, context)
+        job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == body.check_id).with_for_update())
+        if job is None:
+            raise HTTPException(status_code=404, detail="Repair check not found.")
+        try:
+            safe_repair.start_check(db, job, actor=context.username, signature=body.signature)
+        except RecoveryError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+        return safe_repair.serialize(db, job, context.username)
     try:
         require_step_up(body.password, db, context)
         existing = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.idempotency_key == body.idempotency_key))
@@ -610,8 +674,11 @@ def get_attendance_recovery_job(
     job_id: str,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
-    db, _context = auth
-    return serialize_recovery_job(db, _recovery_job_or_404(db, job_id), include_items=True)
+    db, context = auth
+    job = _recovery_job_or_404(db, job_id)
+    if job.action == safe_repair.ACTION:
+        return safe_repair.serialize(db, job, context.username)
+    return serialize_recovery_job(db, job, include_items=True)
 
 
 @app.get("/api/v2/attendance-recovery/jobs/{job_id}/items")
@@ -619,19 +686,33 @@ def get_attendance_recovery_items(
     job_id: str,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    state: str | None = Query(default=None, max_length=40),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    return list_recovery_items(db, _recovery_job_or_404(db, job_id), limit=limit, cursor=cursor)
+    job = _recovery_job_or_404(db, job_id)
+    if job.action == safe_repair.ACTION:
+        return safe_repair.items_page(db, job, after=cursor or 0, limit=limit, state=state)
+    return list_recovery_items(db, job, limit=limit, cursor=cursor)
 
 
 @app.post("/api/v2/attendance-recovery/jobs/{job_id}/control")
 def control_attendance_recovery_job(
     job_id: str,
-    body: AttendanceRecoveryControlRequest,
+    body: AttendanceRecoveryControlRequest | SafeRepairControlRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    if isinstance(body, SafeRepairControlRequest):
+        require_step_up(body.password.get_secret_value(), db, context)
+        job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id).with_for_update())
+        if job is None:
+            raise HTTPException(status_code=404, detail="Repair run not found.")
+        try:
+            safe_repair.control(db, job, action=body.action, actor=context.username)
+        except RecoveryError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+        return safe_repair.serialize(db, job, context.username)
     require_step_up(body.password, db, context)
     try:
         job = control_recovery_job(
@@ -2261,6 +2342,10 @@ async def resolve_historical_directory_identity(
     db, context = auth
     require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
+    try:
+        safe_repair.assert_no_active_safe_repair(db, connector.id)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     zkt = connector.zkt_device
     if zkt is None:
         raise HTTPException(status_code=409, detail="No assigned ZKT device.")
@@ -2331,6 +2416,10 @@ async def resolve_historical_event_group_identity(
     db, context = auth
     require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
+    try:
+        safe_repair.assert_no_active_safe_repair(db, connector.id)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     expected_confirmation = (
         f"{body.source_user_id} -> HR {body.directory_employee_id}"
     )
@@ -2392,6 +2481,10 @@ async def resolve_historical_current_identity(
     db, context = auth
     require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
+    try:
+        safe_repair.assert_no_active_safe_repair(db, connector.id)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     expected_confirmation = (
         f"{body.source_user_id} -> CURRENT {body.source_user_id}"
     )

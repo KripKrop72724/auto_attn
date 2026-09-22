@@ -2003,13 +2003,11 @@ export function ReconciliationView({
                   : job.capture_certified_at
                     ? 100
                     : 0
-                const oracleTarget = job.progress.oracle_target || 0
+                const oracleTarget = Math.max(job.progress.oracle_target || 0, job.progress.oracle_confirmed + job.progress.oracle_pending + (job.progress.oracle_review_required || 0) + (job.progress.blocked_identity || 0))
                 const oraclePercent = oracleTarget
                   ? Math.min(
                       100,
-                      Math.round(
-                        (job.progress.oracle_confirmed / oracleTarget) * 100,
-                      ),
+                      job.progress.oracle_confirmed < oracleTarget ? Math.min(99, Math.floor((job.progress.oracle_confirmed / oracleTarget) * 100)) : 100,
                     )
                   : job.oracle_certified_at
                     ? 100
@@ -2121,8 +2119,9 @@ export function ReconciliationView({
                           {(
                             job.progress.oracle_review_required ?? 0
                           ).toLocaleString()}{' '}
-                          review
+                          review · {(job.progress.blocked_identity || 0).toLocaleString()} waiting for identity evidence
                         </p>
+                        <p className="muted">For this reconciliation’s records only. <a href="/attendance?view=needs-review">Check all saved attendance</a> for other held punches.</p>
                       </section>
                     </div>
                     <dl className="reconciliation-job-facts">

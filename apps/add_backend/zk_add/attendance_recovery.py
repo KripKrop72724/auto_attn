@@ -361,6 +361,7 @@ def _event_lane(
     connector: Connector | None,
     *,
     now: datetime | None = None,
+    identity_prover=None,
 ) -> tuple[str, str]:
     """Classify an event without treating unknown states as retryable."""
 
@@ -391,7 +392,7 @@ def _event_lane(
         or event.identity_resolution_status not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
     )
     if needs_identity:
-        if _identity_provable_without_mutation(session, event, connector):
+        if (identity_prover() if identity_prover is not None else _identity_provable_without_mutation(session, event, connector)):
             return SAFE_LANE, "Exact terminal identity and authoritative CNIC evidence are now verified."
         return IDENTITY_LANE, "Identity evidence is incomplete or reused."
     return SAFE_LANE, "The event can be retried through the idempotent outbox."
@@ -1575,6 +1576,7 @@ def advance_attendance_recovery_jobs(session: Session, *, limit: int | None = No
         select(AttendanceRecoveryJob)
         .where(
             AttendanceRecoveryJob.status.in_(("QUEUED", "RUNNING")),
+            AttendanceRecoveryJob.action != "SAFE_REPAIR",
             or_(AttendanceRecoveryJob.lease_until.is_(None), AttendanceRecoveryJob.lease_until <= now),
         )
         .order_by(AttendanceRecoveryJob.id.asc())
@@ -1646,6 +1648,8 @@ def control_recovery_job(
     reason: str, idempotency_key: str, candidate_digest: str,
     typed_confirmation: str,
 ) -> AttendanceRecoveryJob:
+    if job.action == "SAFE_REPAIR":
+        raise RecoveryError("Use the Repair attendance controls for this run.", "WORKFLOW_MISMATCH")
     job = session.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.id == job.id)
                          .with_for_update().execution_options(populate_existing=True))
     if candidate_digest != job.candidate_digest or typed_confirmation != f"{action.upper()} {job.job_id}":

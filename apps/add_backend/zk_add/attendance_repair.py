@@ -2156,6 +2156,11 @@ def create_repair_job(
     if locked_connector is None or locked_connector.zkt_device is None:
         raise RepairError("The selected terminal no longer exists.", code="NO_TERMINAL")
     connector = locked_connector
+    from zk_add.attendance_safe_repair import assert_no_active_safe_repair
+    try:
+        assert_no_active_safe_repair(session, connector.id)
+    except ValueError as exc:
+        raise RepairError(str(exc), code="TERMINAL_RELEASE_IN_PROGRESS") from exc
     zkt = connector.zkt_device
     hard, waitable = _terminal_eligibility(session, connector)
     if hard:
@@ -2467,6 +2472,11 @@ def create_exact_release_job(
     if locked_connector is None or locked_connector.zkt_device is None:
         raise RepairError("The selected terminal no longer exists.", code="NO_TERMINAL")
     connector = locked_connector
+    from zk_add.attendance_safe_repair import assert_no_active_safe_repair
+    try:
+        assert_no_active_safe_repair(session, connector.id)
+    except ValueError as exc:
+        raise RepairError(str(exc), code="TERMINAL_RELEASE_IN_PROGRESS") from exc
     replay = session.scalar(
         select(AttendanceRepairJob).where(
             AttendanceRepairJob.connector_id == connector.id,

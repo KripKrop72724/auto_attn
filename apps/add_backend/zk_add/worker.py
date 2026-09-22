@@ -359,12 +359,33 @@ async def _attendance_repair_loop(stop: asyncio.Event) -> None:
             pass
 
 
+async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
+    from zk_add.attendance_safe_repair import tick
+
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(tick)
+        except Exception:
+            await browser_events.publish(
+                "backend_error",
+                {
+                    "code": "SAFE_ATTENDANCE_REPAIR_WORKER_ERROR",
+                    "message": "Attendance repair will retry its saved checkpoint. Saved attendance is preserved.",
+                },
+            )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def maintenance_loop(stop: asyncio.Event) -> None:
     tasks = [
         asyncio.create_task(_control_plane_loop(stop)),
         asyncio.create_task(_ords_delivery_loop(stop)),
         asyncio.create_task(_ords_audit_loop(stop)),
         asyncio.create_task(_attendance_repair_loop(stop)),
+        asyncio.create_task(_safe_attendance_repair_loop(stop)),
     ]
     try:
         await stop.wait()
@@ -716,38 +737,103 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
         # IN_FLIGHT forever.  No normal request remains active this long.
         stale_before = now - timedelta(seconds=max(60, int(settings.ords_timeout_seconds * 3)))
         for stale in session.scalars(
-            select(OrdsOutbox).where(
+            select(OrdsOutbox)
+            .where(
                 OrdsOutbox.status == "IN_FLIGHT",
                 OrdsOutbox.last_attempt_at < stale_before,
-            ).order_by(OrdsOutbox.id).limit(100).with_for_update(skip_locked=True)
+            )
+            .order_by(OrdsOutbox.id)
+            .limit(100)
+            .with_for_update(skip_locked=True)
         ).all():
             stale.status = "FAILED_RETRYABLE"
             stale.next_attempt_at = now
             stale.last_error = "RECOVERED_STALE_IN_FLIGHT"
-            event = session.get(AttendanceEvent, stale.attendance_event_id) if stale.attendance_event_id else None
+            event = (
+                session.get(AttendanceEvent, stale.attendance_event_id)
+                if stale.attendance_event_id
+                else None
+            )
             if event:
                 event.ords_status = "FAILED_RETRYABLE"
 
-        candidates = session.scalars(
-            select(OrdsOutbox)
-            .where(
-                OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE"]),
-                (OrdsOutbox.next_attempt_at == None)  # noqa: E711
-                | (OrdsOutbox.next_attempt_at <= now),
+        from zk_add.models import AttendanceDeliverySchedule
+        from sqlalchemy.exc import IntegrityError
+
+        schedule = session.scalar(
+            select(AttendanceDeliverySchedule)
+            .where(AttendanceDeliverySchedule.id == 1)
+            .with_for_update()
+        )
+        if schedule is None:
+            try:
+                with session.begin_nested():
+                    session.add(AttendanceDeliverySchedule(id=1))
+                    session.flush()
+            except IntegrityError:
+                pass  # A concurrent first claimant created the singleton.
+            schedule = session.scalar(
+                select(AttendanceDeliverySchedule)
+                .where(AttendanceDeliverySchedule.id == 1)
+                .with_for_update()
             )
+        eligible = [
+            OrdsOutbox.status.in_(["PENDING", "FAILED_RETRYABLE"]),
+            OrdsOutbox.next_attempt_at.is_(None) | (OrdsOutbox.next_attempt_at <= now),
+        ]
+        priority = deque(
+            session.scalars(
+                select(OrdsOutbox)
+                .where(*eligible, OrdsOutbox.delivery_type != "FULL_HISTORY")
+                .order_by(OrdsOutbox.id)
+                .limit(max(100, limit * 4))
+                .with_for_update(skip_locked=True)
+            ).all()
+        )
+        # Select background independently; a large live queue cannot hide it
+        # behind a LIMIT. Rank one connector at a time, rotating after service.
+        ranked = (
+            select(
+                OrdsOutbox.id.label("row_id"),
+                AttendanceEvent.connector_id.label("connector_id"),
+                func.row_number()
+                .over(partition_by=AttendanceEvent.connector_id, order_by=OrdsOutbox.id)
+                .label("position"),
+            )
+            .join(AttendanceEvent, AttendanceEvent.id == OrdsOutbox.attendance_event_id)
+            .where(*eligible, OrdsOutbox.delivery_type == "FULL_HISTORY")
+            .subquery()
+        )
+        background_ids = (
+            select(ranked.c.row_id)
             .order_by(
-                case(
-                    (OrdsOutbox.delivery_type == "LIVE", 0),
-                    (OrdsOutbox.delivery_type == "CURRENT_RECONCILE", 1),
-                    else_=2,
-                ),
-                case((OrdsOutbox.status == "PENDING", 0), else_=1),
-                OrdsOutbox.id.asc(),
+                ranked.c.position,
+                case((ranked.c.connector_id > schedule.last_connector_id, 0), else_=1),
+                ranked.c.connector_id,
             )
-            .limit(max(200, limit * 20))
+            .limit(max(100, limit))
+        )
+        background_rows = session.scalars(
+            select(OrdsOutbox)
+            .where(OrdsOutbox.id.in_(background_ids))
             .with_for_update(skip_locked=True)
         ).all()
-        for row in fair_ords_candidate_order(session, candidates):
+        indexed = {row.id: row for row in background_rows}
+        background = deque(
+            indexed[row_id] for row_id in session.scalars(background_ids).all() if row_id in indexed
+        )
+        while priority or background:
+            use_background = bool(background) and (schedule.priority_served >= 4 or not priority)
+            row = background.popleft() if use_background else priority.popleft()
+            # Count validation attempts too: corrupt rows must not monopolize a slice.
+            if use_background:
+                schedule.priority_served = 0
+                source = session.get(AttendanceEvent, row.attendance_event_id)
+                schedule.last_connector_id = (
+                    source.connector_id if source else schedule.last_connector_id
+                )
+            else:
+                schedule.priority_served = min(4, schedule.priority_served + 1)
             was_retry = row.status == "FAILED_RETRYABLE"
             event = (
                 session.get(AttendanceEvent, row.attendance_event_id)
@@ -764,7 +850,12 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
             connector = session.get(Connector, event.connector_id)
             zkt = session.get(ZKTDevice, event.zkt_device_id)
             from zk_add.attendance_recovery import _terminal_provenance_verified
-            if connector is None or zkt is None or not _terminal_provenance_verified(event, connector):
+
+            if (
+                connector is None
+                or zkt is None
+                or not _terminal_provenance_verified(event, connector)
+            ):
                 row.status = event.ords_status = "QUARANTINED_MISSING_TERMINAL_PROVENANCE"
                 row.last_error = "Verified terminal provenance is required before Oracle delivery."
                 row.next_attempt_at = None
@@ -777,16 +868,25 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 cnic = None
             identity_unverified = (
                 settings.identity_snapshot_gate_enabled
-                and event.identity_resolution_status
-                not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
+                and event.identity_resolution_status not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
             )
             if connector is None or zkt is None or not cnic or identity_unverified:
                 row.status = "BLOCKED_IDENTITY"
                 event.ords_status = "BLOCKED_IDENTITY"
                 continue
-            if event.clock_quality == "INVALID" or not attendance_device_time_is_plausible(event.device_event_time, event.captured_at):
+            if event.clock_quality == "INVALID" or not attendance_device_time_is_plausible(
+                event.device_event_time, event.captured_at
+            ):
                 row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
                 row.next_attempt_at = None
+                continue
+            from zk_add.attendance_safe_repair import delivery_proof_valid
+
+            if not delivery_proof_valid(session, event, connector):
+                row.status = event.ords_status = "BLOCKED_IDENTITY"
+                row.last_error = (
+                    "The saved identity evidence changed. A new repair check is required."
+                )
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
             row.status = "IN_FLIGHT"

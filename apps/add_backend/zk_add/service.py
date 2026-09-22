@@ -1316,6 +1316,9 @@ def _replace_user_snapshot(
             block_undelivered_attendance(
                 session, zkt=zkt, user=row, snapshot=snapshot_record
             )
+    from zk_add.attendance_identity_evidence import record_identity_observation
+    session.flush()
+    record_identity_observation(session, connector, snapshot_record)
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 

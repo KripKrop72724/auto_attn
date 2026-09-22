@@ -34,3 +34,6 @@ firmware/zone_lite/main/zone_lite_config.h
 *.tsbuildinfo
 apps/add_frontend/vite.config.js
 apps/add_frontend/vite.config.d.ts
+
+apps/add_frontend/test-results/
+apps/add_frontend/playwright-report/

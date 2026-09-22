@@ -1811,3 +1811,72 @@ class QueueEvidence(Base):
     protected_evidence: Mapped[str] = mapped_column(Text)
     disposition: Mapped[str] = mapped_column(String(40), default="PRESERVED_UNRESOLVED")
     created_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceIdentityHistory(Base):
+    """Observed per-person continuity; never backfilled from a current roster."""
+
+    __tablename__ = "add_attendance_identity_history"
+    __table_args__ = (
+        Index("ix_add_identity_history_match", "zkt_device_id", "terminal_serial", "user_id", "uid"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"))
+    device_user_id: Mapped[int] = mapped_column(ForeignKey("add_device_users.id"))
+    terminal_serial: Mapped[str] = mapped_column(String(120))
+    user_id: Mapped[str] = mapped_column(String(100))
+    uid: Mapped[str] = mapped_column(String(40))
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    cnic_encrypted: Mapped[str] = mapped_column(Text)
+    cnic_lookup_hash: Mapped[str] = mapped_column(String(64))
+    display_name_encrypted: Mapped[str | None] = mapped_column(Text)
+    first_snapshot_id: Mapped[int] = mapped_column(ForeignKey("add_device_user_snapshots.id"))
+    last_snapshot_id: Mapped[int] = mapped_column(ForeignKey("add_device_user_snapshots.id"))
+    last_revision: Mapped[int] = mapped_column(Integer)
+    observed_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observed_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceSafeRepairTask(Base):
+    """A frozen device scope and bounded scan cursor for a repair check."""
+
+    __tablename__ = "add_attendance_safe_repair_tasks"
+    __table_args__ = (
+        UniqueConstraint("job_id", "connector_id", name="uq_add_safe_repair_task_device"),
+        Index("ix_add_safe_repair_task_schedule", "status", "updated_at"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_recovery_jobs.id"), index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    terminal_serial: Mapped[str | None] = mapped_column(String(120))
+    hardware_id: Mapped[str] = mapped_column(String(120))
+    high_water_id: Mapped[int] = mapped_column(Integer)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="CHECKING")
+    checked_count: Mapped[int] = mapped_column(Integer, default=0)
+    evidence_digest: Mapped[str] = mapped_column(String(64), default="0" * 64)
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceSafeRepairDecision(Base):
+    """Durable, append-only identity decision committed together with the outbox."""
+
+    __tablename__ = "add_attendance_safe_repair_decisions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_recovery_items.id"), unique=True)
+    attendance_event_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_events.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    proof: Mapped[dict] = mapped_column(JSON)
+    prior_state: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceDeliverySchedule(Base):
+    """One short transaction serializes the 4:1 service budget, including batch size one."""
+    __tablename__ = "add_attendance_delivery_schedule"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    priority_served: Mapped[int] = mapped_column(Integer, default=0)
+    last_connector_id: Mapped[int] = mapped_column(Integer, default=0)
