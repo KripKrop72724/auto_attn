@@ -485,6 +485,19 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALIN
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY)) {
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
+# Safe repair is check-only until production canaries are explicitly enabled.
+foreach ($repairFlag in @("PREVIEW", "EXECUTION", "AUTOMATIC")) {
+    $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_ATTENDANCE_SAFE_REPAIR_${repairFlag}_ENABLED")
+    $environment["ADD_ATTENDANCE_SAFE_REPAIR_${repairFlag}_ENABLED"] = if ($deployValue -eq "true") { "true" } else { "false" }
+}
+$environment["ADD_ATTENDANCE_SAFE_REPAIR_ALLOWED_CONNECTORS"] = $env:ADD_DEPLOY_ATTENDANCE_SAFE_REPAIR_ALLOWED_CONNECTORS
+if ($environment["ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED"] -eq "true" -and $environment["ADD_ATTENDANCE_SAFE_REPAIR_PREVIEW_ENABLED"] -ne "true") {
+    throw "Attendance repair execution requires checks."
+}
+if ($environment["ADD_ATTENDANCE_SAFE_REPAIR_AUTOMATIC_ENABLED"] -eq "true" -and $environment["ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED"] -ne "true") {
+    throw "Automatic attendance repair requires execution."
+}
+
 $environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] = if (
     $env:ADD_DEPLOY_ATTENDANCE_REPAIR_PREVIEW_ENABLED -eq "true"
 ) { "true" } else { "false" }

@@ -1,0 +1,29 @@
+.safe-repair { --muted: #435160; margin-bottom: 20px; overflow: hidden; }
+.safe-repair-header, .safe-repair-heading, .safe-repair-scope, .safe-repair-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.safe-repair-header, .safe-repair-body { padding: 20px; }
+.safe-repair-header p, .safe-repair-items p { margin: 6px 0; color: var(--muted); }
+.safe-repair-body { border-top: 1px solid var(--line); }
+.safe-repair-scope label { flex: 1; max-width: 560px; display: grid; gap: 8px; }
+.safe-repair select { min-height: 44px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; background: var(--surface); color: var(--ink); font: inherit; }
+.safe-repair-run { margin-top: 24px; }
+.safe-repair-steps { display: flex; list-style: none; padding: 0; gap: 12px; flex-wrap: wrap; }
+.safe-repair-steps li { background: var(--soft); border-radius: 6px; padding: 10px 16px; border: 1px solid var(--line); }
+.safe-repair-steps [aria-current] { border-color: var(--blue); color: #00699c; font-weight: 600; }
+.safe-repair-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 20px 0; }
+.safe-repair-next { padding: 16px; background: var(--soft); border-radius: 6px; }
+.safe-repair-actions { margin: 20px 0; justify-content: flex-start; }
+.safe-repair details { margin: 20px 0; }
+.safe-repair summary { cursor: pointer; min-height: 44px; align-content: center; font-weight: 600; }
+.safe-repair-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 20px 0 8px; }
+.safe-repair-items, .safe-repair-devices, .safe-repair-history { list-style: none; padding: 0; }
+.safe-repair-items li { display: flex; gap: 16px; justify-content: space-between; align-items: center; border-top: 1px solid var(--line); padding: 16px 0; }
+.safe-repair-items li > div:last-child { display: grid; justify-items: start; gap: 8px; }
+.safe-repair-devices li { padding: 10px 0; display: grid; gap: 4px; }
+.safe-repair-devices span { color: var(--muted); }
+.safe-repair-history li { padding: 6px 0; }
+.safe-repair-review { padding: 16px 0; border-top: 1px solid var(--line); }
+@media (max-width: 600px) { .safe-repair-header, .safe-repair-body { padding: 14px; } .safe-repair-items li { flex-direction: column; align-items: flex-start; } .safe-repair-steps li { flex: 1; } }
+@media (prefers-reduced-motion: reduce) { .safe-repair * { scroll-behavior: auto; transition: none; } }
+
+.safe-repair small { color: #435160; }
+.safe-repair .safe-repair-steps [aria-current] { color: #00486e; }

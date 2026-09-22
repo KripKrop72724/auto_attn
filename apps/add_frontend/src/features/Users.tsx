@@ -325,20 +325,24 @@ export function HistoricalIdentityResolutionDialog({
   onClose,
   onComplete,
   toast,
+  simple = false,
 }: {
+  simple?: boolean
   state: Exclude<HistoricalIdentityDialogState, null>
   device: Device
   onClose: () => void
   onComplete: () => Promise<void>
-  toast: ReturnType<typeof useToast>
+  toast: Pick<ReturnType<typeof useToast>, 'notice' | 'error'>
 }) {
   const candidate = state.candidate
+  const requestKey = useRef(idempotency('historical-identity-repair'))
   const [cnic, setCnic] = useState('')
   const [employeeId, setEmployeeId] = useState('')
   const [serviceNumber, setServiceNumber] = useState(candidate.user_id)
   const [employeeName, setEmployeeName] = useState(candidate.display_name)
   const [zoneCode, setZoneCode] = useState(device.zone_id)
   const [reason, setReason] = useState('')
+  const [verified, setVerified] = useState(false)
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -361,8 +365,8 @@ export function HistoricalIdentityResolutionDialog({
     }
     if (!employeeName.trim()) return setError('Directory employee name is required.')
     if (reason.trim().length < 10) return setError('Record an audit reason of at least 10 characters.')
-    if (confirmation !== expectedConfirmation) {
-      return setError(`Type ${expectedConfirmation} exactly to continue.`)
+    if (simple ? !verified : confirmation !== expectedConfirmation) {
+      return setError(simple ? 'Confirm that you verified these employee details.' : `Type ${expectedConfirmation} exactly to continue.`)
     }
     if (!password) return setError('Password confirmation is required.')
     if (
@@ -425,13 +429,9 @@ export function HistoricalIdentityResolutionDialog({
                 }
               : {}),
             reason: reason.trim(),
-            typed_confirmation: confirmation,
+            typed_confirmation: simple ? expectedConfirmation : confirmation,
             password,
-            idempotency_key: idempotency(
-              currentIdentityEvidence
-                ? 'historical-current-identity'
-                : 'historical-directory-identity',
-            ),
+            idempotency_key: requestKey.current,
           }),
         },
       )
@@ -454,8 +454,8 @@ export function HistoricalIdentityResolutionDialog({
   return (
     <Dialog
       titleId="historical-identity-resolution-title"
-      title={currentIdentityEvidence ? 'Verify preserved cohort against current identity' : 'Enter verified HR identity evidence'}
-      description={currentIdentityEvidence
+      title={simple ? 'Verify employee details' : currentIdentityEvidence ? 'Verify preserved cohort against current identity' : 'Enter verified HR identity evidence'}
+      description={simple ? 'Use verified employee records to confirm who made these punches. Every match is checked before delivery.' : currentIdentityEvidence
         ? 'Use the authoritative Oracle capture identity to confirm this exact historical cohort belongs to the unchanged current terminal user.'
         : 'Use authoritative HR directory evidence only. ADD will preserve every attendance event and requeue only an exact, unambiguous match.'}
       onClose={onClose}
@@ -465,12 +465,12 @@ export function HistoricalIdentityResolutionDialog({
           <Icon name="shield" />
           <div>
             <h3>{candidate.display_name}</h3>
-            <p>User {candidate.user_id} · UID {candidate.uid} · version {candidate.row_version}</p>
+            <p>Employee number {candidate.user_id} · {device.display_name}</p>
             <p>{candidate.event_count.toLocaleString()} preserved events from {dateTime(candidate.first_event_at)} to {dateTime(candidate.last_event_at)}.</p>
           </div>
         </div>
         <div className="form-grid">
-          <label>Authoritative CNIC<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
+          <label>{simple ? 'Verified CNIC' : 'Authoritative CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" /></label>
           {!currentIdentityEvidence && <label>HR employee ID<input inputMode="numeric" value={employeeId} onChange={(event) => setEmployeeId(event.target.value.replace(/\D/g, '').slice(0, 32))} /></label>}
           {!currentIdentityEvidence && <label>HR service number<input value={serviceNumber} onChange={(event) => setServiceNumber(event.target.value.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64))} /></label>}
           <label>{currentIdentityEvidence ? 'Authoritative employee name' : 'HR employee name'}<input value={employeeName} onChange={(event) => setEmployeeName(event.target.value)} maxLength={255} /></label>
@@ -479,11 +479,11 @@ export function HistoricalIdentityResolutionDialog({
         <div className="message pattern-blocked" role="note">
           <Icon name="alert" />
           {currentIdentityEvidence
-            ? 'Do not infer or guess a CNIC. ADD will require it to match the encrypted current identity, the exact terminal user ID, stable historical name, reviewed cohort token, and current row version.'
+            ? 'Use the verified employee record. ADD checks that these punches belong to this employee on this device.'
             : 'Do not infer or guess a CNIC. The terminal service number and employee name must match the authoritative HR record.'}
         </div>
-        <label>Audit reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
-        <label>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
+        <label>{simple ? 'How did you verify this?' : 'Audit reason'}<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} rows={3} /></label>
+        <label>{simple ? <><input type="checkbox" checked={verified} onChange={event => setVerified(event.target.checked)} /> I verified these details belong to the person who made these punches.</> : <>Type “{expectedConfirmation}”<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></>}</label>
         <label>Confirm administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
         <footer className="dialog-actions">

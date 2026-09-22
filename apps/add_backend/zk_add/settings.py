@@ -76,6 +76,11 @@ class AddSettings(BaseSettings):
     attendance_repair_ords_password: str | None = None
     # Recovery is independently dark-launched.  Read-only previews can be
     # enabled before any batch is permitted to change delivery state.
+    attendance_safe_repair_preview_enabled: bool = False
+    attendance_safe_repair_execution_enabled: bool = False
+    attendance_safe_repair_automatic_enabled: bool = False
+    attendance_safe_repair_allowed_connectors: str = ""
+    attendance_safe_repair_batch_size: int = Field(default=100, ge=1, le=100)
     attendance_recovery_preview_enabled: bool = False
     attendance_recovery_execution_enabled: bool = False
     attendance_source_correction_enabled: bool = False
@@ -176,6 +181,10 @@ class AddSettings(BaseSettings):
                 "ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED requires "
                 "ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED."
             )
+        if self.attendance_safe_repair_execution_enabled and not self.attendance_safe_repair_preview_enabled:
+            raise RuntimeError("Safe attendance repair execution requires repair checks.")
+        if self.attendance_safe_repair_automatic_enabled and not self.attendance_safe_repair_execution_enabled:
+            raise RuntimeError("Automatic attendance repair requires repair execution.")
         if self.attendance_recovery_execution_enabled and not self.attendance_recovery_preview_enabled:
             raise RuntimeError(
                 "ADD_ATTENDANCE_RECOVERY_EXECUTION_ENABLED requires "

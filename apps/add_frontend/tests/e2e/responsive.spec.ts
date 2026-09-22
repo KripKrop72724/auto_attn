@@ -828,3 +828,46 @@ test('physical provisioning environment is responsive, explicit, and accessible'
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
+
+test('safe attendance repair remains clear, accessible and resumable', async ({ page }, testInfo) => {
+  let run = {
+    job_id: '11111111-1111-4111-8111-111111111111', status: 'CHECKED', actor: 'StateHealthAdmin',
+    counts: { checked: 328, ready: 300, waiting: 0, confirmed: 0, review: 28, stopped: 0 },
+    check_complete: true, created_at: '2026-09-22T10:00:00Z', updated_at: '2026-09-22T10:00:00Z',
+    expires_at: '2099-09-22T10:15:00Z', signature: 'a'.repeat(64), last_error: null,
+    execution_enabled: true, eligible_at_check: 300,
+    devices: [{ connector_id: device.connector_id, name: device.display_name, serial: device.zkt.serial, checked: 328, status: 'CHECKED' }],
+  }
+  await page.route('**/api/v2/attendance-recovery/**', async route => {
+    const path = new URL(route.request().url()).pathname
+    let json: unknown = run
+    if (path.endsWith('/checks') && route.request().method() === 'GET') json = { enabled: true, rows: [run], next_cursor: null }
+    if (path.endsWith('/coverage')) json = { total: 2576, confirmed: 2248, pending: 0, identity_held: 328, review: 0, observed_at: run.updated_at }
+    if (path.endsWith('/items')) json = { rows: [{ id: 1, event_id: 1, event_uid: 'e'.repeat(64), status: 'NEEDS_REVIEW', reason: 'We need proof of who used this employee number when the punch was made.', name: 'Example employee', user_id: '100', connector_id: device.connector_id, device_name: device.display_name, device_serial: device.zkt.serial, time: run.created_at }], next_cursor: null }
+    if (path.endsWith('/jobs') && route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toMatchObject({ action: 'SAFE_REPAIR', check_id: run.job_id, password: 'test-password' })
+      run = { ...run, status: 'WAITING_ORACLE', counts: { ...run.counts, ready: 0, waiting: 300 } }
+      json = run
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(json) })
+  })
+  await page.goto(`/attendance?view=needs-review&repair_run=${run.job_id}`)
+  await expect(page.getByRole('heading', { name: 'Ready to review' })).toBeVisible()
+  await expect(page.getByText(/300 punches can be repaired/)).toBeVisible()
+  await page.getByRole('button', { name: 'Start repair', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog.getByRole('button', { name: 'Close dialog' })).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(dialog.getByLabel('Administrator password')).toBeFocused()
+  await dialog.getByLabel('Administrator password').fill('test-password')
+  await dialog.getByRole('button', { name: 'Start repair', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
+  await expect(page.getByText('Repair complete', { exact: true })).toHaveCount(0)
+  const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  const results = await new AxeBuilder({ page }).include('.safe-repair').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()
+  expect(results.violations).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('attendance-repair.png'), fullPage: true })
+})
