@@ -28,7 +28,7 @@ from provision_zone_lite import (
 from provisioning_envelope import REQUEST_ID_PATTERN, encrypt_for_recipient
 
 
-IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._&-]*$")
 HEX_PSK_PATTERN = re.compile(r"^[0-9A-Fa-f]{64}$")
 RFC1918_NETWORKS = tuple(
     ipaddress.IPv4Network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
