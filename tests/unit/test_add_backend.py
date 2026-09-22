@@ -25,6 +25,11 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
+from zk_add.attendance_recovery import (
+    advance_attendance_recovery_jobs,
+    build_recovery_preview,
+    create_recovery_job,
+)
 from zk_add.crypto import (
     cnic_lookup,
     decrypt_cnic,
@@ -48,6 +53,8 @@ from zk_add.identity_conflicts import (
 )
 from zk_add.models import (
     AttendanceDeliverySweep,
+    AttendanceRecoveryItem,
+    AttendanceRecoveryJob,
     AttendanceBatchItem,
     AttendanceBatchReceipt,
     AttendanceEvent,
@@ -83,6 +90,7 @@ from zk_add.protocol import body_sha256, sign_request, signature_material
 from zk_add.schemas import (
     AttendanceBatchRequest,
     AttendanceEventIn,
+    AttendanceRecoveryFilter,
     Envelope,
     HeartbeatPayload,
     CommKeyChangeRequest,
@@ -6227,3 +6235,248 @@ def test_worker_recovery_requires_fresh_workers_for_the_device_family(db, family
     assert alert().state == "OPEN"
     apply([worker("add_delivery", at=100500), worker(source_worker, at=100999)])
     assert alert().state == "RESOLVED"
+
+
+def _make_recovery_event(
+    db: Session,
+    connector: Connector,
+    *,
+    event_number: int,
+    ords_status: str = "PENDING",
+    identity_resolution_status: str = "RESOLVED",
+    device_user_id: int | None = None,
+    cnic_lookup_hash: str | None = "verified-test-hash",
+    device_event_time: datetime | None = None,
+    received_at: datetime | None = None,
+) -> AttendanceEvent:
+    captured_at = received_at or datetime.now(timezone.utc)
+    event = AttendanceEvent(
+        event_uid=f"{event_number:064x}",
+        connector_id=connector.id,
+        zkt_device_id=connector.zkt_device.id,
+        device_user_id=device_user_id,
+        identity_resolution_status=identity_resolution_status,
+        device_serial=SERIAL,
+        uid=str(event_number),
+        user_id=f"user-{event_number}",
+        display_name=f"Employee {event_number}",
+        cnic_lookup_hash=cnic_lookup_hash,
+        cnic_encrypted=encrypt_cnic(CNIC) if cnic_lookup_hash else None,
+        cnic_last4="1234" if cnic_lookup_hash else None,
+        device_event_time=device_event_time or captured_at - timedelta(minutes=1),
+        captured_at=captured_at,
+        source="FULL_HISTORY",
+        status="0",
+        punch="0",
+        clock_quality="OK",
+        raw_event={},
+        ords_status=ords_status,
+    )
+    db.add(event)
+    db.flush()
+    return event
+
+
+def test_recovery_preview_separates_safe_identity_and_unknown_lanes(db, monkeypatch):
+    from zk_add.attendance_recovery import REVIEW_LANE
+
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    connector = connector_fixture(db)
+    safe = _make_recovery_event(db, connector, event_number=901)
+    held = _make_recovery_event(
+        db,
+        connector,
+        event_number=902,
+        ords_status="BLOCKED_IDENTITY",
+        identity_resolution_status="BLOCKED_MALFORMED_IDENTITY",
+    )
+    unknown = _make_recovery_event(
+        db,
+        connector,
+        event_number=903,
+        ords_status="FUTURE_STATE",
+    )
+
+    preview = build_recovery_preview(
+        db,
+        action="REBUILD_OUTBOX",
+        filters=AttendanceRecoveryFilter(lane="SAFE_DELIVERY", zone_id=connector.zone_id),
+    )
+
+    assert preview["counts"]["matching"] == 1
+    assert preview["counts"]["eligible"] == 1
+    assert preview["rows"][0]["attendance_event_id"] == safe.id
+    assert held.id != safe.id and unknown.id != safe.id
+    assert all(row["lane"] != REVIEW_LANE for row in preview["rows"])
+
+
+def test_recovery_job_revalidates_state_and_creates_one_outbox(db, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    monkeypatch.setattr(settings, "attendance_recovery_execution_enabled", True)
+    connector = connector_fixture(db)
+    event = _make_recovery_event(db, connector, event_number=904)
+    filters = AttendanceRecoveryFilter(zone_id=connector.zone_id)
+    preview = build_recovery_preview(db, action="REBUILD_OUTBOX", filters=filters)
+    job = create_recovery_job(
+        db,
+        action="REBUILD_OUTBOX",
+        filters=filters,
+        candidate_digest=preview["candidate_digest"],
+        actor="test-admin",
+        reason="Drain the preserved event through the durable outbox.",
+        idempotency_key="recovery-job-904",
+    )
+    db.commit()
+
+    assert advance_attendance_recovery_jobs(db, owner="test-worker") == 1
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id))
+    assert outbox is not None
+    assert outbox.status == "PENDING"
+    assert db.scalar(select(func.count(OrdsOutbox.id)).where(OrdsOutbox.attendance_event_id == event.id)) == 1
+    assert db.get(AttendanceRecoveryJob, job.id).status == "COMPLETED"
+    assert advance_attendance_recovery_jobs(db, owner="test-worker") == 0
+
+
+def test_recovery_reclassifies_exact_zkt_identity_and_projects_cnic_before_delivery(db, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    monkeypatch.setattr(settings, "attendance_recovery_execution_enabled", True)
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, uid="77", user_id="1077", name=f"Verified-{CNIC}")
+    held = _make_recovery_event(
+        db,
+        connector,
+        event_number=907,
+        ords_status="BLOCKED_IDENTITY",
+        identity_resolution_status="BLOCKED_PROVENANCE",
+        device_user_id=user.id,
+        cnic_lookup_hash=None,
+        device_event_time=utc_now(),
+    )
+    held.user_id = user.user_id
+    held.uid = user.uid
+    held.identity_snapshot_id = connector.zkt_device.identity_snapshot_id
+    db.flush()
+    from zk_add.attendance_recovery import _verified_device_user
+    assert _verified_device_user(db, held, connector) is user
+
+    filters = AttendanceRecoveryFilter(zone_id=connector.zone_id)
+    preview = build_recovery_preview(db, action="REBUILD_OUTBOX", filters=filters)
+    assert preview["counts"]["eligible"] == 1
+    assert preview["rows"][0]["attendance_event_id"] == held.id
+
+    job = create_recovery_job(
+        db,
+        action="REBUILD_OUTBOX",
+        filters=filters,
+        candidate_digest=preview["candidate_digest"],
+        actor="test-admin",
+        reason="Release an exact current terminal identity with authoritative CNIC evidence.",
+        idempotency_key="recovery-job-907",
+    )
+    db.commit()
+    assert advance_attendance_recovery_jobs(db, owner="test-worker") == 1
+    db.refresh(held)
+    assert held.ords_status == "PENDING"
+    assert held.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
+    assert held.cnic_lookup_hash == user.cnic_lookup_hash
+    assert decrypt_cnic(held.cnic_encrypted) == CNIC
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == held.id))
+    assert outbox is not None and outbox.status == "PENDING"
+    item = db.scalar(select(AttendanceRecoveryItem).where(AttendanceRecoveryItem.job_id == job.id))
+    assert item.result["identity_repaired"] is True
+
+
+def test_recovery_job_skips_preview_drift_without_mutating_event(db, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    monkeypatch.setattr(settings, "attendance_recovery_execution_enabled", True)
+    connector = connector_fixture(db)
+    event = _make_recovery_event(db, connector, event_number=905)
+    filters = AttendanceRecoveryFilter(zone_id=connector.zone_id)
+    preview = build_recovery_preview(db, action="REBUILD_OUTBOX", filters=filters)
+    job = create_recovery_job(
+        db,
+        action="REBUILD_OUTBOX",
+        filters=filters,
+        candidate_digest=preview["candidate_digest"],
+        actor="test-admin",
+        reason="Verify state drift is held before any delivery change.",
+        idempotency_key="recovery-job-905",
+    )
+    event.ords_status = "FAILED_RETRYABLE"
+    db.commit()
+
+    assert advance_attendance_recovery_jobs(db, owner="test-worker") == 1
+    item = db.scalar(select(AttendanceRecoveryItem).where(AttendanceRecoveryItem.job_id == job.id))
+    assert item.status == "SKIPPED"
+    assert item.outcome == "STATE_DRIFT"
+    assert db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)) is None
+
+
+def test_stale_in_flight_preview_only_requeues_expired_delivery(db, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    connector = connector_fixture(db)
+    event = _make_recovery_event(db, connector, event_number=906)
+    db.add(
+        OrdsOutbox(
+            attendance_event_id=event.id,
+            status="IN_FLIGHT",
+            last_attempt_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+    )
+    db.flush()
+    preview = build_recovery_preview(
+        db,
+        action="RECOVER_STALE_IN_FLIGHT",
+        filters=AttendanceRecoveryFilter(stale_only=True),
+    )
+    assert preview["counts"]["eligible"] == 1
+    assert preview["rows"][0]["stale_in_flight"] is True
+
+
+def test_recovery_control_endpoint_freezes_job_and_requires_typed_confirmation(
+    db: Session, monkeypatch
+):
+    monkeypatch.setattr(settings, "attendance_recovery_preview_enabled", True)
+    monkeypatch.setattr(settings, "attendance_recovery_execution_enabled", True)
+    connector = connector_fixture(db)
+    _make_recovery_event(db, connector, event_number=908)
+    filters = AttendanceRecoveryFilter(zone_id=connector.zone_id)
+    preview = build_recovery_preview(db, action="RETRY_DELIVERY", filters=filters)
+    job = create_recovery_job(
+        db,
+        action="RETRY_DELIVERY",
+        filters=filters,
+        candidate_digest=preview["candidate_digest"],
+        actor="StateHealthAdmin",
+        reason="Pause this recovery batch while reviewing the canary.",
+        idempotency_key="recovery-control-908",
+    )
+    raw_session, admin = create_admin_session(
+        db,
+        username="StateHealthAdmin",
+        ip_address="127.0.0.1",
+        user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(
+        f"/api/v2/attendance-recovery/jobs/{job.job_id}/control",
+        json={
+            "action": "pause",
+            "reason": "Pause this recovery batch while reviewing the canary.",
+            "password": "correct-password",
+            "idempotency_key": "recovery-control-pause-908",
+            "candidate_digest": job.candidate_digest,
+            "typed_confirmation": f"PAUSE {job.job_id}",
+        },
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "PAUSED"

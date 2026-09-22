@@ -74,6 +74,17 @@ class AddSettings(BaseSettings):
     attendance_repair_source_max_age_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
     attendance_repair_ords_username: str | None = None
     attendance_repair_ords_password: str | None = None
+    # Recovery is independently dark-launched.  Read-only previews can be
+    # enabled before any batch is permitted to change delivery state.
+    attendance_recovery_preview_enabled: bool = False
+    attendance_recovery_execution_enabled: bool = False
+    attendance_source_correction_enabled: bool = False
+    attendance_recovery_allowed_zones: str = ""
+    attendance_recovery_preview_seconds: int = Field(default=15 * 60, ge=60, le=15 * 60)
+    attendance_recovery_batch_size: int = Field(default=100, ge=1, le=500)
+    attendance_recovery_max_items: int = Field(default=5_000, ge=1, le=50_000)
+    attendance_recovery_max_correction_items: int = Field(default=500, ge=1, le=5_000)
+    attendance_recovery_lease_seconds: int = Field(default=90, ge=30, le=10 * 60)
     log_retention_days: int = 14
     telemetry_retention_days: int = 30
     session_retention_days: int = 90
@@ -164,6 +175,21 @@ class AddSettings(BaseSettings):
             raise RuntimeError(
                 "ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED requires "
                 "ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED."
+            )
+        if self.attendance_recovery_execution_enabled and not self.attendance_recovery_preview_enabled:
+            raise RuntimeError(
+                "ADD_ATTENDANCE_RECOVERY_EXECUTION_ENABLED requires "
+                "ADD_ATTENDANCE_RECOVERY_PREVIEW_ENABLED."
+            )
+        if self.attendance_source_correction_enabled and not self.attendance_recovery_execution_enabled:
+            raise RuntimeError(
+                "ADD_ATTENDANCE_SOURCE_CORRECTION_ENABLED requires "
+                "ADD_ATTENDANCE_RECOVERY_EXECUTION_ENABLED."
+            )
+        if self.attendance_recovery_preview_enabled and self.attendance_recovery_lease_seconds < self.ords_timeout_seconds * 2:
+            raise RuntimeError(
+                "ADD_ATTENDANCE_RECOVERY_LEASE_SECONDS must be at least twice "
+                "ADD_ORDS_TIMEOUT_SECONDS."
             )
         if self.attendance_repair_preview_enabled:
             if self.attendance_repair_lease_seconds < self.ords_timeout_seconds * 2:

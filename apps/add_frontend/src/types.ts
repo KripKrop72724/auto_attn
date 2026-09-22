@@ -21,7 +21,7 @@ export type DashboardRoute =
   | 'alerts'
 
 export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
-export type ReconciliationSection = 'jobs' | 'exceptions'
+export type ReconciliationSection = 'jobs' | 'exceptions' | 'recovery'
 export type ReconciliationStatusGroup = '' | 'ACTIVE' | 'QUEUED_WAITING' | 'PAUSED' | 'ATTENTION' | 'COMPLETED' | 'CANCELLED'
 
 export interface FirmwareScopePreview {
@@ -286,6 +286,7 @@ export interface Overview {
     oldest_backlog_at: string | null
     last_attempt_at: string | null
   }
+  attendance_recovery?: AttendanceRecoverySummary
 }
 
 export interface ReconciliationPreflight {
@@ -391,11 +392,161 @@ export interface SourceExceptionList {
 export interface SourceExceptionAssurance {
   total: number
   reviewed: number
+  corrected?: number
   open: number
   invalid_time: number
   malformed: number
-  state: 'NONE' | 'REVIEW_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'SCOPE_MISMATCH'
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
   cohort_digest: string | null
+  correction_ids?: string[]
+}
+
+export type AttendanceRecoveryAction =
+  | 'RETRY_DELIVERY'
+  | 'REBUILD_OUTBOX'
+  | 'RECOVER_STALE_IN_FLIGHT'
+
+export interface AttendanceRecoverySummary {
+  schema_version: string
+  preview_enabled: boolean
+  execution_enabled: boolean
+  correction_enabled?: boolean
+  allowed_zones?: string[]
+  delivery: {
+    safe_retryable: number
+    missing_outbox: number
+    stale_in_flight: number
+    active_in_flight?: number
+    identity_held: number
+    permanent_review: number
+    status_counts: Record<string, number>
+  }
+  source: {
+    zkt_invalid_time: number
+    zkt_malformed: number
+    hikvision: Record<string, number>
+  }
+}
+
+export interface AttendanceRecoveryCandidate {
+  source_kind: string
+  source_ref: string
+  attendance_event_id: number
+  event_uid: string
+  connector_id: string | null
+  display_name: string | null
+  zone_id: string | null
+  firmware_family: string | null
+  terminal_serial: string | null
+  source: string
+  source_epoch?: string | null
+  generation?: number | null
+  source_digest?: string | null
+  source_event_id?: string | null
+  device_event_time: string | null
+  received_at: string | null
+  event_status: string | null
+  outbox_status: string | null
+  lane: string
+  reason: string
+  stale_in_flight: boolean
+  state_digest: string
+  uid?: string | null
+  user_id?: string | null
+  identity_snapshot_id?: number | null
+  clock_quality?: string | null
+  clock_drift_seconds?: number | null
+  terminal_provenance?: 'VERIFIED' | 'MISSING'
+}
+
+export interface AttendanceRecoveryPreview {
+  schema_version: string
+  action: AttendanceRecoveryAction
+  filters: Record<string, unknown>
+  candidate_digest: string
+  preview_expires_at: string
+  confirmation: string
+  counts: {
+    matching: number
+    eligible: number
+    excluded: number
+    safe_delivery: number
+    identity_held: number
+    source_correction: number
+    permanent_review: number
+    confirmed: number
+  }
+  rows: AttendanceRecoveryCandidate[]
+  excluded_rows: AttendanceRecoveryCandidate[]
+  preview_signature: string
+}
+
+export interface SourceCorrectionCandidate {
+  id: number
+  source_kind: 'HIKVISION_EVIDENCE'
+  source_ref: string
+  connector_id: string
+  display_name: string
+  zone_id: string
+  terminal_serial: string
+  source_epoch: string
+  event_uid: string | null
+  source_event_id: string | null
+  observation_sha256: string
+  original_digest: string | null
+  captured_epoch: number
+  disposition: string
+  identity_available: boolean
+  eligible: boolean
+}
+
+export interface AttendanceRecoveryItem {
+  item_id: string
+  source_kind: string
+  source_ref: string
+  attendance_event_id: number | null
+  manifest_id: number | null
+  hikvision_evidence_id: number | null
+  lane: string
+  status: string
+  outcome: string | null
+  error_code: string | null
+  error_message: string | null
+  attempt_count: number
+  corrected_device_time: string | null
+  result: Record<string, unknown>
+  created_at: string
+  completed_at: string | null
+  updated_at: string
+}
+
+export interface AttendanceRecoveryJob {
+  job_id: string
+  action: string
+  status: string
+  actor: string
+  reason: string
+  scope: Record<string, unknown>
+  candidate_digest: string
+  preview_expires_at: string | null
+  progress: {
+    requested: number
+    eligible: number
+    excluded: number
+    identity_held: number
+    review: number
+    succeeded: number
+    failed: number
+    skipped: number
+    cursor: number
+  }
+  lease: { owner: string | null; until: string | null }
+  last_error: string | null
+  items?: AttendanceRecoveryItem[]
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  updated_at: string
 }
 
 export interface SourceExceptionReveal {
@@ -453,6 +604,7 @@ export interface ReconciliationJob {
   operator_state?: string
   operator_message?: string
   completion_outcome?: string | null
+  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | null
   review_required?: boolean
   source_exception_assurance: SourceExceptionAssurance
   connector: null | {
@@ -1176,6 +1328,12 @@ export interface AttendanceEvent {
   id: number
   event_uid: string
   device_serial: string | null
+  terminal_provenance?: {
+    state: string
+    serial: string | null
+    confidence: string
+    explanation: string
+  }
   uid: string | null
   user_id: string
   display_name: string | null

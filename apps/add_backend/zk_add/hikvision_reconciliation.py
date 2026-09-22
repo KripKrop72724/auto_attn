@@ -18,7 +18,14 @@ from zk_add.hikvision_history import (
     record_digest,
     coverage_certificate,
 )
-from zk_add.models import ReconciliationJob, AttendanceEvent, DeviceUser, DeviceUserSnapshot
+from zk_add.models import (
+    AttendanceEvent,
+    AttendanceSourceCorrection,
+    ReconciliationJob,
+    DeviceUser,
+    DeviceUserSnapshot,
+)
+from zk_add.ords_states import classify_ords_assurance_status
 from zk_add.time_utils import utc_now, ensure_utc
 
 MODE = "HIKVISION_SERIAL_HISTORY"
@@ -566,7 +573,6 @@ def apply_page(session: Session, connector, payload: dict):
 def refresh_assurance(session, job):
     if not job.capture_certified_at or job.status in {
         "PAUSED",
-        "NEEDS_ATTENTION",
         "CANCELLED",
         "INVALIDATED",
     }:
@@ -581,7 +587,7 @@ def refresh_assurance(session, job):
     ):
         ids.update(page.evidence_ids)
     # Bounded SQL batches; do not issue a 150k-ID IN expression.
-    confirmed = pending = holds = targets = 0
+    confirmed = pending = holds = identity_holds = review_holds = targets = corrected = 0
     ordered = sorted(ids)
     for offset in range(0, len(ordered), 500):
         evidence_batch = list(
@@ -598,12 +604,50 @@ def refresh_assurance(session, job):
                 select(AttendanceEvent).where(AttendanceEvent.event_uid.in_(uids))
             )
         }
+        corrections = {
+            correction.hikvision_evidence_id: correction
+            for correction in session.scalars(
+                select(AttendanceSourceCorrection).where(
+                    AttendanceSourceCorrection.hikvision_evidence_id.in_(
+                        [evidence.id for evidence in evidence_batch]
+                    ),
+                    AttendanceSourceCorrection.status == "CREATED",
+                    AttendanceSourceCorrection.derived_attendance_event_id.is_not(None),
+                )
+            ).all()
+        }
+        derived = {
+            correction.derived_attendance_event_id: correction
+            for correction in corrections.values()
+        }
+        if derived:
+            for event in session.scalars(
+                select(AttendanceEvent).where(
+                    AttendanceEvent.id.in_(list(derived))
+                )
+            ).all():
+                attendance[event.event_uid] = event
         for evidence in evidence_batch:
             if evidence.disposition == "NON_ATTENDANCE":
                 continue
-            row = attendance.get(evidence.event_uid)
-            if not row or row.ords_status.startswith(("BLOCKED", "QUARANTINED")):
+            correction = corrections.get(evidence.id)
+            row = (
+                session.get(AttendanceEvent, correction.derived_attendance_event_id)
+                if correction
+                else attendance.get(evidence.event_uid)
+            )
+            if correction:
+                corrected += 1
+            outcome = classify_ords_assurance_status(row.ords_status if row else None)
+            if not row:
                 holds += 1
+                review_holds += 1
+            elif outcome == "IDENTITY_HELD":
+                holds += 1
+                identity_holds += 1
+            elif outcome == "REVIEW_REQUIRED":
+                holds += 1
+                review_holds += 1
             else:
                 targets += 1
                 if row.oracle_confirmed_at:
@@ -614,18 +658,34 @@ def refresh_assurance(session, job):
     job.ords_confirmed_count = confirmed
     job.ords_pending_count = pending
     job.ords_review_count = holds
-    job.review_required = bool(holds)
+    job.blocked_identity_count = identity_holds
+    job.review_required = bool(review_holds)
+    job.error_code = "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW" if holds else None
+    job.error_message = (
+        f"{holds:,} preserved Hikvision source event(s) remain held for identity or review."
+        if holds
+        else None
+    )
     job.phase = "ORACLE_ASSURANCE"
-    job.status = "RUNNING"
-    if not holds and not pending and len(ids) == job.cutoff_count:
+    job.status = "NEEDS_ATTENTION" if holds else "RUNNING"
+    if not review_holds and not pending and len(ids) == job.cutoff_count:
         job.oracle_certificate = {
             "source_protocol": "hikvision-isapi-v1",
             "scope": (job.capture_certificate or {}).get("scope", "ALL_RECORDS"),
             "confirmed": confirmed,
             "non_attendance": len(ids) - targets,
+            "corrected_source_events": corrected,
         }
         job.oracle_certified_at = job.completed_at = utc_now()
         job.status = "COMPLETED"
         job.phase = "COMPLETED"
-        job.completion_outcome = "ALL_CONFIRMED"
+        job.error_code = None
+        job.error_message = None
+        job.completion_outcome = (
+            "CERTIFIED_WITH_CORRECTED_SOURCE_EXCEPTIONS"
+            if corrected
+            else "COMPLETED_WITH_IDENTITY_HOLDS"
+            if identity_holds
+            else "ALL_CONFIRMED"
+        )
     return job

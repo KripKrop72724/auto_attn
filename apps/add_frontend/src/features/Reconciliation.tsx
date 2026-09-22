@@ -23,6 +23,7 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
+import { AttendanceRecovery } from './AttendanceRecovery'
 import type {
   Device,
   ReconciliationDivergenceDetail,
@@ -125,11 +126,13 @@ function WorkspaceTabs({
   section,
   activeJobs,
   openExceptions,
+  recoveryCount,
   onChange,
 }: {
   section: ReconciliationSection
   activeJobs: number
   openExceptions: number
+  recoveryCount: number
   onChange: (section: ReconciliationSection) => void
 }) {
   const refs = useRef<Array<HTMLButtonElement | null>>([])
@@ -140,6 +143,7 @@ function WorkspaceTabs({
   }> = [
     { id: 'jobs', label: 'Jobs', count: activeJobs },
     { id: 'exceptions', label: 'Source exceptions', count: openExceptions },
+    { id: 'recovery', label: 'Recovery', count: recoveryCount },
   ]
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let next = index
@@ -1173,6 +1177,8 @@ export function ReconciliationView({
   const [section, setSection] = useState<ReconciliationSection>(
     initial.get('tab') === 'source-exceptions'
       ? 'exceptions'
+      : initial.get('tab') === 'recovery'
+        ? 'recovery'
       : 'jobs',
   )
   const [rows, setRows] = useState<ReconciliationJob[]>([])
@@ -1221,6 +1227,7 @@ export function ReconciliationView({
   const [exceptionError, setExceptionError] = useState('')
   const [exceptionDrawer, setExceptionDrawer] =
     useState<SourceException | null>(null)
+  const [recoveryCount, setRecoveryCount] = useState(0)
   const [exceptionDraft, setExceptionDraft] = useState<ExceptionFilters>({
     ...defaultExceptionFilters,
     job_id: initial.get('job_id') || '',
@@ -1256,6 +1263,7 @@ export function ReconciliationView({
     setSection(next)
     const params = new URLSearchParams()
     if (next === 'exceptions') params.set('tab', 'source-exceptions')
+    if (next === 'recovery') params.set('tab', 'recovery')
     const deviceId = next === 'exceptions' ? exceptionFilters.device_id : ''
     const jobId = next === 'exceptions' ? exceptionFilters.job_id : ''
     if (deviceId) params.set('device_id', deviceId)
@@ -1294,7 +1302,9 @@ export function ReconciliationView({
       const next =
         params.get('tab') === 'source-exceptions'
           ? 'exceptions'
-          : 'jobs'
+          : params.get('tab') === 'recovery'
+            ? 'recovery'
+            : 'jobs'
       setSection(next)
       if (next === 'exceptions') {
         const deviceId = params.get('device_id') || ''
@@ -1428,6 +1438,23 @@ export function ReconciliationView({
   useEffect(() => {
     if (section === 'exceptions') void loadExceptions({ quiet: true })
   }, [revision]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    void api<{
+      delivery: {
+        safe_retryable: number
+        identity_held: number
+        permanent_review: number
+      }
+    }>('/api/v2/attendance-recovery/summary')
+      .then((result) =>
+        setRecoveryCount(
+          result.delivery.safe_retryable +
+            result.delivery.identity_held +
+            result.delivery.permanent_review,
+        ),
+      )
+      .catch(() => setRecoveryCount(0))
+  }, [revision])
   useEffect(
     () => () => {
       jobAbortRef.current?.abort()
@@ -1585,7 +1612,9 @@ export function ReconciliationView({
               onClick={() =>
                 void (section === 'jobs'
                   ? loadJobs({ quiet: true })
-                  : loadExceptions({ quiet: true }))
+                  : section === 'exceptions'
+                    ? loadExceptions({ quiet: true })
+                    : api('/api/v2/attendance-recovery/summary').then(() => undefined))
               }
             >
               <Icon name="refresh" /> Refresh
@@ -1617,9 +1646,18 @@ export function ReconciliationView({
         section={section}
         activeJobs={activeJobCount}
         openExceptions={exceptionTotals.open}
+        recoveryCount={recoveryCount}
         onChange={setWorkspaceSection}
       />
-      {section === 'jobs' ? (
+      {section === 'recovery' ? (
+        <div
+          role="tabpanel"
+          id="reconciliation-recovery-panel"
+          aria-labelledby="reconciliation-recovery-tab"
+        >
+          <AttendanceRecovery revision={revision} toast={toast} />
+        </div>
+      ) : section === 'jobs' ? (
         <div
           role="tabpanel"
           id="reconciliation-jobs-panel"

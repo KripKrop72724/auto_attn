@@ -44,6 +44,7 @@ from zk_add.provisioning import (
     append_provisioning_event,
 )
 from zk_add.service import (
+    attendance_device_time_is_plausible,
     ACTIVE_COMMAND_STATES,
     MUTATING_COMMANDS,
     advance_user_deletion_jobs,
@@ -61,6 +62,7 @@ from zk_add.service import (
     serialize_command,
     upsert_alert,
 )
+from zk_add.attendance_recovery import advance_attendance_recovery_jobs
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 from zk_add.reconciliation import (
@@ -462,6 +464,11 @@ def prepare_maintenance_tick(
         from zk_add.hikvision_delivery import repair_profile_identity_holds
         repair_profile_identity_holds(session)
         repair_attendance_delivery_backlog(session, limit=ORDS_DELIVERY_BATCH_SIZE)
+        advance_attendance_recovery_jobs(
+            session,
+            limit=settings.attendance_recovery_batch_size,
+            owner="maintenance",
+        )
         reconcile_ords_delivery_alerts(session)
         reconcile_admin_lease_states(session)
         from zk_add.comm_keys import expire_staged_comm_key_operations
@@ -659,7 +666,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
             select(OrdsOutbox).where(
                 OrdsOutbox.status == "IN_FLIGHT",
                 OrdsOutbox.last_attempt_at < stale_before,
-            ).limit(100)
+            ).order_by(OrdsOutbox.id).limit(100).with_for_update(skip_locked=True)
         ).all():
             stale.status = "FAILED_RETRYABLE"
             stale.next_attempt_at = now
@@ -703,7 +710,18 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 continue
             connector = session.get(Connector, event.connector_id)
             zkt = session.get(ZKTDevice, event.zkt_device_id)
-            cnic = decrypt_cnic(event.cnic_encrypted)
+            from zk_add.attendance_recovery import _terminal_provenance_verified
+            if connector is None or zkt is None or not _terminal_provenance_verified(event, connector):
+                row.status = event.ords_status = "QUARANTINED_MISSING_TERMINAL_PROVENANCE"
+                row.last_error = "Verified terminal provenance is required before Oracle delivery."
+                row.next_attempt_at = None
+                continue
+            try:
+                cnic = decrypt_cnic(event.cnic_encrypted)
+            except Exception:
+                # A malformed protected identity must remain held instead of
+                # crashing the whole delivery claim transaction.
+                cnic = None
             identity_unverified = (
                 settings.identity_snapshot_gate_enabled
                 and event.identity_resolution_status
@@ -712,6 +730,10 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
             if connector is None or zkt is None or not cnic or identity_unverified:
                 row.status = "BLOCKED_IDENTITY"
                 event.ords_status = "BLOCKED_IDENTITY"
+                continue
+            if event.clock_quality == "INVALID" or not attendance_device_time_is_plausible(event.device_event_time, event.captured_at):
+                row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+                row.next_attempt_at = None
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
             row.status = "IN_FLIGHT"

@@ -875,3 +875,106 @@ class HikvisionPolicyRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
     password: SecretStr
     idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class AttendanceRecoveryFilter(BaseModel):
+    """Bounded, serializable filter used to freeze recovery candidates."""
+
+    connector_id: str | None = Field(default=None, max_length=100)
+    zone_id: str | None = Field(default=None, max_length=100)
+    firmware_family: Literal["zkt", "hikvision"] | None = None
+    lane: Literal[
+        "SAFE_DELIVERY",
+        "IDENTITY_HELD",
+        "SOURCE_CORRECTION",
+        "PERMANENT_REVIEW",
+    ] | None = None
+    statuses: list[str] = Field(default_factory=list, max_length=20)
+    source: str | None = Field(default=None, max_length=40)
+    terminal_serial: str | None = Field(default=None, max_length=120)
+    from_at: datetime | None = None
+    to_at: datetime | None = None
+    stale_only: bool = False
+    event_ids: list[int] = Field(default_factory=list, max_length=5000)
+    source_epoch: str | None = Field(default=None, max_length=64)
+    generation: int | None = Field(default=None, ge=0)
+    retry_age_minutes: int | None = Field(default=None, ge=0, le=52560000)
+    ords_error_category: str | None = Field(default=None, max_length=120)
+    provenance: Literal["VERIFIED", "MISSING"] | None = None
+
+    @field_validator("statuses")
+    @classmethod
+    def normalize_statuses(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values:
+            value = value.strip().upper()
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.from_at and self.to_at and self.from_at > self.to_at:
+            raise ValueError("from_at must be before to_at")
+        return self
+
+
+class AttendanceRecoveryPreviewRequest(BaseModel):
+    action: Literal[
+        "RETRY_DELIVERY",
+        "REBUILD_OUTBOX",
+        "RECOVER_STALE_IN_FLIGHT",
+    ] = "RETRY_DELIVERY"
+    filters: AttendanceRecoveryFilter = Field(default_factory=AttendanceRecoveryFilter)
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class AttendanceRecoveryCreateRequest(AttendanceRecoveryPreviewRequest):
+    candidate_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    preview_expires_at: datetime
+    preview_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AttendanceRecoveryControlRequest(BaseModel):
+    action: Literal["pause", "resume", "cancel", "retry"]
+    reason: str = Field(min_length=10, max_length=500)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+
+
+class AttendanceSourceCorrectionInput(BaseModel):
+    source_kind: Literal["ZKT_MANIFEST", "HIKVISION_EVIDENCE"]
+    source_ref: str = Field(min_length=1, max_length=160)
+    corrected_device_time: datetime
+
+    @field_validator("corrected_device_time")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("A corrected timestamp must include an explicit timezone offset")
+        return value
+
+
+class AttendanceSourceCorrectionPreviewRequest(BaseModel):
+    corrections: list[AttendanceSourceCorrectionInput] = Field(
+        min_length=1, max_length=500
+    )
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class AttendanceSourceCorrectionCreateRequest(AttendanceSourceCorrectionPreviewRequest):
+    candidate_digest: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    typed_confirmation: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    preview_expires_at: datetime
+    preview_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
