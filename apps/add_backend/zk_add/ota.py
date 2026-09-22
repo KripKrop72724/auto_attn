@@ -885,6 +885,78 @@ def record_progress(
     return deployment
 
 
+def previous_firmware_return_evidence(
+    session: Session, *, connector: Connector,
+    deployment: FirmwareDeployment, payload: Any,
+) -> dict[str, Any] | None:
+    """Recognize a return without inventing a bootloader or reset cause.
+
+    Version strings alone, cached connector fields, and one delayed heartbeat
+    cannot terminate an attempt. Require a digest-checked target boot followed
+    by two coherent observations of a newer boot on the previous firmware.
+    """
+    ota = payload.ota
+    if (deployment.status not in {"BOOTED_PENDING", "RECONCILING"}
+            or not deployment.previous_version or not connector.boot_id
+            or not _versions_match(payload.firmware_version, deployment.previous_version)
+            or _versions_match(payload.firmware_version, deployment.target_version)
+            or (ota.running_version and not _versions_match(ota.running_version, payload.firmware_version))
+            or ota.state.upper() == "UPDATING"
+            or (ota.target_version and not _versions_match(ota.target_version, deployment.target_version))
+            or payload.uptime_seconds is None or payload.uptime_seconds < 0):
+        return None
+    release = session.get(FirmwareRelease, deployment.release_id)
+    target_boot = session.scalar(select(FirmwareEvent).where(
+        FirmwareEvent.deployment_id == deployment.id,
+        FirmwareEvent.state.in_(["BOOTED_PENDING", "RECONCILING"]),
+    ).order_by(FirmwareEvent.id.desc()).limit(1))
+    if release is None or target_boot is None:
+        return None
+    details = target_boot.details or {}
+    if (not _application_sha256(release)
+            or details.get("image_sha256") != _application_sha256(release)
+            or not _versions_match(details.get("running_version"), deployment.target_version)
+            or details.get("running_partition") not in {"ota_0", "ota_1"}):
+        return None
+    now = utc_now()
+    boot_at = now - timedelta(seconds=payload.uptime_seconds)
+    # Permit network scheduling skew, but never infer a rollback from an
+    # observation belonging to the pre-install boot.
+    if boot_at <= ensure_utc(target_boot.created_at) + timedelta(seconds=10):
+        return None
+    previous = session.scalar(select(DeviceTelemetry).where(
+        DeviceTelemetry.connector_id == connector.id,
+    ).order_by(DeviceTelemetry.id.desc()).limit(1))
+    if (previous is None or previous.boot_id != connector.boot_id
+            or previous.sequence >= connector.last_sequence
+            or previous.uptime_seconds is None
+            or previous.uptime_seconds < 0
+            or ensure_utc(previous.created_at) <= ensure_utc(target_boot.created_at)):
+        return None
+    age = (now - ensure_utc(previous.created_at)).total_seconds()
+    uptime_delta = payload.uptime_seconds - previous.uptime_seconds
+    old = previous.payload or {}
+    old_ota = old.get("ota") or {}
+    if (not 15 <= age <= 90 or uptime_delta <= 0 or abs(uptime_delta - age) > 10
+            or not _versions_match(old.get("firmware_version"), deployment.previous_version)
+            or old_ota.get("state", "").upper() == "UPDATING"
+            or (old_ota.get("target_version") and not _versions_match(old_ota["target_version"], deployment.target_version))):
+        return None
+    if (ota.image_sha256 and old_ota.get("image_sha256")
+            and ota.image_sha256 != old_ota["image_sha256"]):
+        return None
+    return {
+        "source": "authenticated_heartbeat_return", "reset_cause": "not_reported",
+        "deployment_id": deployment.deployment_id,
+        "target_version": deployment.target_version,
+        "previous_version": deployment.previous_version,
+        "target_boot_event_id": target_boot.id,
+        "prior_telemetry_id": previous.id, "boot_id": connector.boot_id,
+        "sequence": connector.last_sequence, "uptime_seconds": payload.uptime_seconds,
+        "observed_at": now.isoformat(),
+    }
+
+
 def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]:
     next_target = None
     scope_message = None
