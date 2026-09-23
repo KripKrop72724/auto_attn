@@ -26,6 +26,9 @@ FAILURE_FILE = Path("/tmp/add-liveness-failures")
 FAILURES_BEFORE_RESTART = max(
     2, int(os.environ.get("ADD_LIVENESS_FAILURES_BEFORE_RESTART", "3"))
 )
+STARTUP_GRACE_SECONDS = max(
+    30, int(os.environ.get("ADD_LIVENESS_STARTUP_GRACE_SECONDS", "60"))
+)
 
 
 def probe(url: str, timeout: float) -> bool:
@@ -50,7 +53,7 @@ def write_failures(value: int) -> None:
         pass
 
 
-def terminate_api_process() -> None:
+def api_process_ids() -> list[int]:
     own_pid = os.getpid()
     candidates: list[int] = []
     for entry in Path("/proc").iterdir():
@@ -60,13 +63,48 @@ def terminate_api_process() -> None:
         if process_id in {1, own_pid}:
             continue
         try:
-            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            arguments = (entry / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        if b"uvicorn" in command and b"zk_add.web:app" in command:
+        # The startup shell contains both strings inside its `-c` argument while
+        # Alembic is still running. Only an actual Uvicorn executable/module is
+        # eligible for self-healing; never signal that shell or the migration.
+        program = arguments[0].rsplit(b"/", 1)[-1]
+        python = program.startswith(b"python")
+        launches_uvicorn = program == b"uvicorn" or (
+            python
+            and (
+                arguments[1:3] == [b"-m", b"uvicorn"]
+                or (len(arguments) > 1 and arguments[1].rsplit(b"/", 1)[-1] == b"uvicorn")
+            )
+        )
+        if launches_uvicorn and b"zk_add.web:app" in arguments:
             candidates.append(process_id)
+    return candidates
+
+
+def api_startup_complete(process_ids: list[int]) -> bool:
+    try:
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        ticks = os.sysconf("SC_CLK_TCK")
+        for process_id in process_ids:
+            # The process name may contain spaces or parentheses. Fields after
+            # its final closing parenthesis start at stat field 3; starttime is 22.
+            fields = Path(f"/proc/{process_id}/stat").read_text().rsplit(")", 1)[1].split()
+            started = int(fields[19]) / ticks
+            if not 0 <= started <= uptime - STARTUP_GRACE_SECONDS:
+                return False
+    except (OSError, ValueError, IndexError):
+        return False
+    return bool(process_ids)
+
+
+def terminate_api_process() -> None:
+    candidates = api_process_ids()
     if not candidates:
-        raise RuntimeError("The unhealthy Uvicorn process could not be resolved.")
+        return
+    if not api_startup_complete(candidates):
+        return
     for process_id in candidates:
         os.kill(process_id, signal.SIGKILL)
 
@@ -75,6 +113,11 @@ def main() -> int:
     event_loop_live = probe(LIVE_URL, timeout=2.0)
     request_threadpool_live = event_loop_live and probe(SERVE_URL, timeout=2.0)
     if not event_loop_live or not request_threadpool_live:
+        candidates = api_process_ids()
+        if not candidates or not api_startup_complete(candidates):
+            write_failures(0)
+            print("ADD startup is not ready; no API restart requested.", file=sys.stderr)
+            return 1
         failures = read_failures() + 1
         write_failures(failures)
         if failures >= FAILURES_BEFORE_RESTART:

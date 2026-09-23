@@ -87,9 +87,13 @@ def database_report():
         "flags": {
             "checks": settings.attendance_safe_repair_preview_enabled,
             "execution": settings.attendance_safe_repair_execution_enabled,
-            "automatic": settings.attendance_safe_repair_automatic_enabled,
+            "automatic": getattr(settings, "attendance_safe_repair_automatic_enabled", False),
+            "force_checks": getattr(settings, "attendance_force_release_preview_enabled", False),
+            "force_execution": getattr(settings, "attendance_force_release_execution_enabled", False),
+            "oracle_delivery_configured": bool(settings.ords_base_url),
         }
     }
+    queries["schema"] = "SELECT version_num FROM alembic_version"
     for name, query in queries.items():
         try:
             with engine.connect() as connection:
