@@ -113,6 +113,7 @@ def deliver_observation(
     event = root.get("AccessControllerEvent", root) if isinstance(root, dict) else {}
     name = event.get("name") if isinstance(event, dict) else None
     parsed = parse_machine_name(name if isinstance(name, str) and len(name) <= 256 else None)
+    captured_cnic_hash = cnic_lookup(parsed.cnic)
     cnic = normalize_cnic(parsed.cnic) if parsed.display_name else None
     user = None
     identity_source = "TERMINAL_NAME_CNIC" if cnic else "MISSING_NAME_CNIC"
@@ -126,6 +127,12 @@ def deliver_observation(
     if existing:
         if existing.connector_id != connector.id:
             raise ValueError("ATTENDANCE_CONNECTOR_CONFLICT")
+        if captured_cnic_hash:
+            if existing.captured_cnic_lookup_hash and captured_cnic_hash != existing.captured_cnic_lookup_hash:
+                evidence.disposition = "IDENTITY_FACT_CONFLICT"
+                _hold_existing(session, existing, "QUARANTINED_IDENTITY_CONFLICT")
+                return
+            existing.captured_cnic_lookup_hash = captured_cnic_hash
         if lookup and existing.cnic_lookup_hash and lookup != existing.cnic_lookup_hash:
             evidence.disposition = "IDENTITY_FACT_CONFLICT"
             _hold_existing(session, existing, "QUARANTINED_IDENTITY_CONFLICT")
@@ -183,6 +190,7 @@ def deliver_observation(
         display_name=parsed.display_name or None,
         cnic_encrypted=encrypt_cnic(cnic),
         cnic_lookup_hash=lookup,
+        captured_cnic_lookup_hash=captured_cnic_hash,
         cnic_last4=cnic[-4:] if cnic else None,
         device_event_time=event_time,
         captured_at=captured,

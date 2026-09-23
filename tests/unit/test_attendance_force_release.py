@@ -637,3 +637,52 @@ def test_slow_force_verification_does_not_delay_ordinary_delivery(monkeypatch):
         await worker.deliver_ords_batch(limit=5, concurrency=5)
 
     asyncio.run(scenario())
+
+
+def test_manual_sync_concurrency_and_partial_device_availability(store):
+    from zk_add.service import onboard_connector
+
+    sessions, _, _ = store
+    with sessions() as db:
+        for index in range(3):
+            connector, _, _ = onboard_connector(
+                db,
+                hardware_id=f"00:11:22:33:44:{index:02d}",
+                zone_id="FORCE-TEST",
+                zone_name="Same display name",
+                device_id=f"FORCE-{index}",
+                firmware_version="2.4.12",
+                expected_serial=f"FORCE-SERIAL-{index}",
+                actor="test",
+                ip_address=None,
+            )
+            connector.connected = index != 2
+            connector.boot_id = f"test-boot-{index}"
+        db.commit()
+        job = force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="ALL_PAKISTAN", idempotency_key="bounded-national-check"
+            ),
+        )
+        db.commit()
+        job_id = job.id
+    for _ in range(14):
+        tick(sessions)
+    with sessions() as db:
+        tasks = db.scalars(select(Task).where(Task.job_id == job_id)).all()
+        assert len(tasks) == 4
+        assert sum(task.status == "SYNCING" for task in tasks) == 2
+        assert sum(task.status == "SYNC_PENDING" for task in tasks) == 1
+        assert (
+            sum(
+                task.status == "UNAVAILABLE" and task.error_code == "DEVICE_OFFLINE"
+                for task in tasks
+            )
+            == 1
+        )
+        commands = db.scalars(
+            select(DeviceCommand).where(DeviceCommand.command_type == "REFRESH_USERS")
+        ).all()
+        assert len(commands) == 2 and len({c.idempotency_key for c in commands}) == 2

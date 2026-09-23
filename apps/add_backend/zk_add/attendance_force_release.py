@@ -390,6 +390,67 @@ def _uid_optional(session, event, connector):
     )
 
 
+def _hikvision_source_valid(session, event, connector):
+    """Use the preserved ISAPI observation, whose status is not a ZKT byte."""
+    import hashlib
+    from zk_add.hikvision_delivery import HikvisionPolicy
+    from zk_add.hikvision_evidence import HikvisionEvidence
+    from zk_add.hikvision_protocol import normalize_observation
+    from zk_add.hikvision_probe import decode_body, ProbeError
+
+    policy = session.get(HikvisionPolicy, connector.id)
+    if not policy or not policy.enabled or policy.terminal_serial != event.device_serial:
+        return False
+    evidence = session.scalar(
+        select(HikvisionEvidence)
+        .where(
+            HikvisionEvidence.connector_id == connector.id,
+            HikvisionEvidence.event_uid == event.event_uid,
+            HikvisionEvidence.terminal_serial == event.device_serial,
+            HikvisionEvidence.source_epoch == policy.source_epoch,
+            HikvisionEvidence.disposition.in_(
+                {"ATTENDANCE", "IDENTITY_BLOCKED", "DUPLICATE_OBSERVATION"}
+            ),
+        )
+        .order_by(HikvisionEvidence.id)
+        .limit(1)
+    )
+    if not evidence or session.scalar(
+        select(HikvisionEvidence.id)
+        .where(
+            HikvisionEvidence.connector_id == connector.id,
+            HikvisionEvidence.event_uid == event.event_uid,
+            HikvisionEvidence.disposition.in_({"SOURCE_FACT_CONFLICT", "IDENTITY_FACT_CONFLICT"}),
+        )
+        .limit(1)
+    ):
+        return False
+    try:
+        raw = decrypt_text(evidence.raw_encrypted)
+        if hashlib.sha256(raw.encode()).hexdigest() != evidence.observation_sha256:
+            return False
+        observed = normalize_observation(
+            decode_body(raw.encode()),
+            terminal_serial=event.device_serial,
+            source_epoch=evidence.source_epoch,
+        )
+        code = [observed.major, observed.minor]
+        return bool(
+            observed.event_uid == event.event_uid
+            and observed.immutable_facts_digest == evidence.immutable_digest
+            and observed.employee_no == event.user_id
+            and ensure_utc(datetime.fromisoformat(observed.event_time_utc))
+            == ensure_utc(event.device_event_time)
+            and observed.attendance_status == event.status
+            and event.punch is None
+            and observed.serial_no == event.sequence
+            and code in policy.success_codes
+            and code not in policy.excluded_codes
+        )
+    except (ValueError, TypeError, AttributeError, ProbeError):
+        return False
+
+
 def identity_proof(session, event, connector, task=None):
     """Only historical continuity is overridable; contradictory evidence never is."""
     if (
@@ -403,7 +464,10 @@ def identity_proof(session, event, connector, task=None):
         event.device_event_time, event.captured_at
     ):
         return None, "TIME_INVALID"
-    if any(
+    if connector.firmware_family == "hikvision":
+        if not _hikvision_source_valid(session, event, connector):
+            return None, "SOURCE_INVALID"
+    elif any(
         value is not None and (not re.fullmatch(r"[0-9]{1,3}", value) or int(value) > 255)
         for value in (event.status, event.punch)
     ):
