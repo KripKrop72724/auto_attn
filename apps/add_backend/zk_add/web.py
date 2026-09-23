@@ -3184,13 +3184,19 @@ async def cancel_command(
     return command_response(row)
 
 
+def require_stream_admin(request: Request) -> AdminContext:
+    # Streaming responses can stay open for hours. Finish authentication's
+    # transaction before subscribing so the stream owns no database connection.
+    with session_scope() as db:
+        return admin_context(request, db)
+
+
 @app.get("/events/v1/stream")
 async def browser_stream(
     request: Request,
     last_event_id: int | None = Query(default=None),
-    auth: tuple[Session, AdminContext] = Depends(require_admin),
+    _context: AdminContext = Depends(require_stream_admin),
 ):
-    _db, _context = auth
     header_id = request.headers.get("Last-Event-ID")
     if header_id and header_id.isdigit():
         last_event_id = int(header_id)
