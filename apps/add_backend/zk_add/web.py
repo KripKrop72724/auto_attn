@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from uuid import uuid4
 
 import httpx
@@ -25,6 +26,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -3211,12 +3213,25 @@ async def device_attendance(
     body: object = Body(...),
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_attendance, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_attendance(
+    body: object,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
     for event_uid in settlement.accepted_event_uids:
-        await browser_events.publish("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid})
-    return settlement.response()
+        events.append(("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid}))
+    response = settlement.response()
+
+    return response, events
 
 
 @app.post("/device/v2/reconciliations/anchor")
@@ -3224,16 +3239,25 @@ async def device_reconciliation_anchor(
     body: ReconciliationAnchorRequest,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_reconciliation_anchor, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_reconciliation_anchor(
+    body: ReconciliationAnchorRequest,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     try:
         job = apply_reconciliation_anchor(db, connector=connector, payload=body)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
-    await browser_events.publish(
-        "reconciliation", {"job_id": job.job_id, "phase": job.phase}
-    )
-    return {
+    events.append(("reconciliation", {"job_id": job.job_id, "phase": job.phase}))
+    response = {
         "ok": job.status != "NEEDS_ATTENTION",
         "job_id": job.job_id,
         "status": job.status,
@@ -3241,12 +3265,25 @@ async def device_reconciliation_anchor(
         "committed_next_ordinal": job.committed_next_ordinal,
     }
 
+    return response, events
+
 
 @app.post("/device/v2/reconciliations/chunks")
 async def device_reconciliation_chunk(
     body: ReconciliationChunkRequest,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_reconciliation_chunk, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_reconciliation_chunk(
+    body: ReconciliationChunkRequest,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     try:
         job, chunk, duplicate = apply_reconciliation_chunk(
@@ -3255,15 +3292,12 @@ async def device_reconciliation_chunk(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
-    await browser_events.publish(
-        "reconciliation",
-        {
+    events.append(("reconciliation", {
             "job_id": job.job_id,
             "phase": job.phase,
             "committed_next_ordinal": job.committed_next_ordinal,
-        },
-    )
-    return {
+        }))
+    response = {
         "ok": job.status != "NEEDS_ATTENTION",
         "job_id": job.job_id,
         "generation": chunk.generation,
@@ -3273,22 +3307,33 @@ async def device_reconciliation_chunk(
         "duplicate": duplicate,
     }
 
+    return response, events
+
 
 @app.post("/device/v2/reconciliations/manifest")
 async def device_reconciliation_manifest(
     body: ReconciliationManifestRequest,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_reconciliation_manifest, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_reconciliation_manifest(
+    body: ReconciliationManifestRequest,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     try:
         job = apply_reconciliation_manifest(db, connector=connector, payload=body)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
-    await browser_events.publish(
-        "reconciliation", {"job_id": job.job_id, "status": job.status, "phase": job.phase}
-    )
-    return {
+    events.append(("reconciliation", {"job_id": job.job_id, "status": job.status, "phase": job.phase}))
+    response = {
         "ok": job.capture_certified_at is not None,
         "job_id": job.job_id,
         "status": job.status,
@@ -3297,20 +3342,35 @@ async def device_reconciliation_manifest(
         "oracle_certificate": job.oracle_certificate or None,
     }
 
+    return response, events
+
 
 @app.post("/device/v1/user-snapshots")
 async def device_users(
     body: UserSnapshotRequest,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_users, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_users(
+    body: UserSnapshotRequest,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     try:
         count = replace_user_snapshot(db, connector=connector, snapshot=body)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
-    await browser_events.publish("users", {"connector_id": connector.connector_id, "count": count})
-    return {"ok": True, "snapshot_id": body.snapshot_id, "count": count}
+    events.append(("users", {"connector_id": connector.connector_id, "count": count}))
+    response = {"ok": True, "snapshot_id": body.snapshot_id, "count": count}
+
+    return response, events
 
 
 @app.post("/device/v1/logs/batches")
@@ -3318,26 +3378,36 @@ async def device_logs(
     body: LogBatchRequest,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_device_logs, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_device_logs(
+    body: LogBatchRequest,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     count = ingest_logs(db, connector=connector, logs=body.logs)
     db.commit()
     for item in body.logs[-min(count, 50):]:
-        await browser_events.publish(
-            "log",
-            {
+        events.append(("log", {
                 "connector_id": connector.connector_id,
                 "level": item.level,
                 "subsystem": item.subsystem,
                 "code": item.code,
                 "message": item.message,
                 "device_time": item.device_time,
-            },
-        )
-    return {"ok": True, "accepted": count}
+            }))
+    response = {"ok": True, "accepted": count}
+
+    return response, events
 
 
 @app.get("/device/v1/commands")
-async def poll_commands(auth: tuple[Session, Connector] = Depends(require_connector)):
+def poll_commands(auth: tuple[Session, Connector] = Depends(require_connector)):
     db, connector = auth
     rows = db.scalars(
         select(DeviceCommand).where(
@@ -3359,6 +3429,17 @@ async def command_result(
     body: CommandUpdate,
     auth: tuple[Session, Connector] = Depends(require_connector),
 ):
+    response, events = await run_in_threadpool(persist_command_result, body, auth)
+    for event_type, payload in events:
+        await browser_events.publish(event_type, payload)
+    return response
+
+
+def persist_command_result(
+    body: CommandUpdate,
+    auth: tuple[Session, Connector],
+):
+    events = []
     db, connector = auth
     try:
         row = apply_command_update(
@@ -3373,13 +3454,15 @@ async def command_result(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     db.commit()
-    await browser_events.publish("command", command_response(row))
-    return {"ok": True, "command_id": row.command_id, "status": row.status}
+    events.append(("command", command_response(row)))
+    response = {"ok": True, "command_id": row.command_id, "status": row.status}
+
+    return response, events
 
 
 @app.get("/device/v1/config")
 @app.get("/device/v2/config")
-async def device_config(auth: tuple[Session, Connector] = Depends(require_connector)):
+def device_config(auth: tuple[Session, Connector] = Depends(require_connector)):
     db, connector = auth
     tombstones = []
     if connector.zkt_device:
@@ -3420,60 +3503,27 @@ async def device_stream(websocket: WebSocket):
     if not connector_id or not token:
         await websocket.close(code=4401)
         return
-    with session_scope() as db:
-        try:
-            connector = authenticate_websocket_token(db, connector_id, token)
-        except ValueError:
-            await websocket.close(code=4401)
-            return
-        connector_pk = connector.id
-    await connector_hub.connect(connector_id, websocket)
-    with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
-        if connector:
-            connector.connected = True
-            connector.lifecycle_state = "ONLINE"
-            connector.last_seen_at = utc_now()
-    await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
-    with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
-        catalog = identity_catalog_payload(db, connector) if connector else {
-            "schema_version": "2",
-            "type": "identity_catalog",
-            "rows": [],
-        }
-    if not await send_identity_catalog(connector_id, catalog):
-        await websocket.close(code=1011, reason="Identity catalog delivery failed")
-        return
-    with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
-        coverage = (
-            active_coverage(db, connector.zkt_device)
-            if connector is not None and connector.zkt_device is not None
-            else None
-        )
-        coverage_payload = serialize_coverage(coverage)
-        if coverage_payload is None and connector is not None and connector.zkt_device is not None:
-            terminal_serial = (
-                connector.zkt_device.serial or connector.zkt_device.expected_serial
-            )
-            if terminal_serial:
-                coverage_payload = {
-                    "terminal_serial": terminal_serial,
-                    "terminal_generation": max(1, connector.onboarding_generation),
-                    "source_committed_cursor": 0,
-                    "source_committed_chain_digest": "0" * 64,
-                    "active": False,
-                }
-    if coverage_payload is not None:
-        if not await connector_hub.send(
-            connector_id,
-            {"type": "source_coverage", **coverage_payload},
-        ):
-            await websocket.close(code=1011, reason="Source coverage delivery failed")
-            return
-    await send_pending_commands(connector_id)
     try:
+        connector_pk = await asyncio.to_thread(authenticate_stream, connector_id, token)
+    except ValueError:
+        await websocket.close(code=4401)
+        return
+    await connector_hub.connect(connector_id, websocket)
+    try:
+        await asyncio.to_thread(set_stream_connected, connector_pk, True)
+        await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
+        catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
+        if not await send_identity_catalog(connector_id, catalog):
+            await websocket.close(code=1011, reason="Identity catalog delivery failed")
+            return
+        if coverage_payload is not None:
+            if not await connector_hub.send(
+                connector_id,
+                {"type": "source_coverage", **coverage_payload},
+            ):
+                await websocket.close(code=1011, reason="Source coverage delivery failed")
+                return
+        await send_pending_commands(connector_id)
         while True:
             raw = await websocket.receive_text()
             if len(raw) > 512 * 1024:
@@ -3511,7 +3561,7 @@ async def device_stream(websocket: WebSocket):
                         envelope.type,
                         envelope.message_id,
                     )
-                record_envelope_rejection(connector_pk, envelope, exc)
+                await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
                 await websocket.send_json(
                     {
                         "type": "error",
@@ -3524,12 +3574,53 @@ async def device_stream(websocket: WebSocket):
         pass
     finally:
         await connector_hub.disconnect(connector_id, websocket)
-        with session_scope() as db:
-            connector = db.get(Connector, connector_pk)
-            if connector:
-                connector.connected = False
-                connector.last_disconnect_at = utc_now()
+        await asyncio.to_thread(set_stream_connected, connector_pk, False)
         await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+
+
+def authenticate_stream(connector_id: str, token: str) -> int:
+    with session_scope() as db:
+        return authenticate_websocket_token(db, connector_id, token).id
+
+
+def set_stream_connected(connector_pk: int, connected: bool) -> None:
+    with session_scope() as db:
+        connector = db.get(Connector, connector_pk)
+        if connector:
+            connector.connected = connected
+            if connected:
+                connector.lifecycle_state = "ONLINE"
+                connector.last_seen_at = utc_now()
+            else:
+                connector.last_disconnect_at = utc_now()
+
+
+def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
+    """Build detached wire payloads in the thread that owns the transaction."""
+    with session_scope() as db:
+        connector = db.get(Connector, connector_pk)
+        catalog = identity_catalog_payload(db, connector) if connector else {
+            "schema_version": "2", "type": "identity_catalog", "rows": [],
+        }
+        coverage = (
+            active_coverage(db, connector.zkt_device)
+            if connector is not None and connector.zkt_device is not None
+            else None
+        )
+        coverage_payload = serialize_coverage(coverage)
+        if coverage_payload is None and connector is not None and connector.zkt_device is not None:
+            terminal_serial = (
+                connector.zkt_device.serial or connector.zkt_device.expected_serial
+            )
+            if terminal_serial:
+                coverage_payload = {
+                    "terminal_serial": terminal_serial,
+                    "terminal_generation": max(1, connector.onboarding_generation),
+                    "source_committed_cursor": 0,
+                    "source_committed_chain_digest": "0" * 64,
+                    "active": False,
+                }
+    return catalog, coverage_payload
 
 
 def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
@@ -3573,19 +3664,35 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
         )
 
 
-async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
+@dataclass(frozen=True)
+class EnvelopeOutcome:
+    ack: dict
+    event: dict | None = None
+    commands_for: str | None = None
+    coverage: dict | None = None
+    provisioning: dict | None = None
+
+
+def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome | None:
+    """Keep blocking database work and its session entirely off the event loop."""
+    provisioning_payload = None
     event_payload = None
     ack_payload = None
     authoritative_coverage_payload = None
     send_commands_after_ack = False
     connector_id_to_flush = None
     with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
+        # Separate sockets may overlap during reconnect. Serialize sequence checks
+        # and acceptance for the same connector before acknowledging either socket.
+        connector = db.scalar(
+            select(Connector).where(Connector.id == connector_pk).with_for_update()
+        )
         if connector is None:
             return
         if connector.boot_id == envelope.boot_id and envelope.seq <= connector.last_sequence:
-            await websocket.send_json({"type": "ack", "message_id": envelope.message_id, "duplicate": True})
-            return
+            return EnvelopeOutcome(
+                ack={"type": "ack", "message_id": envelope.message_id, "duplicate": True},
+            )
         connector.boot_id = envelope.boot_id
         connector.last_sequence = envelope.seq
         connector.last_seen_at = utc_now()
@@ -3608,13 +3715,10 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
 
             provisioning_session = correlate_onboarding(db, connector)
             if provisioning_session:
-                await browser_events.publish(
-                    "provisioning",
-                    {
-                        "session_id": provisioning_session.session_id,
-                        "state": provisioning_session.state,
-                    },
-                )
+                provisioning_payload = {
+                    "session_id": provisioning_session.session_id,
+                    "state": provisioning_session.state,
+                }
         elif envelope.type == "command_update":
             update = CommandUpdate.model_validate(envelope.payload)
             command = apply_command_update(
@@ -3876,18 +3980,33 @@ async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebS
             }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
-    await websocket.send_json(
-        ack_payload
-        or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq}
+    return EnvelopeOutcome(
+        ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
+        event=event_payload or {},
+        commands_for=connector_id_to_flush if send_commands_after_ack else None,
+        coverage=authoritative_coverage_payload,
+        provisioning=provisioning_payload,
     )
-    if send_commands_after_ack and connector_id_to_flush:
-        await send_pending_commands(connector_id_to_flush)
-    if authoritative_coverage_payload is not None:
-        await websocket.send_json(authoritative_coverage_payload)
-    await browser_events.publish(envelope.type, event_payload or {})
 
 
-async def send_pending_commands(connector_id: str) -> None:
+async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
+    outcome = await asyncio.to_thread(persist_envelope, connector_pk, envelope)
+    if outcome is None:
+        return
+    # The worker returns only after commit. No acknowledgement or browser success
+    # can escape a failed transaction; reconnects replay the unacknowledged input.
+    await websocket.send_json(outcome.ack)
+    if outcome.commands_for:
+        await send_pending_commands(outcome.commands_for)
+    if outcome.coverage is not None:
+        await websocket.send_json(outcome.coverage)
+    if outcome.provisioning is not None:
+        await browser_events.publish("provisioning", outcome.provisioning)
+    if outcome.event is not None:
+        await browser_events.publish(envelope.type, outcome.event)
+
+
+def pending_command_payloads(connector_id: str) -> list[dict]:
     with session_scope() as db:
         connector = connector_or_404(db, connector_id)
         rows = db.scalars(
@@ -3898,23 +4017,27 @@ async def send_pending_commands(connector_id: str) -> None:
             ).order_by(DeviceCommand.created_at.asc())
         ).all()
         payloads = [serialize_command(row) for row in rows]
-    for payload in payloads:
+    return payloads
+
+
+async def send_pending_commands(connector_id: str) -> None:
+    for payload in await asyncio.to_thread(pending_command_payloads, connector_id):
         await connector_hub.send(connector_id, payload)
 
 
+def mark_command_dispatched(command_id: str) -> None:
+    with session_scope() as db:
+        row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command_id))
+        if row and row.status in {"QUEUED", "WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
+            row.status = "DISPATCHED"
+            row.dispatched_at = utc_now()
+            row.attempt_count += 1
+
+
 async def dispatch_command(connector: Connector, command: DeviceCommand) -> None:
+    command_id = command.command_id
     if await connector_hub.send(connector.connector_id, serialize_command(command)):
-        with session_scope() as db:
-            row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command.command_id))
-            if row and row.status in {
-                "QUEUED",
-                "WAITING_FOR_DEVICE",
-                "WAITING_FOR_ZKT",
-                "RETRYING",
-            }:
-                row.status = "DISPATCHED"
-                row.dispatched_at = utc_now()
-                row.attempt_count += 1
+        await asyncio.to_thread(mark_command_dispatched, command_id)
 
 
 def command_response(row: DeviceCommand) -> dict:

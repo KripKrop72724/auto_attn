@@ -15,6 +15,7 @@ def test_diagnostics_discard_payloads_credentials_and_dynamic_paths():
             "sqlalchemy.exc.OperationalError: private sql parameters and protected identity",
             '  File "/app/zk_add/attendance_safe_repair.py", line 181, in create_check',
             "password=secret employee=private-person cnic=3520212345671",
+            "ADD event loop lag detected lag_seconds=42.000 private employee information",
         ]
     )
     assert output == {
@@ -26,4 +27,5 @@ def test_diagnostics_discard_payloads_credentials_and_dynamic_paths():
         "exception_types": {"OperationalError": 1},
         "code_frames": {"attendance_safe_repair.py:181:create_check": 1},
         "proxy_errors": {},
+        "runtime_signals": {"ADD event loop lag detected": 1},
     }
