@@ -1072,6 +1072,7 @@ def _replace_user_snapshot(
         user_count=len(snapshot.users),
         started_at=ensure_utc(snapshot.started_at) if snapshot.started_at else None,
         observed_at=ensure_utc(snapshot.observed_at),
+        connector_boot_id=connector.boot_id,
     )
     session.add(snapshot_record)
     session.flush()
@@ -1308,11 +1309,7 @@ def _replace_user_snapshot(
         if row.id is not None:
             affected[row.id] = row
     for row in affected.values():
-        if row.cnic_lookup_hash and row.identity_conflict_code is None:
-            enrich_undelivered_attendance(
-                session, zkt=zkt, user=row, snapshot=snapshot_record
-            )
-        else:
+        if not row.cnic_lookup_hash or row.identity_conflict_code is not None:
             block_undelivered_attendance(
                 session, zkt=zkt, user=row, snapshot=snapshot_record
             )
@@ -2700,6 +2697,9 @@ def enrich_undelivered_attendance(
     for row in rows:
         if row.ords_status not in eligible_statuses:
             continue
+        from zk_add.attendance_manual_guard import requires_approval
+        if requires_approval(row):
+            continue
         identity_reused = bool(
             (row.device_user_id is not None and row.device_user_id != user.id)
             or (
@@ -2849,6 +2849,10 @@ def repair_attendance_delivery_backlog(
     for row in candidates:
         sweep.last_event_id = row.id
         sweep.scanned_count += 1
+        from zk_add.attendance_manual_guard import requires_approval
+        if requires_approval(row):
+            unresolved += 1
+            continue
         event_uid_valid = bool(re.fullmatch(r"[0-9a-f]{64}", row.event_uid or ""))
         if not event_uid_valid:
             row.ords_status = "QUARANTINED_INVALID_EVENT_UID"
@@ -2956,129 +2960,8 @@ def repair_verified_tombstone_backlog(
     *,
     limit: int = 500,
 ) -> int:
-    """Requeue blocked punches when a preserved terminal identity proves the CNIC.
-
-    A user can disappear from a stable terminal snapshot after punches for that
-    identity were already stored as ``BLOCKED_IDENTITY``.  Deletion correctly
-    preserves an encrypted identity tombstone, but older blocked rows predate
-    that tombstone and therefore need a bounded, durable repair pass.
-
-    The repair fails closed on identity reuse: a row is eligible only when its
-    preserved device-user identity (or, for older rows, its terminal UID)
-    matches the tombstone.  No attendance row is deleted or replaced.
-    """
-
-    bounded_limit = max(1, min(int(limit), 500))
-    eligible_tombstone = (
-        select(IdentityTombstone.id)
-        .where(
-            IdentityTombstone.zkt_device_id == AttendanceEvent.zkt_device_id,
-            IdentityTombstone.user_id == AttendanceEvent.user_id,
-            IdentityTombstone.cnic_encrypted.is_not(None),
-            IdentityTombstone.cnic_lookup_hash.is_not(None),
-            (
-                (
-                    AttendanceEvent.device_user_id.is_not(None)
-                    & (
-                        IdentityTombstone.device_user_id
-                        == AttendanceEvent.device_user_id
-                    )
-                )
-                | (
-                    AttendanceEvent.device_user_id.is_(None)
-                    & AttendanceEvent.uid.is_not(None)
-                    & (AttendanceEvent.uid != "")
-                    & (IdentityTombstone.uid == AttendanceEvent.uid)
-                )
-            ),
-        )
-        .exists()
-    )
-    blocked_rows = session.scalars(
-        select(AttendanceEvent)
-        .where(
-            AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
-            or_(
-                AttendanceEvent.identity_resolution_status.is_(None),
-                AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
-            ),
-            AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
-            eligible_tombstone,
-        )
-        .order_by(AttendanceEvent.id.asc())
-        .limit(bounded_limit)
-        .with_for_update(skip_locked=True)
-    ).all()
-    if not blocked_rows:
-        return 0
-
-    repaired = 0
-    tombstone_cache: dict[tuple[int, str, int | None, str | None], IdentityTombstone | None] = {}
-    for row in blocked_rows:
-        cache_key = (
-            row.zkt_device_id,
-            row.user_id,
-            row.device_user_id,
-            row.uid,
-        )
-        if cache_key not in tombstone_cache:
-            statement = (
-                select(IdentityTombstone)
-                .where(
-                    IdentityTombstone.zkt_device_id == row.zkt_device_id,
-                    IdentityTombstone.user_id == row.user_id,
-                    IdentityTombstone.cnic_encrypted.is_not(None),
-                    IdentityTombstone.cnic_lookup_hash.is_not(None),
-                )
-                .order_by(IdentityTombstone.id.desc())
-            )
-            if row.device_user_id is not None:
-                statement = statement.where(
-                    IdentityTombstone.device_user_id == row.device_user_id
-                )
-            elif row.uid:
-                statement = statement.where(IdentityTombstone.uid == row.uid)
-            else:
-                # A user ID without a preserved device-user or UID can have
-                # been reused on the same terminal. Operator evidence is
-                # required before such a row can be attributed.
-                tombstone_cache[cache_key] = None
-                continue
-            tombstone_cache[cache_key] = session.scalar(statement.limit(1))
-
-        tombstone = tombstone_cache[cache_key]
-        if tombstone is None:
-            continue
-
-        cnic = decrypt_cnic(tombstone.cnic_encrypted)
-        if not cnic:
-            continue
-
-        row.device_user_id = tombstone.device_user_id
-        row.identity_resolution_status = "RESOLVED_TOMBSTONE"
-        row.identity_resolved_at = utc_now()
-        row.identity_repaired_at = utc_now()
-        row.identity_repair_reason = "VERIFIED_IDENTITY_TOMBSTONE"
-        row.display_name = (
-            decrypt_text(tombstone.display_name_encrypted) or row.display_name
-        )
-        row.cnic_encrypted = tombstone.cnic_encrypted
-        row.cnic_lookup_hash = tombstone.cnic_lookup_hash
-        row.cnic_last4 = tombstone.cnic_last4
-        row.raw_punch = row.raw_punch or tombstone.shift_worker
-        row.ords_status = "PENDING"
-        outbox = session.scalar(
-            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
-        )
-        if outbox is None:
-            session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING"))
-        else:
-            outbox.status = "PENDING"
-            outbox.next_attempt_at = None
-            outbox.last_http_status = None
-            outbox.last_error = None
-        repaired += 1
-    return repaired
+    """Retired: held attendance requires an explicit manual force-release run."""
+    return 0
 
 
 def repair_verified_active_identity_backlog(
@@ -3086,155 +2969,8 @@ def repair_verified_active_identity_backlog(
     *,
     limit: int = 500,
 ) -> int:
-    """Requeue recent missing-UID punches proven by a later stable snapshot.
-
-    Some ZKT attendance records contain a user ID and name but no terminal UID.
-    A user ID alone is never sufficient identity evidence because terminals may
-    reuse it.  This bounded repair therefore requires the punch to be newer than
-    the terminal's last identity change and covered by a stable, complete
-    snapshot.  The exact current name must match, and any supplied UID or
-    terminal fingerprint must also match.  Historical or ambiguous rows remain
-    blocked for operator evidence.
-    """
-
-    bounded_limit = max(1, min(int(limit), 500))
-    tolerance = timedelta(
-        seconds=max(0, settings.identity_snapshot_capture_tolerance_seconds)
-    )
-    repaired = 0
-
-    zkts = session.scalars(
-        select(ZKTDevice).where(
-            ZKTDevice.snapshot_complete == True,  # noqa: E712
-            ZKTDevice.identity_snapshot_stable == True,  # noqa: E712
-            ZKTDevice.identity_snapshot_id.is_not(None),
-            ZKTDevice.identity_snapshot_observed_at.is_not(None),
-            ZKTDevice.last_identity_change_at.is_not(None),
-        )
-    ).all()
-    for zkt in zkts:
-        if repaired >= bounded_limit:
-            break
-        assert zkt.identity_snapshot_observed_at is not None
-        assert zkt.last_identity_change_at is not None
-        observed_at = ensure_utc(zkt.identity_snapshot_observed_at)
-        identity_change_at = ensure_utc(zkt.last_identity_change_at)
-        valid_resolutions = valid_identity_resolutions(session, zkt=zkt)
-        resolved_conflict_hashes = tuple(valid_resolutions)
-
-        candidates = session.execute(
-            select(AttendanceEvent, DeviceUser)
-            .join(
-                DeviceUser,
-                (DeviceUser.zkt_device_id == AttendanceEvent.zkt_device_id)
-                & (DeviceUser.user_id == AttendanceEvent.user_id),
-            )
-            .where(
-                AttendanceEvent.zkt_device_id == zkt.id,
-                AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
-                or_(
-                    AttendanceEvent.identity_resolution_status.is_(None),
-                    AttendanceEvent.identity_resolution_status != "BLOCKED_PROVENANCE",
-                ),
-                AttendanceEvent.cnic_lookup_hash == None,  # noqa: E711
-                AttendanceEvent.device_event_time >= identity_change_at,
-                DeviceUser.lifecycle_state == "ACTIVE",
-                DeviceUser.present == True,  # noqa: E712
-                DeviceUser.cnic_encrypted.is_not(None),
-                DeviceUser.cnic_lookup_hash.is_not(None),
-                # Make the database select only rows that can actually be
-                # repaired. Previously, newer bad-name rows consumed the
-                # bounded LIMIT forever and starved older valid punches.
-                func.lower(func.trim(AttendanceEvent.display_name))
-                == func.lower(func.trim(DeviceUser.display_name)),
-                AttendanceEvent.captured_at <= observed_at + tolerance,
-                or_(
-                    AttendanceEvent.identity_terminal_fingerprint.is_(None),
-                    DeviceUser.terminal_identity_fingerprint.is_(None),
-                    AttendanceEvent.identity_terminal_fingerprint
-                    == DeviceUser.terminal_identity_fingerprint,
-                ),
-                or_(
-                    DeviceUser.identity_conflict_code.is_(None),
-                    DeviceUser.cnic_lookup_hash.in_(resolved_conflict_hashes)
-                    if resolved_conflict_hashes
-                    else DeviceUser.identity_conflict_code.is_(None),
-                ),
-                (
-                    AttendanceEvent.device_user_id.is_(None)
-                    | (AttendanceEvent.device_user_id == DeviceUser.id)
-                ),
-                (
-                    AttendanceEvent.uid.is_(None)
-                    | (AttendanceEvent.uid == "")
-                    | (AttendanceEvent.uid == DeviceUser.uid)
-                ),
-            )
-            .order_by(AttendanceEvent.id.desc())
-            .limit(bounded_limit - repaired)
-            .with_for_update(skip_locked=True)
-        ).all()
-
-        for row, user in candidates:
-            if ensure_utc(row.captured_at) > observed_at + tolerance:
-                continue
-            if not _identity_names_match(row.display_name or "", user.display_name or ""):
-                continue
-            if (
-                row.identity_terminal_fingerprint
-                and user.terminal_identity_fingerprint
-                and not secrets.compare_digest(
-                    row.identity_terminal_fingerprint,
-                    user.terminal_identity_fingerprint,
-                )
-            ):
-                continue
-
-            identity_resolution = None
-            if user.identity_conflict_code:
-                identity_resolution = valid_resolutions.get(
-                    user.cnic_lookup_hash or ""
-                )
-                if identity_resolution is None:
-                    continue
-
-            cnic = decrypt_cnic(user.cnic_encrypted)
-            if not cnic:
-                continue
-
-            now = utc_now()
-            row.device_user_id = user.id
-            row.identity_resolution_id = (
-                identity_resolution.id if identity_resolution is not None else None
-            )
-            row.identity_snapshot_id = zkt.identity_snapshot_id
-            row.identity_terminal_fingerprint = user.terminal_identity_fingerprint
-            row.identity_resolution_status = "RESOLVED_CURRENT_SNAPSHOT"
-            row.identity_resolved_at = now
-            row.identity_repaired_at = now
-            row.identity_repair_reason = "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
-            row.display_name = user.display_name
-            row.cnic_encrypted = user.cnic_encrypted
-            row.cnic_lookup_hash = user.cnic_lookup_hash
-            row.cnic_last4 = user.cnic_last4
-            row.raw_punch = row.raw_punch or user.shift_worker
-            row.ords_status = "PENDING"
-            outbox = session.scalar(
-                select(OrdsOutbox).where(
-                    OrdsOutbox.attendance_event_id == row.id
-                )
-            )
-            if outbox is None:
-                session.add(
-                    OrdsOutbox(attendance_event_id=row.id, status="PENDING")
-                )
-            else:
-                outbox.status = "PENDING"
-                outbox.next_attempt_at = None
-                outbox.last_http_status = None
-                outbox.last_error = None
-            repaired += 1
-    return repaired
+    """Retired: held attendance requires an explicit manual force-release run."""
+    return 0
 
 
 def block_undelivered_attendance(
@@ -3290,6 +3026,9 @@ def block_undelivered_attendance(
 
 def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
     """Recover a provenance hold only when retained identity proves continuity."""
+    from zk_add.attendance_manual_guard import requires_approval
+    if requires_approval(row):
+        return False
     zkt = connector.zkt_device
     source_manifest = None
     if zkt is not None:
@@ -3431,26 +3170,8 @@ def repair_missing_terminal_provenance(
 
 
 def repair_verified_source_identity_backlog(session: Session, *, limit: int = 1000) -> int:
-    """Release reconcile rows whose exact terminal user ID is now verifiable."""
-    candidates = session.execute(
-        select(AttendanceEvent, Connector)
-        .join(Connector, Connector.id == AttendanceEvent.connector_id)
-        .where(
-            AttendanceEvent.source.in_(("FULL_HISTORY", "CURRENT_RECONCILE")),
-            AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
-            AttendanceEvent.identity_resolution_status == "BLOCKED_PROVENANCE",
-            AttendanceEvent.device_serial.is_not(None),
-        )
-        .order_by(AttendanceEvent.id.asc())
-        .limit(max(1, min(int(limit), 5000)))
-        .with_for_update(skip_locked=True)
-    ).all()
-    repaired = 0
-    for row, connector in candidates:
-        repaired += int(recover_verified_source_identity(
-            session, connector=connector, row=row
-        ))
-    return repaired
+    """Retired: held attendance requires an explicit manual force-release run."""
+    return 0
 
 
 def ingest_attendance(
@@ -3616,7 +3337,11 @@ def ingest_attendance(
         namespace_mismatch = bool(
             effective_terminal_serial and effective_terminal_serial != zkt.serial
         )
-        provenance_blocked = namespace_mismatch or (
+        captured_cnic_conflict = bool(
+            parsed.cnic and active_user and active_user.cnic_lookup_hash
+            and cnic_lookup(parsed.cnic) != active_user.cnic_lookup_hash
+        )
+        provenance_blocked = namespace_mismatch or captured_cnic_conflict or (
             historical
             and not historical_identity_is_supported(
                 serial=effective_terminal_serial,
@@ -3705,6 +3430,8 @@ def ingest_attendance(
                     else "BLOCKED_IDENTITY"
                 )
             ),
+            manual_release_required=bool(provenance_blocked or not cnic),
+            captured_cnic_lookup_hash=cnic_lookup(parsed.cnic),
             identity_resolved_at=utc_now() if cnic else None,
             device_serial=effective_terminal_serial or (None if historical else zkt.serial),
             uid=incoming.uid,
@@ -3894,6 +3621,12 @@ def record_oracle_receipts(
             continue
 
         receipt.attendance_event_id = event.id
+        from zk_add.attendance_manual_guard import generic_confirmation_allowed
+        if not generic_confirmation_allowed(session, event):
+            # Keep the receipt itself as evidence, without changing the held
+            # record or replacing the manual delivery's content verification.
+            awaiting_event += 1
+            continue
         outbox = outboxes_by_event_id.get(event.id)
         if outbox is None:
             outbox = OrdsOutbox(attendance_event_id=event.id)
@@ -5584,18 +5317,9 @@ def apply_user_command_terminal_state(
     if command.command_type in {"CREATE_USER", "UPDATE_USER"}:
         apply_verified_terminal_fingerprints(user, command.result or {})
     if zkt and command.command_type in {"CREATE_USER", "UPDATE_USER", "DELETE_USER"}:
-        resolved_conflicts = reconcile_device_user_identity_conflicts(
+        reconcile_device_user_identity_conflicts(
             session, connector=zkt.connector, zkt=zkt
         )
-        candidates = [*resolved_conflicts]
-        if command.command_type in {"CREATE_USER", "UPDATE_USER"}:
-            candidates.append(user)
-        for candidate in {row.id: row for row in candidates if row.id is not None}.values():
-            if (
-                candidate.lifecycle_state == "ACTIVE"
-                and candidate.identity_conflict_code is None
-            ):
-                enrich_undelivered_attendance(session, zkt=zkt, user=candidate)
 
 
 def create_admin_lease(

@@ -349,6 +349,7 @@ def test_ords_delivery_preflight_prevents_transport_failure_fanout(monkeypatch):
         raise AssertionError("delivery must not fan out after the route probe fails")
 
     monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
+    monkeypatch.setattr("zk_add.attendance_force_delivery.split_claims", lambda rows: (rows, []))
     monkeypatch.setattr(worker, "post_ords_membership_check", fail_membership_check)
     monkeypatch.setattr(worker, "post_ords_claim", unexpected_delivery)
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
@@ -404,6 +405,7 @@ def test_ords_delivery_preflight_sends_only_proven_missing_events(monkeypatch):
         return claim[0], claim[2], 201, {"success": True}, None, True
 
     monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
+    monkeypatch.setattr("zk_add.attendance_force_delivery.split_claims", lambda rows: (rows, []))
     monkeypatch.setattr(worker, "post_ords_membership_check", check_membership)
     monkeypatch.setattr(worker, "post_ords_claim", deliver_missing)
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
@@ -619,13 +621,13 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
     assert blocked.device_user_id == target.id
     assert blocked.identity_resolution_status == "RESOLVED_HISTORICAL_ALIAS"
     assert blocked.identity_repair_reason == "VERIFIED_HISTORICAL_ALIAS"
-    assert blocked.ords_status == "PENDING"
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
     assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
     outbox = db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == blocked.id)
     )
     assert outbox is not None
-    assert outbox.status == "PENDING"
+    assert outbox.status == "BLOCKED_IDENTITY"
 
     replay, replay_repaired = create_historical_identity_alias(
         db,
@@ -639,6 +641,7 @@ def test_historical_identity_alias_repairs_blocked_events_and_is_idempotent(
     )
     assert replay.id == alias.id
     assert replay_repaired == 0
+
 
 
 def test_historical_directory_identity_repairs_deleted_service_number_user(
@@ -713,13 +716,13 @@ def test_historical_directory_identity_repairs_deleted_service_number_user(
     assert decrypt_cnic(source.cnic_encrypted) == CNIC
     assert blocked.identity_resolution_status == "RESOLVED_DIRECTORY_EVIDENCE"
     assert blocked.identity_repair_reason == "VERIFIED_HR_DIRECTORY_EVIDENCE"
-    assert blocked.ords_status == "PENDING"
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
     assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
     outbox = db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == blocked.id)
     )
     assert outbox is not None
-    assert outbox.status == "PENDING"
+    assert outbox.status == "BLOCKED_IDENTITY"
 
     replay, replay_repaired = create_historical_directory_identity(
         db,
@@ -737,6 +740,7 @@ def test_historical_directory_identity_repairs_deleted_service_number_user(
     )
     assert replay.id == tombstone.id
     assert replay_repaired == 0
+
 
 
 def test_historical_identity_report_attributes_only_unambiguous_deleted_users(
@@ -885,7 +889,7 @@ def test_historical_event_group_identity_repairs_exact_orphan_without_touching_l
     ).all()
     assert len(rows) == 2
     assert all(row.device_user_id == source.id for row in rows)
-    assert all(row.ords_status == "PENDING" for row in rows)
+    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows)
     assert all(
         row.identity_resolution_status == "RESOLVED_DIRECTORY_EVENT_GROUP"
         for row in rows
@@ -896,6 +900,7 @@ def test_historical_event_group_identity_repairs_exact_orphan_without_touching_l
         .select_from(OrdsOutbox)
         .where(OrdsOutbox.attendance_event_id.in_([row.id for row in rows]))
     ) == 2
+
 
 
 def test_historical_event_group_identity_accepts_named_legacy_cohort_without_uid(
@@ -946,13 +951,14 @@ def test_historical_event_group_identity_accepts_named_legacy_cohort_without_uid
     assert repaired == 2
     assert tombstone.uid == ""
     assert all(
-        row.ords_status == "PENDING"
+        row.ords_status == "BLOCKED_IDENTITY"
         for row in db.scalars(
             select(AttendanceEvent).where(
                 AttendanceEvent.event_uid.in_(["6" * 64, "a" * 64])
             )
         ).all()
     )
+
 
 
 def test_historical_event_group_resolves_to_exact_current_verified_identity(
@@ -1019,7 +1025,7 @@ def test_historical_event_group_resolves_to_exact_current_verified_identity(
     )
     assert row is not None
     assert row.device_user_id == active.id
-    assert row.ords_status == "PENDING"
+    assert row.ords_status == "BLOCKED_IDENTITY"
     assert row.identity_resolution_status == "RESOLVED_CURRENT_IDENTITY_EVIDENCE"
     assert row.identity_repair_reason == "VERIFIED_CURRENT_IDENTITY_EVENT_GROUP"
     assert decrypt_cnic(row.cnic_encrypted) == CNIC
@@ -1027,7 +1033,7 @@ def test_historical_event_group_resolves_to_exact_current_verified_identity(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
     )
     assert outbox is not None
-    assert outbox.status == "PENDING"
+    assert outbox.status == "BLOCKED_IDENTITY"
     audit = db.scalar(
         select(AuditEvent).where(
             AuditEvent.action == "HISTORICAL_CURRENT_IDENTITY_VERIFIED"
@@ -1063,6 +1069,7 @@ def test_historical_event_group_resolves_to_exact_current_verified_identity(
     assert db.scalar(
         select(func.count()).select_from(HistoricalCurrentIdentityResolution)
     ) == 1
+
 
 
 @pytest.mark.parametrize(
@@ -1266,8 +1273,9 @@ def test_historical_directory_identity_accepts_exact_alphanumeric_service_number
 
     assert tombstone.device_user_id == source.id
     assert repaired == 1
-    assert blocked.ords_status == "PENDING"
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
     assert blocked.identity_resolution_status == "RESOLVED_DIRECTORY_EVIDENCE"
+
 
 
 def test_historical_directory_identity_rejects_name_only_match(db: Session):
@@ -1345,22 +1353,13 @@ def test_verified_tombstone_requeues_existing_blocked_punches(
     )
     db.flush()
 
-    # The bounded scan must skip the earlier unrecoverable row instead of
-    # allowing it to starve later rows that have verified tombstones.
-    assert repair_verified_tombstone_backlog(db, limit=1) == 1
-    assert blocked.device_user_id == tombstone.device_user_id
-    assert blocked.identity_resolution_status == "RESOLVED_TOMBSTONE"
-    assert blocked.identity_repair_reason == "VERIFIED_IDENTITY_TOMBSTONE"
-    assert decrypt_cnic(blocked.cnic_encrypted) == CNIC
-    assert blocked.ords_status == "PENDING"
-    assert outbox.status == "PENDING"
-    assert outbox.next_attempt_at is None
-
+    assert repair_verified_tombstone_backlog(db, limit=1) == 0
+    assert tombstone.cnic_lookup_hash
+    assert blocked.cnic_encrypted is None
+    assert blocked.ords_status == outbox.status == "BLOCKED_IDENTITY"
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
-    claims = worker.claim_ords_batch(1)
-    assert len(claims) == 1
-    assert claims[0][1]["event_uid"] == "9" * 64
-    assert claims[0][1]["cnic"] == CNIC
+    assert worker.claim_ords_batch(1) == []
+
 
 
 def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
@@ -1419,20 +1418,10 @@ def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
     }
     assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows.values())
 
-    assert repair_verified_active_identity_backlog(db) == 1
-    repaired = rows["1" * 64]
-    assert repaired.device_user_id == user.id
-    assert repaired.identity_snapshot_id == zkt.identity_snapshot_id
-    assert repaired.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
-    assert repaired.identity_repair_reason == "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
-    assert decrypt_cnic(repaired.cnic_encrypted) == CNIC
-    assert repaired.ords_status == "PENDING"
-    assert db.scalar(
-        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == repaired.id)
-    )
-    for event_uid in ("2" * 64, "3" * 64, "4" * 64, "5" * 64):
-        assert rows[event_uid].ords_status == "BLOCKED_IDENTITY"
-        assert rows[event_uid].cnic_lookup_hash is None
+    assert repair_verified_active_identity_backlog(db) == 0
+    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows.values())
+    assert all(row.cnic_encrypted is None for row in rows.values())
+
 
 
 def test_snapshot_history_recovers_backdated_punches_across_unchanged_catalog(
@@ -1486,13 +1475,14 @@ def test_snapshot_history_recovers_backdated_punches_across_unchanged_catalog(
     )
     ingest_attendance(db, connector=connector, events=[punch])
 
-    assert repair_verified_active_identity_backlog(db) == 1
+    assert repair_verified_active_identity_backlog(db) == 0
     repaired = db.scalar(
         select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid)
     )
     assert repaired is not None
-    assert repaired.ords_status == "PENDING"
-    assert decrypt_cnic(repaired.cnic_encrypted) == CNIC
+    assert repaired.ords_status == "BLOCKED_IDENTITY"
+    assert repaired.cnic_encrypted is None
+
 
 
 def test_partial_snapshot_breaks_identity_continuity_for_backdated_repair(db: Session):
@@ -1557,13 +1547,14 @@ def test_verified_active_snapshot_repair_is_not_starved_by_newer_bad_names(
         )
         ingest_attendance(db, connector=connector, events=[invalid])
 
-    assert repair_verified_active_identity_backlog(db, limit=1) == 1
+    assert repair_verified_active_identity_backlog(db, limit=1) == 0
     repaired = db.scalar(
         select(AttendanceEvent).where(AttendanceEvent.event_uid == valid.event_uid)
     )
     assert repaired is not None
-    assert repaired.ords_status == "PENDING"
-    assert repaired.identity_repair_reason == "VERIFIED_CURRENT_TERMINAL_SNAPSHOT"
+    assert repaired.ords_status == "BLOCKED_IDENTITY"
+    assert repaired.identity_repair_reason is None
+
 
 
 def test_verified_active_snapshot_requires_duplicate_cnic_resolution(db: Session):
@@ -1618,10 +1609,11 @@ def test_verified_active_snapshot_requires_duplicate_cnic_resolution(db: Session
         idempotency_key="repair-current-snapshot-duplicate",
         actor="StateHealthAdmin",
     )
-    assert repair_verified_active_identity_backlog(db) == 1
-    assert blocked.identity_resolution_id == resolution.id
-    assert blocked.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
-    assert blocked.ords_status == "PENDING"
+    assert repair_verified_active_identity_backlog(db) == 0
+    assert resolution.id
+    assert blocked.ords_status == "BLOCKED_IDENTITY"
+    assert blocked.cnic_encrypted is None
+
 
 
 def test_maintenance_resolves_delivery_alert_only_after_queue_drains(db: Session):
@@ -1691,9 +1683,9 @@ def test_historical_alias_is_eligible_for_ords_delivery(
 
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
     claims = worker.claim_ords_batch(1)
-    assert len(claims) == 1
-    assert claims[0][1]["event_uid"] == "8" * 64
-    assert claims[0][1]["cnic"] == CNIC
+    assert claims == []
+    assert db.scalar(select(AttendanceEvent)).manual_release_required
+
 
 
 def test_request_signing_fixed_compatibility_vector():
@@ -2016,7 +2008,7 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert attendance.cnic_encrypted is None
     assert db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
-    ) is None
+    ) is None is None
 
     make_writable(connector)
     with pytest.raises(
@@ -2075,11 +2067,12 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
     assert [row.identity_conflict_code for row in users] == [None, None]
     assert {decrypt_cnic(row.cnic_encrypted) for row in users} == {CNIC, replacement_cnic}
     assert alert.state == "RESOLVED"
-    assert attendance.ords_status == "PENDING"
-    assert decrypt_cnic(attendance.cnic_encrypted) == CNIC
+    assert attendance.ords_status == "BLOCKED_IDENTITY"
+    assert attendance.manual_release_required
     assert db.scalar(
         select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == attendance.id)
-    )
+    ) is None
+
 
 
 def test_same_employee_resolution_is_audited_reversible_and_never_mutates_punches(
@@ -2856,69 +2849,11 @@ def test_missing_identity_is_unblocked_but_acked_attendance_is_immutable(db: Ses
         error_code=None,
         error_message=None,
     )
-    assert row.ords_status == "PENDING"
-    assert decrypt_cnic(row.cnic_encrypted) == CNIC
-    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
-    assert outbox
-    row.ords_status = "FAILED_RETRYABLE"
-    outbox.status = "FAILED_RETRYABLE"
-    outbox.next_attempt_at = utc_now() + timedelta(minutes=10)
-    outbox.last_http_status = 503
-    outbox.last_error = "HTTP_503"
-    second = update_device_user_command(
-        db,
-        connector=connector,
-        user=user,
-        display_name=None,
-        cnic="6110112345671",
-        shift_worker=None,
-        privilege=None,
-        expected_version=user.row_version,
-        idempotency_key="enrich-identity-0002",
-        actor="StateHealthAdmin",
-    )
-    apply_command_update(
-        db,
-        connector=connector,
-        command_id=second.command_id,
-        status="SUCCEEDED",
-        result={"verified_privilege": 0},
-        error_code=None,
-        error_message=None,
-    )
-    assert row.ords_status == "PENDING"
-    assert decrypt_cnic(row.cnic_encrypted) == "6110112345671"
-    assert outbox.status == "PENDING"
-    assert outbox.next_attempt_at is None
-    assert outbox.last_http_status is None
-    assert outbox.last_error is None
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert row.cnic_encrypted is None
+    assert row.manual_release_required
+    assert decrypt_cnic(user.cnic_encrypted) == CNIC
 
-    row.ords_status = "ACKED"
-    outbox.status = "ACKED"
-    original_encrypted = row.cnic_encrypted
-    third = update_device_user_command(
-        db,
-        connector=connector,
-        user=user,
-        display_name=None,
-        cnic="3520212345671",
-        shift_worker=None,
-        privilege=None,
-        expected_version=user.row_version,
-        idempotency_key="enrich-identity-0003",
-        actor="StateHealthAdmin",
-    )
-    apply_command_update(
-        db,
-        connector=connector,
-        command_id=third.command_id,
-        status="SUCCEEDED",
-        result={"verified_privilege": 0},
-        error_code=None,
-        error_message=None,
-    )
-    assert row.cnic_encrypted == original_encrypted
-    assert decrypt_cnic(row.cnic_encrypted) == "6110112345671"
 
 
 def test_deleted_identity_tombstone_attributes_later_punches(db: Session):
@@ -4989,10 +4924,10 @@ def test_stable_snapshot_clears_removed_cnic_and_repairs_only_verified_pending_r
         ),
     )
     db.flush()
-    assert decrypt_cnic(attendance.cnic_encrypted) == replacement
-    assert attendance.ords_status == "PENDING"
-    assert attendance.identity_resolution_status == "RESOLVED"
-    assert attendance.identity_repair_reason == "VERIFIED_TERMINAL_SNAPSHOT"
+    assert attendance.cnic_encrypted is None
+    assert attendance.ords_status == "BLOCKED_IDENTITY"
+    assert attendance.manual_release_required
+
 
 
 def test_snapshot_revision_detects_same_count_valid_to_valid_identity_change(db: Session):
@@ -6377,14 +6312,14 @@ def test_recovery_reclassifies_exact_zkt_identity_and_projects_cnic_before_deliv
     db.commit()
     assert advance_attendance_recovery_jobs(db, owner="test-worker") == 1
     db.refresh(held)
-    assert held.ords_status == "PENDING"
-    assert held.identity_resolution_status == "RESOLVED_CURRENT_SNAPSHOT"
-    assert held.cnic_lookup_hash == user.cnic_lookup_hash
-    assert decrypt_cnic(held.cnic_encrypted) == CNIC
+    assert held.ords_status == "BLOCKED_IDENTITY"
+    assert held.cnic_encrypted is None
     outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == held.id))
-    assert outbox is not None and outbox.status == "PENDING"
+    assert outbox is None or outbox.status == "BLOCKED_IDENTITY"
     item = db.scalar(select(AttendanceRecoveryItem).where(AttendanceRecoveryItem.job_id == job.id))
-    assert item.result["identity_repaired"] is True
+    assert item.status == "SKIPPED"
+    assert item.error_code == "MANUAL_APPROVAL_REQUIRED"
+
 
 
 def test_recovery_job_skips_preview_drift_without_mutating_event(db, monkeypatch):

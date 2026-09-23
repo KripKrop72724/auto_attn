@@ -486,7 +486,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONC
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
 # Safe repair is check-only until production canaries are explicitly enabled.
-foreach ($repairFlag in @("PREVIEW", "EXECUTION", "AUTOMATIC")) {
+foreach ($repairFlag in @("PREVIEW", "EXECUTION")) {
     $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_ATTENDANCE_SAFE_REPAIR_${repairFlag}_ENABLED")
     $environment["ADD_ATTENDANCE_SAFE_REPAIR_${repairFlag}_ENABLED"] = if ($deployValue -eq "true") { "true" } else { "false" }
 }
@@ -494,8 +494,15 @@ $environment["ADD_ATTENDANCE_SAFE_REPAIR_ALLOWED_CONNECTORS"] = $env:ADD_DEPLOY_
 if ($environment["ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED"] -eq "true" -and $environment["ADD_ATTENDANCE_SAFE_REPAIR_PREVIEW_ENABLED"] -ne "true") {
     throw "Attendance repair execution requires checks."
 }
-if ($environment["ADD_ATTENDANCE_SAFE_REPAIR_AUTOMATIC_ENABLED"] -eq "true" -and $environment["ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED"] -ne "true") {
-    throw "Automatic attendance repair requires execution."
+$environment.Remove("ADD_ATTENDANCE_SAFE_REPAIR_AUTOMATIC_ENABLED")
+foreach ($forceFlag in @("PREVIEW", "EXECUTION")) {
+    $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_ATTENDANCE_FORCE_RELEASE_${forceFlag}_ENABLED")
+    $environment["ADD_ATTENDANCE_FORCE_RELEASE_${forceFlag}_ENABLED"] = if ($deployValue -eq "true") { "true" } else { "false" }
+}
+$environment["ADD_ATTENDANCE_FORCE_RELEASE_ALLOWED_CONNECTORS"] = $env:ADD_DEPLOY_ATTENDANCE_FORCE_RELEASE_ALLOWED_CONNECTORS
+$environment["ADD_ATTENDANCE_FORCE_RELEASE_ALLOWED_FAMILIES"] = if ($env:ADD_DEPLOY_ATTENDANCE_FORCE_RELEASE_ALLOWED_FAMILIES) { $env:ADD_DEPLOY_ATTENDANCE_FORCE_RELEASE_ALLOWED_FAMILIES } else { "zkt" }
+if ($environment["ADD_ATTENDANCE_FORCE_RELEASE_EXECUTION_ENABLED"] -eq "true" -and $environment["ADD_ATTENDANCE_FORCE_RELEASE_PREVIEW_ENABLED"] -ne "true") {
+    throw "Manual force release requires checks."
 }
 
 $environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] = if (
@@ -802,7 +809,17 @@ try {
             $schemaMayHaveChanged = $applicationStarted -and (
                 -not $preRevision -or -not $postFailureRevision -or $postFailureRevision -ne $preRevision
             )
-            if ($schemaMayHaveChanged) {
+            # Manual approvals and records accepted during deployment must not
+            # disappear when restoring an application image. Migration 0035 is
+            # additive and its delivery guards also protect older ADD images.
+            if ($schemaMayHaveChanged -and -not $postFailureRevision) {
+                throw "Schema revision is unavailable. Preserve PostgreSQL and investigate; an automatic restore could erase accepted attendance."
+            }
+            $preserveManualPolicy = $postFailureRevision -and $postFailureRevision -ge "20260923_0035"
+            if ($schemaMayHaveChanged -and $preserveManualPolicy) {
+                Write-Warning "Preserving manual approvals, delivery evidence and the additive schema during application rollback."
+            }
+            if ($schemaMayHaveChanged -and -not $preserveManualPolicy) {
                 $postgresContainer = Get-PostgresContainer
                 if (-not $postgresContainer) { throw "Cannot restore PostgreSQL: container is unavailable." }
                 $rollbackDump = "/tmp/rollback-$stamp.dump"

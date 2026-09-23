@@ -5,6 +5,7 @@ from sqlalchemy import select, func
 
 from zk_add.crypto import decrypt_cnic
 from zk_add.hikvision_delivery import HikvisionPolicy
+import zk_add.hikvision_profiles  # noqa: F401
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation, HikvisionEvidence
 from zk_add.models import AttendanceEvent, OrdsOutbox
 import pytest
@@ -120,8 +121,9 @@ def test_profile_arrival_releases_only_previously_unmapped_undelivered_punches(d
     first = session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 123))
     uid = first.event_uid
     publish_profile(session, connector)
-    assert repair_profile_identity_holds(session) == 1
-    assert first.ords_status == "PENDING" and first.event_uid == uid
+    assert repair_profile_identity_holds(session) == 0
+    assert first.ords_status == "BLOCKED_IDENTITY" and first.event_uid == uid
+    assert first.manual_release_required
     # Leading zero identifiers are distinct; names never supply the join.
     assert session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 124)).ords_status == "BLOCKED_IDENTITY"
     assert repair_profile_identity_holds(session) == 0

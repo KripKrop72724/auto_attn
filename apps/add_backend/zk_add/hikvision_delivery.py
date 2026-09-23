@@ -12,7 +12,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from zk_add.crypto import encrypt_cnic, cnic_lookup, normalize_cnic, decrypt_text
 from zk_add.db import Base
 from zk_add.identity import parse_machine_name
-from zk_add.models import AttendanceEvent, Connector, OrdsOutbox, DeviceUser, ZKTDevice
+from zk_add.models import AttendanceEvent, Connector, OrdsOutbox, DeviceUser
 from zk_add.time_utils import utc_now
 
 
@@ -54,44 +54,8 @@ def profile_identity(session, connector, employee_no):
 
 
 def repair_profile_identity_holds(session: Session, limit: int = 200) -> int:
-    """Bounded recovery after a verified profile snapshot arrives after a punch."""
-    from sqlalchemy.orm import aliased
-    from zk_add.hikvision_evidence import HikvisionEvidence
-    from zk_add.hikvision_protocol import normalize_observation
-    from zk_add.hikvision_probe import decode_body
-
-    other = aliased(DeviceUser)
-    reused = select(other.id).where(
-        other.zkt_device_id == DeviceUser.zkt_device_id,
-        other.user_id == DeviceUser.user_id, other.id != DeviceUser.id,
-    ).exists()
-    candidates = session.scalars(select(HikvisionEvidence).join(
-        AttendanceEvent, AttendanceEvent.event_uid == HikvisionEvidence.event_uid,
-    ).join(DeviceUser, (DeviceUser.zkt_device_id == AttendanceEvent.zkt_device_id) &
-           (DeviceUser.user_id == AttendanceEvent.user_id)).join(
-        ZKTDevice, ZKTDevice.id == DeviceUser.zkt_device_id,
-    ).join(HikvisionPolicy, HikvisionPolicy.connector_id == HikvisionEvidence.connector_id).where(
-        HikvisionPolicy.enabled.is_(True), HikvisionPolicy.source_epoch == HikvisionEvidence.source_epoch,
-        HikvisionPolicy.terminal_serial == HikvisionEvidence.terminal_serial,
-        ZKTDevice.snapshot_complete.is_(True), ZKTDevice.identity_snapshot_stable.is_(True),
-        DeviceUser.snapshot_revision == ZKTDevice.identity_snapshot_revision,
-        HikvisionEvidence.disposition == "IDENTITY_BLOCKED",
-        AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
-        AttendanceEvent.cnic_lookup_hash.is_(None),
-        DeviceUser.present.is_(True), DeviceUser.lifecycle_state == "ACTIVE",
-        DeviceUser.identity_conflict_code.is_(None), DeviceUser.cnic_lookup_hash.is_not(None),
-        ~reused,
-    ).order_by(HikvisionEvidence.id).limit(limit)).all()
-    resolved = 0
-    for evidence in candidates:
-        connector = session.get(Connector, evidence.connector_id)
-        raw = decode_body(decrypt_text(evidence.raw_encrypted).encode())
-        observation = normalize_observation(raw, terminal_serial=evidence.terminal_serial,
-                                            source_epoch=evidence.source_epoch)
-        deliver_observation(session, connector, evidence, observation, raw)
-        resolved += evidence.disposition == "ATTENDANCE"
-    session.flush()
-    return resolved
+    """Retired: held attendance requires an explicit manual force-release run."""
+    return 0
 
 
 def _hold_existing(session, row, code):
@@ -165,6 +129,9 @@ def deliver_observation(
         if lookup and existing.cnic_lookup_hash and lookup != existing.cnic_lookup_hash:
             evidence.disposition = "IDENTITY_FACT_CONFLICT"
             _hold_existing(session, existing, "QUARANTINED_IDENTITY_CONFLICT")
+            return
+        from zk_add.attendance_manual_guard import requires_approval
+        if requires_approval(existing):
             return
         if (cnic and not existing.cnic_lookup_hash and existing.ords_status == "BLOCKED_IDENTITY"
                 and existing.identity_resolution_status == "BLOCKED_PROVENANCE"

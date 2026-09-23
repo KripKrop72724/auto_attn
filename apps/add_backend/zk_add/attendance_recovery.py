@@ -871,6 +871,12 @@ def _process_delivery_item(session: Session, job: AttendanceRecoveryJob, item: A
         _mark_item(item, status="SKIPPED", outcome="SOURCE_MISSING", error_code="SOURCE_MISSING", error_message="The preserved attendance event is no longer available.")
         job.skipped_count += 1
         return
+    from zk_add.attendance_manual_guard import delivery_authorized
+    if not delivery_authorized(session, event):
+        _mark_item(item, status="SKIPPED", outcome="MANUAL_APPROVAL_REQUIRED", error_code="MANUAL_APPROVAL_REQUIRED",
+                   error_message="Use Force release attendance for a fresh terminal check and administrator approval.")
+        job.skipped_count += 1
+        return
     if _recovery_state_digest(session, event, outbox, connector) != item.expected_state_digest:
         _mark_item(item, status="SKIPPED", outcome="STATE_DRIFT", error_code="STATE_DRIFT", error_message="The event changed after preview; refresh before retrying.")
         job.skipped_count += 1
@@ -1576,7 +1582,7 @@ def advance_attendance_recovery_jobs(session: Session, *, limit: int | None = No
         select(AttendanceRecoveryJob)
         .where(
             AttendanceRecoveryJob.status.in_(("QUEUED", "RUNNING")),
-            AttendanceRecoveryJob.action != "SAFE_REPAIR",
+            AttendanceRecoveryJob.action.not_in(("SAFE_REPAIR", "MANUAL_FORCE_RELEASE")),
             or_(AttendanceRecoveryJob.lease_until.is_(None), AttendanceRecoveryJob.lease_until <= now),
         )
         .order_by(AttendanceRecoveryJob.id.asc())
@@ -1648,7 +1654,7 @@ def control_recovery_job(
     reason: str, idempotency_key: str, candidate_digest: str,
     typed_confirmation: str,
 ) -> AttendanceRecoveryJob:
-    if job.action == "SAFE_REPAIR":
+    if job.action in {"SAFE_REPAIR", "MANUAL_FORCE_RELEASE"}:
         raise RecoveryError("Use the Repair attendance controls for this run.", "WORKFLOW_MISMATCH")
     job = session.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.id == job.id)
                          .with_for_update().execution_options(populate_existing=True))

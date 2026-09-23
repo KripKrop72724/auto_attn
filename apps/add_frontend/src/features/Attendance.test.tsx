@@ -430,6 +430,7 @@ describe('Live attendance workspace', () => {
       const url = new URL(String(input), 'https://add.test')
       if (url.pathname === '/api/v1/attendance')
         return response({ rows: [], next_cursor: null })
+      if (['/api/v2/attendance-force-releases', '/api/v2/attendance-recovery/checks'].includes(url.pathname)) return response({ enabled: true, rows: [], next_cursor: null })
       if (url.pathname === '/api/v2/attendance-release-queue')
         return response({
           preview_enabled: true,
@@ -474,178 +475,12 @@ describe('Live attendance workspace', () => {
     await waitFor(() => expect(reviewTab.getAttribute('aria-selected')).toBe('true'))
   })
 
-  it('starts empty, selects all eligible across unloaded pages, and records explicit exclusions', async () => {
+  it('opens the manual workflow instead of the retired release controls', async () => {
     window.history.replaceState(null, '', '/attendance?view=needs-review')
-    const locked = queueRow({
-      user_key: '33333333-3333-4333-8333-333333333333',
-      display_name: 'CNIC Missing User',
-      user_id: '1010',
-      uid: '10',
-      cnic_masked: null,
-      eligible: false,
-      lock_reason: 'TARGET_CNIC_MISSING',
-      lock_reasons: ['TARGET_CNIC_MISSING'],
-      counts: {
-        ordinary_blocked: 1,
-        identity_reuse: 0,
-        eligible: 0,
-        locked: 1,
-        in_progress: 0,
-      },
-    })
-    const candidatePage = releaseCandidates([releaseCandidate()], {
-      totals: {
-        all: 2,
-        eligible: 2,
-        locked: 0,
-        ordinary_blocked: 2,
-        identity_reuse: 0,
-      },
-      next_cursor: 1,
-    })
-    const prepared = releaseJob()
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(String(input), 'https://add.test')
-      if (url.pathname === '/api/v2/attendance-release-queue')
-        return response({
-          preview_enabled: true,
-          execution_enabled: true,
-          totals: { employees: 2, events: 3, eligible: 2, locked: 1 },
-          rows: [queueRow(), locked],
-          next_cursor: null,
-        })
-      if (url.pathname.endsWith('/attendance-release-candidates/query'))
-        return response(candidatePage)
-      if (url.pathname.endsWith('/attendance-releases/prepare') && init?.method === 'POST')
-        return response(prepared, 201)
-      throw new Error(`Unexpected request ${url.pathname}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('fetch', vi.fn(async () => response({ enabled: true, rows: [], next_cursor: null })))
     render(<AttendanceView {...attendanceProps} />)
-
-    expect(
-      (await screen.findByRole('link', { name: 'Add CNIC' })).getAttribute('href'),
-    ).toBe(`/users/${device.connector_id}?user_id=1010`)
-    fireEvent.click(screen.getByRole('button', { name: 'Review punches' }))
-    const checkbox = await screen.findByRole('checkbox', { name: /Select Check in/i })
-    expect((checkbox as HTMLInputElement).checked).toBe(false)
-    expect(screen.getByText('0 selected')).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: /Select all 2 eligible matching filters/i }))
-    expect((checkbox as HTMLInputElement).checked).toBe(true)
-    expect(screen.getByText('2 selected')).toBeTruthy()
-    fireEvent.click(checkbox)
-    expect((checkbox as HTMLInputElement).checked).toBe(false)
-    expect(screen.getByText('1 selected')).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: /Prepare 1 punches/i }))
-    expect(await screen.findByText(/Oracle check is running/i)).toBeTruthy()
-    const prepareCall = fetchMock.mock.calls.find(([input]) =>
-      String(input).endsWith('/attendance-releases/prepare'),
-    )
-    const payload = JSON.parse(String(prepareCall?.[1]?.body))
-    expect(payload.selection_mode).toBe('ALL_FILTERED')
-    expect(payload.included_event_tokens).toEqual([])
-    expect(payload.excluded_event_tokens).toEqual(['event-token-one'])
-    expect(payload.candidate_set_token).toBe('candidate-set-token')
-  })
-
-  it('requires escalated reuse evidence and moves an approved release into history', async () => {
-    window.history.replaceState(null, '', '/attendance?view=needs-review')
-    const reuseRow = releaseCandidate({
-      source_ords_status: 'QUARANTINED_IDENTITY_REUSE',
-      risk_class: 'IDENTITY_REUSE',
-    })
-    const confirmation = `RELEASE 1 OF 1 PUNCHES FOR 1007 ON ${device.device_id} INCLUDING 1 REUSE ${'f'.repeat(12)}`
-    const awaiting = releaseJob({
-      status: 'AWAITING_APPROVAL',
-      release_state: 'Awaiting approval',
-      phase: 'PREVIEW_FROZEN',
-      preview_digest: 'f'.repeat(64),
-      preview_expires_at: '2026-08-12T10:15:00Z',
-      typed_confirmation: confirmation,
-      totals: {
-        employees: 1,
-        events: 1,
-        selected: 1,
-        safe: 1,
-        ordinary: 0,
-        reuse: 1,
-        safe_reuse: 1,
-        excluded: 0,
-        completed_employees: 0,
-        completed_events: 0,
-        attention_events: 0,
-      },
-    })
-    const approved = releaseJob({
-      ...awaiting,
-      status: 'QUEUED',
-      release_state: 'Queued',
-      phase: 'ORACLE_REPAIR',
-      typed_confirmation: undefined,
-      approved_at: '2026-08-12T09:05:00Z',
-    })
-    let approvalPayload: Record<string, unknown> | null = null
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(String(input), 'https://add.test')
-      if (url.pathname === '/api/v2/attendance-release-queue')
-        return response({
-          preview_enabled: true,
-          execution_enabled: true,
-          totals: { employees: 1, events: 1, eligible: 1, locked: 0 },
-          rows: [queueRow({ counts: { ordinary_blocked: 0, identity_reuse: 1, eligible: 1, locked: 0, in_progress: 0 } })],
-          next_cursor: null,
-        })
-      if (url.pathname.endsWith('/attendance-release-candidates/query'))
-        return response(releaseCandidates([reuseRow]))
-      if (url.pathname.endsWith('/attendance-releases/prepare') && init?.method === 'POST')
-        return response(awaiting, 201)
-      if (url.pathname.endsWith(`/attendance-releases/${awaiting.job_id}/approve`)) {
-        approvalPayload = JSON.parse(String(init?.body))
-        return response(approved)
-      }
-      if (url.pathname === `/api/v2/attendance-releases/${awaiting.job_id}`)
-        return response(approved)
-      if (url.pathname === '/api/v2/attendance-releases')
-        return response({
-          preview_enabled: true,
-          execution_enabled: true,
-          rows: [approved],
-          next_cursor: null,
-          totals: { all: 1, active: 1, attention: 0 },
-          worker: {},
-        })
-      throw new Error(`Unexpected request ${url.pathname}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Review punches' }))
-    fireEvent.click(await screen.findByRole('checkbox', { name: /Select Check in/i }))
-    fireEvent.click(screen.getByRole('button', { name: /Prepare 1 punches/i }))
-    expect(await screen.findByRole('group', { name: /Elevated identity-reuse attestation/i })).toBeTruthy()
-    const approveButton = screen.getByRole('button', { name: /Approve safe punches/i })
-    expect((approveButton as HTMLButtonElement).disabled).toBe(true)
-
-    fireEvent.change(screen.getByLabelText('Full CNIC'), { target: { value: '3520212345671' } })
-    fireEvent.change(screen.getByLabelText('Authoritative employee name'), { target: { value: 'Dr Farzana' } })
-    fireEvent.change(screen.getByLabelText(/Release reason/i), { target: { value: 'Verified exact reuse ownership evidence.' } })
-    fireEvent.change(screen.getByLabelText('Current administrator password'), { target: { value: 'admin-password' } })
-    fireEvent.change(screen.getByLabelText(/Type the server confirmation exactly/i), { target: { value: confirmation } })
-    expect((approveButton as HTMLButtonElement).disabled).toBe(false)
-    fireEvent.click(approveButton)
-
-    expect(await screen.findByRole('heading', { name: 'Attendance · Release history' })).toBeTruthy()
-    expect(window.location.search).toContain('view=release-history')
-    expect(window.location.search).toContain(`release_job=${awaiting.job_id}`)
-    expect(approvalPayload).toMatchObject({
-      reason: 'Verified exact reuse ownership evidence.',
-      password: 'admin-password',
-      typed_confirmation: confirmation,
-      preview_digest: 'f'.repeat(64),
-      reuse_cnic: '3520212345671',
-      reuse_employee_name: 'Dr Farzana',
-    })
+    await screen.findByRole('heading', { name: 'Force release attendance' })
+    expect(screen.queryByRole('button', { name: /Prepare.*punches|Start repair/ })).toBeNull()
+    expect((screen.getByRole('button', { name: 'Sync and check' }) as HTMLButtonElement).disabled).toBe(true)
   })
 })

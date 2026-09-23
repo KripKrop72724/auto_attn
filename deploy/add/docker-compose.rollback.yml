@@ -1,5 +1,14 @@
 services:
   add-api:
+    # An older image cannot resolve a newer additive Alembic revision. Rollback
+    # serves the retained schema without replaying or downgrading migrations.
+    command: ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers", "--workers", "1", "--timeout-keep-alive", "10"]
+    environment:
+      ADD_ATTENDANCE_SAFE_REPAIR_AUTOMATIC_ENABLED: "false"
+      ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_RECOVERY_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_FORCE_RELEASE_EXECUTION_ENABLED: "false"
     # A rollback image can predate the current image-resident healthcheck helper.
     # Keep the rollback probe dependency-free and compatible with prior releases.
     healthcheck:

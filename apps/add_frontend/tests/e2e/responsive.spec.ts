@@ -299,6 +299,7 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/alerts') json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null, device: { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id, hardware_id: device.hardware_id } }], next_cursor: null, totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 } }
     else if (url.pathname.endsWith('/alerts')) json = { rows: [] }
     else if (url.pathname === '/api/v1/attendance') json = { rows: [representativeAttendance], next_cursor: null }
+    else if (url.pathname === '/api/v2/attendance-force-releases' || url.pathname === '/api/v2/attendance-recovery/checks') json = { enabled: true, rows: [], next_cursor: null }
     else if (url.pathname === '/api/v2/attendance-release-queue') json = attendanceReleaseQueue
     else if (url.pathname === `/api/v2/devices/${device.connector_id}/attendance-release-candidates/query`) json = attendanceReleaseCandidates
     else if (url.pathname === '/api/v1/firmware/releases') json = { enabled: true, hil_enabled: false, rows: [{ release_id: 'release-2.2.30', version: '2.2.30', git_sha: 'a'.repeat(40), image_sha256: 'b'.repeat(64), application_sha256: 'c'.repeat(64), image_size: 1024, state: 'AVAILABLE', partition_layout: 'ota-v2', signing_key_id: 'production-key', published_at: '2026-07-30T12:00:00Z', revoked_at: null, revoked_by: null, hil_target_mac: null }], next_cursor: null, filtered_total: 1, totals: { all: 1, available: 1, hil_only: 0, revoked: 0 } }
@@ -545,20 +546,10 @@ test('legacy employee repair route opens the responsive blocked-punch review', a
   await expect(page).toHaveURL(/\/attendance\?view=needs-review&device_id=connector-one$/)
   await expect(page.getByRole('heading', { name: 'Attendance · Needs review' })).toBeVisible()
   await expect(page.getByRole('tab', { name: /Needs review/ })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByRole('heading', { name: 'Employees needing review' })).toBeVisible()
-  await expect(page.getByText('Ayesha Khan')).toBeVisible()
-  await expect(page.getByText('One release always stays within one employee and one terminal.')).toBeVisible()
-
-  await page.getByRole('button', { name: 'Review punches' }).click()
-  await expect(page.getByRole('heading', { name: 'Ayesha Khan' })).toBeVisible()
-  await expect(page.getByText('Nothing is selected automatically. New punches never join this frozen candidate set.')).toBeVisible()
-  const punch = page.getByRole('checkbox', { name: /Select Check in/ })
-  await expect(punch).not.toBeChecked()
-  await punch.focus()
-  await page.keyboard.press('Space')
-  await expect(punch).toBeChecked()
-  await expect(page.getByText('1 selected')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Prepare 1 punches' })).toBeEnabled()
+  await expect(page.getByRole('heading', { name: 'Force release attendance' })).toBeVisible()
+  await expect(page.getByText('Manual approval only')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Sync and check' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Review punches' })).toHaveCount(0)
 
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
@@ -829,42 +820,48 @@ test('physical provisioning environment is responsive, explicit, and accessible'
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
 
-test('safe attendance repair remains clear, accessible and resumable', async ({ page }, testInfo) => {
+test('manual force release remains clear, accessible and resumable', async ({ page }, testInfo) => {
   let run = {
     job_id: '11111111-1111-4111-8111-111111111111', status: 'CHECKED', actor: 'StateHealthAdmin',
-    counts: { checked: 328, ready: 300, waiting: 0, confirmed: 0, review: 28, stopped: 0 },
+    counts: { checked: 328, ready: 300, waiting: 0, confirmed: 0, review: 28, stopped: 0, skipped: 0, already_confirmed: 0, already_delivering: 0, unavailable_devices: 0 },
     check_complete: true, created_at: '2026-09-22T10:00:00Z', updated_at: '2026-09-22T10:00:00Z',
     expires_at: '2099-09-22T10:15:00Z', signature: 'a'.repeat(64), last_error: null,
     execution_enabled: true, eligible_at_check: 300,
-    devices: [{ connector_id: device.connector_id, name: device.display_name, serial: device.zkt.serial, checked: 328, status: 'CHECKED' }],
+    devices: [{ connector_id: device.connector_id, name: device.display_name, serial: device.zkt.serial, checked: 328, ready: 300, status: 'CHECKED', synced_at: '2026-09-23T10:00:00Z', error: null }],
   }
-  await page.route('**/api/v2/attendance-recovery/**', async route => {
+  await page.route(/\/api\/v2\/attendance-force-releases(?:\/|\?|$)/, async route => {
     const path = new URL(route.request().url()).pathname
     let json: unknown = run
-    if (path.endsWith('/checks') && route.request().method() === 'GET') json = { enabled: true, rows: [run], next_cursor: null }
+    if (path.endsWith('/attendance-force-releases') && route.request().method() === 'GET') json = { enabled: true, rows: [run], next_cursor: null }
     if (path.endsWith('/coverage')) json = { total: 2576, confirmed: 2248, pending: 0, identity_held: 328, review: 0, observed_at: run.updated_at }
     if (path.endsWith('/items')) json = { rows: [{ id: 1, event_id: 1, event_uid: 'e'.repeat(64), status: 'NEEDS_REVIEW', reason: 'We need proof of who used this employee number when the punch was made.', name: 'Example employee', user_id: '100', connector_id: device.connector_id, device_name: device.display_name, device_serial: device.zkt.serial, time: run.created_at }], next_cursor: null }
-    if (path.endsWith('/jobs') && route.request().method() === 'POST') {
-      expect(route.request().postDataJSON()).toMatchObject({ action: 'SAFE_REPAIR', check_id: run.job_id, password: 'test-password' })
+    if (path.endsWith('/start') && route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toMatchObject({ reason: 'Current terminal identity checked', signature: run.signature, password: 'test-password' })
       run = { ...run, status: 'WAITING_ORACLE', counts: { ...run.counts, ready: 0, waiting: 300 } }
       json = run
     }
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(json) })
   })
-  await page.goto(`/attendance?view=needs-review&repair_run=${run.job_id}`)
+  await page.goto(`/attendance?view=needs-review&force_run=${run.job_id}`)
   await expect(page.getByRole('heading', { name: 'Ready to review' })).toBeVisible()
-  await expect(page.getByText(/300 punches can be repaired/)).toBeVisible()
-  await page.getByRole('button', { name: 'Start repair', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Force release 300 punches', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Force release 300 punches', exact: true }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog.getByRole('button', { name: 'Close dialog' })).toBeFocused()
   await page.keyboard.press('Tab')
-  await expect(dialog.getByLabel('Administrator password')).toBeFocused()
+  await expect(dialog.getByLabel('Reason for release')).toBeFocused()
+  await dialog.getByLabel('Reason for release').fill('Current terminal identity checked')
   await dialog.getByLabel('Administrator password').fill('test-password')
-  await dialog.getByRole('button', { name: 'Start repair', exact: true }).click()
+  await dialog.getByRole('button', { name: 'Approve 300 punches', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
   await page.reload()
   await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
-  await expect(page.getByText('Repair complete', { exact: true })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Finished', exact: true })).toHaveCount(0)
+  await expect(page.locator('.safe-repair-steps [aria-current="step"]')).toHaveText('Waiting for Oracle')
+  // Inspect final rendered colors after the shared route entrance animation.
+  await page.evaluate(async () => {
+    await Promise.all(document.getAnimations().filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {})))
+  })
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).include('.safe-repair').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()

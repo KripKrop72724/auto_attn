@@ -16,17 +16,13 @@ from zk_add.attendance_repair import (
     RELEASE_WORKFLOW_VERSION,
     OracleRepairError,
     RepairError,
-    approve_repair_job,
     build_attendance_release_candidates,
     build_attendance_release_queue,
     build_repair_candidates,
     control_repair_job,
-    create_exact_release_job,
-    create_repair_job,
     oracle_repair_capabilities,
     repair_preflight,
     repair_worker_metrics,
-    record_release_approval_rejection,
     serialize_repair_job,
     stream_repair_evidence,
 )
@@ -293,29 +289,7 @@ async def prepare_attendance_repair(
     body: RepairPrepareRequest,
     auth: tuple[Session, AdminContext] = Depends(_admin_mutation),
 ):
-    db, context = auth
-    _require_legacy_admission()
-    try:
-        job = create_repair_job(
-            db,
-            connector=_connector(db, connector_id),
-            actor=context.username,
-            selections=[target.model_dump() for target in body.targets],
-            date_from=body.date_from,
-            date_to=body.date_to,
-            idempotency_key=body.idempotency_key,
-        )
-        job_id = job.job_id
-        db.commit()
-    except RepairError as error:
-        db.rollback()
-        _raise_repair(error)
-    row = _job(db, job_id)
-    await browser_events.publish(
-        "attendance_repair",
-        {"job_id": row.job_id, "status": row.status, "phase": row.phase},
-    )
-    return serialize_repair_job(db, row, include_items=True)
+    raise HTTPException(status_code=410, detail="This release policy is retired. Use Force release attendance for a fresh terminal check and manual approval.")
 
 
 @router.get("/api/v1/attendance-repairs")
@@ -408,24 +382,7 @@ async def approve_attendance_repair(
     body: RepairApproveRequest,
     auth: tuple[Session, AdminContext] = Depends(_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password.get_secret_value(), db, context)
-    try:
-        job = approve_repair_job(
-            db,
-            job=_job(db, job_id),
-            actor=context.username,
-            reason=body.reason,
-            typed_confirmation=body.typed_confirmation,
-            preview_digest=body.preview_digest,
-            idempotency_key=body.idempotency_key,
-        )
-        db.commit()
-    except RepairError as error:
-        db.rollback()
-        _raise_repair(error)
-    await browser_events.publish("attendance_repair", {"job_id": job.job_id, "status": job.status})
-    return serialize_repair_job(db, job, include_items=True)
+    raise HTTPException(status_code=410, detail="This release policy is retired. Use Force release attendance for a fresh terminal check and manual approval.")
 
 
 @router.post("/api/v1/attendance-repairs/{job_id}/{action}")
@@ -536,31 +493,7 @@ async def prepare_attendance_release(
     body: AttendanceReleasePrepareRequest,
     auth: tuple[Session, AdminContext] = Depends(_admin_mutation),
 ):
-    db, context = auth
-    try:
-        job = create_exact_release_job(
-            db,
-            connector=_connector(db, connector_id),
-            actor=context.username,
-            candidate_set_token=body.candidate_set_token,
-            selection_mode=body.selection_mode,
-            event_tokens=body.included_event_tokens,
-            excluded_event_tokens=body.excluded_event_tokens,
-            idempotency_key=body.idempotency_key,
-            actor_session_id=str(context.row_id),
-            actor_ip=_client_ip(request),
-        )
-        job_id = job.job_id
-        db.commit()
-    except RepairError as error:
-        db.rollback()
-        _raise_repair(error)
-    row = _release_job(db, job_id)
-    await browser_events.publish(
-        "attendance_repair",
-        {"job_id": row.job_id, "status": row.status, "phase": row.phase},
-    )
-    return serialize_repair_job(db, row, include_items=True)
+    raise HTTPException(status_code=410, detail="This release policy is retired. Use Force release attendance for a fresh terminal check and manual approval.")
 
 
 @router.get("/api/v2/attendance-releases")
@@ -676,54 +609,7 @@ async def approve_attendance_release(
     body: AttendanceReleaseApproveRequest,
     auth: tuple[Session, AdminContext] = Depends(_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password.get_secret_value(), db, context)
-    try:
-        job = approve_repair_job(
-            db,
-            job=_release_job(db, job_id),
-            actor=context.username,
-            reason=body.reason,
-            typed_confirmation=body.typed_confirmation,
-            preview_digest=body.preview_digest,
-            idempotency_key=body.idempotency_key,
-            reuse_cnic=(
-                body.reuse_cnic.get_secret_value() if body.reuse_cnic else None
-            ),
-            reuse_employee_name=(
-                body.reuse_employee_name.get_secret_value()
-                if body.reuse_employee_name
-                else None
-            ),
-            actor_session_id=str(context.row_id),
-            actor_ip=_client_ip(request),
-        )
-        db.commit()
-    except RepairError as error:
-        db.rollback()
-        try:
-            rejected_job = _release_job(db, job_id)
-            record_release_approval_rejection(
-                db,
-                job=rejected_job,
-                actor=context.username,
-                error_code=error.code,
-                reuse_evidence_supplied=bool(
-                    body.reuse_cnic or body.reuse_employee_name
-                ),
-                actor_session_id=str(context.row_id),
-                actor_ip=_client_ip(request),
-            )
-            db.commit()
-        except Exception:
-            # The approval remains rejected even if secondary observability is
-            # unavailable; never turn a failed validation into a mutation.
-            db.rollback()
-        _raise_repair(error)
-    await browser_events.publish(
-        "attendance_repair", {"job_id": job.job_id, "status": job.status}
-    )
-    return serialize_repair_job(db, job, include_items=True)
+    raise HTTPException(status_code=410, detail="This release policy is retired. Use Force release attendance for a fresh terminal check and manual approval.")
 
 
 @router.get("/api/v2/attendance-releases/{job_id}/evidence")
