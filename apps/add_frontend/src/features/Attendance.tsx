@@ -1,3 +1,4 @@
+import { ManualForceRelease, ForcedPill } from './ManualForceRelease'
 import { SafeAttendanceRepair } from './SafeAttendanceRepair'
 import {
   useCallback,
@@ -16,7 +17,7 @@ import {
 import { Icon } from '../Icon'
 import type { RealtimeState } from '../realtime'
 import type { AttendanceEvent, Device } from '../types'
-import { AttendanceReleaseHistory, AttendanceReleaseReview } from './AttendanceRelease'
+import { AttendanceReleaseHistory } from './AttendanceRelease'
 
 type AttendanceRange = 'latest' | 'today' | 'last24' | 'custom'
 type AttendanceViewMode = 'all-events' | 'needs-review' | 'release-history'
@@ -29,12 +30,13 @@ type AttendanceFilters = {
   source: string
   from_time: string
   to_time: string
+  forced: string
 }
 type AttendanceResponse = { rows: AttendanceEvent[]; next_cursor: number | null }
 
 const emptyFilters: AttendanceFilters = {
   device_id: '', q: '', cnic: '', punch: '', clock_quality: '', source: '',
-  from_time: '', to_time: '',
+  from_time: '', to_time: '', forced: '',
 }
 
 const sourceLabels: Record<string, string> = {
@@ -312,6 +314,7 @@ function AllAttendanceEvents({
   const filterLabels: Partial<Record<keyof AttendanceFilters, string>> = {
     device_id: 'Device', q: 'Search', cnic: 'Exact CNIC', punch: 'Punch',
     clock_quality: 'Clock', source: 'Capture', from_time: 'From', to_time: 'To',
+    forced: 'Forced attendance',
   }
   const connectionLabel = {
     connecting: 'Connecting', live: 'Realtime connected', reconnecting: 'Reconnecting', stale: 'Cached connection',
@@ -364,6 +367,7 @@ function AllAttendanceEvents({
             <div className="attendance-advanced-body">
               <header><div><p className="eyebrow">FILTER LIVE ATTENDANCE</p><h3>Advanced filters</h3></div><button className="icon-button" type="button" aria-label="Close attendance filters" onClick={() => setAdvancedOpen(false)}><Icon name="x" /></button></header>
               <div className="attendance-advanced-grid">
+                <label>Manual release<select value={filters.forced} onChange={event => setFilters({ ...filters, forced: event.target.value })}><option value="">All attendance</option><option value="true">Forced attendance</option></select></label>
                 <label>Exact CNIC<input inputMode="numeric" autoComplete="off" value={filters.cnic} onChange={(event) => setFilters({ ...filters, cnic: event.target.value.replace(/\D/g, '').slice(0, 13) })} placeholder="13 digits" /></label>
                 <label>Punch<select value={filters.punch} onChange={(event) => setFilters({ ...filters, punch: event.target.value })}><option value="">All punches</option><option value="0">Check in</option><option value="1">Check out</option></select></label>
                 <label>Clock quality<select value={filters.clock_quality} onChange={(event) => setFilters({ ...filters, clock_quality: event.target.value })}><option value="">Any quality</option><option value="OK">OK</option><option value="DRIFTED">Drifted</option><option value="UNKNOWN">Unknown</option></select></label>
@@ -402,7 +406,8 @@ function AllAttendanceEvents({
                 <div className="attendance-event-cell" data-label="Terminal"><strong>{terminal?.display_name || row.device_serial || 'Terminal provenance unavailable'}</strong><small>{terminal ? row.device_serial : row.terminal_provenance?.explanation || 'Terminal provenance requires review'}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Capture"><StatusBadge state={captureLabel(row.source)} /><small title={row.clock_quality === 'UNKNOWN' ? 'No contemporaneous terminal clock sample exists for this punch. A current sample cannot verify historical clock accuracy.' : undefined} className={row.clock_quality === 'OK' ? '' : 'attention-copy'}>{row.clock_quality === 'OK' ? 'Clock verified' : `Clock ${row.clock_quality.toLowerCase()}`}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Oracle delivery">
-                  <StatusBadge state={row.ords_status} />
+                  <StatusBadge state={row.force_release?.needs_attention ? 'Needs attention' : row.force_release && ['PENDING', 'IN_FLIGHT', 'FAILED_RETRYABLE'].includes(row.ords_status) ? 'Waiting for Oracle' : row.ords_status} />
+                  {row.force_release && <ForcedPill evidence={row.force_release} />}
                   {row.release_state && row.release_state !== 'NOT_APPLICABLE' && <StatusBadge state={row.release_state_label || row.release_state} />}
                   <small>{row.release_state === 'RELEASED' && row.effective_identity_downstream_confirmed_at ? `Oracle and downstream verified ${relativeTime(row.effective_identity_downstream_confirmed_at)}` : row.oracle_confirmed_at ? `Original disposition confirmed ${relativeTime(row.oracle_confirmed_at)}` : row.release_lock_reason ? explainReleaseLock(row.release_lock_reason) : 'Confirmation pending'}</small>
                   {row.release_state === 'ELIGIBLE' && row.release_target_user_key && row.release_connector_id && <button className="text-button" type="button" onClick={() => onReviewEmployee(row)}>Review employee</button>}
@@ -455,7 +460,6 @@ export function AttendanceView({
       : 'all-events',
   )
   const [reviewConnectorId, setReviewConnectorId] = useState(initial.get('device_id'))
-  const [reviewUserKey, setReviewUserKey] = useState(initial.get('user_key'))
   const [releaseJobId, setReleaseJobId] = useState(initial.get('release_job'))
   const safeToast = useMemo(
     () => toast || { notice: () => undefined, error: () => undefined },
@@ -482,7 +486,6 @@ export function AttendanceView({
     if (values?.jobId) params.set('release_job', values.jobId)
     window.history.pushState(null, '', `${window.location.pathname}?${params}`)
     setReviewConnectorId(values?.connectorId || null)
-    setReviewUserKey(values?.userKey || null)
     setReleaseJobId(values?.jobId || null)
     setMode(next)
   }, [])
@@ -496,7 +499,6 @@ export function AttendanceView({
           ? requested
           : 'all-events'
       setReviewConnectorId(params.get('device_id'))
-      setReviewUserKey(params.get('user_key'))
       setReleaseJobId(params.get('release_job'))
       setMode(next)
     }
@@ -560,9 +562,9 @@ export function AttendanceView({
         aria-labelledby={`attendance-${mode}-tab`}
       >
         {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} />}
-        {mode === 'needs-review' && <SafeAttendanceRepair devices={devices} toast={safeToast} />}
-        {mode === 'needs-review' && <AttendanceReleaseReview devices={devices} revision={revision} toast={safeToast} initialConnectorId={reviewConnectorId} initialUserKey={reviewUserKey} onOpenHistory={(jobId) => navigateMode('release-history', { jobId })} />}
+        {mode === 'needs-review' && <ManualForceRelease devices={devices} toast={safeToast} initialConnectorId={reviewConnectorId} />}
         {mode === 'release-history' && <AttendanceReleaseHistory devices={devices} revision={revision} toast={safeToast} initialJobId={releaseJobId} />}
+        {mode === 'release-history' && <SafeAttendanceRepair devices={devices} toast={safeToast} />}
       </div>
     </div>
   )

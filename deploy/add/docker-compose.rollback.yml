@@ -1,5 +1,24 @@
 services:
   add-api:
+    # An older image cannot resolve a newer additive Alembic revision. Rollback
+    # serves the retained schema without replaying or downgrading migrations.
+    command: ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers", "--workers", "1", "--timeout-keep-alive", "10"]
+    environment:
+      # Legacy workers cannot honor a manual decision's frozen payload. Preserve
+      # capture and the outbox, but disable all ADD Oracle network delivery until
+      # a manual-capable image is restored. An empty base URL is understood by
+      # previous releases and avoids introducing a rollback-only code dependency.
+      ADD_ORDS_BASE_URL: ""
+      ADD_ATTENDANCE_SAFE_REPAIR_AUTOMATIC_ENABLED: "false"
+      ADD_ATTENDANCE_SAFE_REPAIR_PREVIEW_ENABLED: "false"
+      ADD_ATTENDANCE_SAFE_REPAIR_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED: "false"
+      ADD_ATTENDANCE_REPAIR_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_RECOVERY_PREVIEW_ENABLED: "false"
+      ADD_ATTENDANCE_RECOVERY_EXECUTION_ENABLED: "false"
+      ADD_ATTENDANCE_SOURCE_CORRECTION_ENABLED: "false"
+      ADD_ATTENDANCE_FORCE_RELEASE_PREVIEW_ENABLED: "false"
+      ADD_ATTENDANCE_FORCE_RELEASE_EXECUTION_ENABLED: "false"
     # A rollback image can predate the current image-resident healthcheck helper.
     # Keep the rollback probe dependency-free and compatible with prior releases.
     healthcheck:

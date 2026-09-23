@@ -5,6 +5,7 @@ from sqlalchemy import select, func
 
 from zk_add.crypto import decrypt_cnic
 from zk_add.hikvision_delivery import HikvisionPolicy
+import zk_add.hikvision_profiles  # noqa: F401
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation, HikvisionEvidence
 from zk_add.models import AttendanceEvent, OrdsOutbox
 import pytest
@@ -120,8 +121,9 @@ def test_profile_arrival_releases_only_previously_unmapped_undelivered_punches(d
     first = session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 123))
     uid = first.event_uid
     publish_profile(session, connector)
-    assert repair_profile_identity_holds(session) == 1
-    assert first.ords_status == "PENDING" and first.event_uid == uid
+    assert repair_profile_identity_holds(session) == 0
+    assert first.ords_status == "BLOCKED_IDENTITY" and first.event_uid == uid
+    assert first.manual_release_required
     # Leading zero identifiers are distinct; names never supply the join.
     assert session.scalar(select(AttendanceEvent).where(AttendanceEvent.sequence == 124)).ords_status == "BLOCKED_IDENTITY"
     assert repair_profile_identity_holds(session) == 0
@@ -248,3 +250,36 @@ def test_policy_cannot_rebind_source_epoch_or_confuse_idempotent_changes(db):
         configure_policy(session, connector, **{**request, 'enabled': False})
     with pytest.raises(ValueError, match='SOURCE_EPOCH_CHANGE_REQUIRES_REVIEW'):
         configure_policy(session, connector, **{**request, 'source_epoch': 'epoch-2', 'idempotency_key': 'policy-test-2'})
+
+
+def test_manual_force_understands_hikvision_status_and_exact_employee_identifier(db):
+    from zk_add.attendance_force_release import identity_proof
+    session, connector = db
+    policy(session, connector)
+    connector.zkt_device.terminal_binding_state = "CONFIRMED"
+    preserve_observation(session, connector, payload(employee="00111", name="Historic employee", attendanceStatus="checkIn"))
+    session.commit()
+    publish_profile(session, connector, employee="00111")
+    row = session.scalar(select(AttendanceEvent))
+    assert row.ords_status == "BLOCKED_IDENTITY" and row.uid is None
+    proof, error = identity_proof(session, row, connector)
+    assert proof and error is None
+    row.status = "tampered"
+    assert identity_proof(session, row, connector)[1] == "SOURCE_INVALID"
+
+
+def test_later_hikvision_capture_cnic_conflict_cannot_be_lost_by_a_sync(db):
+    from zk_add.attendance_force_release import identity_proof
+    session, connector = db
+    policy(session, connector)
+    connector.zkt_device.terminal_binding_state = "CONFIRMED"
+    preserve_observation(session, connector, payload(name="Historic employee"))
+    session.commit()
+    # A later preserved representation carries a contradictory captured CNIC.
+    preserve_observation(session, connector, payload(name="Different-1234599999991"))
+    session.commit()
+    publish_profile(session, connector)
+    row = session.scalar(select(AttendanceEvent))
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert row.captured_cnic_lookup_hash
+    assert identity_proof(session, row, connector)[1] == "CNIC_CONFLICT"

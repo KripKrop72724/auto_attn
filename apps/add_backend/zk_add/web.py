@@ -32,6 +32,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
+from zk_add import attendance_force_release as force_release
+from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest
@@ -178,10 +180,8 @@ from zk_add.worker import maintenance_loop, ords_delivery_metrics
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.attendance_recovery import (
     RecoveryError,
-    build_recovery_preview,
     build_source_correction_preview,
     control_recovery_job,
-    create_recovery_job,
     create_source_correction_job,
     list_source_correction_candidates,
     hikvision_source_evidence_detail,
@@ -542,6 +542,84 @@ from zk_add.attendance_safe_repair_schemas import (  # noqa: E402
 )
 
 
+@app.get("/api/v2/attendance-force-releases")
+def list_force_releases(
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=50),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, context = auth
+    query = select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.action == force_release.ACTION)
+    if before:
+        query = query.where(AttendanceRecoveryJob.id < before)
+    rows = db.scalars(query.order_by(AttendanceRecoveryJob.id.desc()).limit(limit + 1)).all()
+    return {"enabled": settings.attendance_force_release_preview_enabled,
+        "rows": [force_release.serialize(db, row, context.username) for row in rows[:limit]],
+        "next_cursor": rows[limit - 1].id if len(rows) > limit else None}
+
+
+@app.post("/api/v2/attendance-force-releases", status_code=202)
+def create_force_check(body: ForceCheckRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
+    db, context = auth
+    try:
+        job = force_release.create_check(db, actor=context.username, request=body)
+        db.flush()
+        return force_release.serialize(db, job, context.username)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+def _force_job(db, job_id):
+    row = _recovery_job_or_404(db, job_id)
+    if row.action != force_release.ACTION:
+        raise HTTPException(status_code=404, detail="Force release run not found.")
+    return row
+
+
+@app.get("/api/v2/attendance-force-releases/{job_id}")
+def get_force_run(job_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, context = auth
+    return force_release.serialize(db, _force_job(db, job_id), context.username)
+
+
+@app.get("/api/v2/attendance-force-releases/{job_id}/items")
+def get_force_items(job_id: str, cursor: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100), state: str | None = Query(default=None, max_length=40),
+    search: str | None = Query(default=None, max_length=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _context = auth
+    return force_release.items_page(db, _force_job(db, job_id), cursor=cursor, limit=limit, state=state, search=search)
+
+
+@app.post("/api/v2/attendance-force-releases/{job_id}/start", status_code=202)
+def start_force_run(job_id: str, body: ForceStartRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        job = force_release.start(db, _force_job(db, job_id), actor=context.username,
+            signature=body.signature, reason=body.reason, key=body.idempotency_key)
+        db.flush()
+        return force_release.serialize(db, job, context.username)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.post("/api/v2/attendance-force-releases/{job_id}/control")
+def control_force_run(job_id: str, body: ForceControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        job = force_release.control(db, _force_job(db, job_id), actor=context.username,
+            action=body.action, key=body.idempotency_key)
+        db.flush()
+        return force_release.serialize(db, job, context.username)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
 @app.get("/api/v2/attendance-recovery/coverage")
 def attendance_saved_coverage(
     connector_id: str | None = Query(default=None, max_length=100),
@@ -562,7 +640,7 @@ def list_safe_repair_checks(
     if before:
         query = query.where(AttendanceRecoveryJob.id < before)
     rows = db.scalars(query.order_by(AttendanceRecoveryJob.id.desc()).limit(limit + 1)).all()
-    return {"enabled": settings.attendance_safe_repair_preview_enabled,
+    return {"enabled": False,
             "rows": [safe_repair.serialize(db, row, context.username) for row in rows[:limit]],
             "next_cursor": rows[limit - 1].id if len(rows) > limit else None}
 
@@ -572,13 +650,7 @@ def create_safe_repair_check(
     body: SafeRepairCheckRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    try:
-        row = safe_repair.create_check(db, actor=context.username, key=body.idempotency_key,
-                                      connector_ids=body.connector_ids)
-    except RecoveryError as exc:
-        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
-    return safe_repair.serialize(db, row, context.username)
+    raise HTTPException(status_code=410, detail="This repair workflow is retired. Use Force release attendance.")
 
 
 @app.get("/api/v2/attendance-recovery/checks/{check_id}")
@@ -610,19 +682,7 @@ def attendance_recovery_preview(
     body: AttendanceRecoveryPreviewRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
-    db, context = auth
-    try:
-        result = build_recovery_preview(
-            db,
-            action=body.action,
-            filters=body.filters,
-        )
-    except RecoveryError as exc:
-        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
-    result["preview_signature"] = sign_recovery_preview(digest=result["candidate_digest"], expires_at=result["preview_expires_at"], actor=context.username, action=body.action)
-    result.pop("_candidate_rows", None)
-    result["confirmation"] = f"RECOVER {result['counts']['eligible']} EVENTS"
-    return result
+    raise HTTPException(status_code=410, detail="This repair workflow is retired. Use Force release attendance.")
 
 
 @app.post("/api/v2/attendance-recovery/jobs", status_code=201)
@@ -630,45 +690,7 @@ def create_attendance_recovery_job(
     body: AttendanceRecoveryCreateRequest | SafeRepairStartRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    if isinstance(body, SafeRepairStartRequest):
-        require_step_up(body.password.get_secret_value(), db, context)
-        job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == body.check_id).with_for_update())
-        if job is None:
-            raise HTTPException(status_code=404, detail="Repair check not found.")
-        try:
-            safe_repair.start_check(db, job, actor=context.username, signature=body.signature)
-        except RecoveryError as exc:
-            raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
-        return safe_repair.serialize(db, job, context.username)
-    try:
-        require_step_up(body.password, db, context)
-        existing = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.idempotency_key == body.idempotency_key))
-        if existing:
-            if existing.actor != context.username or existing.action != body.action or existing.candidate_digest != body.candidate_digest or existing.reason != body.reason.strip():
-                raise RecoveryError("Idempotency key was already used for a different batch.", "IDEMPOTENCY_CONFLICT")
-            return serialize_recovery_job(db, existing, include_items=True)
-        verify_recovery_preview(digest=body.candidate_digest, expires_at=body.preview_expires_at, actor=context.username, action=body.action, signature=body.preview_signature)
-        preview = build_recovery_preview(db, action=body.action, filters=body.filters)
-        if ensure_utc(body.preview_expires_at) <= utc_now():
-            raise RecoveryError("The recovery preview has expired; generate a new preview.", "PREVIEW_EXPIRED")
-        expected_confirmation = f"RECOVER {preview['counts']['eligible']} EVENTS"
-        if body.typed_confirmation.strip() != expected_confirmation:
-            raise RecoveryError("Typed confirmation does not match the frozen recovery scope.", "CONFIRMATION_MISMATCH")
-        job = create_recovery_job(
-            db,
-            action=body.action,
-            filters=body.filters,
-            candidate_digest=body.candidate_digest,
-            actor=context.username,
-            reason=body.reason,
-            idempotency_key=body.idempotency_key,
-            preview_expires_at=body.preview_expires_at,
-        )
-    except RecoveryError as exc:
-        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
-    db.flush()
-    return serialize_recovery_job(db, job, include_items=True)
+    raise HTTPException(status_code=410, detail="This repair workflow is retired. Use Force release attendance.")
 
 
 @app.get("/api/v2/attendance-recovery/jobs/{job_id}")
@@ -705,6 +727,8 @@ def control_attendance_recovery_job(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    if _recovery_job_or_404(db, job_id).action == force_release.ACTION:
+        raise HTTPException(status_code=409, detail="Use this saved run's Force release controls.")
     if isinstance(body, SafeRepairControlRequest):
         require_step_up(body.password.get_secret_value(), db, context)
         job = db.scalar(select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.job_id == job_id).with_for_update())
@@ -2537,8 +2561,9 @@ async def resolve_historical_current_identity(
 
 
 @app.post("/api/v1/devices/{connector_id}/users/refresh", status_code=202)
-async def refresh_users(
+def refresh_users(
     connector_id: str,
+    body: UserRefreshRequest | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
@@ -2551,12 +2576,13 @@ async def refresh_users(
             payload={},
             expected_state={},
             desired_state={},
-            idempotency_key=f"refresh:{connector_id}:{int(utc_now().timestamp() // 300)}",
+            idempotency_key="refresh:" + force_release._digest([connector_id, body.idempotency_key if body and body.idempotency_key else str(uuid4())]),
             actor=context.username,
             expires_in_seconds=120,
         )
         db.commit()
-        await dispatch_command(connector, command)
+        # The durable command dispatcher sends this after commit. Keeping this
+        # endpoint synchronous puts database work off the ASGI event loop.
         return {
             **command_response(command),
             "identity_snapshot": {
@@ -2871,6 +2897,7 @@ def attendance(
     punch: str | None = None,
     source: str | None = None,
     clock_quality: str | None = None,
+    forced: bool = False,
     from_time: str | None = None,
     to_time: str | None = None,
     cursor: int | None = None,
@@ -2881,6 +2908,9 @@ def attendance(
     # The immutable ledger also shows invalid-UID quarantine rows. They remain
     # visibly locked and can never enter the identity-release candidate set.
     statement = select(AttendanceEvent)
+    if forced:
+        from zk_add.models import AttendanceForceReleaseDecision
+        statement = statement.where(AttendanceEvent.id.in_(select(AttendanceForceReleaseDecision.attendance_event_id)))
     if device_id:
         connector = connector_or_404(db, device_id)
         statement = statement.where(AttendanceEvent.connector_id == connector.id)
@@ -2916,7 +2946,7 @@ def attendance(
     release_states = attendance_release_states(db, page_rows)
     return {
         "rows": [
-            serialize_attendance(row, release_states.get(row.id)) for row in page_rows
+            {**serialize_attendance(row, release_states.get(row.id)), "force_release": force_release.metadata(db, row)} for row in page_rows
         ],
         "next_cursor": next_cursor,
     }

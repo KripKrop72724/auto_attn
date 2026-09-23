@@ -296,6 +296,7 @@ class DeviceUserSnapshot(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     received_at: Mapped[datetime] = utc_column()
+    connector_boot_id: Mapped[str | None] = mapped_column(String(100))
 
 
 class IdentityConflictResolution(Base):
@@ -363,6 +364,11 @@ class AttendanceEvent(Base):
     identity_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     identity_repaired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     identity_repair_reason: Mapped[str | None] = mapped_column(String(120))
+    manual_release_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False, index=True
+    )
+    # Preserve capture-time CNIC evidence independently of later identity enrichment.
+    captured_cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64))
     device_serial: Mapped[str | None] = mapped_column(String(120), index=True)
     uid: Mapped[str | None] = mapped_column(String(40), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
@@ -1880,3 +1886,94 @@ class AttendanceDeliverySchedule(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     priority_served: Mapped[int] = mapped_column(Integer, default=0)
     last_connector_id: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AttendanceForceReleaseTask(Base):
+    """An exact terminal scope, fresh-sync barrier and bounded attendance cursor."""
+
+    __tablename__ = "add_attendance_force_release_tasks"
+    __table_args__ = (
+        UniqueConstraint("job_id", "connector_id", name="uq_add_force_task_device"),
+        Index("ix_add_force_task_schedule", "status", "updated_at"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_recovery_jobs.id"), index=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    terminal_serial: Mapped[str | None] = mapped_column(String(120))
+    hardware_id: Mapped[str] = mapped_column(String(120))
+    high_water_id: Mapped[int] = mapped_column(Integer, default=0)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    user_cursor: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_revision: Mapped[int] = mapped_column(Integer, default=0)
+    sync_revision: Mapped[int] = mapped_column(Integer, default=0)
+    sync_round: Mapped[int] = mapped_column(Integer, default=0)
+    sync_command_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_commands.id"))
+    sync_boot_id: Mapped[str | None] = mapped_column(String(100))
+    sync_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sync_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("add_device_user_snapshots.id"))
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(30), default="BASELINE")
+    checked_count: Mapped[int] = mapped_column(Integer, default=0)
+    evidence_digest: Mapped[str] = mapped_column(String(64), default="0" * 64)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceForceReleaseUser(Base):
+    """Pre-sync identity values prevent a refresh concealing an identity change."""
+
+    __tablename__ = "add_attendance_force_release_users"
+    __table_args__ = (
+        UniqueConstraint("task_id", "device_user_id", name="uq_add_force_baseline_user"),
+        Index("ix_add_force_baseline_identity", "task_id", "user_id", "uid"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_force_release_tasks.id"))
+    device_user_id: Mapped[int] = mapped_column(ForeignKey("add_device_users.id"))
+    user_id: Mapped[str] = mapped_column(String(100))
+    uid: Mapped[str] = mapped_column(String(40))
+    cnic_hash: Mapped[str | None] = mapped_column(String(64))
+    identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+
+
+class AttendanceForceReleaseDecision(Base):
+    """Append-only approval and protected frozen payload; no source fact is rewritten."""
+
+    __tablename__ = "add_attendance_force_release_decisions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(
+        ForeignKey("add_attendance_recovery_items.id"), unique=True, index=True
+    )
+    attendance_event_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_events.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_recovery_jobs.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    reason_encrypted: Mapped[str] = mapped_column(Text)
+    proof: Mapped[dict] = mapped_column(JSON)
+    prior_state_encrypted: Mapped[str] = mapped_column(Text)
+    payload_encrypted: Mapped[str] = mapped_column(Text)
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    operation_id: Mapped[str] = mapped_column(String(36), unique=True)
+    audit_id: Mapped[int | None] = mapped_column(ForeignKey("add_audit_events.id"))
+    created_at: Mapped[datetime] = utc_column()
+
+
+class AttendanceForceReleaseScheduler(Base):
+    """One short transaction serializes admission, keeping at most two syncs active."""
+
+    __tablename__ = "add_attendance_force_release_scheduler"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
+class AttendanceForceReleaseControl(Base):
+    __tablename__ = "add_attendance_force_release_controls"
+    __table_args__ = (UniqueConstraint("job_id", "request_key", name="uq_add_force_control_request"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_recovery_jobs.id"))
+    request_key: Mapped[str] = mapped_column(String(120))
+    actor: Mapped[str] = mapped_column(String(120))
+    action: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = utc_column()
+
+
+from zk_add import attendance_manual_guard as _attendance_manual_guard  # noqa: E402,F401

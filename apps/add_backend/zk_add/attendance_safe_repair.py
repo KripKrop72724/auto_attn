@@ -139,6 +139,8 @@ def classify(
 def create_check(
     session: Session, *, actor: str, key: str, connector_ids: list[str], automatic: bool = False
 ) -> Job:
+    if automatic:
+        raise RecoveryError("Automatic attendance repair is retired.", "REPAIR_RETIRED")
     if not settings.attendance_safe_repair_preview_enabled:
         raise RecoveryError("Attendance repair is not enabled yet.", "REPAIR_DISABLED")
     ids = sorted(set(connector_ids))
@@ -383,10 +385,8 @@ def start_check(
             action=ACTION,
             signature=signature,
         )
-    elif not (
-        settings.attendance_safe_repair_automatic_enabled and job.scope["request"]["automatic"]
-    ):
-        raise RecoveryError("Automatic repair is disabled.", "REPAIR_DISABLED")
+    else:
+        raise RecoveryError("Automatic repair has been removed.", "REPAIR_RETIRED")
     tasks = session.scalars(
         select(Task).where(Task.job_id == job.id).order_by(Task.connector_id)
     ).all()
@@ -505,14 +505,6 @@ def _apply(session: Session, job: Job, item: Item) -> None:
         event.identity_repair_reason = "SAFE_REPAIR_VERIFIED_EVIDENCE"
     if connector.firmware_family == "hikvision" and event.identity_content_status == "VERIFIED":
         event.identity_resolution_status = "RESOLVED_HIKVISION_NAME"
-    if not outbox or outbox.status not in {"IN_FLIGHT", "PENDING", "FAILED_RETRYABLE"}:
-        event.ords_status = "PENDING"
-        if outbox:
-            outbox.status, outbox.next_attempt_at, outbox.last_error = "PENDING", None, None
-        else:
-            outbox, _created = ensure_attendance_ords_outbox(session, event)
-    if outbox and outbox.status != "IN_FLIGHT":
-        outbox.delivery_type = "FULL_HISTORY"
     session.add(
         Decision(
             item_id=item.id,
@@ -522,6 +514,14 @@ def _apply(session: Session, job: Job, item: Item) -> None:
             prior_state=prior,
         )
     )
+    if not outbox or outbox.status not in {"IN_FLIGHT", "PENDING", "FAILED_RETRYABLE"}:
+        event.ords_status = "PENDING"
+        if outbox:
+            outbox.status, outbox.next_attempt_at, outbox.last_error = "PENDING", None, None
+        else:
+            outbox, _created = ensure_attendance_ords_outbox(session, event)
+    if outbox and outbox.status != "IN_FLIGHT":
+        outbox.delivery_type = "FULL_HISTORY"
     item.status, item.outcome = "WAITING_ORACLE", "QUEUED_FOR_DELIVERY"
     item.result = {"reason": "Saved for delivery. Waiting for Oracle confirmation.", "proof": proof}
     item.updated_at = utc_now()
@@ -623,17 +623,13 @@ def advance_once(session: Session) -> int:
     )
     if not job:
         return 0
+    if job.scope.get("request", {}).get("automatic"):
+        job.status = "STOPPING"
     limit = settings.attendance_safe_repair_batch_size
     progress = 0
     if job.status == "CHECKING":
         progress = _scan(session, job, limit)
-        if job.status == "CHECKED" and job.scope["request"]["automatic"]:
-            try:
-                with session.begin_nested():
-                    start_check(session, job, actor=job.actor, signature="", automatic=True)
-            except RecoveryError as exc:
-                job.last_error = str(exc)
-                job.status = "EXPIRED"
+
     else:
         progress = _observe(session, job, limit)
         if job.status == "STOPPING":
@@ -852,85 +848,6 @@ def items_page(
     }
 
 
-def schedule_automatic(session: Session) -> None:
-    """Evidence-triggered rechecks plus an hourly bounded sweep for missed triggers.
-
-    Explicit approvals, snapshots and future holds are discovered without an
-    in-memory notification dependency. A restarted worker resumes saved checks.
-    """
-    if not (
-        settings.attendance_safe_repair_preview_enabled
-        and settings.attendance_safe_repair_automatic_enabled
-        and settings.attendance_safe_repair_execution_enabled
-    ):
-        return
-    from zk_add.models import ZKTDevice
-    from uuid import uuid4
-
-    latest = (
-        select(Task.connector_id, func.max(Job.created_at).label("last_check"))
-        .join(Job, Job.id == Task.job_id)
-        .where(Job.action == ACTION)
-        .group_by(Task.connector_id)
-        .subquery()
-    )
-    busy = (
-        select(Item.connector_id)
-        .join(Job, Job.id == Item.job_id)
-        .where(
-            Job.action == ACTION,
-            Job.status.in_(ACTIVE),
-            Item.status.in_({"READY", "WAITING_ORACLE"}),
-        )
-        .union(
-            select(Task.connector_id)
-            .join(Job, Job.id == Task.job_id)
-            .where(Job.action == ACTION, Job.status == "CHECKING")
-        )
-    )
-    evidence_changed = (ZKTDevice.identity_snapshot_received_at > latest.c.last_check) | select(
-        AttendanceEvent.id
-    ).where(
-        AttendanceEvent.connector_id == Connector.id,
-        AttendanceEvent.identity_repaired_at > latest.c.last_check,
-    ).exists()
-
-    query = (
-        select(Connector)
-        .join(ZKTDevice, ZKTDevice.connector_id == Connector.id)
-        .outerjoin(latest, latest.c.connector_id == Connector.id)
-        .where(
-            Connector.id.not_in(busy),
-            latest.c.last_check.is_(None)
-            | (latest.c.last_check < utc_now() - timedelta(hours=1))
-            | (evidence_changed & (latest.c.last_check < utc_now() - timedelta(minutes=5))),
-            select(AttendanceEvent.id)
-            .where(
-                AttendanceEvent.connector_id == Connector.id,
-                AttendanceEvent.oracle_confirmed_at.is_(None),
-            )
-            .exists(),
-        )
-        .order_by(latest.c.last_check.asc().nullsfirst(), Connector.id)
-        .limit(1)
-        .with_for_update(of=Connector, skip_locked=True)
-    )
-    permitted = {
-        s.strip()
-        for s in settings.attendance_safe_repair_allowed_connectors.split(",")
-        if s.strip()
-    }
-    if permitted:
-        query = query.where(Connector.connector_id.in_(permitted))
-    connector = session.scalar(query)
-    if connector and allowed(connector):
-        create_check(
-            session,
-            actor="system:verified-attendance-repair",
-            key=f"auto-repair:{uuid4()}",
-            connector_ids=[connector.connector_id],
-            automatic=True,
-        )
 
 
 def tick() -> None:
@@ -939,8 +856,6 @@ def tick() -> None:
     try:
         with session_scope() as session:
             advance_once(session)
-        with session_scope() as session:
-            schedule_automatic(session)
     except Exception:
         # A failed transaction retains its cursor. Surface a durable error if
         # the database is available; never copy exception text containing PII.

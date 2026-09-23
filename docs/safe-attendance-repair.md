@@ -1,5 +1,10 @@
 # Saved attendance repair
 
+> Retired by `manual-current-terminal-v1`. This document describes historical
+> repair runs only. New releases use [Manual attendance force release](manual-attendance-force-release.md).
+> Automatic repair and the old start/approval APIs are removed. Do not enable the
+> former rollout switches; old history and previously authorized deliveries remain saved.
+
 Operators open **Attendance → Needs review → Repair attendance**, check all saved
 history or one exact device, review the counts and device list, and start with
 the administrator password. A saved link reopens the same run. Records remain

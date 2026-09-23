@@ -29,7 +29,6 @@ def store(repair_store, monkeypatch):
     sessions, connector_id, user_key, event_uid = repair_store
     monkeypatch.setattr(settings, "attendance_safe_repair_preview_enabled", True)
     monkeypatch.setattr(settings, "attendance_safe_repair_execution_enabled", True)
-    monkeypatch.setattr(settings, "attendance_safe_repair_automatic_enabled", False)
     monkeypatch.setattr(settings, "attendance_safe_repair_batch_size", 2)
     with sessions() as db:
         event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid))
@@ -299,18 +298,8 @@ def test_check_batches_have_no_legacy_preview_limit(store, monkeypatch):
 
 
 def test_automatic_recheck_is_opt_in_and_scoped(store, monkeypatch):
-    sessions, connector_id, _ = store
-    with sessions() as db:
-        repair.schedule_automatic(db)
-        assert db.scalar(select(func.count(AttendanceRecoveryJob.id))) == 0
-        monkeypatch.setattr(settings, "attendance_safe_repair_automatic_enabled", True)
-        repair.schedule_automatic(db)
-        db.flush()
-        assert db.scalar(select(func.count(AttendanceRecoveryJob.id))) == 1
-        db.commit()
-    tick(sessions)
-    with sessions() as db:
-        assert db.scalar(select(AttendanceRecoveryJob)).status == "RUNNING"
+    assert not hasattr(settings, "attendance_safe_repair_automatic_enabled")
+    assert not hasattr(repair, "schedule_automatic")
 
 
 def test_repaired_evidence_is_rechecked_before_network_claim(store):
@@ -416,23 +405,8 @@ def test_checks_api_requires_session_csrf_and_password(store, monkeypatch):
     assert client.post("/api/v2/attendance-recovery/checks", json=body).status_code == 403
     client.headers["X-CSRF-Token"] = csrf
     response = client.post("/api/v2/attendance-recovery/checks", json=body)
-    assert response.status_code == 202, response.text
-    check_id = response.json()["job_id"]
-    assert client.post("/api/v2/attendance-recovery/checks", json=body).json()["job_id"] == check_id
-    tick(sessions)
-    result = client.get(f"/api/v2/attendance-recovery/checks/{check_id}").json()
-    start_body = {
-        "action": "SAFE_REPAIR",
-        "check_id": check_id,
-        "signature": result["signature"],
-        "password": "wrong",
-    }
-    assert client.post("/api/v2/attendance-recovery/jobs", json=start_body).status_code == 403
-    start_body["password"] = "test-repair-password"
-    started = client.post("/api/v2/attendance-recovery/jobs", json=start_body)
-    assert started.status_code == 201, started.text
-    assert started.json()["status"] == "RUNNING"
-    assert "test-repair-password" not in started.text
+    assert response.status_code == 410
+    assert "Force release attendance" in response.text
 
 
 def test_hikvision_verified_identity_reuses_durable_delivery(store):
@@ -488,25 +462,8 @@ def test_source_record_withdrawal_prevents_delivery(store):
 
 
 def test_automatic_sweeps_do_not_duplicate_unrepairable_record_storage(store, monkeypatch):
-    sessions, connector_id, uid = store
-    monkeypatch.setattr(settings, "attendance_safe_repair_automatic_enabled", True)
-    with sessions() as db:
-        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
-        event.user_id = "unknown"
-        db.flush()
-        job = repair.create_check(
-            db,
-            actor="system:test",
-            key="auto-held-check",
-            connector_ids=[connector_id],
-            automatic=True,
-        )
-        repair.advance_once(db)
-        db.flush()
-        assert repair.counts(db, job)["checked"] == 1
-        assert repair.counts(db, job)["review"] == 1
-        assert db.scalar(select(func.count(AttendanceRecoveryItem.id))) == 0
-        assert db.scalar(select(func.count(AttendanceEvent.id))) == 1
+    assert not hasattr(settings, "attendance_safe_repair_automatic_enabled")
+    assert not hasattr(repair, "schedule_automatic")
 
 
 def test_stall_alert_clears_after_a_real_oracle_receipt(store):

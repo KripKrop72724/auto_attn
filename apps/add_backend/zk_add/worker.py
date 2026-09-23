@@ -55,9 +55,6 @@ from zk_add.service import (
     reconcile_admin_lease_states,
     repair_missing_terminal_provenance,
     repair_attendance_delivery_backlog,
-    repair_verified_active_identity_backlog,
-    repair_verified_source_identity_backlog,
-    repair_verified_tombstone_backlog,
     resolve_alert,
     serialize_command,
     upsert_alert,
@@ -361,10 +358,12 @@ async def _attendance_repair_loop(stop: asyncio.Event) -> None:
 
 async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_safe_repair import tick
+    from zk_add.attendance_force_release import tick as force_tick
 
     while not stop.is_set():
         try:
             await asyncio.to_thread(tick)
+            await asyncio.to_thread(force_tick)
         except Exception:
             await browser_events.publish(
                 "backend_error",
@@ -479,11 +478,6 @@ def prepare_maintenance_tick(
                     connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
         repair_missing_terminal_provenance(session)
-        repair_verified_tombstone_backlog(session)
-        repair_verified_active_identity_backlog(session)
-        repair_verified_source_identity_backlog(session)
-        from zk_add.hikvision_delivery import repair_profile_identity_holds
-        repair_profile_identity_holds(session)
         repair_attendance_delivery_backlog(session, limit=ORDS_DELIVERY_BATCH_SIZE)
         advance_attendance_recovery_jobs(
             session,
@@ -849,6 +843,12 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 continue
             connector = session.get(Connector, event.connector_id)
             zkt = session.get(ZKTDevice, event.zkt_device_id)
+            from zk_add.attendance_manual_guard import delivery_authorized, decision_for
+            if not delivery_authorized(session, event):
+                row.status = event.ords_status = "BLOCKED_IDENTITY"
+                row.last_error = "Administrator approval is required. Open Force release attendance."
+                row.next_attempt_at = None
+                continue
             from zk_add.attendance_recovery import _terminal_provenance_verified
 
             if (
@@ -889,6 +889,14 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 )
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
+            if decision_for(session, event):
+                from zk_add.attendance_force_release import delivery_payload
+                candidate_payload = delivery_payload(session, event, connector)
+                if candidate_payload is None:
+                    row.status = event.ords_status = "BLOCKED_IDENTITY"
+                    row.last_error = "The approved identity or source changed. Review this forced release."
+                    row.next_attempt_at = None
+                    continue
             row.status = "IN_FLIGHT"
             row.attempt_count += 1
             row.last_attempt_at = now
@@ -1043,6 +1051,12 @@ def claim_firmware_receipt_audit_batch(
                     event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
                 continue
             row.status = "FIRMWARE_RECEIPT_VERIFYING"
+            from zk_add.attendance_manual_guard import generic_confirmation_allowed, decision_for
+            if not generic_confirmation_allowed(session, event):
+                row.status = event.ords_status = "FAILED_RETRYABLE" if decision_for(session, event) else "BLOCKED_IDENTITY"
+                row.next_attempt_at = None
+                row.last_error = "CONTENT_VERIFICATION_REQUIRED" if decision_for(session, event) else "MANUAL_APPROVAL_REQUIRED"
+                continue
             row.attempt_count += 1
             row.last_attempt_at = now
             row.next_attempt_at = None
@@ -1229,6 +1243,7 @@ async def audit_firmware_receipts_batch(
 def claim_confirmed_membership_audit_batch(
     limit: int = ORDS_FIRMWARE_AUDIT_BATCH_SIZE,
 ) -> list[tuple[int, str, int]]:
+    from zk_add.models import AttendanceForceReleaseDecision
     claims: list[tuple[int, str, int]] = []
     with session_scope() as session:
         now = utc_now()
@@ -1270,6 +1285,7 @@ def claim_confirmed_membership_audit_batch(
                 AttendanceEvent.id == OrdsOutbox.attendance_event_id,
             )
             .where(
+                AttendanceEvent.id.not_in(select(AttendanceForceReleaseDecision.attendance_event_id)),
                 or_(
                     (
                         OrdsOutbox.status.in_(["ACKED", "ACKED_CHECK"])
@@ -1503,6 +1519,10 @@ def apply_ords_confirmation(
     row = session.get(OrdsOutbox, claimed_id)
     if row is None:
         return
+    from zk_add.attendance_manual_guard import generic_confirmation_allowed
+    event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+    if event and not generic_confirmation_allowed(session, event):
+        return
     confirmed_at = utc_now()
     row.status = "ACKED_CHECK"
     row.acknowledged_at = confirmed_at
@@ -1585,6 +1605,9 @@ def apply_ords_delivery_result(
     if row is None:
         return
     event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
+    from zk_add.attendance_manual_guard import generic_confirmation_allowed
+    if event and not generic_confirmation_allowed(session, event):
+        return
     connector = session.get(Connector, event.connector_id) if event else None
     row.last_http_status = status
     category = ords_failure_category(
@@ -1711,60 +1734,78 @@ async def deliver_ords_batch(
         claims = await asyncio.to_thread(claim_ords_batch, max(1, limit))
         if not claims:
             return
-        base_url = settings.ords_base_url.rstrip("/")
-        url = base_url + "/raw-captures"
-        check_url = base_url + "/raw-captures/check"
-        semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
-        route_results: list[tuple[int | None, str | None]] = []
-        async with httpx.AsyncClient(
-            timeout=settings.ords_timeout_seconds,
-            headers={
-                "X-API-Username": settings.ords_username,
-                "X-API-Password": settings.ords_password,
-            },
-        ) as client:
-            send_claims: list[tuple[int, dict, int, bool]] = []
-            confirmed_claim_ids: list[int] = []
-            membership_failure: tuple[int | None, str | None, bool] | None = None
-            check_status, check_body, check_error, check_parsed = (
-                await post_ords_membership_check(client, check_url, claims)
+        from zk_add.attendance_force_delivery import split_claims, deliver_forced
+        claims, forced = await asyncio.to_thread(split_claims, claims)
+        # Reserve service for live claims while slow content verification runs.
+        # Each lane commits its receipts independently of the other's network wait.
+        if forced and claims and concurrency > 1:
+            background_slots = min(4, max(1, concurrency // 5))
+            await asyncio.gather(
+                _deliver_ordinary_claims(claims, concurrency=concurrency - background_slots, limit=limit),
+                deliver_forced(forced, concurrency=background_slots),
             )
-            route_results.append((check_status, check_error))
-            requested = {claim[1]["event_uid"] for claim in claims}
-            missing = ords_membership_missing(check_status, check_body, requested)
-            if missing is not None:
-                for claim in claims:
-                    if claim[1]["event_uid"] in missing:
-                        send_claims.append(claim)
-                    else:
-                        confirmed_claim_ids.append(claim[0])
-            elif check_status in {404, 405}:
-                # Backward compatibility while Oracle environments roll out the
-                # membership endpoint.
-                send_claims.extend(claims)
-            else:
-                membership_failure = (check_status, check_error, check_parsed)
-            results = await asyncio.gather(
-                *(post_ords_claim(client, semaphore, url, claim) for claim in send_claims)
-            )
-            route_results.extend((status, error) for _, _, status, _, error, _ in results)
+        else:
+            if claims:
+                await _deliver_ordinary_claims(claims, concurrency=concurrency, limit=limit)
+            if forced:
+                await deliver_forced(forced, concurrency=concurrency)
 
-        responded_status = next(
-            (status for status, _error in route_results if status is not None),
-            None,
+
+async def _deliver_ordinary_claims(claims, *, concurrency, limit):
+    base_url = settings.ords_base_url.rstrip("/")
+    url = base_url + "/raw-captures"
+    check_url = base_url + "/raw-captures/check"
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, limit)))
+    route_results: list[tuple[int | None, str | None]] = []
+    async with httpx.AsyncClient(
+        timeout=settings.ords_timeout_seconds,
+        headers={
+            "X-API-Username": settings.ords_username,
+            "X-API-Password": settings.ords_password,
+        },
+    ) as client:
+        send_claims: list[tuple[int, dict, int, bool]] = []
+        confirmed_claim_ids: list[int] = []
+        membership_failure: tuple[int | None, str | None, bool] | None = None
+        check_status, check_body, check_error, check_parsed = (
+            await post_ords_membership_check(client, check_url, claims)
         )
-        transport_error = next(
-            (
-                error
-                for status, error in route_results
-                if status is None and error is not None
-            ),
-            None,
+        route_results.append((check_status, check_error))
+        requested = {claim[1]["event_uid"] for claim in claims}
+        missing = ords_membership_missing(check_status, check_body, requested)
+        if missing is not None:
+            for claim in claims:
+                if claim[1]["event_uid"] in missing:
+                    send_claims.append(claim)
+                else:
+                    confirmed_claim_ids.append(claim[0])
+        elif check_status in {404, 405}:
+            # Backward compatibility while Oracle environments roll out the
+            # membership endpoint.
+            send_claims.extend(claims)
+        else:
+            membership_failure = (check_status, check_error, check_parsed)
+        results = await asyncio.gather(
+            *(post_ords_claim(client, semaphore, url, claim) for claim in send_claims)
         )
-        record_ords_route_result(
-            status=responded_status,
-            transport_error=transport_error,
-        )
+        route_results.extend((status, error) for _, _, status, _, error, _ in results)
+
+    responded_status = next(
+        (status for status, _error in route_results if status is not None),
+        None,
+    )
+    transport_error = next(
+        (
+            error
+            for status, error in route_results
+            if status is None and error is not None
+        ),
+        None,
+    )
+    record_ords_route_result(
+        status=responded_status,
+        transport_error=transport_error,
+    )
     await asyncio.to_thread(
         apply_ords_batch_results,
         claims,

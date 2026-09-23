@@ -351,6 +351,7 @@ export function UsersView({
   const [selectedUserKeys, setSelectedUserKeys] = useState<Set<string>>(new Set())
   const [, setLeaseClock] = useState(0)
   const directoryRequest = useRef<AbortController | null>(null)
+  const syncRequest = useRef<{ device: string; key: string } | null>(null)
   const diagnosticsRequest = useRef<AbortController | null>(null)
   const knownUsers = useRef<Map<string, DeviceUser>>(new Map())
   const activeTerminalId = useRef(selectedDeviceId)
@@ -555,8 +556,10 @@ export function UsersView({
 
   const syncFromTerminal = async () => {
     if (!selectedDeviceId) return
+    if (syncRequest.current?.device !== selectedDeviceId) syncRequest.current = { device: selectedDeviceId, key: idempotency('terminal-refresh') }
     try {
-      const response = await api<Command>(`/api/v1/devices/${selectedDeviceId}/users/refresh`, { method: 'POST', body: '{}' })
+      const response = await api<Command>(`/api/v1/devices/${selectedDeviceId}/users/refresh`, { method: 'POST', body: JSON.stringify({ idempotency_key: syncRequest.current.key }) })
+      syncRequest.current = null
       setCommand(response)
       toast.notice('Terminal user synchronization is queued and durably tracked.')
     } catch (reason) {

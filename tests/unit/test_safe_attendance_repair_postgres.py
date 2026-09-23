@@ -7,7 +7,7 @@ import os
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import MetaData, create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from test_safe_attendance_repair import store as store, start, tick
@@ -67,7 +67,14 @@ def postgres_store(store, monkeypatch):
         },
     )
     try:
-        Base.metadata.create_all(engine)
+        # PostgreSQL emits ALTER statements for cyclic foreign keys. SQLAlchemy
+        # attaches their DDL rules to the metadata; sharing those rules with a
+        # later SQLite bootstrap omits constraints that SQLite creates inline.
+        # Keep each disposable database's DDL metadata independent of the ORM.
+        metadata = MetaData()
+        for table in Base.metadata.tables.values():
+            table.to_metadata(metadata)
+        metadata.create_all(engine)
         sessions = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
         monkeypatch.setattr(settings, "attendance_safe_repair_batch_size", 100)
         monkeypatch.setattr("zk_add.db.SessionLocal", sessions)
