@@ -82,6 +82,24 @@ def database_report():
                        FROM pg_stat_activity a WHERE a.datname=current_database()
                        AND cardinality(pg_blocking_pids(a.pid)) > 0 LIMIT 20""",
         "delivery": """SELECT status, count(*) AS records FROM add_ords_outbox GROUP BY status""",
+        "force_sync": """SELECT j.job_id, j.status AS job_status, t.status AS task_status,
+                    t.error_code, t.sync_requested_at, t.sync_deadline,
+                    c.command_id, c.status AS command_status, c.started_at, c.completed_at,
+                    z.identity_snapshot_revision, z.identity_snapshot_observed_at,
+                    z.identity_snapshot_received_at
+                    FROM add_attendance_force_release_tasks t
+                    JOIN add_attendance_recovery_jobs j ON j.id=t.job_id
+                    LEFT JOIN add_device_commands c ON c.id=t.sync_command_id
+                    LEFT JOIN add_zkt_devices z ON z.connector_id=t.connector_id
+                    ORDER BY t.id DESC LIMIT 10""",
+        "force_sync_order": """SELECT c.command_id, e.status, e.created_at,
+                    e.details ->> 'sequence' AS message_sequence,
+                    e.details ->> 'sent_at' AS device_sent_at,
+                    e.details ->> 'observed_at' AS snapshot_observed_at
+                    FROM add_device_command_events e
+                    JOIN add_device_commands c ON c.id=e.command_id
+                    WHERE e.status IN ('SYNC_READ_BEGIN','SYNC_READ_ROSTER','SYNC_READ_END')
+                    ORDER BY e.id DESC LIMIT 30""",
     }
     result = {
         "flags": {

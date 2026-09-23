@@ -3766,6 +3766,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 error_code=update.error_code,
                 error_message=update.error_message,
             )
+            from zk_add.attendance_sync_evidence import record_command
+
+            record_command(db, connector, command, envelope)
             event_payload = command_response(command)
         elif envelope.type == "log":
             log = DeviceLogIn(
@@ -3783,6 +3786,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         elif envelope.type == "user_snapshot":
             snapshot = UserSnapshotRequest.model_validate(envelope.payload)
             count = replace_user_snapshot(db, connector=connector, snapshot=snapshot)
+            from zk_add.attendance_sync_evidence import record_roster
+
+            record_roster(db, connector, envelope)
             resolve_message_rejection(
                 db, connector, message_type="user_snapshot"
             )
