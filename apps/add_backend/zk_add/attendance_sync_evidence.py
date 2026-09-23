@@ -53,7 +53,7 @@ def record_roster(session, connector, envelope):
     command = session.scalar(select(DeviceCommand).where(
         DeviceCommand.connector_id == connector.id,
         DeviceCommand.command_type == "REFRESH_USERS",
-        DeviceCommand.status == "RUNNING",
+        DeviceCommand.status.in_(["RUNNING", "ACKNOWLEDGED", "RETRYING"]),
     ).order_by(DeviceCommand.id.desc()).limit(1))
     if not command or _event(session, command.id, ROSTER):
         return
@@ -61,13 +61,20 @@ def record_roster(session, connector, envelope):
     if not begin:
         return
     start = begin.details
+    try:
+        started = parse_datetime(start["sent_at"])
+        valid_start = (
+            start["version"] == 1 and start["boot_id"] == envelope.boot_id
+            and isinstance(start["sequence"], int) and start["sequence"] < envelope.seq
+        )
+    except (KeyError, TypeError, ValueError):
+        return
     observed = ensure_utc(snapshot.observed_at)
     sent = ensure_utc(envelope.sent_at)
     if not (
-        start["boot_id"] == envelope.boot_id == snapshot.connector_boot_id
-        and start["sequence"] < envelope.seq
-        and parse_datetime(start["sent_at"]) <= observed <= sent
-        and 0 <= (sent - parse_datetime(start["sent_at"])).total_seconds() <= 600
+        valid_start and envelope.boot_id == snapshot.connector_boot_id
+        and started <= observed <= sent
+        and 0 <= (sent - started).total_seconds() <= 600
         and 0 <= (sent - observed).total_seconds() <= 30
         and ensure_utc(snapshot.received_at) >= ensure_utc(begin.created_at)
     ):

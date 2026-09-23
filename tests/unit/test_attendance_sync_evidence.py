@@ -70,9 +70,12 @@ def refresh(store, monkeypatch):
     return sessions, send
 
 
-def test_authenticated_refresh_with_skewed_clock_proves_fresh_roster(refresh):
+@pytest.mark.parametrize("late_ack", [False, True])
+def test_authenticated_refresh_with_skewed_clock_proves_fresh_roster(refresh, late_ack):
     sessions, send = refresh
     send("RUNNING")
+    if late_ack:
+        send("ACKNOWLEDGED", offset=1)
     send("user_snapshot", offset=2)
     send("SUCCEEDED", offset=3)
     tick(sessions)
@@ -87,6 +90,7 @@ def test_authenticated_refresh_with_skewed_clock_proves_fresh_roster(refresh):
 @pytest.mark.parametrize("fault", [
     "cached_bytes", "clock_backward", "clock_jump", "wrong_boot", "missing_begin",
     "missing_finish", "finish_before_roster", "replayed_snapshot_id", "changed_saved_evidence",
+    "damaged_begin",
 ])
 def test_uncertain_or_replayed_clock_skewed_roster_cannot_be_approved(refresh, fault):
     sessions, send = refresh
@@ -95,6 +99,11 @@ def test_uncertain_or_replayed_clock_skewed_roster_cannot_be_approved(refresh, f
         send("user_snapshot", offset=-2, snapshot_id=snapshot_id)
     if fault != "missing_begin":
         send("RUNNING")
+    if fault == "damaged_begin":
+        with sessions() as db:
+            db.scalar(select(DeviceCommandEvent).where(
+                DeviceCommandEvent.status == "SYNC_READ_BEGIN")).details = {}
+            db.commit()
     if fault == "finish_before_roster":
         send("SUCCEEDED", offset=1)
     send("user_snapshot", offset=2,
