@@ -102,8 +102,11 @@ approvals, pending outbox and audit evidence; it must not restore a pre-deployme
 database dump over accepted attendance. The rollback compose file disables all
 repair execution/automatic switches and starts the older API without attempting
 to downgrade or resolve the newer Alembic revision. Database delivery guards stay
-installed. Ordinary attendance continues; manual deliveries remain safely saved
-until the qualified manual-capable image is restored. An unknown schema revision
+installed. Capture continues, while the rollback overlay pauses **all ADD Oracle
+delivery** by clearing its base URL. Legacy workers cannot safely retry the new
+frozen approval payloads. Both ordinary and manual outbox records remain saved;
+restoring the qualified image with its normal configuration resumes delivery.
+Firmware delivery is outside this ADD-only rollback. An unknown schema revision
 stops automatic rollback for investigation instead of discarding data.
 
 ## Qualification evidence

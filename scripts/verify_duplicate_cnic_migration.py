@@ -206,8 +206,15 @@ def verify() -> None:
         assert all(row.terminal_state_fingerprint is None for row in users)
         assert attendance[0].device_user_id == users[0].id
         assert attendance[0].identity_resolution_id is None
-        assert attendance[0].ords_status == "FAILED_RETRYABLE"
-        assert ords_rows[0].last_error == "LEGACY_ERROR_REDACTED"
+        # The manual policy retains this unresolved legacy punch but removes it
+        # from automatic retry. Both ambiguous users and the original outbox
+        # survive; neither duplicate CNIC may silently authorize delivery.
+        assert attendance[0].ords_status == "BLOCKED_IDENTITY"
+        assert attendance[0].manual_release_required
+        assert attendance[0].oracle_confirmed_at is None
+        assert ords_rows[0].status == "BLOCKED_IDENTITY"
+        assert ords_rows[0].next_attempt_at is None
+        assert ords_rows[0].last_error == "MANUAL_APPROVAL_REQUIRED"
 
     with engine.connect() as connection:
         definition = connection.scalar(

@@ -131,6 +131,45 @@ def approve(store, job_id):
     tick(sessions)
 
 
+def test_rollback_overlay_preserves_approved_outbox_without_legacy_delivery(store, monkeypatch):
+    import asyncio
+    from pathlib import Path
+    import yaml
+    from zk_add import worker
+
+    sessions, _, _ = store
+    job_id = checked(store)
+    approve(store, job_id)
+    tick(sessions)
+    overlay = yaml.safe_load(
+        (Path(__file__).parents[2] / "deploy/add/docker-compose.rollback.yml").read_text()
+    )["services"]["add-api"]["environment"]
+    assert overlay["ADD_ORDS_BASE_URL"] == ""
+    assert overlay["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] == "false"
+    with monkeypatch.context() as paused:
+        paused.setattr(settings, "ords_base_url", overlay["ADD_ORDS_BASE_URL"])
+
+        def unexpected_claim(*args, **kwargs):
+            raise AssertionError("A rollback image must not claim approved attendance")
+
+        paused.setattr(worker, "claim_ords_batch", unexpected_claim)
+        asyncio.run(worker.deliver_ords_batch())
+    with sessions() as db:
+        outbox = db.scalar(select(OrdsOutbox))
+        assert outbox.status == "PENDING" and outbox.attempt_count == 0
+        decision = db.scalar(select(Decision))
+        saved_digest = decision.payload_digest
+        assert saved_digest and db.scalar(select(Item)).status == "WAITING_ORACLE"
+    # Restoring the qualified application's configuration resumes the original
+    # approval. No identity is reconstructed by the legacy rollback worker.
+    ordinary, forced = delivery.split_claims(claim_ords_batch(1))
+    assert not ordinary and len(forced) == 1
+    delivery.persist_result(forced[0], "MATCH", "c" * 64)
+    with sessions() as db:
+        assert db.scalar(select(Decision)).payload_digest == saved_digest
+        assert db.scalar(select(AttendanceEvent)).ords_status == "ACKED_CHECK"
+
+
 def test_no_history_manual_approval_content_ack_and_frozen_payload(store):
     sessions, _, _ = store
     job_id = checked(store)

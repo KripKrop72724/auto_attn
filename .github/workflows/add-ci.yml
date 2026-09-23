@@ -144,7 +144,10 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Two 100,000-record PostgreSQL qualifications run in this job. Their own
+    # responsiveness and progress deadlines stay enforced; allow setup and the
+    # separate fresh/legacy migration checks time to finish on hosted runners.
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
