@@ -557,11 +557,19 @@ def identity_proof(session, event, connector, task=None):
         .limit(1)
     ):
         return None, "IDENTITY_CONFLICT"
+    tombstone_identifiers = [IdentityTombstone.user_id == user.user_id]
+    if user.uid:
+        tombstone_identifiers.append(IdentityTombstone.uid == user.uid)
     if session.scalar(
         select(IdentityTombstone.id)
         .where(
             IdentityTombstone.zkt_device_id == terminal.id,
-            or_(IdentityTombstone.user_id == user.user_id, IdentityTombstone.uid == user.uid),
+            or_(
+                IdentityTombstone.device_serial == terminal.serial,
+                IdentityTombstone.device_serial.is_(None),
+                IdentityTombstone.device_serial == "",
+            ),
+            or_(*tombstone_identifiers),
             or_(
                 IdentityTombstone.device_user_id != user.id,
                 IdentityTombstone.cnic_lookup_hash != user.cnic_lookup_hash,
@@ -574,6 +582,10 @@ def identity_proof(session, event, connector, task=None):
         select(AttendanceIdentityHistory.id)
         .where(
             AttendanceIdentityHistory.zkt_device_id == terminal.id,
+            or_(
+                AttendanceIdentityHistory.terminal_serial == terminal.serial,
+                AttendanceIdentityHistory.terminal_serial == "",
+            ),
             AttendanceIdentityHistory.user_id == user.user_id,
             or_(
                 AttendanceIdentityHistory.device_user_id != user.id,
@@ -584,10 +596,13 @@ def identity_proof(session, event, connector, task=None):
     ):
         return None, "IDENTITY_CONFLICT"
     if task:
+        baseline_identifiers = [BaselineUser.user_id == user.user_id]
+        if user.uid:
+            baseline_identifiers.append(BaselineUser.uid == user.uid)
         before = session.scalars(
             select(BaselineUser).where(
                 BaselineUser.task_id == task.id,
-                or_(BaselineUser.user_id == user.user_id, BaselineUser.uid == user.uid),
+                or_(*baseline_identifiers),
             )
         ).all()
         if any(

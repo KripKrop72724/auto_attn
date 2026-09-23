@@ -395,7 +395,7 @@ export function HistoricalIdentityResolutionDialog({
         : eventGroup
           ? 'resolve-event-group'
           : 'resolve'
-      const response = await api<{ repaired_events: number }>(
+      await api<{ repaired_events: number }>(
         `/api/v2/devices/${device.connector_id}/historical-identities/${endpoint}`,
         {
           method: 'POST',
@@ -436,9 +436,7 @@ export function HistoricalIdentityResolutionDialog({
         },
       )
       await onComplete()
-      toast.notice(
-        `${response.repaired_events.toLocaleString()} preserved attendance event${response.repaired_events === 1 ? '' : 's'} requeued for Oracle confirmation.`,
-      )
+      toast.notice('Identity evidence saved. Held attendance still requires manual approval in Force release attendance.')
       onClose()
     } catch (reasonValue) {
       setError(
@@ -455,9 +453,9 @@ export function HistoricalIdentityResolutionDialog({
     <Dialog
       titleId="historical-identity-resolution-title"
       title={simple ? 'Verify employee details' : currentIdentityEvidence ? 'Verify preserved cohort against current identity' : 'Enter verified HR identity evidence'}
-      description={simple ? 'Use verified employee records to confirm who made these punches. Every match is checked before delivery.' : currentIdentityEvidence
+      description={simple ? 'Save verified employee evidence. Held attendance requires a separate Force release approval.' : currentIdentityEvidence
         ? 'Use the authoritative Oracle capture identity to confirm this exact historical cohort belongs to the unchanged current terminal user.'
-        : 'Use authoritative HR directory evidence only. ADD will preserve every attendance event and requeue only an exact, unambiguous match.'}
+        : 'Use authoritative HR directory evidence only. Saving evidence preserves attendance; release requires a separate Force release approval.'}
       onClose={onClose}
     >
       <form className="dialog-body" onSubmit={submit}>
@@ -488,7 +486,7 @@ export function HistoricalIdentityResolutionDialog({
         {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" />{error}</div>}
         <footer className="dialog-actions">
           <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
-          <button className="button primary" disabled={busy}>{busy ? 'Verifying and requeuing…' : currentIdentityEvidence ? 'Verify current identity and requeue' : 'Save verified HR evidence'}</button>
+          <button className="button primary" disabled={busy}>{busy ? 'Saving evidence…' : currentIdentityEvidence ? 'Verify and save identity evidence' : 'Save verified HR evidence'}</button>
         </footer>
       </form>
     </Dialog>

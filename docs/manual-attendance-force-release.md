@@ -34,6 +34,10 @@ reason, sync evidence and saved run. Lists do not expose unmasked CNICs.
 - Terminal serial, connector and hardware identity are frozen and rechecked.
   Unverified bindings, identity reuse, unknown/deleted users, conflicting capture
   evidence, damaged IDs/data/timestamps and unresolved conflicts remain blocked.
+- Historical conflicts use the exact terminal serial as well as the connector.
+  Evidence explicitly belonging to a replaced terminal cannot block a valid
+  punch from the current terminal. Conflicts with unknown terminal provenance
+  remain blocked. Empty optional UIDs never link unrelated employees.
 - Pre-sync CNIC hashes and identity fingerprints are saved before requesting a
   new list. A refresh cannot erase a prior conflict. New capture-time CNIC hashes
   are stored independently of effective identity enrichment.
