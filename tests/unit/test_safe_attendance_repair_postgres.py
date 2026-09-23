@@ -21,6 +21,34 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 
+def test_overlapping_device_sockets_commit_a_sequence_once(postgres_store):
+    from threading import Barrier
+    from zk_add.schemas import Envelope
+    from zk_add.web import persist_envelope
+    from zk_add.models import DeviceLog
+
+    sessions, connector_id = postgres_store
+    with sessions() as db:
+        connector_pk = db.scalar(select(Connector.id).where(Connector.connector_id == connector_id))
+    envelope = Envelope(
+        schema_version="2", message_id="overlapping-sockets", connector_id=connector_id,
+        boot_id="test-boot", seq=1, sent_at=utc_now(), type="log",
+        payload={"level": "INFO", "message": "overlapping sockets regression", "code": "SOCKET_TEST"},
+    )
+    start = Barrier(2)
+
+    def receive():
+        start.wait(timeout=5)
+        return persist_envelope(connector_pk, envelope)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(lambda _: receive(), range(2)))
+    assert sum(result.ack.get("duplicate", False) for result in results) == 1
+    with sessions() as db:
+        assert db.scalar(select(func.count(DeviceLog.id)).where(DeviceLog.code == "SOCKET_TEST")) == 1
+        assert db.get(Connector, connector_pk).last_sequence == 1
+
+
 @pytest.fixture()
 def postgres_store(store, monkeypatch):
     url = os.environ.get("ADD_SAFE_REPAIR_TEST_DATABASE_URL")

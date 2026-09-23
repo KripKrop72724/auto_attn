@@ -115,6 +115,20 @@ allowlisted HTTP/exception counts. It runs only from `main` on the protected
 production runner. It does not change repair flags, attendance, sessions or
 delivery state, and never publishes raw logs, payloads or employee identities.
 
+Device WebSocket transactions, bootstrap/catalog reads and rejection handling run
+in worker threads with their own database sessions. HTTP device mutations and
+signed-request database verification also run outside the event loop. Only plain
+committed response/event payloads return to the asynchronous transport. Connector
+row locks serialize overlapping socket sequence checks. Failed commits emit no
+acknowledgement or browser success. Liveness and thread-pool health protection
+remain enabled; diagnostics include fixed restart/lag markers and health-probe
+exit codes without exposing probe output.
+
+After deploying a responsiveness fix, compare container start time/restart count
+across multiple health-check intervals and confirm login/session responses through
+the public proxy. A single successful readiness probe is insufficient to establish
+recovery from a restart loop.
+
 ## Qualification
 
 `test_safe_attendance_repair.py` covers read-only checks, identity conflicts and

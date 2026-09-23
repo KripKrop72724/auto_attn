@@ -14,6 +14,7 @@ def summarize_logs(lines):
     errors = Counter()
     frames = Counter()
     proxy = Counter()
+    runtime = Counter()
     for line in lines:
         response = re.search(r'"(GET|POST|PUT|PATCH|DELETE) ([^ ]+) HTTP/[^" ]+" (\d{3})', line)
         if response:
@@ -46,11 +47,15 @@ def summarize_logs(lines):
         ):
             if phrase in line.lower():
                 proxy[phrase] += 1
+        for phrase in ("ADD event loop lag detected", "restarting API process"):
+            if phrase in line:
+                runtime[phrase] += 1
     return {
         "http_counts": dict(responses),
         "exception_types": dict(errors),
         "code_frames": dict(frames),
         "proxy_errors": dict(proxy),
+        "runtime_signals": dict(runtime),
     }
 
 

@@ -6480,3 +6480,119 @@ def test_recovery_control_endpoint_freezes_job_and_requires_typed_confirmation(
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "PAUSED"
+
+
+@pytest.mark.parametrize("transport", ["websocket", "http"])
+def test_slow_attendance_transaction_does_not_block_health_or_ack_early(db, monkeypatch, transport):
+    import threading
+    import httpx
+
+    connector = connector_fixture(db)
+    connector_pk = connector.id
+    connector_id = connector.connector_id
+    entered = threading.Event()
+    release = threading.Event()
+    committed = False
+    main_thread = threading.get_ident()
+    original_settle = add_web.settle_attendance_batch
+
+    @sqlalchemy_event.listens_for(db, "after_commit")
+    def record_commit(_session):
+        nonlocal committed
+        committed = True
+
+    def slow_settle(*args, **kwargs):
+        assert threading.get_ident() != main_thread
+        entered.set()
+        assert release.wait(3), "The event loop never released the database worker"
+        return original_settle(*args, **kwargs)
+
+    @contextmanager
+    def tracked_scope():
+        nonlocal committed
+        try:
+            yield db
+            db.commit()
+            committed = True
+        except Exception:
+            db.rollback()
+            raise
+
+    messages = []
+
+    class Socket:
+        async def send_json(self, message):
+            assert committed
+            messages.append(message)
+
+    async def publish(*args):
+        assert committed
+
+    monkeypatch.setattr(add_web, "session_scope", tracked_scope)
+    monkeypatch.setattr(add_web, "settle_attendance_batch", slow_settle)
+    monkeypatch.setattr(add_web.browser_events, "publish", publish)
+    payload = {"batch_id": "slow-durable-batch", "events": [event(event_uid="7" * 64).model_dump(mode="json")]}
+    envelope = Envelope(
+        schema_version="2", message_id="slow-durable", connector_id=connector_id,
+        boot_id="slow-boot", seq=1, sent_at=utc_now(), type="attendance_batch", payload=payload,
+    )
+
+    async def scenario():
+        if transport == "websocket":
+            pending = asyncio.create_task(add_web.handle_envelope(connector_pk, envelope, Socket()))
+        else:
+            pending = asyncio.create_task(add_web.device_attendance(payload, (db, connector)))
+        try:
+            async def started():
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+            await asyncio.wait_for(started(), 1)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=add_web.app), base_url="http://test") as client:
+                for path in ("/health/live", "/health/serve"):
+                    response = await asyncio.wait_for(client.get(path), 1)
+                    assert response.status_code == 200
+            assert not pending.done()
+            assert messages == []
+        finally:
+            release.set()
+            await pending
+
+    asyncio.run(scenario())
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 1
+    if transport == "websocket":
+        assert messages[0]["outcome"] == "COMMITTED"
+
+
+def test_websocket_commit_failure_emits_neither_ack_nor_browser_success(db, monkeypatch):
+    connector = connector_fixture(db)
+    connector_pk = connector.id
+    connector_id = connector.connector_id
+    messages = []
+
+    @contextmanager
+    def failed_commit():
+        try:
+            yield db
+            raise RuntimeError("injected commit failure")
+        finally:
+            db.rollback()
+
+    class Socket:
+        async def send_json(self, message):
+            messages.append(message)
+
+    async def publish(*args):
+        messages.append(args)
+
+    monkeypatch.setattr(add_web, "session_scope", failed_commit)
+    monkeypatch.setattr(add_web.browser_events, "publish", publish)
+    envelope = Envelope(
+        schema_version="2", message_id="failed-commit", connector_id=connector_id,
+        boot_id="failed-commit-boot", seq=1, sent_at=utc_now(), type="attendance_batch",
+        payload={"batch_id": "failed-commit", "events": [event(event_uid="8" * 64).model_dump(mode="json")]},
+    )
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        asyncio.run(add_web.handle_envelope(connector_pk, envelope, Socket()))
+    assert messages == []
+    assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 0
+    assert db.get(Connector, connector_pk).last_sequence == 0

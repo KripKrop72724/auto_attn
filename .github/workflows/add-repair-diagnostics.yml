@@ -31,6 +31,13 @@ jobs:
           foreach ($container in @($api, $web)) {
             & docker inspect --format '{{.Name}} status={{.State.Status}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' $container
             if ($LASTEXITCODE -ne 0) { throw 'Could not inspect an ADD container.' }
+            # Health output may contain arbitrary errors. Publish fixed markers only.
+            $state = (& docker inspect $container | ConvertFrom-Json)[0].State
+            Write-Host "exit_code=$($state.ExitCode) started=$($state.StartedAt) health=$($state.Health.Status) health_failures=$($state.Health.FailingStreak)"
+            foreach ($probe in @($state.Health.Log)) {
+              $restart = [bool]($probe.Output -match 'restarting API process')
+              Write-Host "probe_start=$($probe.Start) exit_code=$($probe.ExitCode) self_restart=$restart"
+            }
           }
           & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
           if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
