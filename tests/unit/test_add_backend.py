@@ -6596,3 +6596,61 @@ def test_websocket_commit_failure_emits_neither_ack_nor_browser_success(db, monk
     assert messages == []
     assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 0
     assert db.get(Connector, connector_pk).last_sequence == 0
+
+
+@pytest.mark.parametrize("mode", ["valid", "missing_cookie", "commit_failure"])
+def test_browser_stream_finishes_auth_transaction_before_first_event(db, monkeypatch, mode):
+    from zk_add.models import AdminSession
+    from zk_add.realtime import LiveEvent
+
+    token, row = create_admin_session(
+        db, username="StateHealthAdmin", ip_address=None, user_agent="test",
+    )
+    previous_seen = utc_now() - timedelta(seconds=30)
+    row.last_seen_at = previous_seen
+    db.commit()
+    row_id = row.id
+    engine = db.get_bind()
+    db.rollback()
+    stages = []
+
+    @contextmanager
+    def auth_scope():
+        with Session(engine) as auth_db:
+            try:
+                yield auth_db
+                if mode == "commit_failure":
+                    raise RuntimeError("injected auth commit failure")
+                auth_db.commit()
+                stages.append("committed")
+            except Exception:
+                auth_db.rollback()
+                stages.append("rolled_back")
+                raise
+        stages.append("closed")
+
+    subscriptions = []
+
+    async def subscribe(last_event_id):
+        # The stream is still open here. Its authentication transaction and
+        # connection must already be released, before it waits for live events.
+        assert stages == ["committed", "closed"]
+        subscriptions.append(last_event_id)
+        yield LiveEvent(13, "test", {"ok": True}, utc_now())
+
+    monkeypatch.setattr(add_web, "session_scope", auth_scope)
+    monkeypatch.setattr(add_web.browser_events, "subscribe", subscribe)
+    app.dependency_overrides[get_db] = lambda: db
+    client = TestClient(app, raise_server_exceptions=False)
+    if mode != "missing_cookie":
+        client.cookies.set(ADMIN_COOKIE, token)
+    response = client.get("/events/v1/stream", headers={"Last-Event-ID": "12"})
+    assert response.status_code == {"valid": 200, "missing_cookie": 401, "commit_failure": 500}[mode]
+    db.expire_all()
+    if mode == "valid":
+        assert subscriptions == [12]
+        assert "id: 13" in response.text
+        assert ensure_utc(db.get(AdminSession, row_id).last_seen_at) > previous_seen
+    else:
+        assert subscriptions == []
+        assert ensure_utc(db.get(AdminSession, row_id).last_seen_at) == previous_seen
