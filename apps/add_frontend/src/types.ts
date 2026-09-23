@@ -1325,7 +1325,7 @@ export interface HistoricalIdentityReport {
 }
 
 export interface AttendanceEvent {
-  force_release?: { run_id: string; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean } | null
+  force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean } | null
   id: number
   event_uid: string
   device_serial: string | null

@@ -359,19 +359,24 @@ async def _attendance_repair_loop(stop: asyncio.Event) -> None:
 async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_safe_repair import tick
     from zk_add.attendance_force_release import tick as force_tick
+    from zk_add.attendance_direct_ords import tick as direct_tick
 
     while not stop.is_set():
-        try:
-            await asyncio.to_thread(tick)
-            await asyncio.to_thread(force_tick)
-        except Exception:
-            await browser_events.publish(
-                "backend_error",
-                {
-                    "code": "SAFE_ATTENDANCE_REPAIR_WORKER_ERROR",
-                    "message": "Attendance repair will retry its saved checkpoint. Saved attendance is preserved.",
-                },
-            )
+        for work, code in (
+            (tick, "SAFE_ATTENDANCE_REPAIR_WORKER_ERROR"),
+            (force_tick, "MANUAL_FORCE_RELEASE_WORKER_ERROR"),
+            (direct_tick, "DIRECT_ORDS_WORKER_ERROR"),
+        ):
+            try:
+                await asyncio.to_thread(work)
+            except Exception:
+                await browser_events.publish(
+                    "backend_error",
+                    {
+                        "code": code,
+                        "message": "Attendance delivery will retry its saved checkpoint. Saved punches are preserved.",
+                    },
+                )
         try:
             await asyncio.wait_for(stop.wait(), timeout=2)
         except asyncio.TimeoutError:
@@ -834,6 +839,30 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 if row.attendance_event_id
                 else None
             )
+            from zk_add.attendance_manual_guard import delivery_authorized, decision_for
+            decision = decision_for(session, event) if event else None
+            if decision and decision.proof.get("policy") == "manual-direct-ords-v1":
+                connector = session.get(Connector, event.connector_id)
+                from zk_add.attendance_force_release import delivery_payload
+
+                candidate_payload = delivery_payload(session, event, connector)
+                if candidate_payload is None:
+                    row.status = event.ords_status = "BLOCKED_IDENTITY"
+                    row.last_error = "The approved punch changed or its user/CNIC is unavailable."
+                    row.next_attempt_at = None
+                    continue
+                row.status = "IN_FLIGHT"
+                row.attempt_count += 1
+                row.last_attempt_at = now
+                row.next_attempt_at = None
+                row.last_error = None
+                row.payload_hash = hashlib.sha256(
+                    json.dumps(candidate_payload, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest()
+                claims.append((row.id, candidate_payload, connector.id, was_retry))
+                if len(claims) >= limit:
+                    break
+                continue
             event_uid = event.event_uid if event else None
             if not event_uid_is_valid(event_uid):
                 row.status = "QUARANTINED_INVALID_EVENT_UID"
@@ -843,7 +872,6 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 continue
             connector = session.get(Connector, event.connector_id)
             zkt = session.get(ZKTDevice, event.zkt_device_id)
-            from zk_add.attendance_manual_guard import delivery_authorized, decision_for
             if not delivery_authorized(session, event):
                 row.status = event.ords_status = "BLOCKED_IDENTITY"
                 row.last_error = "Administrator approval is required. Open Force release attendance."

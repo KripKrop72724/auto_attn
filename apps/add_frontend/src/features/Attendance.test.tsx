@@ -331,6 +331,63 @@ describe('Live attendance workspace', () => {
     expect((await screen.findByRole('alert')).textContent).toMatch(/from time must be earlier/i)
   })
 
+  it('combines Oracle status choices, missing CNIC, and a chosen page size', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({
+      rows: [event()], next_cursor: null,
+      status_options: ['BLOCKED_IDENTITY', 'FAILED_RETRYABLE', 'ACKED'],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    fireEvent.click(screen.getByText(/^Filters$/i))
+    fireEvent.click(screen.getByLabelText('BLOCKED IDENTITY'))
+    fireEvent.click(screen.getByLabelText('FAILED RETRYABLE'))
+    fireEvent.change(screen.getByLabelText('CNIC availability'), { target: { value: 'missing' } })
+    fireEvent.change(screen.getByLabelText('Rows per load'), { target: { value: '250' } })
+    await waitFor(() => {
+      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['BLOCKED_IDENTITY', 'FAILED_RETRYABLE'])
+      expect(sent.searchParams.get('cnic_present')).toBe('false')
+      expect(sent.searchParams.get('limit')).toBe('250')
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Oracle: BLOCKED IDENTITY/i }))
+    await waitFor(() => {
+      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['FAILED_RETRYABLE'])
+    })
+  })
+
+  it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
+    const second = event({ id: 2, event_uid: 'event-two', user_id: '1008', display_name: 'Bilal Ahmed' })
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
+        job_id: 'saved-direct-run', status: 'RUNNING', created_at: '2026-08-12T09:00:00Z', actor: 'operator',
+        selected: 2, ready: 2, waiting: 0, confirmed: 0, skipped: 0, attention: 0,
+      }, 202)
+      if (path === '/api/v2/attendance-direct-ords') return response({ rows: [] })
+      if (path.includes('/api/v2/attendance-direct-ords/')) return response({ rows: [], next_cursor: null })
+      return response({ rows: [event(), second], next_cursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findByRole('article', { name: /Bilal Ahmed/i })
+    fireEvent.click(screen.getByLabelText('Select loaded punches'))
+    fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
+    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current user or a missing or unusable CNIC/i)
+    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Verified by administrator' } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and send 2 punches' }))
+    await screen.findByText('Preparing delivery')
+    const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
+    const body = JSON.parse(String(call?.[1]?.body))
+    expect(body.event_ids).toEqual([1, 2])
+    expect(body.password).toBe('test-password')
+    expect(body.reason).toBe('Verified by administrator')
+    expect(body.idempotency_key).toMatch(/^direct-ords:/)
+    expect(window.location.search).toContain('direct_run=saved-direct-run')
+  })
+
   it('keeps the original hold visible beside the downstream-verified release state', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response({
       rows: [event({
