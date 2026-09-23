@@ -312,6 +312,13 @@ def _accept_sync(session, task, connector, *, releasing):
     started = command.started_at or command.acknowledged_at
     if not (command.status == "SUCCEEDED" and command.completed_at and started and snapshot):
         return
+    if session.scalar(select(DeviceUserSnapshot.id).where(
+        DeviceUserSnapshot.zkt_device_id == snapshot.zkt_device_id,
+        DeviceUserSnapshot.snapshot_id == snapshot.snapshot_id,
+        DeviceUserSnapshot.id != snapshot.id,
+        DeviceUserSnapshot.received_at < started,
+    ).limit(1)):
+        return  # A recently replayed cached ID cannot become a new terminal read.
     from zk_add.attendance_sync_evidence import ordered_refresh_proven
 
     clock_fresh = (

@@ -143,3 +143,18 @@ def test_snapshot_commit_failure_keeps_ordering_evidence_uncommitted(refresh, mo
         assert db.scalar(select(Task)).status == "SYNCING"
         assert not db.scalar(select(DeviceCommandEvent.id).where(
             DeviceCommandEvent.status == "SYNC_READ_ROSTER"))
+
+
+def test_cached_snapshot_id_is_rejected_even_when_its_clock_looks_fresh(refresh):
+    sessions, send = refresh
+    snapshot_id = str(uuid4())
+    # The fixture's clock starts two hours behind; these frames are near server
+    # time. Replaying the pre-command roster must not use the clock fallback.
+    send("user_snapshot", offset=7200, snapshot_id=snapshot_id)
+    send("RUNNING", offset=7201)
+    send("user_snapshot", offset=7202, observed_offset=7200, snapshot_id=snapshot_id)
+    send("SUCCEEDED", offset=7203)
+    tick(sessions)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNCING"
+        assert db.scalar(select(func.count(Item.id))) == 0
