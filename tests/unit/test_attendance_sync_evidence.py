@@ -124,15 +124,17 @@ def test_uncertain_or_replayed_clock_skewed_roster_cannot_be_approved(refresh, f
 
 
 def test_snapshot_commit_failure_keeps_ordering_evidence_uncommitted(refresh, monkeypatch):
+    from zk_add import attendance_sync_evidence
+
     sessions, send = refresh
     send("RUNNING")
-    original = web.replace_user_snapshot
+    original = attendance_sync_evidence.record_roster
 
     def fail_after_append(*args, **kwargs):
         original(*args, **kwargs)
         raise RuntimeError("injected transaction failure")
 
-    monkeypatch.setattr(web, "replace_user_snapshot", fail_after_append)
+    monkeypatch.setattr(attendance_sync_evidence, "record_roster", fail_after_append)
     with pytest.raises(RuntimeError, match="injected"):
         send("user_snapshot", offset=2)
     send("SUCCEEDED", offset=3)
