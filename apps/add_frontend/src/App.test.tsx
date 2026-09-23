@@ -608,7 +608,7 @@ describe('State Life ADD interface', () => {
     ).toBeTruthy()
   })
 
-  it('requires exact HR evidence before requeuing historical attendance', async () => {
+  it('saves exact HR evidence while retaining the manual attendance hold', async () => {
     const fetchMock = fetchStub([user], true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
@@ -635,7 +635,7 @@ describe('State Life ADD interface', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
 
-    expect(await screen.findByText(/3 preserved attendance events requeued/i)).toBeTruthy()
+    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve') &&
       (init as RequestInit | undefined)?.method === 'POST',
@@ -682,7 +682,7 @@ describe('State Life ADD interface', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
 
-    expect(await screen.findByText(/2 preserved attendance events requeued/i)).toBeTruthy()
+    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve-event-group') &&
       (init as RequestInit | undefined)?.method === 'POST',
@@ -757,10 +757,10 @@ describe('State Life ADD interface', () => {
       target: { value: 'test-password' },
     })
     fireEvent.click(
-      screen.getByRole('button', { name: /verify current identity and requeue/i }),
+      screen.getByRole('button', { name: /verify and save identity evidence/i }),
     )
 
-    expect(await screen.findByText(/1 preserved attendance event requeued/i)).toBeTruthy()
+    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve-current-identity') &&
       (init as RequestInit | undefined)?.method === 'POST',

@@ -8,6 +8,63 @@ import re
 import sys
 
 
+# Bound the input before examining identity history. Only internal run/item IDs
+# and booleans leave the database; names, identifiers, CNICs and hashes do not.
+FORCE_CONFLICT_SQL = """
+WITH recent AS (
+    SELECT i.id, i.item_id, i.job_id, i.connector_id, i.attendance_event_id,
+           j.job_id AS run_id
+    FROM add_attendance_recovery_items i
+    JOIN add_attendance_recovery_jobs j ON j.id=i.job_id
+    WHERE j.action='MANUAL_FORCE_RELEASE' AND i.error_code='IDENTITY_CONFLICT'
+    ORDER BY i.id DESC LIMIT 25
+)
+SELECT r.run_id, r.item_id,
+       COALESCE(u.identity_conflict_code <> '', false) AS current_conflict,
+       COALESCE(e.device_user_id <> u.id, false) AS captured_user_changed,
+       e.identity_resolution_status IN ('QUARANTINED_REUSE','BLOCKED_SOURCE_CONFLICT')
+           AS captured_conflict,
+       COALESCE(e.identity_terminal_fingerprint <> '' AND
+           e.identity_terminal_fingerprint IS DISTINCT FROM u.terminal_identity_fingerprint, false)
+           AS captured_fingerprint_changed,
+       EXISTS (SELECT 1 FROM add_device_users d WHERE d.zkt_device_id=z.id
+           AND d.id<>u.id AND (d.user_id=u.user_id OR
+               (NULLIF(u.uid,'') IS NOT NULL AND d.uid=u.uid))) AS other_user_row,
+       EXISTS (SELECT 1 FROM add_identity_tombstones h WHERE h.zkt_device_id=z.id
+           AND (h.user_id=u.user_id OR (NULLIF(u.uid,'') IS NOT NULL AND h.uid=u.uid))
+           AND (h.device_user_id<>u.id OR h.cnic_lookup_hash<>u.cnic_lookup_hash)
+           AND (h.device_serial=z.serial OR h.device_serial IS NULL OR h.device_serial=''))
+           AS tombstone_current_or_unknown_terminal,
+       EXISTS (SELECT 1 FROM add_identity_tombstones h WHERE h.zkt_device_id=z.id
+           AND (h.user_id=u.user_id OR (NULLIF(u.uid,'') IS NOT NULL AND h.uid=u.uid))
+           AND (h.device_user_id<>u.id OR h.cnic_lookup_hash<>u.cnic_lookup_hash)
+           AND NULLIF(h.device_serial,'') IS NOT NULL AND h.device_serial<>z.serial)
+           AS tombstone_other_terminal,
+       EXISTS (SELECT 1 FROM add_attendance_identity_history h WHERE h.zkt_device_id=z.id
+           AND h.user_id=u.user_id AND (h.terminal_serial=z.serial OR h.terminal_serial='')
+           AND (h.device_user_id<>u.id OR h.cnic_lookup_hash<>u.cnic_lookup_hash))
+           AS history_current_or_unknown_terminal,
+       EXISTS (SELECT 1 FROM add_attendance_identity_history h WHERE h.zkt_device_id=z.id
+           AND h.user_id=u.user_id AND NULLIF(h.terminal_serial,'') IS NOT NULL
+           AND h.terminal_serial<>z.serial
+           AND (h.device_user_id<>u.id OR h.cnic_lookup_hash<>u.cnic_lookup_hash))
+           AS history_other_terminal,
+       EXISTS (SELECT 1 FROM add_attendance_force_release_users b WHERE b.task_id=t.id
+           AND (b.user_id=u.user_id OR (NULLIF(u.uid,'') IS NOT NULL AND b.uid=u.uid))
+           AND (b.device_user_id<>u.id OR b.cnic_hash<>u.cnic_lookup_hash
+               OR (NULLIF(b.identity_fingerprint,'') IS NOT NULL AND
+                   b.identity_fingerprint IS DISTINCT FROM u.terminal_identity_fingerprint)))
+           AS baseline_changed
+FROM recent r
+JOIN add_attendance_events e ON e.id=r.attendance_event_id
+JOIN add_zkt_devices z ON z.connector_id=r.connector_id
+JOIN add_attendance_force_release_tasks t ON t.job_id=r.job_id AND t.connector_id=r.connector_id
+JOIN add_device_users u ON u.zkt_device_id=z.id AND u.user_id=e.user_id
+    AND u.present=true AND u.lifecycle_state='ACTIVE'
+ORDER BY r.id DESC
+"""
+
+
 def summarize_logs(lines):
     """Allowlist output fields instead of trying to redact arbitrary log messages."""
     responses = Counter()
@@ -65,6 +122,7 @@ def database_report():
     from zk_add.settings import settings
 
     queries = {
+        "force_conflicts": FORCE_CONFLICT_SQL,
         "jobs": """SELECT id, job_id, status, requested_count, eligible_count,
                    created_at, updated_at, (last_error IS NOT NULL) AS has_error
                    FROM add_attendance_recovery_jobs WHERE action = 'SAFE_REPAIR'

@@ -88,6 +88,53 @@ def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):
         assert db.scalar(select(func.count(Job.id))) == 1
 
 
+def test_conflict_diagnostics_separate_terminal_namespaces_without_exporting_identity(force_pg):
+    import json
+    from test_attendance_repair import WRONG_CNIC, CORRECT_CNIC
+    from zk_add.crypto import encrypt_cnic, cnic_lookup
+    from zk_add.models import (
+        AttendanceIdentityHistory, AttendanceRecoveryItem as Item,
+        AttendanceForceReleaseTask as Task, DeviceUser,
+    )
+    from zk_add.time_utils import utc_now
+
+    path = Path(__file__).parents[2] / "scripts/attendance_repair_diagnostics.py"
+    spec = spec_from_file_location("force_diagnostics", path)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sessions, _, _ = force_pg
+    checked(force_pg)
+    with sessions() as db:
+        item, task, user = db.scalar(select(Item)), db.scalar(select(Task)), db.scalar(select(DeviceUser))
+        item.error_code, item.status = "IDENTITY_CONFLICT", "NEEDS_REVIEW"
+        history = dict(
+            zkt_device_id=user.zkt_device_id, device_user_id=user.id,
+            user_id=user.user_id, uid=user.uid,
+            cnic_encrypted=encrypt_cnic(WRONG_CNIC), cnic_lookup_hash=cnic_lookup(WRONG_CNIC),
+            first_snapshot_id=task.snapshot_id, last_snapshot_id=task.snapshot_id,
+            last_revision=1, observed_from=utc_now(), observed_until=utc_now(),
+        )
+        db.add(AttendanceIdentityHistory(**history, terminal_serial="REPLACED-TERMINAL"))
+        db.flush()
+        rows = db.execute(text(module.FORCE_CONFLICT_SQL)).mappings().all()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["history_other_terminal"] is True
+        assert row["history_current_or_unknown_terminal"] is False
+        assert set(row) == {
+            "run_id", "item_id", "current_conflict", "captured_user_changed",
+            "captured_conflict", "captured_fingerprint_changed", "other_user_row",
+            "tombstone_current_or_unknown_terminal", "tombstone_other_terminal",
+            "history_current_or_unknown_terminal", "history_other_terminal", "baseline_changed",
+        }
+        assert all(isinstance(v, bool) for k, v in row.items() if k not in {"run_id", "item_id"})
+        output = json.dumps(row)
+        assert all(value not in output for value in (user.display_name, WRONG_CNIC, CORRECT_CNIC))
+        db.add(AttendanceIdentityHistory(**history, terminal_serial=task.terminal_serial))
+        db.flush()
+        assert db.execute(text(module.FORCE_CONFLICT_SQL)).mappings().one()["history_current_or_unknown_terminal"]
+
+
 def test_old_application_sql_cannot_reopen_held_attendance(force_pg):
     sessions, _, _ = force_pg
     with pytest.raises(DBAPIError, match="explicit administrator approval"):

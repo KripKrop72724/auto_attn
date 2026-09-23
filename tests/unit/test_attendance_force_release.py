@@ -569,6 +569,92 @@ def test_legitimate_uidless_format_and_harmless_historical_name_truncation(store
         assert force.identity_proof(db, event, connector, task)[1] == "UID_INVALID"
 
 
+@pytest.mark.parametrize("namespace", ["current", "other", "empty"])
+def test_historical_identity_conflicts_belong_to_their_terminal(store, namespace):
+    from zk_add.models import AttendanceIdentityHistory
+    from test_attendance_repair import WRONG_CNIC
+
+    sessions, _, _ = store
+    checked(store)
+    with sessions() as db:
+        event, connector, task, user = (
+            db.scalar(select(AttendanceEvent)), db.scalar(select(Connector)),
+            db.scalar(select(Task)), db.scalar(select(DeviceUser)),
+        )
+        serial = {"current": connector.zkt_device.serial, "other": "REPLACED-TERMINAL",
+                  "empty": ""}[namespace]
+        db.add(AttendanceIdentityHistory(
+            zkt_device_id=connector.zkt_device.id, device_user_id=user.id,
+            terminal_serial=serial, user_id=user.user_id, uid=user.uid,
+            cnic_encrypted=encrypt_cnic(WRONG_CNIC), cnic_lookup_hash=cnic_lookup(WRONG_CNIC),
+            first_snapshot_id=task.snapshot_id, last_snapshot_id=task.snapshot_id,
+            last_revision=1, observed_from=utc_now(), observed_until=utc_now(),
+        ))
+        db.flush()
+        assert force.identity_proof(db, event, connector, task)[1] == (
+            None if namespace == "other" else "IDENTITY_CONFLICT"
+        )
+        if namespace == "other":
+            event.device_serial = serial
+            assert force.identity_proof(db, event, connector, task)[1] == "TERMINAL_CHANGED"
+
+
+def test_empty_uid_is_not_evidence_linking_unrelated_legacy_users(store):
+    from zk_add.models import IdentityTombstone, AttendanceForceReleaseUser as Baseline
+
+    sessions, _, _ = store
+    checked(store)
+    with sessions() as db:
+        event, connector, task, user = (
+            db.scalar(select(AttendanceEvent)), db.scalar(select(Connector)),
+            db.scalar(select(Task)), db.scalar(select(DeviceUser)),
+        )
+        event.uid, event.source, user.uid = None, "LIVE", ""
+        db.scalar(select(Baseline)).uid = ""
+        old = DeviceUser(zkt_device_id=connector.zkt_device.id, uid="", user_id="other",
+                         display_name="Unrelated retired user", lifecycle_state="DELETED")
+        db.add(old)
+        db.flush()
+        tombstone = IdentityTombstone(
+            zkt_device_id=connector.zkt_device.id, device_user_id=old.id,
+            device_serial=connector.zkt_device.serial, user_id=old.user_id, uid="",
+            display_name_encrypted=encrypt_text("Unrelated retired user"),
+        )
+        db.add(tombstone)
+        db.add(Baseline(task_id=task.id, device_user_id=old.id, user_id=old.user_id, uid=""))
+        db.flush()
+        assert force.identity_proof(db, event, connector, task)[1] is None
+        tombstone.user_id = user.user_id
+        db.flush()
+        assert force.identity_proof(db, event, connector, task)[1] == "IDENTITY_CONFLICT"
+
+
+@pytest.mark.parametrize("namespace", ["current", "other", "unknown", "empty"])
+def test_deleted_identity_evidence_preserves_terminal_namespace(store, namespace):
+    from zk_add.models import IdentityTombstone
+    from test_attendance_repair import WRONG_CNIC
+
+    sessions, _, _ = store
+    checked(store)
+    with sessions() as db:
+        event, connector, task, user = (
+            db.scalar(select(AttendanceEvent)), db.scalar(select(Connector)),
+            db.scalar(select(Task)), db.scalar(select(DeviceUser)),
+        )
+        serial = {"current": connector.zkt_device.serial, "other": "REPLACED-TERMINAL",
+                  "unknown": None, "empty": ""}[namespace]
+        db.add(IdentityTombstone(
+            zkt_device_id=connector.zkt_device.id, device_user_id=user.id,
+            device_serial=serial, user_id=user.user_id, uid=user.uid,
+            display_name_encrypted=encrypt_text("Synthetic previous employee"),
+            cnic_encrypted=encrypt_cnic(WRONG_CNIC), cnic_lookup_hash=cnic_lookup(WRONG_CNIC),
+        ))
+        db.flush()
+        assert force.identity_proof(db, event, connector, task)[1] == (
+            None if namespace == "other" else "IDENTITY_CONFLICT"
+        )
+
+
 @pytest.mark.parametrize(
     "first,last,post_kind,expected",
     [
