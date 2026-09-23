@@ -312,6 +312,16 @@ def _accept_sync(session, task, connector, *, releasing):
     started = command.started_at or command.acknowledged_at
     if not (command.status == "SUCCEEDED" and command.completed_at and started and snapshot):
         return
+    from zk_add.attendance_sync_evidence import ordered_refresh_proven
+
+    clock_fresh = (
+        ensure_utc(snapshot.observed_at) >= ensure_utc(started) - timedelta(seconds=5)
+        and abs((ensure_utc(snapshot.received_at) - ensure_utc(snapshot.observed_at)).total_seconds()) <= 300
+    )
+    ordered_fresh = ordered_refresh_proven(
+        session, command, snapshot, boot_id=task.sync_boot_id,
+        requested_at=task.sync_requested_at,
+    )
     # A command acknowledgment is not a roster. The newly committed full roster
     # must be received after execution started, on the same connector boot.
     if not (
@@ -323,11 +333,7 @@ def _accept_sync(session, task, connector, *, releasing):
         and snapshot.connector_boot_id == task.sync_boot_id
         and ensure_utc(snapshot.received_at) >= ensure_utc(started)
         and ensure_utc(snapshot.received_at) >= ensure_utc(task.sync_requested_at)
-        and ensure_utc(snapshot.observed_at) >= ensure_utc(started) - timedelta(seconds=5)
-        and abs(
-            (ensure_utc(snapshot.received_at) - ensure_utc(snapshot.observed_at)).total_seconds()
-        )
-        <= 300
+        and (clock_fresh or ordered_fresh)
     ):
         return
     task.snapshot_id, task.synced_at = snapshot.id, utc_now()

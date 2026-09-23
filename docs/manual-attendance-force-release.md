@@ -63,6 +63,17 @@ Ambiguous freshness excludes the device. Legacy capture information that was
 never retained cannot be reconstructed; no missing evidence is represented as
 historical proof.
 
+For ZKT WebSocket refreshes, ADD also preserves the authenticated command-start,
+committed-roster and command-success message order in the existing command event
+ledger. All three must belong to the same boot, occur within the request's server
+time window, and have increasing sequences. The roster's capture time must fall
+inside that command's **device-clock** interval. This permits a consistently
+skewed ESP clock without accepting old cached bytes: reused snapshot IDs, missing
+boundaries, out-of-order messages, a clock jump, a changed boot, or an uncommitted
+roster cannot supply this proof. Without this complete evidence, the original
+strict clock freshness check applies. This does not relax attendance timestamp,
+identity or Oracle confirmation rules, and requires no firmware change.
+
 Manual delivery retains the 4:1 live/background allocation and rotates devices.
 Network requests run outside database transactions. Slow manual content checks
 do not delay receipt commits for live claims from the same batch. Authentication,
