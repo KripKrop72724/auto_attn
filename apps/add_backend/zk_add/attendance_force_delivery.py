@@ -43,6 +43,7 @@ def split_claims(claims):
                     "row_id": row.id,
                     "decision_id": decision.id,
                     "attempt": row.attempt_count,
+                    "direct": decision.proof.get("policy") == "manual-direct-ords-v1",
                     "payload": payload,
                     "check": {
                         "contract_version": "1",
@@ -66,6 +67,30 @@ def split_claims(claims):
                 }
             )
     return ordinary, forced
+
+
+def reserve_direct_post(claim, classification):
+    """Persist send intent before network I/O so an uncertain reply is verified first."""
+    from zk_add.worker import event_uid_is_valid
+
+    with session_scope() as session:
+        row = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.id == claim["row_id"]).with_for_update()
+        )
+        if not row or row.status != "IN_FLIGHT" or row.attempt_count != claim["attempt"]:
+            return False
+        event = session.get(AttendanceEvent, row.attendance_event_id)
+        decision = decision_for(session, event)
+        if not decision or decision.id != claim["decision_id"]:
+            return False
+        item = session.get(AttendanceRecoveryItem, decision.item_id)
+        prior = item.result.get("direct_post_attempts", 0)
+        if prior and (
+            classification != "MISSING" or not event_uid_is_valid(event.event_uid)
+        ):
+            return False
+        item.result = {**item.result, "direct_post_attempts": prior + 1}
+        return True
 
 
 async def verify(claim):
@@ -200,9 +225,16 @@ async def deliver_forced(claims, *, concurrency):
         async with semaphore:
             try:
                 classification, token = await verify(claim)
-                if classification == "MISSING":
+                should_send = classification == "MISSING" or (
+                    claim["direct"] and classification != "MATCH"
+                )
+                if should_send:
                     if not await asyncio.to_thread(still_authorized, claim):
                         classification = "CHANGED"
+                    elif claim["direct"] and not await asyncio.to_thread(
+                        reserve_direct_post, claim, classification
+                    ):
+                        code = "ORACLE_CONTENT_VERIFICATION_PENDING"
                     else:
                         post_status = None
                         async with httpx.AsyncClient(
@@ -221,7 +253,7 @@ async def deliver_forced(claims, *, concurrency):
                             except httpx.RequestError:
                                 pass  # The write may have committed; content verification decides.
                         classification, token = await verify(claim)
-                        if classification == "MISSING" and post_status in {400, 404, 405, 410, 422}:
+                        if classification != "MATCH" and post_status in {400, 404, 405, 410, 422}:
                             classification, code = "REJECTED", f"ORDS_HTTP_{post_status}"
             except Exception as exc:
                 classification = "UNKNOWN"

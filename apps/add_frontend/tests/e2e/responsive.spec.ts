@@ -541,6 +541,33 @@ test('populated Users and Attendance workspaces are responsive, keyboard-operabl
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
 
+test('Attendance combines Oracle filters and offers an accessible per-punch send review', async ({ page }) => {
+  await page.route('**/api/v1/attendance?*', async (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      rows: [{ ...representativeAttendance, ords_status: 'BLOCKED_IDENTITY', oracle_confirmed_at: null }],
+      next_cursor: null, status_options: ['BLOCKED_IDENTITY', 'FAILED_RETRYABLE'],
+    }),
+  }))
+  await page.goto('/attendance')
+  const row = page.getByRole('article', { name: /Ayesha Khan, Check in/i })
+  await expect(row).toBeVisible()
+  await page.locator('.attendance-advanced > summary').click()
+  await page.getByRole('checkbox', { name: 'BLOCKED IDENTITY' }).check()
+  await page.getByRole('checkbox', { name: 'FAILED RETRYABLE' }).check()
+  await page.getByLabel('CNIC availability').selectOption('present')
+  await page.getByRole('button', { name: 'View results' }).click()
+  await expect(page.getByRole('button', { name: /Oracle: BLOCKED IDENTITY/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Oracle: FAILED RETRYABLE/i })).toBeVisible()
+  await row.getByRole('button', { name: 'Send to ORDS' }).click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog.getByRole('heading', { name: 'Send 1 punch to Oracle' })).toBeVisible()
+  await expect(dialog.getByLabel('Administrator password')).toBeVisible()
+  const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
+  const results = await new AxeBuilder({ page }).include('[role="dialog"]').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()
+  expect(results.violations).toEqual([])
+})
+
 test('legacy employee repair route opens the responsive blocked-punch review', async ({ page }, testInfo) => {
   await page.goto('/reconciliation?tab=employee-repair&device_id=connector-one')
   await expect(page).toHaveURL(/\/attendance\?view=needs-review&device_id=connector-one$/)

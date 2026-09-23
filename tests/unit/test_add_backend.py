@@ -5203,6 +5203,66 @@ def test_invalid_attendance_cnic_filter_is_rejected(db: Session):
     assert "13 digits" in response.json()["detail"]
 
 
+def test_attendance_filters_combine_multiple_ords_states_and_cnic_presence(db: Session):
+    connector = connector_fixture(db)
+    matching = _make_recovery_event(
+        db, connector, event_number=7001, ords_status="BLOCKED_IDENTITY",
+    )
+    _make_recovery_event(
+        db, connector, event_number=7002, ords_status="FAILED_RETRYABLE",
+    )
+    _make_recovery_event(
+        db, connector, event_number=7003, ords_status="BLOCKED_IDENTITY",
+        cnic_lookup_hash=None,
+    )
+    _make_recovery_event(db, connector, event_number=7004, ords_status="ACKED")
+    raw_session, _admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest"
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    selected = client.get(
+        "/api/v1/attendance",
+        params=[
+            ("device_id", connector.connector_id),
+            ("ords_status", "BLOCKED_IDENTITY"),
+            ("ords_status", "FAILED_RETRYABLE"),
+            ("cnic_present", "true"),
+            ("limit", "1"),
+        ],
+    )
+    assert selected.status_code == 200
+    assert selected.json()["rows"][0]["id"] != matching.id
+    assert selected.json()["next_cursor"] is not None
+    older = client.get(
+        "/api/v1/attendance",
+        params=[
+            ("device_id", connector.connector_id),
+            ("ords_status", "BLOCKED_IDENTITY"),
+            ("ords_status", "FAILED_RETRYABLE"),
+            ("cnic_present", "true"),
+            ("limit", "1"),
+            ("cursor", str(selected.json()["next_cursor"])),
+        ],
+    )
+    assert [row["id"] for row in older.json()["rows"]] == [matching.id]
+    assert older.json()["next_cursor"] is None
+    assert {"BLOCKED_IDENTITY", "FAILED_RETRYABLE", "ACKED"}.issubset(
+        set(selected.json()["status_options"])
+    )
+    missing = client.get(
+        "/api/v1/attendance",
+        params={"cnic_present": "false", "ords_status": "BLOCKED_IDENTITY"},
+    )
+    assert [row["user_id"] for row in missing.json()["rows"]] == ["user-7003"]
+
+
 def test_global_alert_queue_is_priority_ordered_and_cursor_safe(db: Session):
     connector = connector_fixture(db)
     now = utc_now()

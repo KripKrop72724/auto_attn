@@ -973,6 +973,10 @@ def delivery_payload(session, event, connector):
     decision = decision_for(session, event)
     if decision is None:
         return None
+    if decision.proof.get("policy") == "manual-direct-ords-v1":
+        from zk_add.attendance_direct_ords import approved_payload
+
+        return approved_payload(session, event, connector, decision)
     proof, error = identity_proof(session, event, connector)
     if error or any(
         proof.get(k) != decision.proof.get(k)
@@ -1307,8 +1311,39 @@ def metadata(session, event):
         return None
     job = session.get(Job, decision.job_id)
     item = session.get(Item, decision.item_id)
+    return _decision_metadata(decision, job, item)
+
+
+def metadata_for_page(session, events):
+    """Load decision, run and item evidence in bounded queries for a ledger page."""
+    event_ids = [event.id for event in events]
+    if not event_ids:
+        return {}
+    decisions = session.scalars(
+        select(Decision).where(Decision.attendance_event_id.in_(event_ids))
+        .order_by(Decision.id.desc())
+    ).all()
+    latest = {}
+    for decision in decisions:
+        latest.setdefault(decision.attendance_event_id, decision)
+    if not latest:
+        return {}
+    jobs = {row.id: row for row in session.scalars(
+        select(Job).where(Job.id.in_({decision.job_id for decision in latest.values()}))
+    ).all()}
+    items = {row.id: row for row in session.scalars(
+        select(Item).where(Item.id.in_({decision.item_id for decision in latest.values()}))
+    ).all()}
+    return {
+        event_id: _decision_metadata(decision, jobs[decision.job_id], items[decision.item_id])
+        for event_id, decision in latest.items()
+    }
+
+
+def _decision_metadata(decision, job, item):
     return {
         "run_id": job.job_id,
+        "policy": decision.proof.get("policy"),
         "administrator": decision.actor,
         "approved_at": job.scope["approval"]["at"],
         "audit_id": decision.audit_id,

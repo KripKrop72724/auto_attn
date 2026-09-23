@@ -32,14 +32,52 @@
 .attendance-advanced-body > header .eyebrow { margin-bottom: 4px; }
 .attendance-advanced-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; padding: 16px; background: var(--surface-muted); }
 .attendance-advanced-grid label { display: grid; gap: 7px; margin: 0; color: var(--ink); font-size: 12px; font-weight: 700; }
+.attendance-status-filter { grid-column: 1/-1; min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.attendance-status-filter legend { padding: 0 5px; color: var(--ink); font-size: 12px; font-weight: 750; }
+.attendance-status-filter > div { display: flex; flex-wrap: wrap; gap: 7px; max-height: 150px; overflow: auto; }
+.attendance-status-filter label { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-muted); cursor: pointer; }
+.attendance-status-filter label:has(input:checked) { border-color: var(--brand-600); color: var(--brand-700); background: var(--brand-50); }
+.attendance-status-filter input { width: 15px; height: 15px; margin: 0; accent-color: var(--brand-700); }
+.attendance-status-filter small { color: var(--muted); }
+.attendance-pagination { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.attendance-pagination label { display: inline-flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; font-weight: 750; }
+.attendance-pagination select { min-width: 78px; }
 .attendance-advanced-body > footer { display: flex; justify-content: flex-end; gap: 9px; padding: 12px 16px; border-top: 1px solid var(--line); }
 .attendance-top-sentinel { height: 1px; }
 .attendance-new-events { position: sticky; z-index: 8; top: calc(var(--app-header-height) + 64px); min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto; padding: 0 16px; border: 1px solid var(--brand-600); border-radius: 999px; color: #fff; background: var(--brand-700); box-shadow: 0 8px 20px rgba(6,109,163,.25); font-size: 12px; font-weight: 750; }
-.attendance-event-head, .attendance-event { display: grid; grid-template-columns: minmax(220px,1.15fr) minmax(230px,1.15fr) minmax(190px,1fr) minmax(145px,.75fr) minmax(170px,.85fr) 44px; align-items: center; gap: 15px; }
+.attendance-event-head, .attendance-event { display: grid; grid-template-columns: 28px minmax(220px,1.15fr) minmax(230px,1.15fr) minmax(190px,1fr) minmax(145px,.75fr) minmax(170px,.85fr) 44px; align-items: center; gap: 15px; }
 .attendance-event-head { min-height: 45px; padding: 0 18px; color: var(--muted); background: #fafcfd; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
 .attendance-event { min-height: 94px; position: relative; padding: 13px 18px; border-top: 1px solid var(--line); border-left: 4px solid transparent; background: #fff; transition: background .14s ease; }
 .attendance-event:hover { background: #f8fbfc; }
 .attendance-event-attention { border-left-color: var(--warning); background: #fffdf7; }
+.attendance-row-select { display: flex; align-items: center; justify-content: center; }
+.attendance-row-select input, .attendance-select-tools input { width: 17px; height: 17px; accent-color: var(--brand-700); cursor: pointer; }
+.attendance-select-tools { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-bottom: 1px solid var(--line); background: #fff; font-size: 12px; }
+.attendance-select-tools label { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--ink); font-weight: 750; }
+.attendance-select-tools span { color: var(--muted); }
+.attendance-direct-send { border-bottom: 1px solid var(--line); background: var(--brand-50); }
+.attendance-direct-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 18px; }
+.attendance-direct-toolbar strong, .attendance-direct-toolbar small { display: block; }
+.attendance-direct-toolbar strong { color: var(--navy-900); font-size: 14px; }
+.attendance-direct-toolbar small { margin-top: 3px; color: var(--muted); font-size: 11px; }
+.attendance-direct-toolbar > div:last-child { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.attendance-direct-progress { margin: 0 18px 12px; padding: 13px; border: 1px solid var(--brand-600); border-radius: 10px; background: #fff; }
+.attendance-direct-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.attendance-direct-heading strong { color: var(--navy-900); }
+.attendance-direct-heading a { font-size: 12px; }
+.attendance-direct-counts { display: flex; flex-wrap: wrap; gap: 7px; margin: 11px 0; }
+.attendance-direct-counts span { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 11px; }
+.attendance-direct-counts strong { color: var(--navy-900); font-size: 14px; }
+.attendance-direct-progress p { margin: 8px 0; color: var(--muted); font-size: 12px; }
+.attendance-direct-progress details { margin-top: 10px; }
+.attendance-direct-progress summary, .attendance-direct-history summary { color: var(--brand-700); cursor: pointer; font-size: 12px; font-weight: 750; }
+.attendance-direct-progress ul, .attendance-direct-history ul { max-height: 260px; overflow: auto; margin: 8px 0; padding-left: 18px; font-size: 12px; }
+.attendance-direct-progress li, .attendance-direct-history li { padding: 5px 0; }
+.attendance-direct-pages { display: flex; gap: 8px; }
+.attendance-direct-review { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
+.attendance-direct-review summary { cursor: pointer; font-weight: 750; }
+.attendance-direct-review ul { max-height: 200px; overflow: auto; padding-left: 20px; font-size: 12px; }
+.attendance-direct-history { margin: 0 18px; padding: 0 0 12px; }
 .attendance-event-cell { min-width: 0; }
 .attendance-event-cell strong, .attendance-event-cell small { display: block; }
 .attendance-event-cell strong { overflow: hidden; margin-bottom: 4px; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -168,7 +206,7 @@
 @keyframes attendance-skeleton-shimmer { to { background-position: -200% 0; } }
 
 @media (max-width: 1280px) {
-  .attendance-event-head, .attendance-event { grid-template-columns: minmax(210px,1.1fr) minmax(220px,1.1fr) minmax(180px,1fr) minmax(150px,.75fr) minmax(165px,.85fr) 42px; gap: 12px; }
+  .attendance-event-head, .attendance-event { grid-template-columns: 26px minmax(210px,1.1fr) minmax(220px,1.1fr) minmax(180px,1fr) minmax(150px,.75fr) minmax(165px,.85fr) 42px; gap: 12px; }
   .release-review-layout.has-detail, .release-history-layout.has-detail { grid-template-columns: 330px minmax(0,1fr); }
   .release-candidate-filters { grid-template-columns: repeat(3,minmax(120px,1fr)); }
   .release-punch-row { grid-template-columns: 28px minmax(125px,.8fr) minmax(135px,.8fr) minmax(145px,.9fr) minmax(160px,1fr); }
@@ -177,6 +215,7 @@
 @media (max-width: 980px) {
   .attendance-event-head { display: none; }
   .attendance-event { grid-template-columns: 1fr 1fr; align-items: start; padding: 16px; }
+  .attendance-row-select { grid-column: 1/-1; justify-content: start; }
   .attendance-event-cell::before { content: attr(data-label); display: block; margin-bottom: 6px; color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
   .attendance-event-cell.attendance-person::before { display: none; }
   .attendance-event-details { grid-column: 1/-1; }
@@ -199,6 +238,8 @@
   .attendance-range { overflow-x: auto; }
   .attendance-range button { min-width: max-content; flex: 1 0 auto; }
   .attendance-primary-filters { grid-template-columns: 1fr; }
+  .attendance-direct-toolbar, .attendance-select-tools { align-items: stretch; flex-direction: column; }
+  .attendance-direct-toolbar > div:last-child { flex-wrap: wrap; }
   .attendance-advanced > summary { width: 100%; }
   .attendance-advanced[open]::before { content: ""; position: fixed; z-index: 70; inset: 0; background: rgba(7,26,43,.55); }
   .attendance-advanced-body { position: fixed; z-index: 71; top: auto; left: 0; right: 0; bottom: calc(var(--app-bottom-nav-height) + env(safe-area-inset-bottom)); width: 100%; max-height: min(82dvh,720px); overflow: auto; border-radius: 18px 18px 0 0; }

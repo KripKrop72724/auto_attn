@@ -16,6 +16,8 @@ from test_safe_attendance_repair import store as store
 from test_safe_attendance_repair_postgres import postgres_store as postgres_store
 from test_attendance_force_release import checked, approve, tick
 from zk_add import attendance_force_release as force, attendance_force_delivery as delivery
+from zk_add import attendance_direct_ords as direct
+from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.attendance_force_schemas import ForceCheckRequest
 from zk_add.models import (
     Connector,
@@ -86,6 +88,40 @@ def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):
     assert len(set(results)) == 1
     with sessions() as db:
         assert db.scalar(select(func.count(Job.id))) == 1
+
+
+def test_direct_ords_approval_survives_postgres_guard_and_requires_content_receipt(force_pg):
+    from zk_add.crypto import encrypt_cnic
+    from zk_add.models import OrdsOutbox, AttendanceRecoveryItem as Item
+
+    sessions, _connector_id, _uid = force_pg
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.cnic_encrypted = encrypt_cnic("3520212345671")
+        event.display_name = "Captured employee"
+        event_id = event.id
+        db.commit()
+    with sessions() as db:
+        direct.create(
+            db, actor="operator",
+            request=DirectOrdsStartRequest(
+                event_ids=[event_id], reason="Reviewed conflicting saved punch",
+                password="test-password", idempotency_key="direct-pg-approval",
+            ),
+        )
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        assert db.scalar(select(Decision)).proof["policy"] == direct.POLICY
+        assert db.scalar(select(OrdsOutbox)).status == "PENDING"
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        # The deferred trigger must reject a false ACK without Oracle content proof.
+        db.scalar(select(OrdsOutbox)).status = "ACKED_CHECK"
+        db.get(AttendanceEvent, event_id).ords_status = "ACKED_CHECK"
+        with pytest.raises(DBAPIError, match="matching Oracle content verification"):
+            db.commit()
 
 
 def test_conflict_diagnostics_separate_terminal_namespaces_without_exporting_identity(force_pg):

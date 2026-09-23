@@ -33,7 +33,9 @@ from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add import attendance_force_release as force_release
+from zk_add import attendance_direct_ords as direct_ords
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
+from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest
@@ -556,6 +558,59 @@ def list_force_releases(
     return {"enabled": settings.attendance_force_release_preview_enabled,
         "rows": [force_release.serialize(db, row, context.username) for row in rows[:limit]],
         "next_cursor": rows[limit - 1].id if len(rows) > limit else None}
+
+
+@app.get("/api/v2/attendance-direct-ords")
+def list_direct_ords_runs(
+    limit: int = Query(default=10, ge=1, le=30),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    rows = db.scalars(
+        select(AttendanceRecoveryJob).where(AttendanceRecoveryJob.action == direct_ords.ACTION)
+        .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
+    ).all()
+    return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+@app.post("/api/v2/attendance-direct-ords", status_code=202)
+def start_direct_ords_run(
+    body: DirectOrdsStartRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        job = direct_ords.create(db, actor=context.username, request=body)
+        db.flush()
+        return direct_ords.serialize(db, job)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+def _direct_ords_job(db, job_id):
+    row = _recovery_job_or_404(db, job_id)
+    if row.action != direct_ords.ACTION:
+        raise HTTPException(status_code=404, detail="Oracle send run not found.")
+    return row
+
+
+@app.get("/api/v2/attendance-direct-ords/{job_id}")
+def get_direct_ords_run(
+    job_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return direct_ords.serialize(db, _direct_ords_job(db, job_id))
+
+
+@app.get("/api/v2/attendance-direct-ords/{job_id}/items")
+def get_direct_ords_items(
+    job_id: str, cursor: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return direct_ords.items_page(db, _direct_ords_job(db, job_id), cursor=cursor, limit=limit)
 
 
 @app.post("/api/v2/attendance-force-releases", status_code=202)
@@ -2898,6 +2953,8 @@ def attendance(
     source: str | None = None,
     clock_quality: str | None = None,
     forced: bool = False,
+    ords_status: list[str] = Query(default=[]),
+    cnic_present: bool | None = None,
     from_time: str | None = None,
     to_time: str | None = None,
     cursor: int | None = None,
@@ -2908,6 +2965,8 @@ def attendance(
     # The immutable ledger also shows invalid-UID quarantine rows. They remain
     # visibly locked and can never enter the identity-release candidate set.
     statement = select(AttendanceEvent)
+    if len(ords_status) > 30 or any(not value or len(value) > 40 for value in ords_status):
+        raise HTTPException(status_code=422, detail="Select at most 30 valid Oracle delivery statuses.")
     if forced:
         from zk_add.models import AttendanceForceReleaseDecision
         statement = statement.where(AttendanceEvent.id.in_(select(AttendanceForceReleaseDecision.attendance_event_id)))
@@ -2930,6 +2989,22 @@ def attendance(
         if normalized is None:
             raise HTTPException(status_code=422, detail="CNIC must contain exactly 13 digits.")
         statement = statement.where(AttendanceEvent.cnic_lookup_hash == cnic_lookup(normalized))
+    if cnic_present is True:
+        statement = statement.where(
+            AttendanceEvent.cnic_lookup_hash.is_not(None),
+            AttendanceEvent.cnic_encrypted.is_not(None),
+            AttendanceEvent.cnic_encrypted != "",
+        )
+    elif cnic_present is False:
+        statement = statement.where(
+            or_(
+                AttendanceEvent.cnic_lookup_hash.is_(None),
+                AttendanceEvent.cnic_encrypted.is_(None),
+                AttendanceEvent.cnic_encrypted == "",
+            )
+        )
+    if ords_status:
+        statement = statement.where(AttendanceEvent.ords_status.in_(set(ords_status)))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:
@@ -2944,11 +3019,15 @@ def attendance(
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
     page_rows = rows[:limit]
     release_states = attendance_release_states(db, page_rows)
+    force_metadata = force_release.metadata_for_page(db, page_rows)
     return {
         "rows": [
-            {**serialize_attendance(row, release_states.get(row.id)), "force_release": force_release.metadata(db, row)} for row in page_rows
+            {**serialize_attendance(row, release_states.get(row.id)), "force_release": force_metadata.get(row.id)} for row in page_rows
         ],
         "next_cursor": next_cursor,
+        "status_options": db.scalars(
+            select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
+        ).all(),
     }
 
 
