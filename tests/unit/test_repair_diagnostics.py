@@ -18,6 +18,7 @@ def test_diagnostics_discard_payloads_credentials_and_dynamic_paths():
             '  File "/app/zk_add/attendance_safe_repair.py", line 181, in create_check',
             "password=secret employee=private-person cnic=3520212345671",
             "ADD event loop lag detected lag_seconds=42.000 private employee information",
+            "WARNING OTA_AUTH_REJECTED connector_fp=012345abcdef reason=TIMESTAMP_INVALID",
         ]
     )
     assert output == {
@@ -32,4 +33,5 @@ def test_diagnostics_discard_payloads_credentials_and_dynamic_paths():
         "code_frames": {"attendance_safe_repair.py:181:create_check": 1},
         "proxy_errors": {},
         "runtime_signals": {"ADD event loop lag detected": 1},
+        "firmware_auth_rejections": {"012345abcdef TIMESTAMP_INVALID": 1},
     }
