@@ -12,7 +12,7 @@ import {
 } from 'react'
 import { z } from 'zod'
 import './Firmware.css'
-import { hilDevice, hilScopeLabel } from './hilTargets'
+import { hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
 import { api, queryString } from '../api'
 import {
   Dialog,
@@ -878,7 +878,7 @@ function CampaignCreator({
                     {selectedRelease ? hilScopeLabel(selectedRelease) : 'No target'}
                     {hilTarget
                       ? ` · ${hilTarget.display_name}`
-                      : ' · no registered match'}
+                      : ` · ${hilDeviceMismatch(selectedRelease, devices) || 'no registered match'}`}
                   </small>
                 </span>
               </div>
