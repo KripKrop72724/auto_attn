@@ -129,14 +129,17 @@ jobs:
           test "$actual" = "$EXPECTED_VERSION"
           storage_mode=OFF
           if [[ "$EXPECTED_VERSION" == "2.6.0" ]]; then storage_mode=ON; fi
+          direct_mode=OFF
+          if [[ "$FIRMWARE_FAMILY" == "zkt" && "$EXPECTED_VERSION" == "2.6.1" ]]; then direct_mode=ON; fi
           docker run --rm \
             -e ZONE_LITE_SEGMENTED_WRITES="$storage_mode" \
+            -e ZONE_LITE_DIRECT_LEGACY_UPGRADE="$direct_mode" \
             -e FIRMWARE_FAMILY \
             -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
+            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_DIRECT_LEGACY_UPGRADE="$ZONE_LITE_DIRECT_LEGACY_UPGRADE" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}

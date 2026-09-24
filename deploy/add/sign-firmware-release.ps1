@@ -94,6 +94,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release me
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
+if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
+    # Keep the incomplete candidate out of the protected signing pipeline.
+    # Remove only after credential cleanup, identity continuity, and physical
+    # G3/SilkBio/MB40 readback tests have been reviewed together.
+    throw 'ZKT 2.6.1 credential policy is not yet certified for signing'
+}
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 $workRoot = if ($env:RUNNER_TEMP) {
@@ -142,7 +148,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -eq '2.6.1') { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })

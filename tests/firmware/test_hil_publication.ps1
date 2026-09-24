@@ -9,12 +9,21 @@ try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
-foreach ($version in @('2.5.4', '2.6.0')) {
+foreach ($version in @('2.5.4', '2.6.0', '2.6.1')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
-    $marker = "ZONE_STORAGE_CONTRACT_V1:${mode}:READ=2:LANES=3F:COMPAT=2.5.4"
+    $marker = if ($version -eq '2.6.1') {
+        'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2'
+    } else {
+        "ZONE_STORAGE_CONTRACT_V1:${mode}:READ=2:LANES=3F:COMPAT=2.5.4"
+    }
     [IO.File]::WriteAllText($contractImage, $marker + [char]0)
     $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
     if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
+    if ($version -eq '2.6.1' -and
+        ($contract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589' -or
+         $contract.allowed_bootstrap_images['2.5.2'] -ne '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b')) {
+        throw 'Direct predecessor image identities changed'
+    }
     $other = if ($version -eq '2.6.0') { '2.5.4' } else { '2.6.0' }
     $rejected = $false
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $other | Out-Null } catch { $rejected = $true }

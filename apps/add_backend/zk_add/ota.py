@@ -372,6 +372,18 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         contract = validate_storage_contract(release.manifest or {}, release.version)
     except ValueError:
         return "STORAGE_CONTRACT_INVALID"
+    if contract and contract.get("allowed_bootstrap_versions") is not None:
+        if connector.firmware_version not in contract["allowed_bootstrap_versions"]:
+            return "DIRECT_BOOTSTRAP_VERSION_UNQUALIFIED"
+        expected_digest = contract["allowed_bootstrap_images"][connector.firmware_version]
+        predecessor = session.scalar(select(FirmwareRelease).where(
+            FirmwareRelease.release_id == f"zone-lite-{connector.firmware_version}",
+            FirmwareRelease.state == "AVAILABLE",
+        ))
+        if (predecessor is None or _application_sha256(predecessor) != expected_digest or
+                connector.ota_image_sha256 != expected_digest or
+                connector.ota_running_partition not in {"ota_0", "ota_1"}):
+            return "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
     if not contract or contract["write_format"] != 2:
         return None
     if not _versions_match(connector.firmware_version, COMPAT_VERSION):

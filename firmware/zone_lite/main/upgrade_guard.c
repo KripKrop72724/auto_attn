@@ -1,5 +1,26 @@
 #include "upgrade_guard.h"
 
+bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32])
+{
+    if (!version || !digest) return false;
+    /* Exact ESP application hashes of the immutable signed ADD releases. */
+    static const char baseline_2412[] =
+        "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589";
+    static const char baseline_252[] =
+        "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
+    const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
+        !strcmp(version, "2.5.2") ? baseline_252 : NULL;
+    if (!expected) return false;
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 32; ++i) {
+        const char *high = strchr(hex, expected[2 * i]);
+        const char *low = strchr(hex, expected[2 * i + 1]);
+        if (!high || !low || digest[i] != (uint8_t)(((high - hex) << 4) | (low - hex)))
+            return false;
+    }
+    return true;
+}
+
 bool ug_capability_valid(const ug_capability_t *c)
 {
     if (!c || c->version != UG_CAPABILITY_VERSION || c->queue_format != DQ_CHECKPOINT_VERSION ||

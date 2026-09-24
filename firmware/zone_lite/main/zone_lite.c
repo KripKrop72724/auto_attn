@@ -1,6 +1,7 @@
 #include "lease_guard.h"
 #include "uid_cache.h"
 #include "storage_upgrade.h"
+#include "zkt_clock.h"
 #include "worker_retry.h"
 #include <errno.h>
 #include <ctype.h>
@@ -134,6 +135,7 @@
 #define CMD_STARTVERIFY 60
 #define CMD_CANCELCAPTURE 62
 #define CMD_GET_TIME 201
+#define CMD_SET_TIME 202
 #define CMD_REG_EVENT 500
 #define CMD_CONNECT 1000
 #define CMD_EXIT 1001
@@ -495,6 +497,10 @@ static uint32_t g_last_zkt_tcp_candidate_ip;
 static volatile bool g_comm_key_operation_active;
 static bool g_sntp_started;
 static bool g_time_synced;
+static volatile uint32_t g_last_sntp_sync_ms;
+static uint32_t g_last_terminal_time_sync_ms;
+static uint32_t g_last_terminal_time_sync_attempt_ms;
+static bool g_terminal_time_sync_succeeded;
 static int64_t g_ords_next_attempt_ms;
 static uint32_t g_ords_failure_backoff_ms = ZONE_LITE_ORDS_FAILURE_BACKOFF_INITIAL_MS;
 static int64_t g_ords_drain_retry_not_before_ms;
@@ -5352,15 +5358,17 @@ static void log_system_time(const char *message)
     ESP_LOGI(TAG, "%s: %s", message, timestamp);
 }
 
+static void sntp_time_sync_cb(struct timeval *timeval)
+{
+    (void)timeval;
+    g_last_sntp_sync_ms = (uint32_t)uptime_ms();
+}
+
 static bool ensure_system_time_synced(void)
 {
-    if (g_time_synced || system_time_is_valid()) {
-        g_time_synced = true;
-        return true;
-    }
-
     if (!g_sntp_started) {
         esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(ZONE_LITE_SNTP_SERVER);
+        config.sync_cb = sntp_time_sync_cb;
         esp_err_t err = esp_netif_sntp_init(&config);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "Could not start SNTP time sync: %s", esp_err_to_name(err));
@@ -5368,6 +5376,11 @@ static bool ensure_system_time_synced(void)
         }
         g_sntp_started = true;
         ESP_LOGI(TAG, "SNTP time sync started using %s", ZONE_LITE_SNTP_SERVER);
+    }
+
+    if (system_time_is_valid()) {
+        g_time_synced = true;
+        return true;
     }
 
     esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(ZONE_LITE_SNTP_SYNC_TIMEOUT_MS));
@@ -5384,6 +5397,67 @@ static bool ensure_system_time_synced(void)
         log_system_time("System UTC time synchronized");
     }
     return g_time_synced;
+}
+
+static bool zk_sync_terminal_time(int sock, zk_context_t *ctx)
+{
+    uint32_t now_ms = (uint32_t)uptime_ms();
+    g_last_terminal_time_sync_attempt_ms = now_ms;
+    g_terminal_time_sync_succeeded = false;
+    if (!g_sntp_started || !g_last_sntp_sync_ms ||
+        (uint32_t)(now_ms - g_last_sntp_sync_ms) > 90U * 60U * 1000U ||
+        !system_time_is_valid()) {
+        add_connector_log("WARN", "zkt", "ZKT_TIME_SYNC_DEFERRED",
+            "ZKT clock update deferred until the ESP receives a fresh NTP sample; retrying in one minute.");
+        return false;
+    }
+    time_t now = time(NULL);
+    uint32_t packed = 0;
+    if (!zkt_clock_pack_pst(now, &packed)) {
+        add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_FAILED",
+            "Current NTP time could not be encoded as Pakistan Standard Time.");
+        return false;
+    }
+    uint8_t payload[4];
+    uint8_t rx[1024];
+    zk_response_t response = {0};
+    write_le32(payload, packed);
+    if (!zk_send_command(sock, ctx, CMD_SET_TIME, payload, sizeof(payload), rx, sizeof(rx), &response) ||
+        response.code != CMD_ACK_OK) {
+        add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_FAILED",
+            "ZKT rejected the Pakistan Standard Time clock update; retrying in one minute.");
+        return false;
+    }
+    struct tm readback = {0};
+    time_t readback_utc = 0;
+    if (!zk_get_time_parts(sock, ctx, &readback) ||
+        !zkt_clock_pst_to_utc(&readback, &readback_utc) ||
+        llabs((long long)(readback_utc - time(NULL))) > 5) {
+        add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_READBACK_FAILED",
+            "ZKT clock update did not verify within five seconds of Pakistan Standard Time.");
+        return false;
+    }
+    g_last_terminal_time_sync_ms = (uint32_t)uptime_ms();
+    g_terminal_time_sync_succeeded = true;
+    char utc[32] = {0};
+    iso_system_now(utc);
+    strlcpy(g_add_zkt.device_time, utc, sizeof(g_add_zkt.device_time));
+    g_add_zkt.device_time_sampled_epoch = epoch_now();
+    add_connector_set_zkt(&g_add_zkt);
+    char local[40] = {0};
+    if (strftime(local, sizeof(local), "%Y-%m-%dT%H:%M:%S", &readback) == 0) {
+        add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_READBACK_FAILED",
+            "Verified terminal time could not be formatted for the ADD log.");
+        g_terminal_time_sync_succeeded = false;
+        return false;
+    }
+    strlcat(local, "+05:00", sizeof(local));
+    char message[160];
+    snprintf(message, sizeof(message),
+        "ZKT terminal time set and read back as Pakistan Standard Time; verified_pst=%s",
+        local);
+    add_connector_log("INFO", "zkt", "ZKT_TIME_SYNC_OK", message);
+    return true;
 }
 
 static bool daily_zkt_reboot_local_time(struct tm *local_time, int *local_day_key)
@@ -7953,6 +8027,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     zkt_mark_authenticated(host_order_ip, "live session authenticated and identified", true);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
+    (void)zk_sync_terminal_time(sock, &ctx);
     if (!add_connector_begin_exclusive_activity("VERIFYING_IDENTITY")) {
         zk_disconnect(sock, &ctx);
         close(sock);
@@ -8039,6 +8114,16 @@ static int64_t gateway_run(uint32_t host_order_ip)
         }
 
         now_ms = uptime_ms();
+        if ((!g_terminal_time_sync_succeeded ||
+             (uint32_t)(now_ms - g_last_terminal_time_sync_ms) >= 60U * 60U * 1000U) &&
+            (uint32_t)(now_ms - g_last_terminal_time_sync_attempt_ms) >= 60U * 1000U) {
+            if (!add_connector_begin_exclusive_activity("SYNCING_TIME")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            (void)zk_sync_terminal_time(sock, &ctx);
+            add_connector_set_activity("LIVE_CAPTURE");
+        }
         if (now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
             zkt_mark_stable();
             if (!file_has_nonempty_line(PENDING_PATH)) led_status_set(LED_STATUS_HEALTHY);
