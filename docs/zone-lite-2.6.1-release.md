@@ -51,6 +51,11 @@ credentials are removed and face/fingerprint templates remain usable.
    [OTA runbook](zone-lite-ota-agent-runbook.md). Promote only the identical
    signed bytes after acceptance. Nationwide rollout remains one zone at a
    time, with a pause on any rollback or attendance/identity regression.
+5. The national ZKT inventory also includes uFace800, uFace800/ID, and
+   uFace800 Plus/ID terminals outside the five-device HIL. Before expanding
+   past the first device of each of those models, verify the same credential
+   removal, biometric preservation, clock, and attendance postconditions on
+   that model. Offline or degraded devices remain pending until healthy.
 
 The generated `build-direct-test` image is unsigned test output and must never
 be flashed or used as a release artifact.
