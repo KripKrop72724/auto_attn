@@ -30,6 +30,25 @@ including administrators and users without biometrics. The required cadence
 is startup and hourly; the terminal user record must remain while non-biometric
 credentials are removed and face/fingerprint templates remain usable.
 
+### G3 disposable-user evidence, 24 September 2026
+
+On the authenticated SLICTOWER 3FL G3, a single operator-created disposable
+user had one fingerprint template and a PIN. A user-scoped raw 72-byte record
+write cleared its PIN while retaining the other record bytes. Readback found
+the PIN absent, the fingerprint template hash unchanged, and all 167 other
+user records byte-for-byte unchanged. This is protocol evidence for the known
+password field on **one G3**. Physical fingerprint/PIN verification and deletion
+of the disposable user are pending. The firmware's
+[`zkt_credential_record` helper](../firmware/zone_lite/main/zkt_credential_record.c)
+encodes the 28/72-byte PIN and card offsets and rejects other record sizes;
+it is not yet scheduled to run.
+
+The national inventory includes uFace800 Plus/ID. [ZKTeco's uFace800 Plus
+datasheet](https://www.zkteco-ea.com/wp-content/uploads/2023/04/uFace800-Plus-1.pdf)
+lists palm templates, so the G3 result cannot qualify palm removal on that
+model. The firmware needs a verified per-user palm read/delete/readback path
+and a disposable palm canary before nationwide promotion.
+
 ## Qualification after the credential work lands
 
 1. Use the exact [five target identities](../deploy/add/hil-targets-2.6.1.json)
