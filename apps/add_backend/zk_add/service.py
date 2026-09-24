@@ -1098,9 +1098,9 @@ def _replace_user_snapshot(
     rows_by_uid = {row.uid: row for row in existing_rows}
     # A policy write changes the V1 fingerprint because V1 includes card. The
     # only continuity exception is a complete, adjacent, promptly acknowledged
-    # pre-write snapshot followed by the same roster with cards cleared. The
-    # firmware sends the pre-write snapshot and waits for its committed ACK
-    # before it writes any terminal record.
+    # pre-write snapshot followed by the same roster with cards cleared. When
+    # ADD is offline the firmware still clears credentials, but this bridge
+    # remains unavailable and ambiguous attendance stays held.
     previous_snapshot = session.scalar(
         select(DeviceUserSnapshot).where(
             DeviceUserSnapshot.zkt_device_id == zkt.id,

@@ -331,7 +331,14 @@ def test_card_policy_transition_preserves_only_fingerprint_bound_gap_events(stor
         assert identity_evidence(db, event, connector) is None
 
 
-def test_card_policy_transition_rejects_roster_change(store):
+@pytest.mark.parametrize(
+    ("before_reason", "after_name"),
+    [
+        ("CREDENTIAL_POLICY_BEFORE", "Changed Name-3520212345671"),
+        ("VERIFIED_TERMINAL_READ", "Correct Name-3520212345671"),
+    ],
+)
+def test_card_policy_transition_rejects_unproven_change(store, before_reason, after_name):
     sessions, connector_id, uid = store
     before_at = utc_now() + timedelta(seconds=1)
     after_at = before_at + timedelta(seconds=20)
@@ -341,7 +348,7 @@ def test_card_policy_transition_rejects_roster_change(store):
         name = "Correct Name-3520212345671"
         replace_user_snapshot(
             db, connector=connector, snapshot=UserSnapshotRequest(
-                snapshot_id="changed-roster-before", reason="CREDENTIAL_POLICY_BEFORE",
+                snapshot_id="changed-roster-before", reason=before_reason,
                 observed_at=before_at,
                 users=[UserSnapshotRow(
                     uid="7", user_id="1007", name=name, card=12345,
@@ -355,7 +362,7 @@ def test_card_policy_transition_rejects_roster_change(store):
                 snapshot_id="changed-roster-after", reason="CREDENTIAL_POLICY_AFTER",
                 observed_at=after_at,
                 users=[UserSnapshotRow(
-                    uid="7", user_id="1007", name="Changed Name-3520212345671", card=0,
+                    uid="7", user_id="1007", name=after_name, card=0,
                     terminal_identity_fingerprint="b" * 64,
                     terminal_state_fingerprint="d" * 64,
                 )],
