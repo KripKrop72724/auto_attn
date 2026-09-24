@@ -6,6 +6,8 @@
 #define UG_ALL_QUEUE_READERS 0x3fU
 #define UG_COMPAT_VERSION "2.5.4"
 #define UG_CANDIDATE_VERSION "2.6.0"
+#define UG_DIRECT_VERSION "2.6.1"
+bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]);
 typedef struct {
     uint32_t version, queue_format, reader_mask;
     char application_version[32];

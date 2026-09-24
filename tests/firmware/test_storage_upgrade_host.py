@@ -59,7 +59,19 @@ const esp_app_desc_t *esp_app_get_description(void){return &app;}
 const esp_partition_t *esp_ota_get_running_partition(void){return &current;}
 const esp_partition_t *esp_ota_get_next_update_partition(const void *ignored){(void)ignored;return &previous;}
 int esp_ota_get_partition_description(const esp_partition_t *p,esp_app_desc_t *out){assert(p==&previous);*out=previous_app;return failure==5?-1:0;}
-int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){assert(p==&previous || p==&current);memset(out,failure==7?0x22:0x11,32);return failure==6?-1:0;}
+int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
+    assert(p==&previous || p==&current);
+#if ZONE_LITE_DIRECT_LEGACY_UPGRADE
+    const char *hex=!strcmp(previous_app.version,"2.4.12")?
+        "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589":
+        "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
+    for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
+    if(failure==7)out[0]^=1;
+#else
+    memset(out,failure==7?0x22:0x11,32);
+#endif
+    return failure==6?-1:0;
+}
 bool esp_secure_boot_enabled(void){return secure;}
 int nvs_open(const char *space,int mode,int *handle){assert(!strcmp(space,"queue_upgrade"));(void)mode;*handle=1;return failure==1?-1:0;}
 int nvs_get_blob(int handle,const char *key,void *out,size_t *length){assert(handle==1 && !strcmp(key,"reader_v1") && *length==sizeof(durable));memcpy(out,&durable,sizeof(durable));return failure==4?-1:0;}
@@ -77,6 +89,24 @@ int main(void)
     secure=false;assert(!storage_upgrade_init() && !storage_upgrade_ready());secure=true;
     assert(storage_upgrade_init());
     strcpy(app.project_name,"unknown");assert(!storage_upgrade_init());
+#elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
+    strcpy(app.version,UG_DIRECT_VERSION);
+    strcpy(previous_app.version,"2.4.12");
+    assert(storage_upgrade_init() && storage_upgrade_ready() && !storage_upgrade_segmented_writes());
+    assert(!writes && !commits);
+    assert(strstr(storage_upgrade_contract(),"BASE=2.4.12,2.5.2"));
+    strcpy(previous_app.version,"2.5.2");assert(storage_upgrade_init());
+    failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
+    strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());
+    strcpy(previous_app.version,UG_CANDIDATE_VERSION);assert(!storage_upgrade_init());
+    strcpy(previous_app.version,"2.4.12");
+    failure=5;assert(!storage_upgrade_init());failure=0;
+    current.subtype=0;assert(!storage_upgrade_init());current.subtype=17;
+    previous.address=current.address;assert(!storage_upgrade_init());previous.address=0x2a0000;
+    strcpy(app.version,UG_CANDIDATE_VERSION);assert(!storage_upgrade_init());
+    strcpy(app.version,UG_DIRECT_VERSION);
+    secure=false;assert(!storage_upgrade_init());secure=true;
+    assert(storage_upgrade_init() && !storage_upgrade_segmented_writes());
 #elif ZONE_LITE_SEGMENTED_WRITES
     FILE *file=fopen("compatibility-proof.bin","rb");assert(file);
     assert(fread(&durable,sizeof(durable),1,file)==1);assert(!fclose(file));
@@ -113,8 +143,8 @@ int main(void)
 """
     unit = tmp_path / "upgrade.c"
     unit.write_text(harness)
-    for mode, hikvision in ((0, 0), (1, 0), (0, 1)):
-        executable = tmp_path / f"upgrade-{mode}-{hikvision}"
+    for mode, hikvision, direct in ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)):
+        executable = tmp_path / f"upgrade-{mode}-{hikvision}-{direct}"
         subprocess.run(
             [
                 shutil.which("cc"),
@@ -129,6 +159,7 @@ int main(void)
                 "-fno-omit-frame-pointer",
                 f"-DZONE_LITE_SEGMENTED_WRITES={mode}",
                 f"-DZONE_LITE_HIKVISION={hikvision}",
+                f"-DZONE_LITE_DIRECT_LEGACY_UPGRADE={direct}",
                 "-I",
                 str(tmp_path),
                 "-I",

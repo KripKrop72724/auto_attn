@@ -1096,6 +1096,78 @@ def _replace_user_snapshot(
         ).all()
     )
     rows_by_uid = {row.uid: row for row in existing_rows}
+    # A policy write changes the V1 fingerprint because V1 includes card. The
+    # only continuity exception is a complete, adjacent, promptly acknowledged
+    # pre-write snapshot followed by the same roster with cards cleared. When
+    # ADD is offline the firmware still clears credentials, but this bridge
+    # remains unavailable and ambiguous attendance stays held.
+    previous_snapshot = session.scalar(
+        select(DeviceUserSnapshot).where(
+            DeviceUserSnapshot.zkt_device_id == zkt.id,
+            DeviceUserSnapshot.revision == next_revision - 1,
+        )
+    )
+    card_transition_user_ids: set[int] = set()
+    if (
+        stable_complete
+        and previous_snapshot is not None
+        and previous_snapshot.complete
+        and previous_snapshot.stable
+        and previous_snapshot.reason == "CREDENTIAL_POLICY_BEFORE"
+        and snapshot.reason in {
+            "CREDENTIAL_POLICY_AFTER",
+            "CREDENTIAL_POLICY_BEFORE",  # recovery after an interrupted write
+            "VERIFIED_TERMINAL_READ",  # recovery after a reboot
+        }
+        and previous_snapshot.user_count == len(snapshot.users) == len(existing_rows)
+        and ensure_utc(previous_snapshot.observed_at) <= ensure_utc(snapshot.observed_at)
+        and ensure_utc(snapshot.observed_at) - ensure_utc(previous_snapshot.observed_at)
+        <= timedelta(minutes=10)
+    ):
+        transition_valid = True
+        changed: set[int] = set()
+        for incoming in snapshot.users:
+            old = rows_by_uid.get(incoming.uid)
+            if (
+                old is None
+                or old.id is None
+                or old.snapshot_revision != previous_snapshot.revision
+                or old.identity_conflict_code is not None
+                or old.user_id != incoming.user_id
+                or (decrypt_text(old.machine_name_encrypted) or "") != incoming.name
+                or old.privilege != incoming.privilege
+                or not old.present
+                or old.lifecycle_state != "ACTIVE"
+            ):
+                transition_valid = False
+                break
+            if (old.card or 0) == (incoming.card or 0):
+                if (
+                    old.terminal_identity_fingerprint
+                    != incoming.terminal_identity_fingerprint
+                    or old.terminal_state_fingerprint
+                    != incoming.terminal_state_fingerprint
+                ):
+                    transition_valid = False
+                    break
+            elif (
+                (old.card or 0) > 0
+                and incoming.card == 0
+                and old.terminal_identity_fingerprint
+                and incoming.terminal_identity_fingerprint
+                and old.terminal_identity_fingerprint
+                != incoming.terminal_identity_fingerprint
+                and old.terminal_state_fingerprint
+                and incoming.terminal_state_fingerprint
+                and old.terminal_state_fingerprint
+                != incoming.terminal_state_fingerprint
+            ):
+                changed.add(old.id)
+            else:
+                transition_valid = False
+                break
+        if transition_valid:
+            card_transition_user_ids = changed
     uid_claiming_user_id = {incoming.user_id: incoming.uid for incoming in snapshot.users}
     if not snapshot.complete:
         # A partial snapshot is evidence about rows that were observed, never
@@ -1315,7 +1387,12 @@ def _replace_user_snapshot(
             )
     from zk_add.attendance_identity_evidence import record_identity_observation
     session.flush()
-    record_identity_observation(session, connector, snapshot_record)
+    record_identity_observation(
+        session,
+        connector,
+        snapshot_record,
+        card_transition_user_ids=card_transition_user_ids,
+    )
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 
@@ -2714,6 +2791,26 @@ def enrich_undelivered_attendance(
                 and row.identity_terminal_fingerprint != user.terminal_identity_fingerprint
             )
         )
+        if (
+            identity_reused
+            and row.device_user_id in {None, user.id}
+            and row.uid in {None, user.uid}
+            and row.identity_terminal_fingerprint
+            and owner is not None
+        ):
+            from zk_add.attendance_identity_evidence import identity_evidence
+
+            retained = identity_evidence(session, row, owner)
+            if (
+                retained is not None
+                and retained.user_id == user.id
+                and retained.cnic_hash == user.cnic_lookup_hash
+            ):
+                # The previous card-bearing fingerprint remains proven by the
+                # bounded policy transition. Leave a held punch for safe repair
+                # and an already pending punch untouched; never rewrite its
+                # captured fingerprint to the new one or mark it as reuse.
+                continue
         if identity_reused:
             row.ords_status = "QUARANTINED_IDENTITY_REUSE"
             row.identity_resolution_status = "QUARANTINED_REUSE"

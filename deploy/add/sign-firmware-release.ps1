@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitSha,
-    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt'
+    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
+    [string]$HilTargetsJson = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +95,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release me
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
+if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
+    # A signed candidate is necessary to exercise the five physical terminals.
+    # Production publication still requires promotion of these exact HIL bytes
+    # after the independent hardware and attendance gates.
+    . (Join-Path $PSScriptRoot 'firmware-2-6-1-hil-scope.ps1')
+    Assert-Zkt261HilScope -HilTargetsJson $HilTargetsJson
+}
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 $workRoot = if ($env:RUNNER_TEMP) {
@@ -142,7 +150,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -eq '2.6.1') { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })

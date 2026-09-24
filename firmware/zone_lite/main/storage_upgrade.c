@@ -9,10 +9,18 @@
 #ifndef ZONE_LITE_SEGMENTED_WRITES
 #define ZONE_LITE_SEGMENTED_WRITES 0
 #endif
+#ifndef ZONE_LITE_DIRECT_LEGACY_UPGRADE
+#define ZONE_LITE_DIRECT_LEGACY_UPGRADE 0
+#endif
+#if ZONE_LITE_SEGMENTED_WRITES && ZONE_LITE_DIRECT_LEGACY_UPGRADE
+#error "Direct legacy upgrades cannot enable segmented writes"
+#endif
 const char *storage_upgrade_contract(void)
 {
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     return "ZONE_HIKVISION_STORAGE_CONTRACT_V1:SOURCE:READ=2:LANES=7F";
+#elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
+    return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2";
 #elif ZONE_LITE_SEGMENTED_WRITES
     return "ZONE_STORAGE_CONTRACT_V1:SEGMENTED:READ=2:LANES=3F:COMPAT=2.5.4";
 #else
@@ -37,6 +45,25 @@ bool storage_upgrade_init(void)
     error_code = ""; ready = true; return true;
 #endif
     if (!running || strcmp(running->project_name, "zone_lite")) return failed("STORAGE_APPLICATION_UNKNOWN");
+#if ZONE_LITE_DIRECT_LEGACY_UPGRADE
+    {
+        if (strcmp(running->version, UG_DIRECT_VERSION)) return failed("STORAGE_DIRECT_VERSION_MISMATCH");
+        if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
+        const esp_partition_t *current = esp_ota_get_running_partition();
+        const esp_partition_t *previous = esp_ota_get_next_update_partition(NULL);
+        esp_app_desc_t description;
+        uint8_t digest[32];
+        bool ota_slots = current && previous && current->address != previous->address &&
+            (current->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || current->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) &&
+            (previous->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || previous->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
+        if (!ota_slots || esp_ota_get_partition_description(previous, &description) != ESP_OK ||
+            strcmp(description.project_name, "zone_lite") ||
+            esp_partition_get_sha256(previous, digest) != ESP_OK ||
+            !ug_direct_predecessor_matches(description.version, digest))
+            return failed("STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED");
+        ready = true; error_code = ""; return true;
+    }
+#endif
     if (!ZONE_LITE_SEGMENTED_WRITES && strcmp(running->version, UG_COMPAT_VERSION)) {
         error_code = ""; ready = true; return true;
     }

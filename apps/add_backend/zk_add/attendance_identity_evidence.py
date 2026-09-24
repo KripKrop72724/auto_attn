@@ -33,7 +33,11 @@ class IdentityEvidence:
 
 
 def record_identity_observation(
-    session: Session, connector: Connector, snapshot: DeviceUserSnapshot
+    session: Session,
+    connector: Connector,
+    snapshot: DeviceUserSnapshot,
+    *,
+    card_transition_user_ids: set[int] | None = None,
 ) -> None:
     """Called in the snapshot transaction; rollback removes both observation and history."""
     zkt = connector.zkt_device
@@ -62,6 +66,7 @@ def record_identity_observation(
         else []
     )
     continued: set[int] = set()
+    card_transition_user_ids = card_transition_user_ids or set()
     for user in users:
         old = by_user.get(user.id)
         if user.identity_conflict_code or not valid_cnic(
@@ -71,6 +76,17 @@ def record_identity_observation(
                 old.revoked = True
             continue
         observed = ensure_utc(snapshot.observed_at)
+        bridge_card_change = bool(
+            old
+            and user.id in card_transition_user_ids
+            and not old.revoked
+            and old.terminal_serial == serial
+            and old.user_id == user.user_id
+            and old.uid == user.uid
+            and old.cnic_lookup_hash == user.cnic_lookup_hash
+            and old.last_revision + 1 == snapshot.revision
+            and observed >= ensure_utc(old.observed_until)
+        )
         if (
             old
             and not old.revoked
@@ -89,6 +105,13 @@ def record_identity_observation(
             old.observed_until = observed
             continued.add(old.id)
         else:
+            # Both V1 fingerprints can describe the brief policy write. Exact
+            # event fingerprints disambiguate the overlap; events lacking one
+            # remain held instead of being attributed by user ID alone.
+            observed_from = observed
+            if bridge_card_change:
+                observed_from = ensure_utc(old.observed_until)
+                old.observed_until = observed
             session.add(
                 AttendanceIdentityHistory(
                     zkt_device_id=zkt.id,
@@ -103,7 +126,7 @@ def record_identity_observation(
                     first_snapshot_id=snapshot.id,
                     last_snapshot_id=snapshot.id,
                     last_revision=snapshot.revision,
-                    observed_from=observed,
+                    observed_from=observed_from,
                     observed_until=observed,
                 )
             )
@@ -207,6 +230,10 @@ def identity_evidence(
     if event.device_user_id:
         history_query = history_query.where(
             AttendanceIdentityHistory.device_user_id == event.device_user_id
+        )
+    if event.identity_terminal_fingerprint:
+        history_query = history_query.where(
+            AttendanceIdentityHistory.fingerprint == event.identity_terminal_fingerprint
         )
     histories = session.scalars(
         history_query.order_by(AttendanceIdentityHistory.id.desc()).limit(3)
