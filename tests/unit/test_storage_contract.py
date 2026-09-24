@@ -57,7 +57,7 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert DIRECT_MARKER in signing
 
 
-@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "2.6.0", "2.6.1", "2.7.0", None])
+@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.7.0", None])
 def test_direct_release_requires_exact_signed_predecessor(bad):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -79,12 +79,13 @@ def test_direct_release_requires_exact_signed_predecessor(bad):
         session.flush()
         assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_VERSION_UNQUALIFIED"
         for allowed in DIRECT_BASELINES:
-            connector.firmware_version = allowed
-            connector.ota_image_sha256 = DIRECT_BASELINE_IMAGES[allowed]
-            connector.ota_running_partition = "ota_0"
-            assert _storage_predecessor_exclusion(session, release, connector) is None
-            connector.ota_image_sha256 = "d" * 64
-            assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
+            for reported in (allowed, f"zone-lite-{allowed}"):
+                connector.firmware_version = reported
+                connector.ota_image_sha256 = DIRECT_BASELINE_IMAGES[allowed]
+                connector.ota_running_partition = "ota_0"
+                assert _storage_predecessor_exclusion(session, release, connector) is None
+                connector.ota_image_sha256 = "d" * 64
+                assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
         release.manifest = {**release.manifest, "queue_storage": {**release.manifest["queue_storage"],
             "allowed_bootstrap_versions": ["2.4.12", "2.5.2", "2.5.4"]}}
         assert _storage_predecessor_exclusion(session, release, connector) == "STORAGE_CONTRACT_INVALID"
