@@ -23,12 +23,32 @@ from zk_add.ota import (
     _ordered_hil_target,
     _storage_predecessor_exclusion,
     _validated_firmware_public_base,
+    _versions_match,
     capability_is_eligible,
     require_family_match,
     version_at_least,
 )
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
+
+
+def _worker_summary(payload: dict) -> list[dict]:
+    diagnostics = payload.get("diagnostics") or {}
+    summary = []
+    for worker in diagnostics.get("workers") or []:
+        if not isinstance(worker, dict) or worker.get("name") not in {
+            "add_delivery", "ords_delivery", "hikvision_source",
+        }:
+            continue
+        summary.append({
+            "name": worker.get("name"),
+            "state": worker.get("state") if worker.get("state") in {
+                "STOPPED", "FAULT", "WAITING_RESOURCE", "WAITING_NETWORK", "RUNNING",
+            } else "OTHER",
+            "restart_attempts": worker.get("restart_attempts")
+            if isinstance(worker.get("restart_attempts"), int) else None,
+        })
+    return summary
 
 
 def diagnose(campaign_id: str) -> dict:
@@ -88,28 +108,20 @@ def diagnose(campaign_id: str) -> dict:
                 latest = session.scalar(select(DeviceTelemetry)
                     .where(DeviceTelemetry.connector_id == connector.id)
                     .order_by(DeviceTelemetry.id.desc()).limit(1))
+                target_sample = next((row for row in session.scalars(
+                    select(DeviceTelemetry)
+                    .where(DeviceTelemetry.connector_id == connector.id)
+                    .order_by(DeviceTelemetry.id.desc()).limit(256)
+                ) if _versions_match((row.payload or {}).get("firmware_version"), release.version)), None)
                 recent_authenticated_requests = session.scalar(select(func.count(ConnectorNonce.id)).where(
                     ConnectorNonce.connector_id == connector.id,
                     ConnectorNonce.created_at >= utc_now() - timedelta(minutes=5),
                 ))
                 ota = ((latest.payload or {}).get("ota") or {}) if latest else {}
                 diagnostics = ((latest.payload or {}).get("diagnostics") or {}) if latest else {}
-                workers = diagnostics.get("workers") or []
-                worker_summary = []
-                for worker in workers:
-                    if not isinstance(worker, dict) or worker.get("name") not in {
-                        "add_delivery", "ords_delivery", "hikvision_source",
-                    }:
-                        continue
-                    worker_summary.append({
-                        "name": worker.get("name"),
-                        "state": worker.get("state") if worker.get("state") in {
-                            "STOPPED", "FAULT", "WAITING_RESOURCE", "WAITING_NETWORK", "RUNNING",
-                        } else "OTHER",
-                        "restart_attempts": worker.get("restart_attempts")
-                        if isinstance(worker.get("restart_attempts"), int) else None,
-                    })
                 storage = diagnostics.get("storage") or {}
+                target_diagnostics = ((target_sample.payload or {}).get("diagnostics") or {}) if target_sample else {}
+                target_storage = target_diagnostics.get("storage") or {}
                 clock_offset_seconds = None
                 if latest:
                     clock_sample = (latest.payload or {}).get("_trusted_envelope_sent_at")
@@ -143,9 +155,14 @@ def diagnose(campaign_id: str) -> dict:
                     "latest_telemetry_at": latest.created_at.isoformat() if latest else None,
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
                     "latest_free_heap_bytes": latest.free_heap if latest else None,
-                    "latest_workers": worker_summary,
+                    "latest_workers": _worker_summary(latest.payload or {}) if latest else [],
                     "storage_upgrade_ready": storage.get("upgrade_ready"),
                     "storage_durability": storage.get("durability"),
+                    "last_target_sample_at": target_sample.created_at.isoformat() if target_sample else None,
+                    "last_target_free_heap_bytes": target_sample.free_heap if target_sample else None,
+                    "last_target_workers": _worker_summary(target_sample.payload or {}) if target_sample else [],
+                    "last_target_storage_upgrade_ready": target_storage.get("upgrade_ready"),
+                    "last_target_storage_durability": target_storage.get("durability"),
                     "device_clock_offset_seconds": clock_offset_seconds,
                     "authenticated_requests_last_5m": recent_authenticated_requests,
                     "telemetry_ota_state": ota.get("state"),
