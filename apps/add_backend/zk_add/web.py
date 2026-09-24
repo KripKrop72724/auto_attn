@@ -3020,9 +3020,15 @@ def attendance(
     page_rows = rows[:limit]
     release_states = attendance_release_states(db, page_rows)
     force_metadata = force_release.metadata_for_page(db, page_rows)
+    direct_ords_identity = direct_ords.identity_hints_for_page(db, page_rows)
     return {
         "rows": [
-            {**serialize_attendance(row, release_states.get(row.id)), "force_release": force_metadata.get(row.id)} for row in page_rows
+            {
+                **serialize_attendance(row, release_states.get(row.id)),
+                "force_release": force_metadata.get(row.id),
+                "direct_ords_identity": direct_ords_identity.get(row.id),
+            }
+            for row in page_rows
         ],
         "next_cursor": next_cursor,
         "status_options": db.scalars(
@@ -4308,6 +4314,11 @@ def serialize_attendance(
     row: AttendanceEvent,
     release: dict | None = None,
 ) -> dict:
+    try:
+        cnic_masked = mask_cnic(decrypt_cnic(row.cnic_encrypted))
+    except Exception:
+        # A damaged saved identity must remain visible for manual review.
+        cnic_masked = None
     raw_provenance = (row.raw_event or {}).get("terminal_provenance")
     if raw_provenance == "VERIFIED_CONNECTOR_BINDING":
         provenance_state = "VERIFIED_CONNECTOR_BINDING"
@@ -4331,7 +4342,7 @@ def serialize_attendance(
         "uid": row.uid,
         "user_id": row.user_id,
         "display_name": row.display_name,
-        "cnic_masked": mask_cnic(decrypt_cnic(row.cnic_encrypted)),
+        "cnic_masked": cnic_masked,
         "device_event_time": row.device_event_time,
         "captured_at": row.captured_at,
         "received_at": row.received_at,

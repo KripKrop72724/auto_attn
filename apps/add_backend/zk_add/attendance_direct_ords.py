@@ -6,14 +6,14 @@ CNIC or source fact, and the ordinary Oracle content check still decides ACKED.
 
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_manual_guard import decision_for
 from zk_add.attendance_recovery import RecoveryError, _digest
 from zk_add.attendance_repair import _immutable_facts
 from zk_add.audit import append_audit
-from zk_add.crypto import decrypt_cnic, decrypt_json, encrypt_json, encrypt_text, normalize_cnic
+from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_json, encrypt_json, encrypt_text, normalize_cnic
 from zk_add.db import session_scope
 from zk_add.models import (
     AttendanceEvent,
@@ -44,6 +44,25 @@ def _source_digest(event: AttendanceEvent, connector: Connector) -> str:
     ])
 
 
+def _identity_from_users(event, users):
+    if len(users) != 1:
+        return None, None, None, None, "UNKNOWN_USER"
+    try:
+        current_cnic = normalize_cnic(decrypt_cnic(users[0].cnic_encrypted))
+    except Exception:
+        current_cnic = None
+    if not current_cnic:
+        return users[0], None, None, None, "CNIC_MISSING"
+    try:
+        saved_cnic = normalize_cnic(decrypt_cnic(event.cnic_encrypted))
+    except Exception:
+        saved_cnic = None
+    return (
+        users[0], saved_cnic or current_cnic,
+        "SAVED_PUNCH" if saved_cnic else "SYNCED_USER", current_cnic, None,
+    )
+
+
 def _known_user_and_cnic(session, event):
     users = session.scalars(
         select(DeviceUser).where(
@@ -53,22 +72,45 @@ def _known_user_and_cnic(session, event):
             DeviceUser.lifecycle_state == "ACTIVE",
         ).limit(2)
     ).all()
-    if len(users) != 1:
-        return None, None, "UNKNOWN_USER"
-    try:
-        cnic = normalize_cnic(decrypt_cnic(event.cnic_encrypted))
-        current_cnic = normalize_cnic(decrypt_cnic(users[0].cnic_encrypted))
-    except Exception:
-        cnic, current_cnic = None, None
-    if not cnic or not current_cnic:
-        return users[0], None, "CNIC_MISSING"
-    return users[0], cnic, None
+    return _identity_from_users(event, users)
 
 
-def _payload(connector, terminal, event, user, cnic):
+def identity_hints_for_page(session, events):
+    """Tell the ledger which rows have a usable synced identity in bounded queries."""
+    if not events:
+        return {}
+    users_by_key = {}
+    keys = sorted({(row.zkt_device_id, row.user_id) for row in events})
+    for start in range(0, len(keys), 200):
+        for user in session.scalars(
+            select(DeviceUser).where(
+                tuple_(DeviceUser.zkt_device_id, DeviceUser.user_id).in_(keys[start:start + 200]),
+                DeviceUser.present.is_(True),
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+        ).all():
+            users_by_key.setdefault((user.zkt_device_id, user.user_id), []).append(user)
+    hints = {}
+    for event in events:
+        _user, _cnic, source, _current_cnic, error = _identity_from_users(
+            event, users_by_key.get((event.zkt_device_id, event.user_id), []),
+        )
+        hints[event.id] = {
+            "eligible": error is None,
+            "cnic_source": source,
+            "exclusion": error,
+        }
+    return hints
+
+
+def _payload(connector, terminal, event, user, cnic, source):
     payload = oracle_payload(connector, terminal, event, cnic)
     payload["device_serial"] = event.device_serial or "unknown"
-    payload["employee_name"] = event.display_name or user.display_name
+    payload["employee_name"] = (
+        user.display_name or event.display_name
+        if source == "SYNCED_USER"
+        else event.display_name or user.display_name
+    )
     return payload
 
 
@@ -107,7 +149,7 @@ def create(session, *, actor: str, request):
     for event in rows:
         connector = session.get(Connector, event.connector_id)
         terminal = session.get(ZKTDevice, event.zkt_device_id)
-        user, cnic, error = _known_user_and_cnic(session, event)
+        user, cnic, source, current_cnic, error = _known_user_and_cnic(session, event)
         outbox = session.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id))
         if event.ords_status in ORDS_ACKNOWLEDGED_STATUSES and event.oracle_confirmed_at:
             error = "ALREADY_CONFIRMED"
@@ -118,7 +160,7 @@ def create(session, *, actor: str, request):
         elif not error:
             accepted += 1
         payload = (
-            _payload(connector, terminal, event, user, cnic)
+            _payload(connector, terminal, event, user, cnic, source)
             if error is None else None
         )
         session.add(Item(
@@ -131,6 +173,9 @@ def create(session, *, actor: str, request):
             result={
                 "payload_encrypted": encrypt_json(payload) if payload else None,
                 "payload_digest": _digest(payload) if payload else None,
+                "cnic_source": source if payload else None,
+                "current_user_key": user.user_key if payload else None,
+                "current_cnic_hash": cnic_lookup(current_cnic) if payload else None,
                 "reason": error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery.",
             },
             completed_at=now if error else None,
@@ -152,14 +197,27 @@ def approved_payload(session, event, connector, decision):
         return None
     if _source_digest(event, connector) != decision.proof.get("source_digest"):
         return None
-    _user, _cnic, error = _known_user_and_cnic(session, event)
+    user, cnic, source, current_cnic, error = _known_user_and_cnic(session, event)
     if error:
         return None
     try:
         payload = decrypt_json(decision.payload_encrypted)
     except Exception:
         return None
-    return payload if _digest(payload) == decision.payload_digest else None
+    if _digest(payload) != decision.payload_digest:
+        return None
+    if decision.proof.get("cnic_source") is None:
+        return payload  # Preserve approvals queued before the stricter identity proof.
+    terminal = session.get(ZKTDevice, event.zkt_device_id)
+    if (
+        terminal is None
+        or decision.proof.get("cnic_source") != source
+        or decision.proof.get("current_user_key") != user.user_key
+        or decision.proof.get("current_cnic_hash") != cnic_lookup(current_cnic)
+        or payload != _payload(connector, terminal, event, user, cnic, source)
+    ):
+        return None
+    return payload
 
 
 def _queue(session, job, item):
@@ -181,7 +239,7 @@ def _queue(session, job, item):
     elif outbox and outbox.status == "IN_FLIGHT":
         return  # Let the earlier claim settle; the next short tick will recheck.
     else:
-        user, cnic, code = _known_user_and_cnic(session, event)
+        user, cnic, source, current_cnic, code = _known_user_and_cnic(session, event)
     if code:
         item.status, item.error_code, item.completed_at = "SKIPPED", code, utc_now()
         item.result = {"reason": code.replace("_", " ").title()}
@@ -194,7 +252,12 @@ def _queue(session, job, item):
         )
         item.result = {"reason": "The saved approval cannot be read. No Oracle send was made."}
         return
-    if payload != _payload(connector, session.get(ZKTDevice, event.zkt_device_id), event, user, cnic):
+    if (
+        payload != _payload(connector, session.get(ZKTDevice, event.zkt_device_id), event, user, cnic, source)
+        or item.result.get("cnic_source") != source
+        or item.result.get("current_user_key") != user.user_key
+        or item.result.get("current_cnic_hash") != cnic_lookup(current_cnic)
+    ):
         item.status, item.error_code, item.completed_at = "SKIPPED", "SOURCE_CHANGED", utc_now()
         item.result = {"reason": "Saved punch or employee changed before delivery."}
         return
@@ -203,7 +266,9 @@ def _queue(session, job, item):
         actor=job.actor, reason_encrypted=job.scope["approval"]["reason_encrypted"],
         proof={"policy": POLICY, "source_digest": item.expected_state_digest,
                "immutable_facts": _immutable_facts(event), "hardware_id": connector.hardware_id,
-               "terminal": event.device_serial},
+               "terminal": event.device_serial, "cnic_source": source,
+               "current_user_key": user.user_key,
+               "current_cnic_hash": cnic_lookup(current_cnic)},
         prior_state_encrypted=encrypt_json({
             "ords_status": event.ords_status, "manual_release_required": event.manual_release_required,
         }),
@@ -220,7 +285,7 @@ def _queue(session, job, item):
     outbox.next_attempt_at, outbox.last_error = None, None
     outbox.payload_hash = decision.payload_digest
     item.status, item.error_code = "WAITING_ORACLE", None
-    item.result = {"reason": "Waiting for Oracle confirmation."}
+    item.result = {"reason": "Waiting for Oracle confirmation.", "cnic_source": source}
     audit = append_audit(
         session, actor=job.actor, action="ATTENDANCE_DIRECT_ORDS_QUEUED",
         target_type="attendance_event", target_id=event.event_uid,

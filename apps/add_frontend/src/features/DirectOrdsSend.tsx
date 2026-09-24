@@ -27,6 +27,7 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest 
   const [items, setItems] = useState<ItemPage>({ rows: [], next_cursor: null })
   const [cursor, setCursor] = useState(0)
   const [disconnected, setDisconnected] = useState(false)
+  const syncedCnicCount = selected.filter((row) => row.direct_ords_identity?.cnic_source === 'SYNCED_USER').length
   const approvalKey = useRef(idempotency('direct-ords'))
   const requestSignature = useRef('')
   const activeId = useRef<string | null>(null)
@@ -114,7 +115,8 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest 
     {error && !open && <p className="message pattern-blocked" role="alert">{error}</p>}
     <details className="attendance-direct-history" onToggle={(event) => { if (event.currentTarget.open) void loadHistory().catch((failure) => setError(message(failure))) }}><summary>Saved Oracle send runs</summary><ul>{history.map((item) => <li key={item.job_id}><button className="text-button" type="button" onClick={() => openRun(item)}>{dateTime(item.created_at)} · {count(item.selected)} · {item.confirmed} confirmed</button></li>)}</ul>{!history.length && <p>No saved runs yet.</p>}</details>
     {open && <Dialog titleId="direct-ords-title" title={`Send ${count(selected.length)} to Oracle`} description="ADD will submit these saved punches under your administrator decision and show actual Oracle results." onClose={close}><form className="dialog-body" onSubmit={approve}>
-      <p>Only an unknown current user or a missing or unusable CNIC in the punch or current user record prevents submission. Other ADD delivery holds are overridden. Oracle can still reject a punch, and a conflicting Oracle record will need attention. Already confirmed or in-progress punches will not be submitted twice.</p>
+      <p>ADD uses a CNIC saved with the punch when available. If the punch has no usable CNIC, your approval uses the CNIC from the current synced user record. This does not prove who owned the terminal user ID when the older punch happened. Unknown current users and users without a usable CNIC are skipped. Other ADD delivery holds are overridden. Oracle may still reject or flag a conflicting record; confirmed and in-progress punches are not sent twice.</p>
+      {syncedCnicCount > 0 && <p className="message pattern-waiting">{count(syncedCnicCount)} will use the current synced user CNIC because the saved punch has none. The original punch remains unchanged.</p>}
       <details className="attendance-direct-review"><summary>Review selected punches</summary><ul>{selected.slice(0, 20).map((row) => <li key={row.id}>{row.display_name || `User ${row.user_id}`} · {row.device_serial || 'Terminal unknown'} · {dateTime(row.device_event_time)} · {row.ords_status.replaceAll('_', ' ')}</li>)}</ul>{selected.length > 20 && <p>And {selected.length - 20} more selected punches.</p>}</details>
       <label>Reason for sending<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
       <label>Administrator password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
