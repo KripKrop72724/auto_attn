@@ -2,6 +2,11 @@ name: ADD read-only repair diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      direct_run_id:
+        description: 'Optional saved direct Oracle send run ID for bounded error-code diagnostics'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +29,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Read container state and bounded database counters
+        env:
+          DIRECT_RUN_ID: ${{ inputs.direct_run_id }}
         run: |
           $ErrorActionPreference = 'Stop'
           $api = 'attendance-device-dashboard-add-api-1'
@@ -42,7 +49,11 @@ jobs:
           & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
           if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
           $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
-          $script | & docker exec -i $api python -
+          if ($env:DIRECT_RUN_ID) {
+            $script | & docker exec -i $api python - --direct-run-id $env:DIRECT_RUN_ID
+          } else {
+            $script | & docker exec -i $api python -
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
 
       - name: Summarize HTTP failures without exposing raw logs

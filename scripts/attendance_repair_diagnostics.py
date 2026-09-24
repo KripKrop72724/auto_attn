@@ -116,7 +116,7 @@ def summarize_logs(lines):
     }
 
 
-def database_report():
+def database_report(direct_run_id=None):
     from sqlalchemy import text
     from zk_add.db import engine
     from zk_add.settings import settings
@@ -167,8 +167,36 @@ def database_report():
             "force_checks": getattr(settings, "attendance_force_release_preview_enabled", False),
             "force_execution": getattr(settings, "attendance_force_release_execution_enabled", False),
             "oracle_delivery_configured": bool(settings.ords_base_url),
+            "oracle_content_verification_configured": bool(
+                settings.attendance_repair_ords_username
+                and settings.attendance_repair_ords_password
+            ),
         }
     }
+    if direct_run_id:
+        # Only operational codes leave the runner. No identities, CNICs,
+        # event UIDs, payloads or secrets appear in workflow logs.
+        queries["direct_run"] = """
+            SELECT i.attendance_event_id, i.status AS item_status,
+                   CASE WHEN i.error_code IS NULL THEN NULL
+                        WHEN i.error_code ~ '^[A-Z][A-Z0-9_]{0,119}$'
+                        THEN i.error_code ELSE 'REDACTED' END AS error_code,
+                   o.status AS outbox_status,
+                   o.attempt_count, o.last_http_status,
+                   CASE WHEN o.last_error IS NULL THEN NULL
+                        WHEN o.last_error ~ '^[A-Z][A-Z0-9_]{0,119}$'
+                        THEN o.last_error ELSE 'REDACTED' END AS outbox_error,
+                   COALESCE((i.result->>'needs_attention')::boolean, false)
+                       AS needs_attention,
+                   (extract(microseconds from e.device_event_time)::bigint % 1000000 <> 0)
+                       AS timestamp_has_fraction
+              FROM add_attendance_recovery_items i
+              JOIN add_attendance_recovery_jobs j ON j.id = i.job_id
+              JOIN add_attendance_events e ON e.id = i.attendance_event_id
+              LEFT JOIN add_ords_outbox o ON o.attendance_event_id = e.id
+             WHERE j.job_id = :direct_run_id AND j.action = 'MANUAL_DIRECT_ORDS'
+             ORDER BY i.id LIMIT 100
+        """
     queries["schema"] = "SELECT version_num FROM alembic_version"
     for name, query in queries.items():
         try:
@@ -176,7 +204,8 @@ def database_report():
                 connection.execute(text("SET TRANSACTION READ ONLY"))
                 connection.execute(text("SET LOCAL statement_timeout = '5s'"))
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
-                result[name] = [dict(row) for row in connection.execute(text(query)).mappings()]
+                params = {"direct_run_id": direct_run_id} if name == "direct_run" else {}
+                result[name] = [dict(row) for row in connection.execute(text(query), params).mappings()]
                 connection.rollback()
         except Exception as exc:
             result[name] = {"error_type": type(exc).__name__}
@@ -186,8 +215,11 @@ def database_report():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs", action="store_true")
+    parser.add_argument("--direct-run-id")
     args = parser.parse_args()
-    result = summarize_logs(sys.stdin) if args.logs else database_report()
+    if args.direct_run_id and not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.direct_run_id):
+        parser.error("direct run ID must be a UUID")
+    result = summarize_logs(sys.stdin) if args.logs else database_report(args.direct_run_id)
     print(json.dumps(result, default=str, sort_keys=True))
 
 
