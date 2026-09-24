@@ -5,13 +5,14 @@ import argparse
 import json
 import re
 import sys
+from datetime import timedelta
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from zk_add.db import engine
 from zk_add.hil_scope import target_matches
-from zk_add.models import Connector, DeviceTelemetry
+from zk_add.models import Connector, ConnectorNonce, DeviceTelemetry
 from zk_add.ota import (
     ACTIVE_DEPLOYMENT_STATES,
     FirmwareCampaign,
@@ -26,6 +27,7 @@ from zk_add.ota import (
     version_at_least,
 )
 from zk_add.settings import settings
+from zk_add.time_utils import utc_now
 
 
 def diagnose(campaign_id: str) -> dict:
@@ -85,6 +87,10 @@ def diagnose(campaign_id: str) -> dict:
                 latest = session.scalar(select(DeviceTelemetry)
                     .where(DeviceTelemetry.connector_id == connector.id)
                     .order_by(DeviceTelemetry.id.desc()).limit(1))
+                recent_authenticated_requests = session.scalar(select(func.count(ConnectorNonce.id)).where(
+                    ConnectorNonce.connector_id == connector.id,
+                    ConnectorNonce.created_at >= utc_now() - timedelta(minutes=5),
+                ))
                 ota = ((latest.payload or {}).get("ota") or {}) if latest else {}
                 ota_error = ota.get("last_error")
                 if not isinstance(ota_error, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", ota_error):
@@ -106,6 +112,8 @@ def diagnose(campaign_id: str) -> dict:
                     "ordered_target_match": target_matches(target, connector) if target else None,
                     "other_active_deployment": bool(other_active and other_active.connector_id != connector.id),
                     "latest_telemetry_at": latest.created_at.isoformat() if latest else None,
+                    "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
+                    "authenticated_requests_last_5m": recent_authenticated_requests,
                     "telemetry_ota_state": ota.get("state"),
                     "telemetry_ota_last_error": ota_error,
                     "telemetry_ota_capable": ota.get("capable"),
