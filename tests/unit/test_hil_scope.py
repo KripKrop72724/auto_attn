@@ -137,6 +137,36 @@ def test_wrong_target_cannot_start_campaign(hil_session, field, value):
         campaign(session, release)
 
 
+def test_hil_preflight_reports_the_exact_target_exclusion(hil_session):
+    session, release, devices = hil_session
+    devices[0].ota_capable = False
+    with pytest.raises(ValueError, match="target exclusion: OTA_NOT_CAPABLE"):
+        preview(session, release)
+
+
+def test_hil_preflight_reports_unverified_direct_predecessor(hil_session):
+    from zk_add.storage_contract import DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSION
+
+    session, release, devices = hil_session
+    release.version = DIRECT_VERSION
+    release.minimum_bootstrap_version = DIRECT_BASELINES[0]
+    release.manifest = {
+        **release.manifest,
+        "minimum_bootstrap_version": DIRECT_BASELINES[0],
+        "queue_storage": {
+            "schema_version": 2,
+            "read_format": 2,
+            "reader_mask": 63,
+            "write_format": 1,
+            "allowed_bootstrap_versions": list(DIRECT_BASELINES),
+            "allowed_bootstrap_images": DIRECT_BASELINE_IMAGES,
+        },
+    }
+    devices[0].firmware_version = "2.5.2"
+    with pytest.raises(ValueError, match="target exclusion: DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"):
+        preview(session, release)
+
+
 def test_stale_preview_cannot_retarget_changed_terminal(hil_session):
     from zk_add.ota import verify_campaign_scope_token
     session, release, devices = hil_session
