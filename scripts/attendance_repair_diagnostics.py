@@ -79,6 +79,10 @@ def summarize_logs(lines):
             path = path.split("?", 1)[0]
             if path.startswith("/api/v2/attendance-recovery/"):
                 family = "attendance-recovery"
+            elif path == "/device/v2/firmware/capability":
+                family = "firmware-capability"
+            elif path == "/device/v2/firmware/assignment":
+                family = "firmware-assignment"
             elif path == "/api/v1/auth/session":
                 family = "auth-session"
             elif path.startswith("/health/"):
