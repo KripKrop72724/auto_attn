@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import time
@@ -4583,16 +4584,30 @@ async def _require_ota_connector(
     signature: str | None = Header(default=None, alias="X-ADD-Signature"),
     db: Session = Depends(get_db),
 ) -> tuple[Session, Connector]:
-    connector = await authenticate_connector_request(
-        request,
-        db,
-        authorization=authorization,
-        connector_id=connector_id,
-        timestamp=timestamp,
-        nonce=nonce,
-        supplied_body_hash=body_hash,
-        signature=signature,
-    )
+    try:
+        connector = await authenticate_connector_request(
+            request,
+            db,
+            authorization=authorization,
+            connector_id=connector_id,
+            timestamp=timestamp,
+            nonce=nonce,
+            supplied_body_hash=body_hash,
+            signature=signature,
+        )
+    except HTTPException as error:
+        if error.status_code == 401:
+            reason = {
+                "Missing connector credentials.": "CREDENTIALS_MISSING",
+                "Invalid connector credentials.": "CREDENTIALS_INVALID",
+                "Missing signed connector headers.": "HEADERS_MISSING",
+                "Invalid connector timestamp.": "TIMESTAMP_INVALID",
+                "Connector body hash mismatch.": "BODY_HASH_MISMATCH",
+                "Invalid connector signature.": "SIGNATURE_INVALID",
+            }.get(str(error.detail), "OTHER")
+            connector_fp = hashlib.sha256((connector_id or "").encode()[:120]).hexdigest()[:12]
+            logger.warning("OTA_AUTH_REJECTED connector_fp=%s reason=%s", connector_fp, reason)
+        raise
     return db, connector
 
 

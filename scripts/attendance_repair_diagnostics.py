@@ -72,6 +72,7 @@ def summarize_logs(lines):
     frames = Counter()
     proxy = Counter()
     runtime = Counter()
+    firmware_auth_rejections = Counter()
     for line in lines:
         response = re.search(r'"(GET|POST|PUT|PATCH|DELETE) ([^ ]+) HTTP/[^" ]+" (\d{3})', line)
         if response:
@@ -111,12 +112,18 @@ def summarize_logs(lines):
         for phrase in ("ADD event loop lag detected", "restarting API process"):
             if phrase in line:
                 runtime[phrase] += 1
+        rejected = re.search(
+            r"OTA_AUTH_REJECTED connector_fp=([0-9a-f]{12}) reason=([A-Z_]+)", line
+        )
+        if rejected:
+            firmware_auth_rejections[" ".join(rejected.groups())] += 1
     return {
         "http_counts": dict(responses),
         "exception_types": dict(errors),
         "code_frames": dict(frames),
         "proxy_errors": dict(proxy),
         "runtime_signals": dict(runtime),
+        "firmware_auth_rejections": dict(firmware_auth_rejections),
     }
 
 

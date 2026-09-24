@@ -2,6 +2,7 @@
 """Read-only, bounded diagnosis of one firmware campaign's assignment gate."""
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -97,6 +98,7 @@ def diagnose(campaign_id: str) -> dict:
                     ota_error = "OTHER_OR_UNAVAILABLE" if ota_error else None
                 summaries.append({
                     "connector_name": connector.display_name,
+                    "connector_fingerprint": hashlib.sha256(connector.connector_id.encode()[:120]).hexdigest()[:12],
                     "deployment_status": deployment.status,
                     "offer_attempts": deployment.attempt_count,
                     "bytes_written": deployment.bytes_written,
