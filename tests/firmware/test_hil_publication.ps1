@@ -88,6 +88,28 @@ if (-not $rejected) { throw 'Reordered HIL scope extension accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $legacyStore -Version 2.6.0 -PublicationMode HIL_ONLY -HilTargetMac 'ac:27:6e:a3:07:f8'
 $legacy=Get-Content (Join-Path $legacyStore "2.6.0/.hil-only.json") -Raw | ConvertFrom-Json
 if($legacy.schema_version -ne 1 -or $legacy.target_mac -cne 'ac:27:6e:a3:07:f8') { throw 'Legacy HIL broken' }
+# ZKT 2.6.1 may be published only to the five reviewed, ordered HIL targets.
+. (Join-Path $repo 'deploy/add/firmware-2-6-1-hil-scope.ps1')
+$exact261 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.1.json') -Raw
+Assert-Zkt261HilScope -HilTargetsJson $exact261
+foreach ($scope in @('', '[]', '{', $targets)) {
+    $rejected = $false
+    try { Assert-Zkt261HilScope -HilTargetsJson $scope } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Invalid 2.6.1 HIL scope accepted' }
+}
+$zkt261Image = Join-Path $source 'zone-lite-2.6.1.bin'
+[IO.File]::WriteAllText($zkt261Image, 'ZKT 2.6.1 fixture, not deployable firmware')
+$manifest = @{version='2.6.1';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.6.1';image_name='zone-lite-2.6.1.bin';image_sha256=(Get-FileHash $zkt261Image).Hash.ToLowerInvariant();image_size=(Get-Item $zkt261Image).Length;git_sha=('a'*40);application_sha256=('e'*64)}
+[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.1 -PublicationMode AVAILABLE } catch { $rejected = $true }
+if (-not $rejected) { throw 'Direct 2.6.1 production publication accepted' }
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.1 -PublicationMode HIL_ONLY -HilTargetsJson $targets } catch { $rejected = $true }
+if (-not $rejected) { throw 'Partial 2.6.1 HIL scope accepted' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.1 -PublicationMode HIL_ONLY -HilTargetsJson $exact261
+$zkt261Marker = Get-Content -LiteralPath (Join-Path $store '2.6.1/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt261Marker.targets.Count -ne 5 -or $zkt261Marker.application_sha256 -cne ('e'*64)) { throw '2.6.1 HIL marker is incomplete' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

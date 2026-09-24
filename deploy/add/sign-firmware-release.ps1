@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitSha,
-    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt'
+    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
+    [string]$HilTargetsJson = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,10 +96,11 @@ if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
 if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
-    # Keep the incomplete candidate out of the protected signing pipeline.
-    # Remove only after credential cleanup, identity continuity, and physical
-    # G3/SilkBio/MB40 readback tests have been reviewed together.
-    throw 'ZKT 2.6.1 credential policy is not yet certified for signing'
+    # A signed candidate is necessary to exercise the five physical terminals.
+    # Production publication still requires promotion of these exact HIL bytes
+    # after the independent hardware and attendance gates.
+    . (Join-Path $PSScriptRoot 'firmware-2-6-1-hil-scope.ps1')
+    Assert-Zkt261HilScope -HilTargetsJson $HilTargetsJson
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path

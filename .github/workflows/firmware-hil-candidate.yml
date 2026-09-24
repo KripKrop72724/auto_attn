@@ -170,6 +170,7 @@ jobs:
           FIRMWARE_FAMILY: ${{ inputs.firmware_family }}
           RELEASE_VERSION: ${{ inputs.version }}
           RELEASE_SHA: ${{ needs.provenance.outputs.sha }}
+          HIL_TARGETS_JSON: ${{ needs.provenance.outputs.targets }}
         run: |
           $ErrorActionPreference = 'Stop'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
@@ -181,7 +182,8 @@ jobs:
             -OutputDirectory $output `
             -Version $env:RELEASE_VERSION `
             -GitSha $env:RELEASE_SHA `
-            -FirmwareFamily $env:FIRMWARE_FAMILY
+            -FirmwareFamily $env:FIRMWARE_FAMILY `
+            -HilTargetsJson $env:HIL_TARGETS_JSON
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-${{ inputs.version }}-hil-only

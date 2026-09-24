@@ -16,9 +16,14 @@ the terminal clock by rereading it and sends `ZKT_TIME_SYNC_OK`,
 
 ## PIN and card policy
 
-**Do not sign, publish, or campaign this image yet.** The protected signing
-script explicitly rejects ZKT 2.6.1 while this work is incomplete. This
-release's credential policy covers terminal PIN/password and card attendance
+The protected signer and publisher now require the exact five-device ordered
+HIL scope for ZKT 2.6.1. Direct production publication is rejected. Sign and
+publish only after the exact main commit has passed CI and the ADD identity
+transition is deployed. A remote campaign can establish boot, clock, terminal
+readback, and attendance telemetry; without an on-site card/PIN and biometric
+check, it cannot establish full credential-policy HIL acceptance or authorize
+nationwide promotion. This release's credential policy covers terminal
+PIN/password and card attendance
 for every user, including administrators and users without biometrics. It does
 not claim to remove palm templates or disable other terminal methods. The
 terminal identity fingerprint includes the card value, so a verified
