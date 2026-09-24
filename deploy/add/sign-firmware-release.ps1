@@ -102,6 +102,10 @@ if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-1-hil-scope.ps1')
     Assert-Zkt261HilScope -HilTargetsJson $HilTargetsJson
 }
+if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.2') {
+    . (Join-Path $PSScriptRoot 'firmware-2-6-2-hil-scope.ps1')
+    Assert-Zkt262HilScope -HilTargetsJson $HilTargetsJson
+}
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 $workRoot = if ($env:RUNNER_TEMP) {
@@ -150,7 +154,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -eq '2.6.1') { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })

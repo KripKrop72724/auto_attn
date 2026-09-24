@@ -15,12 +15,13 @@ from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareRelease, OT
 from zk_add.protocol import body_sha256, sign_request
 from zk_add.security import authenticate_connector_body, connector_token_hash
 from zk_add.settings import settings
-from zk_add.storage_contract import DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSION
+from zk_add.storage_contract import DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSIONS
 from zk_add.time_utils import utc_now
 
 
-@pytest.fixture
-def clock_hil(monkeypatch):
+@pytest.fixture(params=DIRECT_VERSIONS)
+def clock_hil(monkeypatch, request):
+    version = request.param
     target = {
         "connector_id": "clock-hil-connector", "mac": "a4:cb:8f:d4:66:01",
         "terminal_serial": "clock-hil-terminal",
@@ -39,7 +40,7 @@ def clock_hil(monkeypatch):
             manifest={"application_sha256": baseline_digest},
         )
         release = FirmwareRelease(
-            release_id="zone-lite-2.6.1", version=DIRECT_VERSION, git_sha="c" * 40,
+            release_id=f"zone-lite-{version}", version=version, git_sha="c" * 40,
             image_sha256="d" * 64, image_size=1024, signing_key_id="production-key",
             partition_layout=OTA_LAYOUT, minimum_bootstrap_version="2.4.12",
             storage_name="hil/firmware.bin", manifest_signature="signed", state="HIL_ONLY",
@@ -74,14 +75,14 @@ def clock_hil(monkeypatch):
             campaign_id="clock-hil-campaign", release_id=release.id,
             zone_id=connector.zone_id, status="ACTIVE", actor="test",
             idempotency_key="clock-hil", reason="clock canary",
-            typed_confirmation=DIRECT_VERSION,
+            typed_confirmation=version,
         )
         session.add(campaign)
         session.flush()
         session.add(FirmwareDeployment(
             deployment_id="clock-hil-deployment", campaign_id=campaign.id,
             release_id=release.id, connector_id=connector.id, status="PENDING",
-            previous_version="2.5.2", target_version=DIRECT_VERSION,
+            previous_version="2.5.2", target_version=version,
         ))
         session.add(ConnectorCredential(
             connector_id=connector.id, token_hash=connector_token_hash("test-device-token"),
@@ -166,7 +167,7 @@ def test_clock_recovery_carries_verified_new_image_through_boot_ack(clock_hil):
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.connector_id == connector.id
     ))
-    connector.firmware_version = DIRECT_VERSION
+    connector.firmware_version = release.version
     connector.ota_image_sha256 = release.manifest["application_sha256"]
     deployment.status = "READY_TO_BOOT"
     assert trusted_hil_clock_matches(

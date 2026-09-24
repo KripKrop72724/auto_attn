@@ -99,9 +99,15 @@ class StorageDiagnostics(BaseModel):
     error_code: int | None = None
 
 
+class MemoryDiagnostics(BaseModel):
+    internal_free_bytes: int = Field(ge=0)
+    internal_largest_block_bytes: int = Field(ge=0)
+
+
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1] = 1
     storage: StorageDiagnostics | None = None
+    memory: MemoryDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
     workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
     reconciliation_mode: str | None = Field(default=None, max_length=40)

@@ -13,7 +13,7 @@ from zk_add.time_utils import utc_now
 
 
 def manifest(version):
-    if version == "2.6.1":
+    if version in ("2.6.1", "2.6.2"):
         return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.4.12",
                 "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63,
                                   "write_format": 1, "allowed_bootstrap_versions": list(DIRECT_BASELINES),
@@ -33,7 +33,7 @@ def test_signed_contract_rejects_unqualified_capabilities(field, value):
 
 
 def test_signed_contract_required_for_both_storage_releases():
-    for version in ("2.5.4", "2.6.0", "2.6.1"):
+    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2"):
         assert validate_storage_contract(manifest(version), version)
         with pytest.raises(ValueError):
             validate_storage_contract({}, version)
@@ -57,8 +57,9 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert DIRECT_MARKER in signing
 
 
-@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.7.0", None])
-def test_direct_release_requires_exact_signed_predecessor(bad):
+@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.7.0", None])
+@pytest.mark.parametrize("direct_version", ["2.6.1", "2.6.2"])
+def test_direct_release_requires_exact_signed_predecessor(bad, direct_version):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -68,10 +69,10 @@ def test_direct_release_requires_exact_signed_predecessor(bad):
             minimum_bootstrap_version="2.2.0", storage_name=version,
             manifest={"application_sha256": digest}, manifest_signature="fixture", state="AVAILABLE")
             for version, digest in DIRECT_BASELINE_IMAGES.items()]
-        release = FirmwareRelease(release_id="direct", version="2.6.1", git_sha="a" * 40,
+        release = FirmwareRelease(release_id="direct", version=direct_version, git_sha="a" * 40,
             image_sha256="d" * 64, image_size=1024, signing_key_id="key",
             partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.4.12",
-            storage_name="direct", manifest=manifest("2.6.1"), manifest_signature="fixture", state="HIL_ONLY")
+            storage_name="direct", manifest=manifest(direct_version), manifest_signature="fixture", state="HIL_ONLY")
         connector = Connector(connector_id="guard-test", hardware_id="00:11:22:33:44:55",
             zone_id="TEST", zone_name="Test", device_id="1", display_name="test",
             firmware_version=bad)
