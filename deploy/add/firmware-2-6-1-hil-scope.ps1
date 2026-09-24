@@ -5,9 +5,11 @@ function Assert-Zkt261HilScope {
         throw 'ZKT 2.6.1 signing and publication require the ordered exact HIL scope'
     }
     $expectedPath = Join-Path $PSScriptRoot 'hil-targets-2.6.1.json'
-    $expected = @(ConvertFrom-Json -InputObject (Get-Content -LiteralPath $expectedPath -Raw))
+    $expected = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $expectedPath -Raw)
+    $expected = @($expected)
     try {
-        $actual = @(ConvertFrom-Json -InputObject $HilTargetsJson)
+        $actual = ConvertFrom-Json -InputObject $HilTargetsJson
+        $actual = @($actual)
     } catch {
         throw 'ZKT 2.6.1 HIL scope is not valid JSON'
     }
