@@ -10,7 +10,8 @@ export function hilDevice(release: FirmwareRelease | null | undefined, devices: 
       device.hardware_id.toLowerCase() === target.mac.toLowerCase() &&
       device.zkt?.serial === target.terminal_serial &&
       device.zkt?.expected_serial === target.terminal_serial &&
-      device.zkt?.confirmed_serial === target.terminal_serial) || null
+      device.zkt?.confirmed_serial === target.terminal_serial &&
+      device.zkt?.terminal_binding_state === 'CONFIRMED') || null
   }
   return devices.find(device => !device.is_spare && release.hil_target_mac &&
     device.hardware_id.toLowerCase() === release.hil_target_mac.toLowerCase()) || null
@@ -32,6 +33,7 @@ export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, d
   if (device.zkt.confirmed_serial !== target.terminal_serial) {
     return `Confirmed terminal serial is ${device.zkt.confirmed_serial || 'missing'}; binding state ${binding}.`
   }
+  if (binding !== 'CONFIRMED') return `Terminal binding is ${binding}; wait for device acknowledgement.`
   return null
 }
 

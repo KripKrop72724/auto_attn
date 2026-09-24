@@ -462,6 +462,25 @@ describe('Selected-terminal users workspace', () => {
     expect(screen.getByText(/will continue when the ADD device reconnects/i)).toBeTruthy()
   })
 
+  it('offers authenticated repinning for a migrated terminal with no expected serial', async () => {
+    const legacyDevice: Device = {
+      ...device,
+      zkt: {
+        ...device.zkt!,
+        expected_serial: null,
+        confirmed_serial: device.zkt!.serial,
+        terminal_binding_state: 'CONFIRMED',
+        serial_confirmed_by: 'MIGRATED_PREEXISTING',
+      },
+    }
+    vi.stubGlobal('fetch', workspaceFetch({ selectedDevice: legacyDevice }))
+    render(<UsersHarness selectedDevice={legacyDevice} />)
+
+    expect(await screen.findByRole('heading', { name: 'Confirm this physical terminal' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Confirm terminal serial/i }))
+    expect(screen.getByRole('heading', { name: 'Verify migrated terminal binding' })).toBeTruthy()
+  })
+
   it('ignores a superseded directory response and requires an actual edit before enabling submit', async () => {
     let resolveSlow: ((value: Response) => void) | null = null
     const fetchMock = workspaceFetch()
