@@ -1,7 +1,7 @@
 """Direct Oracle approval still has durable custody and two explicit exclusions."""
 
-from contextlib import nullcontext
 import asyncio
+from datetime import timedelta
 
 import httpx
 
@@ -26,6 +26,7 @@ from zk_add.models import (
     OrdsOutbox,
 )
 from zk_add.settings import settings
+from zk_add.time_utils import utc_now
 
 
 def request(event_id, *, key="direct-approval-one"):
@@ -227,32 +228,97 @@ def test_duplicate_request_conflict_and_changed_source_cannot_send(store):
         assert db.scalar(select(Job)).status == "COMPLETED_WITH_REVIEW"
 
 
-def test_invalid_uid_is_attempted_only_under_explicit_direct_approval(store, monkeypatch):
+def test_invalid_uid_is_excluded_before_new_approval(store):
     sessions, _connector_id, _uid = store
     event_id = source_ready(sessions)
     with sessions() as db:
         db.get(AttendanceEvent, event_id).event_uid = "saved-but-invalid-id"
         db.commit()
     with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert direct.identity_hints_for_page(db, [event])[event_id] == {
+            "eligible": False, "cnic_source": "SAVED_PUNCH", "exclusion": "INVALID_EVENT_UID",
+        }
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "INVALID_EVENT_UID"
+        assert db.scalar(select(Decision)) is None
+        assert db.scalar(select(Job)).status == "COMPLETED_WITH_REVIEW"
+
+
+def test_existing_invalid_uid_approval_stops_retry_without_oracle_request(store, monkeypatch):
+    sessions, _connector_id, _uid = store
+    event_id = source_ready(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).event_uid = "saved-but-invalid-id"
+        db.commit()
+    original_validator = worker.event_uid_is_valid
+    monkeypatch.setattr(worker, "event_uid_is_valid", lambda _value: True)
+    with sessions() as db:
         direct.create(db, actor="operator", request=request(event_id))
         db.commit()
     with sessions() as db:
         direct.advance_once(db)
         db.commit()
+    monkeypatch.setattr(worker, "event_uid_is_valid", original_validator)
+    normal, forced = delivery.split_claims(worker.claim_ords_batch(1))
+    assert normal == [] and len(forced) == 1 and forced[0]["direct"] is True
+
+    async def unexpected_oracle_request(*_args, **_kwargs):
+        raise AssertionError("Invalid IDs must never reach Oracle")
+
+    monkeypatch.setattr(delivery, "_ords_request", unexpected_oracle_request)
+    asyncio.run(delivery.deliver_forced(forced, concurrency=1))
     with sessions() as db:
-        monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
-        claims = worker.claim_ords_batch(1)
-        assert len(claims) == 1
-        assert claims[0][1]["event_uid"] == "saved-but-invalid-id"
+        event = db.get(AttendanceEvent, event_id)
+        item = db.scalar(select(Item))
+        outbox = db.scalar(select(OrdsOutbox))
+        assert event.ords_status == outbox.status == "QUARANTINED_INVALID_EVENT_UID"
+        assert event.oracle_confirmed_at is None
+        assert item.status == "NEEDS_REVIEW"
+        assert item.error_code == "INVALID_EVENT_UID"
+        assert item.result["needs_attention"] is True
+        assert outbox.next_attempt_at is None
+
+
+def test_existing_invalid_uid_run_finishes_without_waiting_for_retry(store, monkeypatch):
+    sessions, _connector_id, _uid = store
+    event_id = source_ready(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).event_uid = "saved-but-invalid-id"
+        db.commit()
+    original_validator = worker.event_uid_is_valid
+    monkeypatch.setattr(worker, "event_uid_is_valid", lambda _value: True)
+    with sessions() as db:
+        direct.create(db, actor="operator", request=request(event_id))
         db.commit()
     with sessions() as db:
-        monkeypatch.setattr(delivery, "session_scope", lambda: nullcontext(db))
-        normal, forced = delivery.split_claims(claims)
-        assert normal == [] and len(forced) == 1 and forced[0]["direct"] is True
-        delivery.persist_result(forced[0], "MATCH", token="a" * 64)
+        direct.advance_once(db)
+        outbox = db.scalar(select(OrdsOutbox))
+        event = db.get(AttendanceEvent, event_id)
+        outbox.status = event.ords_status = "FAILED_RETRYABLE"
+        outbox.attempt_count = 12
+        outbox.next_attempt_at = utc_now() + timedelta(minutes=10)
         db.commit()
-        assert db.get(AttendanceEvent, event_id).ords_status == "ACKED_CHECK"
-        assert db.scalar(select(Item)).result["oracle_content_token"] == "a" * 64
+    monkeypatch.setattr(worker, "event_uid_is_valid", original_validator)
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        outbox = db.scalar(select(OrdsOutbox))
+        item = db.scalar(select(Item))
+        job = db.scalar(select(Job))
+        assert event.ords_status == outbox.status == "QUARANTINED_INVALID_EVENT_UID"
+        assert event.oracle_confirmed_at is None
+        assert outbox.attempt_count == 12
+        assert outbox.next_attempt_at is None
+        assert item.status == "NEEDS_REVIEW"
+        assert item.error_code == "INVALID_EVENT_UID"
+        assert item.result["needs_attention"] is True
+        assert job.status == "COMPLETED_WITH_REVIEW"
+        assert direct.serialize(db, job)["waiting"] == 0
+        assert direct.serialize(db, job)["attention"] == 1
 
 
 def test_direct_send_attempts_known_oracle_conflict_but_acks_only_matching_content(store, monkeypatch):

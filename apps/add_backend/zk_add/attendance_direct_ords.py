@@ -77,6 +77,8 @@ def _known_user_and_cnic(session, event):
 
 def identity_hints_for_page(session, events):
     """Tell the ledger which rows have a usable synced identity in bounded queries."""
+    from zk_add.worker import event_uid_is_valid
+
     if not events:
         return {}
     users_by_key = {}
@@ -95,6 +97,8 @@ def identity_hints_for_page(session, events):
         _user, _cnic, source, _current_cnic, error = _identity_from_users(
             event, users_by_key.get((event.zkt_device_id, event.user_id), []),
         )
+        if not error and not event_uid_is_valid(event.event_uid):
+            error = "INVALID_EVENT_UID"
         hints[event.id] = {
             "eligible": error is None,
             "cnic_source": source,
@@ -115,6 +119,8 @@ def _payload(connector, terminal, event, user, cnic, source):
 
 
 def create(session, *, actor: str, request):
+    from zk_add.worker import event_uid_is_valid
+
     _lock_scheduler(session)
     event_ids = sorted(request.event_ids)
     request_digest = _digest([ACTION, actor, event_ids, request.reason.strip()])
@@ -155,6 +161,8 @@ def create(session, *, actor: str, request):
             error = "ALREADY_CONFIRMED"
         elif decision_for(session, event) or (outbox and outbox.status == "IN_FLIGHT"):
             error = "ALREADY_DELIVERING"
+        elif not event_uid_is_valid(event.event_uid):
+            error = "INVALID_EVENT_UID"
         elif not connector or not terminal:
             error = "SOURCE_MISSING"
         elif not error:
@@ -176,7 +184,12 @@ def create(session, *, actor: str, request):
                 "cnic_source": source if payload else None,
                 "current_user_key": user.user_key if payload else None,
                 "current_cnic_hash": cnic_lookup(current_cnic) if payload else None,
-                "reason": error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery.",
+                "reason": (
+                    "Oracle cannot accept this older punch ID. The punch remains saved for ID repair."
+                    if error == "INVALID_EVENT_UID" else
+                    error.replace("_", " ").title() if error else
+                    "Approved; waiting to prepare delivery."
+                ),
             },
             completed_at=now if error else None,
         ))
@@ -295,6 +308,8 @@ def _queue(session, job, item):
 
 
 def _observe(session, job):
+    from zk_add.worker import event_uid_is_valid
+
     waiting = session.scalars(
         select(Item).where(Item.job_id == job.id, Item.status == "WAITING_ORACLE")
         .order_by(Item.id).limit(BATCH)
@@ -307,6 +322,23 @@ def _observe(session, job):
             decision = decision_for(session, event)
             if decision and item.result.get("oracle_verified_payload_digest") == decision.payload_digest:
                 item.status, item.completed_at = "CONFIRMED", utc_now()
+        elif not event_uid_is_valid(event.event_uid):
+            outbox = session.scalar(
+                select(OrdsOutbox)
+                .where(OrdsOutbox.attendance_event_id == event.id)
+                .with_for_update()
+            )
+            # An in-flight worker owns the row and will apply the same guard.
+            if outbox and outbox.status != "IN_FLIGHT":
+                now = utc_now()
+                outbox.status = event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+                outbox.next_attempt_at, outbox.last_error = None, "INVALID_EVENT_UID"
+                item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", "INVALID_EVENT_UID", now
+                item.result = {
+                    **item.result,
+                    "reason": "Oracle cannot accept this older punch ID. The punch and approval remain saved for ID repair.",
+                    "needs_attention": True,
+                }
         elif event.ords_status not in {"PENDING", "IN_FLIGHT", "FAILED_RETRYABLE", "RETRYING"}:
             item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", event.ords_status, utc_now()
         item.updated_at = utc_now()
