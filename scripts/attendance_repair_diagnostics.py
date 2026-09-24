@@ -188,6 +188,7 @@ def database_report(direct_run_id=None):
                         THEN o.last_error ELSE 'REDACTED' END AS outbox_error,
                    COALESCE((i.result->>'needs_attention')::boolean, false)
                        AS needs_attention,
+                   (e.event_uid ~ '^[0-9a-f]{64}$') AS event_uid_format_valid,
                    (extract(microseconds from e.device_event_time)::bigint % 1000000 <> 0)
                        AS timestamp_has_fraction
               FROM add_attendance_recovery_items i
