@@ -176,6 +176,16 @@ def persist_result(claim, classification, token=None, error_code=None):
             row.next_attempt_at, row.last_error = None, code
             item.status, item.error_code = "NEEDS_REVIEW", code
             item.result = {**item.result, "reason": explain(code)}
+        elif classification == "INVALID_EVENT_UID":
+            now = utc_now()
+            row.status = event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+            row.next_attempt_at, row.last_error = None, "INVALID_EVENT_UID"
+            item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", "INVALID_EVENT_UID", now
+            item.result = {
+                **item.result,
+                "reason": "Oracle cannot accept this older punch ID. The punch and approval remain saved for ID repair.",
+                "needs_attention": True,
+            }
         elif classification == "REJECTED":
             row.status = event.ords_status = "QUARANTINED_ORDS_REJECTED"
             row.next_attempt_at, row.last_error = None, error_code or "ORACLE_REJECTED"
@@ -204,6 +214,7 @@ def persist_result(claim, classification, token=None, error_code=None):
                         "ORDS_AUTHENTICATION_NOT_CONFIGURED",
                         "ORDS_HTTP_404",
                         "ORDS_HTTP_405",
+                        "ORDS_HTTP_400",
                         "ORDS_MALFORMED_RESPONSE",
                     }
                 ),
@@ -218,16 +229,22 @@ def persist_result(claim, classification, token=None, error_code=None):
 
 
 async def deliver_forced(claims, *, concurrency):
+    from zk_add.worker import event_uid_is_valid
+
     semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
 
     async def one(claim):
         classification, token, code = "UNKNOWN", None, None
         async with semaphore:
             try:
-                classification, token = await verify(claim)
-                should_send = classification == "MISSING" or (
-                    claim["direct"] and classification != "MATCH"
-                )
+                if not event_uid_is_valid(claim["payload"].get("event_uid")):
+                    classification = "INVALID_EVENT_UID"
+                    should_send = False
+                else:
+                    classification, token = await verify(claim)
+                    should_send = classification == "MISSING" or (
+                        claim["direct"] and classification != "MATCH"
+                    )
                 if should_send:
                     if not await asyncio.to_thread(still_authorized, claim):
                         classification = "CHANGED"
