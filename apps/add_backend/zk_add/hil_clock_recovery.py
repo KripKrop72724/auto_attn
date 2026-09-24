@@ -1,4 +1,4 @@
-"""Bounded clock recovery for signed requests from the current 2.6.1 HIL target."""
+"""Bounded clock recovery for signed requests from qualified direct HIL targets."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from zk_add.ota import (
     _versions_match,
 )
 from zk_add.settings import settings
-from zk_add.storage_contract import DIRECT_BASELINES, DIRECT_VERSION
+from zk_add.storage_contract import DIRECT_BASELINES, DIRECT_VERSIONS
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
@@ -69,7 +69,7 @@ def trusted_hil_clock_matches(
             FirmwareCampaign.status == "ACTIVE",
             FirmwareCampaign.zone_id == connector.zone_id,
             FirmwareCampaign.release_id == FirmwareDeployment.release_id,
-            FirmwareRelease.version == DIRECT_VERSION,
+            FirmwareRelease.version.in_(DIRECT_VERSIONS),
             FirmwareRelease.state == "HIL_ONLY",
         )
         .order_by(FirmwareDeployment.id.desc()).limit(1)
@@ -90,7 +90,7 @@ def trusted_hil_clock_matches(
         if _storage_predecessor_exclusion(session, release, connector):
             return False
     elif not (
-        _versions_match(connector.firmware_version, DIRECT_VERSION)
+        _versions_match(connector.firmware_version, release.version)
         and deployment.status in {"READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"}
         and connector.ota_running_partition in {"ota_0", "ota_1"}
         and connector.ota_image_sha256 == _application_sha256(release)

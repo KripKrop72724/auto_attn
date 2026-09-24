@@ -2407,9 +2407,12 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     cJSON *diagnostics = cJSON_CreateObject();
     if (!diagnostics) return;
     cJSON *storage = cJSON_AddObjectToObject(diagnostics, "storage");
+    cJSON *memory = cJSON_AddObjectToObject(diagnostics, "memory");
     cJSON *workers = cJSON_AddArrayToObject(diagnostics, "workers");
     cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
-    if (!storage || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1)) goto failed;
+    if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1) ||
+        !cJSON_AddNumberToObject(memory, "internal_free_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) ||
+        !cJSON_AddNumberToObject(memory, "internal_largest_block_bytes", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) goto failed;
     size_t total = 0, used = 0;
     esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
     if (measured == ESP_OK) {

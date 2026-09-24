@@ -4,6 +4,7 @@ COMPAT_VERSION = "2.5.4"
 CANDIDATE_VERSION = "2.6.0"
 COMPAT_MARKER = "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4"
 DIRECT_VERSION = "2.6.1"
+DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2")
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
 DIRECT_BASELINE_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -14,7 +15,7 @@ DIRECT_MARKER = "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     contract = manifest.get("queue_storage")
-    required = version in {COMPAT_VERSION, CANDIDATE_VERSION, DIRECT_VERSION}
+    required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:
         return None
     expected = ({
@@ -24,7 +25,7 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
         "write_format": 1,
         "allowed_bootstrap_versions": list(DIRECT_BASELINES),
         "allowed_bootstrap_images": DIRECT_BASELINE_IMAGES,
-    } if version == DIRECT_VERSION else {
+    } if version in DIRECT_VERSIONS else {
         "schema_version": 1,
         "read_format": 2,
         "reader_mask": 63,
@@ -37,6 +38,6 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
         raise ValueError("Firmware storage contract is missing or unqualified.")
     if version == CANDIDATE_VERSION and manifest.get("minimum_bootstrap_version") != COMPAT_VERSION:
         raise ValueError("Segmented storage requires the compatibility predecessor.")
-    if version == DIRECT_VERSION and manifest.get("minimum_bootstrap_version") != DIRECT_BASELINES[0]:
+    if version in DIRECT_VERSIONS and manifest.get("minimum_bootstrap_version") != DIRECT_BASELINES[0]:
         raise ValueError("Direct legacy-write storage requires the qualified baseline.")
     return contract
