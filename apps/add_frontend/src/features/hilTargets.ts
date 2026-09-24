@@ -16,6 +16,20 @@ export function hilDevice(release: FirmwareRelease | null | undefined, devices: 
     device.hardware_id.toLowerCase() === release.hil_target_mac.toLowerCase()) || null
 }
 
+export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, devices: Device[]): string | null {
+  if (release?.state !== 'HIL_ONLY' || !release.hil_targets || !release.hil_next_target) return null
+  const target = release.hil_next_target
+  const device = devices.find(row => row.connector_id === target.connector_id)
+  if (!device) return 'Target connector is missing from the active fleet.'
+  if (device.is_spare) return 'Target connector is in spare inventory.'
+  if (device.hardware_id.toLowerCase() !== target.mac.toLowerCase()) return 'Registered ESP MAC differs from the signed target.'
+  if (!device.zkt) return 'No terminal is registered to the target connector.'
+  if (device.zkt.serial !== target.terminal_serial) return 'Observed terminal serial differs from the signed target.'
+  if (device.zkt.expected_serial !== target.terminal_serial) return 'Expected terminal serial is missing or differs from the signed target.'
+  if (device.zkt.confirmed_serial !== target.terminal_serial) return 'Confirmed terminal serial is missing or differs from the signed target.'
+  return null
+}
+
 export function hilScopeLabel(release: FirmwareRelease): string {
   if (release.hil_targets) {
     const target = release.hil_next_target

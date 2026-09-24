@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Device, FirmwareRelease } from '../types'
-import { hilDevice, hilScopeLabel } from './hilTargets'
+import { hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
 
 const target = { connector_id: 'exact', mac: 'a4:cb:8f:d4:66:64', terminal_serial: 'PGB1261200074' }
 const release = { state: 'HIL_ONLY', hil_targets: [target], hil_next_target: target } as FirmwareRelease
@@ -23,6 +23,11 @@ describe('ordered HIL destination', () => {
   it('rejects a replacement terminal and mismatched connector', () => {
     expect(hilDevice(release, [{ ...device, connector_id: 'other' }])).toBeNull()
     expect(hilDevice(release, [{ ...device, zkt: { ...device.zkt!, serial: 'replacement' } }])).toBeNull()
+    expect(hilDeviceMismatch(release, [{ ...device, zkt: { ...device.zkt!, confirmed_serial: null } }]))
+      .toMatch(/Confirmed terminal serial/)
+    expect(hilDeviceMismatch(release, [{ ...device, zkt: { ...device.zkt!, expected_serial: null } }]))
+      .toMatch(/Expected terminal serial/)
+    expect(hilDeviceMismatch(release, [device])).toBeNull()
   })
   it('preserves legacy single-target support', () => {
     expect(hilDevice({ state: 'HIL_ONLY', hil_target_mac: target.mac } as FirmwareRelease, [device])).toBe(device)
