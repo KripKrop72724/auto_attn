@@ -28,7 +28,7 @@ from zk_add.ota import (
     version_at_least,
 )
 from zk_add.settings import settings
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
 
 def diagnose(campaign_id: str) -> dict:
@@ -93,6 +93,16 @@ def diagnose(campaign_id: str) -> dict:
                     ConnectorNonce.created_at >= utc_now() - timedelta(minutes=5),
                 ))
                 ota = ((latest.payload or {}).get("ota") or {}) if latest else {}
+                clock_offset_seconds = None
+                if latest:
+                    clock_sample = (latest.payload or {}).get("_trusted_envelope_sent_at")
+                    if isinstance(clock_sample, str):
+                        try:
+                            clock_offset_seconds = int((
+                                ensure_utc(latest.created_at) - parse_datetime(clock_sample)
+                            ).total_seconds())
+                        except ValueError:
+                            pass
                 ota_error = ota.get("last_error")
                 if not isinstance(ota_error, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", ota_error):
                     ota_error = "OTHER_OR_UNAVAILABLE" if ota_error else None
@@ -115,6 +125,7 @@ def diagnose(campaign_id: str) -> dict:
                     "other_active_deployment": bool(other_active and other_active.connector_id != connector.id),
                     "latest_telemetry_at": latest.created_at.isoformat() if latest else None,
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
+                    "device_clock_offset_seconds": clock_offset_seconds,
                     "authenticated_requests_last_5m": recent_authenticated_requests,
                     "telemetry_ota_state": ota.get("state"),
                     "telemetry_ota_last_error": ota_error,

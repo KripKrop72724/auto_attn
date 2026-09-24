@@ -3850,6 +3850,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 boot_id=envelope.boot_id,
                 sequence=envelope.seq,
                 payload=payload,
+                device_sent_at=envelope.sent_at,
             )
             # A firmware capability heartbeat can materialize a previously staged
             # recovery command. The initial WebSocket backlog was sent before this
@@ -4594,6 +4595,7 @@ async def _require_ota_connector(
             nonce=nonce,
             supplied_body_hash=body_hash,
             signature=signature,
+            allow_hil_clock_recovery=True,
         )
     except HTTPException as error:
         if error.status_code == 401:

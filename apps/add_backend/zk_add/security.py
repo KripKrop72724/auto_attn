@@ -146,6 +146,7 @@ async def authenticate_connector_request(
     nonce: str | None = Header(default=None, alias="X-ADD-Nonce"),
     supplied_body_hash: str | None = Header(default=None, alias="X-ADD-Body-SHA256"),
     signature: str | None = Header(default=None, alias="X-ADD-Signature"),
+    allow_hil_clock_recovery: bool = False,
 ) -> Connector:
     from starlette.concurrency import run_in_threadpool
 
@@ -155,6 +156,7 @@ async def authenticate_connector_request(
     return await run_in_threadpool(
         authenticate_connector_body, session, authorization, connector_id,
         timestamp, nonce, supplied_body_hash, signature, body, request.method, request.url.path,
+        allow_hil_clock_recovery,
     )
 
 
@@ -162,6 +164,7 @@ def authenticate_connector_body(
     session: Session, authorization: str | None, connector_id: str | None,
     timestamp: str | None, nonce: str | None, supplied_body_hash: str | None,
     signature: str | None, body: bytes, method: str, path: str,
+    allow_hil_clock_recovery: bool = False,
 ) -> Connector:
     if not authorization or not authorization.startswith("Bearer ") or not connector_id:
         raise HTTPException(status_code=401, detail="Missing connector credentials.")
@@ -189,10 +192,13 @@ def authenticate_connector_body(
         raise HTTPException(status_code=401, detail="Missing signed connector headers.")
     try:
         parsed_timestamp = parse_datetime(timestamp)
-        if not timestamp_within_skew(timestamp):
-            raise ValueError
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid connector timestamp.") from None
+    timestamp_fresh = timestamp_within_skew(timestamp)
+    if not timestamp_fresh and not (
+        allow_hil_clock_recovery and path.startswith("/device/v2/firmware/")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid connector timestamp.")
     actual_body_hash = body_sha256(body)
     if not hmac.compare_digest(actual_body_hash, supplied_body_hash):
         raise HTTPException(status_code=401, detail="Connector body hash mismatch.")
@@ -206,6 +212,13 @@ def authenticate_connector_body(
     )
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Invalid connector signature.")
+    if not timestamp_fresh:
+        from zk_add.hil_clock_recovery import trusted_hil_clock_matches
+
+        if not trusted_hil_clock_matches(
+            session, connector=connector, request_timestamp=parsed_timestamp,
+        ):
+            raise HTTPException(status_code=401, detail="Invalid connector timestamp.")
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         session.execute(
             text("SELECT pg_advisory_xact_lock(:connector_key)"),

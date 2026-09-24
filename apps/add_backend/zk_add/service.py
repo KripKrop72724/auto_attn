@@ -662,6 +662,7 @@ def update_heartbeat(
     boot_id: str,
     sequence: int,
     payload: HeartbeatPayload,
+    device_sent_at: datetime | None = None,
 ) -> dict:
     if (connector.firmware_family or "zkt") != payload.firmware_family:
         raise ValueError("FIRMWARE_FAMILY_MISMATCH")
@@ -1005,18 +1006,24 @@ def update_heartbeat(
         connector=connector,
         payload=payload,
     )
+    telemetry_payload = redact_context(payload.model_dump(mode="json"))
+    if device_sent_at is not None:
+        # The authenticated WebSocket envelope supplies a bounded clock sample
+        # for legacy OTA clients whose ESP clock is skewed but still advancing.
+        telemetry_payload["_trusted_envelope_sent_at"] = ensure_utc(device_sent_at).isoformat()
     session.add(
         DeviceTelemetry(
             connector_id=connector.id,
             boot_id=boot_id,
             sequence=sequence,
+            created_at=now,
             rssi=payload.rssi,
             free_heap=payload.free_heap,
             uptime_seconds=payload.uptime_seconds,
             outbox_depth=payload.outbox_depth,
             current_activity=payload.current_activity,
             led_state=payload.led_state,
-            payload=redact_context(payload.model_dump(mode="json")),
+            payload=telemetry_payload,
         )
     )
     if connector.comm_key_capable:
