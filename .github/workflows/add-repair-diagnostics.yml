@@ -7,6 +7,10 @@ on:
         description: 'Optional saved direct Oracle send run ID for bounded error-code diagnostics'
         required: false
         type: string
+      firmware_campaign_id:
+        description: 'Optional exact firmware campaign ID for read-only assignment diagnostics'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -76,6 +80,17 @@ jobs:
             $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'TRANSPORT_ERROR' }
             Write-Host "oracle_content_check_http=$status"
           }
+
+      - name: Inspect one firmware assignment without changing deployment state
+        if: inputs.firmware_campaign_id != ''
+        env:
+          CAMPAIGN_ID: ${{ inputs.firmware_campaign_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CAMPAIGN_ID -notmatch '^[0-9a-f]{32}$') { throw 'Invalid campaign ID.' }
+          $script = Get-Content -Raw 'scripts/firmware_assignment_diagnostics.py'
+          $script | & docker exec -i attendance-device-dashboard-add-api-1 python - --campaign-id $env:CAMPAIGN_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only firmware diagnostics failed.' }
 
       - name: Summarize HTTP failures without exposing raw logs
         run: |
