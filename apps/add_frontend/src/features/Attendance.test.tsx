@@ -401,7 +401,7 @@ describe('Live attendance workspace', () => {
     await screen.findByRole('article', { name: /Bilal Ahmed/i })
     fireEvent.click(screen.getByLabelText('Select loaded punches'))
     fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
-    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current users and users without a usable CNIC are skipped/i)
+    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current users, missing CNICs, and older punch IDs Oracle cannot accept are skipped/i)
     fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Verified by administrator' } })
     fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve and send 2 punches' }))
