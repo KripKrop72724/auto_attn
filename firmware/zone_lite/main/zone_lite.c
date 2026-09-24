@@ -2678,9 +2678,10 @@ static bool add_send_user_snapshot(const user_table_t *users)
     return add_send_user_snapshot_reason(users, "VERIFIED_TERMINAL_READ", false);
 }
 
-/* Re-read the entire raw table before and after each write. A matching UID
- * alone is insufficient: a terminal-side edit between reads must never be
- * overwritten with a stale user record. */
+/* Re-read the entire raw table immediately before each write and after the
+ * final write. A matching UID alone is insufficient: a terminal-side edit
+ * must never be overwritten with a stale user record. The next pre-write
+ * read also verifies the preceding write. */
 typedef struct {
     uint16_t uid;
     uint16_t row;
@@ -2839,8 +2840,6 @@ static bool zk_enforce_credential_policy(
         written[i] = true;
         ++writes;
         ok = zk_refresh_terminal_user_cache(sock, ctx);
-        if (!ok) break;
-        ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);
     }
     if (ok) {
         ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);

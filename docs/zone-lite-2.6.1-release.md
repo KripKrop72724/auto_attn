@@ -26,7 +26,8 @@ ADD/firmware transition is needed to preserve attendance identity evidence
 when a nonzero card is removed. The firmware now checks the complete raw user
 table on startup and hourly, attempts an acknowledged pre-write ADD snapshot,
 clears only PIN and card bytes, refreshes the terminal's active user cache,
-and compares every raw record before and after each write. It then sends an
+and compares every raw record before each write and after the batch. It then
+sends an
 acknowledged stable post-write snapshot when ADD is available. It leaves
 user records intact; biometric preservation still needs physical confirmation
 on each model. ADD retains the old and new card fingerprints across a bounded
@@ -59,6 +60,16 @@ readback after reconnect found both absent, fingerprint template slot 7
 unchanged, and all 167 other user records byte-for-byte unchanged. The
 operator physically confirmed that only the fingerprint still works. The
 disposable user was deleted, again leaving every other record unchanged.
+
+### SLICTOWER 13FL rollback evidence, 22 September 2026
+
+ADD campaign `151669daef2910e907adb81a630c468c` is paused after a
+2.4.12-to-2.5.4 HIL attempt. ADD recorded a verified target boot and repeated
+`WAITING_FOR_RUNTIME_HEALTH` states. It then observed two fresh heartbeats on
+the previous firmware and marked the deployment `PREVIOUS_FIRMWARE_OBSERVED`
+at 1:51 pm PKT. The reset cause was not reported. The 2.6.1 HIL must establish
+runtime-health reporting and explain any return to the previous firmware
+before treating 13FL as accepted.
 
 ## Qualification after the credential work lands
 
