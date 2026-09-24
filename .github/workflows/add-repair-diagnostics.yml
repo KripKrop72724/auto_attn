@@ -56,6 +56,27 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
 
+      - name: Check protected Oracle verification capability without sending attendance
+        env:
+          REPAIR_USER: ${{ secrets.ADD_ATTENDANCE_REPAIR_ORDS_USERNAME }}
+          REPAIR_PASSWORD: ${{ secrets.ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD }}
+        run: |
+          if (-not $env:REPAIR_USER -or -not $env:REPAIR_PASSWORD) {
+            Write-Host 'oracle_content_check=NOT_CONFIGURED'
+            exit 0
+          }
+          try {
+            $response = Invoke-WebRequest `
+              -Uri 'https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event/raw-captures/identity-repairs/capabilities' `
+              -Method Get -UseBasicParsing -TimeoutSec 15 `
+              -Headers @{ 'X-API-Username' = $env:REPAIR_USER; 'X-API-Password' = $env:REPAIR_PASSWORD }
+            $body = $response.Content | ConvertFrom-Json
+            Write-Host "oracle_content_check_http=$([int]$response.StatusCode) contract=$($body.contract_version) raw_content_verification=$([bool]$body.raw_content_verification)"
+          } catch {
+            $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'TRANSPORT_ERROR' }
+            Write-Host "oracle_content_check_http=$status"
+          }
+
       - name: Summarize HTTP failures without exposing raw logs
         run: |
           $ErrorActionPreference = 'Stop'
