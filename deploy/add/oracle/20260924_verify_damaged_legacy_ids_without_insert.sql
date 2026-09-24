@@ -14,6 +14,7 @@ declare
     l_previous_body clob;
     l_normalized_body clob;
     l_candidate_body clob;
+    l_replace_attempted boolean := false;
     l_status varchar2(30);
     l_errors number;
     l_old_1 constant varchar2(4000) := q'~        l_stored_serial hr_raw_attn_capture_events.device_serial%type;
@@ -259,13 +260,14 @@ begin
        or occurrence_count(l_candidate_body, l_new_4) <> 1 then
         raise_application_error(-20891, 'Legacy source-check markers are incomplete.');
     end if;
+    l_replace_attempted := true;
     execute immediate l_candidate_body;
     validate_body;
     dbms_output.put_line('legacy_source_check=installed');
     dbms_output.put_line('attendance_rows_changed_by_migration=0');
 exception
     when others then
-        if l_previous_body is not null then
+        if l_replace_attempted and l_previous_body is not null then
             begin
                 execute immediate l_previous_body;
                 validate_body;

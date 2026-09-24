@@ -57,6 +57,7 @@ def test_only_one_four_character_legacy_block_can_match_an_original():
     assert matches_original(damaged, original)
     assert potentially_recoverable(original[:32] + "b\b??" + original[36:])
     assert matches_original(original[:32] + "b\b??" + original[36:], original)
+    assert matches_original(original[:24] + "????" + original[28:], original)
     assert not potentially_recoverable(original[:32] + "?\x14" + original[34:])
     assert not potentially_recoverable("????" + original[4:])
     assert not potentially_recoverable(original[:25] + "?" + original[26:34] + "??" + original[36:])
