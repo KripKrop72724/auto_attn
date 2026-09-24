@@ -91,13 +91,12 @@ def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):
 
 
 def test_direct_ords_approval_survives_postgres_guard_and_requires_content_receipt(force_pg):
-    from zk_add.crypto import encrypt_cnic
     from zk_add.models import OrdsOutbox, AttendanceRecoveryItem as Item
 
     sessions, _connector_id, _uid = force_pg
     with sessions() as db:
         event = db.scalar(select(AttendanceEvent))
-        event.cnic_encrypted = encrypt_cnic("3520212345671")
+        event.cnic_encrypted = None
         event.display_name = "Captured employee"
         event_id = event.id
         db.commit()
@@ -115,6 +114,7 @@ def test_direct_ords_approval_survives_postgres_guard_and_requires_content_recei
         db.commit()
     with sessions() as db:
         assert db.scalar(select(Decision)).proof["policy"] == direct.POLICY
+        assert db.scalar(select(Decision)).proof["cnic_source"] == "SYNCED_USER"
         assert db.scalar(select(OrdsOutbox)).status == "PENDING"
         assert db.scalar(select(Item)).status == "WAITING_ORACLE"
         # The deferred trigger must reject a false ACK without Oracle content proof.

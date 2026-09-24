@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from test_attendance_force_release import store as store
-from test_attendance_repair import CORRECT_CNIC, repair_store as repair_store
+from test_attendance_repair import CORRECT_CNIC, WRONG_CNIC, repair_store as repair_store
 from zk_add import attendance_direct_ords as direct
 from zk_add import attendance_force_delivery as delivery
 from zk_add import worker
@@ -71,15 +71,13 @@ def test_identity_conflict_is_approved_and_queued_without_rewriting_source(store
         assert len(db.scalars(select(Decision)).all()) == 1
 
 
-@pytest.mark.parametrize("missing", ["user", "cnic", "current_cnic"])
+@pytest.mark.parametrize("missing", ["user", "current_cnic"])
 def test_only_unknown_user_or_missing_cnic_is_excluded(store, missing):
     sessions, _connector_id, _uid = store
     event_id = source_ready(sessions)
     with sessions() as db:
         if missing == "user":
             db.scalar(select(DeviceUser)).present = False
-        elif missing == "cnic":
-            db.get(AttendanceEvent, event_id).cnic_encrypted = None
         else:
             db.scalar(select(DeviceUser)).cnic_encrypted = None
         db.commit()
@@ -89,6 +87,117 @@ def test_only_unknown_user_or_missing_cnic_is_excluded(store, missing):
         assert job.status == "COMPLETED_WITH_REVIEW"
         assert db.scalar(select(Item)).error_code == ("UNKNOWN_USER" if missing == "user" else "CNIC_MISSING")
         assert db.scalar(select(Decision)) is None
+
+
+def test_held_punch_without_saved_cnic_uses_synced_user_and_keeps_source_unchanged(store):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event_id = event.id
+        original_uid = event.event_uid
+        event.cnic_encrypted = None
+        event.ords_status = "BLOCKED_IDENTITY"
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        hint = direct.identity_hints_for_page(db, [event])[event_id]
+        assert hint == {
+            "eligible": True, "cnic_source": "SYNCED_USER", "exclusion": None,
+        }
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+        item = db.scalar(select(Item))
+        assert item.status == "READY"
+        assert item.result["cnic_source"] == "SYNCED_USER"
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        decision = db.scalar(select(Decision))
+        payload = direct.approved_payload(db, event, db.get(Connector, event.connector_id), decision)
+        assert payload["cnic"] == CORRECT_CNIC
+        assert payload["employee_name"] == db.scalar(select(DeviceUser)).display_name
+        assert event.cnic_encrypted is None
+        assert event.event_uid == original_uid
+        assert event.ords_status == "PENDING"
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+
+
+def test_synced_cnic_change_after_approval_stops_dispatch(store):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.cnic_encrypted = None
+        event.ords_status = "BLOCKED_IDENTITY"
+        event_id = event.id
+        db.commit()
+    with sessions() as db:
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        db.scalar(select(DeviceUser)).cnic_encrypted = encrypt_cnic(WRONG_CNIC)
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "SOURCE_CHANGED"
+        assert db.scalar(select(Decision)) is None
+
+
+def test_synced_cnic_change_after_queue_blocks_approved_payload(store):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.cnic_encrypted = None
+        event.ords_status = "BLOCKED_IDENTITY"
+        event_id = event.id
+        db.commit()
+    with sessions() as db:
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        db.scalar(select(DeviceUser)).cnic_encrypted = encrypt_cnic(WRONG_CNIC)
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert direct.approved_payload(
+            db, event, db.get(Connector, event.connector_id), db.scalar(select(Decision)),
+        ) is None
+
+
+def test_missing_saved_and_current_cnic_is_excluded(store):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.cnic_encrypted = None
+        event.ords_status = "BLOCKED_IDENTITY"
+        db.scalar(select(DeviceUser)).cnic_encrypted = None
+        event_id = event.id
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert direct.identity_hints_for_page(db, [event])[event_id]["exclusion"] == "CNIC_MISSING"
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "CNIC_MISSING"
+        assert db.scalar(select(Decision)) is None
+
+
+def test_unreadable_saved_cnic_stays_visible_and_uses_synced_user(store):
+    from zk_add.web import serialize_attendance
+
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.cnic_encrypted = "damaged-protected-value"
+        event.ords_status = "BLOCKED_IDENTITY"
+        db.commit()
+        assert serialize_attendance(event)["cnic_masked"] is None
+        assert direct.identity_hints_for_page(db, [event])[event.id]["cnic_source"] == "SYNCED_USER"
 
 
 def test_duplicate_request_conflict_and_changed_source_cannot_send(store):

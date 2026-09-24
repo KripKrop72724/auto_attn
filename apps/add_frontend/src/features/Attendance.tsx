@@ -323,7 +323,7 @@ function AllAttendanceEvents({
     () => new Map(devices.flatMap((device) => device.zkt?.serial ? [[device.zkt.serial, device] as const] : [])),
     [devices],
   )
-  const canSelect = (row: AttendanceEvent) => Boolean(row.cnic_masked) &&
+  const canSelect = (row: AttendanceEvent) => (row.direct_ords_identity?.eligible ?? Boolean(row.cnic_masked)) &&
     !row.oracle_confirmed_at && !row.ords_status.startsWith('ACK') &&
     row.ords_status !== 'IN_FLIGHT' && !row.force_release
   const selectableRows = rows.filter(canSelect)
@@ -437,7 +437,7 @@ function AllAttendanceEvents({
             return (
               <article className={`attendance-event ${rowAttention ? 'attendance-event-attention' : ''}`} key={row.event_uid} aria-label={`${row.display_name || 'Unknown identity'}, ${punchLabel(row.punch)}, ${dateTime(row.device_event_time)}`}>
                 <label className="attendance-row-select"><input type="checkbox" aria-label={`Select punch for user ${row.user_id} at ${dateTime(row.device_event_time)}`} checked={selected.has(row.id)} disabled={!canSelect(row) || selected.size >= 500 && !selected.has(row.id)} onChange={() => toggleSelection(row)} /></label>
-                <div className="attendance-event-cell attendance-person" data-label="Employee"><span className="avatar">{(row.display_name || '?').slice(0, 2).toUpperCase()}</span><span><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || `User ${row.user_id} · identity incomplete`}</small></span></div>
+                <div className="attendance-event-cell attendance-person" data-label="Employee"><span className="avatar">{(row.display_name || '?').slice(0, 2).toUpperCase()}</span><span><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || (row.direct_ords_identity?.cnic_source === 'SYNCED_USER' ? `User ${row.user_id} · CNIC on synced user` : `User ${row.user_id} · CNIC not linked to punch`)}</small></span></div>
                 <div className="attendance-event-cell" data-label="Event"><strong>{punchLabel(row.punch)}</strong><small>{dateTime(row.device_event_time)} · received {relativeTime(row.received_at)}</small></div>
                 <div className="attendance-event-cell" data-label="Terminal"><strong>{terminal?.display_name || row.device_serial || 'Terminal provenance unavailable'}</strong><small>{terminal ? row.device_serial : row.terminal_provenance?.explanation || 'Terminal provenance requires review'}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Capture"><StatusBadge state={captureLabel(row.source)} /><small title={row.clock_quality === 'UNKNOWN' ? 'No contemporaneous terminal clock sample exists for this punch. A current sample cannot verify historical clock accuracy.' : undefined} className={row.clock_quality === 'OK' ? '' : 'attention-copy'}>{row.clock_quality === 'OK' ? 'Clock verified' : `Clock ${row.clock_quality.toLowerCase()}`}</small></div>

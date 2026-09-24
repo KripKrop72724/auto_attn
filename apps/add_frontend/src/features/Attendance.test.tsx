@@ -357,6 +357,33 @@ describe('Live attendance workspace', () => {
     })
   })
 
+  it('lets an administrator select a held punch when the synced user has a CNIC', async () => {
+    const held = event({
+      cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [held], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+    const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect(within(row).getByText(/CNIC on synced user/i)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Send to ORDS' }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog.textContent).toMatch(/current synced user CNIC because the saved punch has none/i)
+    expect(dialog.textContent).toMatch(/does not prove who owned the terminal user ID/i)
+  })
+
+  it('keeps a punch without a usable current user CNIC out of manual selection', async () => {
+    const held = event({
+      cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: false, cnic_source: null, exclusion: 'CNIC_MISSING' },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [held], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+    const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect(within(row).queryByRole('button', { name: 'Send to ORDS' })).toBeNull()
+    expect(within(row).getByRole('checkbox').hasAttribute('disabled')).toBe(true)
+  })
+
   it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
     const second = event({ id: 2, event_uid: 'event-two', user_id: '1008', display_name: 'Bilal Ahmed' })
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -374,7 +401,7 @@ describe('Live attendance workspace', () => {
     await screen.findByRole('article', { name: /Bilal Ahmed/i })
     fireEvent.click(screen.getByLabelText('Select loaded punches'))
     fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
-    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current user or a missing or unusable CNIC/i)
+    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current users and users without a usable CNIC are skipped/i)
     fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Verified by administrator' } })
     fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve and send 2 punches' }))
