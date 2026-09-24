@@ -24,6 +24,9 @@ DOWNSTREAM_COMPILE_FIX = (
 CHECK_HANDLER_FIX = (
     ROOT / "deploy/add/oracle/20260921_canonicalize_raw_attn_check_handler.sql"
 )
+LEGACY_SOURCE_CHECK = (
+    ROOT / "deploy/add/oracle/20260924_verify_damaged_legacy_ids_without_insert.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -211,6 +214,31 @@ def test_membership_handler_migration_is_guarded_and_data_free() -> None:
     assert "update hr_" not in source
     assert "delete from hr_" not in source
     assert "merge into hr_" not in source
+
+
+def test_damaged_legacy_uid_check_only_matches_existing_oracle_content() -> None:
+    contract = CONTRACT.read_text().lower()
+    verifier = contract.split("procedure post_check(p_body in clob) is", 1)[1].split("end post_check;", 1)[0]
+    migration = LEGACY_SOURCE_CHECK.read_text().lower()
+    assert "l_differences = 4 and l_first >= 25 and l_last <= 36" in verifier
+    assert "l_last - l_first = 3 and l_bad >= 3" in verifier
+    assert "event_uid like substr(item.event_uid, 1, 24) || '%'" in verifier
+    assert "device_serial = item.device_serial" in verifier
+    assert "user_id = item.user_id" in verifier
+    assert "event_timestamp = slic_zkt_truth_api.parse_event_timestamp(item.event_timestamp)" in verifier
+    assert "raw_punch = item.raw_punch" in verifier
+    assert "l_stored_cnic = item.cnic" in verifier
+    assert "l_classification := 'legacy_source_match'" in verifier
+    assert "matched_event_uid" in verifier
+    assert "insert into hr_" not in verifier
+    assert "update hr_" not in verifier
+    assert "delete from hr_" not in verifier
+    assert "execute immediate l_previous_body" in migration
+    assert "user_errors" in migration
+    assert "attendance_rows_changed_by_migration=0" in migration
+    assert "insert into hr_" not in migration
+    assert "update hr_" not in migration
+    assert "delete from hr_" not in migration
 
 
 def test_existing_full_history_reconcile_delete_paths_remain_gated() -> None:

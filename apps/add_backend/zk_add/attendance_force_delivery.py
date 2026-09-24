@@ -12,6 +12,7 @@ import httpx
 from sqlalchemy import select
 
 from zk_add.attendance_force_release import delivery_payload, explain
+from zk_add.attendance_legacy_uid import matches_original, potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
 from zk_add.attendance_repair import _identity_digest, _ords_request, _protected_digest
 from zk_add.crypto import decrypt_json
@@ -117,6 +118,28 @@ async def verify(claim):
     return classification, token
 
 
+async def verify_legacy(claim):
+    """Find an already stored original; never authorize a new Oracle insert."""
+    response = await _ords_request("raw-captures/identity-repairs/check", payload=claim["check"])
+    rows = response.get("results")
+    if response.get("success") is not True or not isinstance(rows, list) or len(rows) != 1:
+        return "UNKNOWN", None, None
+    row = rows[0]
+    if not isinstance(row, dict) or row.get("event_uid") != claim["payload"]["event_uid"]:
+        return "UNKNOWN", None, None
+    classification = row.get("classification")
+    if classification == "LEGACY_SOURCE_MATCH":
+        token, original = row.get("current_content_token"), row.get("matched_event_uid")
+        if not re.fullmatch(r"[0-9a-f]{64}", token or "") or not matches_original(
+            claim["payload"]["event_uid"], original
+        ):
+            return "UNKNOWN", None, None
+        return classification, token, original
+    if classification in {"LEGACY_SOURCE_MISSING", "LEGACY_SOURCE_CONFLICT", "LEGACY_SOURCE_AMBIGUOUS"}:
+        return classification, None, None
+    return "UNKNOWN", None, None
+
+
 def still_authorized(claim):
     with session_scope() as session:
         row = session.get(OrdsOutbox, claim["row_id"])
@@ -132,7 +155,7 @@ def still_authorized(claim):
         )
 
 
-def persist_result(claim, classification, token=None, error_code=None):
+def persist_result(claim, classification, token=None, error_code=None, matched_event_uid=None):
     with session_scope() as session:
         row = session.scalar(
             select(OrdsOutbox).where(OrdsOutbox.id == claim["row_id"]).with_for_update()
@@ -148,11 +171,19 @@ def persist_result(claim, classification, token=None, error_code=None):
         ):
             return
         item = session.get(AttendanceRecoveryItem, decision.item_id)
-        if classification == "MATCH":
+        if classification == "LEGACY_SOURCE_MATCH" and not (
+            claim["direct"] and matches_original(event.event_uid, matched_event_uid)
+            and re.fullmatch(r"[0-9a-f]{64}", token or "")
+        ):
+            classification = "UNKNOWN"
+        if classification in {"MATCH", "LEGACY_SOURCE_MATCH"}:
             now = utc_now()
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
-            event.oracle_confirmation_path = "ADD_FORCE_CONTENT_CHECK"
+            event.oracle_confirmation_path = (
+                "ADD_FORCE_LEGACY_SOURCE_CHECK" if classification == "LEGACY_SOURCE_MATCH"
+                else "ADD_FORCE_CONTENT_CHECK"
+            )
             row.next_attempt_at = row.last_error = None
             row.last_http_status = 200
             item.result = {
@@ -160,9 +191,14 @@ def persist_result(claim, classification, token=None, error_code=None):
                 "oracle_verified_payload_digest": decision.payload_digest,
                 "oracle_content_token": token,
                 "oracle_verified_at": now.isoformat(),
-                "reason": "Oracle confirmed the approved attendance.",
+                "reason": (
+                    "Oracle confirmed the matching original punch already stored there."
+                    if classification == "LEGACY_SOURCE_MATCH" else "Oracle confirmed the approved attendance."
+                ),
                 "needs_attention": False,
             }
+            if classification == "LEGACY_SOURCE_MATCH":
+                item.result = {**item.result, "matched_oracle_event_uid": matched_event_uid}
             item.error_code = None
             item.status, item.completed_at = "CONFIRMED", now
         elif classification in {
@@ -176,6 +212,19 @@ def persist_result(claim, classification, token=None, error_code=None):
             row.next_attempt_at, row.last_error = None, code
             item.status, item.error_code = "NEEDS_REVIEW", code
             item.result = {**item.result, "reason": explain(code)}
+        elif classification in {"LEGACY_SOURCE_MISSING", "LEGACY_SOURCE_CONFLICT", "LEGACY_SOURCE_AMBIGUOUS"}:
+            row.status = event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
+            row.next_attempt_at, row.last_error = None, classification
+            item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", classification, utc_now()
+            item.result = {
+                **item.result,
+                "reason": (
+                    "No matching original punch was found in Oracle. This damaged ID was not sent."
+                    if classification == "LEGACY_SOURCE_MISSING" else
+                    "Oracle has a different or ambiguous punch. Nothing was sent; review is required."
+                ),
+                "needs_attention": True,
+            }
         elif classification == "INVALID_EVENT_UID":
             now = utc_now()
             row.status = event.ords_status = "QUARANTINED_INVALID_EVENT_UID"
@@ -235,9 +284,14 @@ async def deliver_forced(claims, *, concurrency):
 
     async def one(claim):
         classification, token, code = "UNKNOWN", None, None
+        matched_event_uid = None
         async with semaphore:
             try:
-                if not event_uid_is_valid(claim["payload"].get("event_uid")):
+                uid = claim["payload"].get("event_uid")
+                if claim["direct"] and potentially_recoverable(uid):
+                    classification, token, matched_event_uid = await verify_legacy(claim)
+                    should_send = False
+                elif not event_uid_is_valid(uid):
                     classification = "INVALID_EVENT_UID"
                     should_send = False
                 else:
@@ -276,6 +330,6 @@ async def deliver_forced(claims, *, concurrency):
                 classification = "UNKNOWN"
                 # Only controlled error codes; no response bodies or identities in logs.
                 code = getattr(exc, "code", "ORACLE_CONTENT_VERIFICATION_PENDING")
-            await asyncio.to_thread(persist_result, claim, classification, token, code)
+            await asyncio.to_thread(persist_result, claim, classification, token, code, matched_event_uid)
 
     await asyncio.gather(*(one(claim) for claim in claims))

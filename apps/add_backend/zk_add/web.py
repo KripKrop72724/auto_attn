@@ -35,7 +35,7 @@ from zk_add import APP_VERSION
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
-from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
+from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest
@@ -611,6 +611,23 @@ def get_direct_ords_items(
 ):
     db, _context = auth
     return direct_ords.items_page(db, _direct_ords_job(db, job_id), cursor=cursor, limit=limit)
+
+
+@app.post("/api/v2/attendance-direct-ords/{job_id}/recheck", status_code=202)
+def recheck_direct_ords_legacy(
+    job_id: str,
+    body: DirectOrdsRecheckRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    job = _direct_ords_job(db, job_id)
+    try:
+        direct_ords.recheck_legacy(db, job, actor=context.username)
+        db.flush()
+        return direct_ords.serialize(db, job)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
 
 
 @app.post("/api/v2/attendance-force-releases", status_code=202)

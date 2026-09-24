@@ -15,3 +15,8 @@ class DirectOrdsStartRequest(BaseModel):
         if any(value < 1 for value in self.event_ids) or len(set(self.event_ids)) != len(self.event_ids):
             raise ValueError("Select distinct saved punches.")
         return self
+
+
+class DirectOrdsRecheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: SecretStr = Field(min_length=1, max_length=512)
