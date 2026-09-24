@@ -1318,10 +1318,16 @@ async def confirm_device_terminal_binding(
             status_code=409,
             detail="The authenticated connector has not reported a terminal serial.",
         )
-    if zkt.terminal_binding_state != "SERIAL_CONFIRMATION_REQUIRED":
+    migrated_binding_without_pin = (
+        zkt.terminal_binding_state == "CONFIRMED"
+        and not zkt.expected_serial
+        and zkt.confirmed_serial == zkt.serial
+        and zkt.serial_confirmed_by == "MIGRATED_PREEXISTING"
+    )
+    if zkt.terminal_binding_state != "SERIAL_CONFIRMATION_REQUIRED" and not migrated_binding_without_pin:
         raise HTTPException(
             status_code=409,
-            detail="This terminal is not awaiting initial serial confirmation.",
+            detail="This terminal is not awaiting serial confirmation.",
         )
     if body.observed_serial != zkt.serial:
         raise HTTPException(

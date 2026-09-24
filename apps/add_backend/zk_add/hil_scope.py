@@ -50,4 +50,5 @@ def target_matches(target: HilTarget, connector: Any) -> bool:
         and terminal.serial == target.terminal_serial
         and terminal.confirmed_serial == target.terminal_serial
         and terminal.expected_serial == target.terminal_serial
+        and terminal.terminal_binding_state == "CONFIRMED"
     )

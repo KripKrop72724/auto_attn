@@ -15,7 +15,7 @@ def connector():
         active=True, is_spare=False, connector_id="connector-1",
         hardware_id="a4:cb:8f:d4:66:01", display_name="same name",
         zkt_device=SimpleNamespace(serial="terminal-1", expected_serial="terminal-1",
-                                  confirmed_serial="terminal-1"),
+                                  confirmed_serial="terminal-1", terminal_binding_state="CONFIRMED"),
     )
 
 
@@ -49,6 +49,12 @@ def test_matching_requires_all_connector_evidence(field, value):
 def test_replaced_or_unconfirmed_terminal_cannot_receive_candidate(field):
     device = connector()
     setattr(device.zkt_device, field, "replacement")
+    assert not target_matches(parse_hil_targets([target()])[0], device)
+
+
+def test_pending_terminal_pin_cannot_receive_candidate():
+    device = connector()
+    device.zkt_device.terminal_binding_state = "PENDING_DEVICE_ACK"
     assert not target_matches(parse_hil_targets([target()])[0], device)
 
 
@@ -89,7 +95,8 @@ def hil_session(monkeypatch, tmp_path):
             )
             row.zkt_device = ZKTDevice(serial=target(i)["terminal_serial"],
                                       expected_serial=target(i)["terminal_serial"],
-                                      confirmed_serial=target(i)["terminal_serial"])
+                                      confirmed_serial=target(i)["terminal_serial"],
+                                      terminal_binding_state="CONFIRMED")
             session.add(row)
             devices.append(row)
         session.flush()

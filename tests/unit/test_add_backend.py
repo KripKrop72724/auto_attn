@@ -5619,6 +5619,53 @@ def test_admin_can_confirm_initial_terminal_serial_without_provisioning_session(
     assert audit.outcome == "WAITING_FOR_DEVICE"
 
 
+@pytest.mark.parametrize(
+    ("confirmed_by", "confirmed_serial", "expected_status"),
+    [
+        ("MIGRATED_PREEXISTING", SERIAL, 202),
+        ("OTHER_CONFIRMATION", SERIAL, 409),
+        ("MIGRATED_PREEXISTING", "DIFFERENT_TERMINAL", 409),
+    ],
+)
+def test_admin_can_repin_only_matching_migrated_terminal_binding(
+    db: Session, confirmed_by: str, confirmed_serial: str, expected_status: int,
+):
+    connector = connector_fixture(db, expected_serial=None)
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.serial = SERIAL
+    zkt.confirmed_serial = confirmed_serial
+    zkt.terminal_binding_state = "CONFIRMED"
+    zkt.serial_confirmed_by = confirmed_by
+    zkt.certification_state = "CERTIFIED"
+    raw_session, admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(
+        f"/api/v1/devices/{connector.connector_id}/terminal-binding/confirm",
+        json={"observed_serial": SERIAL, "password": "correct-password",
+              "idempotency_key": "migrated-terminal-repin-0001"},
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 202:
+        assert response.json()["command"]["type"] == "PIN_TERMINAL_SERIAL"
+        assert zkt.expected_serial == SERIAL
+        assert zkt.terminal_binding_state == "PENDING_DEVICE_ACK"
+        assert zkt.certification_state == "READ_ONLY"
+    else:
+        assert zkt.expected_serial is None
+        assert zkt.terminal_binding_state == "CONFIRMED"
+
+
 def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
     db: Session,
 ):

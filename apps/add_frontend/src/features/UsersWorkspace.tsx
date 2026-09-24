@@ -238,6 +238,10 @@ function TerminalSerialConfirmationDialog({
   toast: ReturnType<typeof useToast>
 }) {
   const serial = device.zkt?.serial || ''
+  const migratedBindingWithoutPin = device.zkt?.terminal_binding_state === 'CONFIRMED'
+    && !device.zkt.expected_serial
+    && device.zkt.confirmed_serial === serial
+    && device.zkt.serial_confirmed_by === 'MIGRATED_PREEXISTING'
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -273,8 +277,8 @@ function TerminalSerialConfirmationDialog({
   return (
     <Dialog
       titleId="confirm-terminal-serial-title"
-      title="Confirm physical terminal"
-      description="Authorize this one-time terminal binding with your ADD administrator password."
+      title={migratedBindingWithoutPin ? 'Verify migrated terminal binding' : 'Confirm physical terminal'}
+      description="Authorize the observed terminal serial with your ADD administrator password."
       onClose={onClose}
     >
       <form className="dialog-body terminal-confirmation-dialog" onSubmit={(event) => { event.preventDefault(); void confirm() }}>
@@ -293,7 +297,7 @@ function TerminalSerialConfirmationDialog({
         </div>
         <div className="terminal-confirmation-copy">
           <Icon name="alert" />
-          <p>Confirm only if this serial belongs to the physical terminal at <strong>{device.zone_name}</strong>. User editing unlocks after the ESP stores the serial, acknowledges it, and completes the existing safety checks.</p>
+          <p>Confirm only if this serial belongs to the terminal at <strong>{device.zone_name}</strong>. The ESP must store and acknowledge the serial before the binding can be used for HIL. User editing resumes after the existing safety checks.</p>
         </div>
         {!device.connected && <div className="message pattern-waiting"><Icon name="refresh" /><span>The ADD device is offline. Keep it powered and connected; this authorization remains queued for up to 10 minutes.</span></div>}
         <label>ADD administrator password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" autoFocus /></label>
@@ -580,10 +584,18 @@ export function UsersView({
   }
 
   const baseWritable = Boolean(selected?.zkt?.snapshot_complete && (selected.zkt.certification_state === 'CERTIFIED' || (selected.firmware_family === 'hikvision' && selected.zkt.certification_state === 'PROFILE_PILOT')))
+  const migratedBindingWithoutPin = Boolean(
+    selected?.zkt?.serial
+    && selected.zkt.terminal_binding_state === 'CONFIRMED'
+    && !selected.zkt.expected_serial
+    && selected.zkt.confirmed_serial === selected.zkt.serial
+    && selected.zkt.serial_confirmed_by === 'MIGRATED_PREEXISTING',
+  )
   const terminalBindingNeedsAction = Boolean(
     selected?.zkt?.serial
     && (selected.zkt.terminal_binding_state === 'SERIAL_CONFIRMATION_REQUIRED'
-      || ['TERMINAL_SERIAL_CONFIRMATION_REQUIRED', 'TERMINAL_SERIAL_PIN_FAILED'].includes(selected.zkt.writes_disabled_reason || '')),
+      || ['TERMINAL_SERIAL_CONFIRMATION_REQUIRED', 'TERMINAL_SERIAL_PIN_FAILED'].includes(selected.zkt.writes_disabled_reason || '')
+      || migratedBindingWithoutPin),
   )
   const terminalBindingPending = Boolean(
     selected?.zkt?.terminal_binding_state === 'PENDING_DEVICE_ACK'
