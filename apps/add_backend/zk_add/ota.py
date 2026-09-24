@@ -479,6 +479,25 @@ def _campaign_scope(
         # classifier above already rejects every non-target connector.
         eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
         if len(eligible) != 1:
+            if ordered_target is not None:
+                target_row = next(
+                    (row for row in connectors if row.connector_id == ordered_target.connector_id),
+                    None,
+                )
+                if target_row is None:
+                    raise ValueError(
+                        "HIL campaign requires exactly one eligible connector with the target MAC; "
+                        "the exact target is not active in this zone."
+                    )
+                exclusion = next(
+                    (reason for row, reason in excluded if row.id == target_row.id),
+                    None,
+                )
+                if exclusion:
+                    raise ValueError(
+                        "HIL campaign requires exactly one eligible connector with the target MAC; "
+                        f"target exclusion: {exclusion}."
+                    )
             raise ValueError("HIL campaign requires exactly one eligible connector with the target MAC.")
     return release, connectors, eligible, excluded
 
