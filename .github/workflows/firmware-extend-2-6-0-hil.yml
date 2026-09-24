@@ -1,0 +1,86 @@
+name: Extend signed ZKT HIL scope to Swat and Peshawar
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type EXTEND-2.6.0-HIL to append the reviewed exact devices
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: zone-lite-hil-scope-extension
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the exact reviewed confirmation and green main commit
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = 'EXTEND-2.6.0-HIL'
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" > /tmp/hil-extension-checks.json
+          python3 - <<'PYCODE'
+          import json
+          checks = json.load(open('/tmp/hil-extension-checks.json'))['check_runs']
+          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'frontend', 'containers'):
+              matching = [row for row in checks if row['name'] == name and row['app']['slug'] == 'github-actions']
+              if not matching or max(matching, key=lambda row: row['id'])['conclusion'] != 'success':
+                  raise SystemExit(f'Exact main commit is not green: {name}')
+          PYCODE
+
+  extend:
+    needs: provenance
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    env:
+      ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preflight both immutable signed releases before changing either marker
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'Production firmware store is not configured' }
+          $targets = Get-Content -LiteralPath 'deploy/add/hil-targets-2.6.0.json' -Raw | ConvertFrom-Json
+          $old = ConvertTo-Json -InputObject @($targets[0..1]) -Depth 5 -Compress
+          $new = ConvertTo-Json -InputObject @($targets) -Depth 5 -Compress
+          $releases = @(
+            @{version='2.5.4'; git='883382b36538fe842131cad705c85ee6345bc7f3'; image='eeaebe8f1a3e9349f27ff9a69d469b35c81705807cf855dd369171626627c7a0'; application='228fd0d7be4cdad785dbf95fce2ca6e25db55506f89b041d7888b17b962f6c95'},
+            @{version='2.6.0'; git='0bcf5cbf9333aba6f0bdadfc58c53ce4e07e3b9a'; image='cb748044c5d0c6723c3ad176680b6d5ad2c72168dcbdeb1ef4d78473b8baa41e'; application='6deffc07c870cc5ca32e77544e93dec494fd2a71f775980384917ae4238f27cd'}
+          )
+          foreach ($release in $releases) {
+            ./deploy/add/extend-ordered-hil-scope.ps1 `
+              -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+              -Version $release.version `
+              -ExpectedGitSha $release.git `
+              -ExpectedImageSha256 $release.image `
+              -ExpectedApplicationSha256 $release.application `
+              -ExistingTargetsJson $old `
+              -ExtendedTargetsJson $new `
+              -PreviewOnly
+          }
+          foreach ($release in $releases) {
+            ./deploy/add/extend-ordered-hil-scope.ps1 `
+              -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+              -Version $release.version `
+              -ExpectedGitSha $release.git `
+              -ExpectedImageSha256 $release.image `
+              -ExpectedApplicationSha256 $release.application `
+              -ExistingTargetsJson $old `
+              -ExtendedTargetsJson $new
+          }
