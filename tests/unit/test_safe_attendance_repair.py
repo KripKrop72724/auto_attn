@@ -19,9 +19,9 @@ from zk_add.models import (
     OrdsOutbox,
 )
 from zk_add.schemas import UserSnapshotRequest, UserSnapshotRow
-from zk_add.service import replace_user_snapshot
+from zk_add.service import enrich_undelivered_attendance, replace_user_snapshot
 from zk_add.settings import settings
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import ensure_utc, utc_now
 
 
 @pytest.fixture()
@@ -264,6 +264,107 @@ def test_per_employee_history_survives_unrelated_user_change(store):
             )
             == 1
         )
+
+
+def test_card_policy_transition_preserves_only_fingerprint_bound_gap_events(store):
+    sessions, connector_id, uid = store
+    before_at = utc_now() + timedelta(seconds=1)
+    after_at = before_at + timedelta(seconds=20)
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        name = "Correct Name-3520212345671"
+        replace_user_snapshot(
+            db,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="card-policy-before",
+                reason="CREDENTIAL_POLICY_BEFORE",
+                observed_at=before_at,
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name=name, privilege=0, card=12345,
+                    terminal_identity_fingerprint="a" * 64,
+                    terminal_state_fingerprint="c" * 64,
+                )],
+            ),
+        )
+        replace_user_snapshot(
+            db,
+            connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="card-policy-after",
+                reason="CREDENTIAL_POLICY_AFTER",
+                observed_at=after_at,
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name=name, privilege=0, card=0,
+                    terminal_identity_fingerprint="b" * 64,
+                    terminal_state_fingerprint="d" * 64,
+                )],
+            ),
+        )
+        db.flush()
+        histories = db.scalars(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.fingerprint.is_not(None),
+        ).order_by(AttendanceIdentityHistory.id)).all()
+        old = next(row for row in histories if row.fingerprint == "a" * 64)
+        new = next(row for row in histories if row.fingerprint == "b" * 64)
+        assert old.closed and new.closed is False
+        assert ensure_utc(old.observed_until) == after_at
+        assert ensure_utc(new.observed_from) == before_at
+        event.device_event_time = before_at + timedelta(seconds=10)
+        event.identity_terminal_fingerprint = "a" * 64
+        assert identity_evidence(db, event, connector).fingerprint == "a" * 64
+        event.ords_status = "PENDING"
+        event.manual_release_required = False
+        assert enrich_undelivered_attendance(
+            db, zkt=connector.zkt_device, user=user
+        ) == 0
+        assert event.ords_status == "PENDING"
+        assert event.identity_terminal_fingerprint == "a" * 64
+        event.identity_terminal_fingerprint = "b" * 64
+        assert identity_evidence(db, event, connector).fingerprint == "b" * 64
+        event.identity_terminal_fingerprint = None
+        assert identity_evidence(db, event, connector) is None
+        event.identity_terminal_fingerprint = "f" * 64
+        assert identity_evidence(db, event, connector) is None
+
+
+def test_card_policy_transition_rejects_roster_change(store):
+    sessions, connector_id, uid = store
+    before_at = utc_now() + timedelta(seconds=1)
+    after_at = before_at + timedelta(seconds=20)
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        name = "Correct Name-3520212345671"
+        replace_user_snapshot(
+            db, connector=connector, snapshot=UserSnapshotRequest(
+                snapshot_id="changed-roster-before", reason="CREDENTIAL_POLICY_BEFORE",
+                observed_at=before_at,
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name=name, card=12345,
+                    terminal_identity_fingerprint="a" * 64,
+                    terminal_state_fingerprint="c" * 64,
+                )],
+            ),
+        )
+        replace_user_snapshot(
+            db, connector=connector, snapshot=UserSnapshotRequest(
+                snapshot_id="changed-roster-after", reason="CREDENTIAL_POLICY_AFTER",
+                observed_at=after_at,
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name="Changed Name-3520212345671", card=0,
+                    terminal_identity_fingerprint="b" * 64,
+                    terminal_state_fingerprint="d" * 64,
+                )],
+            ),
+        )
+        db.flush()
+        event.device_event_time = before_at + timedelta(seconds=10)
+        event.identity_terminal_fingerprint = "a" * 64
+        assert identity_evidence(db, event, connector) is None
 
 
 def test_check_batches_have_no_legacy_preview_limit(store, monkeypatch):

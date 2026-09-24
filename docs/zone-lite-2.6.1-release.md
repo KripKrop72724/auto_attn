@@ -14,21 +14,28 @@ on session start and every hour, only after a recent NTP sample. It verifies
 the terminal clock by rereading it and sends `ZKT_TIME_SYNC_OK`,
 `ZKT_TIME_SYNC_DEFERRED`, or `ZKT_TIME_SYNC_FAILED` to ADD's device logs.
 
-## Blocking credential work
+## PIN and card policy
 
 **Do not sign, publish, or campaign this image yet.** The protected signing
-script explicitly rejects ZKT 2.6.1 while this work is incomplete. The current ZKT user
-record parser exposes password and card fields, but has no validated way to
-enumerate or remove palm templates or verify all per-user authentication modes
-on the G3, SilkBio-101TC/ID, and MB40-VL/ID terminals. The terminal identity
-fingerprint intentionally includes the card value. Clearing a nonzero card
-would therefore change the fingerprint used to match attendance events and
-could strand previously captured events in identity quarantine. A verified
-ADD/firmware transition for that identity change and terminal-model-specific
-readback tests are required before enabling the cleanup for every user,
-including administrators and users without biometrics. The required cadence
-is startup and hourly; the terminal user record must remain while non-biometric
-credentials are removed and face/fingerprint templates remain usable.
+script explicitly rejects ZKT 2.6.1 while this work is incomplete. This
+release's credential policy covers terminal PIN/password and card attendance
+for every user, including administrators and users without biometrics. It does
+not claim to remove palm templates or disable other terminal methods. The
+terminal identity fingerprint includes the card value, so a verified
+ADD/firmware transition is needed to preserve attendance identity evidence
+when a nonzero card is removed. The firmware now checks the complete raw user
+table on startup and hourly, sends an acknowledged pre-write ADD snapshot,
+clears only PIN and card bytes, refreshes the terminal's active user cache,
+and compares every raw record before and after each write. It then sends an
+acknowledged stable post-write snapshot. It leaves
+user records intact; biometric preservation still needs physical confirmation
+on each model. ADD retains the old and new card fingerprints across a bounded
+transition, but only a captured fingerprint can disambiguate a punch in the
+write window. A held punch without that proof remains held for review. The
+ADD change must be deployed before firmware rollout. A missing pre-write ADD
+acknowledgment defers writes and causes a session retry; offline enforcement
+needs HIL validation before release. Each terminal model needs a card and
+fingerprint canary before wider rollout.
 
 ### G3 disposable-user evidence, 24 September 2026
 
@@ -36,18 +43,13 @@ On the authenticated SLICTOWER 3FL G3, a single operator-created disposable
 user had one fingerprint template and a PIN. A user-scoped raw 72-byte record
 write cleared its PIN while retaining the other record bytes. Readback found
 the PIN absent, the fingerprint template hash unchanged, and all 167 other
-user records byte-for-byte unchanged. This is protocol evidence for the known
-password field on **one G3**. Physical fingerprint/PIN verification and deletion
-of the disposable user are pending. The firmware's
+user records byte-for-byte unchanged. The operator physically confirmed that
+the PIN no longer works and the fingerprint still works. The disposable user
+was then deleted; readback again found all 167 other records unchanged. This
+is protocol and physical evidence for the known PIN field on **one G3**. The firmware's
 [`zkt_credential_record` helper](../firmware/zone_lite/main/zkt_credential_record.c)
 encodes the 28/72-byte PIN and card offsets and rejects other record sizes;
-it is not yet scheduled to run.
-
-The national inventory includes uFace800 Plus/ID. [ZKTeco's uFace800 Plus
-datasheet](https://www.zkteco-ea.com/wp-content/uploads/2023/04/uFace800-Plus-1.pdf)
-lists palm templates, so the G3 result cannot qualify palm removal on that
-model. The firmware needs a verified per-user palm read/delete/readback path
-and a disposable palm canary before nationwide promotion.
+the startup/hourly enforcement calls it for every user, including admins.
 
 ## Qualification after the credential work lands
 
@@ -60,9 +62,9 @@ and a disposable palm canary before nationwide promotion.
    report. Close or cancel old active Peshawar campaigns through ADD before a
    new campaign.
 3. For each model, test a user with face and fingerprint, a user with only one
-   of them, a user with no biometric, and an administrator. Verify PIN/password,
-   card, palm (where supported), and other non-biometric methods are gone on
-   startup and after an hourly cycle; verify face and fingerprint still work.
+   of them, a user with no biometric, and an administrator. Verify PIN/password
+   and card attendance are disabled on startup and after an hourly cycle;
+   verify face and fingerprint still work.
    Check ADD identity continuity, terminal user and punch counts, held events,
    ORDS delivery, and a known employee punch.
 4. Require a green main SHA, physical canary, protected signing, immutable

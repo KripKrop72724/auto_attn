@@ -2,6 +2,7 @@
 #include "uid_cache.h"
 #include "storage_upgrade.h"
 #include "zkt_clock.h"
+#include "zkt_credential_record.h"
 #include "worker_retry.h"
 #include <errno.h>
 #include <ctype.h>
@@ -141,6 +142,7 @@
 #define CMD_EXIT 1001
 #define CMD_RESTART 1004
 #define CMD_AUTH 1102
+#define CMD_REFRESHDATA 1013
 #define CMD_FREE_DATA 1502
 #define CMD_READ_WITH_BUFFER 1503
 #define CMD_READ_BUFFER_CHUNK 1504
@@ -187,6 +189,7 @@
 // capture.  Live punches and explicit ADD refresh commands still perform
 // immediate identity verification.
 #define ZONE_LITE_USER_INTEGRITY_INTERVAL_MS (15 * 60 * 1000)
+#define ZONE_LITE_CREDENTIAL_POLICY_INTERVAL_MS (60 * 60 * 1000)
 #ifndef ZONE_LITE_ORDS_BULK_CHUNK_SIZE
 #define ZONE_LITE_ORDS_BULK_CHUNK_SIZE 100
 #endif
@@ -439,6 +442,7 @@ typedef struct {
     uint32_t card;
     char group_id[8];
     uint8_t record_size;
+    uint8_t raw_record[72];
     char terminal_identity_fingerprint[65];
     char terminal_state_fingerprint[65];
 } zkt_user_t;
@@ -2276,6 +2280,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
             snprintf(u->group_id, sizeof(u->group_id), "%u", p[21]);
             snprintf(u->user_id, sizeof(u->user_id), "%lu", (unsigned long)read_le32(p + 24));
             u->record_size = 28;
+            memcpy(u->raw_record, p, 28);
             set_terminal_user_fingerprints(u, p, 28);
             parse_machine_identity(u);
             p += 28;
@@ -2290,6 +2295,7 @@ static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int3
             copy_zk_string(u->group_id, sizeof(u->group_id), p + 40, 7);
             copy_zk_string(u->user_id, sizeof(u->user_id), p + 48, 24);
             u->record_size = 72;
+            memcpy(u->raw_record, p, 72);
             set_terminal_user_fingerprints(u, p, 72);
             parse_machine_identity(u);
             p += 72;
@@ -2602,7 +2608,10 @@ static bool zk_refresh_users_stable(
     return true;
 }
 
-static bool add_send_user_snapshot(const user_table_t *users)
+static bool add_send_user_snapshot_reason(
+    const user_table_t *users,
+    const char *reason,
+    bool acknowledged)
 {
     cJSON *payload = cJSON_CreateObject();
     if (!payload) return false;
@@ -2618,7 +2627,7 @@ static bool add_send_user_snapshot(const user_table_t *users)
     cJSON_AddStringToObject(payload, "snapshot_id", snapshot_id);
     cJSON_AddBoolToObject(payload, "complete", users->complete);
     cJSON_AddBoolToObject(payload, "stable", true);
-    cJSON_AddStringToObject(payload, "reason", "VERIFIED_TERMINAL_READ");
+    cJSON_AddStringToObject(payload, "reason", reason);
     cJSON_AddStringToObject(payload, "observed_at", observed);
     char state_hash[65] = {0};
     if (user_table_state_hash(users, state_hash)) {
@@ -2650,7 +2659,9 @@ static bool add_send_user_snapshot(const user_table_t *users)
     }
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
-    bool ok = json && add_connector_send_payload("user_snapshot", json);
+    bool ok = json && (acknowledged
+        ? add_connector_send_payload_acknowledged("user_snapshot", json, 60000)
+        : add_connector_send_payload("user_snapshot", json));
     ESP_LOGI(
         TAG,
         "ADD user snapshot users=%u bytes=%u sanitized_fields=%u sent=%s",
@@ -2660,6 +2671,207 @@ static bool add_send_user_snapshot(const user_table_t *users)
         ok ? "true" : "false");
     free(json);
     return ok;
+}
+
+static bool add_send_user_snapshot(const user_table_t *users)
+{
+    return add_send_user_snapshot_reason(users, "VERIFIED_TERMINAL_READ", false);
+}
+
+/* Re-read the entire raw table before and after each write. A matching UID
+ * alone is insufficient: a terminal-side edit between reads must never be
+ * overwritten with a stale user record. */
+typedef struct {
+    uint16_t uid;
+    uint16_t row;
+} zk_credential_row_index_t;
+
+static int zk_credential_row_compare(const void *left, const void *right)
+{
+    const zk_credential_row_index_t *a = left;
+    const zk_credential_row_index_t *b = right;
+    return (a->uid > b->uid) - (a->uid < b->uid);
+}
+
+static bool zk_credential_policy_table_matches(
+    int sock,
+    zk_context_t *ctx,
+    const user_table_t *baseline,
+    const zk_credential_row_index_t *index,
+    const bool *written)
+{
+    if (!baseline || !index || !written || !baseline->complete ||
+        (baseline->record_size != 28 && baseline->record_size != 72)) return false;
+    uint8_t *data = NULL;
+    size_t len = 0;
+    if (!zk_read_buffer(
+            sock, ctx, CMD_USERTEMP_RRQ, FCT_USER,
+            ZKT_BUFFER_CHUNK_BYTES, &data, &len) || len < 4) {
+        free(data);
+        return false;
+    }
+    const uint32_t total = read_le32(data);
+    const size_t size = baseline->record_size;
+    bool ok = total == len - 4 && total == baseline->count * size;
+    bool *seen = ok ? calloc(baseline->count ? baseline->count : 1, sizeof(bool)) : NULL;
+    if (ok && !seen) ok = false;
+    for (size_t offset = 4; ok && offset < len; offset += size) {
+        const uint16_t uid = read_le16(data + offset);
+        zk_credential_row_index_t key = {.uid = uid, .row = 0};
+        const zk_credential_row_index_t *match = bsearch(
+            &key, index, baseline->count, sizeof(*index), zk_credential_row_compare);
+        if (!match || seen[match->row]) {
+            ok = false;
+            break;
+        }
+        const size_t row = match->row;
+        seen[row] = true;
+        const zkt_user_t *user = &baseline->rows[row];
+        uint8_t expected[72];
+        zkt_credential_fields_t fields;
+        if (user->record_size != size ||
+            !zkt_credential_record_clear(user->raw_record, size, expected, &fields) ||
+            memcmp(data + offset, written[row] ? expected : user->raw_record, size) != 0) {
+            ok = false;
+        }
+    }
+    for (size_t index = 0; ok && index < baseline->count; ++index) {
+        if (!seen[index]) ok = false;
+    }
+    free(seen);
+    free(data);
+    return ok;
+}
+
+static bool zk_refresh_terminal_user_cache(int sock, zk_context_t *ctx)
+{
+    uint8_t rx[1024];
+    zk_response_t response = {0};
+    return zk_send_command(
+        sock, ctx, CMD_REFRESHDATA, NULL, 0,
+        rx, sizeof(rx), &response) && response.code == CMD_ACK_OK;
+}
+
+static bool zk_enforce_credential_policy(
+    int sock,
+    zk_context_t *ctx,
+    user_table_t *users,
+    int32_t user_count)
+{
+    if (!users || !users->complete || user_count < 0 ||
+        users->count != (size_t)user_count ||
+        (users->count > 0 &&
+         users->record_size != 28 && users->record_size != 72)) {
+        add_connector_log("ERROR", "users", "ZKT_CREDENTIAL_POLICY_FAILED",
+            "Complete supported terminal user table is required before PIN/card enforcement.");
+        return false;
+    }
+    size_t pin_count = 0;
+    size_t card_count = 0;
+    for (size_t i = 0; i < users->count; ++i) {
+        uint8_t cleared[72];
+        zkt_credential_fields_t fields;
+        if (!zkt_credential_record_clear(
+                users->rows[i].raw_record, users->record_size, cleared, &fields)) return false;
+        pin_count += fields.pin_present ? 1 : 0;
+        card_count += fields.card_present ? 1 : 0;
+    }
+    if (users->count == 0) {
+        add_connector_log("INFO", "users", "ZKT_CREDENTIAL_POLICY_OK",
+            "Terminal user table is empty; no PIN or card credentials exist.");
+        return true;
+    }
+    bool *written = calloc(users->count, sizeof(bool));
+    zk_credential_row_index_t *index = calloc(users->count, sizeof(*index));
+    if (!written || !index) {
+        free(written);
+        free(index);
+        return false;
+    }
+    for (size_t i = 0; i < users->count; ++i) {
+        index[i].uid = (uint16_t)strtoul(users->rows[i].uid, NULL, 10);
+        index[i].row = (uint16_t)i;
+    }
+    qsort(index, users->count, sizeof(*index), zk_credential_row_compare);
+    for (size_t i = 1; i < users->count; ++i) {
+        if (index[i - 1].uid == index[i].uid) {
+            free(written);
+            free(index);
+            add_connector_log("ERROR", "users", "ZKT_CREDENTIAL_POLICY_FAILED",
+                "Duplicate terminal UID prevents safe PIN/card enforcement.");
+            return false;
+        }
+    }
+    bool ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);
+    if (pin_count == 0 && card_count == 0) {
+        ok = ok && zk_refresh_terminal_user_cache(sock, ctx);
+        free(written);
+        free(index);
+        add_connector_log(ok ? "INFO" : "ERROR", "users",
+            ok ? "ZKT_CREDENTIAL_POLICY_OK" : "ZKT_CREDENTIAL_POLICY_FAILED",
+            ok ? "Terminal user table has no PIN or card credentials; no writes needed."
+               : "Terminal user table changed before PIN/card audit completed.");
+        return ok;
+    }
+    ok = ok &&
+        add_send_user_snapshot_reason(users, "CREDENTIAL_POLICY_BEFORE", true);
+    size_t writes = 0;
+    for (size_t i = 0; ok && i < users->count; ++i) {
+        uint8_t cleared[72];
+        zkt_credential_fields_t fields;
+        const zkt_user_t *user = &users->rows[i];
+        ok = zkt_credential_record_clear(
+            user->raw_record, users->record_size, cleared, &fields);
+        if (!ok) break;
+        if (!fields.pin_present && !fields.card_present) continue;
+        ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);
+        if (!ok) break;
+        uint8_t rx[1024];
+        zk_response_t response = {0};
+        ok = zk_send_command(
+            sock, ctx, CMD_USER_WRQ, cleared, users->record_size,
+            rx, sizeof(rx), &response) && response.code == CMD_ACK_OK;
+        if (!ok) break;
+        written[i] = true;
+        ++writes;
+        ok = zk_refresh_terminal_user_cache(sock, ctx);
+        if (!ok) break;
+        ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);
+    }
+    if (ok) {
+        ok = zk_credential_policy_table_matches(sock, ctx, users, index, written);
+    }
+    /* A partial write is still a changed identity state. Publish its stable
+     * truth if possible before the session reconnects and retries. */
+    if (writes > 0) {
+        char state_hash[65] = {0};
+        bool refreshed = zk_refresh_users_stable(sock, ctx, users, user_count, state_hash);
+        bool final_clean = refreshed && users->count == (size_t)user_count;
+        for (size_t i = 0; final_clean && i < users->count; ++i) {
+            uint8_t cleared[72];
+            zkt_credential_fields_t fields;
+            final_clean = zkt_credential_record_clear(
+                users->rows[i].raw_record, users->record_size, cleared, &fields) &&
+                !fields.pin_present && !fields.card_present;
+        }
+        bool published = refreshed && add_send_user_snapshot_reason(
+            users, "CREDENTIAL_POLICY_AFTER", true);
+        ok = ok && refreshed && final_clean && published;
+    }
+    free(written);
+    free(index);
+    if (!ok) {
+        add_connector_log("ERROR", "users", "ZKT_CREDENTIAL_POLICY_FAILED",
+            "PIN/card enforcement or readback failed; session will retry without claiming completion.");
+        return false;
+    }
+    char message[160];
+    snprintf(message, sizeof(message),
+        "Verified PIN/card removal: users=%u PIN=%u card=%u writes=%u",
+        (unsigned)users->count, (unsigned)pin_count,
+        (unsigned)card_count, (unsigned)writes);
+    add_connector_log("INFO", "users", "ZKT_CREDENTIAL_POLICY_OK", message);
+    return true;
 }
 
 static const zkt_user_t *find_user_by_user_id(const user_table_t *users, const char *user_id)
@@ -8043,6 +8255,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
     if (!zk_refresh_users_stable(sock, &ctx, users, user_count, initial_user_state_hash)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
+    if (!zk_enforce_credential_policy(sock, &ctx, users, user_count)) {
+        zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
+    }
     g_add_zkt.user_record_size = users->record_size;
     add_connector_set_zkt(&g_add_zkt);
     (void)add_connector_consume_connected_edge();
@@ -8064,6 +8279,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
         ZONE_LITE_POST_STABILITY_RECONCILE_GRACE_MS;
     int64_t last_live_register = now_ms;
     int64_t last_user_integrity = now_ms;
+    int64_t last_credential_policy = now_ms;
     int64_t last_time_sample = 0;
     size_t live_events_since_sync = 0;
     bool restarted = false;
@@ -8122,6 +8338,29 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 continue;
             }
             (void)zk_sync_terminal_time(sock, &ctx);
+            add_connector_set_activity("LIVE_CAPTURE");
+        }
+        if (now_ms - last_credential_policy >= ZONE_LITE_CREDENTIAL_POLICY_INTERVAL_MS) {
+            int32_t policy_users = 0;
+            int32_t policy_records = 0;
+            char policy_hash[65] = {0};
+            if (!add_connector_begin_exclusive_activity("ENFORCING_CREDENTIAL_POLICY")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (!zk_get_counts(sock, &ctx, &policy_users, &policy_records) ||
+                !zk_refresh_users_stable(sock, &ctx, users, policy_users, policy_hash) ||
+                !zk_enforce_credential_policy(sock, &ctx, users, policy_users)) {
+                break;
+            }
+            user_count = policy_users;
+            g_add_zkt.user_count = policy_users;
+            g_add_zkt.attendance_count = policy_records;
+            add_connector_set_zkt(&g_add_zkt);
+            (void)recover_blocked_events_from_snapshot(users, NULL);
+            (void)add_send_user_snapshot(users);
+            last_credential_policy = uptime_ms();
+            last_user_integrity = last_credential_policy;
             add_connector_set_activity("LIVE_CAPTURE");
         }
         if (now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
