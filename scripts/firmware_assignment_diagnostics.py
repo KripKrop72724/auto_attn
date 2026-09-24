@@ -93,6 +93,23 @@ def diagnose(campaign_id: str) -> dict:
                     ConnectorNonce.created_at >= utc_now() - timedelta(minutes=5),
                 ))
                 ota = ((latest.payload or {}).get("ota") or {}) if latest else {}
+                diagnostics = ((latest.payload or {}).get("diagnostics") or {}) if latest else {}
+                workers = diagnostics.get("workers") or []
+                worker_summary = []
+                for worker in workers:
+                    if not isinstance(worker, dict) or worker.get("name") not in {
+                        "add_delivery", "ords_delivery", "hikvision_source",
+                    }:
+                        continue
+                    worker_summary.append({
+                        "name": worker.get("name"),
+                        "state": worker.get("state") if worker.get("state") in {
+                            "STOPPED", "FAULT", "WAITING_RESOURCE", "WAITING_NETWORK", "RUNNING",
+                        } else "OTHER",
+                        "restart_attempts": worker.get("restart_attempts")
+                        if isinstance(worker.get("restart_attempts"), int) else None,
+                    })
+                storage = diagnostics.get("storage") or {}
                 clock_offset_seconds = None
                 if latest:
                     clock_sample = (latest.payload or {}).get("_trusted_envelope_sent_at")
@@ -125,6 +142,10 @@ def diagnose(campaign_id: str) -> dict:
                     "other_active_deployment": bool(other_active and other_active.connector_id != connector.id),
                     "latest_telemetry_at": latest.created_at.isoformat() if latest else None,
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
+                    "latest_free_heap_bytes": latest.free_heap if latest else None,
+                    "latest_workers": worker_summary,
+                    "storage_upgrade_ready": storage.get("upgrade_ready"),
+                    "storage_durability": storage.get("durability"),
                     "device_clock_offset_seconds": clock_offset_seconds,
                     "authenticated_requests_last_5m": recent_authenticated_requests,
                     "telemetry_ota_state": ota.get("state"),
