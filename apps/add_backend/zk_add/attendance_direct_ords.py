@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, tuple_
 
 from zk_add.attendance_force_release import _lock_scheduler
+from zk_add.attendance_legacy_uid import potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
 from zk_add.attendance_recovery import RecoveryError, _digest
 from zk_add.attendance_repair import _immutable_facts
@@ -97,7 +98,7 @@ def identity_hints_for_page(session, events):
         _user, _cnic, source, _current_cnic, error = _identity_from_users(
             event, users_by_key.get((event.zkt_device_id, event.user_id), []),
         )
-        if not error and not event_uid_is_valid(event.event_uid):
+        if not error and not (event_uid_is_valid(event.event_uid) or potentially_recoverable(event.event_uid)):
             error = "INVALID_EVENT_UID"
         hints[event.id] = {
             "eligible": error is None,
@@ -161,7 +162,7 @@ def create(session, *, actor: str, request):
             error = "ALREADY_CONFIRMED"
         elif decision_for(session, event) or (outbox and outbox.status == "IN_FLIGHT"):
             error = "ALREADY_DELIVERING"
-        elif not event_uid_is_valid(event.event_uid):
+        elif not (event_uid_is_valid(event.event_uid) or potentially_recoverable(event.event_uid)):
             error = "INVALID_EVENT_UID"
         elif not connector or not terminal:
             error = "SOURCE_MISSING"
@@ -322,7 +323,7 @@ def _observe(session, job):
             decision = decision_for(session, event)
             if decision and item.result.get("oracle_verified_payload_digest") == decision.payload_digest:
                 item.status, item.completed_at = "CONFIRMED", utc_now()
-        elif not event_uid_is_valid(event.event_uid):
+        elif not (event_uid_is_valid(event.event_uid) or potentially_recoverable(event.event_uid)):
             outbox = session.scalar(
                 select(OrdsOutbox)
                 .where(OrdsOutbox.attendance_event_id == event.id)
@@ -381,6 +382,68 @@ def tick():
         advance_once(session)
 
 
+def recheck_legacy(session, job, *, actor: str) -> int:
+    """Reopen only saved direct approvals for read-only Oracle source verification."""
+    from zk_add.attendance_force_release import delivery_payload
+
+    _lock_scheduler(session)
+    if job.action != ACTION:
+        raise RecoveryError("This is not a saved Oracle send run.", "RUN_MISMATCH")
+    count = 0
+    items = session.scalars(
+        select(Item).where(
+            Item.job_id == job.id,
+            Item.status == "NEEDS_REVIEW",
+            Item.error_code == "INVALID_EVENT_UID",
+        ).order_by(Item.id).with_for_update()
+    ).all()
+    for item in items:
+        event = session.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.id == item.attendance_event_id).with_for_update()
+        )
+        if not event or not potentially_recoverable(event.event_uid):
+            continue
+        decision = decision_for(session, event)
+        connector = session.get(Connector, event.connector_id)
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id).with_for_update()
+        )
+        try:
+            approved_payload = decrypt_json(decision.payload_encrypted) if decision else None
+        except Exception:
+            approved_payload = None
+        if (
+            not decision or decision.job_id != job.id or decision.item_id != item.id
+            or decision.proof.get("policy") != POLICY
+            or not connector or _source_digest(event, connector) != decision.proof.get("source_digest")
+            or not outbox or outbox.status != "QUARANTINED_INVALID_EVENT_UID"
+            or event.ords_status != "QUARANTINED_INVALID_EVENT_UID"
+            or event.oracle_confirmed_at is not None
+            or approved_payload is None
+            or delivery_payload(session, event, connector) != approved_payload
+        ):
+            continue
+        outbox.status = event.ords_status = "PENDING"
+        outbox.next_attempt_at = outbox.last_error = None
+        item.status, item.error_code, item.completed_at = "WAITING_ORACLE", None, None
+        item.result = {**item.result, "reason": "Checking the already saved Oracle punch.", "needs_attention": False}
+        item.updated_at = utc_now()
+        count += 1
+    if items and not count:
+        raise RecoveryError(
+            "These saved approvals or punch details changed. No Oracle check was started.",
+            "RECHECK_UNAVAILABLE",
+        )
+    if count:
+        job.status, job.completed_at, job.updated_at = "WAITING_ORACLE", None, utc_now()
+        append_audit(
+            session, actor=actor, action="ATTENDANCE_DIRECT_ORDS_LEGACY_RECHECK",
+            target_type="attendance_recovery_job", target_id=job.job_id,
+            outcome="WAITING_ORACLE", after={"rechecked_count": count},
+        )
+    return count
+
+
 def serialize(session, job):
     counts = dict(session.execute(
         select(Item.status, func.count()).where(Item.job_id == job.id).group_by(Item.status)
@@ -391,6 +454,14 @@ def serialize(session, job):
             select(Item.result).where(Item.job_id == job.id, Item.status == "WAITING_ORACLE")
         ).all()
     )
+    recheckable = sum(
+        potentially_recoverable(uid)
+        for (uid,) in session.execute(
+            select(AttendanceEvent.event_uid)
+            .join(Item, Item.attendance_event_id == AttendanceEvent.id)
+            .where(Item.job_id == job.id, Item.status == "NEEDS_REVIEW", Item.error_code == "INVALID_EVENT_UID")
+        ).all()
+    )
     return {
         "job_id": job.job_id, "status": job.status, "created_at": job.created_at,
         "approved_at": job.scope["approval"]["at"], "actor": job.actor,
@@ -398,6 +469,7 @@ def serialize(session, job):
         "waiting": counts.get("WAITING_ORACLE", 0), "confirmed": counts.get("CONFIRMED", 0),
         "skipped": counts.get("SKIPPED", 0),
         "attention": counts.get("NEEDS_REVIEW", 0) + waiting_attention,
+        "legacy_recheckable": recheckable,
         "completed_at": job.completed_at,
     }
 

@@ -362,7 +362,53 @@ create or replace package body slic_zkt_identity_repair_api as
         l_stored_name hr_raw_attn_capture_events.employee_name%type;
         l_stored_cnic hr_raw_attn_capture_events.cnic%type;
         l_stored_serial hr_raw_attn_capture_events.device_serial%type;
+        l_original_uid hr_raw_attn_capture_events.event_uid%type;
+        l_legacy boolean;
         l_json clob;
+        function legacy_uid_shape(p_uid in varchar2) return boolean is
+            l_first pls_integer := 0;
+            l_last pls_integer := 0;
+            l_bad pls_integer := 0;
+            l_char varchar2(1);
+        begin
+            if p_uid is null or length(p_uid) <> 64 then return false; end if;
+            for i in 1..64 loop
+                l_char := substr(p_uid, i, 1);
+                if instr('0123456789abcdef', l_char) = 0 then
+                    if l_char not in ('?', chr(8), chr(20)) then return false; end if;
+                    if l_first = 0 then l_first := i; end if;
+                    l_last := i;
+                    l_bad := l_bad + 1;
+                end if;
+            end loop;
+            return l_bad between 3 and 4 and l_first >= 25
+                and l_last <= 36 and l_last - l_first <= 3;
+        end legacy_uid_shape;
+
+        function matches_original(p_legacy in varchar2, p_original in varchar2)
+            return boolean is
+            l_first pls_integer := 0;
+            l_last pls_integer := 0;
+            l_differences pls_integer := 0;
+            l_bad pls_integer := 0;
+            l_char varchar2(1);
+        begin
+            if not legacy_uid_shape(p_legacy)
+               or not regexp_like(p_original, '^[0-9a-f]{64}$', 'c') then
+                return false;
+            end if;
+            for i in 1..64 loop
+                l_char := substr(p_legacy, i, 1);
+                if l_char <> substr(p_original, i, 1) then
+                    if l_first = 0 then l_first := i; end if;
+                    l_last := i;
+                    l_differences := l_differences + 1;
+                    if l_char in ('?', chr(8), chr(20)) then l_bad := l_bad + 1; end if;
+                end if;
+            end loop;
+            return l_differences = 4 and l_first >= 25 and l_last <= 36
+                and l_last - l_first = 3 and l_bad >= 3;
+        end matches_original;
     begin
         require_add_auth;
         if json_value(p_body, '$.contract_version') <> c_contract_version then
@@ -399,7 +445,9 @@ create or replace package body slic_zkt_identity_repair_api as
                        )
                    ) j
         ) loop
-            if not regexp_like(item.event_uid, '^[0-9a-f]{64}$', 'c')
+            l_legacy := item.event_uid is null or not regexp_like(item.event_uid, '^[0-9a-f]{64}$', 'c');
+            if item.event_uid is null
+               or (l_legacy and not legacy_uid_shape(item.event_uid))
                or item.device_serial is null
                or item.user_id is null
                or item.event_timestamp is null
@@ -409,40 +457,74 @@ create or replace package body slic_zkt_identity_repair_api as
                or slic_zkt_truth_api.parse_event_timestamp(item.event_timestamp) is null then
                 fail_and_stop(400, 'INVALID_CHECK_ITEM');
             end if;
-            select count(*) into l_count
-              from hr_raw_attn_capture_events
-             where event_uid = item.event_uid;
-            if l_count = 0 then
-                l_classification := 'MISSING';
-                l_token := content_token(item.event_uid);
-            elsif l_count > 1 then
-                l_classification := 'CROSS_DEVICE_UID_COLLISION';
-                l_token := null;
+            l_original_uid := null;
+            l_token := null;
+            if l_legacy then
+                -- A damaged local ID can only confirm an existing Oracle row.
+                -- It can never authorize inserting another copy of the punch.
+                select count(*), min(event_uid) into l_count, l_original_uid
+                  from hr_raw_attn_capture_events
+                 where event_uid like substr(item.event_uid, 1, 24) || '%'
+                   and device_serial = item.device_serial
+                   and user_id = item.user_id
+                   and event_timestamp = slic_zkt_truth_api.parse_event_timestamp(item.event_timestamp)
+                   and raw_punch = item.raw_punch;
+                if l_count = 0 then
+                    l_classification := 'LEGACY_SOURCE_MISSING';
+                elsif l_count > 1 then
+                    l_classification := 'LEGACY_SOURCE_AMBIGUOUS';
+                elsif not matches_original(item.event_uid, l_original_uid) then
+                    l_classification := 'LEGACY_SOURCE_CONFLICT';
+                else
+                    select employee_name, cnic into l_stored_name, l_stored_cnic
+                      from hr_raw_attn_capture_events
+                     where event_uid = l_original_uid;
+                    if nvl(l_stored_name, chr(0)) = nvl(item.employee_name, chr(0))
+                       and l_stored_cnic = item.cnic then
+                        l_classification := 'LEGACY_SOURCE_MATCH';
+                        l_token := content_token(l_original_uid);
+                    else
+                        l_classification := 'LEGACY_SOURCE_CONFLICT';
+                    end if;
+                end if;
             else
-                l_token := content_token(item.event_uid);
-                select employee_name, cnic, device_serial
-                  into l_stored_name, l_stored_cnic, l_stored_serial
+                select count(*) into l_count
                   from hr_raw_attn_capture_events
                  where event_uid = item.event_uid;
-                if l_stored_serial <> item.device_serial then
+                if l_count = 0 then
+                    l_classification := 'MISSING';
+                    l_token := content_token(item.event_uid);
+                elsif l_count > 1 then
                     l_classification := 'CROSS_DEVICE_UID_COLLISION';
-                elsif not immutable_matches(
-                    item.event_uid, item.device_serial, item.user_id,
-                    item.event_timestamp, item.raw_punch
-                ) then
-                    l_classification := 'IMMUTABLE_MISMATCH';
-                elsif nvl(l_stored_name, chr(0)) = nvl(item.employee_name, chr(0))
-                      and l_stored_cnic = item.cnic then
-                    l_classification := 'MATCH';
                 else
-                    l_classification := 'MISMATCH';
+                    l_token := content_token(item.event_uid);
+                    select employee_name, cnic, device_serial
+                      into l_stored_name, l_stored_cnic, l_stored_serial
+                      from hr_raw_attn_capture_events
+                     where event_uid = item.event_uid;
+                    if l_stored_serial <> item.device_serial then
+                        l_classification := 'CROSS_DEVICE_UID_COLLISION';
+                    elsif not immutable_matches(
+                        item.event_uid, item.device_serial, item.user_id,
+                        item.event_timestamp, item.raw_punch
+                    ) then
+                        l_classification := 'IMMUTABLE_MISMATCH';
+                    elsif nvl(l_stored_name, chr(0)) = nvl(item.employee_name, chr(0))
+                          and l_stored_cnic = item.cnic then
+                        l_classification := 'MATCH';
+                    else
+                        l_classification := 'MISMATCH';
+                    end if;
                 end if;
             end if;
             l_result := json_object_t();
             l_result.put('event_uid', item.event_uid);
             l_result.put('classification', l_classification);
-            if l_classification in ('MATCH','MISSING','MISMATCH') then
+            if l_classification in ('MATCH','MISSING','MISMATCH','LEGACY_SOURCE_MATCH') then
                 l_result.put('current_content_token', l_token);
+            end if;
+            if l_classification = 'LEGACY_SOURCE_MATCH' then
+                l_result.put('matched_event_uid', l_original_uid);
             end if;
             l_results.append(l_result);
         end loop;

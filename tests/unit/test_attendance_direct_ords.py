@@ -13,6 +13,7 @@ from test_attendance_repair import CORRECT_CNIC, WRONG_CNIC, repair_store as rep
 from zk_add import attendance_direct_ords as direct
 from zk_add import attendance_force_delivery as delivery
 from zk_add import worker
+from zk_add.attendance_legacy_uid import matches_original, potentially_recoverable
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.attendance_recovery import RecoveryError
 from zk_add.crypto import encrypt_cnic
@@ -43,6 +44,120 @@ def source_ready(sessions):
         event.display_name = "Captured employee"
         db.commit()
         return event.id
+
+
+def damaged_uid(original="a" * 64):
+    return original[:32] + "?\x14??" + original[36:]
+
+
+def test_only_one_four_character_legacy_block_can_match_an_original():
+    original = "a" * 64
+    damaged = damaged_uid(original)
+    assert potentially_recoverable(damaged)
+    assert matches_original(damaged, original)
+    assert potentially_recoverable(original[:32] + "b\b??" + original[36:])
+    assert matches_original(original[:32] + "b\b??" + original[36:], original)
+    assert matches_original(original[:24] + "????" + original[28:], original)
+    assert not potentially_recoverable(original[:32] + "?\x14" + original[34:])
+    assert not potentially_recoverable("????" + original[4:])
+    assert not potentially_recoverable(original[:25] + "?" + original[26:34] + "??" + original[36:])
+    assert not matches_original(damaged, "b" + original[1:])
+
+
+def test_damaged_legacy_uid_verifies_existing_oracle_row_without_post(store, monkeypatch):
+    sessions, _connector_id, _uid = store
+    event_id = source_ready(sessions)
+    original = "a" * 64
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        event.event_uid = damaged_uid(original)
+        db.commit()
+        assert direct.identity_hints_for_page(db, [event])[event_id]["eligible"] is True
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    _normal, forced = delivery.split_claims(worker.claim_ords_batch(1))
+    assert len(forced) == 1
+    calls = []
+
+    async def checked(path, *, payload):
+        calls.append(path)
+        assert payload["items"][0]["event_uid"] == damaged_uid(original)
+        return {"success": True, "results": [{
+            "event_uid": damaged_uid(original), "classification": "LEGACY_SOURCE_MATCH",
+            "matched_event_uid": original, "current_content_token": "c" * 64,
+        }]}
+
+    monkeypatch.setattr(delivery, "_ords_request", checked)
+    asyncio.run(delivery.deliver_forced(forced, concurrency=1))
+    assert calls == ["raw-captures/identity-repairs/check"]
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        item = db.scalar(select(Item))
+        assert event.event_uid == damaged_uid(original)
+        assert event.ords_status == "ACKED_CHECK"
+        assert event.oracle_confirmation_path == "ADD_FORCE_LEGACY_SOURCE_CHECK"
+        assert item.status == "CONFIRMED"
+        assert item.result["matched_oracle_event_uid"] == original
+
+
+@pytest.mark.parametrize("classification", [
+    "LEGACY_SOURCE_MISSING", "LEGACY_SOURCE_CONFLICT", "LEGACY_SOURCE_AMBIGUOUS",
+])
+def test_damaged_legacy_uid_never_inserts_when_oracle_cannot_match(store, monkeypatch, classification):
+    sessions, _connector_id, _uid = store
+    event_id = source_ready(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).event_uid = damaged_uid()
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    _normal, forced = delivery.split_claims(worker.claim_ords_batch(1))
+
+    async def checked(_path, *, payload):
+        return {"success": True, "results": [{
+            "event_uid": payload["items"][0]["event_uid"], "classification": classification,
+        }]}
+
+    monkeypatch.setattr(delivery, "_ords_request", checked)
+    asyncio.run(delivery.deliver_forced(forced, concurrency=1))
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "QUARANTINED_INVALID_EVENT_UID"
+        assert event.oracle_confirmed_at is None
+        assert db.scalar(select(Item)).error_code == classification
+
+
+def test_saved_legacy_approval_can_be_rechecked_idempotently(store):
+    sessions, _connector_id, _uid = store
+    event_id = source_ready(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).event_uid = damaged_uid()
+        job = direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    _normal, forced = delivery.split_claims(worker.claim_ords_batch(1))
+    delivery.persist_result(forced[0], "INVALID_EVENT_UID")
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        job = db.get(Job, job.id)
+        assert job.status == "COMPLETED_WITH_REVIEW"
+        assert direct.recheck_legacy(db, job, actor="operator") == 1
+        assert direct.recheck_legacy(db, job, actor="operator") == 0
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING"
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        assert db.get(Job, job.id).status == "WAITING_ORACLE"
 
 
 def test_identity_conflict_is_approved_and_queued_without_rewriting_source(store):

@@ -401,7 +401,7 @@ describe('Live attendance workspace', () => {
     await screen.findByRole('article', { name: /Bilal Ahmed/i })
     fireEvent.click(screen.getByLabelText('Select loaded punches'))
     fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
-    expect(screen.getByRole('dialog').textContent).toMatch(/unknown current users, missing CNICs, and older punch IDs Oracle cannot accept are skipped/i)
+    expect(screen.getByRole('dialog').textContent).toMatch(/older damaged punch IDs are checked against records already in Oracle/i)
     fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Verified by administrator' } })
     fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve and send 2 punches' }))
@@ -413,6 +413,34 @@ describe('Live attendance workspace', () => {
     expect(body.reason).toBe('Verified by administrator')
     expect(body.idempotency_key).toMatch(/^direct-ords:/)
     expect(window.location.search).toContain('direct_run=saved-direct-run')
+  })
+
+  it('rechecks a saved damaged-ID run without offering another Oracle insert', async () => {
+    window.history.replaceState(null, '', '/attendance?direct_run=saved-direct-run')
+    const finished = {
+      job_id: 'saved-direct-run', status: 'COMPLETED_WITH_REVIEW', created_at: '2026-08-12T09:00:00Z',
+      actor: 'operator', selected: 5, ready: 0, waiting: 0, confirmed: 0, skipped: 0,
+      attention: 5, legacy_recheckable: 5,
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/saved-direct-run/recheck') && init?.method === 'POST') {
+        return response({ ...finished, status: 'WAITING_ORACLE', waiting: 5, attention: 0, legacy_recheckable: 0 }, 202)
+      }
+      if (path.endsWith('/saved-direct-run')) return response(finished)
+      if (path.includes('/saved-direct-run/items')) return response({ rows: [], next_cursor: null })
+      return response({ rows: [event()], next_cursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Check 5 punches already in Oracle' }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog.textContent).toMatch(/will not insert another Oracle punch/i)
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Check Oracle records' }))
+    await screen.findByText('Waiting for Oracle')
+    const call = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/saved-direct-run/recheck') && init?.method === 'POST')
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ password: 'test-password' })
   })
 
   it('keeps the original hold visible beside the downstream-verified release state', async () => {
