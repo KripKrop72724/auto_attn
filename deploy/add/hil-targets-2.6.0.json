@@ -1,0 +1,27 @@
+[
+  {
+    "connector_id": "4567587c-29ee-4e59-92a4-6c36650a84aa",
+    "mac": "e0:72:a1:d6:3c:7c",
+    "terminal_serial": "PGB1261200077"
+  },
+  {
+    "connector_id": "2ca9a4c2-5ae4-4330-8d14-840223672897",
+    "mac": "a4:cb:8f:d4:66:64",
+    "terminal_serial": "PGB1261200074"
+  },
+  {
+    "connector_id": "ef1b6fe9-592b-4cf3-95e7-9c6b600f7812",
+    "mac": "ac:27:6e:a5:47:64",
+    "terminal_serial": "AEXH232260005"
+  },
+  {
+    "connector_id": "bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e",
+    "mac": "e0:72:a1:d7:05:c4",
+    "terminal_serial": "CJH9211060009"
+  },
+  {
+    "connector_id": "233dac02-eb1b-4598-a876-e3a7b1ecfd54",
+    "mac": "e0:72:a1:d5:08:a0",
+    "terminal_serial": "CJH9211060002"
+  }
+]
