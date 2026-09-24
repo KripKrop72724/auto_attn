@@ -24,18 +24,20 @@ not claim to remove palm templates or disable other terminal methods. The
 terminal identity fingerprint includes the card value, so a verified
 ADD/firmware transition is needed to preserve attendance identity evidence
 when a nonzero card is removed. The firmware now checks the complete raw user
-table on startup and hourly, sends an acknowledged pre-write ADD snapshot,
+table on startup and hourly, attempts an acknowledged pre-write ADD snapshot,
 clears only PIN and card bytes, refreshes the terminal's active user cache,
 and compares every raw record before and after each write. It then sends an
-acknowledged stable post-write snapshot. It leaves
+acknowledged stable post-write snapshot when ADD is available. It leaves
 user records intact; biometric preservation still needs physical confirmation
 on each model. ADD retains the old and new card fingerprints across a bounded
 transition, but only a captured fingerprint can disambiguate a punch in the
 write window. A held punch without that proof remains held for review. The
-ADD change must be deployed before firmware rollout. A missing pre-write ADD
-acknowledgment defers writes and causes a session retry; offline enforcement
-needs HIL validation before release. Each terminal model needs a card and
-fingerprint canary before wider rollout.
+ADD change must be deployed before firmware rollout. If ADD is offline, the
+firmware still removes PIN/card credentials and verifies the terminal state;
+it logs deferred identity continuity and resends the current snapshot on
+reconnect. Attendance lacking sufficient retained identity proof stays held
+for review. Offline/reconnect behavior needs HIL validation before release.
+Each terminal model needs a card and fingerprint canary before wider rollout.
 
 ### G3 disposable-user evidence, 24 September 2026
 
@@ -50,6 +52,13 @@ is protocol and physical evidence for the known PIN field on **one G3**. The fir
 [`zkt_credential_record` helper](../firmware/zone_lite/main/zkt_credential_record.c)
 encodes the 28/72-byte PIN and card offsets and rejects other record sizes;
 the startup/hourly enforcement calls it for every user, including admins.
+
+A second disposable G3 user had a card, PIN, and fingerprint that all worked
+before the write. A scoped 72-byte record write cleared PIN and card bytes;
+readback after reconnect found both absent, fingerprint template slot 7
+unchanged, and all 167 other user records byte-for-byte unchanged. The
+operator physically confirmed that only the fingerprint still works. The
+disposable user was deleted, again leaving every other record unchanged.
 
 ## Qualification after the credential work lands
 

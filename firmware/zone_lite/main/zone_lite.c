@@ -2813,8 +2813,12 @@ static bool zk_enforce_credential_policy(
                : "Terminal user table changed before PIN/card audit completed.");
         return ok;
     }
-    ok = ok &&
-        add_send_user_snapshot_reason(users, "CREDENTIAL_POLICY_BEFORE", true);
+    bool before_published = ok && add_send_user_snapshot_reason(
+        users, "CREDENTIAL_POLICY_BEFORE", true);
+    if (ok && !before_published) {
+        add_connector_log("WARN", "users", "ZKT_CREDENTIAL_IDENTITY_DEFERRED",
+            "ADD did not acknowledge the pre-write user snapshot; PIN/card removal proceeds and any ambiguous attendance remains held.");
+    }
     size_t writes = 0;
     for (size_t i = 0; ok && i < users->count; ++i) {
         uint8_t cleared[72];
@@ -2856,7 +2860,11 @@ static bool zk_enforce_credential_policy(
         }
         bool published = refreshed && add_send_user_snapshot_reason(
             users, "CREDENTIAL_POLICY_AFTER", true);
-        ok = ok && refreshed && final_clean && published;
+        if (refreshed && !published) {
+            add_connector_log("WARN", "users", "ZKT_CREDENTIAL_IDENTITY_DEFERRED",
+                "ADD did not acknowledge the post-write user snapshot; the verified terminal state will be sent again on reconnect.");
+        }
+        ok = ok && refreshed && final_clean;
     }
     free(written);
     free(index);
@@ -8359,6 +8367,8 @@ static int64_t gateway_run(uint32_t host_order_ip)
             add_connector_set_zkt(&g_add_zkt);
             (void)recover_blocked_events_from_snapshot(users, NULL);
             (void)add_send_user_snapshot(users);
+            if (!zk_register_attlog_events(sock, &ctx, true)) break;
+            last_live_register = uptime_ms();
             last_credential_policy = uptime_ms();
             last_user_integrity = last_credential_policy;
             add_connector_set_activity("LIVE_CAPTURE");
