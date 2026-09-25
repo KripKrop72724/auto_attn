@@ -134,7 +134,8 @@ def start_run(
             worker.get("state") not in {"RUNNING", "WAITING_NETWORK"}
             or tick is None
             or telemetry.uptime_seconds is None
-            or not 0 <= telemetry.uptime_seconds * 1000 - tick <= 90000
+            # Uptime is sampled before the diagnostics and rounded to seconds.
+            or not -5_000 <= telemetry.uptime_seconds * 1000 - tick <= 90_000
         ):
             raise ValueError("Delivery workers are not healthy and fresh")
     queues = diagnostics.get("queues") or []
