@@ -1179,15 +1179,20 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     if (s_identity_catalog_stage_file_ok) {
         FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
         bool file_ok = file != NULL;
+        if (!file_ok) s_catalog_writer_failure_reason = "stage_append_open_failed";
         cJSON_ArrayForEach(row, rows) {
             if (file_ok && !write_encrypted_json_line(file, row)) {
                 file_ok = false;
             }
         }
-        if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+        if (file_ok && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+            s_catalog_writer_failure_reason = "stage_sync_failed";
             file_ok = false;
         }
-        if (file && fclose(file) != 0) file_ok = false;
+        if (file && fclose(file) != 0) {
+            if (file_ok) s_catalog_writer_failure_reason = "stage_close_failed";
+            file_ok = false;
+        }
         if (!file_ok) {
             s_identity_catalog_stage_file_ok = false;
             (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -1220,6 +1225,9 @@ static bool identity_catalog_stage_commit_locked(
         s_identity_catalog_stage_rows == s_identity_catalog_stage_expected;
     bool persisted = ok && s_identity_catalog_stage_file_ok &&
         activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    if (ok && s_identity_catalog_stage_file_ok && !persisted) {
+        s_catalog_writer_failure_reason = "catalog_activation_failed";
+    }
     bool memory_ready = ok &&
         (s_identity_catalog_stage_expected == 0 ||
          (s_identity_catalog_stage_aliases != NULL &&
