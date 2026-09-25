@@ -25,10 +25,12 @@ def test_startup_retries_do_not_reboot_or_recreate_healthy_capture(tmp_path, hik
 #define ESP_LOGE(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
 #define LED_STATUS_LOCAL_FAILURE 1
+#define LED_STATUS_ZKT_FAILURE 2
+#define LED_STATUS_ORDS_FAILURE 3
 typedef void *TaskHandle_t;
 static jmp_buf done;
 static uint32_t now,stop_at;
-static unsigned gateway_attempts,ords_attempts,capture_ticks,faults,reported_attempts;
+static unsigned gateway_attempts,ords_attempts,capture_ticks,faults,local_faults,reported_attempts;
 static bool gateway_created,ords_created,ords_always_fails,first_fails;
 #if !ZONE_LITE_HIKVISION
 #define GATEWAY_STACK_BYTES 24576U
@@ -65,7 +67,7 @@ static bool g_queue_store_ready=true;
 static bool qs_init(void){return true;}
 bool qs_recover_step(void){return true;}
 bool qs_verify_persistence(void){return true;}
-static void led_status_fault(int state){assert(state==1);++faults;}
+static void led_status_fault(int state){assert(state>=1 && state<=3);++faults;if(state==LED_STATUS_LOCAL_FAILURE)++local_faults;}
 static void vTaskDelay(unsigned ms){if(gateway_created)++capture_ticks;now+=ms;if(now>=stop_at)longjmp(done,1);}
 static void launch(void)
 {
@@ -77,22 +79,22 @@ int main(void)
 #if ZONE_LITE_HIKVISION
     assert(gateway_attempts==1 && ords_attempts==0 && capture_ticks==600 && faults==0);
 #else
-    assert(gateway_attempts==1 && ords_attempts==3 && capture_ticks==600 && reported_attempts==3 && faults==600);
+    assert(gateway_attempts==1 && ords_attempts==3 && capture_ticks==600 && reported_attempts==3 && faults==600 && local_faults==0);
 #endif
-    now=gateway_attempts=ords_attempts=capture_ticks=faults=reported_attempts=0;
+    now=gateway_attempts=ords_attempts=capture_ticks=faults=local_faults=reported_attempts=0;
     gateway_created=ords_created=ords_always_fails=false;first_fails=true;stop_at=700000;
     if(!setjmp(done))launch();
 #if ZONE_LITE_HIKVISION
     assert(gateway_attempts==2 && ords_attempts==0 && capture_ticks==699 && faults==1);
 #else
-    assert(gateway_attempts==2 && ords_attempts==2 && capture_ticks==699 && reported_attempts==2 && faults==1);
+    assert(gateway_attempts==2 && ords_attempts==2 && capture_ticks==699 && reported_attempts==2 && faults==2 && local_faults==0);
     // A fragmented heap can reject a dynamic ORDS stack. Early caller-owned
     // stacks must still start both workers without entering the fault state.
-    now=gateway_attempts=ords_attempts=capture_ticks=faults=reported_attempts=0;
+    now=gateway_attempts=ords_attempts=capture_ticks=faults=local_faults=reported_attempts=0;
     gateway_created=ords_created=first_fails=false;ords_always_fails=true;
     worker_stacks_reserved=true;stop_at=60000;
     if(!setjmp(done))launch();
-    assert(gateway_attempts==1 && ords_attempts==1 && capture_ticks==60 && reported_attempts==1 && faults==0);
+    assert(gateway_attempts==1 && ords_attempts==1 && capture_ticks==60 && reported_attempts==1 && faults==0 && local_faults==0);
 #endif
     return 0;
 }
