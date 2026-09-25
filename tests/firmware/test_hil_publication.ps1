@@ -312,7 +312,7 @@ if (-not $rejected) { throw 'Partial 2.6.8 HIL scope accepted' }
 $zkt268Marker = Get-Content -LiteralPath (Join-Path $store '2.6.8/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt268Marker.targets.Count -ne 5 -or $zkt268Marker.application_sha256 -cne ('e'*64)) { throw '2.6.8 HIL marker is incomplete' }
 # Queue read contention remains retryable while the same five exact terminals stay quarantined.
-. (Join-Path $repo 'deploy/add/firmware-2-6-8-hil-scope.ps1')
+. (Join-Path $repo 'deploy/add/firmware-2-6-9-hil-scope.ps1')
 $exact269 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.9.json') -Raw
 Assert-Zkt269HilScope -HilTargetsJson $exact269
 foreach ($scope in @('', '[]', '{', $targets)) {
