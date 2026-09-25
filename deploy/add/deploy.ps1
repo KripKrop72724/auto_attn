@@ -203,7 +203,8 @@ function Assert-OrdsAuthentication {
     param(
         [Parameter(Mandatory = $true)][string] $BaseUrl,
         [Parameter(Mandatory = $true)][string] $Username,
-        [Parameter(Mandatory = $true)][string] $Password
+        [Parameter(Mandatory = $true)][string] $Password,
+        [switch] $AllowUnavailable
     )
 
     $probeEventUid = "7f19a5f6c2d038b37cd20d91d18df7282d27b673a90170ce21c3e44a9bf4be21"
@@ -228,6 +229,10 @@ function Assert-OrdsAuthentication {
         $status = $null
         if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
             $status = [int]$_.Exception.Response.StatusCode
+        }
+        if ($AllowUnavailable -and $status -in @(502, 503, 504)) {
+            Write-Warning "Oracle membership endpoint returned HTTP $status. Unchanged credentials will be checked when ORDS recovers; attendance remains queued."
+            return
         }
         if ($status) {
             throw "Oracle membership authentication failed with HTTP $status."
@@ -300,6 +305,8 @@ function Assert-OrdsRepairAuthentication {
 }
 
 function Assert-OrdsContainerAuthentication {
+    param([switch] $AllowUnavailable)
+
     $probe = @'
 import json
 import os
@@ -324,6 +331,9 @@ try:
         status = response.status
         payload = json.load(response)
 except urllib.error.HTTPError as exc:
+    if os.environ.get("ADD_DEPLOY_ALLOW_ORDS_5XX") == "1" and exc.code in (502, 503, 504):
+        print("ORDS_AUTH_DEGRADED")
+        sys.exit(0)
     print(f"ORDS_AUTH_HTTP_{exc.code}")
     sys.exit(1)
 except Exception as exc:
@@ -373,10 +383,17 @@ print("ORDS_AUTH_OK")
 '@
     $probeEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
     $probeLauncher = "import base64;exec(base64.b64decode('$probeEncoded'))"
+    $allowUnavailableValue = if ($AllowUnavailable) { "1" } else { "0" }
     $result = Invoke-Docker -Arguments ($compose + @(
-        "exec", "-T", "add-api", "python", "-c", $probeLauncher
+        "exec", "-T", "-e", "ADD_DEPLOY_ALLOW_ORDS_5XX=$allowUnavailableValue",
+        "add-api", "python", "-c", $probeLauncher
     )) -Capture
-    if (@($result -split "\r?\n") -notcontains "ORDS_AUTH_OK") {
+    $probeLines = @($result -split "\r?\n")
+    if ($probeLines -contains "ORDS_AUTH_DEGRADED" -and $AllowUnavailable) {
+        Write-Warning "Oracle membership endpoint is unavailable from the ADD container. Attendance remains queued."
+        return
+    }
+    if ($probeLines -notcontains "ORDS_AUTH_OK") {
         throw "Authenticated Oracle membership probe failed inside the ADD container."
     }
     Write-Host "Authenticated Oracle membership probe passed inside the ADD container."
@@ -650,10 +667,32 @@ if ($environment["ADD_FIRMWARE_PUBLIC_BASE_URL"] -ne "https://autoattn.slichealt
 if ($environment["ADD_ORDS_BASE_URL"] -ne "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event") {
     throw "ADD_ORDS_BASE_URL must use the validated internal production raw attendance capture endpoint."
 }
+$stateRoot = if ($env:ADD_DEPLOY_STATE_DIR) {
+    $env:ADD_DEPLOY_STATE_DIR
+} else {
+    Join-Path $env:ProgramData "StateLife\AttendanceDeviceDashboard"
+}
+$priorEnvironmentPath = Join-Path (Join-Path $stateRoot "config") "add.env"
+$allowDegradedOrds = $false
+if (
+    $environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -ne "true" -and
+    (Test-Path -LiteralPath $priorEnvironmentPath -PathType Leaf)
+) {
+    $priorEnvironment = Get-EnvironmentMap -Path $priorEnvironmentPath
+    $allowDegradedOrds = (
+        $priorEnvironment.ContainsKey("ADD_ORDS_BASE_URL") -and
+        $priorEnvironment.ContainsKey("ADD_ORDS_USERNAME") -and
+        $priorEnvironment.ContainsKey("ADD_ORDS_PASSWORD") -and
+        $priorEnvironment["ADD_ORDS_BASE_URL"] -ceq $environment["ADD_ORDS_BASE_URL"] -and
+        $priorEnvironment["ADD_ORDS_USERNAME"] -ceq $environment["ADD_ORDS_USERNAME"] -and
+        $priorEnvironment["ADD_ORDS_PASSWORD"] -ceq $environment["ADD_ORDS_PASSWORD"]
+    )
+}
 Assert-OrdsAuthentication `
     -BaseUrl $environment["ADD_ORDS_BASE_URL"] `
     -Username $environment["ADD_ORDS_USERNAME"] `
-    -Password $environment["ADD_ORDS_PASSWORD"]
+    -Password $environment["ADD_ORDS_PASSWORD"] `
+    -AllowUnavailable:$allowDegradedOrds
 if ($environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -eq "true") {
     Assert-OrdsRepairAuthentication `
         -BaseUrl $environment["ADD_ORDS_BASE_URL"] `
@@ -661,11 +700,6 @@ if ($environment["ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -eq "true") {
         -Password $environment["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"]
 }
 
-$stateRoot = if ($env:ADD_DEPLOY_STATE_DIR) {
-    $env:ADD_DEPLOY_STATE_DIR
-} else {
-    Join-Path $env:ProgramData "StateLife\AttendanceDeviceDashboard"
-}
 $backupRoot = Join-Path $stateRoot "backups"
 $configRoot = Join-Path $stateRoot "config"
 $releaseRoot = Join-Path $stateRoot "releases"
@@ -752,7 +786,7 @@ try {
         Invoke-Docker -Arguments ($compose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "240"))
         Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
         Wait-Endpoint -Uri "http://127.0.0.1:8095/health/ui"
-        Assert-OrdsContainerAuthentication
+        Assert-OrdsContainerAuthentication -AllowUnavailable:$allowDegradedOrds
         $postRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
         if (-not $postRevision) { throw "Alembic schema revision is unavailable after deployment." }
 

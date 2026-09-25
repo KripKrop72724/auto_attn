@@ -47,3 +47,17 @@ def test_add_deploy_requires_authenticated_ords_probes() -> None:
     assert "must not reuse the connector/fleet Oracle credential" in deploy
     assert "ORDS_AUTH_OK" in deploy
     assert '-notcontains "ORDS_AUTH_OK"' in deploy
+
+
+def test_add_deploy_only_tolerates_ords_outage_with_unchanged_credentials() -> None:
+    deploy = (ROOT / "deploy" / "add" / "deploy.ps1").read_text(encoding="utf-8")
+
+    assert '$status -in @(502, 503, 504)' in deploy
+    assert 'exc.code in (502, 503, 504)' in deploy
+    assert 'ADD_ATTENDANCE_REPAIR_PREVIEW_ENABLED"] -ne "true"' in deploy
+    for setting in ("ADD_ORDS_BASE_URL", "ADD_ORDS_USERNAME", "ADD_ORDS_PASSWORD"):
+        assert (
+            f'$priorEnvironment["{setting}"] -ceq $environment["{setting}"]'
+            in deploy
+        )
+    assert '-AllowUnavailable:$allowDegradedOrds' in deploy

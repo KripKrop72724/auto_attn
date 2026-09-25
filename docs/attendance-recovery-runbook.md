@@ -68,3 +68,10 @@ OpenAPI contract check, migration smoke test, frontend build and bundle budget,
 and the production deployment health probes. If a job reports state drift,
 identity hold, or source review, leave the item preserved and create a new
 preview after the underlying evidence has been reviewed.
+
+During a production release, an ORDS HTTP 502, 503, or 504 can be treated as a
+temporary delivery outage only when the protected prior release has the same
+ORDS endpoint and credentials and repair preview is disabled. The host and
+container probes still reject authorization errors and invalid responses.
+Attendance stays in the durable retry queue until ORDS recovers; verify the
+queue drains before considering the affected punches delivered.
