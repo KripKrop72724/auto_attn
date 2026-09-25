@@ -55,7 +55,9 @@ def _worker_summary(payload: dict) -> list[dict]:
 def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dict:
     """Bounded, credential-free evidence for intermittent worker health alerts."""
     states: Counter[str] = Counter()
+    anomaly_reasons: Counter[str] = Counter()
     anomalies = []
+    state_failures = []
     matched = 0
     for sample in samples:
         payload = sample.payload or {}
@@ -73,10 +75,13 @@ def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dic
             tick = worker.get("last_activity_uptime_ms")
             uptime = sample.uptime_seconds
             delta = uptime * 1000 - tick if isinstance(uptime, int) and isinstance(tick, int) else None
-            if state in {"STOPPED", "FAULT", "WAITING_RESOURCE"} or delta is None or not -999 <= delta <= 90_000:
-                if len(anomalies) < 30:
+            state_failed = state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
+            tick_failed = delta is None or not -999 <= delta <= 90_000
+            if state_failed or tick_failed:
+                anomaly_reasons["worker_state" if state_failed else "tick_range"] += 1
+                if len(anomalies) < 30 or (state_failed and len(state_failures) < 10):
                     operation = worker.get("operation")
-                    anomalies.append({
+                    evidence = {
                         "at": sample.created_at.isoformat(),
                         "worker": name,
                         "state": state,
@@ -88,9 +93,15 @@ def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dic
                         "internal_free_bytes": memory.get("internal_free_bytes"),
                         "internal_largest_block_bytes": memory.get("internal_largest_block_bytes"),
                         "led_state": payload.get("led_state"),
-                    })
+                    }
+                    if state_failed:
+                        if len(state_failures) < 10:
+                            state_failures.append(evidence)
+                    elif len(anomalies) < 30:
+                        anomalies.append(evidence)
     return {"samples_examined": len(samples), "target_version_samples": matched,
-            "worker_states": dict(states), "anomalies": anomalies}
+            "worker_states": dict(states), "anomaly_reasons": dict(anomaly_reasons),
+            "state_failures": state_failures, "anomalies": anomalies}
 
 
 def _health_summary(payload: dict) -> dict:

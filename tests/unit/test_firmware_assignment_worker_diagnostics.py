@@ -31,5 +31,9 @@ def test_recent_worker_evidence_distinguishes_timestamp_skew_from_real_fault():
     assert evidence["target_version_samples"] == 3
     assert evidence["worker_states"] == {"add_delivery:RUNNING": 2, "add_delivery:FAULT": 1}
     assert [(row["state"], row["tick_delta_ms"]) for row in evidence["anomalies"]] == [
-        ("RUNNING", -2500), ("FAULT", 91000),
+        ("RUNNING", -2500),
+    ]
+    assert evidence["anomaly_reasons"] == {"tick_range": 1, "worker_state": 1}
+    assert [(row["state"], row["tick_delta_ms"]) for row in evidence["state_failures"]] == [
+        ("FAULT", 91000),
     ]

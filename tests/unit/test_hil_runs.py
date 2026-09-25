@@ -132,6 +132,11 @@ def test_observation_starts_after_readiness_and_is_idempotent(ready):
     assert not list(ready[0].scalars(select(FirmwareEvent)))
 
 
+def test_observation_accepts_worker_tick_sampled_after_rounded_uptime(ready):
+    ready[-1].payload["diagnostics"]["workers"][0]["last_activity_uptime_ms"] = 102000
+    assert start(ready).status == "OBSERVING"
+
+
 @pytest.mark.parametrize(
     "change",
     [
