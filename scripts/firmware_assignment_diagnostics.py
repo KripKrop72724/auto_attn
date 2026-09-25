@@ -85,6 +85,7 @@ def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dic
                         "at": sample.created_at.isoformat(),
                         "worker": name,
                         "state": state,
+                        "heartbeat_uptime_seconds": uptime,
                         "operation": operation if operation in {
                             "idle", "reading queue", "waiting for acknowledgement",
                             "committing receipt", "allocating delivery buffer",
