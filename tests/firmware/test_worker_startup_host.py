@@ -30,6 +30,16 @@ static jmp_buf done;
 static uint32_t now,stop_at;
 static unsigned gateway_attempts,ords_attempts,capture_ticks,faults,reported_attempts;
 static bool gateway_created,ords_created,ords_always_fails,first_fails;
+#if !ZONE_LITE_HIKVISION
+#define GATEWAY_STACK_BYTES 24576U
+#define ORDS_STACK_BYTES 16384U
+typedef unsigned char StackType_t;
+typedef int StaticTask_t;
+static StackType_t gateway_stack[GATEWAY_STACK_BYTES],ords_stack[ORDS_STACK_BYTES];
+static StackType_t *s_gateway_stack=gateway_stack,*s_ords_stack=ords_stack;
+static StaticTask_t s_gateway_tcb,s_ords_tcb;
+static bool worker_stacks_reserved;
+#endif
 static int64_t uptime_ms(void){return now;}
 static void gateway_task(void *arg){(void)arg;}
 void ords_uploader_task(void *arg){(void)arg;}
@@ -40,6 +50,16 @@ static int xTaskCreate(void (*task)(void *),const char *name,unsigned stack,void
     else{assert(task==ords_uploader_task && !ords_created);++ords_attempts;if(ords_always_fails || (first_fails && ords_attempts==1))return 0;ords_created=true;}
     *handle=(void *)1;return pdPASS;
 }
+#if !ZONE_LITE_HIKVISION
+static TaskHandle_t xTaskCreateStatic(void (*task)(void *),const char *name,unsigned stack,void *arg,unsigned priority,StackType_t *buffer,StaticTask_t *tcb)
+{
+    (void)name;(void)arg;(void)priority;
+    assert(worker_stacks_reserved);
+    if(task==gateway_task){assert(stack==GATEWAY_STACK_BYTES && buffer==s_gateway_stack && tcb==&s_gateway_tcb);++gateway_attempts;assert(!gateway_created);gateway_created=true;}
+    else{assert(task==ords_uploader_task && stack==ORDS_STACK_BYTES && buffer==s_ords_stack && tcb==&s_ords_tcb);++ords_attempts;assert(!ords_created);ords_created=true;}
+    return (void *)1;
+}
+#endif
 void add_connector_report_ords_start(bool started,uint32_t attempts){assert(started==ords_created);reported_attempts=attempts;}
 static bool g_queue_store_ready=true;
 static bool qs_init(void){return true;}
@@ -66,6 +86,13 @@ int main(void)
     assert(gateway_attempts==2 && ords_attempts==0 && capture_ticks==699 && faults==1);
 #else
     assert(gateway_attempts==2 && ords_attempts==2 && capture_ticks==699 && reported_attempts==2 && faults==1);
+    // A fragmented heap can reject a dynamic ORDS stack. Early caller-owned
+    // stacks must still start both workers without entering the fault state.
+    now=gateway_attempts=ords_attempts=capture_ticks=faults=reported_attempts=0;
+    gateway_created=ords_created=first_fails=false;ords_always_fails=true;
+    worker_stacks_reserved=true;stop_at=60000;
+    if(!setjmp(done))launch();
+    assert(gateway_attempts==1 && ords_attempts==1 && capture_ticks==60 && reported_attempts==1 && faults==0);
 #endif
     return 0;
 }
