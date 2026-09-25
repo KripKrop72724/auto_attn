@@ -384,7 +384,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             return "DIRECT_BOOTSTRAP_VERSION_UNQUALIFIED"
         expected_digest = contract["allowed_bootstrap_images"][qualified_version]
         hil_retry = (release.version == "2.6.7" and qualified_version == "2.6.6") or (
-            release.version == "2.6.8" and qualified_version in {"2.6.6", "2.6.7"})
+            release.version == "2.6.8" and qualified_version in {"2.6.6", "2.6.7"}) or (
+            release.version == "2.6.9" and qualified_version in {"2.6.6", "2.6.7", "2.6.8"})
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",

@@ -35,13 +35,13 @@ static bool g_prefer_segmented_ords;
 static int64_t g_segmented_ords_retry_ms;
 static durable_queue_t segmented;
 static dq_checkpoint_t segmented_cp;
-static bool segmented_exists;
+static bool segmented_exists, peek_pending;
 static int segmented_load(void *ctx, dq_checkpoint_t *cp)
 { (void)ctx; *cp=segmented_cp;return segmented_exists; }
 static bool segmented_commit(void *ctx,const dq_checkpoint_t *cp)
 { (void)ctx;segmented_cp=*cp;segmented_exists=true;return true; }
 dq_result_t qs_peek(qs_lane_t lane,void *data,size_t capacity,size_t *length,dq_token_t *token)
-{ assert(lane==QS_ORDS);return dq_peek(&segmented,data,capacity,length,token); }
+{ assert(lane==QS_ORDS);return peek_pending?DQ_PENDING:dq_peek(&segmented,data,capacity,length,token); }
 dq_result_t qs_settle(qs_lane_t lane,const dq_token_t *token)
 { assert(lane==QS_ORDS && !storage_lock);return dq_settle(&segmented,token); }
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth)
@@ -139,6 +139,10 @@ int main(void)
     assert(stat(PENDING_BACKUP_PATH,&st)!=0 && errno==ENOENT);
     assert(stat(PENDING_TMP_PATH,&st)!=0 && errno==ENOENT);
     assert(dq_append(&segmented,"segmented",9)==DQ_OK);
+    unsigned prior_faults=faults;
+    peek_pending=true;
+    assert(!oracle_drain_segmented_slice() && faults==prior_faults && segmented.checkpoint.depth==1);
+    peek_pending=false;g_segmented_ords_retry_ms=0;
     fail_receipt=true;g_prefer_segmented_ords=false;
     prior=requests;oracle_drain_pending(true);
     assert(requests==prior+1 && segmented.checkpoint.depth==1);

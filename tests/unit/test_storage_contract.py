@@ -11,14 +11,16 @@ from zk_add.storage_contract import (COMPAT_MARKER, DIRECT_BASELINES, DIRECT_MAR
                                      DIRECT_BASELINE_IMAGES, RETRY_BASELINES,
                                      RETRY_BASELINE_IMAGES, RETRY_MARKER,
                                      DIAGNOSTIC_BASELINES, DIAGNOSTIC_BASELINE_IMAGES,
-                                     DIAGNOSTIC_MARKER, validate_storage_contract)
+                                     DIAGNOSTIC_MARKER, CONTENTION_BASELINES,
+                                     CONTENTION_BASELINE_IMAGES, CONTENTION_MARKER,
+                                     validate_storage_contract)
 from zk_add.time_utils import utc_now
 
 
 def manifest(version):
-    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8"):
-        baselines = DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
-        images = DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
+    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9"):
+        baselines = CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+        images = CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
         return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.4.12",
                 "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63,
                                   "write_format": 1, "allowed_bootstrap_versions": list(baselines),
@@ -38,7 +40,7 @@ def test_signed_contract_rejects_unqualified_capabilities(field, value):
 
 
 def test_signed_contract_required_for_both_storage_releases():
-    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8"):
+    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9"):
         assert validate_storage_contract(manifest(version), version)
         with pytest.raises(ValueError):
             validate_storage_contract({}, version)
@@ -64,6 +66,8 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert RETRY_MARKER in signing
     assert DIAGNOSTIC_MARKER in firmware
     assert DIAGNOSTIC_MARKER in signing
+    assert CONTENTION_MARKER in firmware
+    assert CONTENTION_MARKER in signing
 
 
 @pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.7.0", None])
@@ -154,6 +158,43 @@ def test_268_accepts_only_signed_hil_predecessors(predecessor_version):
             image_sha256="c" * 64, image_size=1024, signing_key_id="key",
             partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.4.12",
             storage_name="2.6.8.bin", manifest=manifest("2.6.8"),
+            manifest_signature="fixture", state="HIL_ONLY",
+        )
+        connector = Connector(
+            connector_id="swat", hardware_id="ac:27:6e:a5:47:64", zone_id="SWAT",
+            zone_name="Swat", device_id="1", display_name="Swat",
+            firmware_version=predecessor_version, ota_image_sha256=digest,
+            ota_running_partition="ota_1",
+        )
+        session.add_all([predecessor, release, connector])
+        session.flush()
+        assert _storage_predecessor_exclusion(session, release, connector) is None
+        connector.ota_image_sha256 = "d" * 64
+        assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
+        connector.ota_image_sha256 = digest
+        predecessor.state = "REVOKED"
+        assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("predecessor_version", ["2.6.6", "2.6.7", "2.6.8"])
+def test_269_accepts_only_signed_hil_predecessors(predecessor_version):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        digest = CONTENTION_BASELINE_IMAGES[predecessor_version]
+        predecessor = FirmwareRelease(
+            release_id=f"zone-lite-{predecessor_version}", version=predecessor_version,
+            git_sha="a" * 40, image_sha256="b" * 64, image_size=1024,
+            signing_key_id="key", partition_layout="zone-lite-ota-v1",
+            minimum_bootstrap_version="2.4.12", storage_name="predecessor.bin",
+            manifest={"application_sha256": digest}, manifest_signature="fixture", state="HIL_ONLY",
+        )
+        release = FirmwareRelease(
+            release_id="zone-lite-2.6.9", version="2.6.9", git_sha="a" * 40,
+            image_sha256="c" * 64, image_size=1024, signing_key_id="key",
+            partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.4.12",
+            storage_name="2.6.9.bin", manifest=manifest("2.6.9"),
             manifest_signature="fixture", state="HIL_ONLY",
         )
         connector = Connector(

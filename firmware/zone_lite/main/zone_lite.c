@@ -7141,6 +7141,10 @@ static bool oracle_drain_segmented_slice(void)
     dq_token_t token;
     dq_result_t read = qs_peek(QS_ORDS, event, DQ_MAX_RECORD_BYTES, &length, &token);
     if (read == DQ_EMPTY) return false;
+    if (read == DQ_PENDING) {
+        g_segmented_ords_retry_ms = now + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
+        return false;
+    }
     if (read != DQ_OK) {
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
         g_segmented_ords_retry_ms = now + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
