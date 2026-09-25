@@ -3666,7 +3666,8 @@ static void outbox_task(void *arg)
             dq_result_t read = qs_peek(lanes[selected], line, ADD_OUTBOX_LINE_BYTES - 1, &length, &token);
             have_row = read == DQ_OK;
             if (have_row) { line[length] = 0; raw_length = length; }
-            else if (read != DQ_EMPTY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            else if (read != DQ_EMPTY && read != DQ_PENDING)
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
         } else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
             have_row = read_outbox_row_locked(outbox, line, &row_end);
             if (have_row) {

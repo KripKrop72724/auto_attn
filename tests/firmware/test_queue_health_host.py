@@ -26,14 +26,14 @@ static int lane_lock, budget_mutex;
 static int *budget_lock=&budget_mutex;
 static lane_t lanes[QS_COUNT];
 static qs_health_t health;
-static bool generation_ok=true, budget_busy;
+static bool generation_ok=true, budget_busy, lane_busy;
 static dq_result_t injected=DQ_OK;
 static unsigned accesses;
 static int xSemaphoreTake(int *mutex,int timeout)
 { (void)timeout;assert(!*mutex);if(budget_busy)return 0;*mutex=1;return 1; }
 static void xSemaphoreGive(int *mutex) { assert(*mutex);*mutex=0; }
 static bool lock(qs_lane_t lane)
-{ if((unsigned)lane>=QS_COUNT)return false;assert(!lane_lock);lane_lock=1;return true; }
+{ if((unsigned)lane>=QS_COUNT)return false;if(lane_busy)return false;assert(!lane_lock);lane_lock=1;return true; }
 static bool ensure_storage_generation(void) { assert(lane_lock && budget_mutex);return generation_ok; }
 static dq_result_t reopen(lane_t *lane)
 { (void)lane;assert(lane_lock && budget_mutex);return DQ_OK; }
@@ -66,7 +66,13 @@ int main(void)
     assert(qs_peek(QS_LIVE,data,sizeof(data),&size,&token)==DQ_IO);
     assert(qs_settle(QS_LIVE,&token)==DQ_IO && accesses==before);
     generation_ok=true;budget_busy=true;
-    assert(qs_peek(QS_LIVE,data,sizeof(data),&size,&token)==DQ_IO);
+    failures=health.failures;
+    assert(qs_peek(QS_LIVE,data,sizeof(data),&size,&token)==DQ_PENDING);
+    assert(health.failures==failures);
+    budget_busy=false;lane_busy=true;
+    assert(qs_peek(QS_LIVE,data,sizeof(data),&size,&token)==DQ_PENDING);
+    assert(health.failures==failures && !lane_lock && !budget_mutex);
+    lane_busy=false;budget_busy=true;
     assert(qs_settle(QS_LIVE,&token)==DQ_IO && accesses==before);
     assert(!lane_lock && !budget_mutex);
     return 0;

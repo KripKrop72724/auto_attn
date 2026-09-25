@@ -168,7 +168,8 @@ static dq_result_t reopen(lane_t *lane)
  * clear a latched storage fault; only a complete recovery check may do so. */
 static void record_queue_result(dq_result_t result, const char *operation, bool writing)
 {
-    if (result == DQ_OK || result == DQ_EMPTY || result == DQ_STALE || result == DQ_BUFFER_SMALL) return;
+    if (result == DQ_OK || result == DQ_EMPTY || result == DQ_STALE ||
+        result == DQ_BUFFER_SMALL || result == DQ_PENDING) return;
     health.failures++;
     if (result == DQ_FULL) health.admission_rejections++;
     else if (writing) health.write_failures++;
@@ -310,9 +311,14 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
 }
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
 {
-    if (!lock(lane)) return DQ_IO;
+    /* A catalog commit may hold the shared budget lock for longer than this
+     * reader's slice. Contention preserves the queue and must be retried; only
+     * a failed storage operation is evidence of lost local durability. */
+    if (!lock(lane))
+        return (unsigned)lane < QS_COUNT && lanes[lane].mutex ? DQ_PENDING : DQ_IO;
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
+        xSemaphoreGive(lanes[lane].mutex);
+        return budget_lock ? DQ_PENDING : DQ_IO;
     }
     errno = 0;
     dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
