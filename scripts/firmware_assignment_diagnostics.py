@@ -158,6 +158,11 @@ def diagnose(campaign_id: str) -> dict:
                 ota_error = ota.get("last_error")
                 if not isinstance(ota_error, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", ota_error):
                     ota_error = "OTHER_OR_UNAVAILABLE" if ota_error else None
+                ota_counters = {
+                    key: ota.get(key) if isinstance(ota.get(key), int) and 0 <= ota[key] <= 2**32 - 1 else None
+                    for key in ("boot_health_checks", "progress_attempts", "progress_successes")
+                }
+                ota_status = ota.get("progress_last_http_status")
                 summaries.append({
                     "connector_name": connector.display_name,
                     "connector_fingerprint": hashlib.sha256(connector.connector_id.encode()[:120]).hexdigest()[:12],
@@ -193,6 +198,13 @@ def diagnose(campaign_id: str) -> dict:
                     "telemetry_ota_state": ota.get("state"),
                     "telemetry_ota_last_error": ota_error,
                     "telemetry_ota_capable": ota.get("capable"),
+                    "telemetry_ota_boot_health_checks": ota_counters["boot_health_checks"],
+                    "telemetry_ota_boot_health_last_ready": ota.get("boot_health_last_ready")
+                    if isinstance(ota.get("boot_health_last_ready"), bool) else None,
+                    "telemetry_ota_progress_attempts": ota_counters["progress_attempts"],
+                    "telemetry_ota_progress_successes": ota_counters["progress_successes"],
+                    "telemetry_ota_progress_last_http_status": ota_status
+                    if isinstance(ota_status, int) and -1 <= ota_status <= 599 else None,
                 })
             result["deployments"] = summaries
             return result

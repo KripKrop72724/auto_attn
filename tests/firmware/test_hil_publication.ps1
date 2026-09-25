@@ -9,9 +9,9 @@ try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
-foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4')) {
+foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
-    $marker = if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4')) {
+    $marker = if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5')) {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2'
     } else {
         "ZONE_STORAGE_CONTRACT_V1:${mode}:READ=2:LANES=3F:COMPAT=2.5.4"
@@ -19,7 +19,7 @@ foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4')) {
     [IO.File]::WriteAllText($contractImage, $marker + [char]0)
     $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
     if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
-    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4') -and
+    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5') -and
         ($contract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589' -or
          $contract.allowed_bootstrap_images['2.5.2'] -ne '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b')) {
         throw 'Direct predecessor image identities changed'
@@ -188,6 +188,32 @@ if (-not $rejected) { throw 'Partial 2.6.4 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.4 -PublicationMode HIL_ONLY -HilTargetsJson $exact264
 $zkt264Marker = Get-Content -LiteralPath (Join-Path $store '2.6.4/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt264Marker.targets.Count -ne 5 -or $zkt264Marker.application_sha256 -cne ('e'*64)) { throw '2.6.4 HIL marker is incomplete' }
+# The OTA confirmation direct build keeps the same five exact terminals in order.
+. (Join-Path $repo 'deploy/add/firmware-2-6-5-hil-scope.ps1')
+$exact265 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.5.json') -Raw
+Assert-Zkt265HilScope -HilTargetsJson $exact265
+foreach ($scope in @('', '[]', '{', $targets)) {
+    $rejected = $false
+    try { Assert-Zkt265HilScope -HilTargetsJson $scope } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Invalid 2.6.5 HIL scope accepted' }
+}
+$zkt265Image = Join-Path $source 'zone-lite-2.6.5.bin'
+[IO.File]::WriteAllText($zkt265Image, 'ZKT 2.6.5 fixture, not deployable firmware')
+$manifest.version='2.6.5'
+$manifest.release_id='zone-lite-2.6.5'
+$manifest.image_name='zone-lite-2.6.5.bin'
+$manifest.image_sha256=(Get-FileHash $zkt265Image).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $zkt265Image).Length
+[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.5 -PublicationMode AVAILABLE } catch { $rejected = $true }
+if (-not $rejected) { throw 'Direct 2.6.5 production publication accepted' }
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.5 -PublicationMode HIL_ONLY -HilTargetsJson $targets } catch { $rejected = $true }
+if (-not $rejected) { throw 'Partial 2.6.5 HIL scope accepted' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.5 -PublicationMode HIL_ONLY -HilTargetsJson $exact265
+$zkt265Marker = Get-Content -LiteralPath (Join-Path $store '2.6.5/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt265Marker.targets.Count -ne 5 -or $zkt265Marker.application_sha256 -cne ('e'*64)) { throw '2.6.5 HIL marker is incomplete' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

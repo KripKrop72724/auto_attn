@@ -36,6 +36,7 @@
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
+#define OTA_TASK_PRIORITY 5
 
 typedef struct {
     char *data;
@@ -51,6 +52,11 @@ static bool s_journal_ready;
 static bool s_started;
 static bool s_busy;
 static char s_last_error[64];
+static volatile uint32_t s_boot_health_checks;
+static volatile bool s_boot_health_last_ready;
+static volatile uint32_t s_progress_attempts;
+static volatile uint32_t s_progress_successes;
+static volatile int s_progress_last_http_status;
 // The running partition cannot change before reboot. Hash it before delivery
 // workers consume the internal heap, then reuse the verified digest for every
 // authenticated progress report and heartbeat on this boot.
@@ -237,8 +243,9 @@ static bool signed_request(
     return err == ESP_OK;
 }
 
-static bool post_json(const char *path, cJSON *root)
+static bool post_json(const char *path, cJSON *root, int *http_status)
 {
+    if (http_status) *http_status = 0;
     char *body = cJSON_PrintUnformatted(root);
     if (!body) return false;
     char *response_data = calloc(1, OTA_HTTP_RESPONSE_BYTES);
@@ -249,6 +256,7 @@ static bool post_json(const char *path, cJSON *root)
     ota_response_t response = {.data = response_data, .capacity = OTA_HTTP_RESPONSE_BYTES};
     int status = 0;
     bool ok = signed_request("POST", path, body, &response, &status) && status >= 200 && status < 300;
+    if (http_status) *http_status = status;
     free(response_data);
     free(body);
     return ok;
@@ -276,6 +284,7 @@ static bool add_running_image_evidence(cJSON *root)
 
 static bool report_state(const char *state, const char *error)
 {
+    s_progress_attempts++;
     if (!s_journal.deployment_id[0]) return false;
     char path[160];
     snprintf(path, sizeof(path), "/device/v2/firmware/deployments/%s/progress", s_journal.deployment_id);
@@ -284,7 +293,10 @@ static bool report_state(const char *state, const char *error)
         cJSON_AddNumberToObject(root, "bytes_written", (double)s_journal.bytes_written) &&
         add_running_image_evidence(root);
     if (valid && error && error[0]) valid = cJSON_AddStringToObject(root, "error_code", error) != NULL;
-    bool ok = valid && post_json(path, root);
+    int http_status = 0;
+    bool ok = valid && post_json(path, root, &http_status);
+    s_progress_last_http_status = http_status;
+    if (ok) s_progress_successes++;
     cJSON_Delete(root);
     return ok;
 }
@@ -297,7 +309,7 @@ static bool report_capability(void)
         cJSON_AddBoolToObject(root, "rollback_enabled", true) &&
         cJSON_AddStringToObject(root, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT) &&
         add_running_image_evidence(root);
-    bool ok = valid && post_json("/device/v2/firmware/capability", root);
+    bool ok = valid && post_json("/device/v2/firmware/capability", root, NULL);
     cJSON_Delete(root);
     return ok;
 }
@@ -492,7 +504,10 @@ static bool confirm_or_report_rollback(void)
                 "WAITING_FOR_RUNTIME_HEALTH");
             last_health_report = now;
         }
-        if (add_acknowledged && add_connector_boot_health_ready()) {
+        bool boot_health_ready = add_acknowledged && add_connector_boot_health_ready();
+        s_boot_health_checks++;
+        s_boot_health_last_ready = boot_health_ready;
+        if (boot_health_ready) {
             if (!report_state("BOOTED_PENDING", "RUNTIME_HEALTHY")) {
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
@@ -593,7 +608,9 @@ void ota_manager_init(void)
 void ota_manager_start(void)
 {
     if (s_started) return;
-    s_started = xTaskCreate(ota_task, "ota_manager", 12288, NULL, 2, NULL) == pdPASS;
+    // Boot confirmation and rollback must keep running while capture and
+    // delivery workers are busy at priorities 5, 4 and 3 respectively.
+    s_started = xTaskCreate(ota_task, "ota_manager", 12288, NULL, OTA_TASK_PRIORITY, NULL) == pdPASS;
 }
 
 bool ota_manager_busy(void)
@@ -613,7 +630,12 @@ void ota_manager_append_telemetry(cJSON *heartbeat)
         cJSON_AddStringToObject(ota, "state", s_busy ? "UPDATING" : s_journal.state) &&
         cJSON_AddStringToObject(ota, "target_version", s_journal.target_version) &&
         cJSON_AddNumberToObject(ota, "bytes_written", (double)s_journal.bytes_written) &&
-        cJSON_AddNumberToObject(ota, "image_size", (double)s_journal.image_size);
+        cJSON_AddNumberToObject(ota, "image_size", (double)s_journal.image_size) &&
+        cJSON_AddNumberToObject(ota, "boot_health_checks", s_boot_health_checks) &&
+        cJSON_AddBoolToObject(ota, "boot_health_last_ready", s_boot_health_last_ready) &&
+        cJSON_AddNumberToObject(ota, "progress_attempts", s_progress_attempts) &&
+        cJSON_AddNumberToObject(ota, "progress_successes", s_progress_successes) &&
+        cJSON_AddNumberToObject(ota, "progress_last_http_status", s_progress_last_http_status);
     if (valid && s_last_error[0]) valid = cJSON_AddStringToObject(ota, "last_error", s_last_error) != NULL;
     if (valid && cJSON_AddItemToObject(heartbeat, "ota", ota)) return;
     cJSON_Delete(ota);

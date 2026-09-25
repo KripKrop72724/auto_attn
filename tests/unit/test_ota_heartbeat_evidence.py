@@ -21,6 +21,22 @@ def test_new_heartbeat_preserves_running_image_evidence():
     assert evidence["image_sha256"] == "a" * 64
 
 
+def test_ota_confirmation_diagnostics_survive_heartbeat_validation():
+    payload = HeartbeatPayload.model_validate({"ota": {
+        "boot_health_checks": 42,
+        "boot_health_last_ready": True,
+        "progress_attempts": 7,
+        "progress_successes": 3,
+        "progress_last_http_status": -1,
+    }})
+    evidence = payload.model_dump(mode="json")["ota"]
+    assert evidence["boot_health_checks"] == 42
+    assert evidence["boot_health_last_ready"] is True
+    assert evidence["progress_attempts"] == 7
+    assert evidence["progress_successes"] == 3
+    assert evidence["progress_last_http_status"] == -1
+
+
 @pytest.mark.parametrize("digest", ["", "a" * 63, "a" * 65, "A" * 64, "g" * 64])
 def test_malformed_running_image_digest_is_rejected(digest):
     with pytest.raises(ValidationError):
