@@ -51,6 +51,29 @@ def _worker_summary(payload: dict) -> list[dict]:
     return summary
 
 
+def _health_summary(payload: dict) -> dict:
+    """Expose only bounded firmware health fields needed to explain a HIL gate."""
+    diagnostics = payload.get("diagnostics") or {}
+    storage = diagnostics.get("storage") or {}
+    memory = diagnostics.get("memory") or {}
+    led = payload.get("led_state")
+    operation = storage.get("error_operation")
+    upgrade_error = storage.get("upgrade_error")
+    return {
+        "led_state": led if led in {"HEALTHY", "LOCAL_FAILURE", "FATAL", "ZKT_FAILURE", "ORDS_FAILURE"} else "OTHER_OR_UNAVAILABLE",
+        "storage_durability": storage.get("durability"),
+        "storage_recovery_complete": storage.get("recovery_complete"),
+        "storage_persistence_verified": storage.get("persistence_verified"),
+        "storage_write_failures": storage.get("write_failures"),
+        "storage_read_failures": storage.get("read_failures"),
+        "storage_error_code": storage.get("error_code") if isinstance(storage.get("error_code"), int) else None,
+        "storage_error_operation": operation if isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", operation) else None,
+        "storage_upgrade_error": upgrade_error if isinstance(upgrade_error, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", upgrade_error) else None,
+        "internal_free_bytes": memory.get("internal_free_bytes") if isinstance(memory.get("internal_free_bytes"), int) else None,
+        "internal_largest_block_bytes": memory.get("internal_largest_block_bytes") if isinstance(memory.get("internal_largest_block_bytes"), int) else None,
+    }
+
+
 def diagnose(campaign_id: str) -> dict:
     with engine.connect() as connection:
         if connection.dialect.name == "postgresql":
@@ -156,11 +179,13 @@ def diagnose(campaign_id: str) -> dict:
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
                     "latest_free_heap_bytes": latest.free_heap if latest else None,
                     "latest_workers": _worker_summary(latest.payload or {}) if latest else [],
+                    "latest_health": _health_summary(latest.payload or {}) if latest else None,
                     "storage_upgrade_ready": storage.get("upgrade_ready"),
                     "storage_durability": storage.get("durability"),
                     "last_target_sample_at": target_sample.created_at.isoformat() if target_sample else None,
                     "last_target_free_heap_bytes": target_sample.free_heap if target_sample else None,
                     "last_target_workers": _worker_summary(target_sample.payload or {}) if target_sample else [],
+                    "last_target_health": _health_summary(target_sample.payload or {}) if target_sample else None,
                     "last_target_storage_upgrade_ready": target_storage.get("upgrade_ready"),
                     "last_target_storage_durability": target_storage.get("durability"),
                     "device_clock_offset_seconds": clock_offset_seconds,
