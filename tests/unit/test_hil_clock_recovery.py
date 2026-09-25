@@ -15,13 +15,16 @@ from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareRelease, OT
 from zk_add.protocol import body_sha256, sign_request
 from zk_add.security import authenticate_connector_body, connector_token_hash
 from zk_add.settings import settings
-from zk_add.storage_contract import DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSIONS
+from zk_add.storage_contract import (DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSIONS,
+                                     RETRY_BASELINE_IMAGES, RETRY_BASELINES)
 from zk_add.time_utils import utc_now
 
 
 @pytest.fixture(params=DIRECT_VERSIONS)
 def clock_hil(monkeypatch, request):
     version = request.param
+    baselines = RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+    baseline_images = RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
     target = {
         "connector_id": "clock-hil-connector", "mac": "a4:cb:8f:d4:66:01",
         "terminal_serial": "clock-hil-terminal",
@@ -51,8 +54,8 @@ def clock_hil(monkeypatch, request):
                 "queue_storage": {
                     "schema_version": 2, "read_format": 2, "reader_mask": 63,
                     "write_format": 1,
-                    "allowed_bootstrap_versions": list(DIRECT_BASELINES),
-                    "allowed_bootstrap_images": DIRECT_BASELINE_IMAGES,
+                    "allowed_bootstrap_versions": list(baselines),
+                    "allowed_bootstrap_images": baseline_images,
                 },
             },
         )

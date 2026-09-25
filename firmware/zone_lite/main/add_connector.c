@@ -2434,6 +2434,8 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
     const char *led = led_status_current_name();
+    char local_failure_source[80];
+    led_status_local_failure_source(local_failure_source, sizeof(local_failure_source));
     const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
         ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
         ? "HEALTHY" : "UNKNOWN";
@@ -2442,7 +2444,8 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         !cJSON_AddBoolToObject(storage, "recovery_complete", measured_health.recovery_complete) ||
         !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
         !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
-        !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready())) goto failed;
+        !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready()) ||
+        (local_failure_source[0] && !cJSON_AddStringToObject(storage, "local_failure_source", local_failure_source))) goto failed;
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -4070,6 +4073,15 @@ bool add_connector_boot_health_ready(void)
 #else
     bool ready = false;
     if (!storage_upgrade_ready()) return false;
+    // An authenticated control connection and healthy workers cannot attest
+    // to safe attendance preservation when local storage is degraded.
+    size_t storage_total = 0, storage_used = 0;
+    qs_health_t storage_health = qs_health();
+    const char *led = led_status_current_name();
+    if (esp_spiffs_info(NULL, &storage_total, &storage_used) != ESP_OK ||
+        !storage_health.observed || !storage_health.recovery_complete ||
+        !storage_health.persistence_verified || storage_health.last_error ||
+        !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         time_t now = time(NULL);
         bool authenticated_stability_elapsed =

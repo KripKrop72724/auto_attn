@@ -383,9 +383,10 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         if qualified_version is None:
             return "DIRECT_BOOTSTRAP_VERSION_UNQUALIFIED"
         expected_digest = contract["allowed_bootstrap_images"][qualified_version]
+        allowed_state = {"AVAILABLE", "HIL_ONLY"} if release.version == "2.6.7" and qualified_version == "2.6.6" else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
-            FirmwareRelease.state == "AVAILABLE",
+            FirmwareRelease.state.in_(allowed_state),
         ))
         if (predecessor is None or _application_sha256(predecessor) != expected_digest or
                 connector.ota_image_sha256 != expected_digest or

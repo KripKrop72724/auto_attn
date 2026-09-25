@@ -101,6 +101,13 @@ if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.6') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-6-hil-scope.ps1')
     Assert-Zkt266HilScope -HilTargetsJson $HilTargetsJson
 }
+if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.7') {
+    if ($PublicationMode -ne 'HIL_ONLY' -or -not [string]::IsNullOrWhiteSpace($HilTargetMac)) {
+        throw 'ZKT 2.6.7 must first be published only to its exact ordered HIL scope'
+    }
+    . (Join-Path $PSScriptRoot 'firmware-2-6-7-hil-scope.ps1')
+    Assert-Zkt267HilScope -HilTargetsJson $HilTargetsJson
+}
 $scopeJson = ConvertTo-Json -InputObject @($targets) -Depth 5 -Compress
 
 $final = Join-Path $store $Version

@@ -1,6 +1,7 @@
 #include "led_status.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -40,6 +41,7 @@ typedef struct {
     int64_t latched_until_ms;
     bool has_latched_fault;
     bool local_failure; /* Cleared only by verified storage recovery, never a timer. */
+    char local_failure_source[80];
     bool has_backlog;
     bool live_flash;
     int64_t live_flash_until_ms;
@@ -301,13 +303,21 @@ void led_status_set(led_status_t status)
     }
 }
 
-void led_status_fault(led_status_t status)
+void led_status_fault_at(led_status_t status, const char *file, int line)
 {
     if (!s_started || s_led_lock == NULL || !is_fault_status(status)) {
         return;
     }
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (status == LED_STATUS_LOCAL_FAILURE) s_state.local_failure = true;
+        if (status == LED_STATUS_LOCAL_FAILURE) {
+            if (!s_state.local_failure) {
+                const char *basename = file ? strrchr(file, '/') : NULL;
+                basename = basename ? basename + 1 : file;
+                snprintf(s_state.local_failure_source, sizeof(s_state.local_failure_source),
+                    "%s:%d", basename ? basename : "unknown", line);
+            }
+            s_state.local_failure = true;
+        }
         s_state.latched_fault = status;
         s_state.has_latched_fault = true;
         s_state.latched_until_ms = now_ms() + ZONE_LITE_LED_FAULT_LATCH_MS;
@@ -324,10 +334,23 @@ void led_status_clear_fault(led_status_t status)
         return;
     }
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (status == LED_STATUS_LOCAL_FAILURE) s_state.local_failure = false;
+        if (status == LED_STATUS_LOCAL_FAILURE) {
+            s_state.local_failure = false;
+            s_state.local_failure_source[0] = '\0';
+        }
         if (s_state.has_latched_fault && s_state.latched_fault == status) {
             s_state.has_latched_fault = false;
         }
+        xSemaphoreGive(s_led_lock);
+    }
+}
+
+void led_status_local_failure_source(char *destination, size_t capacity)
+{
+    if (!destination || !capacity) return;
+    destination[0] = '\0';
+    if (s_led_lock && xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        snprintf(destination, capacity, "%s", s_state.local_failure_source);
         xSemaphoreGive(s_led_lock);
     }
 }

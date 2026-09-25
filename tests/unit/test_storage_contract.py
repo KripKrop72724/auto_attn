@@ -8,16 +8,19 @@ from sqlalchemy.orm import Session
 from zk_add.models import Base, Connector
 from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareRelease, _storage_predecessor_exclusion
 from zk_add.storage_contract import (COMPAT_MARKER, DIRECT_BASELINES, DIRECT_MARKER,
-                                     DIRECT_BASELINE_IMAGES, validate_storage_contract)
+                                     DIRECT_BASELINE_IMAGES, RETRY_BASELINES,
+                                     RETRY_BASELINE_IMAGES, RETRY_MARKER, validate_storage_contract)
 from zk_add.time_utils import utc_now
 
 
 def manifest(version):
-    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"):
+    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7"):
+        baselines = RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+        images = RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
         return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.4.12",
                 "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63,
-                                  "write_format": 1, "allowed_bootstrap_versions": list(DIRECT_BASELINES),
-                                  "allowed_bootstrap_images": DIRECT_BASELINE_IMAGES.copy()}}
+                                  "write_format": 1, "allowed_bootstrap_versions": list(baselines),
+                                  "allowed_bootstrap_images": images.copy()}}
     return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.5.4" if version == "2.6.0" else "2.2.0",
             "queue_storage": {"schema_version": 1, "read_format": 2, "reader_mask": 63,
                               "write_format": 2 if version == "2.6.0" else 1, "compatibility_version": "2.5.4"}}
@@ -33,7 +36,7 @@ def test_signed_contract_rejects_unqualified_capabilities(field, value):
 
 
 def test_signed_contract_required_for_both_storage_releases():
-    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"):
+    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7"):
         assert validate_storage_contract(manifest(version), version)
         with pytest.raises(ValueError):
             validate_storage_contract({}, version)
@@ -55,9 +58,11 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
         assert f"'{version}' = '{digest}'" in signing
     assert DIRECT_MARKER in firmware
     assert DIRECT_MARKER in signing
+    assert RETRY_MARKER in firmware
+    assert RETRY_MARKER in signing
 
 
-@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.7.0", None])
+@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.7.0", None])
 @pytest.mark.parametrize("direct_version", ["2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"])
 def test_direct_release_requires_exact_signed_predecessor(bad, direct_version):
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -90,6 +95,40 @@ def test_direct_release_requires_exact_signed_predecessor(bad, direct_version):
         release.manifest = {**release.manifest, "queue_storage": {**release.manifest["queue_storage"],
             "allowed_bootstrap_versions": ["2.4.12", "2.5.2", "2.5.4"]}}
         assert _storage_predecessor_exclusion(session, release, connector) == "STORAGE_CONTRACT_INVALID"
+    engine.dispose()
+
+
+def test_267_accepts_only_the_signed_266_hil_image_for_swat_retry():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        predecessor = FirmwareRelease(
+            release_id="zone-lite-2.6.6", version="2.6.6", git_sha="a" * 40,
+            image_sha256="b" * 64, image_size=1024, signing_key_id="key",
+            partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.4.12",
+            storage_name="2.6.6.bin", manifest={"application_sha256": RETRY_BASELINE_IMAGES["2.6.6"]},
+            manifest_signature="fixture", state="HIL_ONLY",
+        )
+        release = FirmwareRelease(
+            release_id="zone-lite-2.6.7", version="2.6.7", git_sha="a" * 40,
+            image_sha256="c" * 64, image_size=1024, signing_key_id="key",
+            partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.4.12",
+            storage_name="2.6.7.bin", manifest=manifest("2.6.7"),
+            manifest_signature="fixture", state="HIL_ONLY",
+        )
+        connector = Connector(
+            connector_id="swat", hardware_id="ac:27:6e:a5:47:64", zone_id="SWAT",
+            zone_name="Swat", device_id="1", display_name="Swat", firmware_version="2.6.6",
+            ota_image_sha256=RETRY_BASELINE_IMAGES["2.6.6"], ota_running_partition="ota_1",
+        )
+        session.add_all([predecessor, release, connector])
+        session.flush()
+        assert _storage_predecessor_exclusion(session, release, connector) is None
+        connector.ota_image_sha256 = "d" * 64
+        assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
+        connector.ota_image_sha256 = RETRY_BASELINE_IMAGES["2.6.6"]
+        predecessor.state = "REVOKED"
+        assert _storage_predecessor_exclusion(session, release, connector) == "DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"
     engine.dispose()
 
 

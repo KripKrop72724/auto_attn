@@ -4,13 +4,20 @@ COMPAT_VERSION = "2.5.4"
 CANDIDATE_VERSION = "2.6.0"
 COMPAT_MARKER = "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4"
 DIRECT_VERSION = "2.6.1"
-DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6")
+DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7")
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
 DIRECT_BASELINE_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
     "2.5.2": "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b",
 }
 DIRECT_MARKER = "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2"
+RETRY_VERSION = "2.6.7"
+RETRY_BASELINES = (*DIRECT_BASELINES, "2.6.6")
+RETRY_BASELINE_IMAGES = {
+    **DIRECT_BASELINE_IMAGES,
+    "2.6.6": "69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e",
+}
+RETRY_MARKER = "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6"
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
@@ -18,13 +25,15 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:
         return None
+    direct_baselines = RETRY_BASELINES if version == RETRY_VERSION else DIRECT_BASELINES
+    direct_images = RETRY_BASELINE_IMAGES if version == RETRY_VERSION else DIRECT_BASELINE_IMAGES
     expected = ({
         "schema_version": 2,
         "read_format": 2,
         "reader_mask": 63,
         "write_format": 1,
-        "allowed_bootstrap_versions": list(DIRECT_BASELINES),
-        "allowed_bootstrap_images": DIRECT_BASELINE_IMAGES,
+        "allowed_bootstrap_versions": list(direct_baselines),
+        "allowed_bootstrap_images": direct_images,
     } if version in DIRECT_VERSIONS else {
         "schema_version": 1,
         "read_format": 2,
