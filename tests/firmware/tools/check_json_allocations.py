@@ -167,7 +167,7 @@ with tempfile.TemporaryDirectory() as directory:
 # Compile the production OTA evidence builders, including serialization, against
 # actual cJSON; transport records only complete payloads.
 ota = (ROOT / "firmware/zone_lite/main/ota_manager.c").read_text()
-start = ota.index("static bool add_running_image_evidence(")
+start = ota.index("static bool cache_running_image_digest(")
 end = ota.index("static bool fetch_assignment(", start)
 ota_program = r'''
 #include <assert.h>
@@ -189,6 +189,7 @@ static const esp_partition_t partition={"ota_1"};
 static struct { char deployment_id[48];size_t bytes_written,image_size;char state[40],target_version[80]; } s_journal={.deployment_id="test",.bytes_written=1024,.image_size=1024,.state="SUCCEEDED",.target_version="2.6.0"};
 static bool s_busy;
 static const char s_last_error[]="test_error";
+static char s_running_image_digest[65];
 static const esp_app_desc_t *esp_app_get_description(void) { return missing_description?NULL:&description; }
 static const esp_partition_t *esp_ota_get_running_partition(void) { return missing_partition?NULL:&partition; }
 static bool esp_secure_boot_enabled(void) { return true; }
@@ -217,6 +218,7 @@ int main(void)
             assert(!sends);
         }
         fail_at=0;sends=0;
+        s_running_image_digest[0]=0;
         fail_hash=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));fail_hash=false;
         missing_partition=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_partition=false;
         missing_description=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_description=false;
@@ -233,6 +235,8 @@ int main(void)
         ota_manager_append_telemetry(heartbeat);assert(!cJSON_HasObjectItem(heartbeat,"ota"));cJSON_Delete(heartbeat);
     }
     fail_at=0;heartbeat=cJSON_CreateObject();fail_hash=true;
+    ota_manager_append_telemetry(heartbeat);assert(cJSON_HasObjectItem(heartbeat,"ota"));cJSON_Delete(heartbeat);
+    s_running_image_digest[0]=0;heartbeat=cJSON_CreateObject();
     ota_manager_append_telemetry(heartbeat);assert(!cJSON_HasObjectItem(heartbeat,"ota"));cJSON_Delete(heartbeat);
     puts("OTA evidence allocation regressions passed");
 }
