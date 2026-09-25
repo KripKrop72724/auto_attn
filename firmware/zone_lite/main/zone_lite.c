@@ -9778,7 +9778,11 @@ void app_main(void)
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
         if (!gateway_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #else
-        if (!gateway_handle || !ords_handle) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        // Worker allocation can be retried after the OTA boot has already
+        // started. Report a recoverable worker fault while a handle is absent;
+        // only durable storage failures may latch LOCAL_FAILURE permanently.
+        if (!gateway_handle) led_status_fault(LED_STATUS_ZKT_FAILURE);
+        if (!ords_handle) led_status_fault(LED_STATUS_ORDS_FAILURE);
         if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence())
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #endif

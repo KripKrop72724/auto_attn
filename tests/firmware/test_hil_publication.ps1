@@ -9,9 +9,11 @@ try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
-foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6')) {
+foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
-    $marker = if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6')) {
+    $marker = if ($version -eq '2.6.7') {
+        'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6'
+    } elseif ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6')) {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2'
     } else {
         "ZONE_STORAGE_CONTRACT_V1:${mode}:READ=2:LANES=3F:COMPAT=2.5.4"
@@ -19,10 +21,15 @@ foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.
     [IO.File]::WriteAllText($contractImage, $marker + [char]0)
     $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
     if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
-    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6') -and
+    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7') -and
         ($contract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589' -or
          $contract.allowed_bootstrap_images['2.5.2'] -ne '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b')) {
         throw 'Direct predecessor image identities changed'
+    }
+    if ($version -eq '2.6.7' -and
+        ($contract.allowed_bootstrap_versions.Count -ne 3 -or
+         $contract.allowed_bootstrap_images['2.6.6'] -ne '69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e')) {
+        throw 'Signed 2.6.6 HIL predecessor identity changed'
     }
     $other = if ($version -eq '2.6.0') { '2.5.4' } else { '2.6.0' }
     $rejected = $false
@@ -240,6 +247,32 @@ if (-not $rejected) { throw 'Partial 2.6.6 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.6 -PublicationMode HIL_ONLY -HilTargetsJson $exact266
 $zkt266Marker = Get-Content -LiteralPath (Join-Path $store '2.6.6/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt266Marker.targets.Count -ne 5 -or $zkt266Marker.application_sha256 -cne ('e'*64)) { throw '2.6.6 HIL marker is incomplete' }
+# Storage fault source diagnostics and the fail-closed boot gate retain the same five exact terminals.
+. (Join-Path $repo 'deploy/add/firmware-2-6-7-hil-scope.ps1')
+$exact267 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.7.json') -Raw
+Assert-Zkt267HilScope -HilTargetsJson $exact267
+foreach ($scope in @('', '[]', '{', $targets)) {
+    $rejected = $false
+    try { Assert-Zkt267HilScope -HilTargetsJson $scope } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Invalid 2.6.7 HIL scope accepted' }
+}
+$zkt267Image = Join-Path $source 'zone-lite-2.6.7.bin'
+[IO.File]::WriteAllText($zkt267Image, 'ZKT 2.6.7 fixture, not deployable firmware')
+$manifest.version='2.6.7'
+$manifest.release_id='zone-lite-2.6.7'
+$manifest.image_name='zone-lite-2.6.7.bin'
+$manifest.image_sha256=(Get-FileHash $zkt267Image).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $zkt267Image).Length
+[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.7 -PublicationMode AVAILABLE } catch { $rejected = $true }
+if (-not $rejected) { throw 'Direct 2.6.7 production publication accepted' }
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.7 -PublicationMode HIL_ONLY -HilTargetsJson $targets } catch { $rejected = $true }
+if (-not $rejected) { throw 'Partial 2.6.7 HIL scope accepted' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.7 -PublicationMode HIL_ONLY -HilTargetsJson $exact267
+$zkt267Marker = Get-Content -LiteralPath (Join-Path $store '2.6.7/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt267Marker.targets.Count -ne 5 -or $zkt267Marker.application_sha256 -cne ('e'*64)) { throw '2.6.7 HIL marker is incomplete' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

@@ -64,6 +64,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
 #if ZONE_LITE_DIRECT_LEGACY_UPGRADE
     const char *hex=!strcmp(previous_app.version,"2.4.12")?
         "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589":
+        !strcmp(previous_app.version,"2.6.6")?
+        "69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -96,6 +98,8 @@ int main(void)
     assert(!writes && !commits);
     assert(strstr(storage_upgrade_contract(),"BASE=2.4.12,2.5.2"));
     strcpy(previous_app.version,"2.5.2");assert(storage_upgrade_init());
+    strcpy(previous_app.version,"2.6.6");assert(storage_upgrade_init());
+    failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());
     strcpy(previous_app.version,UG_CANDIDATE_VERSION);assert(!storage_upgrade_init());

@@ -11,12 +11,14 @@ def test_actual_led_storage_fault_remains_latched(tmp_path):
     source = (firmware / "led_status.c").read_text()
     state = source[source.index("typedef struct {"):source.index("static led_strip_handle_t")]
     priority = source[source.index("static int priority_for_status("):source.index("static void set_rgb(")]
-    fault = source[source.index("void led_status_fault("):source.index("void led_status_event(")]
+    fault = source[source.index("void led_status_fault_at("):source.index("void led_status_event(")]
     program = r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 #include "led_status.h"
 #define pdMS_TO_TICKS(x) (x)
 #define pdTRUE 1

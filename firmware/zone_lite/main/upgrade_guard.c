@@ -8,8 +8,11 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589";
     static const char baseline_252[] =
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
+    static const char hil_266[] =
+        "69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
-        !strcmp(version, "2.5.2") ? baseline_252 : NULL;
+        !strcmp(version, "2.5.2") ? baseline_252 :
+        !strcmp(version, "2.6.6") ? hil_266 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

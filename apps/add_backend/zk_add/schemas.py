@@ -89,6 +89,7 @@ class WorkerDiagnostics(BaseModel):
 
 
 class StorageDiagnostics(BaseModel):
+    local_failure_source: str | None = Field(default=None, max_length=80)
     upgrade_contract: str | None = Field(default=None, max_length=100)
     upgrade_error: str | None = Field(default=None, max_length=80)
     upgrade_ready: bool | None = None

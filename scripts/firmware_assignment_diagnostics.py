@@ -59,6 +59,7 @@ def _health_summary(payload: dict) -> dict:
     led = payload.get("led_state")
     operation = storage.get("error_operation")
     upgrade_error = storage.get("upgrade_error")
+    failure_source = storage.get("local_failure_source")
     return {
         "led_state": led if led in {"HEALTHY", "LOCAL_FAILURE", "FATAL", "ZKT_FAILURE", "ORDS_FAILURE"} else "OTHER_OR_UNAVAILABLE",
         "storage_durability": storage.get("durability"),
@@ -69,6 +70,7 @@ def _health_summary(payload: dict) -> dict:
         "storage_error_code": storage.get("error_code") if isinstance(storage.get("error_code"), int) else None,
         "storage_error_operation": operation if isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", operation) else None,
         "storage_upgrade_error": upgrade_error if isinstance(upgrade_error, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", upgrade_error) else None,
+        "storage_local_failure_source": failure_source if isinstance(failure_source, str) and re.fullmatch(r"[A-Za-z0-9_]+\.c:[0-9]{1,5}", failure_source) else None,
         "internal_free_bytes": memory.get("internal_free_bytes") if isinstance(memory.get("internal_free_bytes"), int) else None,
         "internal_largest_block_bytes": memory.get("internal_largest_block_bytes") if isinstance(memory.get("internal_largest_block_bytes"), int) else None,
     }
