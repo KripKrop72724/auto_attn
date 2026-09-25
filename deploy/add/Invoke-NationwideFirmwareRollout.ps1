@@ -6,7 +6,8 @@ param(
     [string]$BaseUrl = 'http://127.0.0.1:8096',
     [string]$AdminUsername = 'StateHealthAdmin',
     [ValidateRange(1, 5)][int]$BatchSize = 1,
-    [ValidateRange(15, 240)][int]$BatchTimeoutMinutes = 90
+    [ValidateRange(15, 240)][int]$BatchTimeoutMinutes = 90,
+    [switch]$DeferOfflineZones
 )
 
 $ErrorActionPreference = 'Stop'
@@ -251,16 +252,32 @@ try {
         [bool]$_.ota_capable -and -not [string]::IsNullOrWhiteSpace([string]$_.zone_id)
     })
     if ($eligibleDevices.Count -eq 0) { throw 'No OTA-capable devices were found.' }
-    $allZones = @($eligibleDevices | ForEach-Object { [string]$_.zone_id } | Sort-Object -Unique)
+    $deferredZones = @()
+    if ($DeferOfflineZones) {
+        # A campaign scopes an entire zone. Defer the whole zone when even one
+        # ZKT connector is offline, so an offline deployment cannot be counted
+        # as accepted or leave an online peer in a partly completed campaign.
+        $deferredZones = @($eligibleDevices | Where-Object {
+            -not [bool]$_.connected -or $_.state -eq 'OFFLINE'
+        } | ForEach-Object { [string]$_.zone_id } | Sort-Object -Unique)
+        foreach ($zoneId in $deferredZones) {
+            $identities = @($eligibleDevices | Where-Object { $_.zone_id -eq $zoneId } |
+                ForEach-Object { [string]$_.hardware_id }) -join ', '
+            Write-Warning "Deferred offline ZKT zone $zoneId; devices=$identities."
+        }
+    }
+    $rolloutDevices = @($eligibleDevices | Where-Object { $_.zone_id -notin $deferredZones })
+    $allZones = @($rolloutDevices | ForEach-Object { [string]$_.zone_id } | Sort-Object -Unique)
+    if ($allZones.Count -eq 0) { throw 'No online ZKT zone is available for rollout.' }
     $pendingZones = @($allZones | Where-Object {
         $zone = $_
-        @($eligibleDevices | Where-Object {
+        @($rolloutDevices | Where-Object {
             $_.zone_id -eq $zone -and
             -not (Test-ReportedFirmwareVersion -ReportedVersion ([string]$_.firmware_version) -ExpectedVersion $Version)
         }).Count -gt 0
     })
 
-    Write-Host "Nationwide rollout inventory: devices=$($eligibleDevices.Count), zones=$($allZones.Count), pending_zones=$($pendingZones.Count)."
+    Write-Host "ZKT rollout inventory: devices=$($rolloutDevices.Count), zones=$($allZones.Count), pending_zones=$($pendingZones.Count), deferred_zones=$($deferredZones.Count)."
     for ($offset = 0; $offset -lt $pendingZones.Count; $offset += $BatchSize) {
         $last = [Math]::Min($offset + $BatchSize - 1, $pendingZones.Count - 1)
         $batch = @($pendingZones[$offset..$last])
@@ -403,7 +420,11 @@ try {
     if (-not $finalDeliveryAssurance.ok) {
         throw "Final Oracle delivery queue was not quiescent: $($finalDeliveryAssurance.detail)."
     }
-    Write-Host "Nationwide OTA succeeded: version=$Version devices=$($finalDevices.Count) zones=$($allZones.Count)."
+    if ($deferredZones.Count -gt 0) {
+        Write-Warning "Connected-zone OTA succeeded: version=$Version devices=$($finalDevices.Count) zones=$($allZones.Count); deferred zones=$($deferredZones -join ', '). Nationwide completion remains pending."
+    } else {
+        Write-Host "Nationwide OTA succeeded: version=$Version devices=$($finalDevices.Count) zones=$($allZones.Count)."
+    }
 } finally {
     try {
         Invoke-AddApi -Method POST -Path '/api/v1/auth/logout' -Body @{} | Out-Null
