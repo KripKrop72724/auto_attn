@@ -280,7 +280,7 @@ if (-not $rejected) { throw 'Partial 2.6.7 HIL scope accepted' }
 $zkt267Marker = Get-Content -LiteralPath (Join-Path $store '2.6.7/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt267Marker.targets.Count -ne 5 -or $zkt267Marker.application_sha256 -cne ('e'*64)) { throw '2.6.7 HIL marker is incomplete' }
 # Catalog admission diagnostics and the fail-closed boot gate retain the same five exact terminals.
-. (Join-Path $repo 'deploy/add/firmware-2-6-7-hil-scope.ps1')
+. (Join-Path $repo 'deploy/add/firmware-2-6-8-hil-scope.ps1')
 $exact268 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.8.json') -Raw
 Assert-Zkt268HilScope -HilTargetsJson $exact268
 foreach ($scope in @('', '[]', '{', $targets)) {
