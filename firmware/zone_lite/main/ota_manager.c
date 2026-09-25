@@ -51,6 +51,10 @@ static bool s_journal_ready;
 static bool s_started;
 static bool s_busy;
 static char s_last_error[64];
+// The running partition cannot change before reboot. Hash it before delivery
+// workers consume the internal heap, then reuse the verified digest for every
+// authenticated progress report and heartbeat on this boot.
+static char s_running_image_digest[65];
 
 static void wait_for_capture_safepoint(void);
 static bool acknowledge_pending_success(void);
@@ -250,17 +254,24 @@ static bool post_json(const char *path, cJSON *root)
     return ok;
 }
 
+static bool cache_running_image_digest(void)
+{
+    if (s_running_image_digest[0]) return true;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    unsigned char digest[32];
+    if (!running || esp_partition_get_sha256(running, digest) != ESP_OK) return false;
+    hex_bytes(digest, sizeof(digest), s_running_image_digest);
+    return true;
+}
+
 static bool add_running_image_evidence(cJSON *root)
 {
     const esp_app_desc_t *description = esp_app_get_description();
     const esp_partition_t *running = esp_ota_get_running_partition();
-    unsigned char digest[32];
-    char digest_hex[65];
-    if (!root || !description || !running || esp_partition_get_sha256(running, digest) != ESP_OK) return false;
-    hex_bytes(digest, sizeof(digest), digest_hex);
+    if (!root || !description || !running || !cache_running_image_digest()) return false;
     return cJSON_AddStringToObject(root, "running_version", description->version) &&
         cJSON_AddStringToObject(root, "running_partition", running->label) &&
-        cJSON_AddStringToObject(root, "image_sha256", digest_hex);
+        cJSON_AddStringToObject(root, "image_sha256", s_running_image_digest);
 }
 
 static bool report_state(const char *state, const char *error)
@@ -574,6 +585,8 @@ static void ota_task(void *argument)
 
 void ota_manager_init(void)
 {
+    if (!cache_running_image_digest())
+        ESP_LOGW(TAG, "Running image digest unavailable at boot; OTA evidence will retry");
     load_journal();
 }
 

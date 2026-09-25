@@ -57,6 +57,15 @@ def test_ota_hash_uses_the_esp_application_digest_contract() -> None:
     assert "hash_partition_bytes" not in text
 
 
+def test_running_image_digest_is_cached_before_delivery_workers_start() -> None:
+    ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert ota.count("esp_partition_get_sha256(running, digest)") == 1
+    assert "if (s_running_image_digest[0]) return true;" in ota
+    assert "if (!cache_running_image_digest())" in ota[ota.index("void ota_manager_init(void)"):]
+    assert runtime.index("ota_manager_init();") < runtime.index("xTaskCreate(gateway_task")
+
+
 def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text
