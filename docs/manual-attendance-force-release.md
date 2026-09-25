@@ -41,9 +41,13 @@ reason, sync evidence and saved run. Lists do not expose unmasked CNICs.
 - Pre-sync CNIC hashes and identity fingerprints are saved before requesting a
   new list. A refresh cannot erase a prior conflict. New capture-time CNIC hashes
   are stored independently of effective identity enrichment.
-- Existing held rows receive a sticky manual-approval marker. ORM and deferred
-  PostgreSQL constraints prevent automatic reopening, including older application
-  images. Normal valid new attendance and existing explicit approvals continue.
+- Held rows keep a manual-approval marker until a current, complete terminal
+  sync proves the same valid CNIC for the captured user ID. A captured CNIC
+  can prove the match directly; a live punch without one also needs a matching
+  name when present, an unchanged roster covering the punch, and a sync after
+  capture. ADD requests that sync automatically for an unknown live punch.
+  Clock failures, conflicting CNICs, and unproven older identity reuse stay held.
+  The ORM and PostgreSQL guard permit only this verified automatic path.
 - Snapshot enrichment, tombstone, identity-backlog and Hikvision held-record
   release are retired. Prior repair history remains readable; old start/approve
   APIs return 410. Automatic configuration and scheduled approval are removed.

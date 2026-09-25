@@ -1416,11 +1416,17 @@ def test_verified_active_snapshot_repairs_only_safe_missing_uid_punches(
             )
         ).all()
     }
-    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows.values())
+    assert {row.event_uid: row.ords_status for row in rows.values()} == {
+        "1" * 64: "PENDING",
+        "2" * 64: "BLOCKED_IDENTITY",
+        "3" * 64: "BLOCKED_IDENTITY",
+        "4" * 64: "PENDING",
+        "5" * 64: "BLOCKED_IDENTITY",
+    }
 
     assert repair_verified_active_identity_backlog(db) == 0
-    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in rows.values())
-    assert all(row.cnic_encrypted is None for row in rows.values())
+    assert all(rows[str(number) * 64].cnic_encrypted is None for number in (2, 3, 5))
+    assert all(decrypt_cnic(rows[str(number) * 64].cnic_encrypted) == CNIC for number in (1, 4))
 
 
 
@@ -1552,8 +1558,8 @@ def test_verified_active_snapshot_repair_is_not_starved_by_newer_bad_names(
         select(AttendanceEvent).where(AttendanceEvent.event_uid == valid.event_uid)
     )
     assert repaired is not None
-    assert repaired.ords_status == "BLOCKED_IDENTITY"
-    assert repaired.identity_repair_reason is None
+    assert repaired.ords_status == "PENDING"
+    assert decrypt_cnic(repaired.cnic_encrypted) == CNIC
 
 
 
@@ -4877,6 +4883,116 @@ def test_raw_machine_name_is_encrypted_at_rest(db: Session):
     assert user.machine_name_encrypted
     assert CNIC not in user.machine_name_encrypted
     assert decrypt_text(user.machine_name_encrypted) == f"Ayesha-{CNIC}"
+
+
+def test_live_punch_uses_synced_cnic_when_terminal_uid_differs(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, uid="7", user_id="03199", name=f"JawadHus-{CNIC}")
+    connector.zkt_device.confirmed_serial = connector.zkt_device.serial
+    incoming = event(event_uid="a" * 64, user_id="03199", uid="99", raw_name=f"JawadHus-{CNIC}")
+    ingest_attendance(db, connector=connector, events=[incoming])
+    db.flush()
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+    assert row.device_user_id == user.id
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    assert row.ords_status == "PENDING"
+    assert not row.manual_release_required
+
+
+def test_unknown_live_punch_is_released_after_fresh_matching_sync(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, uid="7", user_id="03199", name=f"JawadHus-{CNIC}")
+    zkt = connector.zkt_device
+    zkt.confirmed_serial = zkt.serial
+    incoming = event(event_uid="c" * 64, user_id="03199", uid=None, raw_name=None)
+    ingest_attendance(db, connector=connector, events=[incoming])
+    db.flush()
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert row.manual_release_required
+    assert db.scalar(select(DeviceCommand).where(
+        DeviceCommand.connector_id == connector.id,
+        DeviceCommand.command_type == "REFRESH_USERS",
+        DeviceCommand.actor == "system:attendance-identity",
+    )) is not None
+
+    replace_user_snapshot(
+        db, connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id="jawad-fresh-after-punch", observed_at=utc_now(),
+            users=[UserSnapshotRow(uid=user.uid, user_id=user.user_id, name=f"JawadHus-{CNIC}")],
+        ),
+    )
+    db.flush()
+    assert row.ords_status == "PENDING"
+    assert row.device_user_id == user.id
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    assert not row.manual_release_required
+
+
+def test_synced_cnic_releases_held_punch_without_manual_approval(db: Session):
+    from zk_add.service import release_synced_cnic_attendance
+    from zk_add.attendance_safe_repair import delivery_proof_valid
+
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, uid="7", user_id="03199", name=f"JawadHus-{CNIC}")
+    zkt = connector.zkt_device
+    zkt.confirmed_serial = zkt.serial
+    incoming = event(event_uid="b" * 64, user_id="03199", uid="99", raw_name=None)
+    ingest_attendance(db, connector=connector, events=[incoming])
+    db.flush()
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+    row.ords_status = "BLOCKED_IDENTITY"
+    row.identity_resolution_status = "BLOCKED_IDENTITY"
+    row.cnic_encrypted = row.cnic_lookup_hash = row.cnic_last4 = None
+    row.device_user_id = None
+    row.manual_release_required = True
+    row.captured_cnic_lookup_hash = cnic_lookup(CNIC)
+    db.flush()
+
+    assert release_synced_cnic_attendance(db, zkt=zkt, user=user) == 1
+    db.flush()
+    assert row.ords_status == "PENDING"
+    assert row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+    assert not row.manual_release_required
+    assert decrypt_cnic(row.cnic_encrypted) == CNIC
+    outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+    assert outbox.status == "PENDING"
+    assert delivery_proof_valid(db, row, connector)
+    user.cnic_lookup_hash = cnic_lookup("6110112345671")
+    assert not delivery_proof_valid(db, row, connector)
+    assert release_synced_cnic_attendance(db, zkt=zkt, user=user) == 0
+
+
+def test_synced_cnic_repair_keeps_bad_clock_and_conflicting_cnic_held(db: Session):
+    from zk_add.service import release_synced_cnic_attendance
+
+    connector = connector_fixture(db)
+    make_writable(connector)
+    user = snapshot_user(db, connector, uid="7", user_id="03199", name=f"JawadHus-{CNIC}")
+    zkt = connector.zkt_device
+    zkt.confirmed_serial = zkt.serial
+    for index, captured_hash, clock in (
+        (1, cnic_lookup(CNIC), "INVALID"),
+        (2, cnic_lookup("6110112345671"), "OK"),
+        (3, None, "OK"),
+    ):
+        row = AttendanceEvent(
+            event_uid=f"{index:064x}", connector_id=connector.id,
+            zkt_device_id=zkt.id, user_id="03199", uid="99",
+            device_serial=zkt.serial, device_event_time=utc_now() - timedelta(minutes=10),
+            captured_at=utc_now() - timedelta(minutes=9), source="FULL_HISTORY",
+            clock_quality=clock, captured_cnic_lookup_hash=captured_hash,
+            ords_status="BLOCKED_IDENTITY", manual_release_required=True,
+            identity_resolution_status="BLOCKED_IDENTITY", raw_event={},
+        )
+        db.add(row)
+    db.flush()
+    assert release_synced_cnic_attendance(db, zkt=zkt, user=user) == 0
+    assert all(row.ords_status == "BLOCKED_IDENTITY" for row in db.scalars(select(AttendanceEvent)).all())
 
 
 def test_stable_snapshot_clears_removed_cnic_and_repairs_only_verified_pending_rows(
