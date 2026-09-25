@@ -21,6 +21,7 @@ from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.attendance_force_schemas import ForceCheckRequest
 from zk_add.models import (
     Connector,
+    DeviceUser,
     AttendanceEvent,
     AttendanceRecoveryJob as Job,
     AttendanceForceReleaseDecision as Decision,
@@ -58,6 +59,63 @@ def force_pg(postgres_store, monkeypatch):
         with Operations.context(MigrationContext.configure(conn)):
             migration.install_delivery_guards()
     return sessions, connector_id, uid
+
+
+def test_synced_cnic_migration_releases_verified_hold_only(force_pg):
+    sessions, _, event_uid = force_pg
+    engine = sessions.kw["bind"]
+    path = (
+        Path(__file__).parents[2]
+        / "apps/add_backend/migrations/versions/20260925_0036_auto_synced_cnic.py"
+    )
+    spec = spec_from_file_location("auto_cnic_migration", path)
+    migration = module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid))
+        connector = db.get(Connector, event.connector_id)
+        user = db.get(DeviceUser, event.device_user_id)
+        db.execute(text("""
+            UPDATE add_attendance_events SET ords_status='BLOCKED_IDENTITY',
+              manual_release_required=true, identity_resolution_status='BLOCKED_IDENTITY',
+              identity_snapshot_id=:snapshot, cnic_encrypted=:encrypted,
+              cnic_lookup_hash=:hash, captured_cnic_lookup_hash=:hash,
+              device_serial=:serial, clock_quality='OK'
+            WHERE id=:id
+        """), {
+            "id": event.id, "snapshot": connector.zkt_device.identity_snapshot_id,
+            "encrypted": user.cnic_encrypted, "hash": user.cnic_lookup_hash,
+            "serial": connector.zkt_device.serial,
+        })
+        db.execute(text("UPDATE add_ords_outbox SET status='BLOCKED_IDENTITY' WHERE attendance_event_id=:id"), {"id": event.id})
+        db.commit()
+        event_id = event.id
+    with engine.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.upgrade()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE add_attendance_events SET ords_status='PENDING',
+              manual_release_required=false,
+              identity_resolution_status='RESOLVED_SYNCED_CNIC',
+              identity_repair_reason='VERIFIED_SYNCED_CNIC'
+            WHERE id=:id
+        """), {"id": event_id})
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE add_attendance_events SET ords_status='BLOCKED_IDENTITY',
+              manual_release_required=true, captured_cnic_lookup_hash=:wrong
+            WHERE id=:id
+        """), {"id": event_id, "wrong": "0" * 64})
+    with pytest.raises(DBAPIError, match="explicit administrator approval"):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE add_attendance_events SET ords_status='PENDING',
+                  manual_release_required=false WHERE id=:id
+            """), {"id": event_id})
 
 
 def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):

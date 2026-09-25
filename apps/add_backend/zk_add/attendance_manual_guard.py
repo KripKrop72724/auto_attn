@@ -7,6 +7,14 @@ HELD = {"BLOCKED_IDENTITY", "QUARANTINED_IDENTITY_REUSE", "WAITING_FOR_SNAPSHOT"
 
 
 def requires_approval(row) -> bool:
+    if (
+        row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+        and row.identity_repair_reason == "VERIFIED_SYNCED_CNIC"
+        and row.ords_status not in HELD
+        and row.cnic_lookup_hash
+        and row.clock_quality == "OK"
+    ):
+        return False
     return bool(row.manual_release_required or row.ords_status in HELD)
 
 
@@ -97,7 +105,9 @@ def retain_manual_approval_requirement(session, _context, _instances):
         state = inspect(row)
         prior_status = state.attrs.ords_status.history.deleted
         prior_required = state.attrs.manual_release_required.history.deleted
-        if (
+        if not requires_approval(row):
+            row.manual_release_required = False
+        elif (
             row.ords_status in HELD
             or any(s in HELD for s in prior_status)
             or True in prior_required

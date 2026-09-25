@@ -29,6 +29,7 @@ from zk_add.models import (
     AttendanceSafeRepairDecision as Decision,
     AttendanceSafeRepairTask as Task,
     Connector,
+    DeviceUser,
     IdentityConflictResolution,
     OrdsOutbox,
 )
@@ -538,6 +539,16 @@ def _apply(session: Session, job: Job, item: Item) -> None:
 
 def delivery_proof_valid(session: Session, event: AttendanceEvent, connector: Connector) -> bool:
     """Final pre-send check for repaired identity; changing evidence cannot silently pass."""
+    if event.identity_resolution_status == "RESOLVED_SYNCED_CNIC":
+        from zk_add.service import synced_cnic_identity_proven
+
+        zkt = connector.zkt_device
+        user = session.get(DeviceUser, event.device_user_id) if event.device_user_id else None
+        return bool(
+            zkt and user and event.identity_snapshot_id == zkt.identity_snapshot_id
+            and event.cnic_lookup_hash == user.cnic_lookup_hash
+            and synced_cnic_identity_proven(zkt, user, event)
+        )
     if event.identity_resolution_status != "RESOLVED_RETAINED_IDENTITY":
         return True
     decision = session.scalar(

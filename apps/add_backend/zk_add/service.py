@@ -172,6 +172,7 @@ ORACLE_CONFIRMATION_PATH_PRIORITY = {
 }
 MIN_PLAUSIBLE_ATTENDANCE_TIME = datetime(2010, 1, 1, tzinfo=timezone.utc)
 MAX_DEVICE_CLOCK_LEAD = timedelta(days=1)
+AUTO_SYNC_LIVE_EVENT_AGE = timedelta(minutes=10)
 OTA_FAILURE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 OTA_FAILURE_MESSAGES = {
     "IMAGE_TOO_LARGE": "The signed OTA image does not fit the inactive application slot.",
@@ -1400,6 +1401,18 @@ def _replace_user_snapshot(
         snapshot_record,
         card_transition_user_ids=card_transition_user_ids,
     )
+    if stable_complete:
+        held_user_ids = session.scalars(select(AttendanceEvent.user_id).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
+        ).distinct()).all()
+        if held_user_ids:
+            for row in session.scalars(select(DeviceUser).where(
+                DeviceUser.zkt_device_id == zkt.id,
+                DeviceUser.user_id.in_(held_user_ids),
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )).all():
+                release_synced_cnic_attendance(session, zkt=zkt, user=row)
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 
@@ -2855,6 +2868,86 @@ def enrich_undelivered_attendance(
     return changed
 
 
+def synced_cnic_identity_proven(zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent) -> bool:
+    """Check the roster and capture proof used by both repair and delivery."""
+    if not (
+        zkt.snapshot_complete and zkt.identity_snapshot_stable
+        and zkt.identity_snapshot_observed_at and zkt.confirmed_serial == zkt.serial
+        and user.present and user.lifecycle_state == "ACTIVE"
+        and user.identity_conflict_code is None
+        and user.snapshot_revision == zkt.identity_snapshot_revision
+        and user.cnic_lookup_hash and user.cnic_encrypted
+        and row.zkt_device_id == zkt.id and row.user_id == user.user_id
+        and row.device_serial == zkt.confirmed_serial
+        and row.clock_quality == "OK"
+        and attendance_device_time_is_plausible(row.device_event_time, row.captured_at)
+        and row.identity_resolution_status in {
+            "BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT", "BLOCKED_PROVENANCE", "RESOLVED_SYNCED_CNIC"
+        }
+        and (not row.captured_cnic_lookup_hash
+             or row.captured_cnic_lookup_hash == user.cnic_lookup_hash)
+    ):
+        return False
+    try:
+        cnic = decrypt_cnic(user.cnic_encrypted)
+        if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
+            return False
+    except Exception:
+        return False
+    return bool(
+        row.captured_cnic_lookup_hash == user.cnic_lookup_hash
+        or (row.source in {"LIVE", "LIVE_POLL"}
+            and zkt.last_identity_change_at is not None
+            and (not row.display_name or row.display_name.casefold() == user.display_name.casefold())
+            and timedelta(0) <= ensure_utc(row.captured_at) - ensure_utc(row.device_event_time)
+                <= AUTO_SYNC_LIVE_EVENT_AGE
+            and ensure_utc(row.device_event_time) >= ensure_utc(zkt.last_identity_change_at)
+            and ensure_utc(zkt.identity_snapshot_observed_at)
+            >= ensure_utc(row.captured_at))
+    )
+
+
+def release_synced_cnic_attendance(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser,
+    limit: int | None = None, after_id: int = 0,
+) -> int:
+    """Release held ZKT punches when the device roster proves their CNIC.
+
+    A captured CNIC is the strongest evidence. For a live punch without one,
+    the roster must have been observed again after capture and remained
+    unchanged across the punch. Older ID-only history is not attributed to a
+    possibly reused user ID.
+    """
+    rows = session.scalars(
+        select(AttendanceEvent).where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == user.user_id,
+            AttendanceEvent.id > after_id,
+            AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
+        ).order_by(AttendanceEvent.id).limit(limit).with_for_update(skip_locked=True)
+    ).all()
+    changed = 0
+    for row in rows:
+        if not synced_cnic_identity_proven(zkt, user, row):
+            continue
+        row.device_user_id = user.id
+        row.identity_snapshot_id = zkt.identity_snapshot_id
+        row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
+        row.identity_resolved_at = row.identity_repaired_at = utc_now()
+        row.identity_repair_reason = "VERIFIED_SYNCED_CNIC"
+        row.display_name = user.display_name
+        row.cnic_encrypted = user.cnic_encrypted
+        row.cnic_lookup_hash = user.cnic_lookup_hash
+        row.cnic_last4 = user.cnic_last4
+        row.manual_release_required = False
+        row.ords_status = "PENDING"
+        outbox, _ = ensure_attendance_ords_outbox(session, row, status="PENDING")
+        outbox.next_attempt_at = None
+        outbox.last_error = None
+        changed += 1
+    return changed
+
+
 def _ords_delivery_type_for_event(row: AttendanceEvent) -> str:
     if row.source == "LIVE" or row.source == "LIVE_POLL":
         return "LIVE"
@@ -2953,10 +3046,6 @@ def repair_attendance_delivery_backlog(
     for row in candidates:
         sweep.last_event_id = row.id
         sweep.scanned_count += 1
-        from zk_add.attendance_manual_guard import requires_approval
-        if requires_approval(row):
-            unresolved += 1
-            continue
         event_uid_valid = bool(re.fullmatch(r"[0-9a-f]{64}", row.event_uid or ""))
         if not event_uid_valid:
             row.ords_status = "QUARANTINED_INVALID_EVENT_UID"
@@ -2975,6 +3064,24 @@ def repair_attendance_delivery_backlog(
                 session, row, status="QUARANTINED_INVALID_DEVICE_TIME"
             )
             quarantined += 1
+            continue
+
+        if row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+            connector = session.get(Connector, row.connector_id)
+            zkt = session.get(ZKTDevice, row.zkt_device_id)
+            if connector is not None and zkt is not None and connector.firmware_family != "hikvision":
+                user = session.scalar(select(DeviceUser).where(
+                    DeviceUser.zkt_device_id == zkt.id,
+                    DeviceUser.user_id == row.user_id,
+                    DeviceUser.lifecycle_state == "ACTIVE",
+                ))
+                if user is not None:
+                    repaired += release_synced_cnic_attendance(
+                        session, zkt=zkt, user=user, limit=1, after_id=row.id - 1
+                    )
+        from zk_add.attendance_manual_guard import requires_approval
+        if requires_approval(row):
+            unresolved += 1
             continue
 
         # Reconcile/source rows may be released only after retained source
@@ -3356,12 +3463,32 @@ def ingest_attendance(
         )
         active_user = users_by_id.get(incoming.user_id)
         user = active_user
-        # A terminal user ID is not an identity by itself: ZKT terminals can
-        # reuse it after deletion.  Only the exact current (user ID, UID) pair
-        # may inherit a live identity.  A mismatch is handled as historical
-        # identity evidence, never silently attached to the current employee.
+        captured_cnic_matches_user = bool(
+            parsed.cnic and active_user and active_user.cnic_lookup_hash
+            and cnic_lookup(parsed.cnic) == active_user.cnic_lookup_hash
+            and active_user.identity_conflict_code is None
+        )
+        live_synced_user = bool(
+            active_user and incoming.source in {"LIVE", "LIVE_POLL"}
+            and active_user.identity_conflict_code is None
+            and (not parsed.display_name or parsed.display_name.casefold() == active_user.display_name.casefold())
+            and zkt.snapshot_complete and zkt.identity_snapshot_stable
+            and zkt.confirmed_serial == zkt.serial
+            and zkt.identity_snapshot_observed_at
+            and zkt.last_identity_change_at
+            and active_user.snapshot_revision == zkt.identity_snapshot_revision
+            and timedelta(0) <= ensure_utc(incoming.captured_at) - ensure_utc(incoming.device_event_time)
+                <= AUTO_SYNC_LIVE_EVENT_AGE
+            and ensure_utc(incoming.device_event_time) >= ensure_utc(zkt.last_identity_change_at)
+            and ensure_utc(zkt.identity_snapshot_observed_at) >= ensure_utc(incoming.captured_at)
+            and (not parsed.cnic or captured_cnic_matches_user)
+        )
+        # A terminal user ID can be reused. A UID mismatch is accepted only
+        # when the captured CNIC agrees with the synced roster or a later
+        # complete snapshot proves continuous identity across a live punch.
         if (
             user is not None
+            and not (captured_cnic_matches_user or live_synced_user)
             and (
                 (not incoming.uid and not source_attested)
                 or not user.uid
@@ -3396,15 +3523,20 @@ def ingest_attendance(
                 )
             identity_resolution = identity_resolution_cache[lookup]
         usable_user_identity = bool(
-            user and (user.identity_conflict_code is None or identity_resolution is not None)
+            user and (user.identity_conflict_code is None or identity_resolution is not None
+                      or captured_cnic_matches_user or live_synced_user)
         )
         snapshot_verified = bool(
             zkt.identity_snapshot_stable
             and zkt.identity_snapshot_id
             and zkt.identity_snapshot_observed_at
-            and ensure_utc(zkt.identity_snapshot_observed_at)
-            >= ensure_utc(incoming.captured_at)
-            - timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
+            and (
+                live_synced_user
+                or captured_cnic_matches_user
+                or ensure_utc(zkt.identity_snapshot_observed_at)
+                >= ensure_utc(incoming.captured_at)
+                - timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
+            )
         )
         if settings.identity_snapshot_gate_enabled and not snapshot_verified:
             usable_user_identity = False
@@ -3624,6 +3756,34 @@ def ingest_attendance(
     # Persist the corresponding Oracle outbox rows in one second flush so the
     # whole firmware message is durable before its websocket acknowledgement.
     session.flush()
+    if connector.connected and zkt.online and any(
+        row.source in {"LIVE", "LIVE_POLL"}
+        and row.ords_status == "BLOCKED_IDENTITY"
+        and row.clock_quality == "OK"
+        and row.captured_cnic_lookup_hash is None
+        and (candidate := users_by_id.get(row.user_id)) is not None
+        and candidate.cnic_lookup_hash is not None
+        and candidate.identity_conflict_code is None
+        for row, _, _, _, _ in pending_rows
+    ):
+        now = utc_now()
+        recent_refresh = session.scalar(select(DeviceCommand.id).where(
+            DeviceCommand.connector_id == connector.id,
+            DeviceCommand.command_type == "REFRESH_USERS",
+            DeviceCommand.created_at >= now - timedelta(minutes=5),
+        ).limit(1))
+        active_write = session.scalar(select(DeviceCommand.id).where(
+            DeviceCommand.connector_id == connector.id,
+            DeviceCommand.command_type.in_(MUTATING_COMMANDS),
+            DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
+        ).limit(1))
+        if recent_refresh is None and active_write is None:
+            create_command(
+                session, connector=connector, command_type="REFRESH_USERS",
+                payload={}, expected_state={}, desired_state={},
+                idempotency_key=f"auto-identity-sync:{connector.id}:{int(now.timestamp()) // 300}",
+                actor="system:attendance-identity", expires_in_seconds=120,
+            )
     return accepted, duplicates
 
 
