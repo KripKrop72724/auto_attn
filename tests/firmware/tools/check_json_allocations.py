@@ -173,6 +173,7 @@ ota_program = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -190,6 +191,11 @@ static struct { char deployment_id[48];size_t bytes_written,image_size;char stat
 static bool s_busy;
 static const char s_last_error[]="test_error";
 static char s_running_image_digest[65];
+static volatile uint32_t s_boot_health_checks;
+static volatile bool s_boot_health_last_ready;
+static volatile uint32_t s_progress_attempts;
+static volatile uint32_t s_progress_successes;
+static volatile int s_progress_last_http_status;
 static const esp_app_desc_t *esp_app_get_description(void) { return missing_description?NULL:&description; }
 static const esp_partition_t *esp_ota_get_running_partition(void) { return missing_partition?NULL:&partition; }
 static bool esp_secure_boot_enabled(void) { return true; }
@@ -197,8 +203,9 @@ static int esp_partition_get_sha256(const esp_partition_t *p,unsigned char diges
 { assert(p==&partition);memset(digest,0x11,32);return fail_hash?-1:0; }
 static void hex_bytes(const unsigned char *input,size_t length,char *out)
 { (void)input;memset(out,'1',length*2);out[length*2]=0; }
-static bool post_json(const char *path,cJSON *root)
+static bool post_json(const char *path,cJSON *root,int *http_status)
 {
+    if(http_status)*http_status=200;
     assert(path[0]);char *body=cJSON_PrintUnformatted(root);if(!body)return false;
     assert(strstr(body,"running_version") && strstr(body,"running_partition") && strstr(body,"image_sha256"));
     if(strstr(path,"progress"))assert(strstr(body,"bytes_written") && strstr(body,"error_code"));
