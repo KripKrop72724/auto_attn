@@ -325,8 +325,11 @@ def test_end_to_end_report_is_read_only_anonymized_and_never_certifies():
     assert report["live_stream"]["messages"] == 1
     assert all(status == "NOT_RUN" for status in report["required_hardware_checks"].values())
     encoded = json.dumps(report)
-    for sensitive in ("Private Name", "00012", "TEST-SERIAL", "local-secret", "192.168.50.10"):
+    for sensitive in ("Private Name", "TEST-SERIAL", "local-secret", "192.168.50.10"):
         assert sensitive not in encoded
+    # An opaque pseudonym can contain these digits by chance; reject the
+    # original employee number as a complete JSON value.
+    assert '"00012"' not in encoded
     assert all(request.method == "GET" or request.url.path in {
         path.split("?")[0] for path in SEARCH_PATHS.values()
     } for request in requests)
