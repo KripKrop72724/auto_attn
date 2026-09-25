@@ -63,6 +63,11 @@ class OtaHeartbeatPayload(BaseModel):
     bytes_written: int = Field(default=0, ge=0, le=2**63 - 1)
     image_size: int = Field(default=0, ge=0, le=2**63 - 1)
     last_error: str = Field(default="", max_length=64)
+    boot_health_checks: int = Field(default=0, ge=0, le=2**32 - 1)
+    boot_health_last_ready: bool = False
+    progress_attempts: int = Field(default=0, ge=0, le=2**32 - 1)
+    progress_successes: int = Field(default=0, ge=0, le=2**32 - 1)
+    progress_last_http_status: int = Field(default=0, ge=-1, le=599)
 
 
 class QueueDiagnostics(BaseModel):
