@@ -75,6 +75,14 @@ def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     assert ".buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES" in text
 
 
+def test_direct_ota_tls_buffers_can_use_psram_after_worker_startup() -> None:
+    defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
+    component = (FIRMWARE / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert "CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y" in defaults
+    assert "CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096" in defaults
+    assert "if(NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC OR NOT CONFIG_SPIRAM_USE_MALLOC)" in component
+
+
 def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "bool capability_reported = false;" in text

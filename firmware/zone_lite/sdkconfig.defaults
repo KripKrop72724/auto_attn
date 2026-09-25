@@ -18,6 +18,12 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# The 16 KiB TLS receive buffer cannot fit the fragmented internal heap once
+# both ZKT delivery stacks are running after an OTA boot. Prefer internal RAM
+# for small mbedTLS allocations; let large buffers use the existing PSRAM malloc
+# policy, as the Hikvision family already does on this hardware.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+
 # Device credentials and site configuration are encrypted with XTS keys
 # derived from a per-device HMAC key in read/write-protected eFuse block 0.
 CONFIG_NVS_ENCRYPTION=y
