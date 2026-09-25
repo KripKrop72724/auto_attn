@@ -13,7 +13,7 @@ from zk_add.time_utils import utc_now
 
 
 def manifest(version):
-    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5"):
+    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"):
         return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.4.12",
                 "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63,
                                   "write_format": 1, "allowed_bootstrap_versions": list(DIRECT_BASELINES),
@@ -33,7 +33,7 @@ def test_signed_contract_rejects_unqualified_capabilities(field, value):
 
 
 def test_signed_contract_required_for_both_storage_releases():
-    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5"):
+    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"):
         assert validate_storage_contract(manifest(version), version)
         with pytest.raises(ValueError):
             validate_storage_contract({}, version)
@@ -57,8 +57,8 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert DIRECT_MARKER in signing
 
 
-@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.7.0", None])
-@pytest.mark.parametrize("direct_version", ["2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5"])
+@pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.7.0", None])
+@pytest.mark.parametrize("direct_version", ["2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6"])
 def test_direct_release_requires_exact_signed_predecessor(bad, direct_version):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
