@@ -802,13 +802,23 @@ static bool recover_catalog_transaction_locked(void)
     return ok;
 }
 
+static const char *s_catalog_writer_failure_reason = "none";
+
 static FILE *create_catalog_stage(const char *path)
 {
-    if (!qs_local_begin(QS_ADMIT_HISTORICAL, 4096)) return NULL;
+    s_catalog_writer_failure_reason = "none";
+    if (!qs_local_begin(QS_ADMIT_HISTORICAL, 4096)) {
+        s_catalog_writer_failure_reason = errno == EBUSY ? "admission_lock_busy" : "admission_rejected";
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return NULL;
+    }
     FILE *file = fopen(path, "w");
     int captured = file ? 0 : errno;
     qs_local_end(file != NULL, captured);
-    if (!file) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!file) {
+        s_catalog_writer_failure_reason = "stage_open_failed";
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    }
     return file;
 }
 
@@ -818,12 +828,21 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     char *encrypted = encrypt_storage_json(plain);
     size_t bytes = encrypted ? strlen(encrypted) + 1 : 0;
     long position = file && fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
-    bool admitted = encrypted && bytes <= DQ_MAX_RECORD_BYTES && position >= 0 &&
+    bool bounded = encrypted && bytes <= DQ_MAX_RECORD_BYTES && position >= 0 &&
         (uint64_t)position <= ADD_IDENTITY_CATALOG_MAX_BYTES &&
-        bytes <= ADD_IDENTITY_CATALOG_MAX_BYTES - (size_t)position &&
-        qs_local_begin(QS_ADMIT_HISTORICAL, bytes);
+        bytes <= ADD_IDENTITY_CATALOG_MAX_BYTES - (size_t)position;
+    if (!plain) s_catalog_writer_failure_reason = "json_allocation_failed";
+    else if (!encrypted) s_catalog_writer_failure_reason = "encryption_failed";
+    else if (bytes > DQ_MAX_RECORD_BYTES) s_catalog_writer_failure_reason = "record_too_large";
+    else if (position < 0) s_catalog_writer_failure_reason = "stage_seek_failed";
+    else if (!bounded) s_catalog_writer_failure_reason = "catalog_size_limit";
+    bool admitted = bounded && qs_local_begin(QS_ADMIT_HISTORICAL, bytes);
+    if (bounded && !admitted) {
+        s_catalog_writer_failure_reason = errno == EBUSY ? "admission_lock_busy" : "admission_rejected";
+    }
     bool ok = admitted && fprintf(file, "%s\n", encrypted) > 0 &&
         fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (admitted && !ok) s_catalog_writer_failure_reason = "stage_write_failed";
     if (admitted) qs_local_end(ok, ok ? 0 : errno);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(plain);
@@ -1160,15 +1179,20 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     if (s_identity_catalog_stage_file_ok) {
         FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
         bool file_ok = file != NULL;
+        if (!file_ok) s_catalog_writer_failure_reason = "stage_append_open_failed";
         cJSON_ArrayForEach(row, rows) {
             if (file_ok && !write_encrypted_json_line(file, row)) {
                 file_ok = false;
             }
         }
-        if (file && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+        if (file_ok && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+            s_catalog_writer_failure_reason = "stage_sync_failed";
             file_ok = false;
         }
-        if (file && fclose(file) != 0) file_ok = false;
+        if (file && fclose(file) != 0) {
+            if (file_ok) s_catalog_writer_failure_reason = "stage_close_failed";
+            file_ok = false;
+        }
         if (!file_ok) {
             s_identity_catalog_stage_file_ok = false;
             (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
@@ -1201,6 +1225,9 @@ static bool identity_catalog_stage_commit_locked(
         s_identity_catalog_stage_rows == s_identity_catalog_stage_expected;
     bool persisted = ok && s_identity_catalog_stage_file_ok &&
         activate_identity_catalog(ADD_IDENTITY_CATALOG_STAGE_PATH);
+    if (ok && s_identity_catalog_stage_file_ok && !persisted) {
+        s_catalog_writer_failure_reason = "catalog_activation_failed";
+    }
     bool memory_ready = ok &&
         (s_identity_catalog_stage_expected == 0 ||
          (s_identity_catalog_stage_aliases != NULL &&
@@ -2121,11 +2148,16 @@ static void parse_inbound(const char *data, size_t len)
                 "Committed bounded encrypted ADD identity catalog rows=%u",
                 (unsigned)row_count);
             if (volatile_fallback) {
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+                char message[192];
+                snprintf(message, sizeof(message),
+                    "Verified ADD identity catalog is active in bounded PSRAM; encrypted flash persistence failed (%s) and will retry on reconnect",
+                    s_catalog_writer_failure_reason);
                 add_connector_log(
                     "WARN",
                     "identity",
                     "IDENTITY_CATALOG_MEMORY_FALLBACK",
-                    "Verified ADD identity catalog is active in bounded PSRAM because flash storage is full; encrypted persistence will retry on reconnect");
+                    message);
             }
         }
         cJSON_Delete(root);

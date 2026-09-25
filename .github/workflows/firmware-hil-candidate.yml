@@ -130,7 +130,7 @@ jobs:
           storage_mode=OFF
           if [[ "$EXPECTED_VERSION" == "2.6.0" ]]; then storage_mode=ON; fi
           direct_mode=OFF
-          if [[ "$FIRMWARE_FAMILY" == "zkt" && ( "$EXPECTED_VERSION" == "2.6.1" || "$EXPECTED_VERSION" == "2.6.2" || "$EXPECTED_VERSION" == "2.6.3" || "$EXPECTED_VERSION" == "2.6.4" || "$EXPECTED_VERSION" == "2.6.5" || "$EXPECTED_VERSION" == "2.6.6" || "$EXPECTED_VERSION" == "2.6.7" ) ]]; then direct_mode=ON; fi
+          if [[ "$FIRMWARE_FAMILY" == "zkt" && ( "$EXPECTED_VERSION" == "2.6.1" || "$EXPECTED_VERSION" == "2.6.2" || "$EXPECTED_VERSION" == "2.6.3" || "$EXPECTED_VERSION" == "2.6.4" || "$EXPECTED_VERSION" == "2.6.5" || "$EXPECTED_VERSION" == "2.6.6" || "$EXPECTED_VERSION" == "2.6.7" || "$EXPECTED_VERSION" == "2.6.8" ) ]]; then direct_mode=ON; fi
           docker run --rm \
             -e ZONE_LITE_SEGMENTED_WRITES="$storage_mode" \
             -e ZONE_LITE_DIRECT_LEGACY_UPGRADE="$direct_mode" \

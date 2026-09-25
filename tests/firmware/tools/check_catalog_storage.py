@@ -7,7 +7,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[3]
 firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
-functions = source[source.index("static FILE *create_catalog_stage("):
+functions = source[source.index("static const char *s_catalog_writer_failure_reason"):
                    source.index("static void recover_identity_catalog_backup_if_active_missing(")]
 persist = source[source.index("static bool persist_identity_catalog_locked("):
                  source.index("static bool persist_identity_catalog(")]
@@ -52,12 +52,14 @@ int main(void){
   fail_at=0;assert(write_encrypted_json_line(file,row));assert(!fclose(file));
  }
  used=8U*1024U*1024U*60U/100U+1;assert(!create_catalog_stage("pressure"));
+ assert(!strcmp(s_catalog_writer_failure_reason,"admission_rejected"));
  used=8U*1024U*1024U*58U/100U;assert(!create_catalog_stage("pressure"));
  used=8U*1024U*1024U*54U/100U;file=create_catalog_stage("pressure");assert(file);assert(!fclose(file));
  used=8U*1024U*1024U*70U/100U+1;assert(!create_catalog_stage("pressure"));
  used=0;file=create_catalog_stage("catalog");assert(file);
  assert(!ftruncate(fileno(file),ADD_IDENTITY_CATALOG_MAX_BYTES));
  assert(!write_encrypted_json_line(file,row));assert(ftell(file)==ADD_IDENTITY_CATALOG_MAX_BYTES && !held);
+ assert(!strcmp(s_catalog_writer_failure_reason,"catalog_size_limit"));
  assert(!fclose(file));cJSON_Delete(row);
  cJSON *catalog=cJSON_Parse("{\"rows\":[{\"user_id\":\"test\"}]}");assert(catalog);
  calls=0;fail_at=0;s_identity_catalog_active_memory_valid=true;

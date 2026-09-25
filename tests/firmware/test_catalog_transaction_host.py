@@ -10,7 +10,7 @@ def test_catalog_replacement_keeps_committed_generation(tmp_path):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "add_connector.c").read_text()
     recovery = source[source.index("static bool recover_catalog_transaction_locked("):
-                      source.index("static FILE *create_catalog_stage(")]
+                      source.index("static const char *s_catalog_writer_failure_reason")]
     activation = source[source.index("static bool activate_identity_catalog("):
                         source.index("static bool persist_identity_catalog_locked(")]
     program = r'''
