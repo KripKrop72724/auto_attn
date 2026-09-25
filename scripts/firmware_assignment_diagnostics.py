@@ -2,6 +2,7 @@
 """Read-only, bounded diagnosis of one firmware campaign's assignment gate."""
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import re
@@ -49,6 +50,47 @@ def _worker_summary(payload: dict) -> list[dict]:
             if isinstance(worker.get("restart_attempts"), int) else None,
         })
     return summary
+
+
+def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dict:
+    """Bounded, credential-free evidence for intermittent worker health alerts."""
+    states: Counter[str] = Counter()
+    anomalies = []
+    matched = 0
+    for sample in samples:
+        payload = sample.payload or {}
+        if not _versions_match(payload.get("firmware_version"), version):
+            continue
+        matched += 1
+        diagnostics = payload.get("diagnostics") or {}
+        memory = diagnostics.get("memory") or {}
+        for worker in diagnostics.get("workers") or []:
+            name = worker.get("name")
+            if name not in {"add_delivery", "ords_delivery"}:
+                continue
+            state = worker.get("state")
+            states[f"{name}:{state}"] += 1
+            tick = worker.get("last_activity_uptime_ms")
+            uptime = sample.uptime_seconds
+            delta = uptime * 1000 - tick if isinstance(uptime, int) and isinstance(tick, int) else None
+            if state in {"STOPPED", "FAULT", "WAITING_RESOURCE"} or delta is None or not -999 <= delta <= 90_000:
+                if len(anomalies) < 30:
+                    operation = worker.get("operation")
+                    anomalies.append({
+                        "at": sample.created_at.isoformat(),
+                        "worker": name,
+                        "state": state,
+                        "operation": operation if operation in {
+                            "idle", "reading queue", "waiting for acknowledgement",
+                            "committing receipt", "allocating delivery buffer",
+                        } else "OTHER_OR_UNAVAILABLE",
+                        "tick_delta_ms": delta,
+                        "internal_free_bytes": memory.get("internal_free_bytes"),
+                        "internal_largest_block_bytes": memory.get("internal_largest_block_bytes"),
+                        "led_state": payload.get("led_state"),
+                    })
+    return {"samples_examined": len(samples), "target_version_samples": matched,
+            "worker_states": dict(states), "anomalies": anomalies}
 
 
 def _health_summary(payload: dict) -> dict:
@@ -138,6 +180,9 @@ def diagnose(campaign_id: str) -> dict:
                     .where(DeviceTelemetry.connector_id == connector.id)
                     .order_by(DeviceTelemetry.id.desc()).limit(256)
                 ) if _versions_match((row.payload or {}).get("firmware_version"), release.version)), None)
+                recent_samples = list(session.scalars(select(DeviceTelemetry)
+                    .where(DeviceTelemetry.connector_id == connector.id)
+                    .order_by(DeviceTelemetry.id.desc()).limit(512)))
                 recent_authenticated_requests = session.scalar(select(func.count(ConnectorNonce.id)).where(
                     ConnectorNonce.connector_id == connector.id,
                     ConnectorNonce.created_at >= utc_now() - timedelta(minutes=5),
@@ -186,6 +231,7 @@ def diagnose(campaign_id: str) -> dict:
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,
                     "latest_free_heap_bytes": latest.free_heap if latest else None,
                     "latest_workers": _worker_summary(latest.payload or {}) if latest else [],
+                    "recent_worker_evidence": _recent_worker_evidence(recent_samples, release.version),
                     "latest_health": _health_summary(latest.payload or {}) if latest else None,
                     "storage_upgrade_ready": storage.get("upgrade_ready"),
                     "storage_durability": storage.get("durability"),
