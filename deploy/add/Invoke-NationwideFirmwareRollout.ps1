@@ -86,6 +86,14 @@ function Test-ReportedFirmwareVersion {
     return $normalized -eq $ExpectedVersion
 }
 
+function Test-ZktFirmwareDevice {
+    param([Parameter(Mandatory = $true)][object]$Device)
+    return (
+        [string]$Device.firmware_family -eq 'zkt' -and
+        [string]$Device.terminal_vendor -eq 'zkt'
+    )
+}
+
 function Get-OrdsDeliveryAssurance {
     $overview = Invoke-AddApi -Method GET -Path '/api/v1/overview'
     $delivery = $overview.ords_delivery
@@ -137,6 +145,7 @@ function Get-ZoneSourceAssurance {
         [string]$ExpectedVersion = ''
     )
     $devices = @((Invoke-AddApi -Method GET -Path '/api/v1/devices').rows | Where-Object {
+        (Test-ZktFirmwareDevice -Device $_) -and
         [bool]$_.ota_capable -and $_.zone_id -eq $ZoneId
     })
     if ($devices.Count -lt 1) {
@@ -238,6 +247,7 @@ try {
 
     $devicesResponse = Invoke-AddApi -Method GET -Path '/api/v1/devices'
     $eligibleDevices = @($devicesResponse.rows | Where-Object {
+        (Test-ZktFirmwareDevice -Device $_) -and
         [bool]$_.ota_capable -and -not [string]::IsNullOrWhiteSpace([string]$_.zone_id)
     })
     if ($eligibleDevices.Count -eq 0) { throw 'No OTA-capable devices were found.' }
@@ -365,6 +375,7 @@ try {
     }
 
     $finalDevices = @((Invoke-AddApi -Method GET -Path '/api/v1/devices').rows | Where-Object {
+        (Test-ZktFirmwareDevice -Device $_) -and
         [bool]$_.ota_capable -and $_.zone_id -in $allZones
     })
     $unstable = @($finalDevices | Where-Object {
