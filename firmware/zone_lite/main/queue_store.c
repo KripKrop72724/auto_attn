@@ -110,8 +110,18 @@ static bool admit(void *arg, size_t bytes)
 }
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
-    if ((unsigned)policy > QS_ADMIT_RECOVERY || !budget_lock ||
-        xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    if ((unsigned)policy > QS_ADMIT_RECOVERY || !budget_lock) {
+        errno = EINVAL;
+        return false;
+    }
+    // Historical catalog writes are outside the live attendance path. Give
+    // a concurrent queue fsync time to release the shared admission lock.
+    int wait_ms = policy == QS_ADMIT_HISTORICAL ? 10000 : 1000;
+    uint32_t wait = pdMS_TO_TICKS(wait_ms);
+    if (xSemaphoreTake(budget_lock, wait) != pdTRUE) {
+        errno = EBUSY;
+        return false;
+    }
     bool measured = measure();
     sb_class_t kind = policy == QS_ADMIT_HISTORICAL ? SB_HISTORICAL :
         policy == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
