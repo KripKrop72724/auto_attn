@@ -9639,6 +9639,37 @@ static void gateway_task(void *arg)
     }
 }
 
+// Reserve the two long-lived ZKT stacks before ADD starts its short-lived
+// network and delivery allocations. A free-byte count alone is insufficient:
+// Swat had 50 KiB free but no 16 KiB contiguous block for ORDS after startup.
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+#define GATEWAY_STACK_BYTES 24576U
+#define ORDS_STACK_BYTES 16384U
+static StackType_t *s_gateway_stack;
+static StaticTask_t s_gateway_tcb;
+static StackType_t *s_ords_stack;
+static StaticTask_t s_ords_tcb;
+
+static bool reserve_delivery_worker_stacks(void)
+{
+    // Xtensa FreeRTOS asserts 16-byte alignment for a caller-owned stack.
+    s_gateway_stack = heap_caps_aligned_alloc(16, GATEWAY_STACK_BYTES,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_ords_stack = heap_caps_aligned_alloc(16, ORDS_STACK_BYTES,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_gateway_stack || !s_ords_stack) {
+        heap_caps_free(s_gateway_stack);
+        heap_caps_free(s_ords_stack);
+        s_gateway_stack = NULL;
+        s_ords_stack = NULL;
+        ESP_LOGE(TAG, "Could not reserve delivery worker stacks: largest internal block=%u",
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    return true;
+}
+#endif
+
 void app_main(void)
 {
     setenv("TZ", "UTC0", 1);
@@ -9691,6 +9722,9 @@ void app_main(void)
     (void)ensure_system_time_synced();
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     add_connector_set_zkt(&g_add_zkt);
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    bool worker_stacks_reserved = reserve_delivery_worker_stacks();
+#endif
     add_connector_start();
     // Retain handles and retry startup from the existing app task. Delivery
     // allocation failure must not reboot a healthy capture task repeatedly.
@@ -9703,7 +9737,19 @@ void app_main(void)
     for (;;) {
         uint32_t now = (uint32_t)uptime_ms();
         if (!gateway_handle && worker_retry_allow(&gateway_retry, now)) {
-            if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, &gateway_handle) != pdPASS) {
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+            if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, &gateway_handle) != pdPASS)
+                gateway_handle = NULL;
+#else
+            gateway_handle = worker_stacks_reserved
+                ? xTaskCreateStatic(gateway_task, "zone_gateway", GATEWAY_STACK_BYTES,
+                    NULL, 5, s_gateway_stack, &s_gateway_tcb)
+                : NULL;
+            if (!worker_stacks_reserved &&
+                xTaskCreate(gateway_task, "zone_gateway", GATEWAY_STACK_BYTES,
+                    NULL, 5, &gateway_handle) != pdPASS) gateway_handle = NULL;
+#endif
+            if (!gateway_handle) {
                 gateway_handle = NULL;
                 ESP_LOGE(TAG, "Capture worker startup deferred: largest internal block=%u",
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -9713,7 +9759,14 @@ void app_main(void)
         /* Hikvision transfers evidence to ADD's independent Oracle outbox;
          * only ZKT uses this local direct-ORDS worker. */
         if (!ords_handle && worker_retry_allow(&ords_retry, now)) {
-            if (xTaskCreate(ords_uploader_task, "ords_uploader", 16384, NULL, 3, &ords_handle) != pdPASS) {
+            ords_handle = worker_stacks_reserved
+                ? xTaskCreateStatic(ords_uploader_task, "ords_uploader", ORDS_STACK_BYTES,
+                    NULL, 3, s_ords_stack, &s_ords_tcb)
+                : NULL;
+            if (!worker_stacks_reserved &&
+                xTaskCreate(ords_uploader_task, "ords_uploader", ORDS_STACK_BYTES,
+                    NULL, 3, &ords_handle) != pdPASS) ords_handle = NULL;
+            if (!ords_handle) {
                 ords_handle = NULL;
                 ESP_LOGE(TAG, "ORDS worker startup deferred: largest internal block=%u",
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
