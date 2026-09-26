@@ -523,7 +523,7 @@ describe('State Life ADD interface', () => {
 
   it('uses secure automatic onboarding language and exposes no registration control', async () => {
     render(<App />)
-    expect(await screen.findByRole('heading', { name: /attendance device command center/i })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Fleet', level: 1 })).toBeTruthy()
     expect(screen.getByAltText('State Life Insurance Corporation')).toBeTruthy()
     expect(screen.queryByText(/register connector/i)).toBeNull()
     expect(screen.getByText(/secure auto-onboarding enabled/i)).toBeTruthy()
@@ -534,7 +534,7 @@ describe('State Life ADD interface', () => {
 
   it('opens on the Pakistan map and preserves the complete list behind an in-memory toggle', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     expect(await screen.findByRole('region', { name: 'Pakistan device network map' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Map' }).getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i })).toBeTruthy()
@@ -559,7 +559,7 @@ describe('State Life ADD interface', () => {
     vi.stubGlobal('fetch', fetchStub([user], false, false, false, false, [device, spareDevice]))
     render(<App />)
 
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     expect(await screen.findByRole('tab', { name: /active fleet 1/i })).toBeTruthy()
     fireEvent.click(await screen.findByRole('tab', { name: /spares 1/i }))
 
@@ -567,12 +567,12 @@ describe('State Life ADD interface', () => {
     expect(screen.getByText(/offline state and alerts do not affect fleet availability/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Inspect Islamabad reserve device' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: `Inspect ${device.display_name}` })).toBeNull()
-    expect(screen.getByText('SPARE')).toBeTruthy()
+    expect(screen.getByText('Spare')).toBeTruthy()
   })
 
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     expect(await screen.findByText(maskedCnic)).toBeTruthy()
@@ -585,7 +585,7 @@ describe('State Life ADD interface', () => {
   it('marks duplicate CNIC identities with text and a non-color-only pattern', async () => {
     vi.stubGlobal('fetch', fetchStub([conflictedUser]))
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
@@ -612,7 +612,7 @@ describe('State Life ADD interface', () => {
     const fetchMock = fetchStub([user], true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
@@ -659,7 +659,7 @@ describe('State Life ADD interface', () => {
     const fetchMock = fetchStub([user], false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
@@ -712,7 +712,7 @@ describe('State Life ADD interface', () => {
     const fetchMock = fetchStub([missingIdentityUser], false, false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
@@ -731,7 +731,7 @@ describe('State Life ADD interface', () => {
     const fetchMock = fetchStub([currentUser], false, false, false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Users' }))
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
@@ -786,10 +786,10 @@ describe('State Life ADD interface', () => {
     const { container, rerender } = render(<StatusBadge state="ONLINE" />)
     expect(container.querySelector('[data-pattern="confirmed"]')).toBeTruthy()
     expect(container.querySelector('svg')).toBeTruthy()
-    expect(screen.getByText('ONLINE')).toBeTruthy()
+    expect(screen.getByText('Online')).toBeTruthy()
     rerender(<StatusBadge state="WAITING_FOR_ZKT" />)
     expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
-    expect(screen.getByText('WAITING FOR ZKT')).toBeTruthy()
+    expect(screen.getByText('Waiting for ZKT')).toBeTruthy()
     const badge = screen.getByLabelText('Status: WAITING FOR ZKT')
     expect(badge.getAttribute('title')).toBe('WAITING FOR ZKT')
   })
@@ -798,12 +798,12 @@ describe('State Life ADD interface', () => {
     render(<StatusBadge state="SOURCE_RECOVERY_EPOCH_ACTIVATED" />)
     const badge = screen.getByLabelText('Status: SOURCE RECOVERY EPOCH ACTIVATED')
     expect(badge.getAttribute('title')).toBe('SOURCE RECOVERY EPOCH ACTIVATED')
-    expect(badge.textContent).toContain('SOURCE RECOVERY EPOCH ACTIVATED')
+    expect(badge.textContent).toContain('Source recovery epoch activated')
   })
 
   it('renders an unknown status instead of crashing on a partial API response', () => {
     const { container } = render(<StatusBadge state={undefined} />)
-    expect(screen.getByText('UNKNOWN')).toBeTruthy()
+    expect(screen.getByText('Unknown')).toBeTruthy()
     expect(container.querySelector('[data-pattern="notice"]')).toBeTruthy()
   })
 
@@ -829,9 +829,9 @@ describe('State Life ADD interface', () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
-    expect(await screen.findByRole('heading', { name: 'Firmware operations' })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
     const newCampaign = screen.getByRole('button', { name: 'New campaign' }) as HTMLButtonElement
     await waitFor(() => expect(newCampaign.disabled).toBe(false))
     fireEvent.click(newCampaign)
@@ -875,7 +875,7 @@ describe('State Life ADD interface', () => {
 
   it('returns to the login screen when any request reports an expired session', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     vi.stubGlobal('fetch', vi.fn(async () => response({ detail: 'Session expired.' }, 401)))
     await api('/api/v1/protected-test').catch(() => undefined)
     expect(await screen.findByText(/sign in to the national device operations console/i)).toBeTruthy()
@@ -894,13 +894,13 @@ describe('State Life ADD interface', () => {
         onCancel={async () => undefined}
       />,
     )
-    expect(screen.getByRole('heading', { name: 'UNKNOWN' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Unknown' })).toBeTruthy()
     expect(screen.getByText(/durably tracked/i)).toBeTruthy()
   })
 
   it('renders only allowlisted alert diagnostics', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
     expect(await screen.findByText(/Category HTTP_503 · HTTP 503 · Attempt 4/i)).toBeTruthy()
     expect(await screen.findByRole('heading', { name: /attendance quarantine/i })).toBeTruthy()
@@ -913,7 +913,7 @@ describe('State Life ADD interface', () => {
 
   it('requires audited step-up to reveal and review attendance quarantine', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
     fireEvent.click(await screen.findByRole('button', { name: /^review$/i }))
     expect(await screen.findByRole('heading', { name: /review quarantined attendance/i })).toBeTruthy()
@@ -956,7 +956,7 @@ describe('State Life ADD interface', () => {
         onCancel={async () => undefined}
       />,
     )
-    expect(screen.getByRole('heading', { name: 'WAITING FOR ZKT' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Waiting for ZKT' })).toBeTruthy()
     expect(screen.getByText(/durably tracked/i)).toBeTruthy()
     expect(container.querySelector('.pattern-waiting')).toBeTruthy()
     expect(screen.getByRole('button', { name: /cancel before execution/i })).toBeTruthy()
@@ -964,13 +964,13 @@ describe('State Life ADD interface', () => {
 
   it('supports semantic keyboard tabs, Escape close, and focus restoration', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: /attendance device command center/i })
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(await screen.findByRole('button', { name: /Islamabad, 1 device, All online/i }))
     const inspect = await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
     inspect.focus()
     fireEvent.click(inspect)
     expect(await screen.findByRole('dialog')).toBeTruthy()
-    const overview = screen.getByRole('tab', { name: 'overview' })
+    const overview = screen.getByRole('tab', { name: 'Overview' })
     expect(overview.getAttribute('aria-controls')).toBe('device-tabpanel')
     fireEvent.keyDown(overview, { key: 'ArrowRight' })
     const logs = screen.getByRole('tab', { name: 'Live logs' })

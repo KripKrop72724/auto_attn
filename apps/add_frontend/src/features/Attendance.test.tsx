@@ -228,7 +228,7 @@ describe('Live attendance workspace', () => {
     expect(within(row).getByText('SLICTOWER · 3rd Floor')).toBeTruthy()
     expect(within(row).getByText('Live capture')).toBeTruthy()
     expect(within(row).getByText('Clock verified')).toBeTruthy()
-    expect(within(row).getByText('ACKNOWLEDGED')).toBeTruthy()
+    expect(within(row).getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy()
     expect(screen.getByText('Events loaded').closest('article')?.textContent).toContain('1')
     expect(screen.getByText('Oracle confirmed').closest('article')?.textContent).toContain('1')
     expect(screen.getByText('Data-quality attention').closest('article')?.textContent).toContain('0')
@@ -253,7 +253,7 @@ describe('Live attendance workspace', () => {
     view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
 
     expect(await screen.findByRole('button', { name: /1 new event · show newest/i })).toBeTruthy()
-    expect(within(ayesha).getByText('ACKNOWLEDGED')).toBeTruthy()
+    expect(within(ayesha).getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy()
     expect(screen.queryByRole('article', { name: /Bilal Ahmed/i })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: /1 new event · show newest/i }))
     expect(await screen.findByRole('article', { name: /Bilal Ahmed, Check out/i })).toBeTruthy()
@@ -282,7 +282,7 @@ describe('Live attendance workspace', () => {
     expect(screen.queryByRole('button', { name: /Load older events/i })).toBeNull()
 
     view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
-    await waitFor(() => expect(screen.getByText('ACKNOWLEDGED')).toBeTruthy())
+    await waitFor(() => expect(screen.getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy())
     expect(screen.getByRole('article', { name: /Older Event/i })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /Load older events/i })).toBeNull()
   })
@@ -340,8 +340,8 @@ describe('Live attendance workspace', () => {
     render(<AttendanceView {...attendanceProps} />)
     await screen.findByRole('article', { name: /Ayesha Khan/i })
     fireEvent.click(screen.getByText(/^Filters$/i))
-    fireEvent.click(screen.getByLabelText('BLOCKED IDENTITY'))
-    fireEvent.click(screen.getByLabelText('FAILED RETRYABLE'))
+    fireEvent.click(screen.getByLabelText('Blocked identity'))
+    fireEvent.click(screen.getByLabelText('Failed retryable'))
     fireEvent.change(screen.getByLabelText('CNIC availability'), { target: { value: 'missing' } })
     fireEvent.change(screen.getByLabelText('Rows per load'), { target: { value: '250' } })
     await waitFor(() => {
@@ -458,7 +458,7 @@ describe('Live attendance workspace', () => {
     render(<AttendanceView {...attendanceProps} />)
 
     const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(row).getByText('BLOCKED IDENTITY')).toBeTruthy()
+    expect(within(row).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
     expect(within(row).getByText('Released · Oracle verified')).toBeTruthy()
     expect(within(row).getByText(/Oracle and downstream verified/i)).toBeTruthy()
     fireEvent.click(within(row).getByLabelText(/view event details/i))
@@ -574,13 +574,13 @@ describe('Live attendance workspace', () => {
     expect(reviewTab.getAttribute('aria-selected')).toBe('true')
     expect(document.activeElement).toBe(reviewTab)
     expect(window.location.search).toBe('?view=needs-review')
-    expect(await screen.findByRole('heading', { name: 'Attendance · Needs review' })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Force release attendance' })).toBeTruthy()
 
     fireEvent.keyDown(reviewTab, { key: 'End' })
     expect(historyTab.getAttribute('aria-selected')).toBe('true')
     expect(document.activeElement).toBe(historyTab)
     expect(window.location.search).toBe('?view=release-history')
-    expect(await screen.findByRole('heading', { name: 'Attendance · Release history' })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Previous repair history' })).toBeTruthy()
 
     window.history.replaceState(null, '', '/attendance?view=needs-review')
     window.dispatchEvent(new PopStateEvent('popstate'))

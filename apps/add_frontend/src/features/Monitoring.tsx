@@ -209,7 +209,7 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
   }
   return (
     <>
-      <PageHeader eyebrow="OPERATIONS QUEUE" title="Alerts and exceptions" description="Triage current device conditions before reviewing acknowledged and resolved history." action={<button className="button secondary" onClick={() => void load()}><Icon name="refresh" /> Refresh</button>} />
+      <PageHeader title="Alerts" description="Open device conditions first, then acknowledged and resolved history." action={<button className="button secondary" onClick={() => void Promise.all([load(), loadQuarantine()])}><Icon name="refresh" /> Refresh</button>} />
       <section className="queue-toolbar" aria-label="Alert filters">
         <div className="segmented-control" role="group" aria-label="Alert queue">
           <button className={queue === 'OPEN' ? 'active' : ''} onClick={() => setQueue('OPEN')}>Open <span>{totals.open}</span></button>
@@ -219,26 +219,26 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
         </div>
         <div className="queue-selects"><label><span>Severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="WARNING">Warning</option></select></label><label><span>Device</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)}><option value="ALL">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label></div>
       </section>
-      <section className="panel attendance-quarantine-panel" aria-labelledby="attendance-quarantine-title">
-        <div className="panel-header">
-          <div><span className="eyebrow">NON-BLOCKING INGESTION</span><h2 id="attendance-quarantine-title">Attendance quarantine</h2><p>Malformed rows are preserved for review after a durable receipt; valid and newer punches continue through the delivery pipeline.</p></div>
-          <button className="button secondary" onClick={() => void loadQuarantine()}><Icon name="refresh" /> Refresh</button>
-        </div>
-        {quarantineError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{quarantineError}</span></div>}
-        {quarantine && <div className="quarantine-summary"><StatusBadge state={quarantine.totals.open ? 'WARNING' : 'HEALTHY'} /><strong>{quarantine.totals.open.toLocaleString()} open</strong><span>{quarantine.totals.all.toLocaleString()} retained in total</span></div>}
-        {quarantine?.rows.map((row) => <article className="quarantine-row" key={row.id}><div><strong>{row.display_name} · {row.zone_id}</strong><p>{row.error_code || 'VALIDATION_ERROR'}{row.error_path ? ` · ${row.error_path}` : ''} · Batch item {row.item_index}</p></div><div className="quarantine-row-actions"><StatusBadge state="QUARANTINED" /><small>{relativeTime(row.observed_at)} · Receipt {row.receipt_id.slice(0, 8)}</small><button className="button secondary" onClick={() => setSelectedQuarantine(row)}><Icon name="search" /> Review</button></div></article>)}
-        {quarantine && !quarantine.rows.length && !quarantineError && <div className="empty-state compact"><Icon name="shield" /><p>No attendance rows are waiting for review in this scope.</p></div>}
-      </section>
       <section className="alert-list">
         {error && <div className="panel message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{error}</span><button className="button secondary" onClick={() => void load()}>Retry queue</button></div>}
-        {loading && !rows.length && <div className="panel empty-state"><Icon name="refresh" /><h2>Loading the national alert queue…</h2></div>}
+        {loading && !rows.length && <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h2>Loading alerts…</h2></div>}
         {rows.map((row) => {
           const diagnostics = formatAlertDiagnostics(row.details)
           const inspectorPath = typeof row.details.inspector_path === 'string' && /^\/reconciliation\?tab=source-exceptions&device_id=[A-Za-z0-9-]{1,100}$/.test(row.details.inspector_path) ? row.details.inspector_path : null
           return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><a href={routePath('fleet', row.device.connector_id)}>{row.device.display_name} · {row.device.zone_id}</a></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div><div className="alert-actions">{inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</div></article>
         })}
-        {!loading && !error && !rows.length && <div className="panel empty-state"><Icon name="shield" /><h2>No alerts in this view.</h2><p>Change the queue filters or wait for the next live telemetry update.</p></div>}
+        {!loading && !error && !rows.length && <div className="panel empty-state"><Icon name={queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'check' : 'search'} /><h2>{queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'No open alerts' : 'No alerts in this view'}</h2><p>{queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'Every device condition is clear. New alerts appear here as telemetry arrives.' : 'Change the queue or filters to see other alerts.'}</p></div>}
         {nextCursor && <div className="load-more"><button className="button secondary" disabled={loading} onClick={() => void load(nextCursor, true)}>{loading ? 'Loading…' : 'Load more alerts'}</button><small>{rows.length.toLocaleString()} alerts loaded</small></div>}
+      </section>
+      <section className="panel attendance-quarantine-panel" aria-labelledby="attendance-quarantine-title">
+        <div className="panel-header">
+          <div><h2 id="attendance-quarantine-title">Attendance quarantine</h2><p>Malformed rows are preserved for review after a durable receipt; valid and newer punches continue through the delivery pipeline.</p></div>
+          {quarantine && <StatusBadge state={quarantine.totals.open ? 'WARNING' : 'HEALTHY'} />}
+        </div>
+        {quarantineError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{quarantineError}</span></div>}
+        {quarantine && <div className="quarantine-summary"><strong>{quarantine.totals.open.toLocaleString()} open</strong><span>{quarantine.totals.all.toLocaleString()} retained in total</span></div>}
+        {quarantine?.rows.map((row) => <article className="quarantine-row" key={row.id}><div><strong>{row.display_name} · {row.zone_id}</strong><p>{row.error_code || 'VALIDATION_ERROR'}{row.error_path ? ` · ${row.error_path}` : ''} · Batch item {row.item_index}</p></div><div className="quarantine-row-actions"><StatusBadge state="QUARANTINED" /><small>{relativeTime(row.observed_at)} · Receipt {row.receipt_id.slice(0, 8)}</small><button className="button secondary" onClick={() => setSelectedQuarantine(row)}><Icon name="search" /> Review</button></div></article>)}
+        {quarantine && !quarantine.rows.length && !quarantineError && <p className="quarantine-clear">No attendance rows are waiting for review in this scope.</p>}
       </section>
       {selectedQuarantine && <AttendanceQuarantineDialog row={selectedQuarantine} toast={toast} onClose={() => setSelectedQuarantine(null)} onChanged={async () => { await Promise.all([loadQuarantine(), load()]) }} />}
     </>

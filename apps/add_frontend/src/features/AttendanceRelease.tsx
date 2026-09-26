@@ -454,10 +454,10 @@ export function AttendanceReleaseReview({
   return (
     <div className="release-review-workspace">
       <section className="metric-grid attendance-metrics" aria-label="Attendance release queue totals">
-        <Metric label="Employees in queue" value={(queue?.totals.employees || 0).toLocaleString()} detail="Grouped by employee and terminal" icon="users" />
-        <Metric label="Held punches" value={(queue?.totals.events || 0).toLocaleString()} detail="Original capture dispositions retained" icon="clock" />
-        <Metric label="Eligible now" value={(queue?.totals.eligible || 0).toLocaleString()} detail="Current, stable and CNIC-complete" icon="check" tone="positive" />
-        <Metric label="Locked" value={(queue?.totals.locked || 0).toLocaleString()} detail="Reason shown on every group" icon="shield" tone={queue?.totals.locked ? 'warning' : 'positive'} />
+        <Metric label="Employees in queue" value={(queue?.totals?.employees || 0).toLocaleString()} detail="Grouped by employee and terminal" icon="users" />
+        <Metric label="Held punches" value={(queue?.totals?.events || 0).toLocaleString()} detail="Original capture dispositions retained" icon="clock" />
+        <Metric label="Eligible now" value={(queue?.totals?.eligible || 0).toLocaleString()} detail="Current, stable and CNIC-complete" icon="check" tone="positive" />
+        <Metric label="Locked" value={(queue?.totals?.locked || 0).toLocaleString()} detail="Reason shown on every group" icon="shield" tone={queue?.totals?.locked ? 'warning' : 'positive'} />
       </section>
 
       {!queue?.preview_enabled && (
@@ -546,7 +546,7 @@ export function AttendanceReleaseReview({
 
             {job && (
               <div className="release-preview">
-                <header><div><p className="eyebrow">DURABLE RELEASE {job.job_id.slice(0, 8)}</p><h3>{job.release_state || humanize(job.status)}</h3></div><StatusBadge state={job.status} /></header>
+                <header><div><p className="eyebrow">DURABLE RELEASE {job.job_id.slice(0, 8)}</p><h3>{humanize(job.release_state || job.status)}</h3></div><StatusBadge state={job.status} /></header>
                 <div className="release-preview-counts">
                   <span><strong>{job.totals.selected ?? job.totals.events}</strong><small>selected</small></span>
                   <span><strong>{job.totals.safe ?? Math.max(0, job.totals.events - job.totals.excluded)}</strong><small>safe</small></span>
@@ -734,9 +734,9 @@ export function AttendanceReleaseHistory({
   return (
     <div className="release-history-workspace">
       <section className="metric-grid attendance-metrics" aria-label="Release history totals">
-        <Metric label="All releases" value={(list?.totals.all || 0).toLocaleString()} detail="Immutable job history" icon="list" />
-        <Metric label="Active" value={(list?.totals.active || 0).toLocaleString()} detail="Preparing, queued or verifying" icon="refresh" tone={list?.totals.active ? 'warning' : 'positive'} />
-        <Metric label="Needs attention" value={(list?.totals.attention || 0).toLocaleString()} detail="Safe retry or operator review" icon="alert" tone={list?.totals.attention ? 'critical' : 'positive'} />
+        <Metric label="All releases" value={(list?.totals?.all || 0).toLocaleString()} detail="Immutable job history" icon="list" />
+        <Metric label="Active" value={(list?.totals?.active || 0).toLocaleString()} detail="Preparing, queued or verifying" icon="refresh" tone={list?.totals?.active ? 'warning' : 'positive'} />
+        <Metric label="Needs attention" value={(list?.totals?.attention || 0).toLocaleString()} detail="Safe retry or operator review" icon="alert" tone={list?.totals?.attention ? 'critical' : 'positive'} />
         <Metric label="Worker" value={list?.worker?.heartbeat?.state || 'Unknown'} detail={`${list?.worker?.waiting_downstream_items || 0} waiting downstream`} icon="server" />
       </section>
       {error && <div className="message pattern-blocked" role="alert"><Icon name="alert" /><span>{error}</span></div>}
@@ -751,7 +751,7 @@ export function AttendanceReleaseHistory({
           <div className="release-history-list" aria-busy={loading && !job}>
             {jobs.map((row) => (
               <button className={`release-history-row ${job?.job_id === row.job_id ? 'is-selected' : ''}`} type="button" key={row.job_id} onClick={() => void openJob(row.job_id)}>
-                <span><strong>{row.targets[0]?.display_name || `User ${row.release_target_user_id || '—'}`}</strong><small>{row.device_id} · {row.totals.events} selected · {row.totals.excluded} excluded</small></span>
+                <span><strong>{row.targets[0]?.display_name || `User ${row.release_target_user_id || '—'}`}</strong><small>{devices.find((device) => device.connector_id === row.connector_id)?.display_name || `Terminal ${row.device_id}`} · {row.totals.events.toLocaleString()} selected · {row.totals.excluded.toLocaleString()} excluded</small></span>
                 <StatusBadge state={row.release_state || row.status} />
                 <span><strong>{row.actor}</strong><small>{relativeTime(row.created_at)}</small></span>
                 <Icon name="chevron" />
@@ -791,7 +791,7 @@ export function AttendanceReleaseHistory({
               {canPause && <button className="button secondary" type="button" onClick={() => setControl('pause')}><Icon name="pause" /> Pause</button>}
               {canResume && <button className="button secondary" type="button" onClick={() => setControl('resume')}><Icon name="refresh" /> Resume</button>}
               {canRetry && <button className="button secondary" type="button" onClick={() => setControl('retry')}><Icon name="refresh" /> Retry</button>}
-              {canCancel && <button className="button danger" type="button" onClick={() => setControl('cancel')}><Icon name="x" /> Cancel uncommitted</button>}
+              {canCancel && <button className="button destructive" type="button" onClick={() => setControl('cancel')}><Icon name="x" /> Cancel uncommitted</button>}
               <a className="button secondary" href={`/api/v2/attendance-releases/${job.job_id}/evidence`}><Icon name="shield" /> Download evidence JSON</a>
             </div>
             <div className="release-outcome-list">
@@ -813,11 +813,11 @@ export function AttendanceReleaseHistory({
 
       {control && job && (
         <Dialog titleId="release-control-title" title={controlCopy[control]} description="This control is recorded in the hash-chained release evidence." onClose={() => setControl(null)}>
-          <form className="dialog-form" onSubmit={submitControl}>
+          <form className="dialog-body" onSubmit={submitControl}>
             {control === 'cancel' && <div className="info-copy pattern-blocked"><Icon name="alert" /><span><strong>Oracle-confirmed punches are never reversed</strong><small>Cancellation stops only work that has not committed.</small></span></div>}
             <label>Reason<textarea minLength={10} maxLength={500} value={controlReason} onChange={(event) => setControlReason(event.target.value)} /></label>
             <label>Current administrator password<input type="password" autoComplete="current-password" value={controlPassword} onChange={(event) => setControlPassword(event.target.value)} /></label>
-            <footer className="dialog-actions"><button className="button secondary" type="button" onClick={() => setControl(null)}>Keep current state</button><button className={`button ${control === 'cancel' ? 'danger' : 'primary'}`} type="submit" disabled={loading || controlReason.trim().length < 10 || !controlPassword}>{loading ? 'Saving…' : controlCopy[control]}</button></footer>
+            <footer className="dialog-actions"><button className="button secondary" type="button" onClick={() => setControl(null)}>Keep current state</button><button className={`button ${control === 'cancel' ? 'destructive' : 'primary'}`} type="submit" disabled={loading || controlReason.trim().length < 10 || !controlPassword}>{loading ? 'Saving…' : controlCopy[control]}</button></footer>
           </form>
         </Dialog>
       )}

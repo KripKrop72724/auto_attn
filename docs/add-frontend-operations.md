@@ -23,7 +23,7 @@ Fleet is the operational home and authoritative inventory. Status includes text,
 
 ### Users
 
-Users are always scoped to one selected terminal. Directory results use cursor pagination; **Select eligible on loaded rows** states the exact bulk-action scope. Opening `/users` clears a previous terminal selection, while `/users/{connector}` restores explicit context.
+Users are always scoped to one selected terminal. Directory results use cursor pagination; **Select eligible users in this view** applies only to loaded eligible rows, and the summary beside it states the exact bulk-action scope. Opening `/users` clears a previous terminal selection, while `/users/{connector}` restores explicit context.
 
 The preferred enrollment path is a ten-minute administrator lease. Permanent elevation requires a password, an audited reason, and the exact phrase `ELEVATE {user_id} ON {device_id}`. CNIC remains write-only and masked in every response.
 

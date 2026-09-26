@@ -9,6 +9,7 @@ import {
 import { useBlocker } from 'react-router-dom'
 import { z } from 'zod'
 import './Firmware.css'
+import './FirmwareProvisioning.css'
 import { api, ApiError } from '../api'
 import {
   Dialog,
@@ -799,9 +800,8 @@ export default function FirmwareProvisioning({
   return (
     <div className="firmware-workspace firmware-provisioning-workspace">
       <PageHeader
-        eyebrow="SECURE USB PROVISIONING"
-        title="Prepare a Zone Lite ESP32"
-        description="Connect one ESP32-S3. ADD will apply the latest approved signed firmware, provision encrypted site settings, verify every written range, and onboard it automatically."
+        title="Firmware"
+        description="Signed releases, device preparation, and audited rollouts to exact device scopes."
         action={
           <button className="button secondary" onClick={() => void load()}>
             <Icon name="refresh" /> Refresh
@@ -809,7 +809,7 @@ export default function FirmwareProvisioning({
         }
       />
       <nav
-        className="firmware-workspace-tabs"
+        className="section-tabs firmware-workspace-tabs"
         role="tablist"
         aria-label="Firmware sections"
       >
@@ -835,6 +835,11 @@ export default function FirmwareProvisioning({
           ),
         )}
       </nav>
+      <p className="firmware-prepare-intro">
+        Prepare a Zone Lite ESP32 over USB. ADD applies the approved signed
+        firmware, writes encrypted site settings, verifies every range, and
+        onboards the device automatically.
+      </p>
       <section
         className="firmware-provisioning-readiness"
         aria-label="Provisioning readiness"

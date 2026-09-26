@@ -110,7 +110,7 @@ describe('DeviceDrawer COMM Key controls', () => {
       />,
     )
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'control' }))
+    fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }))
     await screen.findByText('Break-glass reveal')
     fireEvent.change(screen.getByLabelText('Reveal reason'), {
       target: { value: 'Authorized Quetta recovery credential inspection' },
@@ -180,7 +180,7 @@ describe('DeviceDrawer COMM Key controls', () => {
       />,
     )
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'control' }))
+    fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }))
     const card = screen.getByRole('heading', { name: 'Replace terminal binding' }).closest('article')
     expect(card).not.toBeNull()
     const controls = within(card as HTMLElement)

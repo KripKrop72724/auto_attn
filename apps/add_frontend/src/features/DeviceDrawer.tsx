@@ -3,13 +3,19 @@ import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent a
 import { api } from '../api'
 import {
   CommandProgress, Dialog, StatusBadge, dateTime, drawerTabs, idempotency,
-  relativeTime, statusPattern, useToast, type DrawerTab,
+  relativeTime, useToast, type DrawerTab,
 } from '../App'
 import { Icon } from '../Icon'
+import { firmwareLabel, humanizeStatus } from '../status'
 import { FirmwareHealth } from './FirmwareHealth'
 import type {
   Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceLog,
 } from '../types'
+
+const tabLabels: Record<DrawerTab, string> = { overview: 'Overview', logs: 'Live logs', control: 'Controls' }
+const logClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Karachi', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' })
+const logTime = (value: string) => logClock.format(new Date(value)).replace(',', '')
+const logLevelPattern = (level: string) => /ERR|FATAL|CRIT/i.test(level) ? 'blocked' : /WARN/i.test(level) ? 'waiting' : 'notice'
 
 export function DeviceDrawer({
   seed,
@@ -246,7 +252,7 @@ export function DeviceDrawer({
             onClick={() => setTab(item)}
             onKeyDown={(event) => handleTabKey(event, index)}
           >
-            {item === 'logs' ? 'Live logs' : item}
+            {tabLabels[item]}
           </button>
         ))}
       </div>
@@ -257,14 +263,9 @@ export function DeviceDrawer({
         aria-labelledby={`device-tab-${tab}`}
       >
         {tab === 'overview' && <div className="overview-grid">
-          <article className={`detail-card wide inventory-assignment-card ${device.is_spare ? 'is-spare' : ''}`}>
-            <span className="inventory-assignment-icon"><Icon name={device.is_spare ? 'server' : 'grid'} /></span>
-            <div><p className="eyebrow">INVENTORY ASSIGNMENT</p><h3>{device.is_spare ? 'Spare device' : 'Active fleet device'}</h3><p>{device.is_spare ? 'Telemetry remains available, but this device is excluded from active fleet availability, outage counts, and the operations queue.' : 'This device contributes to active fleet health, availability, and operational alert reporting.'}</p></div>
-            <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
-          </article>
-          <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{device.firmware_version || 'Unknown'}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
-          <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div></dl></article>
-          <article className="detail-card"><p className="eyebrow">LIVE TERMINAL CLOCK</p><h3>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</h3><p>Sampled {relativeTime(device.zkt?.device_time_sampled_at)} · Drift {device.zkt?.drift_seconds == null ? 'unknown' : `${Math.round(device.zkt.drift_seconds)} seconds`}</p></article>
+          {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{humanizeStatus(device.last_error_code)}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
+          <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{firmwareLabel(device.firmware_version)}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
+          <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div><div><dt>Terminal clock</dt><dd>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</dd></div><div><dt>Clock drift</dt><dd>{device.zkt?.device_time_sampled_at ? `${device.zkt.drift_seconds == null ? 'Unknown' : `${Math.round(device.zkt.drift_seconds)} s`} · sampled ${relativeTime(device.zkt.device_time_sampled_at)}` : 'Not sampled yet'}</dd></div></dl></article>
           {device.firmware_family === 'hikvision' ? <article className="detail-card">
             <p className="eyebrow">HIKVISION CAPTURE HEALTH</p>
             <p>{deviceActivity(device)}</p>
@@ -287,8 +288,8 @@ export function DeviceDrawer({
             <p>Live polling continues during reconciliation. Slow terminal responses can extend the target interval. Full history and Oracle assurance are reported in Reconciliation.</p>
           </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
-            <h3>{device.zkt?.attendance_count ?? '—'} terminal punches</h3>
-            <p>{device.zkt?.user_count ?? '—'} users{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : ` · Last full reconciliation ${relativeTime(device.zkt?.last_reconcile_at)}`}</p>
+            <h3>{device.zkt?.attendance_count == null ? 'Punch count pending' : `${device.zkt.attendance_count.toLocaleString()} terminal punches`}</h3>
+            <p>{device.zkt?.user_count == null ? 'User count pending' : `${device.zkt.user_count.toLocaleString()} users`}{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : device.zkt?.last_reconcile_at ? ` · Last full reconciliation ${relativeTime(device.zkt.last_reconcile_at)}` : ' · No full reconciliation yet'}</p>
             {device.zkt?.capabilities.source_coverage_certified ? <dl>
               <div><dt>Source assurance</dt><dd>Certified source with append-tail verification</dd></div>
               <div><dt>Committed source cursor</dt><dd>{device.firmware_diagnostics?.committed_source_cursor ?? device.zkt?.capabilities.source_coverage_cursor ?? 'Not reported'}</dd></div>
@@ -312,10 +313,14 @@ export function DeviceDrawer({
             </dl>}
           </article>}
           <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} />
-          {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{device.last_error_code.replaceAll('_', ' ')}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
+          <article className={`detail-card wide inventory-assignment-card ${device.is_spare ? 'is-spare' : ''}`}>
+            <span className="inventory-assignment-icon"><Icon name={device.is_spare ? 'server' : 'grid'} /></span>
+            <div><p className="eyebrow">INVENTORY ASSIGNMENT</p><h3>{device.is_spare ? 'Spare device' : 'Active fleet device'}</h3><p>{device.is_spare ? 'Telemetry remains available, but this device is excluded from active fleet availability, outage counts, and the operations queue.' : 'This device contributes to active fleet health, availability, and operational alert reporting.'}</p></div>
+            <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
+          </article>
         </div>}
-        {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${statusPattern(row.level)}`}><time>{dateTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}
+        {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${logLevelPattern(row.level)}`}><time dateTime={row.device_time || row.received_at} title={dateTime(row.device_time || row.received_at)}>{logTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}
         {tab === 'control' && <div className="control-stack">
           <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>{device.firmware_family === 'hikvision' ? 'Manage employee profiles and ADD identity mappings. Biometric enrollment takes place on the terminal.' : 'Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.'}</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
           <article className="control-card"><span><Icon name="refresh" /></span><div><h3>Refresh terminal users</h3><p>Request two matching terminal reads. Current verified revision: {device.zkt?.identity_snapshot_revision || 'none'} · {device.zkt?.identity_snapshot_stable ? 'stable' : 'awaiting verification'}{device.zkt?.identity_snapshot_observed_at ? ` · ${relativeTime(device.zkt.identity_snapshot_observed_at)}` : ''}.</p></div><button className="button secondary" onClick={() => void refreshUsers()}>Request verified reread</button></article>
@@ -349,7 +354,7 @@ export function DeviceDrawer({
               <label>Expected ZKT serial<input value={commKeySerial} onChange={(event) => setCommKeySerial(event.target.value.trim())} /></label>
               {!device.zkt?.serial && <p>The entered serial will be recorded as a provisional, read-only recovery expectation. Firmware must authenticate to the ZKT and prove this exact serial before applying the key.</p>}
               <label>Operational reason<input value={commKeyReason} onChange={(event) => setCommKeyReason(event.target.value)} /></label>
-              <label>Type <strong>CHANGE {device.connector_id} {commKeySerial || '&lt;serial&gt;'}</strong><input value={commKeyConfirmation} onChange={(event) => setCommKeyConfirmation(event.target.value)} /></label>
+              <label>Type <strong>CHANGE {device.connector_id} {commKeySerial || '<serial>'}</strong><input value={commKeyConfirmation} onChange={(event) => setCommKeyConfirmation(event.target.value)} /></label>
               <label>Confirm administrator password<input type="password" autoComplete="current-password" value={commKeyPassword} onChange={(event) => setCommKeyPassword(event.target.value)} /></label>
               <button className="button destructive" disabled={busy || !commKeyState?.enabled} onClick={() => void changeCommKey()}>{commKeyState?.capabilities.recovery_staging ? 'Stage secure recovery' : 'Queue secure recovery'}</button>
             </div>}

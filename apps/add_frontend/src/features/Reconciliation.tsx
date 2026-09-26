@@ -159,7 +159,7 @@ function WorkspaceTabs({
   }
   return (
     <div
-      className="reconciliation-workspace-tabs"
+      className="section-tabs reconciliation-workspace-tabs"
       role="tablist"
       aria-label="Reconciliation workspace"
     >
@@ -202,6 +202,7 @@ function TerminalPicker({
 }) {
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
+  const cardRef = useRef<HTMLElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const optionsRef = useRef<HTMLDivElement>(null)
   const selected =
@@ -244,6 +245,7 @@ function TerminalPicker({
   }
   return (
     <section
+      ref={cardRef}
       className={`reconciliation-terminal-picker panel ${open ? 'is-open' : ''}`}
       aria-label="Terminal selection"
     >
@@ -252,9 +254,8 @@ function TerminalPicker({
           <Icon name="server" />
         </span>
         <div>
-          <small>Terminal to reconcile</small>
           <strong>
-            {selected?.display_name || 'Choose an authorized terminal'}
+            {selected?.display_name || 'Choose a terminal to reconcile'}
           </strong>
           <span>
             {selected
@@ -277,7 +278,7 @@ function TerminalPicker({
         </button>
       </div>
       {open && (
-        <AnchoredLayer anchorRef={triggerRef} className="reconciliation-terminal-layer" matchAnchor mobileSheet preferredWidth={760} onDismiss={(reason) => close(reason === 'escape')}>
+        <AnchoredLayer anchorRef={cardRef} className="reconciliation-terminal-layer" matchAnchor mobileSheet preferredWidth={560} onDismiss={(reason) => close(reason === 'escape')}>
           <div className="reconciliation-terminal-popover">
           <label className="search-field">
             <span className="sr-only">Search authorized terminals</span>
@@ -315,9 +316,6 @@ function TerminalPicker({
                   close(false)
                 }}
               >
-                <span className="reconciliation-terminal-symbol">
-                  <Icon name="server" />
-                </span>
                 <span>
                   <strong>{device.display_name}</strong>
                   <small>
@@ -332,7 +330,7 @@ function TerminalPicker({
                     records · {relativeTime(device.last_seen_at)}
                   </small>
                 </span>
-                <Icon name="chevron" />
+                <Icon name={device.connector_id === selectedId ? 'check' : 'chevron'} />
               </button>
             ))}
             {!shown.length && (
@@ -354,7 +352,7 @@ function ReconciliationCancelMenu({ onCancel }: { onCancel: () => void }) {
   const triggerRef = useRef<HTMLButtonElement>(null)
   return (
     <div className="reconciliation-action-menu">
-      <button ref={triggerRef} className="button secondary" type="button" aria-label="More reconciliation actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
+      <button ref={triggerRef} className="icon-button" type="button" aria-label="More reconciliation actions" title="More actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="more" /></button>
       {open && <AnchoredLayer anchorRef={triggerRef} className="reconciliation-action-layer" mobileSheet preferredWidth={310} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
         <div className="reconciliation-action-panel" role="group" aria-label="Reconciliation actions">
           <button type="button" className="danger-action" onClick={() => { setOpen(false); onCancel() }}><Icon name="x" /><span><strong>Cancel reconciliation</strong><small>Committed checkpoints and evidence remain preserved.</small></span></button>
@@ -806,7 +804,7 @@ function SourceExceptionDrawer({
               </div>
               <div>
                 <dt>Error</dt>
-                <dd>{row.error_code || row.disposition}</dd>
+                <dd>{row.error_code || humanize(row.disposition)}</dd>
               </div>
               <div>
                 <dt>Observed identity</dt>
@@ -1602,9 +1600,8 @@ export function ReconciliationView({
   return (
     <div className="reconciliation-workspace">
       <PageHeader
-        eyebrow="TERMINAL TRUTH & RECOVERY"
-        title="Terminal truth & recovery"
-        description="Recover complete terminal history through bounded, restart-safe capture and separately prove append-only Oracle membership. Every committed checkpoint and exception remains immutable."
+        title="Reconciliation"
+        description="Recover complete terminal history, prove Oracle delivery, and review source exceptions. Every checkpoint stays immutable."
         action={
           <div className="page-actions">
             <button
@@ -1709,8 +1706,7 @@ export function ReconciliationView({
             <section className="reconciliation-readiness panel">
               <div className="panel-header">
                 <div>
-                  <p className="eyebrow">SELECTED TERMINAL CONTEXT</p>
-                  <h2>{selected.display_name}</h2>
+                  <h2>Readiness for {selected.display_name}</h2>
                   <p>
                     {selected.zone_name} · connector {selected.connector_id} ·
                     device {selected.device_id}
@@ -1902,15 +1898,15 @@ export function ReconciliationView({
           <section className="panel reconciliation-ledger">
             <div className="panel-header">
               <div>
-                <h2>Durable reconciliation ledger</h2>
+                <h2>Reconciliation jobs</h2>
                 <p>
-                  Attention-first operational history with independent capture
-                  and Oracle assurance progress.
+                  Jobs needing attention first, with capture and Oracle
+                  assurance progress for each terminal.
                 </p>
               </div>
-              <StatusBadge
-                state={`${jobFilteredTotal.toLocaleString()} MATCHING`}
-              />
+              <span className="badge">
+                {jobFilteredTotal.toLocaleString()} matching
+              </span>
             </div>
             <div className="reconciliation-toolbar">
               <label className="search-field">
@@ -1923,7 +1919,7 @@ export function ReconciliationView({
                 />
               </label>
               <label>
-                <span>Status</span>
+                <span className="sr-only">Status</span>
                 <select
                   value={jobStatus}
                   onChange={(event) =>
@@ -1942,7 +1938,7 @@ export function ReconciliationView({
                 </select>
               </label>
               <label>
-                <span>Zone</span>
+                <span className="sr-only">Zone</span>
                 <select
                   value={jobZone}
                   onChange={(event) => setJobZone(event.target.value)}
@@ -1962,7 +1958,7 @@ export function ReconciliationView({
                     setJobZone('')
                   }}
                 >
-                  Clear {activeJobFilters}
+                  Clear filters
                 </button>
               )}
             </div>
@@ -2202,7 +2198,7 @@ export function ReconciliationView({
                       )}
                       {directAction && (
                         <button
-                          className="button primary"
+                          className={`button ${sourceAssurance.state === 'REVIEW_REQUIRED' ? 'secondary' : 'primary'}`}
                           onClick={() =>
                             setDialog({
                               mode: 'control',
@@ -2226,8 +2222,8 @@ export function ReconciliationView({
                   <Icon name="refresh" />
                   <h3>
                     {activeJobFilters
-                      ? 'No reconciliation jobs match these filters.'
-                      : 'No complete reconciliation has been requested.'}
+                      ? 'No reconciliation jobs match these filters'
+                      : 'No reconciliation has been requested yet'}
                   </h3>
                   <p>
                     {activeJobFilters
@@ -2336,13 +2332,13 @@ export function ReconciliationView({
                 <h2>Immutable source exception ledger</h2>
                 <p>
                   Review never changes a preserved record or creates attendance.
-                  Once every exception in a certified job is reviewed, ADD
-                  automatically continues assurance for its valid records.
+                  When every exception in a certified job is reviewed, ADD
+                  continues assurance for its valid records automatically.
                 </p>
               </div>
-              <StatusBadge
-                state={`${exceptionFilteredTotal.toLocaleString()} MATCHING`}
-              />
+              <span className="badge">
+                {exceptionFilteredTotal.toLocaleString()} matching
+              </span>
             </div>
             {exceptionScope && scopedAssurance && (
               <div
@@ -2708,7 +2704,7 @@ export function ReconciliationView({
         >
           <div className="dialog-body">
             <div
-              className={`info-copy pattern-${dialog.mode === 'start' || dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}
+              className={`info-copy pattern-${dialog.mode === 'start' ? 'notice' : dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}
             >
               <Icon name="shield" />
               <div>

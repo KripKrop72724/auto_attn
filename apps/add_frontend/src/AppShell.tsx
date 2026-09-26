@@ -4,15 +4,31 @@ import type { DashboardRoute } from './types'
 import type { RealtimeState } from './realtime'
 
 const navigation = [
-  { id: 'fleet', label: 'Fleet', icon: 'grid' },
-  { id: 'users', label: 'Users', icon: 'users' },
-  { id: 'attendance', label: 'Attendance', icon: 'clock' },
-  { id: 'reconciliation', label: 'Reconciliation', icon: 'refresh' },
-  { id: 'firmware', label: 'Firmware', icon: 'terminal' },
-  { id: 'alerts', label: 'Alerts', icon: 'alert' },
+  { id: 'fleet', label: 'Fleet', icon: 'grid', description: 'Live device health across the national fleet' },
+  { id: 'users', label: 'Users', icon: 'users', description: 'Terminal identities for one selected device' },
+  { id: 'attendance', label: 'Attendance', icon: 'clock', description: 'Punches, Oracle delivery, and release reviews' },
+  { id: 'reconciliation', label: 'Reconciliation', icon: 'refresh', description: 'Terminal history, recovery, and source evidence' },
+  { id: 'firmware', label: 'Firmware', icon: 'terminal', description: 'Signed releases, device preparation, and campaigns' },
+  { id: 'alerts', label: 'Alerts', icon: 'alert', description: 'Open device conditions and their history' },
 ] as const
 
 const mobilePrimary = new Set<DashboardRoute>(['fleet', 'users', 'attendance', 'alerts'])
+
+const connectionLabels: Record<RealtimeState, string> = {
+  connecting: 'Connecting',
+  live: 'Live sync',
+  reconnecting: 'Reconnecting',
+  stale: 'Cached data',
+}
+
+const pktTime = (value: Date) => value.toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi', hour: 'numeric', minute: '2-digit', second: '2-digit' })
+
+export function operatorInitials(name: string) {
+  const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').split(/[\s._@-]+/).filter(Boolean)
+  if (!words.length) return '?'
+  const letters = words.length === 1 ? words[0].slice(0, 2) : `${words[0][0]}${words[words.length - 1][0]}`
+  return letters.toUpperCase()
+}
 
 export function AppShell({
   children,
@@ -36,8 +52,17 @@ export function AppShell({
   workspaceRef: RefObject<HTMLElement | null>
 }) {
   const [moreOpen, setMoreOpen] = useState(false)
+  const [scrolled, setScrolled] = useState(false)
   const moreTriggerRef = useRef<HTMLButtonElement>(null)
   const moreSheetRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    const update = () => setScrolled(workspace.scrollTop > 56)
+    update()
+    workspace.addEventListener('scroll', update, { passive: true })
+    return () => workspace.removeEventListener('scroll', update)
+  }, [workspaceRef])
   useEffect(() => {
     if (!moreOpen) return
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -69,12 +94,10 @@ export function AppShell({
       ;(previousFocus || moreTriggerRef.current)?.focus()
     }
   }, [moreOpen])
-  const connectionLabel = {
-    connecting: 'Connecting',
-    live: 'Live sync',
-    reconnecting: 'Reconnecting',
-    stale: 'Cached data',
-  }[realtimeState]
+  const connectionLabel = connectionLabels[realtimeState]
+  const current = navigation.find((item) => item.id === route) || navigation[0]
+  const secondaryActive = !mobilePrimary.has(route)
+  const syncDetail = lastSyncAt ? `Last successful sync ${pktTime(lastSyncAt)} PKT` : 'Connecting to live operations'
   return (
     <div className="app-shell">
       <aside className="app-sidebar">
@@ -87,7 +110,7 @@ export function AppShell({
           }}
         >
           <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
-          <span><strong>Attendance Device Dashboard</strong><small>National operations</small></span>
+          <span><strong>State Life</strong><small>Attendance devices</small></span>
         </a>
         <nav aria-label="Primary navigation">
           {navigation.map((item) => (
@@ -95,40 +118,41 @@ export function AppShell({
               key={item.id}
               className={`${route === item.id ? 'active' : ''} ${mobilePrimary.has(item.id) ? 'mobile-primary' : 'mobile-secondary'}`}
               aria-current={route === item.id ? 'page' : undefined}
+              title={item.label}
               onClick={() => onNavigate(item.id)}
             >
               <Icon name={item.icon} />
               <span>{item.label}</span>
               {item.id === 'alerts' && openAlertCount > 0 && (
-                <span className="nav-count" aria-label={`${openAlertCount} open alerts`}>{openAlertCount}</span>
+                <span className="nav-count" aria-label={`${openAlertCount} open alerts`}>{openAlertCount > 99 ? '99+' : openAlertCount}</span>
               )}
             </button>
           ))}
         </nav>
-        <div className="sidebar-system">
-          <span className={`live-sync connection-${realtimeState}`}><i /> {connectionLabel}</span>
-          <small>{lastSyncAt ? `Last sync ${lastSyncAt.toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi' })} PKT` : 'Encrypted · audited · PKT'}</small>
-        </div>
-        <button ref={moreTriggerRef} className={`mobile-more-trigger ${moreOpen ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="grid" /><span>More</span></button>
+        <div className="sidebar-footer"><strong>Pakistan Standard Time</strong><span>All times are shown in PKT</span></div>
+        <button ref={moreTriggerRef} className={`mobile-more-trigger ${moreOpen || secondaryActive ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="menu" /><span>More</span></button>
       </aside>
       <section ref={workspaceRef} className="app-workspace">
-        <header className="app-header">
-          <div className="mobile-brand">
+        <header className={`app-header ${scrolled ? 'is-scrolled' : ''}`}>
+          <div className="app-header-context">
             <img src="/state-life-logo.png" alt="" />
-            <span><strong>ADD Command Center</strong><small>{route}</small></span>
+            <strong>{current.label}</strong>
           </div>
           <div className="operator-area">
-            <span className={`live-sync connection-${realtimeState}`} title={lastSyncAt ? `Last successful sync ${lastSyncAt.toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })} PKT` : 'Connecting to live operations'}><i /> {connectionLabel}</span>
-            <span><strong>{username}</strong><small>State Life operator</small></span>
-            <button className="icon-button" onClick={onLogout} aria-label="Sign out"><Icon name="logout" /></button>
+            <span className={`live-sync connection-${realtimeState}`} role="status" title={syncDetail}><i aria-hidden="true" /><span>{connectionLabel}</span></span>
+            <span className="operator">
+              <span className="operator-avatar" aria-hidden="true">{operatorInitials(username)}</span>
+              <span><strong>{username}</strong><small>State Life operator</small></span>
+            </span>
+            <button className="icon-button" onClick={onLogout} aria-label="Sign out" title="Sign out"><Icon name="logout" /></button>
           </div>
         </header>
         <main className="page-content">{children}</main>
       </section>
       {moreOpen && <div className="mobile-more-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMoreOpen(false) }}>
         <section ref={moreSheetRef} className="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
-          <header><div><p className="eyebrow">ALL WORKSPACES</p><h2 id="mobile-more-title">More operations</h2></div><button className="icon-button" aria-label="Close more navigation" onClick={() => setMoreOpen(false)}><Icon name="x" /></button></header>
-          {navigation.filter((item) => !mobilePrimary.has(item.id)).map((item) => <button key={item.id} className={route === item.id ? 'active' : ''} onClick={() => { onNavigate(item.id); setMoreOpen(false) }}><Icon name={item.icon} /><span><strong>{item.label}</strong><small>{item.id === 'reconciliation' ? 'Historical truth, recovery, and immutable evidence' : 'Signed releases, scope previews, and campaigns'}</small></span><Icon name="chevron" /></button>)}
+          <header><h2 id="mobile-more-title">More operations</h2><button className="icon-button" aria-label="Close more navigation" onClick={() => setMoreOpen(false)}><Icon name="x" /></button></header>
+          {navigation.filter((item) => !mobilePrimary.has(item.id)).map((item) => <button key={item.id} className={route === item.id ? 'active' : ''} aria-current={route === item.id ? 'page' : undefined} onClick={() => { onNavigate(item.id); setMoreOpen(false) }}><Icon name={item.icon} /><span><strong>{item.label}</strong><small>{item.description}</small></span><Icon name="chevron" /></button>)}
         </section>
       </div>}
     </div>

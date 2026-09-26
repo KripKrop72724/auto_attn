@@ -159,7 +159,7 @@ describe('Selected-terminal users workspace', () => {
     expect(within(metrics).getByText('Identity attention').closest('article')?.textContent).toContain('1')
     expect(screen.getByRole('tab', { name: /Directory2/i })).toBeTruthy()
     expect(screen.getByRole('tab', { name: /Identity Review0/i })).toBeTruthy()
-    expect(screen.getByText('RUNNING')).toBeTruthy()
+    expect(screen.getByText('Running')).toBeTruthy()
 
     const add = screen.getByRole('button', { name: 'Add user' }) as HTMLButtonElement
     expect(add.disabled).toBe(true)

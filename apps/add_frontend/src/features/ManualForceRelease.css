@@ -1,14 +1,27 @@
-.force-scope { display: flex; flex-wrap: wrap; gap: 20px; border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 12px 0; }
-.force-scope label, .force-inline { display: flex; align-items: center; gap: 8px; min-height: 44px; }
-.force-device-picker { max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; margin: 12px 0; }
-.force-device-picker label { display: flex; align-items: center; gap: 12px; padding: 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
-.force-device-picker label span { display: grid; gap: 4px; }
-.manual-force input[type=checkbox], .manual-force input[type=radio] { width: 18px; height: 18px; flex-shrink: 0; accent-color: var(--blue); }
-.manual-force label:not(.force-inline) { line-height: 1.6; }
-.manual-force input:not([type=checkbox]):not([type=radio]), .manual-force textarea { max-width: 100%; min-height: 44px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+.manual-force h3 { margin: 0 0 12px; font-size: 15px; }
+.force-scope { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 0 0 16px; padding: 10px 14px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.force-scope legend { padding: 0 4px; color: var(--text); font-size: 13px; font-weight: 500; }
+.force-scope label, .force-inline { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; font-size: 14px; cursor: pointer; }
+.manual-force .force-inline { display: flex; width: fit-content; margin-bottom: 12px; }
+.force-device-search { display: grid; gap: 6px; color: var(--text); font-size: 13px; font-weight: 500; }
+.force-device-picker { max-height: 300px; overflow: auto; margin: 10px 0 8px; border: 1px solid var(--border); border-radius: var(--radius-md); overscroll-behavior: contain; }
+.force-device-picker label { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background-color var(--motion-control) var(--ease-corporate); }
+.force-device-picker label:last-child { border-bottom: 0; }
+.force-device-picker label:hover { background: var(--surface-hover); }
+.force-device-picker label:has(input:checked) { background: var(--accent-subtle); }
+.force-device-picker label span { display: grid; gap: 1px; min-width: 0; }
+.force-device-picker strong { font-size: 14px; font-weight: 500; }
+.force-device-picker small { color: var(--text-tertiary); }
+.force-selection-count { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; }
+.manual-force input[type="checkbox"], .manual-force input[type="radio"] { width: 16px; height: 16px; flex-shrink: 0; }
 .manual-force .safe-repair-filter label { display: grid; gap: 6px; }
-.force-employee-group { border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
-.force-employee-group h4 { margin: 0 0 4px; }
-.force-pill { border: 1px solid #a9c9e9; border-radius: 999px; background: #edf5ff; color: #174979; font: inherit; font-size: 12px; font-weight: 600; padding: 6px 12px; cursor: pointer; min-height: 32px; }
-.force-pill:focus-visible, .manual-force :focus-visible { outline: 3px solid #0075b4; outline-offset: 3px; }
-@media (max-width: 600px) { .force-device-picker small { overflow-wrap: anywhere; } .manual-force .safe-repair-filter { align-items: stretch; flex-direction: column; } }
+.manual-force .force-inline + .safe-repair-scope { margin-bottom: 12px; }
+.force-employee-group { margin: 12px 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.force-employee-group h4 { margin: 0 0 2px; font-size: 14px; }
+.force-employee-group > small { color: var(--text-tertiary); }
+.force-pill { min-height: 22px; padding: 0 8px; border: 1px solid var(--accent-border); border-radius: var(--radius-full); color: var(--accent); background: var(--accent-subtle); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.force-pill:hover { border-color: var(--accent); }
+@media (max-width: 600px) {
+  .force-device-picker small { overflow-wrap: anywhere; }
+  .manual-force .safe-repair-filter { align-items: stretch; flex-direction: column; }
+}

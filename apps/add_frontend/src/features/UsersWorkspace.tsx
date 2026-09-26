@@ -11,6 +11,7 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
+import { humanizeStatus } from '../status'
 import type {
   Command, Device, DeviceUser, HistoricalIdentityReport, IdentityConflictReport,
   IdentityIntegrity, UserDeletionJob,
@@ -35,8 +36,8 @@ type DiagnosticKey = 'device' | 'identity' | 'history' | 'deletion'
 
 const userSections: Array<{ id: UsersSection; label: string; icon: 'users' | 'alert' | 'shield' }> = [
   { id: 'directory', label: 'Directory', icon: 'users' },
-  { id: 'identity', label: 'Identity Review', icon: 'alert' },
-  { id: 'history', label: 'Historical Backlog', icon: 'shield' },
+  { id: 'identity', label: 'Identity review', icon: 'alert' },
+  { id: 'history', label: 'Historical backlog', icon: 'shield' },
 ]
 
 const isBulkSelectionEligible = (user: DeviceUser) =>
@@ -48,21 +49,25 @@ const requestError = (reason: unknown, fallback: string) =>
 function TerminalPicker({
   devices,
   selectedDeviceId,
+  detail,
   open,
   onOpenChange,
   onSelect,
 }: {
   devices: Device[]
   selectedDeviceId: string
+  detail?: Device
   open: boolean
   onOpenChange: (open: boolean) => void
   onSelect: (id: string) => void
 }) {
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
+  const cardRef = useRef<HTMLElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const resultsRef = useRef<HTMLDivElement>(null)
-  const selected = devices.find((device) => device.connector_id === selectedDeviceId)
+  const selected = detail || devices.find((device) => device.connector_id === selectedDeviceId)
+  const terminalName = selected?.zkt?.model || (selected?.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'ZKT terminal')
   const shown = devices.filter((device) =>
     `${device.display_name} ${device.zone_name} ${device.zone_id} ${device.zkt?.serial || ''}`
       .toLowerCase()
@@ -93,24 +98,27 @@ function TerminalPicker({
   }
 
   return (
-    <section className={`terminal-picker panel ${open ? 'is-open' : ''}`} aria-label="Selected terminal">
+    <section ref={cardRef} className={`terminal-picker panel ${open ? 'is-open' : ''}`} aria-label="Selected terminal">
       <div className="terminal-picker-current">
         <span className="terminal-picker-icon"><Icon name="server" /></span>
         <div>
-          <small>Selected terminal</small>
           <strong>{selected?.display_name || 'Choose a terminal'}</strong>
-          <span>{selected ? `${selected.zone_name} · ${selected.zkt?.serial || 'serial pending'}` : 'Search the authorized national fleet'}</span>
+          <span>{selected ? [selected.zone_name, selected.zkt?.serial || 'Serial pending', terminalName, selected.zkt?.ip_address].filter(Boolean).join(' · ') : 'Search the authorized national fleet by name, zone, or serial'}</span>
         </div>
+        {selected && <dl className="terminal-picker-facts">
+          <div><dt>Snapshot</dt><dd>{selected.zkt?.snapshot_complete ? 'Complete' : 'Pending'}</dd></div>
+          <div><dt>Last contact</dt><dd>{relativeTime(selected.last_seen_at)}</dd></div>
+        </dl>}
         {selected && <StatusBadge state={selected.state} live={selected.connected} />}
-        <button ref={triggerRef} className="button secondary" type="button" aria-expanded={open} aria-haspopup="listbox" aria-controls={open ? 'authorized-terminal-options' : undefined} onClick={() => onOpenChange(!open)}><Icon name="search" /> {selected ? 'Change terminal' : 'Select terminal'}</button>
+        <button ref={triggerRef} className={`button ${selected ? 'secondary' : 'primary'}`} type="button" aria-expanded={open} aria-haspopup="listbox" aria-controls={open ? 'authorized-terminal-options' : undefined} onClick={() => onOpenChange(!open)}><Icon name="search" /> {selected ? 'Change terminal' : 'Select terminal'}</button>
       </div>
       {open && (
         <AnchoredLayer
-          anchorRef={triggerRef}
+          anchorRef={cardRef}
           className="terminal-picker-layer"
           matchAnchor
           mobileSheet
-          preferredWidth={720}
+          preferredWidth={560}
           onDismiss={(reason) => closePicker(reason === 'escape')}
         >
           <div className="terminal-picker-popover" aria-label="Choose an authorized terminal">
@@ -125,10 +133,9 @@ function TerminalPicker({
                 onKeyDown={(event) => moveOptionFocus(event, index)}
                 onClick={() => { closePicker(false); onSelect(device.connector_id) }}
               >
-                <span className="terminal-result-symbol"><Icon name="server" /></span>
-                <span><strong>{device.display_name}</strong><small>{device.zone_name} · {device.zkt?.serial || 'serial pending'}</small></span>
-                <span><StatusBadge state={device.state} /><small>{device.zkt?.user_count ?? '—'} users · {relativeTime(device.last_seen_at)}</small></span>
-                <Icon name="chevron" />
+                <span><strong>{device.display_name}</strong><small>{device.zone_name} · {device.zkt?.serial || 'Serial pending'}</small></span>
+                <span><StatusBadge state={device.state} /><small>{device.zkt?.user_count == null ? 'Users pending' : `${device.zkt.user_count.toLocaleString()} users`} · {relativeTime(device.last_seen_at)}</small></span>
+                {device.connector_id === selectedDeviceId ? <Icon name="check" /> : <Icon name="chevron" />}
               </button>
             ))}
             {!shown.length && <div className="empty-state compact"><Icon name="search" /><p>No authorized terminals match this search.</p></div>}
@@ -172,8 +179,8 @@ function UserActionMenu({
   }
   return (
     <div className="user-row-actions">
-      <button className="button secondary user-edit-action" type="button" aria-label={`Edit ${user.display_name}`} disabled={!canEdit} title={!canEdit ? editReason : undefined} onClick={onEdit}><Icon name="edit" /> Edit</button>
-      <button ref={triggerRef} className="button secondary user-more-action" type="button" aria-label={`More actions for ${user.display_name}`} aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
+      <button className="button secondary small user-edit-action" type="button" aria-label={`Edit ${user.display_name}`} disabled={!canEdit} title={!canEdit ? editReason : undefined} onClick={onEdit}><Icon name="edit" /> Edit</button>
+      <button ref={triggerRef} className="icon-button user-more-action" type="button" aria-label={`More actions for ${user.display_name}`} title="More actions" aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}><Icon name="more" /></button>
       {open && <AnchoredLayer anchorRef={triggerRef} className="user-action-layer" mobileSheet preferredWidth={290} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
         <div className="user-action-menu-panel" role="group" aria-label={`Actions for ${user.display_name}`}>
           <button type="button" aria-label={`Enrollment access for ${user.display_name}`} disabled={!canLease} onClick={() => runAction(onLease)}><Icon name="shield" /><span><strong>Enrollment access</strong><small>{canLease ? 'Grant a 10-minute administrator lease' : leaseReason}</small></span></button>
@@ -769,7 +776,7 @@ export function UsersView({
           <span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span>
         </div>
         <div className="user-directory-cell" data-label="Terminal record"><strong>User {user.user_id}</strong><small>UID {user.uid} · version {user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
-        <div className="user-directory-cell user-state-stack" data-label="Role and state"><StatusBadge state={user.privilege === 14 ? 'ADMINISTRATOR' : 'REGULAR'} />{user.current_command_state ? <StatusBadge state={user.current_command_state} /> : <small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small>}</div>
+        <div className="user-directory-cell user-state-stack" data-label="Role and state">{user.privilege === 14 ? <StatusBadge state="ADMINISTRATOR" /> : <strong>Regular user</strong>}{user.current_command_state ? <StatusBadge state={user.current_command_state} /> : <small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small>}</div>
         <div className="user-directory-cell" data-label="Last synchronized"><strong>{relativeTime(user.observed_at)}</strong><small>{dateTime(user.observed_at)}</small></div>
         <UserActionMenu user={user} canEdit={rowCanEdit} canLease={rowCanLease} canDelete={rowCanDelete} editReason={editReason} leaseReason={leaseReason} deleteReason={deleteReason} onEdit={() => setDialog({ mode: 'edit', user })} onLease={() => setDialog({ mode: 'lease', user })} onDelete={() => setDialog({ mode: 'delete', user })} />
       </article>
@@ -778,7 +785,7 @@ export function UsersView({
 
   const directoryPanel = (
     <section className="panel user-directory-panel">
-      <header className="panel-header"><div><h2>Terminal directory</h2><p>{rows.length.toLocaleString()} loaded · mutations remain scoped to {selected?.display_name}</p></div><div className="directory-header-actions"><button className="button secondary" type="button" onClick={() => void refreshWorkspace()}><Icon name="refresh" /> Refresh view</button><button className="button secondary" type="button" disabled={!selected?.connected || Boolean(trackedCommand && !terminalCommandStates.has(trackedCommand.status))} onClick={() => void syncFromTerminal()}><Icon name="server" /> Sync from terminal</button></div></header>
+      <header className="panel-header"><div><h2>Terminal directory</h2><p>{rows.length.toLocaleString()} loaded · changes apply only to {selected?.display_name}</p></div><div className="directory-header-actions"><button className="button secondary" type="button" onClick={() => void refreshWorkspace()}><Icon name="refresh" /> Refresh view</button><button className="button secondary" type="button" disabled={!selected?.connected || Boolean(trackedCommand && !terminalCommandStates.has(trackedCommand.status))} title={!selected?.connected ? 'The terminal must be connected to synchronize.' : undefined} onClick={() => void syncFromTerminal()}><Icon name="server" /> Sync from terminal</button></div></header>
       <div className="users-directory-toolbar">
         <label className="search-field"><span className="sr-only">Search user name, user ID, or UID</span><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name, user ID, or UID" /></label>
         <label><span className="sr-only">Exact CNIC search</span><input inputMode="numeric" autoComplete="off" value={cnicQuery} onChange={(event) => setCnicQuery(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="Exact 13-digit CNIC" aria-invalid={Boolean(cnicError)} /></label>
@@ -788,7 +795,8 @@ export function UsersView({
       {activeFilters.length > 0 && <div className="active-filter-bar" aria-label="Active user filters"><span>{activeFilters.length} active</span>{activeFilters.map((filter) => <button type="button" key={filter.key} onClick={() => clearFilter(filter.key)}>{filter.label}<Icon name="x" /></button>)}<button className="text-button" type="button" onClick={clearFilters}>Clear all</button></div>}
       {directoryError && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{directoryError}</span><button className="button secondary" type="button" onClick={() => void loadDirectory()}>Retry directory</button></div>}
       <div className="users-selection-row">
-        <label className="check-field"><input ref={selectEligibleRowsRef} type="checkbox" checked={allVisibleEligibleSelected} disabled={!canDeleteProfile || activeDeletionJob || validatingSelection || !eligibleRows.length} onChange={(event) => toggleEligibleRows(event.target.checked)} /><span><strong>Select eligible users in this view</strong><small>{selectionSummary}</small></span></label>
+        <label><input ref={selectEligibleRowsRef} type="checkbox" checked={allVisibleEligibleSelected} disabled={!canDeleteProfile || activeDeletionJob || validatingSelection || !eligibleRows.length} onChange={(event) => toggleEligibleRows(event.target.checked)} /><span>Select eligible users in this view</span></label>
+        <small>{selectionSummary}</small>
         <span>Administrators, read-only rows, and active operations are always excluded.</span>
       </div>
       <div ref={userTableRef} className={`user-directory-table ${rows.length >= 200 ? 'is-virtualized' : ''}`} aria-busy={loadingDirectory} aria-label="Selected terminal users">
@@ -804,7 +812,7 @@ export function UsersView({
 
   const identityPanel = (
     <section className="panel users-review-panel">
-      <header className="panel-header"><div><p className="eyebrow">REVERSIBLE IDENTITY REVIEW</p><h2>Exact-CNIC identity review</h2><p>Review duplicate terminal identities without merging users, fingerprints, UIDs, or attendance.</p></div><StatusBadge state={identityCount ? 'REVIEW REQUIRED' : 'RESOLVED'} /></header>
+      <header className="panel-header"><div><h2>Exact-CNIC identity review</h2><p>Review duplicate terminal identities without merging users, fingerprints, UIDs, or attendance.</p></div><StatusBadge state={identityCount ? 'REVIEW REQUIRED' : 'RESOLVED'} /></header>
       {diagnosticErrors.identity && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{diagnosticErrors.identity}</span><button className="button secondary" type="button" onClick={() => void loadDiagnostics()}>Retry review</button></div>}
       {loadingDiagnostics && !conflictReport && <div className="empty-state compact"><Icon name="refresh" /><p>Loading identity evidence…</p></div>}
       {conflictReport?.groups.map((group) => <article key={group.group_token} className={`identity-review-card pattern-${group.status === 'UNRESOLVED' ? 'blocked' : 'confirmed'}`}><header><div><strong>{group.cnic_masked || 'Masked CNIC'}</strong><small>{group.classification.replaceAll('_', ' ')}</small></div><StatusBadge state={group.status} /></header><div className="identity-review-members">{group.members.map((member) => <div key={member.user_key}><span className="avatar">{member.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{member.display_name}</strong><small>User {member.user_id} · UID {member.uid}</small></span><span><strong>{member.punch_evidence.captured_count.toLocaleString()} captured</strong><small>{member.punch_evidence.last_captured_at ? `Last ${dateTime(member.punch_evidence.last_captured_at)}` : 'No punches in ADD evidence'}</small></span></div>)}</div><footer><small>{group.status === 'UNRESOLVED' ? group.recommended_action.replaceAll('_', ' ') : group.resolution_reason}</small><button className={`button ${group.status === 'UNRESOLVED' ? 'secondary' : 'text-button'}`} type="button" onClick={() => setResolutionDialog({ mode: group.status === 'UNRESOLVED' ? 'resolve' : 'revoke', group })}><Icon name={group.status === 'UNRESOLVED' ? 'shield' : 'alert'} />{group.status === 'UNRESOLVED' ? 'Review same-employee alias' : 'Revoke resolution'}</button></footer></article>)}
@@ -814,7 +822,7 @@ export function UsersView({
 
   const historicalPanel = (
     <section className="panel users-review-panel">
-      <header className="panel-header"><div><p className="eyebrow">PRESERVED ATTENDANCE · IDENTITY REQUIRED</p><h2>Historical identity backlog</h2><p>{historyCount.toLocaleString()} events remain fail-closed until exact authoritative evidence is supplied.</p></div><StatusBadge state={historyCount ? 'HR EVIDENCE REQUIRED' : 'RESOLVED'} /></header>
+      <header className="panel-header"><div><h2>Historical identity backlog</h2><p>{historyCount.toLocaleString()} events remain fail-closed until exact authoritative evidence is supplied.</p></div><StatusBadge state={historyCount ? 'HR EVIDENCE REQUIRED' : 'RESOLVED'} /></header>
       {diagnosticErrors.history && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{diagnosticErrors.history}</span><button className="button secondary" type="button" onClick={() => void loadDiagnostics()}>Retry backlog</button></div>}
       {loadingDiagnostics && !historicalReport && <div className="empty-state compact"><Icon name="refresh" /><p>Loading preserved attendance cohorts…</p></div>}
       <div className="historical-review-grid">{[...(historicalReport?.rows || []), ...(historicalReport?.unassigned_groups || [])].map((candidate) => <article key={candidate.source_user_key || candidate.group_token} className="historical-review-card pattern-blocked"><header><div><strong>{candidate.display_name}</strong><small>User {candidate.user_id} · UID {candidate.uid || 'missing'}{candidate.row_version == null ? ' · exact event cohort' : ` · version ${candidate.row_version}`}</small></div><StatusBadge state={candidate.resolution_path.replaceAll('_', ' ')} /></header><div className="historical-review-facts"><span><strong>{candidate.event_count.toLocaleString()}</strong><small>Preserved events</small></span><span><strong>{candidate.blocked_count.toLocaleString()}</strong><small>Identity blocked</small></span><span><strong>{candidate.quarantined_count.toLocaleString()}</strong><small>Quarantined</small></span></div><p>{candidate.operator_actionable ? 'Identity evidence can be reviewed here. Held punches still require manual approval in Force release attendance.' : 'This cohort remains fail-closed until its identity conflict or reuse review is resolved.'}</p><button className="button secondary" type="button" disabled={!candidate.operator_actionable} onClick={() => { if (candidate.resolution_path === 'ACTIVE_USER_ENRICHMENT') { const activeUser = rows.find((row) => row.user_key === candidate.active_user_key); if (activeUser) setDialog({ mode: 'edit', user: activeUser }); else toast.error('Linked current user is unavailable. Refresh and retry.') } else setHistoricalDialog({ candidate }) }}><Icon name="shield" />{candidate.resolution_path === 'ACTIVE_USER_ENRICHMENT' ? 'Enrich current user' : candidate.resolution_path === 'CURRENT_IDENTITY_EVIDENCE' ? 'Verify against current identity' : 'Enter verified HR evidence'}</button></article>)}</div>
@@ -824,22 +832,19 @@ export function UsersView({
 
   return (
     <div className="users-workspace">
-      <PageHeader eyebrow="SELECTED-TERMINAL USER CONTROL" title="Device users" description="Manage certified terminal identities with clearer capability, identity, and safety evidence." action={selected && <div className="page-action-stack"><button className="button primary" type="button" disabled={!canCreate} title={!canCreate ? createReason : undefined} aria-describedby={!canCreate ? 'create-user-disabled-reason' : undefined} onClick={() => setDialog({ mode: 'create' })}><Icon name="userPlus" /> Add user</button>{!canCreate && <small id="create-user-disabled-reason">{createReason}</small>}</div>} />
-      <TerminalPicker devices={devices} selectedDeviceId={selectedDeviceId} open={pickerOpen} onOpenChange={setPickerOpen} onSelect={onSelectDevice} />
-      {!selected ? <section className="panel empty-state users-select-empty"><Icon name="users" /><h2>Select a terminal to manage its users.</h2><p>Every mutation, lease, and identity review remains explicitly scoped to one authorized terminal.</p></section> : <>
-        <section className="selected-terminal-context" aria-label="Selected terminal context"><div><span className="terminal-context-icon"><Icon name="server" /></span><span><small>Terminal context</small><strong>{selected.zkt?.model || (selected.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'ZKT terminal')} · {selected.zkt?.ip_address || 'No IP reported'}</strong></span></div><StatusBadge state={selected.state} live={selected.connected} /><span><small>Snapshot</small><strong>{selected.zkt?.snapshot_complete ? 'Complete' : 'Pending'}</strong></span><span><small>Last contact</small><strong>{relativeTime(selected.last_seen_at)}</strong></span></section>
-
-        <section className="metric-grid users-metrics" aria-label="Selected terminal user indicators"><Metric label="Terminal users" value={identityTotal.toLocaleString()} detail={`${rows.length.toLocaleString()} loaded in this view`} icon="users" /><Metric label="CNIC complete" value={`${completeness}%`} detail={`${identityComplete.toLocaleString()} of ${identityTotal.toLocaleString()} identities`} icon="check" tone={completeness === 100 ? 'positive' : 'warning'} /><Metric label="Identity attention" value={identitiesNeedingAttention.toLocaleString()} detail="Missing CNIC or unresolved duplicate" icon="alert" tone={identitiesNeedingAttention ? 'warning' : 'positive'} /><Metric label="Preserved backlog" value={historyCount.toLocaleString()} detail="Events awaiting identity evidence" icon="shield" tone={historyCount ? 'warning' : 'positive'} /></section>
-
+      <PageHeader title="Users" description="Terminal identities for one selected device. Every change is scoped to that terminal and audited." action={selected && <div className="page-action-stack"><button className="button primary" type="button" disabled={!canCreate} title={!canCreate ? createReason : undefined} aria-describedby={!canCreate ? 'create-user-disabled-reason' : undefined} onClick={() => setDialog({ mode: 'create' })}><Icon name="userPlus" /> Add user</button>{!canCreate && <small id="create-user-disabled-reason">{createReason}</small>}</div>} />
+      <TerminalPicker devices={devices} selectedDeviceId={selectedDeviceId} detail={selected} open={pickerOpen} onOpenChange={setPickerOpen} onSelect={onSelectDevice} />
+      {!selected ? !pickerOpen && <section className="panel empty-state users-select-empty"><Icon name="users" /><h2>Choose a terminal to manage its users</h2><p>Every change, lease, and identity review applies to exactly one authorized terminal.</p></section> : <>
         {selected.firmware_family === 'hikvision' && selected.zkt?.terminal_binding_state === 'CONFIRMED' && <section className="capability-banner pattern-confirmed" aria-label="Terminal identity verified"><Icon name="check" /><div><strong>Terminal identity verified</strong><span>Serial <code>{selected.zkt.serial}</code> is bound to this ESP. No further terminal confirmation is required.</span></div><StatusBadge state="CONFIRMED" /></section>}
-
         {terminalBindingNeedsAction ? <section className="terminal-confirmation-card pattern-waiting" aria-labelledby="terminal-confirmation-heading"><span className="terminal-confirmation-symbol"><Icon name="shield" /></span><div className="terminal-confirmation-card-copy"><p className="eyebrow">ONE-TIME TERMINAL SAFETY CHECK</p><h2 id="terminal-confirmation-heading">Confirm this physical terminal</h2><p>ADD has authenticated the device and observed ZKT serial <code>{selected.zkt?.serial}</code>. An administrator can bind it here with the normal ADD password—no provisioning session is required.</p><div className="terminal-confirmation-meta"><span><Icon name="server" />{selected.zkt?.model || (selected.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'ZKT terminal')}</span><span><Icon name={selected.connected ? 'check' : 'alert'} />{selected.connected ? 'Ready for verification' : 'Offline · confirmation will queue'}</span></div></div><div className="terminal-confirmation-card-action"><StatusBadge state="ACTION REQUIRED" /><button className="button primary" type="button" onClick={() => setSerialConfirmationOpen(true)}><Icon name="shield" /> Confirm terminal serial</button><small>User writes stay read-only until device acknowledgement.</small></div></section>
           : terminalBindingPending ? <section className="terminal-confirmation-card is-pending pattern-waiting" aria-label="Terminal serial confirmation pending"><span className="terminal-confirmation-symbol"><Icon name="refresh" /></span><div className="terminal-confirmation-card-copy"><p className="eyebrow">TERMINAL BINDING IN PROGRESS</p><h2>Waiting for device acknowledgement</h2><p>Authorization was accepted. ADD will unlock user writes only after the ESP stores serial <code>{selected.zkt?.serial}</code> and the terminal passes its stability checks.</p></div><div className="terminal-confirmation-card-action"><StatusBadge state={selected.connected ? 'VERIFYING' : 'WAITING FOR DEVICE'} live={selected.connected} /><small>{selected.connected ? 'Verification is being tracked below.' : 'Keep the ADD device powered and connected.'}</small></div></section>
             : !baseWritable && <div className="capability-banner pattern-waiting"><Icon name="shield" /><div><strong>User writes are unavailable.</strong><span>{actionReason}</span></div><StatusBadge state={selected.zkt?.certification_state || 'READ ONLY'} /></div>}
         {diagnosticErrors.device && <div className="capability-banner pattern-waiting"><Icon name="alert" /><div><strong>Live terminal status is temporarily unavailable.</strong><span>{diagnosticErrors.device}</span></div><button className="button secondary" type="button" onClick={() => void loadDiagnostics()}>Retry</button></div>}
-        {selected.active_lease && <div className={`active-lease-banner pattern-${statusPattern(selected.active_lease.state)}`}><span className="command-symbol"><Icon name="shield" /></span><div><p className="eyebrow">TEMPORARY ENROLLMENT ACCESS</p><h3>{selected.active_lease.state.replaceAll('_', ' ')}</h3><p>{selected.active_lease.expires_at ? `Expires ${relativeTime(selected.active_lease.expires_at)} · ${dateTime(selected.active_lease.expires_at)}` : 'Waiting for a verified terminal expiry.'}{selected.active_lease.last_error ? ` · ${selected.active_lease.last_error}` : ''}</p></div><button className="button destructive" type="button" disabled={selected.active_lease.state === 'REVOKING'} onClick={() => setRevokeLeaseOpen(true)}>Revoke access</button></div>}
+        {selected.active_lease && <div className={`active-lease-banner pattern-${statusPattern(selected.active_lease.state)}`}><span className="command-symbol"><Icon name="shield" /></span><div><p className="eyebrow">TEMPORARY ENROLLMENT ACCESS</p><h3>{humanizeStatus(selected.active_lease.state)}</h3><p>{selected.active_lease.expires_at ? `Expires ${relativeTime(selected.active_lease.expires_at)} · ${dateTime(selected.active_lease.expires_at)}` : 'Waiting for a verified terminal expiry.'}{selected.active_lease.last_error ? ` · ${selected.active_lease.last_error}` : ''}</p></div><button className="button destructive" type="button" disabled={selected.active_lease.state === 'REVOKING'} onClick={() => setRevokeLeaseOpen(true)}>Revoke access</button></div>}
         {trackedCommand && <CommandProgress command={trackedCommand} onCancel={cancelCommand} />}
         {deletionJob && <BulkDeletionProgress job={deletionJob} onCancel={cancelDeletionJob} />}
+
+        <section className="metric-grid users-metrics" aria-label="Selected terminal user indicators"><Metric label="Terminal users" value={identityTotal.toLocaleString()} detail={`${rows.length.toLocaleString()} loaded in this view`} icon="users" /><Metric label="CNIC complete" value={`${completeness}%`} detail={`${identityComplete.toLocaleString()} of ${identityTotal.toLocaleString()} identities`} icon="check" tone={completeness === 100 ? 'positive' : 'warning'} /><Metric label="Identity attention" value={identitiesNeedingAttention.toLocaleString()} detail="Missing CNIC or unresolved duplicate" icon="alert" tone={identitiesNeedingAttention ? 'warning' : 'positive'} /><Metric label="Preserved backlog" value={historyCount.toLocaleString()} detail="Events awaiting identity evidence" icon="shield" tone={historyCount ? 'warning' : 'positive'} /></section>
 
         <div ref={tabsRef} className="section-tabs users-section-tabs" role="tablist" aria-label="User workspace sections">{userSections.map((item) => { const count = item.id === 'directory' ? identityTotal : item.id === 'identity' ? identityCount : historyCount; return <button key={item.id} id={`users-tab-${item.id}`} role="tab" type="button" aria-selected={section === item.id} aria-controls={`users-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? 'active' : ''} onClick={() => selectSection(item.id)} onKeyDown={handleTabKey}><Icon name={item.icon} /><span>{item.label}</span><strong>{count.toLocaleString()}</strong></button> })}</div>
         <div id={`users-panel-${section}`} role="tabpanel" aria-labelledby={`users-tab-${section}`}>{section === 'directory' ? directoryPanel : section === 'identity' ? identityPanel : historicalPanel}</div>

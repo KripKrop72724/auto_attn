@@ -1,7 +1,8 @@
+import { humanizeStatus } from './status'
 import type { Device } from './types'
 
 export function deviceActivity(device: Device): string {
-  if (device.firmware_family !== 'hikvision') return device.current_activity || 'Idle'
+  if (device.firmware_family !== 'hikvision') return device.current_activity ? humanizeStatus(device.current_activity) : 'Idle'
   if (!device.connected) return 'ESP disconnected from ADD'
   if (device.last_error_message) return device.last_error_message
   const error = device.hikvision?.poll_error

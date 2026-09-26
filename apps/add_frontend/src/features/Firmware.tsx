@@ -129,23 +129,22 @@ const sumStates = (counts: Record<string, number>, states: string[]) =>
     0,
   )
 
+const formatBytes = (bytes: number) =>
+  bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(2)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} bytes`
+
 function FirmwareTabs({
   section,
-  releases,
-  campaigns,
   onChange,
 }: {
   section: FirmwareSection
-  releases: number
-  campaigns: number
   onChange: (section: FirmwareSection) => void
 }) {
   const refs = useRef<Array<HTMLButtonElement | null>>([])
-  const tabs: Array<{ id: FirmwareSection; label: string; count?: number }> = [
+  const tabs: Array<{ id: FirmwareSection; label: string }> = [
     { id: 'overview', label: 'Overview' },
     { id: 'prepare', label: 'Prepare device' },
-    { id: 'releases', label: 'Signed releases', count: releases },
-    { id: 'campaigns', label: 'Campaigns', count: campaigns },
+    { id: 'releases', label: 'Signed releases' },
+    { id: 'campaigns', label: 'Campaigns' },
   ]
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let next = index
@@ -161,7 +160,7 @@ function FirmwareTabs({
   }
   return (
     <div
-      className="firmware-workspace-tabs"
+      className="section-tabs firmware-workspace-tabs"
       role="tablist"
       aria-label="Firmware sections"
     >
@@ -181,9 +180,6 @@ function FirmwareTabs({
           onClick={() => onChange(tab.id)}
         >
           {tab.label}
-          {tab.count !== undefined && (
-            <strong>{tab.count.toLocaleString()}</strong>
-          )}
         </button>
       ))}
     </div>
@@ -814,7 +810,7 @@ function CampaignCreator({
         </ol>
         <form onSubmit={(event) => void start(event)}>
           <section>
-            <p className="eyebrow">1 · SIGNED RELEASE</p>
+            <h3 className="firmware-wizard-heading"><span aria-hidden="true">1</span>Signed release</h3>
             <label>
               Release channel
               <select
@@ -848,7 +844,7 @@ function CampaignCreator({
             )}
           </section>
           <section>
-            <p className="eyebrow">2 · DESTINATION ZONE</p>
+            <h3 className="firmware-wizard-heading"><span aria-hidden="true">2</span>Destination zone</h3>
             <label>
               Zone
               <select
@@ -885,7 +881,13 @@ function CampaignCreator({
             )}
           </section>
           <section>
-            <p className="eyebrow">3 · SERVER-AUTHORITATIVE SCOPE</p>
+            <h3 className="firmware-wizard-heading"><span aria-hidden="true">3</span>Device scope</h3>
+            {(!selectedRelease || !zoneId) && (
+              <p className="firmware-wizard-hint">
+                Choose a release and zone to preview exactly which devices will
+                receive it.
+              </p>
+            )}
             {selectedRelease && zoneId && (!scope || expired) && (
               <button
                 type="button"
@@ -917,7 +919,7 @@ function CampaignCreator({
                 </header>
                 <div className="firmware-scope-columns">
                   <section>
-                    <h3>Eligible devices</h3>
+                    <h4>Eligible devices</h4>
                     {scope.eligible.map((device) => (
                       <article key={device.connector_id}>
                         <Icon name="check" />
@@ -934,7 +936,7 @@ function CampaignCreator({
                     ))}
                   </section>
                   <section>
-                    <h3>Safely excluded</h3>
+                    <h4>Safely excluded</h4>
                     {scope.excluded.map((device) => (
                       <article key={device.connector_id}>
                         <Icon name="alert" />
@@ -959,7 +961,7 @@ function CampaignCreator({
             )}
           </section>
           <section>
-            <p className="eyebrow">4 · AUDIT & CONFIRM</p>
+            <h3 className="firmware-wizard-heading"><span aria-hidden="true">4</span>Audit and confirm</h3>
             <label>
               Audited reason
               <textarea
@@ -970,7 +972,14 @@ function CampaignCreator({
               />
             </label>
             <label>
-              Type exact version <code>{selectedRelease?.version || '—'}</code>
+              <span className="firmware-wizard-label">
+                Type exact version{' '}
+                {selectedRelease ? (
+                  <code>{selectedRelease.version}</code>
+                ) : (
+                  <small>after choosing a release</small>
+                )}
+              </span>
               <input
                 value={confirmation}
                 onChange={(event) => setConfirmation(event.target.value)}
@@ -1315,9 +1324,8 @@ export function FirmwareView({
   return (
     <div className="firmware-workspace">
       <PageHeader
-        eyebrow="SIGNED FIRMWARE CONTROL PLANE"
-        title="Firmware operations"
-        description="Prepare Zone Lite hardware, verify signed release channels, and operate exact-scope sequential rollouts with durable evidence and audited controls."
+        title="Firmware"
+        description="Signed releases, device preparation, and audited rollouts to exact device scopes."
         action={
           <div className="page-actions">
             <button
@@ -1347,14 +1355,18 @@ export function FirmwareView({
           </div>
         }
       />
-      <section className="firmware-channel-strip">
+      <FirmwareTabs
+        section={section}
+        onChange={onSection}
+      />
+      {section !== 'prepare' && <section className="firmware-channel-strip" aria-label="OTA channels">
         <article className={`pattern-${enabled ? 'confirmed' : 'blocked'}`}>
           <Icon name="shield" />
           <span>
             <strong>National production OTA</strong>
             <small>
               {enabled
-                ? 'AVAILABLE releases may use exact zone scope'
+                ? 'Available releases may target an exact zone'
                 : 'Disabled; production campaign creation is blocked'}
             </small>
           </span>
@@ -1372,13 +1384,7 @@ export function FirmwareView({
           </span>
           <StatusBadge state={hilEnabled ? 'ENABLED' : 'DISABLED'} />
         </article>
-      </section>
-      <FirmwareTabs
-        section={section}
-        releases={releaseTotals.all}
-        campaigns={campaignTotals.campaigns.all || 0}
-        onChange={onSection}
-      />
+      </section>}
       {section === 'overview' && (
         <div role="tabpanel" id="firmware-overview-panel">
           <section className="metric-grid firmware-metrics">
@@ -1398,7 +1404,7 @@ export function FirmwareView({
             <Metric
               label="OTA-ready fleet"
               value={`${otaReady}/${devices.length}`}
-              detail="Authoritative OTA_READY device state"
+              detail="Devices reporting OTA ready"
               icon="server"
               tone={
                 otaReady === devices.length && devices.length
@@ -1558,13 +1564,13 @@ export function FirmwareView({
             <div>
               <h2>Signed release inventory</h2>
               <p>
-                Compact cryptographic inventory with production, HIL, and
-                revoked channels kept visually distinct.
+                Production, HIL-only, and revoked releases with their signing
+                evidence.
               </p>
             </div>
-            <StatusBadge
-              state={`${releaseFilteredTotal.toLocaleString()} MATCHING`}
-            />
+            <span className="badge">
+              {releaseFilteredTotal.toLocaleString()} matching
+            </span>
           </div>
           <div className="firmware-toolbar">
             <label className="search-field">
@@ -1577,7 +1583,7 @@ export function FirmwareView({
               />
             </label>
             <label>
-              <span>Channel</span>
+              <span className="sr-only">Channel</span>
               <select
                 value={releaseState}
                 onChange={(event) => setReleaseState(event.target.value)}
@@ -1596,7 +1602,7 @@ export function FirmwareView({
                   setReleaseState('')
                 }}
               >
-                Clear {releaseFilterCount}
+                Clear filters
               </button>
             )}
           </div>
@@ -1658,7 +1664,7 @@ export function FirmwareView({
                   </span>
                   <span>
                     <small>Image size</small>
-                    <strong>{release.image_size.toLocaleString()} bytes</strong>
+                    <strong title={`${release.image_size.toLocaleString()} bytes`}>{formatBytes(release.image_size)}</strong>
                   </span>
                   <span>
                     <small>Partition</small>
@@ -1689,7 +1695,7 @@ export function FirmwareView({
                             void copy('Git commit', release.git_sha)
                           }
                         >
-                          <Icon name="list" />
+                          <Icon name="copy" />
                         </button>
                       </dd>
                     </div>
@@ -1703,7 +1709,7 @@ export function FirmwareView({
                             void copy('Image SHA-256', release.image_sha256)
                           }
                         >
-                          <Icon name="list" />
+                          <Icon name="copy" />
                         </button>
                       </dd>
                     </div>
@@ -1723,7 +1729,7 @@ export function FirmwareView({
                               )
                             }
                           >
-                            <Icon name="list" />
+                            <Icon name="copy" />
                           </button>
                         )}
                       </dd>
@@ -1742,7 +1748,7 @@ export function FirmwareView({
                 {release.state !== 'REVOKED' && (
                   <footer>
                     <button
-                      className="button destructive"
+                      className="button destructive-outline"
                       onClick={() => {
                         setRevokeRelease(release)
                         setRevokeError('')
@@ -1804,13 +1810,13 @@ export function FirmwareView({
             <div>
               <h2>Campaign operations</h2>
               <p>
-                Attention-first sequential rollout history with details loaded
-                only when inspected.
+                Sequential rollouts, attention first. Open a campaign for its
+                per-device evidence.
               </p>
             </div>
-            <StatusBadge
-              state={`${campaignFilteredTotal.toLocaleString()} MATCHING`}
-            />
+            <span className="badge">
+              {campaignFilteredTotal.toLocaleString()} matching
+            </span>
           </div>
           <div className="firmware-campaign-toolbar">
             <label className="search-field">
@@ -1823,7 +1829,7 @@ export function FirmwareView({
               />
             </label>
             <label>
-              <span>Status</span>
+              <span className="sr-only">Status</span>
               <select
                 value={campaignStatus}
                 onChange={(event) => setCampaignStatus(event.target.value)}
@@ -1836,7 +1842,7 @@ export function FirmwareView({
               </select>
             </label>
             <label>
-              <span>Zone</span>
+              <span className="sr-only">Zone</span>
               <select
                 value={campaignZone}
                 onChange={(event) => setCampaignZone(event.target.value)}
@@ -1848,7 +1854,7 @@ export function FirmwareView({
               </select>
             </label>
             <label>
-              <span>Release</span>
+              <span className="sr-only">Release</span>
               <select
                 value={campaignRelease}
                 onChange={(event) => setCampaignRelease(event.target.value)}
@@ -1871,7 +1877,7 @@ export function FirmwareView({
                   setCampaignRelease('')
                 }}
               >
-                Clear {campaignFilterCount}
+                Clear filters
               </button>
             )}
           </div>

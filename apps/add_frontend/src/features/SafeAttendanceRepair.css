@@ -1,29 +1,53 @@
-.safe-repair { --muted: #435160; margin-bottom: 20px; overflow: hidden; }
-.safe-repair-header, .safe-repair-heading, .safe-repair-scope, .safe-repair-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.safe-repair-header, .safe-repair-body { padding: 20px; }
-.safe-repair-header p, .safe-repair-items p { margin: 6px 0; color: var(--muted); }
-.safe-repair-body { border-top: 1px solid var(--line); }
-.safe-repair-scope label { flex: 1; max-width: 560px; display: grid; gap: 8px; }
-.safe-repair select { min-height: 44px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; background: var(--surface); color: var(--ink); font: inherit; }
-.safe-repair-run { margin-top: 24px; }
-.safe-repair-steps { display: flex; list-style: none; padding: 0; gap: 12px; flex-wrap: wrap; }
-.safe-repair-steps li { background: var(--soft); border-radius: 6px; padding: 10px 16px; border: 1px solid var(--line); }
-.safe-repair-steps [aria-current] { border-color: var(--blue); color: #00699c; font-weight: 600; }
-.safe-repair-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 20px 0; }
-.safe-repair-next { padding: 16px; background: var(--soft); border-radius: 6px; }
-.safe-repair-actions { margin: 20px 0; justify-content: flex-start; }
-.safe-repair details { margin: 20px 0; }
-.safe-repair summary { cursor: pointer; min-height: 44px; align-content: center; font-weight: 600; }
-.safe-repair-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 20px 0 8px; }
-.safe-repair-items, .safe-repair-devices, .safe-repair-history { list-style: none; padding: 0; }
-.safe-repair-items li { display: flex; gap: 16px; justify-content: space-between; align-items: center; border-top: 1px solid var(--line); padding: 16px 0; }
-.safe-repair-items li > div:last-child { display: grid; justify-items: start; gap: 8px; }
-.safe-repair-devices li { padding: 10px 0; display: grid; gap: 4px; }
-.safe-repair-devices span { color: var(--muted); }
-.safe-repair-history li { padding: 6px 0; }
-.safe-repair-review { padding: 16px 0; border-top: 1px solid var(--line); }
-@media (max-width: 600px) { .safe-repair-header, .safe-repair-body { padding: 14px; } .safe-repair-items li { flex-direction: column; align-items: flex-start; } .safe-repair-steps li { flex: 1; } }
+.safe-repair { margin-bottom: 20px; }
+.attendance-workspace [role="tabpanel"] > * + .safe-repair { margin-top: 16px; }
+.safe-repair-header, .safe-repair-heading, .safe-repair-scope, .safe-repair-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; }
+.safe-repair-header { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.safe-repair-header h2 { margin: 0; font-size: 16px; }
+.safe-repair-header p { margin: 2px 0 0; color: var(--text-secondary); font-size: 13px; }
+.safe-repair-body { padding: 20px; }
+.safe-repair-body > p { color: var(--text-secondary); font-size: 13px; }
+.safe-repair-empty { margin: 0; color: var(--text-tertiary); font-size: 13px; }
+.safe-repair-items p { margin: 4px 0; color: var(--text-secondary); }
+.safe-repair-scope { justify-content: flex-start; }
+.safe-repair-scope label { flex: 1; max-width: 320px; display: grid; gap: 6px; font-size: 13px; font-weight: 500; }
+.safe-repair select { max-width: 100%; }
+.safe-repair-run { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+.safe-repair-heading h3 { margin: 0; font-size: 16px; }
+.safe-repair-heading a { font-size: 13px; }
+.safe-repair-steps { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; padding: 0; list-style: none; counter-reset: repair-step; }
+.safe-repair-steps li { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 12px 0 8px; border: 1px solid var(--border); border-radius: var(--radius-full); color: var(--text-tertiary); background: var(--surface); font-size: 13px; counter-increment: repair-step; }
+.safe-repair-steps li::before { content: counter(repair-step); width: 20px; height: 20px; display: inline-grid; place-items: center; border-radius: 50%; color: var(--text-secondary); background: var(--surface-sunken); font-size: 11px; font-weight: 600; }
+.safe-repair-steps [aria-current] { border-color: var(--accent-border); color: var(--accent); background: var(--accent-subtle); font-weight: 600; }
+.safe-repair-steps [aria-current]::before { color: #fff; background: var(--accent); }
+.safe-repair-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 16px 0; }
+.safe-repair-next { margin: 16px 0; padding: 16px; border: 1px solid var(--accent-border); border-radius: var(--radius-md); background: var(--accent-subtle); }
+.safe-repair-next h3 { margin: 0 0 4px; }
+.safe-repair-next p { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; }
+.safe-repair-next small { display: block; margin-top: 8px; }
+.safe-repair-actions { justify-content: flex-start; margin: 16px 0; }
+.safe-repair-actions span { color: var(--text-tertiary); font-size: 13px; }
+.safe-repair details { margin: 20px 0 0; }
+.safe-repair summary { min-height: 36px; display: flex; align-items: center; color: var(--accent); font-size: 14px; font-weight: 500; }
+.safe-repair summary::before { content: ""; width: 14px; height: 14px; flex: none; margin-right: 8px; background: var(--chevron-right) center / 14px no-repeat; transition: transform var(--motion-control) var(--ease-corporate); }
+.safe-repair details[open] > summary::before { transform: rotate(90deg); }
+.safe-repair-filter { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 20px 0 8px; }
+.safe-repair-filter label { font-size: 13px; font-weight: 500; }
+.safe-repair-filter select, .safe-repair-filter input { width: auto; min-width: 220px; }
+.safe-repair-items, .safe-repair-devices, .safe-repair-history { margin: 0; padding: 0; list-style: none; }
+.safe-repair-items li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.safe-repair-items li > div:last-child { display: grid; justify-items: start; gap: 4px; }
+.safe-repair-items li > div:last-child span { color: var(--text-secondary); }
+.safe-repair-devices { margin: 12px 0; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.safe-repair-devices li { display: grid; gap: 2px; padding: 10px 14px; }
+.safe-repair-devices li + li { border-top: 1px solid var(--border); }
+.safe-repair-devices strong { font-size: 14px; font-weight: 500; }
+.safe-repair-devices span { color: var(--text-secondary); font-size: 13px; }
+.safe-repair-history { display: grid; gap: 6px; margin-top: 8px; }
+.safe-repair-history li .button { width: 100%; justify-content: flex-start; font-weight: 400; }
+.safe-repair small { color: var(--text-tertiary); }
+@media (max-width: 600px) {
+  .safe-repair-header, .safe-repair-body { padding: 14px 16px; }
+  .safe-repair-items li { align-items: flex-start; flex-direction: column; }
+  .safe-repair-filter select, .safe-repair-filter input { width: 100%; min-width: 0; }
+}
 @media (prefers-reduced-motion: reduce) { .safe-repair * { scroll-behavior: auto; transition: none; } }
-
-.safe-repair small { color: #435160; }
-.safe-repair .safe-repair-steps [aria-current] { color: #00486e; }

@@ -334,7 +334,7 @@ test.beforeEach(async ({ page }) => mockDashboard(page))
 
 test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
   await page.goto('/fleet')
-  await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
   await expect(page.getByRole('region', { name: 'Pakistan device network map' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Map' })).toHaveAttribute('aria-pressed', 'true')
   const islamabadMarker = page.getByRole('button', { name: /Islamabad, 1 device, All online/i })
@@ -369,7 +369,7 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   }))
 
   await page.goto('/fleet')
-  await expect(page.getByRole('heading', { name: 'Attendance device command center' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
   const markers = page.locator('.fleet-map-marker')
   await expect(markers).toHaveCount(7, { timeout: 10_000 })
   const projectedCoordinates = await markers.evaluateAll((nodes) => Object.fromEntries(nodes.map((node) => {
@@ -454,7 +454,7 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
 
   const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })
   await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Users', exact: true, level: 1 })).toBeVisible()
   await primaryNav.getByRole('button', { name: 'Attendance', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Live attendance' })).toBeVisible()
   if ((page.viewportSize()?.width || 0) <= 760) {
@@ -467,15 +467,15 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
     await moreTrigger.click()
     const moreNavigation = page.getByRole('dialog', { name: 'More operations' })
     await moreNavigation.getByRole('button', { name: /Reconciliation/ }).click()
-    await expect(page.getByRole('heading', { name: 'Terminal truth & recovery' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
     await page.getByRole('button', { name: 'More', exact: true }).click()
     await page.getByRole('dialog', { name: 'More operations' }).getByRole('button', { name: /Firmware/ }).click()
   } else {
     await primaryNav.getByRole('button', { name: 'Reconciliation', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Terminal truth & recovery' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
     await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
   }
-  await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
   const channelBadgeGeometry = await page.locator('.firmware-channel-strip .status-badge').first().evaluate((badge) => {
     const icon = badge.querySelector('svg')?.getBoundingClientRect()
     const text = badge.querySelector('span')?.getBoundingClientRect()
@@ -497,14 +497,14 @@ test('primary routes and device deep link remain usable', async ({ page }) => {
   await page.getByRole('tab', { name: /Campaigns/ }).click()
   await expect(page.getByRole('heading', { name: 'Campaign operations' })).toBeVisible()
   await primaryNav.getByRole('button', { name: /Alerts/ }).click()
-  await expect(page.getByRole('heading', { name: 'Alerts and exceptions' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Alerts', exact: true, level: 1 })).toBeVisible()
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length }))).toEqual({ local: 0, session: 0 })
 })
 
 test('populated Users and Attendance workspaces are responsive, keyboard-operable, and accessible', async ({ page }) => {
   await page.goto('/users/connector-one')
-  await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Users', exact: true, level: 1 })).toBeVisible()
   await expect(page.getByRole('article', { name: /Ayesha Khan, user 1007/i })).toBeVisible()
   await expect(page.getByRole('tab', { name: /Directory/i })).toHaveAttribute('aria-selected', 'true')
   const more = page.getByLabel('More actions for Ayesha Khan')
@@ -552,8 +552,8 @@ test('Attendance combines Oracle filters and offers an accessible per-punch send
   const row = page.getByRole('article', { name: /Ayesha Khan, Check in/i })
   await expect(row).toBeVisible()
   await page.locator('.attendance-advanced > summary').click()
-  await page.getByRole('checkbox', { name: 'BLOCKED IDENTITY' }).check()
-  await page.getByRole('checkbox', { name: 'FAILED RETRYABLE' }).check()
+  await page.getByRole('checkbox', { name: 'Blocked identity' }).check()
+  await page.getByRole('checkbox', { name: 'Failed retryable' }).check()
   await page.getByLabel('CNIC availability').selectOption('present')
   await page.getByRole('button', { name: 'View results' }).click()
   await expect(page.getByRole('button', { name: /Oracle: BLOCKED IDENTITY/i })).toBeVisible()
@@ -571,7 +571,7 @@ test('Attendance combines Oracle filters and offers an accessible per-punch send
 test('legacy employee repair route opens the responsive blocked-punch review', async ({ page }, testInfo) => {
   await page.goto('/reconciliation?tab=employee-repair&device_id=connector-one')
   await expect(page).toHaveURL(/\/attendance\?view=needs-review&device_id=connector-one$/)
-  await expect(page.getByRole('heading', { name: 'Attendance · Needs review' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Attendance', exact: true, level: 1 })).toBeVisible()
   await expect(page.getByRole('tab', { name: /Needs review/ })).toHaveAttribute('aria-selected', 'true')
   await expect(page.getByRole('heading', { name: 'Force release attendance' })).toBeVisible()
   await expect(page.getByText('Manual approval only')).toBeVisible()
@@ -624,7 +624,7 @@ test('terminal multi-selection survives server-side search and current-view togg
 
 test('source exception inspector is responsive, keyboard-operable, and fail-closed', async ({ page }) => {
   await page.goto('/reconciliation')
-  await expect(page.getByRole('heading', { name: 'Terminal truth & recovery' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
   await page.getByRole('tab', { name: /Source exceptions/ }).click()
   await expect(page.getByRole('heading', { name: 'Immutable source exception ledger' })).toBeVisible()
   await expect(page.getByText('IMPLAUSIBLE_TERMINAL_TIME')).toBeVisible()
@@ -760,10 +760,10 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   const savedScroll = await workspace.evaluate((node) => node.scrollTop)
   expect(savedScroll).toBeGreaterThan(0)
   await page.getByRole('navigation', { name: 'Primary navigation' }).getByRole('button', { name: 'Firmware', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Firmware operations' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
   await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(0)
   await page.goBack()
-  await expect(page.getByRole('heading', { name: 'Device users' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Users', exact: true, level: 1 })).toBeVisible()
   await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(savedScroll)
 
   await page.route('**/api/v1/devices*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: nationwideDevices }) }))
@@ -829,7 +829,8 @@ test('physical provisioning environment is responsive, explicit, and accessible'
     })
   })
   await page.goto('/firmware?tab=prepare')
-  await expect(page.getByRole('heading', { name: 'Prepare a Zone Lite ESP32' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Prepare device' })).toHaveAttribute('aria-selected', 'true')
   await expect(page.getByRole('heading', { name: 'Connect the provisioning companion' })).toBeVisible()
   await expect(page.getByText('c'.repeat(64))).toBeVisible()
   await expect(page.getByText(/not OS code-signed/i)).toBeVisible()

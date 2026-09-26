@@ -36,6 +36,18 @@ FORBIDDEN_EXACT = {
 ALLOWED_UI_COLORS = {
     "#0094da",
     # State Life corporate navy/blue scale and accessible semantic states.
+    # Dashboard design tokens: corporate blue, neutral surfaces/text, and
+    # accessible success/warning/error states. Keep this list explicit so
+    # unreviewed colors still fail the branding contract.
+    "#005d8a", "#0071a7", "#067647", "#0b1220", "#0c111d",
+    "#101828", "#111827", "#172033", "#17b26a", "#1d2939",
+    "#1f2937", "#374151", "#475467", "#667085", "#7cc8ef",
+    "#8b95a7", "#912018", "#98a2b3", "#a8dcf4", "#a9b2bf",
+    "#abefc6", "#b3bcc8", "#b42318", "#b54708", "#c5ccd6",
+    "#d0d5dd", "#d1d5db", "#d8effb", "#e4e7ec", "#e5e7eb",
+    "#ecfdf3", "#eef8fd", "#f04438", "#f1f3f5", "#f4f6f8",
+    "#f6f7f9", "#f79009", "#f97066", "#f9fafb", "#fdb022",
+    "#fecdca", "#fedf89", "#fef3f2", "#fffaeb",
     "#066da3", "#071a2b", "#079bdc", "#087cb7", "#0b2238", "#0c5279",
     "#0c704d", "#12202d", "#12324f", "#164c70", "#526475", "#536675",
     "#55c6f2", "#62cff7", "#65cef5", "#7894a6", "#8bcdb4", "#8ca0ad",

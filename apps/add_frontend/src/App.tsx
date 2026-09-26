@@ -21,7 +21,7 @@ import { AppShell } from './AppShell'
 import { Icon } from './Icon'
 import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
 import { useRealtime, type RealtimeTopic } from './realtime'
-import { normalizedStatus, statusPattern } from './status'
+import { firmwareLabel, humanizeStatus, normalizedStatus, statusPattern } from './status'
 import type {
   Alert,
   AlertQueueResponse,
@@ -173,6 +173,13 @@ export const confirmationMatches = (value: string, user: DeviceUser) =>
 export const bulkDeletionConfirmation = (count: number, deviceId: string) =>
   `DELETE ${count} USERS FROM ${deviceId}`
 
+export const statusIcon = {
+  confirmed: 'check',
+  blocked: 'alert',
+  waiting: 'clock',
+  notice: 'info',
+} as const
+
 export function StatusBadge({
   state,
   live = false,
@@ -183,18 +190,10 @@ export function StatusBadge({
   const status = normalizedStatus(state)
   const label = status.replaceAll('_', ' ')
   const pattern = statusPattern(status)
-  const icon =
-    pattern === 'confirmed'
-      ? 'check'
-      : pattern === 'blocked'
-        ? 'alert'
-        : pattern === 'waiting'
-          ? 'pause'
-          : 'info'
   return (
     <span className={`status-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Status: ${label}`} title={label}>
-      <Icon name={icon} />
-      <span>{label}</span>
+      <Icon name={statusIcon[pattern]} />
+      <span>{humanizeStatus(status)}</span>
       {live && <i aria-hidden="true" />}
     </span>
   )
@@ -204,12 +203,13 @@ export function useToast() {
   const [toast, setToast] = useState<ToastState>(null)
   useEffect(() => {
     if (!toast) return
-    const timeout = window.setTimeout(() => setToast(null), 5000)
+    const timeout = window.setTimeout(() => setToast(null), toast.kind === 'error' ? 8000 : 5000)
     return () => window.clearTimeout(timeout)
   }, [toast])
   const notice = useCallback((text: string) => setToast({ kind: 'notice', text }), [])
   const error = useCallback((text: string) => setToast({ kind: 'error', text }), [])
-  return useMemo(() => ({ toast, notice, error }), [error, notice, toast])
+  const dismiss = useCallback(() => setToast(null), [])
+  return useMemo(() => ({ toast, notice, error, dismiss }), [dismiss, error, notice, toast])
 }
 
 let modalLockDepth = 0
@@ -320,7 +320,6 @@ export function Dialog({
       >
         <header className="dialog-header">
           <div>
-            <p className="eyebrow">STATE LIFE · SECURE OPERATION</p>
             <h2 id={titleId}>{title}</h2>
             {description && <p id={`${titleId}-description`}>{description}</p>}
           </div>
@@ -339,37 +338,41 @@ const Login = lazy(() => import('./features/Login'))
 const FleetMap = lazy(() => import('./features/FleetMap').then((module) => ({ default: module.FleetMap })))
 
 export function PageHeader({
-  eyebrow,
   title,
   description,
   action,
 }: {
-  eyebrow: string
   title: string
-  description: string
+  description?: string
   action?: ReactNode
 }) {
   return (
     <header className="page-header">
       <div>
-        <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
-        <p>{description}</p>
+        {description && <p>{description}</p>}
       </div>
       {action}
     </header>
   )
 }
 
-export function Metric({ label, value, detail, icon, tone = 'neutral', onClick }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: 'neutral' | 'positive' | 'warning' | 'critical'; onClick?: () => void }) {
-  const content = <>
-      <span className="metric-icon"><Icon name={icon} /></span>
-      <div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div>
-    </>
+export type MetricTone = 'neutral' | 'positive' | 'warning' | 'critical'
+
+export function Metric({ label, value, detail, icon, tone = 'neutral', onClick }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: MetricTone; onClick?: () => void }) {
+  const content = <div>
+      <p><Icon name={icon} />{label}</p>
+      <strong>{typeof value === 'number' ? value.toLocaleString() : value}</strong>
+      <small>{detail}</small>
+    </div>
   return onClick
-    ? <button className={`metric-card metric-${tone} metric-link`} onClick={onClick} aria-label={`${label}: ${value}. ${detail}`}>{content}</button>
+    ? <button type="button" className={`metric-card metric-${tone} metric-link`} onClick={onClick} aria-label={`${label}: ${value}. ${detail}`}>{content}</button>
     : <article className={`metric-card metric-${tone}`}>{content}</article>
 }
+
+// Availability is only calm when nearly every connector is online.
+export const availabilityTone = (percent: number, total: number): MetricTone =>
+  !total ? 'neutral' : percent >= 95 ? 'positive' : percent >= 80 ? 'warning' : 'critical'
 
 function FleetView({
   devices,
@@ -396,12 +399,15 @@ function FleetView({
   const activeDevices = devices.filter((device) => !device.is_spare)
   const spareDevices = devices.filter((device) => device.is_spare)
   const inventoryDevices = inventory === 'fleet' ? activeDevices : spareDevices
+  const needle = query.trim().toLowerCase()
+  const matchesState = (device: Device) => inventory === 'spares' || filter === 'ALL'
+    || (filter === 'ATTENTION' ? statusPattern(device.state) !== 'confirmed' : device.state === filter)
   const shown = inventoryDevices.filter(
     (device) =>
-      (inventory === 'spares' || filter === 'ALL' || device.state === filter) &&
-      `${device.display_name} ${device.zone_name} ${device.hardware_id} ${device.zkt?.serial || ''}`
+      matchesState(device) &&
+      `${device.display_name} ${device.zone_name} ${device.zone_id} ${device.hardware_id} ${device.zkt?.serial || ''}`
         .toLowerCase()
-        .includes(query.toLowerCase()),
+        .includes(needle),
   ).sort((left, right) => sort === 'name'
     ? left.display_name.localeCompare(right.display_name)
     : sort === 'state'
@@ -415,53 +421,59 @@ function FleetView({
     (overview.flapping || 0) +
     (overview.quarantined_duplicate_serial || 0)
   const delivery = overview.ords_delivery
+  const recovery = overview.attendance_recovery?.delivery
+  const backlogStale = Boolean(delivery?.oldest_backlog_at && Date.now() - +new Date(delivery.oldest_backlog_at) > 15 * 60_000)
+  const filtered = Boolean(needle) || (inventory === 'fleet' && filter !== 'ALL')
+  const clearFilters = () => { setQuery(''); setFilter('ALL') }
+  const showAttention = () => { setInventory('fleet'); setFilter('ATTENTION'); setMode('list') }
   return (
     <>
       <PageHeader
-        eyebrow={inventory === 'fleet' ? 'NATIONAL FLEET' : 'SPARE INVENTORY'}
-        title={inventory === 'fleet' ? 'Attendance device command center' : 'Spare device inventory'}
+        title={inventory === 'fleet' ? 'Fleet' : 'Spare device inventory'}
         description={inventory === 'fleet'
-          ? 'Live operational state of every assigned Zone Lite ESP and its ZKT terminal.'
-          : 'Unassigned backup devices kept separate from active fleet health, outages, and operational issues.'}
-        action={<div className="page-context"><span>{inventory === 'fleet' ? 'National footprint' : 'Ready reserve'}</span><strong>{inventory === 'fleet' ? `${overview.total} active pair${overview.total === 1 ? '' : 's'}` : `${overview.spares ?? spareDevices.length} spare device${(overview.spares ?? spareDevices.length) === 1 ? '' : 's'}`}</strong><small>{inventory === 'fleet' ? 'Live control · PKT' : 'Excluded from fleet health'}</small></div>}
+          ? 'Live health of every Zone Lite connector and its attendance terminal.'
+          : 'Backup devices, kept apart from fleet health, outages, and the operations queue.'}
       />
       <div className="section-tabs fleet-inventory-tabs" role="tablist" aria-label="Device inventory">
-        <button role="tab" aria-selected={inventory === 'fleet'} className={inventory === 'fleet' ? 'active' : ''} onClick={() => setInventory('fleet')}><Icon name="grid" /> Active fleet <span>{activeDevices.length}</span></button>
-        <button role="tab" aria-selected={inventory === 'spares'} className={inventory === 'spares' ? 'active' : ''} onClick={() => setInventory('spares')}><Icon name="server" /> Spares <span>{spareDevices.length}</span></button>
+        <button role="tab" aria-selected={inventory === 'fleet'} className={inventory === 'fleet' ? 'active' : ''} onClick={() => setInventory('fleet')}><Icon name="grid" /> Active fleet <span className="tab-count">{activeDevices.length}</span></button>
+        <button role="tab" aria-selected={inventory === 'spares'} className={inventory === 'spares' ? 'active' : ''} onClick={() => setInventory('spares')}><Icon name="server" /> Spares <span className="tab-count">{spareDevices.length}</span></button>
       </div>
       {inventory === 'fleet' ? <section className="metric-grid" aria-label="Fleet key indicators">
-        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" tone="positive" onClick={() => setFilter('ONLINE')} />
-        <Metric label="Open operations queue" value={overview.open_alerts} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline`} icon="alert" tone={overview.open_alerts ? 'warning' : 'positive'} onClick={onNavigateAlerts} />
+        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" tone={availabilityTone(availability, overview.total)} onClick={attention || online < overview.total ? showAttention : undefined} />
+        <Metric label="Operations queue" value={overview.open_alerts} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline`} icon="alert" tone={overview.open_alerts ? 'warning' : 'neutral'} onClick={onNavigateAlerts} />
         <Metric
           label="ORDS delivery queue"
           value={delivery?.backlog ?? 0}
           detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`}
           icon="clock"
-          tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 ? 'warning' : 'positive'}
+          tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 && backlogStale ? 'warning' : 'neutral'}
         />
         <Metric
           label="Attendance recovery"
-          value={overview.attendance_recovery?.delivery.safe_retryable ?? 0}
-          detail={`${overview.attendance_recovery?.delivery.identity_held ?? 0} identity-held · ${overview.attendance_recovery?.delivery.permanent_review ?? 0} review-only`}
+          value={recovery?.safe_retryable ?? 0}
+          detail={`${recovery?.identity_held ?? 0} held for identity · ${recovery?.permanent_review ?? 0} for review`}
           icon="refresh"
-          tone={(overview.attendance_recovery?.delivery.safe_retryable ?? 0) > 0 ? 'warning' : 'positive'}
+          tone={(recovery?.safe_retryable ?? 0) > 0 ? 'warning' : 'neutral'}
           onClick={onNavigateReconciliation}
         />
-        <Metric label="Enrollment access" value={overview.active_leases} detail="Active temporary administrator leases" icon="shield" tone={overview.active_leases ? 'warning' : 'neutral'} />
+        <Metric label="Enrollment leases" value={overview.active_leases} detail="Temporary administrator access" icon="shield" />
       </section> : <section className="spare-inventory-banner" aria-label="Spare inventory monitoring policy">
         <span className="spare-inventory-icon"><Icon name="shield" /></span>
-        <div><p className="eyebrow">MONITORING POLICY</p><h2>Ready when the active fleet needs a replacement</h2><p>Spare devices keep their telemetry and management access, but their offline state and alerts do not affect fleet availability or the operations queue.</p></div>
-        <div className="spare-inventory-count"><strong>{spareDevices.length}</strong><span>Spare device{spareDevices.length === 1 ? '' : 's'}</span><small>Open a device to return it to active service.</small></div>
+        <div><h2>Ready when the active fleet needs a replacement</h2><p>Spare devices keep their telemetry and management access, but their offline state and alerts do not affect fleet availability or the operations queue.</p></div>
+        <div className="spare-inventory-count"><strong>{spareDevices.length}</strong><span>Spare device{spareDevices.length === 1 ? '' : 's'}</span></div>
       </section>}
       <section className="panel">
         <header className="panel-header">
-          <div><h2>{inventory === 'fleet' ? 'Live fleet' : 'Spare devices'}</h2><p>{inventory === 'fleet' ? 'State labels and border patterns remain readable without color.' : 'Reserve hardware is isolated from active operational reporting.'}</p></div>
+          <div>
+            <h2>{inventory === 'fleet' ? 'Devices' : 'Spare devices'}</h2>
+            <p>{filtered ? `${shown.length} of ${inventoryDevices.length} shown` : inventory === 'fleet' ? `${inventoryDevices.length} connector${inventoryDevices.length === 1 ? '' : 's'} · open a device for live logs and controls` : 'Open a device to return it to active service.'}</p>
+          </div>
           <div className="fleet-panel-actions">
+            {inventory === 'fleet' && <span className="fleet-toolbar-note"><Icon name="shield" /> Secure auto-onboarding enabled</span>}
             {inventory === 'fleet' && <div className="segmented-control fleet-view-toggle" role="group" aria-label="Fleet view">
               <button type="button" className={mode === 'map' ? 'active' : ''} aria-pressed={mode === 'map'} onClick={() => setMode('map')}><Icon name="map" /> Map</button>
               <button type="button" className={mode === 'list' ? 'active' : ''} aria-pressed={mode === 'list'} onClick={() => setMode('list')}><Icon name="list" /> List</button>
             </div>}
-            <div className={`auto-onboard-note ${inventory === 'spares' ? 'spare-note' : ''}`}><Icon name="shield" /> {inventory === 'fleet' ? 'Secure auto-onboarding enabled' : 'Excluded from fleet health'}</div>
           </div>
         </header>
         <div className="toolbar">
@@ -469,7 +481,8 @@ function FleetView({
             <span className="sr-only">{inventory === 'fleet' ? 'Search active fleet' : 'Search spare devices'}</span>
             <Icon name="search" />
             <input
-              placeholder={inventory === 'fleet' ? 'Search active fleet' : 'Search spare devices'}
+              type="search"
+              placeholder={inventory === 'fleet' ? 'Search name, zone, MAC, or serial' : 'Search spare devices'}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -478,6 +491,7 @@ function FleetView({
             <span className="sr-only">Filter by state</span>
             <select value={filter} onChange={(event) => setFilter(event.target.value)}>
               <option value="ALL">All states</option>
+              <option value="ATTENTION">Needs attention</option>
               <option value="ONLINE">Online</option>
               <option value="DEGRADED">Degraded</option>
               <option value="FLAPPING">Flapping</option>
@@ -492,7 +506,7 @@ function FleetView({
           <Suspense fallback={<div className="fleet-map-fallback" role="status"><Icon name="refresh" /> Preparing national map…</div>}>
             <FleetMap
               devices={shown}
-              loading={loading}
+              loading={loading && !devices.length}
               onInspect={onInspect}
               onManageUsers={onManageUsers}
               formatRelativeTime={relativeTime}
@@ -500,28 +514,29 @@ function FleetView({
           </Suspense>
         ) : (
           <div className="device-list" aria-busy={loading}>
-            {loading && <div className="empty-state"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
-            {!loading && shown.map((device) => (
+            {loading && !shown.length && <div className="empty-state is-loading" role="status"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
+            {shown.length > 0 && <div className="device-list-head" aria-hidden="true"><span>Device</span><span>Terminal</span><span>Activity</span><span>Firmware</span><span>Status</span></div>}
+            {shown.map((device) => (
               <article className={`device-card ${device.is_spare ? 'spare-device-card pattern-notice' : `pattern-${statusPattern(device.state)}`}`} key={device.connector_id}>
                 <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
-                  <span className="device-symbol"><Icon name="server" /></span>
                   <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
-                  <span className="device-terminal"><strong>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal identity')}</strong><small>{device.zkt?.ip_address || 'No IP'} · {device.zkt?.serial || 'No serial'}</small></span>
-                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : (deviceActivity(device))}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <span className="device-terminal"><strong>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</strong><small>{[device.zkt?.ip_address, device.zkt?.serial].filter(Boolean).join(' · ') || 'Identity pending'}</small></span>
+                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : deviceActivity(device)}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <span className="device-firmware"><strong>{device.firmware_version ? firmwareLabel(device.firmware_version) : 'Firmware unknown'}</strong><small>{device.ota_capable ? humanizeStatus(device.ota_state || 'OTA_READY') : 'Manual updates'}</small></span>
                   <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
                   <Icon name="chevron" />
                 </button>
                 <div className="device-card-actions">
-                  <button className="text-button" onClick={() => onManageUsers(device)}><Icon name="users" /> Manage users</button>
-                  <span>{device.is_spare ? 'Excluded from fleet health and operational alerts · ' : ''}FW {device.firmware_version || 'unknown'} · {device.ota_capable ? (device.ota_state || 'OTA ready') : 'Manual firmware updates'} · {device.zkt?.certification_state || 'uncertified'}</span>
+                  <button className="icon-button" onClick={() => onManageUsers(device)} aria-label={`Manage users on ${device.display_name}`} title="Manage users"><Icon name="users" /></button>
                 </div>
               </article>
             ))}
             {!loading && !shown.length && (
               <div className="empty-state">
-                <Icon name="server" />
-                <h3>{inventoryDevices.length ? 'No devices match these filters.' : inventory === 'spares' ? 'No spare devices yet.' : 'Waiting for an authorized Zone Lite device to connect automatically.'}</h3>
-                <p>{inventoryDevices.length ? 'Change the search or state filter.' : inventory === 'spares' ? 'Open any active device and move it to spare inventory when it is taken out of service.' : 'A securely flashed ESP will appear here after signed onboarding.'}</p>
+                <Icon name={filtered ? 'search' : 'server'} />
+                <h3>{inventoryDevices.length ? 'No devices match these filters' : inventory === 'spares' ? 'No spare devices yet' : 'Waiting for the first device'}</h3>
+                <p>{inventoryDevices.length ? 'Try a different search or state.' : inventory === 'spares' ? 'Open any active device and move it to spare inventory when it is taken out of service.' : 'A securely flashed Zone Lite ESP appears here automatically after signed onboarding.'}</p>
+                {filtered && inventoryDevices.length > 0 && <button type="button" className="button secondary small" onClick={clearFilters}>Clear filters</button>}
               </div>
             )}
           </div>
@@ -541,13 +556,14 @@ export function CommandProgress({
   const status = normalizedStatus(command.status)
   const commandType = normalizedStatus(command.type)
   const canCancel = !['RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(status)
+  const pattern = statusPattern(status)
   return (
-    <section className={`command-progress pattern-${statusPattern(status)}`} aria-live="polite">
-      <span className="command-symbol"><Icon name={status === 'SUCCEEDED' ? 'check' : status === 'FAILED' ? 'alert' : 'refresh'} /></span>
+    <section className={`command-progress pattern-${pattern}`} aria-live="polite">
+      <span className="command-symbol"><Icon name={status === 'SUCCEEDED' ? 'check' : status === 'FAILED' ? 'alert' : statusIcon[pattern]} /></span>
       <div>
         <p className="eyebrow">{commandType.replaceAll('_', ' ')}</p>
-        <h3>{status.replaceAll('_', ' ')}</h3>
-        <p>{command.error_message || command.error_code || `Command ${command.command_id.slice(0, 8)} is durably tracked.`}</p>
+        <h3>{humanizeStatus(status)}</h3>
+        <p>{command.error_message || (command.error_code ? humanizeStatus(command.error_code) : `Command ${command.command_id.slice(0, 8)} is durably tracked.`)}</p>
       </div>
       {canCancel && <button className="button secondary" onClick={() => void onCancel(command)}>Cancel before execution</button>}
     </section>
@@ -815,21 +831,39 @@ function DashboardApp() {
     <>
       <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
         {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} />}
-        {view === 'users' && <Suspense fallback={<div className="panel empty-state">Opening selected-terminal users…</div>}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
-        {view === 'attendance' && <Suspense fallback={<div className="panel empty-state">Opening immutable attendance ledger…</div>}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}
-        {view === 'reconciliation' && <Suspense fallback={<div className="panel empty-state">Opening reconciliation workspace…</div>}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
-        {view === 'firmware' && <Suspense fallback={<div className="panel empty-state">Opening firmware workspace…</div>}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
-        {view === 'alerts' && <Suspense fallback={<div className="panel empty-state">Opening national alert queue…</div>}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
+        {view === 'users' && <Suspense fallback={<WorkspaceLoading label="Opening users" />}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
+        {view === 'attendance' && <Suspense fallback={<WorkspaceLoading label="Opening attendance" />}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}
+        {view === 'reconciliation' && <Suspense fallback={<WorkspaceLoading label="Opening reconciliation" />}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
+        {view === 'firmware' && <Suspense fallback={<WorkspaceLoading label="Opening firmware" />}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
+        {view === 'alerts' && <Suspense fallback={<WorkspaceLoading label="Opening alerts" />}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
       {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
-      {toast.toast && <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}><Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />{toast.toast.text}</div>}
+      {toast.toast && createPortal(
+        <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}>
+          <Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />
+          <span>{toast.toast.text}</span>
+          <button type="button" className="icon-button" onClick={toast.dismiss} aria-label="Dismiss notification"><Icon name="x" /></button>
+        </div>,
+        document.getElementById('overlay-root') || document.body,
+      )}
     </>
   )
 }
 
+// Waits briefly so a fast lazy chunk never flashes a loading state.
+function WorkspaceLoading({ label }: { label: string }) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const timer = window.setTimeout(() => setVisible(true), 180)
+    return () => window.clearTimeout(timer)
+  }, [])
+  if (!visible) return null
+  return <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h3>{label}…</h3></div>
+}
+
 function RouteErrorBoundary() {
   const error = useRouteError()
-  return <main className="boot-screen route-error" role="alert"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><h1>This workspace could not be opened.</h1><p>{error instanceof Error ? error.message : 'The requested route is unavailable.'}</p><a className="button primary" href="/fleet">Return to Fleet</a></main>
+  return <main className="boot-screen route-error" role="alert"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><h1>This workspace could not be opened</h1><p>{error instanceof Error ? error.message : 'The requested route is unavailable.'}</p><a className="button primary" href="/fleet">Return to Fleet</a></main>
 }
 
 export default function App() {
