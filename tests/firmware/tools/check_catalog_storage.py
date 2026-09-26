@@ -29,7 +29,7 @@ static bool s_identity_catalog_active_memory_valid=true;
 static bool activation_fails;
 static bool activate_identity_catalog(const char *path){return !activation_fails && rename(path,"active")==0;}
 #define ADD_IDENTITY_CATALOG_MAX_BYTES (2U * 1024U * 1024U)
-#define QS_ADMIT_HISTORICAL 1
+#define QS_ADMIT_OPTIONAL_HISTORICAL 3
 #define LED_STATUS_LOCAL_FAILURE 1
 static size_t used, calls, fail_at;
 static storage_budget_t budget;
@@ -37,7 +37,7 @@ static bool held;
 static unsigned led_faults;
 static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n);}
 #define malloc allocate
-static bool qs_local_begin(int policy,size_t bytes){assert(policy==1 && !held);held=storage_budget_admit(&budget,8U*1024U*1024U,used,bytes,SB_HISTORICAL);return held;}
+static bool qs_local_begin(int policy,size_t bytes){assert(policy==3 && !held);held=storage_budget_admit(&budget,8U*1024U*1024U,used,bytes,SB_HISTORICAL);return held;}
 static void qs_local_end(bool ok,int error){(void)ok;(void)error;assert(held);held=false;}
 static void led_status_fault(int state){assert(state==1);++led_faults;}
 static char *encrypt_storage_json(const char *plain){if(!plain)return NULL;char *out=malloc(strlen(plain)+1);if(out)strcpy(out,plain);return out;}

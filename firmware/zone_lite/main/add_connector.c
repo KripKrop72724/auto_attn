@@ -807,7 +807,7 @@ static const char *s_catalog_writer_failure_reason = "none";
 static FILE *create_catalog_stage(const char *path)
 {
     s_catalog_writer_failure_reason = "none";
-    if (!qs_local_begin(QS_ADMIT_HISTORICAL, 4096)) {
+    if (!qs_local_begin(QS_ADMIT_OPTIONAL_HISTORICAL, 4096)) {
         s_catalog_writer_failure_reason = errno == EBUSY ? "admission_lock_busy" : "admission_rejected";
         if (errno != ENOSPC && errno != EBUSY) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return NULL;
@@ -836,7 +836,7 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     else if (bytes > DQ_MAX_RECORD_BYTES) s_catalog_writer_failure_reason = "record_too_large";
     else if (position < 0) s_catalog_writer_failure_reason = "stage_seek_failed";
     else if (!bounded) s_catalog_writer_failure_reason = "catalog_size_limit";
-    bool admitted = bounded && qs_local_begin(QS_ADMIT_HISTORICAL, bytes);
+    bool admitted = bounded && qs_local_begin(QS_ADMIT_OPTIONAL_HISTORICAL, bytes);
     if (bounded && !admitted) {
         s_catalog_writer_failure_reason = errno == EBUSY ? "admission_lock_busy" : "admission_rejected";
     }
