@@ -76,7 +76,8 @@ def _recent_worker_evidence(samples: list[DeviceTelemetry], version: str) -> dic
             uptime = sample.uptime_seconds
             delta = uptime * 1000 - tick if isinstance(uptime, int) and isinstance(tick, int) else None
             state_failed = state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
-            tick_failed = delta is None or not -999 <= delta <= 90_000
+            # Match ADD's accepted collection delay: uptime is captured before worker ticks.
+            tick_failed = delta is None or not -5_000 <= delta <= 90_000
             if state_failed or tick_failed:
                 anomaly_reasons["worker_state" if state_failed else "tick_range"] += 1
                 if len(anomalies) < 30 or (state_failed and len(state_failures) < 10):
