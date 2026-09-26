@@ -16,6 +16,12 @@ on:
         required: false
         default: false
         type: boolean
+      runner_capacity_mode:
+        description: Inspect runner disk or clear only generated build and action staging files
+        required: false
+        default: none
+        type: choice
+        options: [none, inspect, clean-generated]
 
 permissions:
   contents: read
@@ -26,8 +32,85 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runner-capacity:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_capacity_mode != 'none'
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      # No checkout or downloaded action: this must work when action staging
+      # itself fails because the runner disk is full.
+      - name: Inspect runner and optionally clear generated files
+        env:
+          MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'clean-generated')) {
+            throw 'Unsupported runner maintenance mode.'
+          }
+          $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $actionsRoot = Join-Path $workRoot '_actions'
+          $driveName = [IO.Path]::GetPathRoot($workRoot).Substring(0, 1)
+          function Show-FreeSpace([string]$label) {
+            $drive = Get-PSDrive -Name $driveName
+            Write-Host "$label drive=$driveName free_bytes=$([int64]$drive.Free) used_bytes=$([int64]$drive.Used)"
+          }
+          function Show-DirectoryBytes([string]$label, [string]$path) {
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+              Write-Host "$label bytes=0 present=false"
+              return
+            }
+            $sum = (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+              Measure-Object -Property Length -Sum).Sum
+            Write-Host "$label bytes=$([int64]$sum) present=true"
+          }
+          Show-FreeSpace 'before'
+          Show-DirectoryBytes 'actions_cache' $actionsRoot
+          Show-DirectoryBytes 'runner_temp' $env:RUNNER_TEMP
+          Show-DirectoryBytes 'workspace' $workspace
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            & docker system df
+            if ($LASTEXITCODE -ne 0) { Write-Host 'docker_disk_usage_unavailable=true' }
+          }
+          if ($env:MAINTENANCE_MODE -eq 'inspect') { exit 0 }
+
+          $generated = @(
+            (Join-Path $workspace 'unsigned'),
+            (Join-Path $workspace 'firmware\zone_lite\build')
+          )
+          $firmwareRoot = Join-Path $workspace 'firmware\zone_lite'
+          if (Test-Path -LiteralPath $firmwareRoot -PathType Container) {
+            $generated += @(Get-ChildItem -LiteralPath $firmwareRoot -Directory -Force |
+              Where-Object { $_.Name -match '^build-[a-z0-9-]+$' } |
+              ForEach-Object { $_.FullName })
+          }
+          $removedGenerated = 0
+          foreach ($path in $generated) {
+            $full = [IO.Path]::GetFullPath($path)
+            if (-not $full.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe generated path.' }
+            if (Test-Path -LiteralPath $full -PathType Container) {
+              Remove-Item -LiteralPath $full -Recurse -Force
+              $removedGenerated++
+            }
+          }
+          $removedActionStaging = 0
+          if (Test-Path -LiteralPath $actionsRoot -PathType Container) {
+            foreach ($entry in @(Get-ChildItem -LiteralPath $actionsRoot -Directory -Force |
+                Where-Object { $_.Name -match '^_temp_[0-9a-f-]+$' })) {
+              Remove-Item -LiteralPath $entry.FullName -Recurse -Force
+              $removedActionStaging++
+            }
+          }
+          Write-Host "removed_generated_directories=$removedGenerated removed_action_staging=$removedActionStaging"
+          Show-FreeSpace 'after'
+
   recover-core:
-    if: github.event_name == 'workflow_dispatch' && inputs.recover_core == true
+    if: github.event_name == 'workflow_dispatch' && inputs.recover_core == true && inputs.runner_capacity_mode == 'none'
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
     timeout-minutes: 5
@@ -84,7 +167,7 @@ jobs:
 
   announce:
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true) ||
+      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true && inputs.runner_capacity_mode == 'none') ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -112,7 +195,7 @@ jobs:
 
   deploy:
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true) ||
+      (github.event_name == 'workflow_dispatch' && inputs.recover_core != true && inputs.runner_capacity_mode == 'none') ||
       github.event.workflow_run.conclusion == 'success'
     needs: announce
     runs-on: [self-hosted, Windows, X64]
