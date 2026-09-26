@@ -25,13 +25,14 @@ def test_recent_worker_evidence_distinguishes_timestamp_skew_from_real_fault():
         )
 
     evidence = module._recent_worker_evidence(
-        [sample("RUNNING", 102500), sample("FAULT", 9000), sample("RUNNING", 99000)],
+        [sample("RUNNING", 102500), sample("RUNNING", 106000),
+         sample("FAULT", 9000), sample("RUNNING", 99000)],
         "2.6.9",
     )
-    assert evidence["target_version_samples"] == 3
-    assert evidence["worker_states"] == {"add_delivery:RUNNING": 2, "add_delivery:FAULT": 1}
+    assert evidence["target_version_samples"] == 4
+    assert evidence["worker_states"] == {"add_delivery:RUNNING": 3, "add_delivery:FAULT": 1}
     assert [(row["state"], row["tick_delta_ms"]) for row in evidence["anomalies"]] == [
-        ("RUNNING", -2500),
+        ("RUNNING", -6000),
     ]
     assert evidence["anomaly_reasons"] == {"tick_range": 1, "worker_state": 1}
     assert [(row["state"], row["tick_delta_ms"]) for row in evidence["state_failures"]] == [
