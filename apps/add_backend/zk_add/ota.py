@@ -42,6 +42,29 @@ from zk_add.storage_contract import CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VER
 
 OTA_LAYOUT = "zone-lite-ota-v1"
 HIL_MARKER = ".hil-only.json"
+# This one signed artifact has three independent first-stage HIL sites.  The
+# identities below bind the policy to the published image and its existing
+# exact-scope marker; no additional connector can be admitted by this rule.
+HIL_269_PARALLEL_IDENTITY = (
+    "zone-lite-2.6.9",
+    "2.6.9",
+    "b71da5291d8940c28b3179b26dc97e0a90da3841",
+    "1ab737d94cc7965cf5d04fb02af17ad7b642c3bb3a56f9531235cf93bd62134d",
+    "ad71339fef6926b21a21a05c1e1c4e30a936e0df5be6160871c7283841ad91b8",
+)
+HIL_269_PARALLEL_PREFIX_SIZE = 3
+HIL_269_EXACT_TARGETS = (
+    HilTarget(connector_id="ef1b6fe9-592b-4cf3-95e7-9c6b600f7812",
+              mac="ac:27:6e:a5:47:64", terminal_serial="AEXH232260005"),
+    HilTarget(connector_id="4567587c-29ee-4e59-92a4-6c36650a84aa",
+              mac="e0:72:a1:d6:3c:7c", terminal_serial="PGB1261200077"),
+    HilTarget(connector_id="2ca9a4c2-5ae4-4330-8d14-840223672897",
+              mac="a4:cb:8f:d4:66:64", terminal_serial="PGB1261200074"),
+    HilTarget(connector_id="bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e",
+              mac="e0:72:a1:d7:05:c4", terminal_serial="CJH9211060009"),
+    HilTarget(connector_id="233dac02-eb1b-4598-a876-e3a7b1ecfd54",
+              mac="e0:72:a1:d5:08:a0", terminal_serial="CJH9211060002"),
+)
 ACTIVE_DEPLOYMENT_STATES = {
     "OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"
 }
@@ -220,7 +243,18 @@ def _require_previous_candidate_acceptance(
             raise ValueError("The previous target must pass hardening-candidate HIL before the next compatibility update.")
 
 
-def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget | None:
+def _parallel_269_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> int:
+    identity = (
+        release.release_id, release.version, release.git_sha,
+        release.image_sha256, _application_sha256(release),
+    )
+    return HIL_269_PARALLEL_PREFIX_SIZE if (
+        identity == HIL_269_PARALLEL_IDENTITY
+        and tuple(targets) == HIL_269_EXACT_TARGETS
+    ) else 0
+
+
+def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
@@ -239,7 +273,7 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
             FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE"]),
         ).order_by(FirmwareEvent.id)
     ))
-    for index, target in enumerate(targets):
+    def accepted(target: HilTarget) -> bool:
         evidence = [
             (event, deployment)
             for event, connector, deployment in events
@@ -250,14 +284,27 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
             and event.details.get("application_sha256") == _application_sha256(release)
         ]
         if not evidence:
-            _require_previous_candidate_acceptance(session, release, targets, index)
-            return target
+            return False
         latest, deployment = evidence[-1]
-        if (latest.state != "HIL_ACCEPTED" or latest.details.get("outcome") != "PASS"
-                or deployment.status != "SUCCEEDED"):
+        return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
+                and deployment.status == "SUCCEEDED")
+
+    parallel_prefix = _parallel_269_prefix(release, targets)
+    if parallel_prefix:
+        pending = [target for target in targets[:parallel_prefix] if not accepted(target)]
+        if pending:
+            return pending
+    for index, target in enumerate(targets[parallel_prefix:], start=parallel_prefix):
+        if not accepted(target):
             _require_previous_candidate_acceptance(session, release, targets, index)
-            return target
+            return [target]
     raise ValueError("All ordered HIL targets already have acceptance; release remains HIL_ONLY.")
+
+
+def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget | None:
+    """Compatibility view for callers that need the first permitted target."""
+    permitted = _permitted_hil_targets(session, release)
+    return permitted[0] if permitted else None
 
 
 def capability_is_eligible(connector: Connector) -> bool:
@@ -449,10 +496,8 @@ def _campaign_scope(
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         raise ValueError("National firmware OTA remains disabled.")
     hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
-    ordered_target = _ordered_hil_target(session, release) if release.state == "HIL_ONLY" else None
-    if ordered_target:
-        hil_target_mac = ordered_target.mac
-    elif release.state == "HIL_ONLY":
+    permitted_targets = _permitted_hil_targets(session, release) if release.state == "HIL_ONLY" else None
+    if release.state == "HIL_ONLY" and permitted_targets is None:
         configured_target = configured_hil_mac(release)
         if not settings.firmware_hil_enabled or not configured_target:
             raise ValueError("Firmware HIL quarantine is disabled.")
@@ -470,14 +515,14 @@ def _campaign_scope(
     for connector in connectors:
         reason = _scope_exclusion_reason(
             connector,
-            hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" else "",
+            hil_target_mac=hil_target_mac if release.state == "HIL_ONLY" and permitted_targets is None else "",
             minimum_version=release.minimum_bootstrap_version,
         )
         try:
             require_family_match(connector.firmware_family, release.manifest or {})
         except ValueError:
             reason = "FIRMWARE_FAMILY_MISMATCH"
-        if ordered_target and not target_matches(ordered_target, connector):
+        if permitted_targets and not any(target_matches(target, connector) for target in permitted_targets):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
         if not reason:
             reason = _storage_predecessor_exclusion(session, release, connector)
@@ -488,11 +533,18 @@ def _campaign_scope(
     if release.state == "HIL_ONLY":
         # Keep the quarantine boundary explicit even though the exclusion
         # classifier above already rejects every non-target connector.
-        eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
+        if permitted_targets is None:
+            eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
+        else:
+            eligible = [row for row in eligible if any(
+                target_matches(target, row) for target in permitted_targets
+            )]
         if len(eligible) != 1:
-            if ordered_target is not None:
+            if permitted_targets is not None:
                 target_row = next(
-                    (row for row in connectors if row.connector_id == ordered_target.connector_id),
+                    (row for row in connectors if any(
+                        row.connector_id == target.connector_id for target in permitted_targets
+                    )),
                     None,
                 )
                 if target_row is None:
@@ -826,11 +878,11 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         return None
     if release.state == "HIL_ONLY":
         try:
-            ordered_target = _ordered_hil_target(session, release)
+            permitted_targets = _permitted_hil_targets(session, release)
         except ValueError:
             return None
-        if ordered_target:
-            if not target_matches(ordered_target, connector):
+        if permitted_targets:
+            if not any(target_matches(target, connector) for target in permitted_targets):
                 return None
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
@@ -1001,11 +1053,13 @@ def previous_firmware_return_evidence(
 
 def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]:
     next_target = None
+    allowed_targets = None
     scope_message = None
     if row.state == "HIL_ONLY" and (row.manifest or {}).get("_hil_targets") is not None:
         try:
-            target = _ordered_hil_target(session, row)
-            next_target = target.model_dump() if target else None
+            permitted = _permitted_hil_targets(session, row)
+            allowed_targets = [target.model_dump() for target in permitted or []]
+            next_target = allowed_targets[0] if allowed_targets else None
         except ValueError as exc:
             scope_message = str(exc)
     return {
@@ -1026,6 +1080,7 @@ def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]
         "hil_target_mac": (row.manifest or {}).get("_hil_target_mac"),
         "hil_targets": (row.manifest or {}).get("_hil_targets"),
         "hil_next_target": next_target,
+        "hil_allowed_targets": allowed_targets,
         "hil_scope_message": scope_message,
     }
 
@@ -1395,9 +1450,9 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
         configured = configured_hil_mac(release)
         connector = session.get(Connector, grant.connector_id)
-        ordered_target = _ordered_hil_target(session, release)
-        if ordered_target:
-            if connector is None or not target_matches(ordered_target, connector):
+        permitted_targets = _permitted_hil_targets(session, release)
+        if permitted_targets:
+            if connector is None or not any(target_matches(item, connector) for item in permitted_targets):
                 raise ValueError("HIL firmware grant exact target mismatch.")
         else:
             if not settings.firmware_hil_enabled or not target or target != configured:

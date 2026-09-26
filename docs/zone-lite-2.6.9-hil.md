@@ -1,7 +1,9 @@
 # ZKT Zone Lite 2.6.9 HIL candidate
 
-2.6.9 is a signed, exact-scope retry for the five ordered ZKT HIL devices in
-`deploy/add/hil-targets-2.6.9.json`. Swat is first. The release remains
+2.6.9 is a signed, exact-scope retry for the five ZKT HIL devices in
+`deploy/add/hil-targets-2.6.9.json`. Swat, SLICTOWER 13FL, and SLICTOWER 3FL
+may each run an independent first-stage HIL campaign. The two Peshawar targets
+remain ordered after those three. The release remains
 `HIL_ONLY`; no nationwide campaign or production promotion is authorized by an
 OTA download or boot alone.
 
@@ -26,9 +28,16 @@ confirmation. The five signed predecessor image identities include 2.4.12,
 
 ## Rollout gate
 
+The published release, signed image, application digest, and all five exact
+connector/MAC/terminal serial tuples must match the 2.6.9 parallel-stage
+policy. Each campaign still scopes to exactly one eligible connector in its
+zone. Only Swat, SLICTOWER 13FL, and SLICTOWER 3FL can begin without another
+target's acceptance. Peshawar 02 becomes eligible only after all three have
+formal `HIL_ACCEPTED` PASS evidence; Peshawar 06 follows Peshawar 02.
+
 For each device, require a successful boot-confirmed deployment, healthy
 durable storage, running delivery workers, preserved queue/source state, live
 attendance receipt evidence, and the formal `HIL_ACCEPTED` PASS before
-advancing the next target. The physical PIN/card versus biometric canary was
+accepting that device. The physical PIN/card versus biometric canary was
 verified on the SLICTOWER G3 only. Swat and Peshawar require their own terminal
 model checks before the full credential-cleanup claim can be accepted.

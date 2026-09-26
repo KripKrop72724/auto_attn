@@ -230,6 +230,138 @@ def test_order_changed_after_preview_rejected(hil_session, monkeypatch):
                                     release_public_id=release.release_id, zone_id="ZONE-HIL")
 
 
+@pytest.fixture
+def parallel_269_session(hil_session, monkeypatch):
+    import json
+    from zk_add.ota import FirmwareRelease, HIL_269_EXACT_TARGETS, HIL_269_PARALLEL_IDENTITY
+    from zk_add.settings import settings
+    from zk_add.models import Connector, ZKTDevice
+    from zk_add.storage_contract import CONTENTION_BASELINES, CONTENTION_BASELINE_IMAGES
+
+    session, release, devices = hil_session
+    release.release_id, release.version, release.git_sha, release.image_sha256, application = (
+        HIL_269_PARALLEL_IDENTITY
+    )
+    release.minimum_bootstrap_version = "2.4.12"
+    release.manifest = {
+        "application_sha256": application,
+        "minimum_bootstrap_version": "2.4.12",
+        "_hil_targets": [row.model_dump() for row in HIL_269_EXACT_TARGETS],
+        "queue_storage": {
+            "schema_version": 2, "read_format": 2, "reader_mask": 63,
+            "write_format": 1,
+            "allowed_bootstrap_versions": list(CONTENTION_BASELINES),
+            "allowed_bootstrap_images": CONTENTION_BASELINE_IMAGES,
+        },
+    }
+    monkeypatch.setattr(settings, "firmware_hil_targets_json", json.dumps(release.manifest["_hil_targets"]))
+    baseline_digest = CONTENTION_BASELINE_IMAGES["2.4.12"]
+    session.add(FirmwareRelease(
+        release_id="zone-lite-2.4.12", version="2.4.12", git_sha="d" * 40,
+        image_sha256="e" * 64, image_size=1024, signing_key_id="production-key",
+        partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.2.0",
+        storage_name="hil/baseline.bin", manifest_signature="test-signature", state="AVAILABLE",
+        manifest={"application_sha256": baseline_digest},
+    ))
+    zones = (
+        "ZONE-SWAT-01", "ZONE-SLICTOWER-13FL", "ZONE-SLICTOWER-3FL",
+        "ZONE-PESHAWAR-02", "ZONE-PESHAWAR-06",
+    )
+    for index, (target_row, zone) in enumerate(zip(HIL_269_EXACT_TARGETS, zones)):
+        if index < len(devices):
+            device = devices[index]
+        else:
+            device = Connector(
+                connector_id=target_row.connector_id, hardware_id=target_row.mac,
+                zone_id=zone, zone_name=zone, device_id=str(index + 1),
+                display_name=zone, connected=True, ota_capable=True,
+                ota_secure_boot=True, ota_rollback_enabled=True,
+                ota_partition_layout="zone-lite-ota-v1",
+            )
+            device.zkt_device = ZKTDevice()
+            session.add(device)
+            devices.append(device)
+        device.connector_id = target_row.connector_id
+        device.hardware_id = target_row.mac
+        device.zone_id = zone
+        device.is_spare = False
+        device.firmware_version = "zone-lite-2.4.12"
+        device.ota_image_sha256 = baseline_digest
+        device.ota_running_partition = "ota_0"
+        device.zkt_device.serial = target_row.terminal_serial
+        device.zkt_device.expected_serial = target_row.terminal_serial
+        device.zkt_device.confirmed_serial = target_row.terminal_serial
+        device.zkt_device.terminal_binding_state = "CONFIRMED"
+    session.flush()
+    return session, release, devices, zones
+
+
+def test_exact_269_first_three_can_start_independent_hil_campaigns(parallel_269_session):
+    from zk_add.ota import assignment_for_connector, create_campaign, preview_campaign_scope
+
+    session, release, devices, zones = parallel_269_session
+    for index in (1, 2, 0):
+        scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[index])
+        assert [row["connector_id"] for row in scope["eligible"]] == [devices[index].connector_id]
+        campaign = create_campaign(
+            session, release_public_id=release.release_id, zone_id=zones[index],
+            reason="Independent exact HIL", typed_confirmation=release.version,
+            actor="test-admin", scope_token=scope["scope_token"],
+            idempotency_key=f"parallel-{index}",
+        )
+        assert campaign.eligible_count == 1
+        assert assignment_for_connector(session, connector=devices[index],
+                                        public_base="https://test.invalid") is not None
+    with pytest.raises(ValueError, match="exact target is not active"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[3])
+
+
+def test_269_peshawar_waits_for_all_three_exact_acceptances(parallel_269_session):
+    from sqlalchemy import select
+    from zk_add.ota import (
+        FirmwareDeployment, FirmwareEvent, HIL_269_EXACT_TARGETS,
+        _permitted_hil_targets, create_campaign, preview_campaign_scope,
+    )
+
+    session, release, devices, zones = parallel_269_session
+    for index in (1, 0, 2):
+        scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[index])
+        campaign = create_campaign(
+            session, release_public_id=release.release_id, zone_id=zones[index],
+            reason="Independent exact HIL", typed_confirmation=release.version,
+            actor="test-admin", scope_token=scope["scope_token"],
+            idempotency_key=f"accept-{index}",
+        )
+        deployment = session.scalar(select(FirmwareDeployment).where(
+            FirmwareDeployment.campaign_id == campaign.id
+        ))
+        deployment.status = "SUCCEEDED"
+        session.add(FirmwareEvent(
+            deployment_id=deployment.id, state="HIL_ACCEPTED",
+            details={
+                "outcome": "PASS", "target": HIL_269_EXACT_TARGETS[index].model_dump(),
+                "git_sha": release.git_sha, "artifact_sha256": release.image_sha256,
+                "application_sha256": release.manifest["application_sha256"],
+            },
+        ))
+        session.flush()
+        if index != 2:
+            with pytest.raises(ValueError, match="exact target is not active"):
+                preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[3])
+    assert _permitted_hil_targets(session, release) == [HIL_269_EXACT_TARGETS[3]]
+    assert preview_campaign_scope(session, release_public_id=release.release_id,
+                                  zone_id=zones[3])["counts"]["eligible"] == 1
+
+
+def test_269_parallel_policy_requires_the_exact_published_identity(parallel_269_session):
+    from zk_add.ota import HIL_269_EXACT_TARGETS, _permitted_hil_targets
+
+    session, release, _devices, _zones = parallel_269_session
+    release.git_sha = "0" * 40
+    session.flush()
+    assert _permitted_hil_targets(session, release) == [HIL_269_EXACT_TARGETS[0]]
+
+
 @pytest.mark.parametrize("state", ["PAUSED", "CANCELLED"])
 def test_paused_or_cancelled_hil_rejects_existing_download_grant(hil_session, state):
     from zk_add.ota import assignment_for_connector, resolve_download

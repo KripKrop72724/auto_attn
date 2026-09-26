@@ -18,7 +18,7 @@ from zk_add.ota import (
     FirmwareHilRun,
     FirmwareRelease,
     _application_sha256,
-    _ordered_hil_target,
+    _permitted_hil_targets,
 )
 from zk_add.time_utils import ensure_utc, utc_now
 
@@ -72,7 +72,7 @@ def start_run(
         raise ValueError("The HIL campaign is paused or unavailable")
     if release.state != "HIL_ONLY" or deployment.status != "SUCCEEDED":
         raise ValueError("HIL requires an installed, successful quarantined deployment")
-    if _ordered_hil_target(session, release) != target or not target_matches(target, connector):
+    if target not in (_permitted_hil_targets(session, release) or []) or not target_matches(target, connector):
         raise ValueError("HIL target is not the next exact permitted device")
     if session.scalar(
         select(FirmwareHilRun.id).where(

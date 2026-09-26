@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Device, FirmwareRelease } from '../types'
-import { hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
+import { hilAllowedTargets, hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
 
 const target = { connector_id: 'exact', mac: 'a4:cb:8f:d4:66:64', terminal_serial: 'PGB1261200074' }
 const release = { state: 'HIL_ONLY', hil_targets: [target], hil_next_target: target } as FirmwareRelease
@@ -34,5 +34,20 @@ describe('ordered HIL destination', () => {
   })
   it('preserves legacy single-target support', () => {
     expect(hilDevice({ state: 'HIL_ONLY', hil_target_mac: target.mac } as FirmwareRelease, [device])).toBe(device)
+  })
+  it('selects an independently allowed HIL target by zone without admitting another zone', () => {
+    const swat = { connector_id: 'swat', mac: 'ac:27:6e:a5:47:64', terminal_serial: 'AEXH232260005' }
+    const peshawar = { connector_id: 'peshawar', mac: 'e0:72:a1:d7:05:c4', terminal_serial: 'CJH9211060009' }
+    const swatDevice = { ...device, connector_id: swat.connector_id, hardware_id: swat.mac,
+      zone_id: 'SWAT', zkt: { ...device.zkt!, serial: swat.terminal_serial,
+        expected_serial: swat.terminal_serial, confirmed_serial: swat.terminal_serial } } as Device
+    const slicDevice = { ...device, zone_id: 'SLICTOWER-3FL' } as Device
+    const gated = { ...release, hil_targets: [swat, target, peshawar],
+      hil_allowed_targets: [swat, target] } as FirmwareRelease
+    expect(hilAllowedTargets(gated)).toEqual([swat, target])
+    expect(hilDevice(gated, [swatDevice, slicDevice], 'SLICTOWER-3FL')).toBe(slicDevice)
+    expect(hilDevice(gated, [swatDevice, slicDevice], 'PESHAWAR')).toBeNull()
+    expect(hilDeviceMismatch(gated, [swatDevice, slicDevice], 'PESHAWAR')).toMatch(/outside/)
+    expect(hilScopeLabel(gated)).toMatch(/2 exact HIL targets/)
   })
 })
