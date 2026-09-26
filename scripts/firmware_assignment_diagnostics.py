@@ -21,7 +21,7 @@ from zk_add.ota import (
     FirmwareDeployment,
     FirmwareRelease,
     _application_sha256,
-    _ordered_hil_target,
+    _permitted_hil_targets,
     _storage_predecessor_exclusion,
     _validated_firmware_public_base,
     _versions_match,
@@ -161,12 +161,12 @@ def diagnose(campaign_id: str) -> dict:
             except ValueError:
                 result["public_base_valid"] = False
             try:
-                target = _ordered_hil_target(session, release) if release.state == "HIL_ONLY" else None
-                result["ordered_target_valid"] = True
+                permitted_targets = _permitted_hil_targets(session, release) if release.state == "HIL_ONLY" else None
+                result["permitted_targets_valid"] = True
             except ValueError as error:
-                target = None
-                result["ordered_target_valid"] = False
-                result["ordered_target_error"] = str(error)
+                permitted_targets = None
+                result["permitted_targets_valid"] = False
+                result["permitted_targets_error"] = str(error)
             result["application_digest_present"] = _application_sha256(release) is not None
             summaries = []
             for deployment in deployments:
@@ -238,7 +238,7 @@ def diagnose(campaign_id: str) -> dict:
                     "minimum_version_met": version_at_least(
                         connector.firmware_version, release.minimum_bootstrap_version),
                     "predecessor_exclusion": _storage_predecessor_exclusion(session, release, connector),
-                    "ordered_target_match": target_matches(target, connector) if target else None,
+                    "permitted_target_match": any(target_matches(target, connector) for target in permitted_targets) if permitted_targets else None,
                     "other_active_deployment": bool(other_active and other_active.connector_id != connector.id),
                     "latest_telemetry_at": latest.created_at.isoformat() if latest else None,
                     "latest_telemetry_uptime_seconds": latest.uptime_seconds if latest else None,

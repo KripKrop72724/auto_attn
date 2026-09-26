@@ -34,11 +34,12 @@ static bool activate_identity_catalog(const char *path){return !activation_fails
 static size_t used, calls, fail_at;
 static storage_budget_t budget;
 static bool held;
+static unsigned led_faults;
 static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n);}
 #define malloc allocate
 static bool qs_local_begin(int policy,size_t bytes){assert(policy==1 && !held);held=storage_budget_admit(&budget,8U*1024U*1024U,used,bytes,SB_HISTORICAL);return held;}
 static void qs_local_end(bool ok,int error){(void)ok;(void)error;assert(held);held=false;}
-static void led_status_fault(int state){assert(state==1);}
+static void led_status_fault(int state){assert(state==1);++led_faults;}
 static char *encrypt_storage_json(const char *plain){if(!plain)return NULL;char *out=malloc(strlen(plain)+1);if(out)strcpy(out,plain);return out;}
 ''' + functions + persist + r'''
 int main(void){
@@ -51,9 +52,11 @@ int main(void){
   calls=0;fail_at=i;assert(!write_encrypted_json_line(file,row));assert(ftell(file)==0 && !held);
   fail_at=0;assert(write_encrypted_json_line(file,row));assert(!fclose(file));
  }
- used=8U*1024U*1024U*60U/100U+1;assert(!create_catalog_stage("pressure"));
+ used=8U*1024U*1024U*60U/100U+1;unsigned before_faults=led_faults;
+ errno=ENOSPC;assert(!create_catalog_stage("pressure"));assert(led_faults==before_faults);
  assert(!strcmp(s_catalog_writer_failure_reason,"admission_rejected"));
- used=8U*1024U*1024U*58U/100U;assert(!create_catalog_stage("pressure"));
+ used=8U*1024U*1024U*58U/100U;errno=ENOSPC;
+ assert(!create_catalog_stage("pressure"));assert(led_faults==before_faults);
  used=8U*1024U*1024U*54U/100U;file=create_catalog_stage("pressure");assert(file);assert(!fclose(file));
  used=8U*1024U*1024U*70U/100U+1;assert(!create_catalog_stage("pressure"));
  used=0;file=create_catalog_stage("catalog");assert(file);

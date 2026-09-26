@@ -14,11 +14,14 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         "3bed51d23d85fe50c03642e95f1d1d1e0b45960ccbf97d551645c0b268da1f1c";
     static const char hil_268[] =
         "fecc5df0223a3c7c8b019a445bcf829bc8d09dd93e920aecc8446908fadeadc6";
+    static const char hil_269[] =
+        "ad71339fef6926b21a21a05c1e1c4e30a936e0df5be6160871c7283841ad91b8";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
         !strcmp(version, "2.6.7") ? hil_267 :
-        !strcmp(version, "2.6.8") ? hil_268 : NULL;
+        !strcmp(version, "2.6.8") ? hil_268 :
+        !strcmp(version, "2.6.9") ? hil_269 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

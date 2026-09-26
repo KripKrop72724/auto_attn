@@ -68,12 +68,14 @@ int main(void)
     }
     assert(health.write_failures==operations);
     fail_operation=0;operation=0;
+    health.last_error=0; // A separate clean boot under policy pressure.
     used=(total*60+99)/100;
     unsigned before=opens;
     assert(!append_line_policy("rows","history",QS_ADMIT_HISTORICAL));
     assert(!locked && opens==before && health.bulk_paused);
     assert(health.admission_rejections==1 && health.write_failures==operations);
     assert(!strcmp(health.last_operation,"capacity_admission"));
+    assert(health.last_error==0); // Reserve refusal is not filesystem I/O failure.
     assert(append_line_policy("rows","live",QS_ADMIT_LIVE));
     used=total*56/100;
     assert(!append_line_policy("rows","history",QS_ADMIT_HISTORICAL));

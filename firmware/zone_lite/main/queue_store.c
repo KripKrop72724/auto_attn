@@ -133,7 +133,10 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
         health.admission_rejections++;
         health.last_operation = measured ? "capacity_admission" : "filesystem_info";
         int error = measured ? ENOSPC : EIO;
-        health.last_error = error;
+        // A reserve-policy refusal is not a failed filesystem operation.
+        // Keep real measurement failures latched, while optional producers
+        // can fall back without poisoning queue recovery and boot proof.
+        if (!measured) health.last_error = error;
         xSemaphoreGive(budget_lock);
         errno = error;
     }
