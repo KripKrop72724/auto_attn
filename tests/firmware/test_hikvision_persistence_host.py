@@ -14,6 +14,7 @@ def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path):
     harness = r'''
 #include "queue_store.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,12 +48,23 @@ int main(void){
  health.recovery_complete=true;assert(qs_verify_persistence());assert(health.persistence_verified && writes==1);
  assert(qs_verify_persistence() && writes==1); /* no recurring flash wear */
  health=(qs_health_t){.recovery_complete=true};fail_fs=1;
- assert(!qs_verify_persistence() && !health.persistence_verified && health.last_error);assert(writes==1);
- fail_fs=0;assert(!qs_verify_persistence());assert(writes==1); /* latched fault not hidden */
+ assert(!qs_verify_persistence() && !health.persistence_verified && !health.last_error);
+ assert(health.persistence_probe_failures==1 && writes==1);
+ fail_fs=0;assert(qs_verify_persistence() && health.persistence_verified && !health.last_error);
+ assert(health.persistence_probe_failures==0 && writes==2); /* transient retry proves both stores */
+ health=(qs_health_t){.recovery_complete=true};fail_fs=1;
+ for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ assert(!health.persistence_verified && health.last_error);
+ assert(!strcmp(health.last_operation,"persistence_sync"));
+ fail_fs=0;assert(!qs_verify_persistence()); /* established fault remains latched */
  health=(qs_health_t){.recovery_complete=true};fail_nvs=1;
- assert(!qs_verify_persistence() && !health.persistence_verified && health.last_error);
+ for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ assert(!health.persistence_verified && health.last_error);
+ assert(!strcmp(health.last_operation,"persistence_nvs_commit"));
  health=(qs_health_t){.recovery_complete=true};fail_nvs=0;corrupt_nvs=1;
- assert(!qs_verify_persistence() && !health.persistence_verified && health.last_error);
+ for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ assert(!health.persistence_verified && health.last_error);
+ assert(!strcmp(health.last_operation,"persistence_nvs_read"));
  return 0;
 }
 '''

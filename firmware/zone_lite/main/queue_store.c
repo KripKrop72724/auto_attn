@@ -251,36 +251,104 @@ bool qs_verify_persistence(void)
     unsigned char expected[32], actual[32];
     esp_fill_random(expected, sizeof(expected));
     const char *path = "/storage/persistence-probe";
-    bool ok = measure() && storage_budget_admit(&budget, health.total_bytes,
-        health.used_bytes, 4096, SB_RECOVERY);
-    FILE *f = ok ? fopen(path, "wb") : NULL;
-    ok = f && fwrite(expected, 1, sizeof(expected), f) == sizeof(expected) &&
-        fflush(f) == 0 && fsync(fileno(f)) == 0;
-    if (f && fclose(f) != 0) ok = false;
-    f = ok ? fopen(path, "rb") : NULL;
-    ok = f && fread(actual, 1, sizeof(actual), f) == sizeof(actual) &&
-        fgetc(f) == EOF && !ferror(f) && !memcmp(actual, expected, sizeof(actual));
-    if (f && fclose(f) != 0) ok = false;
-    if (ok && unlink(path) != 0) ok = false;
+    const char *stage = "persistence_measure";
+    int nvs_error = ESP_OK;
+    int file_error = 0;
+    errno = 0;
+    bool ok = measure();
+    if (!ok) file_error = EIO;
+    if (ok) {
+        stage = "persistence_capacity";
+        ok = storage_budget_admit(&budget, health.total_bytes, health.used_bytes, 4096, SB_RECOVERY);
+        if (!ok) file_error = ENOSPC;
+    }
+    FILE *f = NULL;
+    if (ok) {
+        stage = "persistence_open_write";
+        f = fopen(path, "wb");
+        ok = f != NULL;
+        if (!ok) file_error = errno;
+    }
+    if (ok) {
+        stage = "persistence_write";
+        ok = fwrite(expected, 1, sizeof(expected), f) == sizeof(expected);
+        if (!ok) file_error = errno;
+    }
+    if (ok) {
+        stage = "persistence_sync";
+        ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        if (!ok) file_error = errno;
+    }
+    if (f && fclose(f) != 0 && ok) {
+        stage = "persistence_close_write";
+        ok = false;
+        file_error = errno;
+    }
+    f = NULL;
+    if (ok) {
+        stage = "persistence_open_read";
+        f = fopen(path, "rb");
+        ok = f != NULL;
+        if (!ok) file_error = errno;
+    }
+    if (ok) {
+        stage = "persistence_read";
+        ok = fread(actual, 1, sizeof(actual), f) == sizeof(actual) &&
+            fgetc(f) == EOF && !ferror(f) && !memcmp(actual, expected, sizeof(actual));
+        if (!ok) file_error = errno;
+    }
+    if (f && fclose(f) != 0 && ok) {
+        stage = "persistence_close_read";
+        ok = false;
+        file_error = errno;
+    }
+    if (ok) {
+        stage = "persistence_unlink";
+        ok = unlink(path) == 0;
+        if (!ok) file_error = errno;
+    }
     nvs_handle_t h;
     if (ok) {
-        ok = nvs_open("durable_queue", NVS_READWRITE, &h) == ESP_OK;
+        stage = "persistence_nvs_open_write";
+        nvs_error = nvs_open("durable_queue", NVS_READWRITE, &h);
+        ok = nvs_error == ESP_OK;
         if (ok) {
-            ok = nvs_set_blob(h, "write_proof", expected, sizeof(expected)) == ESP_OK && nvs_commit(h) == ESP_OK;
+            stage = "persistence_nvs_set";
+            nvs_error = nvs_set_blob(h, "write_proof", expected, sizeof(expected));
+            ok = nvs_error == ESP_OK;
+            if (ok) {
+                stage = "persistence_nvs_commit";
+                nvs_error = nvs_commit(h);
+                ok = nvs_error == ESP_OK;
+            }
             nvs_close(h);
         }
+    }
+    if (ok) {
+        stage = "persistence_nvs_open_read";
+        nvs_error = nvs_open("durable_queue", NVS_READONLY, &h);
+        ok = nvs_error == ESP_OK;
         if (ok) {
-            ok = nvs_open("durable_queue", NVS_READONLY, &h) == ESP_OK;
-            if (ok) {
-                size_t size = sizeof(actual);
-                ok = nvs_get_blob(h, "write_proof", actual, &size) == ESP_OK &&
-                    size == sizeof(actual) && !memcmp(actual, expected, size);
-                nvs_close(h);
-            }
+            size_t size = sizeof(actual);
+            stage = "persistence_nvs_read";
+            nvs_error = nvs_get_blob(h, "write_proof", actual, &size);
+            ok = nvs_error == ESP_OK && size == sizeof(actual) &&
+                !memcmp(actual, expected, size);
+            nvs_close(h);
         }
     }
     health.persistence_verified = ok;
-    if (!ok) record_queue_result(DQ_IO, "persistence_probe", true);
+    if (ok) health.persistence_probe_failures = 0;
+    else {
+        if (health.persistence_probe_failures < 3) health.persistence_probe_failures++;
+        // A single interrupted write is not yet an established durability
+        // failure. Keep boot proof withheld and retry twice before latching.
+        if (health.persistence_probe_failures >= 3) {
+            errno = file_error ? file_error : EIO;
+            record_queue_result(DQ_IO, stage, true);
+            if (nvs_error != ESP_OK) health.last_error = nvs_error;
+        }
+    }
     xSemaphoreGive(budget_lock);
     return ok;
 }

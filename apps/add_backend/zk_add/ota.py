@@ -71,7 +71,7 @@ HIL_269_EXACT_TARGETS = (
 # The live 3FL connector boots the signed 2.4.12 application from factory.
 # A direct 2.6.x boot would lack a qualified predecessor in the other OTA
 # slot. Bridge only this exact device through the already published 2.5.2
-# image, then allow the 2.6.10 HIL update after 2.5.2 boot confirmation.
+# image, then allow the current signed HIL update after 2.5.2 boot confirmation.
 FACTORY_3FL_BRIDGE_RELEASE = (
     "zone-lite-2.5.2", "2.5.2",
     "e818e8e7db5d9aa1c92b798d03d088026b36bbe9f4672f908450aa4aa85ef564",
@@ -264,15 +264,15 @@ def _parallel_hil_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> 
     )
     exact_scope = tuple(targets) == HIL_269_EXACT_TARGETS
     published_269 = identity == HIL_269_PARALLEL_IDENTITY
-    signed_patch_2610 = (
-        release.release_id == "zone-lite-2.6.10"
-        and release.version == "2.6.10"
+    signed_patch = (
+        release.release_id == f"zone-lite-{release.version}"
+        and release.version in {"2.6.10", "2.6.11"}
         and release.state == "HIL_ONLY"
         and bool(re.fullmatch(r"[0-9a-f]{40}", release.git_sha))
         and bool(re.fullmatch(r"[0-9a-f]{64}", release.image_sha256))
         and _application_sha256(release) is not None
     )
-    return HIL_269_PARALLEL_PREFIX_SIZE if exact_scope and (published_269 or signed_patch_2610) else 0
+    return HIL_269_PARALLEL_PREFIX_SIZE if exact_scope and (published_269 or signed_patch) else 0
 
 
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
@@ -478,7 +478,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         hil_retry = (release.version == "2.6.7" and qualified_version == "2.6.6") or (
             release.version == "2.6.8" and qualified_version in {"2.6.6", "2.6.7"}) or (
             release.version == "2.6.9" and qualified_version in {"2.6.6", "2.6.7", "2.6.8"}) or (
-            release.version == "2.6.10" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9"})
+            release.version == "2.6.10" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9"}) or (
+            release.version == "2.6.11" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10"})
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
