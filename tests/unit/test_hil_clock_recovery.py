@@ -18,15 +18,16 @@ from zk_add.settings import settings
 from zk_add.storage_contract import (DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, DIRECT_VERSIONS,
                                      RETRY_BASELINE_IMAGES, RETRY_BASELINES,
                                      DIAGNOSTIC_BASELINE_IMAGES, DIAGNOSTIC_BASELINES,
-                                     CONTENTION_BASELINE_IMAGES, CONTENTION_BASELINES)
+                                     CONTENTION_BASELINE_IMAGES, CONTENTION_BASELINES,
+                                     PRESSURE_BASELINE_IMAGES, PRESSURE_BASELINES)
 from zk_add.time_utils import utc_now
 
 
 @pytest.fixture(params=DIRECT_VERSIONS)
 def clock_hil(monkeypatch, request):
     version = request.param
-    baselines = CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
-    baseline_images = CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
+    baselines = PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+    baseline_images = PRESSURE_BASELINE_IMAGES if version == "2.6.10" else CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
     target = {
         "connector_id": "clock-hil-connector", "mac": "a4:cb:8f:d4:66:01",
         "terminal_serial": "clock-hil-terminal",
