@@ -481,7 +481,7 @@ details > summary { cursor: pointer; }
 
 .page-content { width: 100%; max-width: var(--app-content-max); margin-inline: auto; padding: 28px var(--app-gutter) 64px; }
 .page-content > * { animation: route-enter var(--motion-content) var(--ease-corporate); }
-@keyframes route-enter { from { opacity: 0; } }
+@keyframes route-enter { from { transform: translateY(4px); } }
 
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
 .page-header > div:first-child { min-width: 0; }

@@ -201,6 +201,11 @@
 .fleet-unmapped > header span { color: var(--text-secondary); font-size: 12px; }
 .fleet-unmapped .fleet-location-devices { padding: 10px; }
 
+@media (min-width: 1181px) and (max-width: 1400px) {
+  /* Keep city markers clear of the details sheet at compact desktop widths. */
+  .fleet-map-canvas:has(.fleet-location-sheet) .fleet-map-stage { margin-right: 38%; }
+}
+
 @media (max-width: 1180px) {
   .fleet-map-stage { width: min(64%, 530px); margin-right: 10%; }
 }
