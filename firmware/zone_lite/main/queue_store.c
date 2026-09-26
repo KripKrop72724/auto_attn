@@ -110,20 +110,20 @@ static bool admit(void *arg, size_t bytes)
 }
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
-    if ((unsigned)policy > QS_ADMIT_RECOVERY || !budget_lock) {
+    if ((unsigned)policy > QS_ADMIT_OPTIONAL_HISTORICAL || !budget_lock) {
         errno = EINVAL;
         return false;
     }
     // Historical catalog writes are outside the live attendance path. Give
     // a concurrent queue fsync time to release the shared admission lock.
-    int wait_ms = policy == QS_ADMIT_HISTORICAL ? 10000 : 1000;
+    int wait_ms = policy == QS_ADMIT_HISTORICAL || policy == QS_ADMIT_OPTIONAL_HISTORICAL ? 10000 : 1000;
     uint32_t wait = pdMS_TO_TICKS(wait_ms);
     if (xSemaphoreTake(budget_lock, wait) != pdTRUE) {
         errno = EBUSY;
         return false;
     }
     bool measured = measure();
-    sb_class_t kind = policy == QS_ADMIT_HISTORICAL ? SB_HISTORICAL :
+    sb_class_t kind = policy == QS_ADMIT_HISTORICAL || policy == QS_ADMIT_OPTIONAL_HISTORICAL ? SB_HISTORICAL :
         policy == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
     bool admitted = measured && storage_budget_admit(&budget,
         health.total_bytes, health.used_bytes, bytes, kind);
@@ -133,7 +133,9 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
         health.admission_rejections++;
         health.last_operation = measured ? "capacity_admission" : "filesystem_info";
         int error = measured ? ENOSPC : EIO;
-        health.last_error = error;
+        // Only the optional authenticated catalog may fall back to memory.
+        // Refused attendance and recovery writes must still block boot proof.
+        if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) health.last_error = error;
         xSemaphoreGive(budget_lock);
         errno = error;
     }

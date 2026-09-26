@@ -362,6 +362,110 @@ def test_269_parallel_policy_requires_the_exact_published_identity(parallel_269_
     assert _permitted_hil_targets(session, release) == [HIL_269_EXACT_TARGETS[0]]
 
 
+def test_2610_exact_scope_keeps_first_three_independent(parallel_269_session):
+    from zk_add.ota import HIL_269_EXACT_TARGETS, _permitted_hil_targets
+    from zk_add.storage_contract import PRESSURE_BASELINES, PRESSURE_BASELINE_IMAGES
+
+    session, release, _devices, _zones = parallel_269_session
+    release.release_id = "zone-lite-2.6.10"
+    release.version = "2.6.10"
+    release.git_sha = "f" * 40
+    release.image_sha256 = "9" * 64
+    release.manifest = {
+        **release.manifest,
+        "application_sha256": "d" * 64,
+        "queue_storage": {
+            **release.manifest["queue_storage"],
+            "allowed_bootstrap_versions": list(PRESSURE_BASELINES),
+            "allowed_bootstrap_images": PRESSURE_BASELINE_IMAGES,
+        },
+    }
+    session.flush()
+    assert _permitted_hil_targets(session, release) == list(HIL_269_EXACT_TARGETS[:3])
+    release.manifest = {**release.manifest, "_hil_targets": [
+        *release.manifest["_hil_targets"][:2],
+        {**release.manifest["_hil_targets"][2], "terminal_serial": "replacement"},
+        *release.manifest["_hil_targets"][3:],
+    ]}
+    with pytest.raises(ValueError, match="configured exact scope"):
+        _permitted_hil_targets(session, release)
+
+
+def test_252_factory_bridge_selects_only_live_3fl_and_rechecks_grant(parallel_269_session, monkeypatch):
+    from zk_add.models import Connector, ZKTDevice
+    from zk_add.ota import (
+        FACTORY_3FL_BRIDGE_RELEASE, HIL_269_EXACT_TARGETS,
+        assignment_for_connector, create_campaign, preview_campaign_scope, resolve_download,
+    )
+    from zk_add.settings import settings
+
+    session, release, devices, zones = parallel_269_session
+    monkeypatch.setattr(settings, "firmware_ota_enabled", True)
+    release.release_id, release.version, release.image_sha256, app_digest = FACTORY_3FL_BRIDGE_RELEASE
+    release.state = "AVAILABLE"
+    release.minimum_bootstrap_version = "2.2.0"
+    release.manifest = {"application_sha256": app_digest}
+    target = devices[2]
+    target.ota_running_partition = "factory"
+    spare = Connector(
+        connector_id="spare-3fl", hardware_id="aa:bb:cc:dd:ee:ff",
+        zone_id=zones[2], zone_name=zones[2], device_id="spare",
+        display_name="3FL spare", firmware_version="zone-lite-2.4.12",
+        connected=False, is_spare=True, ota_capable=True, ota_secure_boot=True,
+        ota_rollback_enabled=True, ota_partition_layout="zone-lite-ota-v1",
+    )
+    spare.zkt_device = ZKTDevice(serial="spare", expected_serial="spare",
+                                  confirmed_serial="spare", terminal_binding_state="CONFIRMED")
+    session.add(spare)
+    session.flush()
+    scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[2])
+    assert [row["connector_id"] for row in scope["eligible"]] == [HIL_269_EXACT_TARGETS[2].connector_id]
+    assert scope["counts"]["excluded"] == 1
+    run = create_campaign(
+        session, release_public_id=release.release_id, zone_id=zones[2],
+        reason="Exact factory bridge", typed_confirmation=release.version,
+        actor="test-admin", scope_token=scope["scope_token"], idempotency_key="3fl-bridge",
+    )
+    assert run.eligible_count == 1
+    assert assignment_for_connector(session, connector=spare, public_base="https://test.invalid") is None
+    offer = assignment_for_connector(session, connector=target, public_base="https://test.invalid")
+    assert offer is not None
+    session.flush()
+    grant = offer["download_url"].rsplit("/", 1)[1]
+    assert resolve_download(session, grant)[0] == release
+    target.zone_id = "ZONE-OTHER"
+    with pytest.raises(ValueError, match="bridge exact target or predecessor changed"):
+        resolve_download(session, grant)
+    target.zone_id = zones[2]
+    target.ota_running_partition = "ota_0"
+    with pytest.raises(ValueError, match="bridge exact target or predecessor changed"):
+        resolve_download(session, grant)
+
+
+def test_252_factory_bridge_rejects_changed_identity_or_predecessor(parallel_269_session, monkeypatch):
+    from zk_add.ota import FACTORY_3FL_BRIDGE_RELEASE, HIL_269_EXACT_TARGETS, preview_campaign_scope
+    from zk_add.settings import settings
+
+    session, release, devices, zones = parallel_269_session
+    monkeypatch.setattr(settings, "firmware_ota_enabled", True)
+    release.release_id, release.version, release.image_sha256, app_digest = FACTORY_3FL_BRIDGE_RELEASE
+    release.state = "AVAILABLE"
+    release.minimum_bootstrap_version = "2.2.0"
+    release.manifest = {"application_sha256": app_digest}
+    target = devices[2]
+    target.ota_running_partition = "factory"
+    target.zkt_device.confirmed_serial = "replacement"
+    with pytest.raises(ValueError, match="BRIDGE_EXACT_IDENTITY_MISMATCH"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[2])
+    target.zkt_device.confirmed_serial = HIL_269_EXACT_TARGETS[2].terminal_serial
+    target.ota_image_sha256 = "f" * 64
+    with pytest.raises(ValueError, match="BRIDGE_FACTORY_PREDECESSOR_MISMATCH"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[2])
+    release.image_sha256 = "f" * 64
+    with pytest.raises(ValueError, match="exact published 2.5.2 image"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[2])
+
+
 @pytest.mark.parametrize("state", ["PAUSED", "CANCELLED"])
 def test_paused_or_cancelled_hil_rejects_existing_download_grant(hil_session, state):
     from zk_add.ota import assignment_for_connector, resolve_download

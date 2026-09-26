@@ -38,7 +38,10 @@ from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
-from zk_add.storage_contract import CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, validate_storage_contract
+from zk_add.storage_contract import (
+    CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, DIRECT_BASELINE_IMAGES,
+    validate_storage_contract,
+)
 
 OTA_LAYOUT = "zone-lite-ota-v1"
 HIL_MARKER = ".hil-only.json"
@@ -65,6 +68,17 @@ HIL_269_EXACT_TARGETS = (
     HilTarget(connector_id="233dac02-eb1b-4598-a876-e3a7b1ecfd54",
               mac="e0:72:a1:d5:08:a0", terminal_serial="CJH9211060002"),
 )
+# The live 3FL connector boots the signed 2.4.12 application from factory.
+# A direct 2.6.x boot would lack a qualified predecessor in the other OTA
+# slot. Bridge only this exact device through the already published 2.5.2
+# image, then allow the 2.6.10 HIL update after 2.5.2 boot confirmation.
+FACTORY_3FL_BRIDGE_RELEASE = (
+    "zone-lite-2.5.2", "2.5.2",
+    "e818e8e7db5d9aa1c92b798d03d088026b36bbe9f4672f908450aa4aa85ef564",
+    DIRECT_BASELINE_IMAGES["2.5.2"],
+)
+FACTORY_3FL_BRIDGE_ZONE = "ZONE-SLICTOWER-3FL"
+FACTORY_3FL_BRIDGE_TARGET = HIL_269_EXACT_TARGETS[2]
 ACTIVE_DEPLOYMENT_STATES = {
     "OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"
 }
@@ -243,15 +257,22 @@ def _require_previous_candidate_acceptance(
             raise ValueError("The previous target must pass hardening-candidate HIL before the next compatibility update.")
 
 
-def _parallel_269_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> int:
+def _parallel_hil_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> int:
     identity = (
         release.release_id, release.version, release.git_sha,
         release.image_sha256, _application_sha256(release),
     )
-    return HIL_269_PARALLEL_PREFIX_SIZE if (
-        identity == HIL_269_PARALLEL_IDENTITY
-        and tuple(targets) == HIL_269_EXACT_TARGETS
-    ) else 0
+    exact_scope = tuple(targets) == HIL_269_EXACT_TARGETS
+    published_269 = identity == HIL_269_PARALLEL_IDENTITY
+    signed_patch_2610 = (
+        release.release_id == "zone-lite-2.6.10"
+        and release.version == "2.6.10"
+        and release.state == "HIL_ONLY"
+        and bool(re.fullmatch(r"[0-9a-f]{40}", release.git_sha))
+        and bool(re.fullmatch(r"[0-9a-f]{64}", release.image_sha256))
+        and _application_sha256(release) is not None
+    )
+    return HIL_269_PARALLEL_PREFIX_SIZE if exact_scope and (published_269 or signed_patch_2610) else 0
 
 
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
@@ -289,7 +310,7 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
                 and deployment.status == "SUCCEEDED")
 
-    parallel_prefix = _parallel_269_prefix(release, targets)
+    parallel_prefix = _parallel_hil_prefix(release, targets)
     if parallel_prefix:
         pending = [target for target in targets[:parallel_prefix] if not accepted(target)]
         if pending:
@@ -305,6 +326,30 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
     """Compatibility view for callers that need the first permitted target."""
     permitted = _permitted_hil_targets(session, release)
     return permitted[0] if permitted else None
+
+
+def _factory_3fl_bridge_target(release: FirmwareRelease, zone_id: str) -> HilTarget | None:
+    if zone_id != FACTORY_3FL_BRIDGE_ZONE or release.release_id != "zone-lite-2.5.2":
+        return None
+    identity = (
+        release.release_id, release.version,
+        release.image_sha256, _application_sha256(release),
+    )
+    if release.state != "AVAILABLE" or identity != FACTORY_3FL_BRIDGE_RELEASE:
+        raise ValueError("The SLICTOWER 3FL bridge requires the exact published 2.5.2 image.")
+    return FACTORY_3FL_BRIDGE_TARGET
+
+
+def _factory_3fl_bridge_exclusion(connector: Connector, target: HilTarget) -> str | None:
+    if not target_matches(target, connector):
+        return "BRIDGE_EXACT_IDENTITY_MISMATCH"
+    if not connector.connected:
+        return "BRIDGE_TARGET_OFFLINE"
+    if (not _versions_match(connector.firmware_version, "2.4.12")
+            or connector.ota_running_partition != "factory"
+            or connector.ota_image_sha256 != DIRECT_BASELINE_IMAGES["2.4.12"]):
+        return "BRIDGE_FACTORY_PREDECESSOR_MISMATCH"
+    return None
 
 
 def capability_is_eligible(connector: Connector) -> bool:
@@ -432,7 +477,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         expected_digest = contract["allowed_bootstrap_images"][qualified_version]
         hil_retry = (release.version == "2.6.7" and qualified_version == "2.6.6") or (
             release.version == "2.6.8" and qualified_version in {"2.6.6", "2.6.7"}) or (
-            release.version == "2.6.9" and qualified_version in {"2.6.6", "2.6.7", "2.6.8"})
+            release.version == "2.6.9" and qualified_version in {"2.6.6", "2.6.7", "2.6.8"}) or (
+            release.version == "2.6.10" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9"})
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
@@ -497,6 +543,7 @@ def _campaign_scope(
         raise ValueError("National firmware OTA remains disabled.")
     hil_target_mac = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
     permitted_targets = _permitted_hil_targets(session, release) if release.state == "HIL_ONLY" else None
+    bridge_target = _factory_3fl_bridge_target(release, zone_id)
     if release.state == "HIL_ONLY" and permitted_targets is None:
         configured_target = configured_hil_mac(release)
         if not settings.firmware_hil_enabled or not configured_target:
@@ -524,6 +571,8 @@ def _campaign_scope(
             reason = "FIRMWARE_FAMILY_MISMATCH"
         if permitted_targets and not any(target_matches(target, connector) for target in permitted_targets):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
+        if bridge_target:
+            reason = _factory_3fl_bridge_exclusion(connector, bridge_target) or reason
         if not reason:
             reason = _storage_predecessor_exclusion(session, release, connector)
         if reason:
@@ -562,6 +611,13 @@ def _campaign_scope(
                         f"target exclusion: {exclusion}."
                     )
             raise ValueError("HIL campaign requires exactly one eligible connector with the target MAC.")
+    if bridge_target and len(eligible) != 1:
+        target_row = next((row for row in connectors if row.connector_id == bridge_target.connector_id), None)
+        exclusion = next((reason for row, reason in excluded if row.id == target_row.id), None) if target_row else None
+        raise ValueError(
+            "Factory-to-OTA bridge requires exactly one eligible exact connector"
+            + (f"; target exclusion: {exclusion}." if exclusion else ".")
+        )
     return release, connectors, eligible, excluded
 
 
@@ -873,6 +929,12 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
         return None
     if _storage_predecessor_exclusion(session, release, connector):
+        return None
+    try:
+        bridge_target = _factory_3fl_bridge_target(release, connector.zone_id)
+    except ValueError:
+        return None
+    if bridge_target and _factory_3fl_bridge_exclusion(connector, bridge_target):
         return None
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
         return None
@@ -1462,6 +1524,12 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     connector = session.get(Connector, grant.connector_id)
     if connector is None or _storage_predecessor_exclusion(session, release, connector):
         raise ValueError("Firmware storage predecessor is no longer eligible.")
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    bridge_target = _factory_3fl_bridge_target(release, campaign.zone_id if campaign else connector.zone_id)
+    if bridge_target and (campaign is None or campaign.status != "ACTIVE"
+                          or connector.zone_id != campaign.zone_id
+                          or _factory_3fl_bridge_exclusion(connector, bridge_target)):
+        raise ValueError("Factory-to-OTA bridge exact target or predecessor changed.")
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()
     if root not in image.parents or not image.is_file():

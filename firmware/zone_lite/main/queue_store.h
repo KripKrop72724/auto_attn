@@ -3,7 +3,8 @@
 
 typedef enum { QS_LIVE, QS_BULK, QS_ORDS, QS_BLOCKED, QS_RECEIPTS, QS_EVIDENCE,
     QS_HIK_SOURCE, QS_COUNT } qs_lane_t;
-typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY } qs_admission_t;
+typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY,
+    QS_ADMIT_OPTIONAL_HISTORICAL } qs_admission_t;
 typedef struct {
     size_t total_bytes, used_bytes, admission_reserve_bytes;
     bool observed, available, bulk_paused, recovery_complete, persistence_verified;
