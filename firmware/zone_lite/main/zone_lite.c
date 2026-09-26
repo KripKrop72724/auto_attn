@@ -9787,7 +9787,8 @@ void app_main(void)
         // only durable storage failures may latch LOCAL_FAILURE permanently.
         if (!gateway_handle) led_status_fault(LED_STATUS_ZKT_FAILURE);
         if (!ords_handle) led_status_fault(LED_STATUS_ORDS_FAILURE);
-        if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence())
+        if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence() &&
+            qs_health().last_error)
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #endif
         vTaskDelay(pdMS_TO_TICKS(1000));

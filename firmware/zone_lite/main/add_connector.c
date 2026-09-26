@@ -2464,6 +2464,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     if (measured_health.observed) {
         if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
             !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
+            !cJSON_AddNumberToObject(storage, "persistence_probe_failures", measured_health.persistence_probe_failures) ||
             !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||

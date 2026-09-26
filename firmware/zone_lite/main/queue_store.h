@@ -9,6 +9,7 @@ typedef struct {
     size_t total_bytes, used_bytes, admission_reserve_bytes;
     bool observed, available, bulk_paused, recovery_complete, persistence_verified;
     uint32_t failures, write_failures, read_failures, admission_rejections;
+    uint32_t persistence_probe_failures;
     int last_error;
     const char *last_operation;
 } qs_health_t;
