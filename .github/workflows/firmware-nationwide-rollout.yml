@@ -20,6 +20,11 @@ on:
         required: true
         default: 5
         type: number
+      defer_offline_zones:
+        description: Roll out connected ZKT zones and report offline zones as pending
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -77,4 +82,5 @@ jobs:
             -GitSha '${{ needs.provenance.outputs.sha }}' `
             -CanaryCampaignId '${{ inputs.canary_campaign_id }}' `
             -AdminPassword $env:ADD_ADMIN_PASSWORD `
-            -BatchSize '${{ inputs.batch_size }}'
+            -BatchSize '${{ inputs.batch_size }}' `
+            -DeferOfflineZones:('${{ inputs.defer_offline_zones }}' -eq 'true')
