@@ -67,6 +67,10 @@ static bool g_queue_store_ready=true;
 static bool qs_init(void){return true;}
 bool qs_recover_step(void){return true;}
 bool qs_verify_persistence(void){return true;}
+#if !ZONE_LITE_HIKVISION
+typedef struct {int last_error;} qs_health_t;
+static qs_health_t qs_health(void){return (qs_health_t){.last_error=0};}
+#endif
 static void led_status_fault(int state){assert(state>=1 && state<=3);++faults;if(state==LED_STATUS_LOCAL_FAILURE)++local_faults;}
 static void vTaskDelay(unsigned ms){if(gateway_created)++capture_ticks;now+=ms;if(now>=stop_at)longjmp(done,1);}
 static void launch(void)
