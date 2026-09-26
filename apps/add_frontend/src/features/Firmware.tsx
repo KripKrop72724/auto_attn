@@ -680,9 +680,11 @@ function CampaignCreator({
       ].sort(([left], [right]) => left.localeCompare(right)),
     [devices],
   )
-  const hilZoneIds = hilAllowedTargets(selectedRelease).map(
-    target => devices.find(device => device.connector_id === target.connector_id)?.zone_id,
-  )
+  const hilZoneIds = selectedRelease?.hil_targets
+    ? hilAllowedTargets(selectedRelease).map(
+        target => devices.find(device => device.connector_id === target.connector_id)?.zone_id,
+      )
+    : [hilDevice(selectedRelease, devices)?.zone_id]
   const selectableZones = isHil ? zones.filter(([id]) => hilZoneIds.includes(id)) : zones
   const hilTarget = hilDevice(selectedRelease, devices, zoneId)
   const expiresIn = scope
