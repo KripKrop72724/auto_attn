@@ -744,6 +744,7 @@ export interface FirmwareRelease {
   hil_target_mac: string | null
   hil_targets?: HilTarget[] | null
   hil_next_target?: HilTarget | null
+  hil_allowed_targets?: HilTarget[] | null
   hil_scope_message?: string | null
 }
 

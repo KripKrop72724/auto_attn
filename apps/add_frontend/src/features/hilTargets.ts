@@ -1,9 +1,22 @@
 import type { Device, FirmwareRelease } from '../types'
 
-export function hilDevice(release: FirmwareRelease | null | undefined, devices: Device[]): Device | null {
+export function hilAllowedTargets(release: FirmwareRelease | null | undefined) {
+  if (!release || release.state !== 'HIL_ONLY' || !release.hil_targets) return []
+  return release.hil_allowed_targets || (release.hil_next_target ? [release.hil_next_target] : [])
+}
+
+function selectedHilTarget(release: FirmwareRelease | null | undefined, devices: Device[], zoneId?: string) {
+  const targets = hilAllowedTargets(release)
+  return targets.find(target => {
+    const device = devices.find(row => row.connector_id === target.connector_id)
+    return device && (!zoneId || device.zone_id === zoneId)
+  }) || (zoneId ? null : targets[0] || null)
+}
+
+export function hilDevice(release: FirmwareRelease | null | undefined, devices: Device[], zoneId?: string): Device | null {
   if (!release || release.state !== 'HIL_ONLY') return null
   if (release.hil_targets) {
-    const target = release.hil_next_target
+    const target = selectedHilTarget(release, devices, zoneId)
     if (!target) return null
     return devices.find(device => !device.is_spare &&
       device.connector_id === target.connector_id &&
@@ -17,9 +30,10 @@ export function hilDevice(release: FirmwareRelease | null | undefined, devices: 
     device.hardware_id.toLowerCase() === release.hil_target_mac.toLowerCase()) || null
 }
 
-export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, devices: Device[]): string | null {
-  if (release?.state !== 'HIL_ONLY' || !release.hil_targets || !release.hil_next_target) return null
-  const target = release.hil_next_target
+export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, devices: Device[], zoneId?: string): string | null {
+  if (release?.state !== 'HIL_ONLY' || !release.hil_targets || !hilAllowedTargets(release).length) return null
+  const target = selectedHilTarget(release, devices, zoneId)
+  if (!target) return 'This zone is outside the current HIL scope.'
   const device = devices.find(row => row.connector_id === target.connector_id)
   if (!device) return 'Target connector is missing from the active fleet.'
   if (device.is_spare) return 'Target connector is in spare inventory.'
@@ -39,7 +53,9 @@ export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, d
 
 export function hilScopeLabel(release: FirmwareRelease): string {
   if (release.hil_targets) {
-    const target = release.hil_next_target
+    const allowed = hilAllowedTargets(release)
+    if (allowed.length > 1) return `${allowed.length} exact HIL targets open for independent trials`
+    const target = allowed[0]
     return target
       ? `${release.hil_targets.length} ordered targets · next ${target.mac} · ${target.terminal_serial}`
       : release.hil_scope_message || 'Ordered HIL targets are on hold'

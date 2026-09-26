@@ -14,7 +14,7 @@ from zk_add.ota import (
     FirmwareDeployment,
     FirmwareRelease,
     _application_sha256,
-    _ordered_hil_target,
+    _permitted_hil_targets,
     _storage_predecessor_exclusion,
     _versions_match,
 )
@@ -78,10 +78,10 @@ def trusted_hil_clock_matches(
         return False
     deployment, release = row
     try:
-        target = _ordered_hil_target(session, release)
+        targets = _permitted_hil_targets(session, release)
     except ValueError:
         return False
-    if target is None or not target_matches(target, connector):
+    if not targets or not any(target_matches(target, connector) for target in targets):
         return False
     baseline_running = any(
         _versions_match(connector.firmware_version, version) for version in DIRECT_BASELINES

@@ -12,7 +12,7 @@ import {
 } from 'react'
 import { z } from 'zod'
 import './Firmware.css'
-import { hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
+import { hilAllowedTargets, hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
 import { api, queryString } from '../api'
 import {
   Dialog,
@@ -667,7 +667,6 @@ function CampaignCreator({
   const [clock, setClock] = useState(() => Date.now())
   const selectedRelease =
     releases.find((release) => release.release_id === releaseId) || null
-  const hilTarget = hilDevice(selectedRelease, devices)
   const isHil = selectedRelease?.state === 'HIL_ONLY'
   const zones = useMemo(
     () =>
@@ -681,6 +680,11 @@ function CampaignCreator({
       ].sort(([left], [right]) => left.localeCompare(right)),
     [devices],
   )
+  const hilZoneIds = hilAllowedTargets(selectedRelease).map(
+    target => devices.find(device => device.connector_id === target.connector_id)?.zone_id,
+  )
+  const selectableZones = isHil ? zones.filter(([id]) => hilZoneIds.includes(id)) : zones
+  const hilTarget = hilDevice(selectedRelease, devices, zoneId)
   const expiresIn = scope
     ? Math.max(0, Math.ceil((Date.parse(scope.expires_at) - clock) / 1000))
     : 0
@@ -849,14 +853,14 @@ function CampaignCreator({
               Zone
               <select
                 value={zoneId}
-                disabled={isHil}
+                disabled={isHil && selectableZones.length <= 1}
                 onChange={(event) => {
                   setZoneId(event.target.value)
                   resetScope()
                 }}
               >
                 <option value="">Select a zone</option>
-                {zones.map(([id, name]) => (
+                {selectableZones.map(([id, name]) => (
                   <option key={id} value={id}>
                     {name} · {id}
                   </option>
@@ -874,7 +878,7 @@ function CampaignCreator({
                     {selectedRelease ? hilScopeLabel(selectedRelease) : 'No target'}
                     {hilTarget
                       ? ` · ${hilTarget.display_name}`
-                      : ` · ${hilDeviceMismatch(selectedRelease, devices) || 'no registered match'}`}
+                      : ` · ${hilDeviceMismatch(selectedRelease, devices, zoneId) || 'no registered match'}`}
                   </small>
                 </span>
               </div>
