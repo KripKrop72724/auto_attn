@@ -1524,8 +1524,11 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     connector = session.get(Connector, grant.connector_id)
     if connector is None or _storage_predecessor_exclusion(session, release, connector):
         raise ValueError("Firmware storage predecessor is no longer eligible.")
-    bridge_target = _factory_3fl_bridge_target(release, connector.zone_id)
-    if bridge_target and _factory_3fl_bridge_exclusion(connector, bridge_target):
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    bridge_target = _factory_3fl_bridge_target(release, campaign.zone_id if campaign else connector.zone_id)
+    if bridge_target and (campaign is None or campaign.status != "ACTIVE"
+                          or connector.zone_id != campaign.zone_id
+                          or _factory_3fl_bridge_exclusion(connector, bridge_target)):
         raise ValueError("Factory-to-OTA bridge exact target or predecessor changed.")
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()

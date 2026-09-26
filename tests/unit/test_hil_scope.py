@@ -433,6 +433,10 @@ def test_252_factory_bridge_selects_only_live_3fl_and_rechecks_grant(parallel_26
     session.flush()
     grant = offer["download_url"].rsplit("/", 1)[1]
     assert resolve_download(session, grant)[0] == release
+    target.zone_id = "ZONE-OTHER"
+    with pytest.raises(ValueError, match="bridge exact target or predecessor changed"):
+        resolve_download(session, grant)
+    target.zone_id = zones[2]
     target.ota_running_partition = "ota_0"
     with pytest.raises(ValueError, match="bridge exact target or predecessor changed"):
         resolve_download(session, grant)
