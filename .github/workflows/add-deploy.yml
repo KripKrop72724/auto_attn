@@ -21,7 +21,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, inspect, clean-generated]
+        options: [none, inspect, clean-generated, clean-signing-scratch]
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
           MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:MAINTENANCE_MODE -notin @('inspect', 'clean-generated')) {
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'clean-generated', 'clean-signing-scratch')) {
             throw 'Unsupported runner maintenance mode.'
           }
           $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
@@ -69,6 +69,33 @@ jobs:
             Write-Host "$label bytes=$([int64]$sum) present=true"
           }
           Show-FreeSpace 'before'
+          if ($env:MAINTENANCE_MODE -eq 'clean-signing-scratch') {
+            $removed = 0
+            if (Test-Path -LiteralPath $workspace -PathType Container) {
+              foreach ($entry in @(Get-ChildItem -LiteralPath $workspace -Directory -Force |
+                  Where-Object { $_.Name -match '^zone-lite-release-sign-[0-9a-f]{32}$' })) {
+                $full = [IO.Path]::GetFullPath($entry.FullName)
+                if (-not $full.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar,
+                    [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe signing scratch path.' }
+                $key = Join-Path $full 'active-key.pem'
+                if (Test-Path -LiteralPath $key -PathType Leaf) {
+                  $length = (Get-Item -LiteralPath $key).Length
+                  if ($length -gt 1MB) { throw 'Unexpected signing scratch key size.' }
+                  if ($length -gt 0) {
+                    $random = New-Object byte[] $length
+                    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+                    try { $rng.GetBytes($random) } finally { $rng.Dispose() }
+                    [IO.File]::WriteAllBytes($key, $random)
+                  }
+                }
+                Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+                $removed++
+              }
+            }
+            Write-Host "removed_signing_scratch_directories=$removed"
+            Show-FreeSpace 'after'
+            exit 0
+          }
           if ($env:MAINTENANCE_MODE -eq 'inspect') {
             Show-DirectoryBytes 'actions_cache' $actionsRoot
             Show-DirectoryBytes 'runner_temp' $env:RUNNER_TEMP
