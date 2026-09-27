@@ -36,7 +36,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.runner_capacity_mode != 'none'
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
-    timeout-minutes: 10
+    timeout-minutes: 20
     defaults:
       run:
         shell: powershell
@@ -69,14 +69,20 @@ jobs:
             Write-Host "$label bytes=$([int64]$sum) present=true"
           }
           Show-FreeSpace 'before'
-          Show-DirectoryBytes 'actions_cache' $actionsRoot
-          Show-DirectoryBytes 'runner_temp' $env:RUNNER_TEMP
-          Show-DirectoryBytes 'workspace' $workspace
-          if (Get-Command docker -ErrorAction SilentlyContinue) {
-            & docker system df
-            if ($LASTEXITCODE -ne 0) { Write-Host 'docker_disk_usage_unavailable=true' }
+          if ($env:MAINTENANCE_MODE -eq 'inspect') {
+            Show-DirectoryBytes 'actions_cache' $actionsRoot
+            Show-DirectoryBytes 'runner_temp' $env:RUNNER_TEMP
+            Show-DirectoryBytes 'workspace' $workspace
+            if (Get-Command docker -ErrorAction SilentlyContinue) {
+              & docker system df
+              if ($LASTEXITCODE -ne 0) { Write-Host 'docker_disk_usage_unavailable=true' }
+            }
+            exit 0
           }
-          if ($env:MAINTENANCE_MODE -eq 'inspect') { exit 0 }
+
+          # A full drive can make recursive size measurement or Docker's own
+          # accounting stall. The cleanup mode must reach deletion first.
+          Write-Host 'Removing only known generated workspace and action staging directories.'
 
           $generated = @(
             (Join-Path $workspace 'unsigned'),
