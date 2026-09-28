@@ -122,6 +122,12 @@ with engine.connect() as connection:
             select raw_record_digest from add_terminal_record_manifest
              where source_epoch_id = 595 and canonical_source = true
         """)).scalars().all())
+        comparison = connection.execute(text("""
+            select source_epoch_id, raw_record_digest
+              from add_terminal_record_manifest
+             where source_epoch_id in (592, 593, 594, 595)
+               and canonical_source = true
+        """)).mappings().all()
         event_sources = connection.execute(
             text("""
                 select source, count(*) as count
@@ -166,5 +172,13 @@ print("G3_DELETE_PREFLIGHT_JSON=" + json.dumps({
             for epoch in epochs
         ],
         "distinct_raw_digests_in_latest": len({row["raw_record_digest"] for row in historical if row["raw_record_digest"] in current_digests}),
+        "recent_epoch_source_comparison": [
+            {
+                "epoch_id": epoch_id,
+                "source_records": sum(row["source_epoch_id"] == epoch_id for row in comparison),
+                "raw_digest_in_latest": sum(row["source_epoch_id"] == epoch_id and row["raw_record_digest"] in current_digests for row in comparison),
+            }
+            for epoch_id in (592, 593, 594, 595)
+        ],
     },
 }, separators=(",", ":")))
