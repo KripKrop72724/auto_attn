@@ -17,11 +17,11 @@ on:
         default: false
         type: boolean
       runner_capacity_mode:
-        description: Inspect runner disk or clear only generated build and action staging files
+        description: Inspect runner disk or Docker, or clear generated build and signing files
         required: false
         default: none
         type: choice
-        options: [none, inspect, clean-generated, clean-signing-scratch]
+        options: [none, inspect, diagnose-docker, clean-generated, clean-signing-scratch]
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
           MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:MAINTENANCE_MODE -notin @('inspect', 'clean-generated', 'clean-signing-scratch')) {
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'clean-generated', 'clean-signing-scratch')) {
             throw 'Unsupported runner maintenance mode.'
           }
           $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
@@ -69,6 +69,39 @@ jobs:
             Write-Host "$label bytes=$([int64]$sum) present=true"
           }
           Show-FreeSpace 'before'
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-docker') {
+            $service = Get-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
+            Write-Host "docker_service_status=$(if ($service) { $service.Status } else { 'missing' })"
+            foreach ($name in @('com.docker.backend', 'Docker Desktop')) {
+              $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+              Write-Host "docker_process=$name count=$($processes.Count)"
+            }
+            $docker = Get-Command docker -ErrorAction SilentlyContinue
+            if (-not $docker) {
+              Write-Host 'docker_cli_present=false'
+              exit 0
+            }
+            $probe = New-Object System.Diagnostics.Process
+            $probe.StartInfo.FileName = $docker.Source
+            $probe.StartInfo.Arguments = 'info --format "{{.ServerVersion}}"'
+            $probe.StartInfo.UseShellExecute = $false
+            $probe.StartInfo.CreateNoWindow = $true
+            $probe.StartInfo.RedirectStandardOutput = $true
+            $probe.StartInfo.RedirectStandardError = $true
+            try {
+              [void]$probe.Start()
+              if (-not $probe.WaitForExit(15000)) {
+                $probe.Kill()
+                [void]$probe.WaitForExit(5000)
+                Write-Host 'docker_info_result=timeout'
+              } else {
+                Write-Host "docker_info_result=exit_$($probe.ExitCode)"
+              }
+            } finally {
+              $probe.Dispose()
+            }
+            exit 0
+          }
           if ($env:MAINTENANCE_MODE -eq 'clean-signing-scratch') {
             $removed = 0
             if (Test-Path -LiteralPath $workspace -PathType Container) {
