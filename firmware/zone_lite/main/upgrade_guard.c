@@ -20,6 +20,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         "a95370b1487d9c1454dfb932c41432451f24ef69d0abc1292a5c0262c17c243c";
     static const char hil_2612[] =
         "3f9028126c8dde9816486783a27a9802ed41179cd9f8caf9935deb79a0057fc1";
+    static const char hil_2613[] =
+        "c7be4171153333563f9ed6e43f91376d42dfb9d3ca2faefda2ca6d1ac87b2def";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -27,7 +29,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.6.8") ? hil_268 :
         !strcmp(version, "2.6.9") ? hil_269 :
         !strcmp(version, "2.6.10") ? hil_2610 :
-        !strcmp(version, "2.6.12") ? hil_2612 : NULL;
+        !strcmp(version, "2.6.12") ? hil_2612 :
+        !strcmp(version, "2.6.13") ? hil_2613 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

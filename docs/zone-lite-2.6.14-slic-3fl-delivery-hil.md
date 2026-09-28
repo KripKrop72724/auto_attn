@@ -1,0 +1,7 @@
+# Zone Lite 2.6.14 SLICTOWER 3FL delivery-fault HIL patch
+
+The signed 2.6.13 HIL image fixed the G3 live-frame parser. SLICTOWER 3FL has delivered fresh `LIVE` punches to ADD and Oracle, and its storage recovery and persistence checks passed. During an ADD backend deployment, a failed ADD outbox enqueue latched the ESP's `LOCAL_FAILURE` state even though the primary attendance record was durably preserved. The device reported `ESP_DURABILITY_FAULT` until an ESP-only power cycle, after which ADD showed ONLINE, healthy storage, and zero read/write failures.
+
+2.6.14 keeps the 2.6.13 attendance parser and stops classifying that preserved attendance delivery retry as a flash failure. Real queue admission, write, read, and persistence failures remain fail-closed through the storage health checks. The release admits the exact signed 2.6.13 application digest as a qualified predecessor and retains the prior signed baseline list. It remains `HIL_ONLY` for the same five exact Swat, SLICTOWER, and Peshawar targets.
+
+Trial SLICTOWER 3FL first. Require signed OTA boot, healthy storage and workers, an accepted heartbeat, a fresh biometric `LIVE` punch acknowledged by Oracle, and physical rejection of card/PIN punch methods where a test user is available. Do not treat a source-recovered or blocked-identity event as live HIL evidence. Keep SLICTOWER 13FL off further OTA trials while its flash-full blocked-attendance queue is preserved and diagnosed.
