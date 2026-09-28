@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   inspect:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/audit/g3-current-source'
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
     timeout-minutes: 5
@@ -80,6 +80,16 @@ jobs:
             $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'TRANSPORT_ERROR' }
             Write-Host "oracle_content_check_http=$status"
           }
+
+      - name: Compare certified G3 source with saved ADD events
+        if: github.ref == 'refs/heads/audit/g3-current-source' && inputs.direct_run_id != ''
+        env:
+          G3_JOB_ID: ${{ inputs.direct_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Get-Content -Raw 'scripts/g3_current_source_audit.py'
+          $script | & docker exec -i attendance-device-dashboard-add-api-1 python - --job-id $env:G3_JOB_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only G3 source audit failed.' }
 
       - name: Inspect one firmware assignment without changing deployment state
         if: inputs.firmware_campaign_id != ''
