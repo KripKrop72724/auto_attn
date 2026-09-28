@@ -21,7 +21,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, inspect, diagnose-docker, clean-generated, clean-signing-scratch]
+        options: [none, inspect, diagnose-docker, diagnose-ords-route, clean-generated, clean-signing-scratch]
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
           MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'clean-generated', 'clean-signing-scratch')) {
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'diagnose-ords-route', 'clean-generated', 'clean-signing-scratch')) {
             throw 'Unsupported runner maintenance mode.'
           }
           $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
@@ -69,6 +69,30 @@ jobs:
             Write-Host "$label bytes=$([int64]$sum) present=true"
           }
           Show-FreeSpace 'before'
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-ords-route') {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+            foreach ($route in @(
+                @{ Name = 'public'; Host = 'eclaim2.slichealth.com' },
+                @{ Name = 'internal'; Host = 'local.slichealth.com' }
+              )) {
+              $uri = "https://$($route.Host)/ords/slic_hrm/raw_attn_capture_event/raw-captures"
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Method Options -Uri $uri -TimeoutSec 12
+                $result = "HTTP_$($response.StatusCode)"
+              } catch {
+                $exception = $_.Exception
+                if ($exception.Response -and $exception.Response.StatusCode) {
+                  $result = "HTTP_$([int]$exception.Response.StatusCode)"
+                } elseif ($exception -is [System.Net.WebException]) {
+                  $result = "ERROR_WEB_$($exception.Status.ToString().ToUpperInvariant())"
+                } else {
+                  $result = "ERROR_$($exception.GetType().Name)"
+                }
+              }
+              Write-Host "ords_$($route.Name)_host_probe=$result"
+            }
+            exit 0
+          }
           if ($env:MAINTENANCE_MODE -eq 'diagnose-docker') {
             $service = Get-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
             Write-Host "docker_service_status=$(if ($service) { $service.Status } else { 'missing' })"
