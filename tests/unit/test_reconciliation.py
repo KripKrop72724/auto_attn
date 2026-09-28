@@ -1374,6 +1374,68 @@ def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
     assert job.auto_retry_count == 1
 
 
+def test_stream_v2_release_uses_add_cursor_after_ack_lost(reconciliation_db):
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    assert zkt is not None
+    zkt.capability_profile = {
+        **(zkt.capability_profile or {}),
+        "history_stream_v2": True,
+        "history_chunk_max_records": 100,
+        "history_credit_max_records": 400,
+    }
+    zkt.attendance_count = 500
+    job = create_reconciliation_job(
+        session,
+        connector=connector,
+        actor="operator",
+        reason="Verify a lost chunk ACK cannot discard ADD source evidence.",
+        confirmation="RECONCILE 1 FROM START",
+        idempotency_key="reconcile-stream-v2-lost-ack",
+    )
+    job.cutoff_count = 500
+    job.record_size = 8
+    job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
+    job.committed_next_ordinal = 100
+    job.scanned_count = 100
+    job.last_chain_digest = hashlib.sha256(b"checkpoint-100").hexdigest()
+    assignment = assignment_rows(session)[0][1]
+
+    # ADD committed a chunk, but the connector only knows the prior cursor.
+    job.committed_next_ordinal = 200
+    job.scanned_count = 200
+    job.last_chain_digest = hashlib.sha256(b"checkpoint-200").hexdigest()
+    with pytest.raises(ValueError, match="exceeded ADD's durable cursor"):
+        apply_reconciliation_assignment_release(
+            session,
+            connector=connector,
+            payload=ReconciliationAssignmentReleaseRequest(
+                assignment_id=assignment["assignment_id"],
+                job_id=job.job_id,
+                generation=job.terminal_generation,
+                committed_next_ordinal=201,
+                reason="TRANSIENT_STEP_FAILED",
+            ),
+        )
+    assert job.active_assignment_id == assignment["assignment_id"]
+
+    apply_reconciliation_assignment_release(
+        session,
+        connector=connector,
+        payload=ReconciliationAssignmentReleaseRequest(
+            assignment_id=assignment["assignment_id"],
+            job_id=job.job_id,
+            generation=job.terminal_generation,
+            committed_next_ordinal=100,
+            reason="TRANSIENT_STEP_FAILED",
+        ),
+    )
+    assert job.active_assignment_id is None
+    assert job.committed_next_ordinal == 200
+    assert job.last_chain_digest == hashlib.sha256(b"checkpoint-200").hexdigest()
+    assert job.wait_reason == "TRANSIENT_STEP_RETRY"
+
+
 @pytest.mark.parametrize(
     ("remaining", "expected_credit"),
     [(1, 1), (31, 31), (99, 99), (100, 100), (101, 101)],
