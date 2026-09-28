@@ -70,6 +70,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
         "3f9028126c8dde9816486783a27a9802ed41179cd9f8caf9935deb79a0057fc1":
         !strcmp(previous_app.version,"2.6.13")?
         "c7be4171153333563f9ed6e43f91376d42dfb9d3ca2faefda2ca6d1ac87b2def":
+        !strcmp(previous_app.version,"2.6.14")?
+        "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -105,6 +107,7 @@ int main(void)
     strcpy(previous_app.version,"2.6.6");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.12");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.13");assert(storage_upgrade_init());
+    strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());

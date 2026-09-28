@@ -21,15 +21,15 @@ from zk_add.storage_contract import (DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, D
                                      CONTENTION_BASELINE_IMAGES, CONTENTION_BASELINES,
                                      PRESSURE_BASELINE_IMAGES, PRESSURE_BASELINES,
                                      PROBE_BASELINE_IMAGES, PROBE_BASELINES)
-from zk_add.storage_contract import LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES
+from zk_add.storage_contract import LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES, LOCK_BASELINES, LOCK_BASELINE_IMAGES
 from zk_add.time_utils import utc_now
 
 
 @pytest.fixture(params=DIRECT_VERSIONS)
 def clock_hil(monkeypatch, request):
     version = request.param
-    baselines = DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
-    baseline_images = DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES if version == "2.6.10" else CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
+    baselines = LOCK_BASELINES if version == "2.6.15" else DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+    baseline_images = LOCK_BASELINE_IMAGES if version == "2.6.15" else DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES if version == "2.6.10" else CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
     target = {
         "connector_id": "clock-hil-connector", "mac": "a4:cb:8f:d4:66:01",
         "terminal_serial": "clock-hil-terminal",
