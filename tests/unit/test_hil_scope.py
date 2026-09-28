@@ -362,11 +362,12 @@ def test_269_parallel_policy_requires_the_exact_published_identity(parallel_269_
     assert _permitted_hil_targets(session, release) == [HIL_269_EXACT_TARGETS[0]]
 
 
-@pytest.mark.parametrize("version", ["2.6.10", "2.6.11", "2.6.12"])
+@pytest.mark.parametrize("version", ["2.6.10", "2.6.11", "2.6.12", "2.6.13"])
 def test_signed_patch_exact_scope_keeps_first_three_independent(parallel_269_session, version):
     from zk_add.ota import HIL_269_EXACT_TARGETS, _permitted_hil_targets
     from zk_add.storage_contract import (PRESSURE_BASELINES, PRESSURE_BASELINE_IMAGES,
-                                         PROBE_BASELINES, PROBE_BASELINE_IMAGES)
+                                         PROBE_BASELINES, PROBE_BASELINE_IMAGES,
+                                         LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES)
 
     session, release, _devices, _zones = parallel_269_session
     release.release_id = f"zone-lite-{version}"
@@ -378,8 +379,8 @@ def test_signed_patch_exact_scope_keeps_first_three_independent(parallel_269_ses
         "application_sha256": "d" * 64,
         "queue_storage": {
             **release.manifest["queue_storage"],
-            "allowed_bootstrap_versions": list(PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES),
-            "allowed_bootstrap_images": PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES,
+            "allowed_bootstrap_versions": list(LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES),
+            "allowed_bootstrap_images": LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES,
         },
     }
     session.flush()

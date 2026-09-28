@@ -37,13 +37,28 @@ int main(void)
     assert(!rel_json_syntax_valid(deep, 198));
 
     size_t shape;
-    assert(!rel_live_frame_size(13, 0, &shape));
-    assert(!rel_live_frame_size(36, 0, &shape));
-    assert(rel_live_frame_size(36, 12, &shape) && shape == 12);
-    assert(rel_live_frame_size(36, 36, &shape) && shape == 36);
-    assert(!rel_live_frame_size(64, 0, &shape));
-    assert(rel_live_frame_size(64, 32, &shape) && shape == 32);
-    assert(!rel_live_frame_size(65, 32, &shape));
+    unsigned char singleton[36] = {0};
+    singleton[0] = '1'; singleton[1] = '9';
+    singleton[26] = 26; singleton[27] = 9; singleton[28] = 28;
+    singleton[29] = 14; singleton[30] = 55; singleton[31] = 17;
+    assert(!rel_live_frame_size(singleton, 13, 0, &shape));
+    assert(rel_live_frame_size(singleton, 36, 0, &shape) && shape == 36);
+    assert(rel_live_frame_size(singleton, 36, 36, &shape) && shape == 36);
+    unsigned char compact[36] = {0};
+    for (size_t offset = 0; offset < sizeof(compact); offset += 12) {
+        compact[offset] = 7;
+        compact[offset + 6] = 26; compact[offset + 7] = 9;
+        compact[offset + 8] = 28; compact[offset + 9] = 14;
+        compact[offset + 10] = 55; compact[offset + 11] = 17;
+    }
+    assert(rel_live_frame_size(compact, 36, 0, &shape) && shape == 12);
+    compact[27] = 9; compact[28] = 1; compact[29] = 1;
+    assert(!rel_live_frame_size(compact, 36, 0, &shape));
+    unsigned char malformed[65] = {0};
+    assert(!rel_live_frame_size(malformed, 36, 0, &shape));
+    assert(!rel_live_frame_size(malformed, 64, 0, &shape));
+    assert(rel_live_frame_size(malformed, 64, 32, &shape) && shape == 32);
+    assert(!rel_live_frame_size(malformed, 65, 32, &shape));
     for (size_t length = 0; length <= 4096; length++) {
         unsigned char *bytes = calloc(length ? length : 1, 1);
         rel_live_record_t record;
@@ -99,6 +114,7 @@ int main(void)
         size_t n = seed % sizeof(data);
         rel_live_record_t record;
         (void)rel_parse_live_record(data, n, &record);
+        (void)rel_live_frame_size(data, n, 0, &shape);
         (void)rel_json_syntax_valid((const char *)data, n);
     }
     puts("reliability host regression tests passed");
