@@ -99,14 +99,29 @@ with engine.connect() as connection:
         """)).scalars().all()
         historical = connection.execute(
             text("""
-                select attendance_event_id, source_epoch_id, source_kind,
-                       canonical_source, disposition, ordinal, created_at
+                select attendance_event_id, source_epoch_id, generation,
+                       source_kind, canonical_source, disposition, ordinal,
+                       raw_record_digest, created_at
                   from add_terminal_record_manifest
                  where attendance_event_id in :ids
                  order by attendance_event_id, created_at
             """).bindparams(bindparam("ids", expanding=True)),
             {"ids": IDS},
         ).mappings().all()
+        epochs = connection.execute(text("""
+            select e.id, e.sequence, e.state, e.parent_epoch_id,
+                   e.terminal_generation, e.activated_at, e.superseded_at,
+                   e.created_at
+              from add_terminal_source_epochs e
+             where e.id in :ids
+             order by e.id
+        """).bindparams(bindparam("ids", expanding=True)), {
+            "ids": tuple({row["source_epoch_id"] for row in historical if row["source_epoch_id"] is not None}) + (595,)
+        }).mappings().all()
+        current_digests = set(connection.execute(text("""
+            select raw_record_digest from add_terminal_record_manifest
+             where source_epoch_id = 595 and canonical_source = true
+        """)).scalars().all())
         event_sources = connection.execute(
             text("""
                 select source, count(*) as count
@@ -133,5 +148,23 @@ print("G3_DELETE_PREFLIGHT_JSON=" + json.dumps({
         "dispositions": sorted({row["disposition"] for row in historical if row["disposition"] is not None}),
         "first_created_at": min((row["created_at"] for row in historical), default=None).isoformat() if historical else None,
         "last_created_at": max((row["created_at"] for row in historical), default=None).isoformat() if historical else None,
+        "epoch_details": [
+            {
+                "id": epoch["id"],
+                "sequence": epoch["sequence"],
+                "state": epoch["state"],
+                "parent_epoch_id": epoch["parent_epoch_id"],
+                "terminal_generation": epoch["terminal_generation"],
+                "activated_at": epoch["activated_at"].isoformat() if epoch["activated_at"] else None,
+                "superseded_at": epoch["superseded_at"].isoformat() if epoch["superseded_at"] else None,
+                "linked_events": len({row["attendance_event_id"] for row in historical if row["source_epoch_id"] == epoch["id"]}),
+                "linked_records": sum(row["source_epoch_id"] == epoch["id"] for row in historical),
+                "raw_digest_in_latest": sum(row["source_epoch_id"] == epoch["id"] and row["raw_record_digest"] in current_digests for row in historical),
+                "first_ordinal": min((row["ordinal"] for row in historical if row["source_epoch_id"] == epoch["id"]), default=None),
+                "last_ordinal": max((row["ordinal"] for row in historical if row["source_epoch_id"] == epoch["id"]), default=None),
+            }
+            for epoch in epochs
+        ],
+        "distinct_raw_digests_in_latest": len({row["raw_record_digest"] for row in historical if row["raw_record_digest"] in current_digests}),
     },
 }, separators=(",", ":")))
