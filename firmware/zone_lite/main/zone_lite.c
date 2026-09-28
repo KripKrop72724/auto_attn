@@ -3428,7 +3428,8 @@ static bool add_send_attendance_event_acknowledged(
 static bool recover_live_event_after_storage_error(
     const attendance_event_t *event,
     const char *capturetype,
-    const char *storage_failure)
+    const char *storage_failure,
+    bool storage_fault)
 {
     if (strcmp(capturetype, "LIVE") != 0) {
         return false;
@@ -3458,7 +3459,10 @@ static bool recover_live_event_after_storage_error(
     if (event->cnic[0] == '\0') {
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
     }
-    led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    // A bounded lock wait can expire while another worker owns healthy storage.
+    // An acknowledged live event has ADD custody and unchanged ZKT source truth;
+    // reserve the persistent fault latch for an actual local storage failure.
+    if (storage_fault) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     char message[224];
     snprintf(
         message,
@@ -3469,7 +3473,7 @@ static bool recover_live_event_after_storage_error(
     (void)add_connector_log(
         "WARN",
         "live",
-        "LIVE_LOCAL_STORAGE_RECOVERED",
+        storage_fault ? "LIVE_LOCAL_STORAGE_RECOVERED" : "LIVE_OUTBOX_LOCK_RECOVERED",
         message);
     return true;
 }
@@ -3629,13 +3633,16 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
 {
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGE(TAG, "Could not lock durable attendance outbox");
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        bool storage_fault = !g_storage_lock;
         if (recover_live_event_after_storage_error(
                 event,
                 capturetype,
-                "attendance outbox lock timeout")) {
+                "attendance outbox lock timeout",
+                storage_fault)) {
             return ENQUEUE_ACKNOWLEDGED;
         }
+        // No durable record or acknowledged fallback was obtained.
+        led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return ENQUEUE_STORAGE_ERROR;
     }
     enqueue_result_t result = enqueue_event_to_files(event, capturetype);
@@ -3643,11 +3650,13 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
     // ADD capacity waits and acknowledgement recovery must never own the local
     // storage lock. Local capture has already settled or explicitly failed.
     if (result == ENQUEUE_STORAGE_ERROR && recover_live_event_after_storage_error(
-            event, capturetype, "local append failure")) return ENQUEUE_ACKNOWLEDGED;
+            event, capturetype, "local append failure", true)) return ENQUEUE_ACKNOWLEDGED;
     if (result == ENQUEUE_PENDING || result == ENQUEUE_BLOCKED) {
         if (!add_send_attendance_event(event, capturetype)) {
             ESP_LOGE(TAG, "Attendance remains locally preserved; ADD delivery requires retry");
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            // The primary attendance record is already durable. A failed ADD
+            // enqueue needs reconciliation, but is not proof of lost storage.
+            // Any actual queue write failure is recorded by qs_local_end().
         }
     }
     return result;
