@@ -504,7 +504,7 @@ if (-not $rejected) { throw 'Partial 2.6.14 HIL scope accepted' }
 $zkt2614Marker = Get-Content -LiteralPath (Join-Path $store '2.6.14/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2614Marker.targets.Count -ne 5 -or $zkt2614Marker.application_sha256 -cne ('e'*64)) { throw '2.6.14 HIL marker is incomplete' }
 # Lock-contention patch remains scoped to the same five exact HIL devices.
-. (Join-Path $repo 'deploy/add/firmware-2-6-14-hil-scope.ps1')
+. (Join-Path $repo 'deploy/add/firmware-2-6-15-hil-scope.ps1')
 $exact2615 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.15.json') -Raw
 Assert-Zkt2615HilScope -HilTargetsJson $exact2615
 foreach ($scope in @('', '[]', '{', $targets)) {
