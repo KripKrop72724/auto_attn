@@ -17,6 +17,8 @@ foreach ($name in $required) {
         throw "Firmware package is missing $name"
     }
 }
+& python (Join-Path $PSScriptRoot '../../scripts/canonicalize_firmware_manifest.py') (Join-Path $source 'manifest.json') --check
+if ($LASTEXITCODE -ne 0) { throw 'Firmware manifest is not in ADD canonical signed form' }
 
 $manifest = Get-Content (Join-Path $source 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $Version) { throw 'Manifest version does not match requested version' }
@@ -135,6 +137,13 @@ if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.11') {
     }
     . (Join-Path $PSScriptRoot 'firmware-2-6-11-hil-scope.ps1')
     Assert-Zkt2611HilScope -HilTargetsJson $HilTargetsJson
+}
+if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.12') {
+    if ($PublicationMode -ne 'HIL_ONLY' -or -not [string]::IsNullOrWhiteSpace($HilTargetMac)) {
+        throw 'ZKT 2.6.12 must first be published only to its exact ordered HIL scope'
+    }
+    . (Join-Path $PSScriptRoot 'firmware-2-6-12-hil-scope.ps1')
+    Assert-Zkt2612HilScope -HilTargetsJson $HilTargetsJson
 }
 $scopeJson = ConvertTo-Json -InputObject @($targets) -Depth 5 -Compress
 

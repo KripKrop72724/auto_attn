@@ -266,7 +266,7 @@ def _parallel_hil_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> 
     published_269 = identity == HIL_269_PARALLEL_IDENTITY
     signed_patch = (
         release.release_id == f"zone-lite-{release.version}"
-        and release.version in {"2.6.10", "2.6.11"}
+        and release.version in {"2.6.10", "2.6.11", "2.6.12"}
         and release.state == "HIL_ONLY"
         and bool(re.fullmatch(r"[0-9a-f]{40}", release.git_sha))
         and bool(re.fullmatch(r"[0-9a-f]{64}", release.image_sha256))
@@ -479,7 +479,7 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version == "2.6.8" and qualified_version in {"2.6.6", "2.6.7"}) or (
             release.version == "2.6.9" and qualified_version in {"2.6.6", "2.6.7", "2.6.8"}) or (
             release.version == "2.6.10" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9"}) or (
-            release.version == "2.6.11" and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10"})
+            release.version in {"2.6.11", "2.6.12"} and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10"})
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
