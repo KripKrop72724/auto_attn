@@ -21,7 +21,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, inspect, diagnose-docker, diagnose-ords-route, clean-generated, clean-signing-scratch]
+        options: [none, inspect, diagnose-docker, diagnose-wsl, diagnose-ords-route, clean-generated, clean-signing-scratch]
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
           MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'diagnose-ords-route', 'clean-generated', 'clean-signing-scratch')) {
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'diagnose-wsl', 'diagnose-ords-route', 'clean-generated', 'clean-signing-scratch')) {
             throw 'Unsupported runner maintenance mode.'
           }
           $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
@@ -123,6 +123,21 @@ jobs:
               }
             } finally {
               $probe.Dispose()
+            }
+            exit 0
+          }
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-wsl') {
+            $serverIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -in @('10.10.30.30', '10.10.50.3') } |
+              Select-Object -ExpandProperty IPAddress)
+            Write-Host "saved_connection_match=$(if ($serverIps.Count) { $serverIps -join ',' } else { 'neither' })"
+            foreach ($name in @('WslService', 'LxssManager', 'vmcompute')) {
+              $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+              Write-Host "windows_service_$name=$(if ($service) { $service.Status } else { 'missing' })"
+            }
+            foreach ($name in @('vmmem', 'vmmemWSL')) {
+              $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+              Write-Host "windows_process_$name=$($processes.Count)"
             }
             exit 0
           }
