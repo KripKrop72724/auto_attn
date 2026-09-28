@@ -97,9 +97,41 @@ with engine.connect() as connection:
                and not tgisinternal
              order by tgname
         """)).scalars().all()
+        historical = connection.execute(
+            text("""
+                select attendance_event_id, source_epoch_id, source_kind,
+                       canonical_source, disposition, ordinal, created_at
+                  from add_terminal_record_manifest
+                 where attendance_event_id in :ids
+                 order by attendance_event_id, created_at
+            """).bindparams(bindparam("ids", expanding=True)),
+            {"ids": IDS},
+        ).mappings().all()
+        event_sources = connection.execute(
+            text("""
+                select source, count(*) as count
+                  from add_attendance_events
+                 where id in :ids
+                 group by source
+                 order by source
+            """).bindparams(bindparam("ids", expanding=True)),
+            {"ids": IDS},
+        ).mappings().all()
 
 print("G3_DELETE_PREFLIGHT_JSON=" + json.dumps({
     "frozen_event_count": len(IDS),
     "references": [row for row in references if row["count"]],
     "user_triggers": triggers,
+    "event_sources": [dict(row) for row in event_sources],
+    "historical_manifest": {
+        "linked_event_ids": sorted({row["attendance_event_id"] for row in historical}),
+        "canonical_linked_event_ids": sorted({
+            row["attendance_event_id"] for row in historical if row["canonical_source"]
+        }),
+        "epochs": sorted({row["source_epoch_id"] for row in historical if row["source_epoch_id"] is not None}),
+        "source_kinds": sorted({row["source_kind"] for row in historical if row["source_kind"] is not None}),
+        "dispositions": sorted({row["disposition"] for row in historical if row["disposition"] is not None}),
+        "first_created_at": min((row["created_at"] for row in historical), default=None).isoformat() if historical else None,
+        "last_created_at": max((row["created_at"] for row in historical), default=None).isoformat() if historical else None,
+    },
 }, separators=(",", ":")))
