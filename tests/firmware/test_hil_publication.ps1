@@ -408,7 +408,7 @@ if (-not $rejected) { throw 'Partial 2.6.11 HIL scope accepted' }
 $zkt2611Marker = Get-Content -LiteralPath (Join-Path $store '2.6.11/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2611Marker.targets.Count -ne 5 -or $zkt2611Marker.application_sha256 -cne ('e'*64)) { throw '2.6.11 HIL marker is incomplete' }
 # Canonical signing patch keeps the exact five terminals quarantined.
-. (Join-Path $repo 'deploy/add/firmware-2-6-11-hil-scope.ps1')
+. (Join-Path $repo 'deploy/add/firmware-2-6-12-hil-scope.ps1')
 $exact2612 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.12.json') -Raw
 Assert-Zkt2612HilScope -HilTargetsJson $exact2612
 foreach ($scope in @('', '[]', '{', $targets)) {
