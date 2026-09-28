@@ -3647,7 +3647,9 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
     if (result == ENQUEUE_PENDING || result == ENQUEUE_BLOCKED) {
         if (!add_send_attendance_event(event, capturetype)) {
             ESP_LOGE(TAG, "Attendance remains locally preserved; ADD delivery requires retry");
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            // The primary attendance record is already durable. A failed ADD
+            // enqueue needs reconciliation, but is not proof of lost storage.
+            // Any actual queue write failure is recorded by qs_local_end().
         }
     }
     return result;
