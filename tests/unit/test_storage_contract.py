@@ -18,6 +18,7 @@ from zk_add.storage_contract import (COMPAT_MARKER, DIRECT_BASELINES, DIRECT_MAR
                                      LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, LIVE_FRAME_MARKER,
                                      validate_storage_contract)
 from zk_add.time_utils import utc_now
+from zk_add.schemas import HeartbeatPayload
 
 
 def manifest(version):
@@ -77,6 +78,13 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert PROBE_MARKER in signing
     assert LIVE_FRAME_MARKER in firmware
     assert LIVE_FRAME_MARKER in signing
+
+
+def test_signed_2613_contract_fits_runtime_heartbeat_schema():
+    heartbeat = HeartbeatPayload.model_validate({
+        "diagnostics": {"storage": {"upgrade_contract": LIVE_FRAME_MARKER}}
+    })
+    assert heartbeat.diagnostics.storage.upgrade_contract == LIVE_FRAME_MARKER
 
 
 @pytest.mark.parametrize("bad", ["2.4.11", "2.5.4", "zone-lite-2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.7.0", None])
