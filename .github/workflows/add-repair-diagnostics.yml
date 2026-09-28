@@ -91,6 +91,14 @@ jobs:
           $script | & docker exec -i attendance-device-dashboard-add-api-1 python - --job-id $env:G3_JOB_ID
           if ($LASTEXITCODE -ne 0) { throw 'Read-only G3 source audit failed.' }
 
+      - name: Inspect references to the frozen G3 event set
+        if: github.ref == 'refs/heads/audit/g3-current-source' && inputs.direct_run_id != ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Get-Content -Raw 'scripts/g3_exact_delete_preflight.py'
+          $script | & docker exec -i attendance-device-dashboard-add-api-1 python -
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only G3 deletion preflight failed.' }
+
       - name: Inspect one firmware assignment without changing deployment state
         if: inputs.firmware_campaign_id != ''
         env:
