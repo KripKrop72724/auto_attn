@@ -874,8 +874,12 @@ def apply_reconciliation_assignment_release(
 
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
-    if payload.committed_next_ordinal != job.committed_next_ordinal:
-        raise ValueError("Released reconciliation credit did not match ADD's durable cursor.")
+    # A chunk can commit in ADD before the connector receives its ACK.  The
+    # connector may then release its credit with the last cursor it knows.
+    # ADD's committed cursor remains authoritative; reject only a claimed
+    # cursor ahead of durable evidence.
+    if payload.committed_next_ordinal > job.committed_next_ordinal:
+        raise ValueError("Released reconciliation credit exceeded ADD's durable cursor.")
     if job.active_assignment_id == payload.assignment_id:
         _release_assignment(job)
         now = utc_now()
@@ -895,7 +899,8 @@ def apply_reconciliation_assignment_release(
             "ASSIGNMENT_RELEASED",
             {
                 "assignment_id": payload.assignment_id,
-                "committed_next_ordinal": payload.committed_next_ordinal,
+                "committed_next_ordinal": job.committed_next_ordinal,
+                "reported_next_ordinal": payload.committed_next_ordinal,
                 "reason": payload.reason,
             },
         )

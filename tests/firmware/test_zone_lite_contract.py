@@ -1340,7 +1340,7 @@ def test_ords_drain_preserves_authoritative_outbox_under_storage_pressure():
     assert "lq_settle(" in drain
     assert "lq_reclaim(" in drain
     assert "PENDING_TMP_PATH" not in drain
-    assert "g_legacy_probe_head ? 1 : 100" in drain
+    assert "g_legacy_probe_head ? 1 : LEGACY_ORDS_SLICE_RECORDS" in drain
     assert "ords_drain_preserved_deferred" in drain
     assert "led_status_clear_fault(LED_STATUS_LOCAL_FAILURE)" not in drain
 

@@ -15,9 +15,11 @@ try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
-foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14')) {
+foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
-    $marker = if ($version -eq '2.6.14') {
+    $marker = if ($version -eq '2.6.15') {
+        'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14'
+    } elseif ($version -eq '2.6.14') {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13'
     } elseif ($version -eq '2.6.13') {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12'
@@ -39,39 +41,43 @@ foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.
     [IO.File]::WriteAllText($contractImage, $marker + [char]0)
     $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
     if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
-    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
         ($contract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589' -or
          $contract.allowed_bootstrap_images['2.5.2'] -ne '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b')) {
         throw 'Direct predecessor image identities changed'
     }
-    if ($version -in @('2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
-        ($contract.allowed_bootstrap_versions.Count -ne $(if ($version -eq '2.6.14') { 9 } elseif ($version -eq '2.6.13') { 8 } elseif ($version -in @('2.6.11', '2.6.12')) { 7 } elseif ($version -eq '2.6.10') { 6 } elseif ($version -eq '2.6.9') { 5 } elseif ($version -eq '2.6.8') { 4 } else { 3 }) -or
+    if ($version -in @('2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
+        ($contract.allowed_bootstrap_versions.Count -ne $(if ($version -eq '2.6.15') { 10 } elseif ($version -eq '2.6.14') { 9 } elseif ($version -eq '2.6.13') { 8 } elseif ($version -in @('2.6.11', '2.6.12')) { 7 } elseif ($version -eq '2.6.10') { 6 } elseif ($version -eq '2.6.9') { 5 } elseif ($version -eq '2.6.8') { 4 } else { 3 }) -or
          $contract.allowed_bootstrap_images['2.6.6'] -ne '69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e')) {
         throw 'Signed 2.6.6 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.7'] -ne '3bed51d23d85fe50c03642e95f1d1d1e0b45960ccbf97d551645c0b268da1f1c') {
         throw 'Signed 2.6.7 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.8'] -ne 'fecc5df0223a3c7c8b019a445bcf829bc8d09dd93e920aecc8446908fadeadc6') {
         throw 'Signed 2.6.8 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.9'] -ne 'ad71339fef6926b21a21a05c1e1c4e30a936e0df5be6160871c7283841ad91b8') {
         throw 'Signed 2.6.9 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.11', '2.6.12', '2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.10'] -ne 'a95370b1487d9c1454dfb932c41432451f24ef69d0abc1292a5c0262c17c243c') {
         throw 'Signed 2.6.10 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.13', '2.6.14') -and
+    if ($version -in @('2.6.13', '2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.12'] -ne '3f9028126c8dde9816486783a27a9802ed41179cd9f8caf9935deb79a0057fc1') {
         throw 'Signed 2.6.12 HIL predecessor identity changed'
     }
-    if ($version -eq '2.6.14' -and
+    if ($version -in @('2.6.14', '2.6.15') -and
         $contract.allowed_bootstrap_images['2.6.13'] -ne 'c7be4171153333563f9ed6e43f91376d42dfb9d3ca2faefda2ca6d1ac87b2def') {
         throw 'Signed 2.6.13 HIL predecessor identity changed'
+    }
+    if ($version -eq '2.6.15' -and
+        $contract.allowed_bootstrap_images['2.6.14'] -ne '7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469') {
+        throw 'Signed 2.6.14 HIL predecessor identity changed'
     }
     $other = if ($version -eq '2.6.0') { '2.5.4' } else { '2.6.0' }
     $rejected = $false
@@ -497,6 +503,32 @@ if (-not $rejected) { throw 'Partial 2.6.14 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.14 -PublicationMode HIL_ONLY -HilTargetsJson $exact2614
 $zkt2614Marker = Get-Content -LiteralPath (Join-Path $store '2.6.14/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2614Marker.targets.Count -ne 5 -or $zkt2614Marker.application_sha256 -cne ('e'*64)) { throw '2.6.14 HIL marker is incomplete' }
+# Lock-contention patch remains scoped to the same five exact HIL devices.
+. (Join-Path $repo 'deploy/add/firmware-2-6-15-hil-scope.ps1')
+$exact2615 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.15.json') -Raw
+Assert-Zkt2615HilScope -HilTargetsJson $exact2615
+foreach ($scope in @('', '[]', '{', $targets)) {
+    $rejected = $false
+    try { Assert-Zkt2615HilScope -HilTargetsJson $scope } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Invalid 2.6.15 HIL scope accepted' }
+}
+$zkt2615Image = Join-Path $source 'zone-lite-2.6.15.bin'
+[IO.File]::WriteAllText($zkt2615Image, 'ZKT 2.6.15 fixture, not deployable firmware')
+$manifest.version='2.6.15'
+$manifest.release_id='zone-lite-2.6.15'
+$manifest.image_name='zone-lite-2.6.15.bin'
+$manifest.image_sha256=(Get-FileHash $zkt2615Image).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $zkt2615Image).Length
+Write-TestManifest
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode AVAILABLE } catch { $rejected = $true }
+if (-not $rejected) { throw 'Direct 2.6.15 production publication accepted' }
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode HIL_ONLY -HilTargetsJson $targets } catch { $rejected = $true }
+if (-not $rejected) { throw 'Partial 2.6.15 HIL scope accepted' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode HIL_ONLY -HilTargetsJson $exact2615
+$zkt2615Marker = Get-Content -LiteralPath (Join-Path $store '2.6.15/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cne ('e'*64)) { throw '2.6.15 HIL marker is incomplete' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

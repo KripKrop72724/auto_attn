@@ -19,6 +19,7 @@
 #define pdMS_TO_TICKS(x) (x)
 #define pdTRUE 1
 #define ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS 1000
+#define LEGACY_ORDS_SLICE_RECORDS 16
 static int storage_lock, gate_lock;
 static int *g_storage_lock=&storage_lock, *g_ords_outbox_gate=&gate_lock;
 static int64_t g_ords_drain_retry_not_before_ms;
@@ -49,6 +50,8 @@ bool qs_snapshot(qs_lane_t lane,uint32_t *depth)
 typedef enum { ADD_WORKER_IDLE, ADD_WORKER_READING, ADD_WORKER_NETWORK,
     ADD_WORKER_COMMITTING, ADD_WORKER_RESOURCE } add_worker_operation_t;
 static void add_connector_report_ords_worker(add_worker_operation_t operation) { (void)operation; }
+static bool add_connector_log(const char *level,const char *subsystem,const char *code,const char *message)
+{ (void)level;(void)subsystem;(void)code;(void)message;return true; }
 static bool fail_allocate, fail_receipt, fail_commit, append_during_send, fail_bulk;
 static lq_checkpoint_t durable;
 static bool exists;
@@ -107,17 +110,17 @@ int main(void)
     assert(dq_open(&segmented,"segmented-",port)==DQ_OK);
     fail_allocate=true;oracle_drain_pending(true);assert(requests==0 && faults==1);
     fail_allocate=false;
-    for(unsigned i=0;i<101;i++) assert(append_line(PENDING_PATH,"record"));
+    for(unsigned i=0;i<17;i++) assert(append_line(PENDING_PATH,"record"));
     fail_receipt=true;
     oracle_drain_pending(true);
-    assert(requests==1 && accepted==100 && g_legacy_pending.checkpoint.offset==0);
+    assert(requests==1 && accepted==16 && g_legacy_pending.checkpoint.offset==0);
     fail_receipt=false;append_during_send=true;
     oracle_drain_pending(true);
-    assert(requests==2 && accepted==200 && g_legacy_pending.checkpoint.offset==700);
+    assert(requests==2 && accepted==32 && g_legacy_pending.checkpoint.offset==112);
     // Restart with two records still pending, including the concurrent append.
     g_legacy_pending.ready=false;
     fail_commit=true;oracle_drain_pending(true);
-    assert(requests==3 && durable.offset==700 && !g_legacy_pending.ready);
+    assert(requests==3 && durable.offset==112 && !g_legacy_pending.ready);
     fail_commit=false;oracle_drain_pending(true);
     assert(requests==4 && durable.offset==0);
     FILE *f=fopen(PENDING_PATH,"r");assert(!f);

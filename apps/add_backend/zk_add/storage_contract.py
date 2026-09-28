@@ -4,7 +4,7 @@ COMPAT_VERSION = "2.5.4"
 CANDIDATE_VERSION = "2.6.0"
 COMPAT_MARKER = "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4"
 DIRECT_VERSION = "2.6.1"
-DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14")
+DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15")
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
 DIRECT_BASELINE_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -58,6 +58,12 @@ DELIVERY_BASELINE_IMAGES = {
     "2.6.13": "c7be4171153333563f9ed6e43f91376d42dfb9d3ca2faefda2ca6d1ac87b2def",
 }
 DELIVERY_MARKER = "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13"
+LOCK_BASELINES = (*DELIVERY_BASELINES, "2.6.14")
+LOCK_BASELINE_IMAGES = {
+    **DELIVERY_BASELINE_IMAGES,
+    "2.6.14": "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469",
+}
+LOCK_MARKER = DELIVERY_MARKER + ",2.6.14"
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
@@ -65,14 +71,16 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:
         return None
-    direct_baselines = (DELIVERY_BASELINES if version == "2.6.14" else
+    direct_baselines = (LOCK_BASELINES if version == "2.6.15" else
+                        DELIVERY_BASELINES if version == "2.6.14" else
                         LIVE_FRAME_BASELINES if version == "2.6.13" else
                         PROBE_BASELINES if version in {PROBE_VERSION, "2.6.12"} else
                         PRESSURE_BASELINES if version == PRESSURE_VERSION else
                         CONTENTION_BASELINES if version == CONTENTION_VERSION else
                         DIAGNOSTIC_BASELINES if version == DIAGNOSTIC_VERSION else
                         RETRY_BASELINES if version == RETRY_VERSION else DIRECT_BASELINES)
-    direct_images = (DELIVERY_BASELINE_IMAGES if version == "2.6.14" else
+    direct_images = (LOCK_BASELINE_IMAGES if version == "2.6.15" else
+                     DELIVERY_BASELINE_IMAGES if version == "2.6.14" else
                      LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else
                      PROBE_BASELINE_IMAGES if version in {PROBE_VERSION, "2.6.12"} else
                      PRESSURE_BASELINE_IMAGES if version == PRESSURE_VERSION else

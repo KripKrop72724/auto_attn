@@ -7134,6 +7134,7 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
 
 static legacy_queue_t g_legacy_pending;
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
+#define LEGACY_ORDS_SLICE_RECORDS 16
 static bool g_legacy_probe_head;
 static bool g_ords_buffer_failed;
 static bool g_prefer_segmented_ords;
@@ -7219,13 +7220,14 @@ static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoi
 
 static void oracle_drain_pending(bool live_first)
 {
+    static int64_t last_slow_lock_log_ms;
     (void)live_first;
     int64_t now_ms = uptime_ms();
     if (truth_ords_gate_priority_active(now_ms) ||
         g_ords_drain_retry_not_before_ms > now_ms || !ords_send_allowed()) return;
     if (!g_legacy_drain_buffer) {
         g_legacy_drain_buffer = heap_caps_malloc(
-            100 * sizeof(*g_legacy_drain_buffer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            LEGACY_ORDS_SLICE_RECORDS * sizeof(*g_legacy_drain_buffer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!g_legacy_drain_buffer) {
             g_ords_buffer_failed = true;
             add_connector_report_ords_worker(ADD_WORKER_RESOURCE);
@@ -7246,8 +7248,9 @@ static void oracle_drain_pending(bool live_first)
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
-    lq_token_t tokens[100];
-    char *events[100];
+    int64_t lock_started_ms = uptime_ms();
+    lq_token_t tokens[LEGACY_ORDS_SLICE_RECORDS];
+    char *events[LEGACY_ORDS_SLICE_RECORDS];
     size_t count = 0;
     bool binary_head = false;
     dq_result_t read = DQ_OK;
@@ -7256,7 +7259,7 @@ static void oracle_drain_pending(bool live_first)
         read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
     }
     legacy_queue_t scan = g_legacy_pending;
-    size_t limit = g_legacy_probe_head ? 1 : 100;
+    size_t limit = g_legacy_probe_head ? 1 : LEGACY_ORDS_SLICE_RECORDS;
     while (read == DQ_OK && count < limit) {
         events[count] = g_legacy_drain_buffer[count];
         read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
@@ -7273,6 +7276,15 @@ static void oracle_drain_pending(bool live_first)
         if (reclaim != DQ_OK && reclaim != DQ_EMPTY) read = reclaim;
     }
     xSemaphoreGive(g_storage_lock);
+    now_ms = uptime_ms();
+    if (now_ms - lock_started_ms >= 1000 &&
+        (last_slow_lock_log_ms == 0 || now_ms - last_slow_lock_log_ms >= 60000)) {
+        char message[128];
+        snprintf(message, sizeof(message), "Legacy ORDS read held storage lock for %lld ms, records=%u",
+            (long long)(now_ms - lock_started_ms), (unsigned)count);
+        (void)add_connector_log("WARN", "storage", "ORDS_LEGACY_LOCK_SLOW", message);
+        last_slow_lock_log_ms = now_ms;
+    }
     if (!count) {
         if (read == DQ_EMPTY) {
             if (!oracle_drain_segmented_slice()) {
@@ -7285,7 +7297,7 @@ static void oracle_drain_pending(bool live_first)
         return;
     }
     led_status_set_backlog(true);
-    // At most 100 events and one completed ORDS request per slice. No storage
+    // At most 16 events and one completed ORDS request per slice. No storage
     // lock is held during ORDS waits or durable ADD receipt enqueue/backpressure.
     oracle_delivery_result_t delivery;
     add_connector_report_ords_worker(ADD_WORKER_NETWORK);
@@ -7314,6 +7326,7 @@ static void oracle_drain_pending(bool live_first)
     const char *failure_stage = NULL;
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        lock_started_ms = uptime_ms();
         if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
         if (settled) {
             for (size_t i = 0; i < count; i++) {
@@ -7335,6 +7348,15 @@ static void oracle_drain_pending(bool live_first)
             }
         }
         xSemaphoreGive(g_storage_lock);
+        now_ms = uptime_ms();
+        if (now_ms - lock_started_ms >= 1000 &&
+            (last_slow_lock_log_ms == 0 || now_ms - last_slow_lock_log_ms >= 60000)) {
+            char message[128];
+            snprintf(message, sizeof(message), "Legacy ORDS commit held storage lock for %lld ms, records=%u",
+                (long long)(now_ms - lock_started_ms), (unsigned)count);
+            (void)add_connector_log("WARN", "storage", "ORDS_LEGACY_LOCK_SLOW", message);
+            last_slow_lock_log_ms = now_ms;
+        }
     }
     free(quarantine);
     xSemaphoreGive(g_ords_outbox_gate);
