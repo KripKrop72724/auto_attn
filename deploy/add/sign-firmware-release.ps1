@@ -142,6 +142,10 @@ if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.11') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-11-hil-scope.ps1')
     Assert-Zkt2611HilScope -HilTargetsJson $HilTargetsJson
 }
+if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.12') {
+    . (Join-Path $PSScriptRoot 'firmware-2-6-12-hil-scope.ps1')
+    Assert-Zkt2612HilScope -HilTargetsJson $HilTargetsJson
+}
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 $workRoot = if ($env:RUNNER_TEMP) {
@@ -190,7 +194,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
@@ -213,12 +217,21 @@ try {
         $manifestJson,
         (New-Object Text.UTF8Encoding($false))
     )
+    & python (Join-Path $PSScriptRoot '../../scripts/canonicalize_firmware_manifest.py') (Join-Path $output 'manifest.json')
+    if ($LASTEXITCODE -ne 0) { throw 'Firmware manifest canonicalization failed' }
     Copy-Item -LiteralPath (Join-Path $output 'manifest.json') -Destination (Join-Path $work 'manifest.json')
+    Copy-Item -LiteralPath $publicPath -Destination (Join-Path $work 'manifest-public-key.pem')
     Invoke-Docker @(
         'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
         'openssl', 'dgst', '-sha256', '-sign', '/work/active-key.pem',
         '-sigopt', 'rsa_padding_mode:pss', '-sigopt', 'rsa_pss_saltlen:32',
         '-out', '/work/manifest.sig', '/work/manifest.json'
+    )
+    Invoke-Docker @(
+        'run', '--rm', '-v', "${work}:/work", 'espressif/idf:v5.5.3',
+        'openssl', 'dgst', '-sha256', '-verify', '/work/manifest-public-key.pem',
+        '-sigopt', 'rsa_padding_mode:pss', '-sigopt', 'rsa_pss_saltlen:32',
+        '-signature', '/work/manifest.sig', '/work/manifest.json'
     )
     $signature = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $work 'manifest.sig')))
     [IO.File]::WriteAllText(

@@ -5,13 +5,19 @@ $store = Join-Path $root 'store'
 $legacyStore = Join-Path $root 'legacy-store'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $publish = Join-Path $repo 'deploy/add/publish-firmware.ps1'
+function Write-TestManifest {
+    $path = Join-Path $source 'manifest.json'
+    [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 10 -Compress))
+    & python (Join-Path $repo 'scripts/canonicalize_firmware_manifest.py') $path
+    if ($LASTEXITCODE -ne 0) { throw 'Test manifest canonicalization failed' }
+}
 try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
-foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11')) {
+foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
-    $marker = if ($version -eq '2.6.11') {
+    $marker = if ($version -in @('2.6.11', '2.6.12')) {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10'
     } elseif ($version -eq '2.6.10') {
         'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9'
@@ -29,29 +35,29 @@ foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.
     [IO.File]::WriteAllText($contractImage, $marker + [char]0)
     $contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $version
     if ($contract.read_format -ne 2 -or $contract.reader_mask -ne 63) { throw 'Wrong reader contract' }
-    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11') -and
+    if ($version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12') -and
         ($contract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589' -or
          $contract.allowed_bootstrap_images['2.5.2'] -ne '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b')) {
         throw 'Direct predecessor image identities changed'
     }
-    if ($version -in @('2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11') -and
-        ($contract.allowed_bootstrap_versions.Count -ne $(if ($version -eq '2.6.11') { 7 } elseif ($version -eq '2.6.10') { 6 } elseif ($version -eq '2.6.9') { 5 } elseif ($version -eq '2.6.8') { 4 } else { 3 }) -or
+    if ($version -in @('2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12') -and
+        ($contract.allowed_bootstrap_versions.Count -ne $(if ($version -in @('2.6.11', '2.6.12')) { 7 } elseif ($version -eq '2.6.10') { 6 } elseif ($version -eq '2.6.9') { 5 } elseif ($version -eq '2.6.8') { 4 } else { 3 }) -or
          $contract.allowed_bootstrap_images['2.6.6'] -ne '69ec4cf34204d84d76933c30510ed78d46ec11d294f7257697af19047ce6869e')) {
         throw 'Signed 2.6.6 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.8', '2.6.9', '2.6.10', '2.6.11') -and
+    if ($version -in @('2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12') -and
         $contract.allowed_bootstrap_images['2.6.7'] -ne '3bed51d23d85fe50c03642e95f1d1d1e0b45960ccbf97d551645c0b268da1f1c') {
         throw 'Signed 2.6.7 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.9', '2.6.10', '2.6.11') -and
+    if ($version -in @('2.6.9', '2.6.10', '2.6.11', '2.6.12') -and
         $contract.allowed_bootstrap_images['2.6.8'] -ne 'fecc5df0223a3c7c8b019a445bcf829bc8d09dd93e920aecc8446908fadeadc6') {
         throw 'Signed 2.6.8 HIL predecessor identity changed'
     }
-    if ($version -in @('2.6.10', '2.6.11') -and
+    if ($version -in @('2.6.10', '2.6.11', '2.6.12') -and
         $contract.allowed_bootstrap_images['2.6.9'] -ne 'ad71339fef6926b21a21a05c1e1c4e30a936e0df5be6160871c7283841ad91b8') {
         throw 'Signed 2.6.9 HIL predecessor identity changed'
     }
-    if ($version -eq '2.6.11' -and
+    if ($version -in @('2.6.11', '2.6.12') -and
         $contract.allowed_bootstrap_images['2.6.10'] -ne 'a95370b1487d9c1454dfb932c41432451f24ef69d0abc1292a5c0262c17c243c') {
         throw 'Signed 2.6.10 HIL predecessor identity changed'
     }
@@ -72,7 +78,7 @@ if (-not $rejected) { throw 'Missing contract accepted' }
 $image = Join-Path $source 'zone-lite-2.6.0.bin'
 [IO.File]::WriteAllText($image, 'fixture, not deployable firmware')
 $manifest = @{version='2.6.0';image_name='zone-lite-2.6.0.bin';image_sha256=(Get-FileHash $image).Hash.ToLowerInvariant();image_size=(Get-Item $image).Length;git_sha=('a'*40);application_sha256=('c'*64)}
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 [IO.File]::WriteAllText((Join-Path $source 'manifest.sig'), 'test-signature')
 [IO.File]::WriteAllText((Join-Path $source 'SHA256SUMS'), 'test')
 $targets='[{"connector_id":"first","mac":"a4:cb:8f:d4:66:01","terminal_serial":"SERIAL1"},{"connector_id":"second","mac":"a4:cb:8f:d4:66:02","terminal_serial":"SERIAL2"}]'
@@ -131,7 +137,7 @@ foreach ($scope in @('', '[]', '{', $targets)) {
 $zkt261Image = Join-Path $source 'zone-lite-2.6.1.bin'
 [IO.File]::WriteAllText($zkt261Image, 'ZKT 2.6.1 fixture, not deployable firmware')
 $manifest = @{version='2.6.1';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.6.1';image_name='zone-lite-2.6.1.bin';image_sha256=(Get-FileHash $zkt261Image).Hash.ToLowerInvariant();image_size=(Get-Item $zkt261Image).Length;git_sha=('a'*40);application_sha256=('e'*64)}
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.1 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.1 production publication accepted' }
@@ -157,7 +163,7 @@ $manifest.release_id='zone-lite-2.6.2'
 $manifest.image_name='zone-lite-2.6.2.bin'
 $manifest.image_sha256=(Get-FileHash $zkt262Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt262Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.2 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.2 production publication accepted' }
@@ -183,7 +189,7 @@ $manifest.release_id='zone-lite-2.6.3'
 $manifest.image_name='zone-lite-2.6.3.bin'
 $manifest.image_sha256=(Get-FileHash $zkt263Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt263Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.3 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.3 production publication accepted' }
@@ -209,7 +215,7 @@ $manifest.release_id='zone-lite-2.6.4'
 $manifest.image_name='zone-lite-2.6.4.bin'
 $manifest.image_sha256=(Get-FileHash $zkt264Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt264Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.4 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.4 production publication accepted' }
@@ -235,7 +241,7 @@ $manifest.release_id='zone-lite-2.6.5'
 $manifest.image_name='zone-lite-2.6.5.bin'
 $manifest.image_sha256=(Get-FileHash $zkt265Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt265Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.5 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.5 production publication accepted' }
@@ -261,7 +267,7 @@ $manifest.release_id='zone-lite-2.6.6'
 $manifest.image_name='zone-lite-2.6.6.bin'
 $manifest.image_sha256=(Get-FileHash $zkt266Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt266Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.6 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.6 production publication accepted' }
@@ -287,7 +293,7 @@ $manifest.release_id='zone-lite-2.6.7'
 $manifest.image_name='zone-lite-2.6.7.bin'
 $manifest.image_sha256=(Get-FileHash $zkt267Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt267Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.7 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.7 production publication accepted' }
@@ -313,7 +319,7 @@ $manifest.release_id='zone-lite-2.6.8'
 $manifest.image_name='zone-lite-2.6.8.bin'
 $manifest.image_sha256=(Get-FileHash $zkt268Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt268Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.8 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.8 production publication accepted' }
@@ -339,7 +345,7 @@ $manifest.release_id='zone-lite-2.6.9'
 $manifest.image_name='zone-lite-2.6.9.bin'
 $manifest.image_sha256=(Get-FileHash $zkt269Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt269Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.9 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.9 production publication accepted' }
@@ -365,7 +371,7 @@ $manifest.release_id='zone-lite-2.6.10'
 $manifest.image_name='zone-lite-2.6.10.bin'
 $manifest.image_sha256=(Get-FileHash $zkt2610Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt2610Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.10 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.10 production publication accepted' }
@@ -391,7 +397,7 @@ $manifest.release_id='zone-lite-2.6.11'
 $manifest.image_name='zone-lite-2.6.11.bin'
 $manifest.image_sha256=(Get-FileHash $zkt2611Image).Hash.ToLowerInvariant()
 $manifest.image_size=(Get-Item $zkt2611Image).Length
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected = $false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.11 -PublicationMode AVAILABLE } catch { $rejected = $true }
 if (-not $rejected) { throw 'Direct 2.6.11 production publication accepted' }
@@ -401,15 +407,41 @@ if (-not $rejected) { throw 'Partial 2.6.11 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.11 -PublicationMode HIL_ONLY -HilTargetsJson $exact2611
 $zkt2611Marker = Get-Content -LiteralPath (Join-Path $store '2.6.11/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2611Marker.targets.Count -ne 5 -or $zkt2611Marker.application_sha256 -cne ('e'*64)) { throw '2.6.11 HIL marker is incomplete' }
+# Canonical signing patch keeps the exact five terminals quarantined.
+. (Join-Path $repo 'deploy/add/firmware-2-6-11-hil-scope.ps1')
+$exact2612 = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.12.json') -Raw
+Assert-Zkt2612HilScope -HilTargetsJson $exact2612
+foreach ($scope in @('', '[]', '{', $targets)) {
+    $rejected = $false
+    try { Assert-Zkt2612HilScope -HilTargetsJson $scope } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Invalid 2.6.12 HIL scope accepted' }
+}
+$zkt2612Image = Join-Path $source 'zone-lite-2.6.12.bin'
+[IO.File]::WriteAllText($zkt2612Image, 'ZKT 2.6.12 fixture, not deployable firmware')
+$manifest.version='2.6.12'
+$manifest.release_id='zone-lite-2.6.12'
+$manifest.image_name='zone-lite-2.6.12.bin'
+$manifest.image_sha256=(Get-FileHash $zkt2612Image).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $zkt2612Image).Length
+Write-TestManifest
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.12 -PublicationMode AVAILABLE } catch { $rejected = $true }
+if (-not $rejected) { throw 'Direct 2.6.12 production publication accepted' }
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.12 -PublicationMode HIL_ONLY -HilTargetsJson $targets } catch { $rejected = $true }
+if (-not $rejected) { throw 'Partial 2.6.12 HIL scope accepted' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.12 -PublicationMode HIL_ONLY -HilTargetsJson $exact2612
+$zkt2612Marker = Get-Content -LiteralPath (Join-Path $store '2.6.12/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt2612Marker.targets.Count -ne 5 -or $zkt2612Marker.application_sha256 -cne ('e'*64)) { throw '2.6.12 HIL marker is incomplete' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')
 $manifest = @{version='3.1.0';firmware_family='hikvision';project_name='zone_lite_hikvision';release_id='zone-lite-hikvision-3.1.0';image_name='zone-lite-hikvision-3.1.0.bin';image_sha256=(Get-FileHash $hikImage).Hash.ToLowerInvariant();image_size=(Get-Item $hikImage).Length;git_sha=('b'*40);application_sha256=('d'*64)}
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 3.1.0 -PublicationMode HIL_ONLY -HilTargetMac 'ac:27:6e:a4:e9:74'
 if (-not (Test-Path (Join-Path $store '3.1.0/zone-lite-hikvision-3.1.0.bin'))) { throw 'Hikvision labelled image missing' }
 $manifest.image_name='zone-lite-3.1.0.bin'
-[IO.File]::WriteAllText((Join-Path $source 'manifest.json'), ($manifest | ConvertTo-Json))
+Write-TestManifest
 $rejected=$false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 3.1.0 -PublicationMode HIL_ONLY -HilTargetMac 'ac:27:6e:a4:e9:74' } catch { $rejected=$true }
 if (-not $rejected) { throw 'Mislabelled Hikvision image accepted' }
