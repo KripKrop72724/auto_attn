@@ -177,16 +177,31 @@ bool rel_json_syntax_valid(const char *text, size_t length)
     return c.p == c.end;
 }
 
-bool rel_live_frame_size(size_t length, size_t hint, size_t *record_size)
+bool rel_live_frame_size(const uint8_t *data, size_t length, size_t hint, size_t *record_size)
 {
-    if (!record_size) return false;
+    if (!data || !record_size) return false;
     if (hint == 12 || hint == 32 || hint == 36 || hint == 52) {
         if (!length || length % hint) return false;
         *record_size = hint;
         return true;
     }
-    // 36 bytes could be one extended record or three 12-byte records.
-    // Length alone cannot establish that format for a new session.
+    if (length == 36) {
+        rel_live_record_t record;
+        bool extended = rel_parse_live_record(data, 36, &record);
+        bool compact = true;
+        for (size_t offset = 0; offset < 36; offset += 12) {
+            if (!rel_parse_live_record(data + offset, 12, &record)) {
+                compact = false;
+                break;
+            }
+        }
+        // A first frame establishes the session shape only when exactly one
+        // interpretation is valid. Ambiguous or malformed data go to source
+        // reconciliation without generating a possibly wrong live punch.
+        if (extended == compact) return false;
+        *record_size = extended ? 36 : 12;
+        return true;
+    }
     if (length != 12 && length != 32 && length != 52) return false;
     *record_size = length;
     return true;

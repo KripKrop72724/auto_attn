@@ -7581,10 +7581,13 @@ static size_t process_live_packet(const uint8_t *data, size_t len, const user_ta
     size_t record_size = 0;
     // A complete singleton frame establishes its wire shape. Batched frames
     // without an independently negotiated shape must be recovered from truth.
-    if (!wire_hint || !rel_live_frame_size(len, *wire_hint, &record_size)) {
+    if (!wire_hint || !rel_live_frame_size(data, len, *wire_hint, &record_size)) {
         g_force_truth_reconcile = true;
-        (void)add_connector_log("WARN", "live", "LIVE_PACKET_FORMAT_REJECTED",
-            "Truncated or ambiguous live frame; source recovery required");
+        char detail[112];
+        snprintf(detail, sizeof(detail),
+            "Truncated or ambiguous live frame len=%lu hint=%u; source recovery required",
+            (unsigned long)len, wire_hint ? (unsigned)*wire_hint : 0U);
+        (void)add_connector_log("WARN", "live", "LIVE_PACKET_FORMAT_REJECTED", detail);
         return 0;
     }
     // Validate the whole frame before accepting any record. The wire hint is

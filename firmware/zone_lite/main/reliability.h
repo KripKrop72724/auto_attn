@@ -30,8 +30,9 @@ typedef struct {
     uint32_t timestamp;
 } rel_live_record_t;
 /* A hint is a previously established wire record size, never a user-record size.
- * Without a hint only one complete, unambiguous record is accepted. */
-bool rel_live_frame_size(size_t length, size_t hint, size_t *record_size);
+ * A 36-byte first frame is resolved only when its contents validate exactly
+ * one of the single extended-record and three compact-record interpretations. */
+bool rel_live_frame_size(const uint8_t *data, size_t length, size_t hint, size_t *record_size);
 bool rel_parse_live_record(const uint8_t *data, size_t length, rel_live_record_t *out);
 bool rel_identity_matches(const char *saved_serial, const char *current_serial,
                           const char *saved_fingerprint, const char *current_fingerprint);
