@@ -2975,6 +2975,7 @@ def attendance_identity_evidence_report(
 ):
     """Show an administrator why a held punch can or cannot be auto released."""
     from zk_add.attendance_identity_evidence import identity_evidence, source_evidence
+    from zk_add.models import AttendanceIdentityHistory, TerminalRecordManifest, TerminalSourceEpoch
     from zk_add.service import synced_cnic_identity_proven
 
     db, _context = auth
@@ -2992,6 +2993,44 @@ def attendance_identity_evidence_report(
         if zkt else []
     )
     user = users[0] if len(users) == 1 else None
+    manifest = db.scalar(
+        select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ).order_by(
+            TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc()
+        ).limit(1)
+    )
+    epoch = (
+        db.get(TerminalSourceEpoch, manifest.source_epoch_id)
+        if manifest and manifest.source_epoch_id else None
+    )
+    history_filters = [
+        AttendanceIdentityHistory.zkt_device_id == event.zkt_device_id,
+        AttendanceIdentityHistory.terminal_serial == event.device_serial,
+        AttendanceIdentityHistory.user_id == event.user_id,
+    ]
+    if event.uid:
+        history_filters.append(AttendanceIdentityHistory.uid == event.uid)
+    history_count = db.scalar(select(func.count(AttendanceIdentityHistory.id)).where(
+        *history_filters
+    )) or 0
+    covering_filters = [
+        *history_filters,
+        AttendanceIdentityHistory.revoked.is_(False),
+        AttendanceIdentityHistory.observed_from <= event.device_event_time,
+        AttendanceIdentityHistory.observed_until >= event.device_event_time,
+    ]
+    covering_count = db.scalar(select(func.count(AttendanceIdentityHistory.id)).where(
+        *covering_filters
+    )) or 0
+    matching_cnic_count = (
+        db.scalar(select(func.count(AttendanceIdentityHistory.id)).where(
+            *covering_filters,
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.cnic_lookup_hash == user.cnic_lookup_hash,
+        )) or 0
+        if user and user.cnic_lookup_hash else 0
+    )
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
     return {
@@ -3000,6 +3039,20 @@ def attendance_identity_evidence_report(
         "clock_quality": event.clock_quality,
         "source": event.source,
         "source_proof": source["kind"] if source else None,
+        "manifest_disposition": manifest.disposition if manifest else None,
+        "manifest_canonical_source": manifest.canonical_source if manifest else None,
+        "manifest_owner_matches": bool(
+            manifest and connector
+            and manifest.connector_id == connector.id
+            and manifest.zkt_device_id == event.zkt_device_id
+            and manifest.terminal_serial == event.device_serial
+            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
+            and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
+        ),
+        "manifest_epoch_state": epoch.state if epoch else None,
+        "history_identity_intervals": history_count,
+        "history_covering_intervals": covering_count,
+        "history_covering_current_cnic_intervals": matching_cnic_count,
         "identity_proof": evidence.proof["kind"] if evidence else None,
         "active_user_count": len(users),
         "active_user_uid_matches": bool(user and event.uid and user.uid == event.uid),

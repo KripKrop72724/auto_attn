@@ -308,11 +308,16 @@ def test_reconciled_unknown_identity_releases_only_with_retained_interval(store)
         db.flush()
 
         assert identity_evidence(db, event, connector).proof["kind"] == "RETAINED_INTERVAL"
-        manifest.canonical_source = False
+        manifest.observed_user_id = "OTHER"
         db.flush()
         assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
-        manifest.canonical_source = True
+        manifest.observed_user_id = event.user_id
+        manifest.disposition = "INVALID_TIME"
         db.flush()
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+        manifest.disposition = "TERMINAL_DUPLICATE"
+        db.flush()
+        assert identity_evidence(db, event, connector).proof["source"]["kind"] == "NEAR_LIVE_RECONCILE"
         assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
         db.flush()
         assert event.ords_status == "PENDING"
