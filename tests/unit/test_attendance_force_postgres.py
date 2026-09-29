@@ -118,6 +118,37 @@ def test_synced_cnic_migration_releases_verified_hold_only(force_pg):
             """), {"id": event_id})
 
 
+def test_manual_hold_reports_internal_event_id_without_releasing(force_pg):
+    sessions, _, event_uid = force_pg
+    path = (
+        Path(__file__).parents[2]
+        / "apps/add_backend/migrations/versions/20260929_0040_manual_hold_event_diagnostic.py"
+    )
+    spec = spec_from_file_location("hold_diagnostic_migration", path)
+    migration = module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.upgrade()
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid))
+        event.ords_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        event_id = event.id
+        db.commit()
+    with pytest.raises(DBAPIError, match=rf"explicit administrator approval \(event {event_id}\)"):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE add_attendance_events SET ords_status='PENDING',
+                  manual_release_required=false WHERE id=:id
+            """), {"id": event_id})
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "BLOCKED_IDENTITY"
+        assert event.manual_release_required
+
+
 @pytest.mark.parametrize(
     "record_case", ["near_live_record_uid", "saved_exact_uid", "saved_record_uid"]
 )
