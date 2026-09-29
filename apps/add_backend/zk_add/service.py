@@ -2913,7 +2913,12 @@ def synced_cnic_identity_proven(
     # A reconciled ID-only record needs its own authenticated source and an
     # identity interval that actually covers the punch time. A later roster
     # observation alone cannot attribute a historical punch to this employee.
-    if not row.uid or row.uid != user.uid or row.connector_id != connector.id:
+    if (
+        row.source not in {
+            "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"
+        }
+        or not row.uid or row.uid != user.uid or row.connector_id != connector.id
+    ):
         return False
     from zk_add.attendance_identity_evidence import identity_evidence
 
@@ -2933,8 +2938,8 @@ def release_synced_cnic_attendance(
 
     A captured CNIC is the strongest evidence. For a live punch without one,
     the roster must have been observed again after capture and remained
-    unchanged across the punch. A saved terminal record without CNIC needs a
-    retained per-user identity interval spanning the punch time.
+    unchanged across the punch. A current reconciliation record without CNIC
+    needs a retained per-user identity interval spanning the punch time.
     """
     rows = session.scalars(
         select(AttendanceEvent).where(
