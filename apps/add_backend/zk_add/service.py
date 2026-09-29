@@ -3014,9 +3014,21 @@ def ensure_attendance_ords_outbox(
     ingestion repairs and the historical sweep.  It never creates an ORDS
     delivery row for a second time and never changes an acknowledged row.
     """
-    outbox = session.scalar(
-        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+    # The backlog sweep can release a held row and revisit its delivery state
+    # in the same transaction. Sessions with autoflush disabled cannot see the
+    # first pending INSERT through a SELECT, so reuse it before querying.
+    outbox = next(
+        (
+            pending for pending in session.new
+            if isinstance(pending, OrdsOutbox)
+            and pending.attendance_event_id == row.id
+        ),
+        None,
     )
+    if outbox is None:
+        outbox = session.scalar(
+            select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+        )
     created = outbox is None
     if outbox is None:
         outbox = OrdsOutbox(

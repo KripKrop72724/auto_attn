@@ -22,6 +22,7 @@ from zk_add.models import (
 from zk_add.schemas import UserSnapshotRequest, UserSnapshotRow
 from zk_add.service import (
     enrich_undelivered_attendance,
+    repair_attendance_delivery_backlog,
     release_synced_cnic_attendance,
     replace_user_snapshot,
 )
@@ -418,7 +419,11 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         db.flush()
         evidence = identity_evidence(db, event, connector)
         assert evidence and evidence.proof["kind"] == "RETAINED_EQUIVALENT_INTERVALS"
-        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+        assert repair_attendance_delivery_backlog(db, limit=10)["repaired"] >= 1
+        db.flush()
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == event.id
+        )) == 1
         assert event.ords_status == "PENDING"
         assert repair.delivery_proof_valid(db, event, connector)
 
