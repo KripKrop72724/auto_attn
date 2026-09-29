@@ -118,7 +118,10 @@ def test_synced_cnic_migration_releases_verified_hold_only(force_pg):
             """), {"id": event_id})
 
 
-def test_reconciled_cnic_migration_releases_only_matching_record_and_history(force_pg):
+@pytest.mark.parametrize("saved_record", [False, True])
+def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
+    force_pg, saved_record,
+):
     from datetime import timedelta
     from zk_add.models import AttendanceIdentityHistory, OrdsOutbox, TerminalRecordManifest
     from zk_add.service import release_synced_cnic_attendance
@@ -131,10 +134,10 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
         connector = db.get(Connector, event.connector_id)
         zkt = connector.zkt_device
         user = db.get(DeviceUser, event.device_user_id)
-        when = utc_now() - timedelta(minutes=4)
+        when = utc_now() - timedelta(minutes=20 if saved_record else 4)
         event.source = "CURRENT_RECONCILE"
         event.device_event_time = when
-        event.captured_at = when + timedelta(minutes=3)
+        event.captured_at = when + timedelta(minutes=15 if saved_record else 3)
         event.received_at = event.captured_at + timedelta(seconds=1)
         event.identity_terminal_fingerprint = "a" * 64
         event.identity_snapshot_id = zkt.identity_snapshot_id
@@ -143,7 +146,8 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
         event.manual_release_required = True
         event.cnic_encrypted = event.cnic_lookup_hash = None
         event.captured_cnic_lookup_hash = None
-        event.raw_event = {"attendance_record_uid": "28943"}
+        record_uid = user.uid if saved_record else "28943"
+        event.raw_event = {"attendance_record_uid": record_uid}
         db.add(AttendanceIdentityHistory(
             zkt_device_id=zkt.id, device_user_id=user.id,
             terminal_serial=zkt.serial, user_id=user.user_id, uid=user.uid,
@@ -161,13 +165,14 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
             canonical_source=True, record_size=40,
             raw_record_digest="b" * 64, terminal_record_key="c" * 64,
             attendance_event_id=event.id, disposition="BLOCKED_IDENTITY",
-            observed_uid="28943", observed_user_id=user.user_id,
+            observed_uid=record_uid, observed_user_id=user.user_id,
         ))
         db.commit()
         event_id = event.id
     for filename in (
         "20260925_0036_auto_synced_cnic.py",
         "20260929_0037_reconciled_cnic_guard.py",
+        "20260929_0038_saved_reconcile_cnic_guard.py",
     ):
         path = Path(__file__).parents[2] / "apps/add_backend/migrations/versions" / filename
         spec = spec_from_file_location(filename.removesuffix(".py"), path)
@@ -176,6 +181,19 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
         with engine.begin() as conn:
             with Operations.context(MigrationContext.configure(conn)):
                 migration.upgrade()
+        if filename == "20260929_0037_reconciled_cnic_guard.py" and saved_record:
+            with sessions() as db:
+                assert db.scalar(text(
+                    "SELECT add_auto_reconciled_cnic_verified("
+                    "jsonb_populate_record(NULL::add_attendance_events, "
+                    "to_jsonb(e) || jsonb_build_object("
+                    "'identity_resolution_status','RESOLVED_SYNCED_CNIC',"
+                    "'identity_repair_reason','VERIFIED_SYNCED_CNIC',"
+                    "'cnic_lookup_hash',u.cnic_lookup_hash,"
+                    "'cnic_encrypted',u.cnic_encrypted))) "
+                    "FROM add_attendance_events e JOIN add_device_users u "
+                    "ON u.id=e.device_user_id WHERE e.id=:id"
+                ), {"id": event_id}) is False
     with sessions() as db:
         event = db.get(AttendanceEvent, event_id)
         connector = db.get(Connector, event.connector_id)
@@ -191,7 +209,10 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
         manifest = db.scalar(select(TerminalRecordManifest).where(
             TerminalRecordManifest.attendance_event_id == event_id
         ))
-        manifest.record_size = None
+        if saved_record:
+            manifest.canonical_source = False
+        else:
+            manifest.record_size = None
         db.commit()
     with sessions() as db:
         assert db.scalar(text(
