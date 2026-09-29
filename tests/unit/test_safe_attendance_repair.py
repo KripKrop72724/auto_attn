@@ -311,6 +311,11 @@ def test_reconciled_unknown_identity_releases_only_with_retained_interval(store)
         manifest.observed_user_id = "OTHER"
         db.flush()
         assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+        from zk_add.web import attendance_identity_evidence_report
+        diagnostic = attendance_identity_evidence_report(event.id, auth=(db, None))
+        assert diagnostic["manifest_rows"][0]["observed_user_id"] == "OTHER"
+        assert not diagnostic["manifest_rows"][0]["observed_user_id_matches"]
+        assert diagnostic["history_covering_rows"][0]["cnic_matches_current"]
         manifest.observed_user_id = event.user_id
         manifest.disposition = "INVALID_TIME"
         db.flush()
