@@ -127,7 +127,7 @@ def summarize_logs(lines):
     }
 
 
-def database_report(direct_run_id=None, attendance_event_id=None):
+def database_report(direct_run_id=None, attendance_event_ids=None):
     from sqlalchemy import text
     from zk_add.db import engine
     from zk_add.settings import settings
@@ -209,7 +209,7 @@ def database_report(direct_run_id=None, attendance_event_id=None):
              WHERE j.job_id = :direct_run_id AND j.action = 'MANUAL_DIRECT_ORDS'
              ORDER BY i.id LIMIT 100
         """
-    if attendance_event_id:
+    if attendance_event_ids:
         # Build only a virtual proposed row. PostgreSQL evaluates the guard
         # against current roster/history without changing attendance or outbox.
         queries["reconciled_guard"] = """
@@ -267,8 +267,9 @@ def database_report(direct_run_id=None, attendance_event_id=None):
             JOIN add_device_users u ON u.zkt_device_id=z.id
               AND u.user_id=e.user_id AND u.present
               AND u.lifecycle_state='ACTIVE'
-            WHERE e.id=:attendance_event_id
-            LIMIT 3
+            WHERE e.id=ANY(:attendance_event_ids)
+            ORDER BY e.id
+            LIMIT 30
         """
     queries["schema"] = "SELECT version_num FROM alembic_version"
     for name, query in queries.items():
@@ -279,7 +280,7 @@ def database_report(direct_run_id=None, attendance_event_id=None):
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
                 params = (
                     {"direct_run_id": direct_run_id} if name == "direct_run" else
-                    {"attendance_event_id": attendance_event_id}
+                    {"attendance_event_ids": attendance_event_ids}
                     if name == "reconciled_guard" else {}
                 )
                 result[name] = [dict(row) for row in connection.execute(text(query), params).mappings()]
@@ -293,15 +294,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs", action="store_true")
     parser.add_argument("--direct-run-id")
-    parser.add_argument("--attendance-event-id", type=int)
+    parser.add_argument("--attendance-event-id")
     args = parser.parse_args()
     if args.direct_run_id and not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.direct_run_id):
         parser.error("direct run ID must be a UUID")
-    if args.attendance_event_id is not None and not 1 <= args.attendance_event_id <= 2_000_000_000:
-        parser.error("attendance event ID must be a positive database ID")
+    attendance_event_ids = None
+    if args.attendance_event_id is not None:
+        tokens = args.attendance_event_id.split(",")
+        if not 1 <= len(tokens) <= 30 or any(
+            not token.isdigit() or not 1 <= int(token) <= 2_000_000_000
+            for token in tokens
+        ):
+            parser.error("provide up to 30 positive attendance database IDs")
+        attendance_event_ids = [int(token) for token in tokens]
     result = (
         summarize_logs(sys.stdin) if args.logs
-        else database_report(args.direct_run_id, args.attendance_event_id)
+        else database_report(args.direct_run_id, attendance_event_ids)
     )
     print(json.dumps(result, default=str, sort_keys=True))
 

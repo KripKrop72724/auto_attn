@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       attendance_event_id:
-        description: 'Optional attendance row ID for boolean-only reconciled CNIC guard diagnostics'
+        description: 'Optional comma-separated attendance row IDs (up to 30) for boolean-only CNIC guard diagnostics'
         required: false
         type: string
       firmware_campaign_id:
