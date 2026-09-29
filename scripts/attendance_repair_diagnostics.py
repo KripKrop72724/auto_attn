@@ -127,7 +127,7 @@ def summarize_logs(lines):
     }
 
 
-def database_report(direct_run_id=None):
+def database_report(direct_run_id=None, attendance_event_id=None):
     from sqlalchemy import text
     from zk_add.db import engine
     from zk_add.settings import settings
@@ -209,6 +209,67 @@ def database_report(direct_run_id=None):
              WHERE j.job_id = :direct_run_id AND j.action = 'MANUAL_DIRECT_ORDS'
              ORDER BY i.id LIMIT 100
         """
+    if attendance_event_id:
+        # Build only a virtual proposed row. PostgreSQL evaluates the guard
+        # against current roster/history without changing attendance or outbox.
+        queries["reconciled_guard"] = """
+            SELECT e.id AS event_id,
+                   e.source, e.clock_quality,
+                   e.captured_cnic_lookup_hash IS NULL AS captured_hash_null,
+                   e.captured_cnic_lookup_hash = '' AS captured_hash_empty,
+                   e.identity_terminal_fingerprint IS NOT NULL AS event_fingerprint_present,
+                   e.captured_at BETWEEN e.device_event_time
+                                     AND e.device_event_time + INTERVAL '10 minutes'
+                       AS capture_window,
+                   e.received_at BETWEEN e.captured_at - INTERVAL '30 seconds'
+                                     AND e.captured_at + INTERVAL '10 minutes'
+                       AS receipt_window,
+                   u.snapshot_revision = z.identity_snapshot_revision
+                       AND z.identity_snapshot_id IS NOT NULL AS current_snapshot,
+                   (SELECT count(*) FROM add_attendance_identity_history h
+                    WHERE h.zkt_device_id=z.id AND h.device_user_id=u.id
+                      AND h.terminal_serial=e.device_serial
+                      AND h.user_id=e.user_id AND h.uid=e.uid
+                      AND h.fingerprint=e.identity_terminal_fingerprint
+                      AND h.cnic_lookup_hash=u.cnic_lookup_hash
+                      AND NOT h.revoked
+                      AND h.observed_from <= e.device_event_time
+                      AND h.observed_until >= e.device_event_time)
+                       AS matching_history_count,
+                   (SELECT count(*) FROM add_terminal_record_manifest m
+                    WHERE m.attendance_event_id=e.id
+                      AND (m.connector_id IS DISTINCT FROM e.connector_id
+                        OR m.zkt_device_id IS DISTINCT FROM e.zkt_device_id
+                        OR m.terminal_serial IS DISTINCT FROM e.device_serial
+                        OR (m.observed_user_id IS NOT NULL
+                          AND m.observed_user_id <> e.user_id)
+                        OR (m.observed_uid IS NOT NULL AND m.observed_uid <> e.uid
+                          AND NOT COALESCE(m.record_size=40 AND
+                            m.observed_uid=(e.raw_event ->> 'attendance_record_uid'), false))
+                        OR m.disposition NOT IN
+                          ('EVENT','BLOCKED_IDENTITY','TERMINAL_DUPLICATE')))
+                       AS conflicting_manifest_count,
+                   add_auto_reconciled_cnic_verified(
+                     jsonb_populate_record(NULL::add_attendance_events,
+                       to_jsonb(e) || jsonb_build_object(
+                         'identity_resolution_status','RESOLVED_SYNCED_CNIC',
+                         'identity_repair_reason','VERIFIED_SYNCED_CNIC',
+                         'device_user_id',u.id,
+                         'cnic_lookup_hash',u.cnic_lookup_hash,
+                         'cnic_encrypted',u.cnic_encrypted,
+                         'identity_snapshot_id',z.identity_snapshot_id,
+                         'ords_status','PENDING',
+                         'manual_release_required',false,
+                         'display_name',u.display_name)))
+                       AS prospective_guard_accepts
+            FROM add_attendance_events e
+            JOIN add_zkt_devices z ON z.id=e.zkt_device_id
+            JOIN add_device_users u ON u.zkt_device_id=z.id
+              AND u.user_id=e.user_id AND u.present
+              AND u.lifecycle_state='ACTIVE'
+            WHERE e.id=:attendance_event_id
+            LIMIT 3
+        """
     queries["schema"] = "SELECT version_num FROM alembic_version"
     for name, query in queries.items():
         try:
@@ -216,7 +277,11 @@ def database_report(direct_run_id=None):
                 connection.execute(text("SET TRANSACTION READ ONLY"))
                 connection.execute(text("SET LOCAL statement_timeout = '5s'"))
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
-                params = {"direct_run_id": direct_run_id} if name == "direct_run" else {}
+                params = (
+                    {"direct_run_id": direct_run_id} if name == "direct_run" else
+                    {"attendance_event_id": attendance_event_id}
+                    if name == "reconciled_guard" else {}
+                )
                 result[name] = [dict(row) for row in connection.execute(text(query), params).mappings()]
                 connection.rollback()
         except Exception as exc:
@@ -228,10 +293,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs", action="store_true")
     parser.add_argument("--direct-run-id")
+    parser.add_argument("--attendance-event-id", type=int)
     args = parser.parse_args()
     if args.direct_run_id and not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.direct_run_id):
         parser.error("direct run ID must be a UUID")
-    result = summarize_logs(sys.stdin) if args.logs else database_report(args.direct_run_id)
+    if args.attendance_event_id is not None and not 1 <= args.attendance_event_id <= 2_000_000_000:
+        parser.error("attendance event ID must be a positive database ID")
+    result = (
+        summarize_logs(sys.stdin) if args.logs
+        else database_report(args.direct_run_id, args.attendance_event_id)
+    )
     print(json.dumps(result, default=str, sort_keys=True))
 
 

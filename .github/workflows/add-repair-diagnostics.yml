@@ -7,6 +7,10 @@ on:
         description: 'Optional saved direct Oracle send run ID for bounded error-code diagnostics'
         required: false
         type: string
+      attendance_event_id:
+        description: 'Optional attendance row ID for boolean-only reconciled CNIC guard diagnostics'
+        required: false
+        type: string
       firmware_campaign_id:
         description: 'Optional exact firmware campaign ID for read-only assignment diagnostics'
         required: false
@@ -35,6 +39,7 @@ jobs:
       - name: Read container state and bounded database counters
         env:
           DIRECT_RUN_ID: ${{ inputs.direct_run_id }}
+          ATTENDANCE_EVENT_ID: ${{ inputs.attendance_event_id }}
         run: |
           $ErrorActionPreference = 'Stop'
           $api = 'attendance-device-dashboard-add-api-1'
@@ -53,7 +58,9 @@ jobs:
           & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
           if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
           $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
-          if ($env:DIRECT_RUN_ID) {
+          if ($env:ATTENDANCE_EVENT_ID) {
+            $script | & docker exec -i $api python - --attendance-event-id $env:ATTENDANCE_EVENT_ID
+          } elseif ($env:DIRECT_RUN_ID) {
             $script | & docker exec -i $api python - --direct-run-id $env:DIRECT_RUN_ID
           } else {
             $script | & docker exec -i $api python -
