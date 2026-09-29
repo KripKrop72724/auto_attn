@@ -162,7 +162,10 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             and manifest.connector_id == connector.id
             and manifest.zkt_device_id == event.zkt_device_id
             and manifest.terminal_serial == event.device_serial
-            and manifest.disposition == "EVENT"
+            # Identity-blocked records still have the same authenticated,
+            # canonical terminal source. The disposition describes delivery,
+            # not whether the source record was genuine.
+            and manifest.disposition in {"EVENT", "BLOCKED_IDENTITY"}
             and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
             and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
         ):
@@ -186,6 +189,23 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             "generation": manifest.generation,
             "epoch_id": manifest.source_epoch_id,
         }
+    # Earlier firmware delivered current reconciliation punches in its normal
+    # authenticated attendance batch, without a separate source manifest.
+    # The server receipt bounds this fallback to punches captured near-live;
+    # queued history cannot claim this source simply by choosing a new label.
+    if event.source == "CURRENT_RECONCILE" and connector.zkt_device:
+        zkt = connector.zkt_device
+        event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
+        receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
+        if (
+            event.connector_id == connector.id
+            and event.zkt_device_id == zkt.id
+            and event.device_serial == zkt.confirmed_serial == zkt.serial
+            and event.clock_quality == "OK"
+            and timedelta(0) <= event_age <= timedelta(minutes=10)
+            and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
+        ):
+            return {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
     if (event.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE":
         return {"kind": "VERIFIED_TERMINAL_SOURCE", "serial": event.device_serial}
     return None

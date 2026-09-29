@@ -547,7 +547,7 @@ def delivery_proof_valid(session: Session, event: AttendanceEvent, connector: Co
         return bool(
             zkt and user and event.identity_snapshot_id == zkt.identity_snapshot_id
             and event.cnic_lookup_hash == user.cnic_lookup_hash
-            and synced_cnic_identity_proven(zkt, user, event)
+            and synced_cnic_identity_proven(session, connector, zkt, user, event)
         )
     if event.identity_resolution_status != "RESOLVED_RETAINED_IDENTITY":
         return True

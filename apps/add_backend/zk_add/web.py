@@ -2968,6 +2968,51 @@ async def restart_device(
     return command_response(command)
 
 
+@app.get("/api/v2/attendance/{event_id}/identity-evidence")
+def attendance_identity_evidence_report(
+    event_id: int,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Show an administrator why a held punch can or cannot be auto released."""
+    from zk_add.attendance_identity_evidence import identity_evidence, source_evidence
+    from zk_add.service import synced_cnic_identity_proven
+
+    db, _context = auth
+    event = db.get(AttendanceEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Attendance event not found.")
+    connector = db.get(Connector, event.connector_id)
+    zkt = connector.zkt_device if connector else None
+    users = (
+        db.scalars(select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_id == event.user_id,
+            DeviceUser.lifecycle_state == "ACTIVE",
+        ).limit(2)).all()
+        if zkt else []
+    )
+    user = users[0] if len(users) == 1 else None
+    source = source_evidence(db, event, connector) if connector else None
+    evidence = identity_evidence(db, event, connector) if connector else None
+    return {
+        "event_id": event.id,
+        "ords_status": event.ords_status,
+        "clock_quality": event.clock_quality,
+        "source": event.source,
+        "source_proof": source["kind"] if source else None,
+        "identity_proof": evidence.proof["kind"] if evidence else None,
+        "active_user_count": len(users),
+        "active_user_uid_matches": bool(user and event.uid and user.uid == event.uid),
+        "active_user_cnic_matches_history": bool(
+            user and evidence and user.cnic_lookup_hash == evidence.cnic_hash
+        ),
+        "auto_release_eligible": bool(
+            connector and zkt and user
+            and synced_cnic_identity_proven(db, connector, zkt, user, event)
+        ),
+    }
+
+
 @app.get("/api/v1/attendance")
 def attendance(
     device_id: str | None = None,

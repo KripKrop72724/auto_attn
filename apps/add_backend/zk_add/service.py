@@ -2868,7 +2868,10 @@ def enrich_undelivered_attendance(
     return changed
 
 
-def synced_cnic_identity_proven(zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent) -> bool:
+def synced_cnic_identity_proven(
+    session: Session, connector: Connector, zkt: ZKTDevice,
+    user: DeviceUser, row: AttendanceEvent,
+) -> bool:
     """Check the roster and capture proof used by both repair and delivery."""
     if not (
         zkt.snapshot_complete and zkt.identity_snapshot_stable
@@ -2894,16 +2897,36 @@ def synced_cnic_identity_proven(zkt: ZKTDevice, user: DeviceUser, row: Attendanc
             return False
     except Exception:
         return False
-    return bool(
-        row.captured_cnic_lookup_hash == user.cnic_lookup_hash
-        or (row.source in {"LIVE", "LIVE_POLL"}
+    if row.captured_cnic_lookup_hash == user.cnic_lookup_hash:
+        return True
+    if (
+        row.source in {"LIVE", "LIVE_POLL"}
             and zkt.last_identity_change_at is not None
             and (not row.display_name or row.display_name.casefold() == user.display_name.casefold())
             and timedelta(0) <= ensure_utc(row.captured_at) - ensure_utc(row.device_event_time)
                 <= AUTO_SYNC_LIVE_EVENT_AGE
             and ensure_utc(row.device_event_time) >= ensure_utc(zkt.last_identity_change_at)
             and ensure_utc(zkt.identity_snapshot_observed_at)
-            >= ensure_utc(row.captured_at))
+            >= ensure_utc(row.captured_at)
+    ):
+        return True
+    # A reconciled ID-only record needs its own authenticated source and an
+    # identity interval that actually covers the punch time. A later roster
+    # observation alone cannot attribute a historical punch to this employee.
+    if (
+        row.source not in {
+            "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"
+        }
+        or not row.uid or row.uid != user.uid or row.connector_id != connector.id
+    ):
+        return False
+    from zk_add.attendance_identity_evidence import identity_evidence
+
+    evidence = identity_evidence(session, row, connector)
+    return bool(
+        evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
+        and evidence.user_id == user.id
+        and evidence.cnic_hash == user.cnic_lookup_hash
     )
 
 
@@ -2915,8 +2938,8 @@ def release_synced_cnic_attendance(
 
     A captured CNIC is the strongest evidence. For a live punch without one,
     the roster must have been observed again after capture and remained
-    unchanged across the punch. Older ID-only history is not attributed to a
-    possibly reused user ID.
+    unchanged across the punch. A current reconciliation record without CNIC
+    needs a retained per-user identity interval spanning the punch time.
     """
     rows = session.scalars(
         select(AttendanceEvent).where(
@@ -2928,7 +2951,7 @@ def release_synced_cnic_attendance(
     ).all()
     changed = 0
     for row in rows:
-        if not synced_cnic_identity_proven(zkt, user, row):
+        if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
             continue
         row.device_user_id = user.id
         row.identity_snapshot_id = zkt.identity_snapshot_id
