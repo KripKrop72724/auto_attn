@@ -162,7 +162,10 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             and manifest.connector_id == connector.id
             and manifest.zkt_device_id == event.zkt_device_id
             and manifest.terminal_serial == event.device_serial
-            and manifest.disposition == "EVENT"
+            # Identity-blocked records still have the same authenticated,
+            # canonical terminal source. The disposition describes delivery,
+            # not whether the source record was genuine.
+            and manifest.disposition in {"EVENT", "BLOCKED_IDENTITY"}
             and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
             and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
         ):

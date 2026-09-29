@@ -17,9 +17,14 @@ from zk_add.models import (
     Connector,
     DeviceUser,
     OrdsOutbox,
+    TerminalRecordManifest,
 )
 from zk_add.schemas import UserSnapshotRequest, UserSnapshotRow
-from zk_add.service import enrich_undelivered_attendance, replace_user_snapshot
+from zk_add.service import (
+    enrich_undelivered_attendance,
+    release_synced_cnic_attendance,
+    replace_user_snapshot,
+)
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
 
@@ -264,6 +269,91 @@ def test_per_employee_history_survives_unrelated_user_change(store):
             )
             == 1
         )
+
+
+def test_reconciled_unknown_identity_releases_only_with_retained_interval(store):
+    sessions, connector_id, uid = store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        start_at = utc_now() - timedelta(minutes=5)
+        for index in range(2):
+            replace_user_snapshot(
+                db, connector=connector,
+                snapshot=UserSnapshotRequest(
+                    snapshot_id=f"reconcile-identity-{index}",
+                    complete=True, stable=True,
+                    observed_at=start_at + timedelta(minutes=index),
+                    users=[
+                        UserSnapshotRow(uid="7", user_id="1007", name="Correct Name-3520212345671"),
+                        UserSnapshotRow(uid="8", user_id="1008", name=f"Other {index}-3520212345672"),
+                    ],
+                ),
+            )
+        event.device_event_time = start_at + timedelta(seconds=20)
+        event.captured_at = event.device_event_time + timedelta(minutes=3)
+        event.source = "CURRENT_RECONCILE"
+        event.device_user_id = None
+        event.identity_terminal_fingerprint = None
+        event.display_name = None
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.ords_status = event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        manifest.disposition = "BLOCKED_IDENTITY"
+        db.flush()
+
+        assert identity_evidence(db, event, connector).proof["kind"] == "RETAINED_INTERVAL"
+        manifest.canonical_source = False
+        db.flush()
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+        manifest.canonical_source = True
+        db.flush()
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+        db.flush()
+        assert event.ords_status == "PENDING"
+        assert not event.manual_release_required
+        assert event.cnic_lookup_hash == user.cnic_lookup_hash
+        assert repair.delivery_proof_valid(db, event, connector)
+
+        history = db.scalar(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.observed_from <= event.device_event_time,
+            AttendanceIdentityHistory.observed_until >= event.device_event_time,
+        ))
+        history.revoked = True
+        db.flush()
+        assert not repair.delivery_proof_valid(db, event, connector)
+
+
+def test_reconciled_id_only_punch_does_not_use_later_roster(store):
+    sessions, connector_id, uid = store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        event.device_user_id = None
+        event.identity_terminal_fingerprint = None
+        event.display_name = None
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.source = "CURRENT_RECONCILE"
+        event.ords_status = event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        event.device_event_time = utc_now() - timedelta(days=1)
+        event.captured_at = event.device_event_time + timedelta(minutes=3)
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        manifest.disposition = "BLOCKED_IDENTITY"
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+        assert event.ords_status == "BLOCKED_IDENTITY"
 
 
 def test_card_policy_transition_preserves_only_fingerprint_bound_gap_events(store):
