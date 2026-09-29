@@ -2910,9 +2910,9 @@ def synced_cnic_identity_proven(
             >= ensure_utc(row.captured_at)
     ):
         return True
-    # A reconciled ID-only record needs its own authenticated source and an
-    # identity interval that actually covers the punch time. A later roster
-    # observation alone cannot attribute a historical punch to this employee.
+    # A reconciled ID-only record needs its own authenticated source and proof
+    # that the same CNIC covered the punch time. A later roster observation
+    # alone cannot attribute a historical punch to this employee.
     if (
         row.source not in {
             "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"
@@ -2921,10 +2921,25 @@ def synced_cnic_identity_proven(
     ):
         return False
     from zk_add.attendance_identity_evidence import identity_evidence
+    from zk_add.models import AttendanceIdentityHistory
 
     evidence = identity_evidence(session, row, connector)
+    if evidence and evidence.proof["kind"] == "LEGACY_CONTINUITY":
+        # A revoked or conflicting interval cannot be bypassed by the older
+        # aggregate roster proof. Use that fallback only when no per-user
+        # observation exists for the punch time at all.
+        prior_interval = session.scalar(select(AttendanceIdentityHistory.id).where(
+            AttendanceIdentityHistory.zkt_device_id == zkt.id,
+            AttendanceIdentityHistory.terminal_serial == row.device_serial,
+            AttendanceIdentityHistory.user_id == row.user_id,
+            AttendanceIdentityHistory.uid == row.uid,
+            AttendanceIdentityHistory.observed_from <= row.device_event_time,
+            AttendanceIdentityHistory.observed_until >= row.device_event_time,
+        ).limit(1))
+        if prior_interval is not None:
+            return False
     return bool(
-        evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
+        evidence and evidence.proof["kind"] in {"RETAINED_INTERVAL", "LEGACY_CONTINUITY"}
         and evidence.user_id == user.id
         and evidence.cnic_hash == user.cnic_lookup_hash
     )
@@ -2939,7 +2954,8 @@ def release_synced_cnic_attendance(
     A captured CNIC is the strongest evidence. For a live punch without one,
     the roster must have been observed again after capture and remained
     unchanged across the punch. A current reconciliation record without CNIC
-    needs a retained per-user identity interval spanning the punch time.
+    needs a retained per-user interval or whole-roster continuity spanning the
+    punch time.
     """
     rows = session.scalars(
         select(AttendanceEvent).where(

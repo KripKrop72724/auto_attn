@@ -148,52 +148,11 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
 
     if event.source in {"LIVE", "LIVE_POLL"}:
         return {"kind": "CAPTURE_BINDING", "serial": event.device_serial}
-    manifest = session.scalar(
-        select(TerminalRecordManifest)
-        .where(
-            TerminalRecordManifest.attendance_event_id == event.id,
-        )
-        .order_by(TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc())
-        .limit(1)
-    )
-    if manifest:
-        if not (
-            manifest.canonical_source
-            and manifest.connector_id == connector.id
-            and manifest.zkt_device_id == event.zkt_device_id
-            and manifest.terminal_serial == event.device_serial
-            # Identity-blocked records still have the same authenticated,
-            # canonical terminal source. The disposition describes delivery,
-            # not whether the source record was genuine.
-            and manifest.disposition in {"EVENT", "BLOCKED_IDENTITY"}
-            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
-            and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
-        ):
-            return None
-        epoch = (
-            session.get(TerminalSourceEpoch, manifest.source_epoch_id)
-            if manifest.source_epoch_id
-            else None
-        )
-        if manifest.source_epoch_id and (
-            not epoch
-            or epoch.state != "ACTIVE"
-            or epoch.zkt_device_id != event.zkt_device_id
-            or epoch.terminal_generation != manifest.generation
-        ):
-            return None
-        return {
-            "kind": "SAVED_TERMINAL_RECORD",
-            "manifest_id": manifest.id,
-            "digest": manifest.raw_record_digest,
-            "generation": manifest.generation,
-            "epoch_id": manifest.source_epoch_id,
-        }
     # Earlier firmware delivered current reconciliation punches in its normal
-    # authenticated attendance batch, without a separate source manifest.
-    # The server receipt bounds this fallback to punches captured near-live;
-    # queued history cannot claim this source simply by choosing a new label.
-    if event.source == "CURRENT_RECONCILE" and connector.zkt_device:
+    # authenticated attendance batch. This proof belongs to that original
+    # capture, even if a later terminal scan also attached a manifest.
+    near_live = None
+    if event.source == "CURRENT_RECONCILE" and connector.zkt_device and event.received_at:
         zkt = connector.zkt_device
         event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
         receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
@@ -205,7 +164,56 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             and timedelta(0) <= event_age <= timedelta(minutes=10)
             and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
         ):
-            return {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
+            near_live = {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
+    manifest = session.scalar(
+        select(TerminalRecordManifest)
+        .where(
+            TerminalRecordManifest.attendance_event_id == event.id,
+        )
+        .order_by(TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc())
+        .limit(1)
+    )
+    if manifest:
+        if not (
+            manifest.connector_id == connector.id
+            and manifest.zkt_device_id == event.zkt_device_id
+            and manifest.terminal_serial == event.device_serial
+            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
+            and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
+        ):
+            return None
+        epoch = (
+            session.get(TerminalSourceEpoch, manifest.source_epoch_id)
+            if manifest.source_epoch_id
+            else None
+        )
+        if (
+            manifest.canonical_source
+            and manifest.disposition in {"EVENT", "BLOCKED_IDENTITY"}
+            and (
+                not manifest.source_epoch_id
+                or (
+                    epoch and epoch.state == "ACTIVE"
+                    and epoch.zkt_device_id == event.zkt_device_id
+                    and epoch.terminal_generation == manifest.generation
+                )
+            )
+        ):
+            return {
+                "kind": "SAVED_TERMINAL_RECORD",
+                "manifest_id": manifest.id,
+                "digest": manifest.raw_record_digest,
+                "generation": manifest.generation,
+                "epoch_id": manifest.source_epoch_id,
+            }
+        # A later duplicate or superseded source epoch does not revoke the
+        # original near-live capture. An explicitly conflicting identity or
+        # malformed/invalid-time source still prevents this fallback.
+        if manifest.disposition not in {"EVENT", "BLOCKED_IDENTITY", "TERMINAL_DUPLICATE"}:
+            return None
+        return near_live
+    if near_live:
+        return near_live
     if (event.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE":
         return {"kind": "VERIFIED_TERMINAL_SOURCE", "serial": event.device_serial}
     return None
