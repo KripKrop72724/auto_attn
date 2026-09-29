@@ -356,6 +356,47 @@ def test_reconciled_id_only_punch_does_not_use_later_roster(store):
         assert event.ords_status == "BLOCKED_IDENTITY"
 
 
+@pytest.mark.parametrize("receipt_lag_minutes, expected", [(0, 1), (11, 0)])
+def test_near_live_reconcile_without_manifest_requires_timely_server_receipt(
+    store, receipt_lag_minutes, expected,
+):
+    sessions, connector_id, uid = store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        start_at = utc_now() - timedelta(minutes=5)
+        for index in range(2):
+            replace_user_snapshot(
+                db, connector=connector,
+                snapshot=UserSnapshotRequest(
+                    snapshot_id=f"near-live-{index}", complete=True, stable=True,
+                    observed_at=start_at + timedelta(minutes=index),
+                    users=[
+                        UserSnapshotRow(uid="7", user_id="1007", name="Correct Name-3520212345671"),
+                    ],
+                ),
+            )
+        event.device_event_time = start_at + timedelta(seconds=20)
+        event.captured_at = event.device_event_time + timedelta(minutes=3)
+        event.received_at = event.captured_at + timedelta(minutes=receipt_lag_minutes)
+        event.source = "CURRENT_RECONCILE"
+        event.device_user_id = None
+        event.identity_terminal_fingerprint = None
+        event.display_name = None
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.ords_status = event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        db.delete(manifest)
+        db.flush()
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == expected
+        assert event.ords_status == ("PENDING" if expected else "BLOCKED_IDENTITY")
+
+
 def test_card_policy_transition_preserves_only_fingerprint_bound_gap_events(store):
     sessions, connector_id, uid = store
     before_at = utc_now() + timedelta(seconds=1)

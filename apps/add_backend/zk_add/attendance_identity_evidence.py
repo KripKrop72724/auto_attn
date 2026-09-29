@@ -189,6 +189,23 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             "generation": manifest.generation,
             "epoch_id": manifest.source_epoch_id,
         }
+    # Earlier firmware delivered current reconciliation punches in its normal
+    # authenticated attendance batch, without a separate source manifest.
+    # The server receipt bounds this fallback to punches captured near-live;
+    # queued history cannot claim this source simply by choosing a new label.
+    if event.source == "CURRENT_RECONCILE" and connector.zkt_device:
+        zkt = connector.zkt_device
+        event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
+        receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
+        if (
+            event.connector_id == connector.id
+            and event.zkt_device_id == zkt.id
+            and event.device_serial == zkt.confirmed_serial == zkt.serial
+            and event.clock_quality == "OK"
+            and timedelta(0) <= event_age <= timedelta(minutes=10)
+            and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
+        ):
+            return {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
     if (event.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE":
         return {"kind": "VERIFIED_TERMINAL_SOURCE", "serial": event.device_serial}
     return None
