@@ -118,9 +118,11 @@ def test_synced_cnic_migration_releases_verified_hold_only(force_pg):
             """), {"id": event_id})
 
 
-@pytest.mark.parametrize("saved_record", [False, True])
+@pytest.mark.parametrize(
+    "record_case", ["near_live_record_uid", "saved_exact_uid", "saved_record_uid"]
+)
 def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
-    force_pg, saved_record,
+    force_pg, record_case,
 ):
     from datetime import timedelta
     from zk_add.models import AttendanceIdentityHistory, OrdsOutbox, TerminalRecordManifest
@@ -129,6 +131,7 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
 
     sessions, _, _ = force_pg
     engine = sessions.kw["bind"]
+    saved_record = record_case != "near_live_record_uid"
     with sessions() as db:
         event = db.scalar(select(AttendanceEvent))
         connector = db.get(Connector, event.connector_id)
@@ -146,7 +149,7 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
         event.manual_release_required = True
         event.cnic_encrypted = event.cnic_lookup_hash = None
         event.captured_cnic_lookup_hash = None
-        record_uid = user.uid if saved_record else "28943"
+        record_uid = user.uid if record_case == "saved_exact_uid" else "28943"
         event.raw_event = {"attendance_record_uid": record_uid}
         db.add(AttendanceIdentityHistory(
             zkt_device_id=zkt.id, device_user_id=user.id,
@@ -173,6 +176,7 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
         "20260925_0036_auto_synced_cnic.py",
         "20260929_0037_reconciled_cnic_guard.py",
         "20260929_0038_saved_reconcile_cnic_guard.py",
+        "20260929_0039_delayed_record_uid_guard.py",
     ):
         path = Path(__file__).parents[2] / "apps/add_backend/migrations/versions" / filename
         spec = spec_from_file_location(filename.removesuffix(".py"), path)
@@ -181,7 +185,12 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
         with engine.begin() as conn:
             with Operations.context(MigrationContext.configure(conn)):
                 migration.upgrade()
-        if filename == "20260929_0037_reconciled_cnic_guard.py" and saved_record:
+        if (
+            (filename == "20260929_0037_reconciled_cnic_guard.py"
+             and record_case == "saved_exact_uid")
+            or (filename == "20260929_0038_saved_reconcile_cnic_guard.py"
+                and record_case == "saved_record_uid")
+        ):
             with sessions() as db:
                 assert db.scalar(text(
                     "SELECT add_auto_reconciled_cnic_verified("

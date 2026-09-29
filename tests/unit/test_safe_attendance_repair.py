@@ -25,6 +25,7 @@ from zk_add.service import (
     repair_attendance_delivery_backlog,
     release_synced_cnic_attendance,
     replace_user_snapshot,
+    synced_cnic_identity_proven,
 )
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
@@ -238,7 +239,7 @@ def test_per_employee_history_survives_unrelated_user_change(store):
     with sessions() as db:
         connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
         event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
-        start_at = utc_now() - timedelta(minutes=5)
+        start_at = utc_now() - timedelta(minutes=20)
         for index in range(2):
             replace_user_snapshot(
                 db,
@@ -403,6 +404,37 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         db.flush()
         assert identity_evidence(db, event, connector) is None
         manifest.observed_user_id = event.user_id
+
+        # A delayed canonical 40-byte record can still prove the source when
+        # its exact user ID and a retained fingerprint/CNIC interval agree.
+        event.captured_at = event.device_event_time + timedelta(minutes=11)
+        event.received_at = event.captured_at + timedelta(seconds=1)
+        db.flush()
+        evidence = identity_evidence(db, event, connector)
+        assert evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
+        assert evidence.proof["source"]["requires_retained_identity"]
+        assert synced_cnic_identity_proven(
+            db, connector, connector.zkt_device, user, event
+        )
+        history = db.scalar(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.observed_from <= event.device_event_time,
+            AttendanceIdentityHistory.observed_until >= event.device_event_time,
+        ))
+        assert history is not None
+        history.revoked = True
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        assert not synced_cnic_identity_proven(
+            db, connector, connector.zkt_device, user, event
+        )
+        history.revoked = False
+        manifest.observed_user_id = None
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        manifest.observed_user_id = event.user_id
+        event.captured_at = event.device_event_time + timedelta(minutes=3)
+        event.received_at = event.captured_at + timedelta(seconds=1)
 
         history = db.scalar(select(AttendanceIdentityHistory).where(
             AttendanceIdentityHistory.device_user_id == user.id,

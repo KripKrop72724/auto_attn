@@ -143,15 +143,21 @@ def valid_cnic(encrypted: str | None, digest: str | None) -> bool:
         return False
 
 
+def plausible_reconcile_receipt(event: AttendanceEvent) -> bool:
+    if not event.received_at:
+        return False
+    receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
+    return -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
+
+
 def near_live_reconcile_capture(event: AttendanceEvent) -> bool:
-    if event.source != "CURRENT_RECONCILE" or not event.received_at:
+    if event.source != "CURRENT_RECONCILE":
         return False
     event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
-    receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
     return bool(
         event.clock_quality == "OK"
         and timedelta(0) <= event_age <= timedelta(minutes=10)
-        and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
+        and plausible_reconcile_receipt(event)
     )
 
 
@@ -164,9 +170,17 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
     # record, not the enrolled person. The firmware retains both namespaces.
     return bool(
         manifest.record_size == 40
-        and near_live_reconcile_capture(event)
         and (event.raw_event or {}).get("attendance_record_uid") == manifest.observed_uid
         and event.identity_terminal_fingerprint
+        and (
+            near_live_reconcile_capture(event)
+            or (
+                event.source == "CURRENT_RECONCILE"
+                and manifest.observed_user_id is not None
+                and manifest.observed_user_id == event.user_id
+                and plausible_reconcile_receipt(event)
+            )
+        )
     )
 
 
@@ -226,6 +240,14 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
                 "digest": manifest.raw_record_digest,
                 "generation": manifest.generation,
                 "epoch_id": manifest.source_epoch_id,
+                # A delayed 40-byte record carries a record UID rather than
+                # the enrolled UID. Its exact user ID must also be backed by
+                # a retained, fingerprint-bound identity interval.
+                "requires_retained_identity": bool(
+                    manifest.record_size == 40
+                    and manifest.observed_uid != event.uid
+                    and not near_live_reconcile_capture(event)
+                ),
             }
         # A later duplicate or superseded source epoch does not revoke the
         # original near-live capture. An explicitly conflicting identity or
@@ -340,6 +362,8 @@ def identity_evidence(
             )
         return None
     if histories:
+        return None
+    if source.get("requires_retained_identity"):
         return None
     # Legacy observations can prove only their existing global continuity window.
     # A changed snapshot id alone does not invalidate an unchanged employee.
