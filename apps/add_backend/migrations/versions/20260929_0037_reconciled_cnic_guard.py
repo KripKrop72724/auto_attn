@@ -80,8 +80,8 @@ def upgrade() -> None:
                   OR (m.observed_user_id IS NOT NULL
                     AND m.observed_user_id <> e.user_id)
                   OR (m.observed_uid IS NOT NULL AND m.observed_uid <> e.uid
-                    AND NOT (m.record_size = 40 AND
-                      m.observed_uid = (e.raw_event ->> 'attendance_record_uid')))
+                    AND NOT COALESCE(m.record_size = 40 AND
+                      m.observed_uid = (e.raw_event ->> 'attendance_record_uid'), false))
                   OR m.disposition NOT IN
                     ('EVENT','BLOCKED_IDENTITY','TERMINAL_DUPLICATE'))
             ), false)

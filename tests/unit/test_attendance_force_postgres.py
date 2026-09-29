@@ -191,7 +191,7 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(for
         manifest = db.scalar(select(TerminalRecordManifest).where(
             TerminalRecordManifest.attendance_event_id == event_id
         ))
-        manifest.observed_uid = "wrong-record"
+        manifest.record_size = None
         db.commit()
     with sessions() as db:
         assert db.scalar(text(
