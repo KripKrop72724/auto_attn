@@ -3043,6 +3043,8 @@ def attendance_identity_evidence_report(
         AttendanceIdentityHistory.observed_from <= event.device_event_time,
         AttendanceIdentityHistory.observed_until >= event.device_event_time,
     ).order_by(AttendanceIdentityHistory.id).limit(5)).all()
+    from zk_add.attendance_identity_evidence import manifest_identity_matches_event
+
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
     return {
@@ -3058,8 +3060,7 @@ def attendance_identity_evidence_report(
             and manifest.connector_id == connector.id
             and manifest.zkt_device_id == event.zkt_device_id
             and manifest.terminal_serial == event.device_serial
-            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
-            and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
+            and manifest_identity_matches_event(manifest, event)
         ),
         "manifest_epoch_state": epoch.state if epoch else None,
         "manifest_rows": [
@@ -3074,6 +3075,11 @@ def attendance_identity_evidence_report(
                     not row.observed_user_id or row.observed_user_id == event.user_id
                 ),
                 "observed_uid": row.observed_uid,
+                "record_size": row.record_size,
+                "event_record_uid_matches": bool(
+                    row.observed_uid
+                    and (event.raw_event or {}).get("attendance_record_uid") == row.observed_uid
+                ),
                 "observed_uid_matches": bool(
                     not event.uid or not row.observed_uid or row.observed_uid == event.uid
                 ),

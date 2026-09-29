@@ -340,6 +340,93 @@ def test_reconciled_unknown_identity_releases_only_with_retained_interval(store)
         assert not repair.delivery_proof_valid(db, event, connector)
 
 
+def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(store):
+    sessions, connector_id, uid = store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        start_at = utc_now() - timedelta(minutes=5)
+        for index in range(2):
+            replace_user_snapshot(
+                db, connector=connector,
+                snapshot=UserSnapshotRequest(
+                    snapshot_id=f"record-uid-{index}", complete=True, stable=True,
+                    observed_at=start_at + timedelta(minutes=index),
+                        users=[UserSnapshotRow(
+                            uid=user.uid, user_id=user.user_id,
+                            name="Correct Name-3520212345671",
+                            terminal_identity_fingerprint="a" * 64,
+                        )],
+                ),
+            )
+        event.device_event_time = start_at + timedelta(seconds=20)
+        event.captured_at = event.device_event_time + timedelta(minutes=3)
+        event.received_at = event.captured_at + timedelta(seconds=1)
+        event.source = "CURRENT_RECONCILE"
+        event.identity_terminal_fingerprint = user.terminal_identity_fingerprint
+        event.device_user_id = None
+        event.display_name = None
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.ords_status = event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.raw_event = {"attendance_record_uid": "28943"}
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        manifest.record_size = 40
+        manifest.observed_uid = "28943"
+        manifest.disposition = "BLOCKED_IDENTITY"
+        db.flush()
+        evidence = identity_evidence(db, event, connector)
+        assert evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
+        assert evidence.proof["source"]["kind"] == "SAVED_TERMINAL_RECORD"
+
+        event.source = "FULL_HISTORY"
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        event.source = "CURRENT_RECONCILE"
+        event.received_at = event.captured_at + timedelta(minutes=11)
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        event.received_at = event.captured_at + timedelta(seconds=1)
+        manifest.record_size = 8
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        manifest.record_size = 40
+        event.raw_event = {"attendance_record_uid": "wrong"}
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        event.raw_event = {"attendance_record_uid": "28943"}
+        manifest.observed_user_id = "another-user"
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        manifest.observed_user_id = event.user_id
+
+        history = db.scalar(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.observed_from <= event.device_event_time,
+            AttendanceIdentityHistory.observed_until >= event.device_event_time,
+        ))
+        assert history is not None
+        duplicate = AttendanceIdentityHistory(**{
+            column.name: getattr(history, column.name)
+            for column in AttendanceIdentityHistory.__table__.columns
+            if column.name != "id"
+        })
+        db.add(duplicate)
+        db.flush()
+        evidence = identity_evidence(db, event, connector)
+        assert evidence and evidence.proof["kind"] == "RETAINED_EQUIVALENT_INTERVALS"
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+        assert event.ords_status == "PENDING"
+        assert repair.delivery_proof_valid(db, event, connector)
+
+        duplicate.revoked = True
+        db.flush()
+        assert identity_evidence(db, event, connector).proof["kind"] == "RETAINED_INTERVAL"
+
+
 def test_reconciled_id_only_punch_does_not_use_later_roster(store):
     sessions, connector_id, uid = store
     with sessions() as db:
