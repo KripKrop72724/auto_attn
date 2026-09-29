@@ -2939,7 +2939,9 @@ def synced_cnic_identity_proven(
         if prior_interval is not None:
             return False
     return bool(
-        evidence and evidence.proof["kind"] in {"RETAINED_INTERVAL", "LEGACY_CONTINUITY"}
+        evidence and evidence.proof["kind"] in {
+            "RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS", "LEGACY_CONTINUITY"
+        }
         and evidence.user_id == user.id
         and evidence.cnic_hash == user.cnic_lookup_hash
     )

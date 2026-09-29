@@ -143,6 +143,20 @@ def valid_cnic(encrypted: str | None, digest: str | None) -> bool:
         return False
 
 
+def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
+    if manifest.observed_user_id and manifest.observed_user_id != event.user_id:
+        return False
+    if not manifest.observed_uid or not event.uid or manifest.observed_uid == event.uid:
+        return True
+    # On some 40-byte ZKT records the first two bytes identify the attendance
+    # record, not the enrolled person. The firmware retains both namespaces.
+    return bool(
+        manifest.record_size == 40
+        and (event.raw_event or {}).get("attendance_record_uid") == manifest.observed_uid
+        and event.identity_terminal_fingerprint
+    )
+
+
 def source_evidence(session: Session, event: AttendanceEvent, connector: Connector) -> dict | None:
     from zk_add.models import TerminalRecordManifest, TerminalSourceEpoch
 
@@ -178,8 +192,7 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             manifest.connector_id == connector.id
             and manifest.zkt_device_id == event.zkt_device_id
             and manifest.terminal_serial == event.device_serial
-            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
-            and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
+            and manifest_identity_matches_event(manifest, event)
         ):
             return None
         epoch = (
@@ -264,10 +277,27 @@ def identity_evidence(
             AttendanceIdentityHistory.fingerprint == event.identity_terminal_fingerprint
         )
     histories = session.scalars(
-        history_query.order_by(AttendanceIdentityHistory.id.desc()).limit(3)
+        history_query.order_by(AttendanceIdentityHistory.id.desc()).limit(101)
     ).all()
-    # Multiple observation intervals are not interchangeable around an identity change.
-    if len(histories) == 1:
+    # Duplicate observation intervals can overlap after snapshot backfills.
+    # They prove one identity only when every interval has the same person,
+    # fingerprint and CNIC; a transition or unbounded overlap stays held.
+    equivalent_overlap = bool(
+        1 < len(histories) <= 100
+        and event.identity_terminal_fingerprint
+        and all(
+            (
+                h.device_user_id, h.terminal_serial, h.user_id, h.uid,
+                 h.fingerprint, h.cnic_lookup_hash)
+            == (
+                histories[0].device_user_id, histories[0].terminal_serial,
+                histories[0].user_id, histories[0].uid, histories[0].fingerprint,
+                histories[0].cnic_lookup_hash)
+            and valid_cnic(h.cnic_encrypted, h.cnic_lookup_hash)
+            for h in histories
+        )
+    )
+    if len(histories) == 1 or equivalent_overlap:
         h = histories[0]
         user = session.get(DeviceUser, h.device_user_id)
         if (
@@ -286,9 +316,13 @@ def identity_evidence(
                 decrypt_text(h.display_name_encrypted),
                 h.fingerprint,
                 {
-                    "kind": "RETAINED_INTERVAL",
+                    "kind": (
+                        "RETAINED_EQUIVALENT_INTERVALS" if equivalent_overlap
+                        else "RETAINED_INTERVAL"
+                    ),
                     "source": source,
                     "history_id": h.id,
+                    **({"history_ids": [row.id for row in histories]} if equivalent_overlap else {}),
                     "terminal": h.terminal_serial,
                     "user_id": h.user_id,
                     "uid": h.uid,
