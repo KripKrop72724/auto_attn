@@ -261,6 +261,108 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
         ), {"id": event_id}) is False
 
 
+def test_reconciled_legacy_continuity_matches_postgres_guard(force_pg):
+    from datetime import timedelta
+    from zk_add.models import AttendanceIdentityHistory, TerminalRecordManifest
+    from zk_add.service import release_synced_cnic_attendance, synced_cnic_identity_proven
+    from zk_add.time_utils import utc_now
+
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        connector = db.get(Connector, event.connector_id)
+        zkt = connector.zkt_device
+        user = db.get(DeviceUser, event.device_user_id)
+        when = utc_now() - timedelta(minutes=4)
+        zkt.last_identity_change_at = when - timedelta(minutes=1)
+        zkt.identity_snapshot_observed_at = when + timedelta(minutes=3)
+        user.terminal_identity_fingerprint = "a" * 64
+        event.source = "CURRENT_RECONCILE"
+        event.device_event_time = when
+        event.captured_at = when + timedelta(minutes=2)
+        event.received_at = event.captured_at + timedelta(seconds=1)
+        event.identity_terminal_fingerprint = "a" * 64
+        event.identity_snapshot_id = zkt.identity_snapshot_id
+        event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.ords_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        event.cnic_encrypted = event.cnic_lookup_hash = None
+        event.captured_cnic_lookup_hash = None
+        event.raw_event = {"attendance_record_uid": "28943"}
+        db.add(TerminalRecordManifest(
+            connector_id=connector.id, zkt_device_id=zkt.id,
+            terminal_serial=zkt.serial, generation=1, ordinal=0,
+            canonical_source=True, record_size=40,
+            raw_record_digest="b" * 64, terminal_record_key="c" * 64,
+            attendance_event_id=event.id, disposition="BLOCKED_IDENTITY",
+            observed_uid="28943", observed_user_id=user.user_id,
+        ))
+        db.commit()
+        event_id = event.id
+        zkt_id = zkt.id
+        user_id = user.id
+
+    filenames = (
+        "20260925_0036_auto_synced_cnic.py",
+        "20260929_0037_reconciled_cnic_guard.py",
+        "20260929_0038_saved_reconcile_cnic_guard.py",
+        "20260929_0039_delayed_record_uid_guard.py",
+        "20260929_0040_manual_hold_event_diagnostic.py",
+        "20260929_0041_legacy_reconcile_cnic_guard.py",
+    )
+    for filename in filenames:
+        path = Path(__file__).parents[2] / "apps/add_backend/migrations/versions" / filename
+        spec = spec_from_file_location(filename.removesuffix(".py"), path)
+        migration = module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        with engine.begin() as conn:
+            with Operations.context(MigrationContext.configure(conn)):
+                migration.upgrade()
+        if filename == "20260929_0040_manual_hold_event_diagnostic.py":
+            with sessions() as db:
+                assert db.scalar(text("""
+                    SELECT add_auto_reconciled_cnic_verified(
+                      jsonb_populate_record(NULL::add_attendance_events,
+                        to_jsonb(e) || jsonb_build_object(
+                          'identity_resolution_status','RESOLVED_SYNCED_CNIC',
+                          'identity_repair_reason','VERIFIED_SYNCED_CNIC',
+                          'cnic_lookup_hash',u.cnic_lookup_hash,
+                          'cnic_encrypted',u.cnic_encrypted)))
+                    FROM add_attendance_events e JOIN add_device_users u
+                      ON u.id=e.device_user_id WHERE e.id=:id
+                """), {"id": event_id}) is False
+
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        connector = db.get(Connector, event.connector_id)
+        user = db.get(DeviceUser, user_id)
+        assert synced_cnic_identity_proven(db, connector, connector.zkt_device, user, event)
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+        user = db.get(DeviceUser, user_id)
+        db.add(AttendanceIdentityHistory(
+            zkt_device_id=zkt_id, device_user_id=user_id,
+            terminal_serial=event.device_serial, user_id=event.user_id, uid=event.uid,
+            fingerprint="a" * 64, cnic_encrypted=user.cnic_encrypted,
+            cnic_lookup_hash=user.cnic_lookup_hash, revoked=True,
+            first_snapshot_id=event.identity_snapshot_id,
+            last_snapshot_id=event.identity_snapshot_id,
+            last_revision=user.snapshot_revision,
+            observed_from=when - timedelta(seconds=1),
+            observed_until=when + timedelta(seconds=1),
+        ))
+        db.commit()
+    with sessions() as db:
+        assert db.scalar(text(
+            "SELECT add_auto_reconciled_cnic_verified(e) "
+            "FROM add_attendance_events e WHERE id=:id"
+        ), {"id": event_id}) is False
+
+
 def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):
     sessions, connector_id, _ = force_pg
     # Seed singleton exactly as production migration does.
