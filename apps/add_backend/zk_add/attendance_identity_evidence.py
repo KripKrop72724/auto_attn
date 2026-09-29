@@ -143,6 +143,18 @@ def valid_cnic(encrypted: str | None, digest: str | None) -> bool:
         return False
 
 
+def near_live_reconcile_capture(event: AttendanceEvent) -> bool:
+    if event.source != "CURRENT_RECONCILE" or not event.received_at:
+        return False
+    event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
+    receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
+    return bool(
+        event.clock_quality == "OK"
+        and timedelta(0) <= event_age <= timedelta(minutes=10)
+        and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
+    )
+
+
 def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
     if manifest.observed_user_id and manifest.observed_user_id != event.user_id:
         return False
@@ -152,6 +164,7 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
     # record, not the enrolled person. The firmware retains both namespaces.
     return bool(
         manifest.record_size == 40
+        and near_live_reconcile_capture(event)
         and (event.raw_event or {}).get("attendance_record_uid") == manifest.observed_uid
         and event.identity_terminal_fingerprint
     )
@@ -166,17 +179,12 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
     # authenticated attendance batch. This proof belongs to that original
     # capture, even if a later terminal scan also attached a manifest.
     near_live = None
-    if event.source == "CURRENT_RECONCILE" and connector.zkt_device and event.received_at:
+    if near_live_reconcile_capture(event) and connector.zkt_device:
         zkt = connector.zkt_device
-        event_age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
-        receipt_lag = ensure_utc(event.received_at) - ensure_utc(event.captured_at)
         if (
             event.connector_id == connector.id
             and event.zkt_device_id == zkt.id
             and event.device_serial == zkt.confirmed_serial == zkt.serial
-            and event.clock_quality == "OK"
-            and timedelta(0) <= event_age <= timedelta(minutes=10)
-            and -timedelta(seconds=30) <= receipt_lag <= timedelta(minutes=10)
         ):
             near_live = {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
     manifest = session.scalar(
@@ -285,6 +293,7 @@ def identity_evidence(
     equivalent_overlap = bool(
         1 < len(histories) <= 100
         and event.identity_terminal_fingerprint
+        and near_live_reconcile_capture(event)
         and all(
             (
                 h.device_user_id, h.terminal_serial, h.user_id, h.uid,

@@ -382,6 +382,14 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         assert evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
         assert evidence.proof["source"]["kind"] == "SAVED_TERMINAL_RECORD"
 
+        event.source = "FULL_HISTORY"
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        event.source = "CURRENT_RECONCILE"
+        event.received_at = event.captured_at + timedelta(minutes=11)
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        event.received_at = event.captured_at + timedelta(seconds=1)
         manifest.record_size = 8
         db.flush()
         assert identity_evidence(db, event, connector) is None
