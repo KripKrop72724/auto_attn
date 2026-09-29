@@ -3004,6 +3004,13 @@ def attendance_identity_evidence_report(
         db.get(TerminalSourceEpoch, manifest.source_epoch_id)
         if manifest and manifest.source_epoch_id else None
     )
+    manifest_rows = db.scalars(
+        select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ).order_by(
+            TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc()
+        ).limit(5)
+    ).all()
     history_filters = [
         AttendanceIdentityHistory.zkt_device_id == event.zkt_device_id,
         AttendanceIdentityHistory.terminal_serial == event.device_serial,
@@ -3031,6 +3038,11 @@ def attendance_identity_evidence_report(
         )) or 0
         if user and user.cnic_lookup_hash else 0
     )
+    covering_rows = db.scalars(select(AttendanceIdentityHistory).where(
+        *history_filters,
+        AttendanceIdentityHistory.observed_from <= event.device_event_time,
+        AttendanceIdentityHistory.observed_until >= event.device_event_time,
+    ).order_by(AttendanceIdentityHistory.id).limit(5)).all()
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
     return {
@@ -3050,9 +3062,45 @@ def attendance_identity_evidence_report(
             and (not event.uid or not manifest.observed_uid or manifest.observed_uid == event.uid)
         ),
         "manifest_epoch_state": epoch.state if epoch else None,
+        "manifest_rows": [
+            {
+                "canonical_source": row.canonical_source,
+                "disposition": row.disposition,
+                "connector_matches": bool(connector and row.connector_id == connector.id),
+                "device_matches": row.zkt_device_id == event.zkt_device_id,
+                "serial_matches": row.terminal_serial == event.device_serial,
+                "observed_user_id": row.observed_user_id,
+                "observed_user_id_matches": bool(
+                    not row.observed_user_id or row.observed_user_id == event.user_id
+                ),
+                "observed_uid": row.observed_uid,
+                "observed_uid_matches": bool(
+                    not event.uid or not row.observed_uid or row.observed_uid == event.uid
+                ),
+            }
+            for row in manifest_rows
+        ],
         "history_identity_intervals": history_count,
         "history_covering_intervals": covering_count,
         "history_covering_current_cnic_intervals": matching_cnic_count,
+        "history_covering_rows": [
+            {
+                "revoked": row.revoked,
+                "closed": row.closed,
+                "device_user_matches_current": bool(user and row.device_user_id == user.id),
+                "cnic_matches_current": bool(
+                    user and user.cnic_lookup_hash == row.cnic_lookup_hash
+                ),
+                "fingerprint_present": bool(row.fingerprint),
+                "fingerprint_matches_event": bool(
+                    event.identity_terminal_fingerprint
+                    and row.fingerprint == event.identity_terminal_fingerprint
+                ),
+                "observed_from": row.observed_from,
+                "observed_until": row.observed_until,
+            }
+            for row in covering_rows
+        ],
         "identity_proof": evidence.proof["kind"] if evidence else None,
         "active_user_count": len(users),
         "active_user_uid_matches": bool(user and event.uid and user.uid == event.uid),
