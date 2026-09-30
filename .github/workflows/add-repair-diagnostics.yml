@@ -104,15 +104,33 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $api = 'attendance-device-dashboard-add-api-1'
-          $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
-          $runner = "import base64;exec(base64.b64decode('$encoded'))"
-          foreach ($container in @($api, 'attendance-device-dashboard-add-web-1')) {
-            # cmd combines native stdout/stderr before PowerShell receives it.
-            # Raw text stays in memory and is never written to workflow output.
-            $raw = @(& cmd /c "docker logs --since 15m --tail 5000 $container 2>&1")
-            if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container logs.' }
-            Write-Host "Allowlisted summary: $container"
-            $raw | & docker exec -i $api python -c $runner --logs
-            if ($LASTEXITCODE -ne 0) { throw 'Log summarization failed.' }
+          $script = Get-Content -Raw -Encoding UTF8 'scripts/attendance_repair_diagnostics.py'
+          $scriptPath = "/tmp/add-repair-diagnostics-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.py"
+          $previousEncoding = $OutputEncoding
+          $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+          $installed = $false
+          $summaryFailed = $false
+          try {
+            # Source travels on stdin; the native command stays below Windows' argv limit.
+            $script | & docker exec -i $api python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())' $scriptPath
+            if ($LASTEXITCODE -ne 0) { throw 'Could not install the temporary diagnostic script.' }
+            $installed = $true
+            foreach ($container in @($api, 'attendance-device-dashboard-add-web-1')) {
+              # cmd combines native stdout/stderr before PowerShell receives it.
+              # Raw text stays in memory and is never written to workflow output.
+              $raw = @(& cmd /c "docker logs --since 15m --tail 5000 $container 2>&1")
+              if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container logs.' }
+              Write-Host "Allowlisted summary: $container"
+              $raw | & docker exec -i $api python $scriptPath --logs
+              if ($LASTEXITCODE -ne 0) { throw 'Log summarization failed.' }
+            }
+          } catch {
+            $summaryFailed = $true
+            throw
+          } finally {
+            $OutputEncoding = $previousEncoding
+            if ($installed) {
+              & docker exec $api python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)' $scriptPath
+              if ($LASTEXITCODE -ne 0 -and -not $summaryFailed) { throw 'Could not remove the temporary diagnostic script.' }
+            }
           }

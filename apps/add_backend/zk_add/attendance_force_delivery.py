@@ -22,6 +22,24 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 
+def content_check_facts(proof, payload):
+    """Match the explicit missing-serial placeholder in an approved direct payload.
+
+    The saved source facts remain unchanged. Only the read-only Oracle check
+    uses the same ``unknown`` namespace that this direct approval already
+    authorized for delivery; every other policy and real serial stays exact.
+    """
+    facts = proof["immutable_facts"]
+    if (
+        proof.get("policy") == "manual-direct-ords-v1"
+        and "terminal" in proof and proof["terminal"] in (None, "")
+        and "device_serial" in facts and facts["device_serial"] in (None, "")
+        and payload.get("device_serial") == "unknown"
+    ):
+        return {**facts, "device_serial": "unknown"}
+    return facts
+
+
 def split_claims(claims):
     ordinary, forced = [], []
     with session_scope() as session:
@@ -38,7 +56,11 @@ def split_claims(claims):
                 row.status = event.ords_status = "BLOCKED_IDENTITY"
                 row.last_error = "The saved approval no longer matches the attendance."
                 continue
-            facts = decision.proof["immutable_facts"]
+            original_facts = decision.proof["immutable_facts"]
+            facts = content_check_facts(decision.proof, payload)
+            check_terminal_serial = event.device_serial
+            if facts.get("device_serial") != original_facts.get("device_serial"):
+                check_terminal_serial = facts["device_serial"]
             forced.append(
                 {
                     "row_id": row.id,
@@ -49,7 +71,7 @@ def split_claims(claims):
                     "check": {
                         "contract_version": "1",
                         "connector_id": connector.connector_id,
-                        "terminal_serial": event.device_serial,
+                        "terminal_serial": check_terminal_serial,
                         "items": [
                             {
                                 "event_uid": event.event_uid,

@@ -116,6 +116,7 @@ def probe_saved_direct_checks(checks):
 
 def oracle_direct_run_diagnostics(direct_run_id, attendance_event_ids=None):
     from sqlalchemy import text
+    from zk_add import attendance_force_delivery
     from zk_add.attendance_repair import _identity_digest, _protected_digest
     from zk_add.crypto import decrypt_json
     from zk_add.db import engine
@@ -144,10 +145,15 @@ def oracle_direct_run_diagnostics(direct_run_id, attendance_event_ids=None):
         checks = []
         for row in rows:
             payload = decrypt_json(row["payload_encrypted"])
-            facts = row["proof"]["immutable_facts"]
+            original_facts = row["proof"]["immutable_facts"]
+            adapter = getattr(attendance_force_delivery, "content_check_facts", None)
+            facts = adapter(row["proof"], payload) if adapter else original_facts
+            check_terminal_serial = row["device_serial"]
+            if facts.get("device_serial") != original_facts.get("device_serial"):
+                check_terminal_serial = facts["device_serial"]
             checks.append({
                 "contract_version": "1", "connector_id": row["connector_id"],
-                "terminal_serial": row["device_serial"], "items": [{
+                "terminal_serial": check_terminal_serial, "items": [{
                     "event_uid": payload["event_uid"], "immutable_facts": facts,
                     "immutable_facts_digest": _protected_digest(facts),
                     "desired_identity": {
