@@ -8,6 +8,7 @@ from test_attendance_repair import repair_store as repair_store
 from zk_add import attendance_safe_repair as repair
 from zk_add.attendance_identity_evidence import identity_evidence
 from zk_add.attendance_recovery import RecoveryError
+from zk_add.crypto import cnic_lookup, encrypt_cnic
 from zk_add.models import (
     AttendanceEvent,
     AttendanceIdentityHistory,
@@ -494,6 +495,149 @@ def test_reconciled_id_only_punch_does_not_use_later_roster(store):
         db.flush()
         assert identity_evidence(db, event, connector).proof["kind"] == "LEGACY_CONTINUITY"
         assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+
+
+@pytest.fixture()
+def delayed_equivalent_store(store):
+    sessions, connector_id, uid = store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.get(DeviceUser, event.device_user_id)
+        start = utc_now() - timedelta(minutes=20)
+        for index in range(2):
+            replace_user_snapshot(
+                db, connector=connector,
+                snapshot=UserSnapshotRequest(
+                    snapshot_id=f"delayed-equivalent-{index}", complete=True, stable=True,
+                    observed_at=start + timedelta(minutes=index),
+                    users=[
+                        UserSnapshotRow(
+                            uid=user.uid, user_id=user.user_id,
+                            name="Correct Name-3520212345671",
+                            terminal_identity_fingerprint="a" * 64,
+                        ),
+                        UserSnapshotRow(
+                            uid="8", user_id="1008", name=f"Other {index}-3520212345672",
+                            terminal_identity_fingerprint=f"{index + 1}" * 64,
+                        ),
+                    ],
+                ),
+            )
+        event.device_event_time = start + timedelta(seconds=20)
+        event.captured_at = event.device_event_time + timedelta(minutes=15)
+        event.received_at = event.captured_at + timedelta(seconds=1)
+        event.source = "CURRENT_RECONCILE"
+        event.identity_terminal_fingerprint = user.terminal_identity_fingerprint
+        event.device_user_id = None
+        event.display_name = None
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.ords_status = event.identity_resolution_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        event.raw_event = {"attendance_record_uid": "29139"}
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        manifest.record_size = 40
+        manifest.observed_uid = "29139"
+        manifest.observed_user_id = user.user_id
+        manifest.disposition = "BLOCKED_IDENTITY"
+        history = db.scalar(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.observed_from <= event.device_event_time,
+            AttendanceIdentityHistory.observed_until >= event.device_event_time,
+        ))
+        db.add(AttendanceIdentityHistory(**{
+            column.name: getattr(history, column.name)
+            for column in AttendanceIdentityHistory.__table__.columns
+            if column.name != "id"
+        }))
+        db.commit()
+    return sessions, connector_id, uid
+
+
+def test_delayed_saved_record_releases_with_equivalent_retained_intervals(delayed_equivalent_store):
+    sessions, connector_id, uid = delayed_equivalent_store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.scalar(select(DeviceUser).where(
+            DeviceUser.zkt_device_id == event.zkt_device_id, DeviceUser.user_id == event.user_id,
+        ))
+        evidence = identity_evidence(db, event, connector)
+        assert evidence.proof["kind"] == "RETAINED_EQUIVALENT_INTERVALS"
+        assert len(evidence.proof["history_ids"]) == 2
+        assert evidence.proof["source"]["kind"] == "SAVED_TERMINAL_RECORD"
+        assert evidence.proof["source"]["requires_retained_identity"]
+        assert synced_cnic_identity_proven(db, connector, connector.zkt_device, user, event)
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
+        db.flush()
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+        assert repair.delivery_proof_valid(db, event, connector)
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == event.id
+        )) == 1
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+
+
+@pytest.mark.parametrize("blocker", [
+    "conflicting_cnic", "conflicting_user", "bad_ciphertext", "wrong_uid", "wrong_fingerprint",
+    "missing_source", "noncanonical_source", "conflicting_source", "revoked", "over_limit",
+])
+def test_delayed_equivalent_repair_keeps_unproven_identity_held(delayed_equivalent_store, blocker):
+    sessions, connector_id, uid = delayed_equivalent_store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        event = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        user = db.scalar(select(DeviceUser).where(
+            DeviceUser.zkt_device_id == event.zkt_device_id, DeviceUser.user_id == event.user_id,
+        ))
+        histories = db.scalars(select(AttendanceIdentityHistory).where(
+            AttendanceIdentityHistory.device_user_id == user.id,
+            AttendanceIdentityHistory.observed_from <= event.device_event_time,
+            AttendanceIdentityHistory.observed_until >= event.device_event_time,
+        )).all()
+        manifest = db.scalar(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.attendance_event_id == event.id
+        ))
+        if blocker == "conflicting_cnic":
+            histories[0].cnic_encrypted = encrypt_cnic("3520212345673")
+            histories[0].cnic_lookup_hash = cnic_lookup("3520212345673")
+        elif blocker == "conflicting_user":
+            histories[0].device_user_id = db.scalar(select(DeviceUser.id).where(
+                DeviceUser.zkt_device_id == event.zkt_device_id, DeviceUser.user_id == "1008",
+            ))
+        elif blocker == "bad_ciphertext":
+            histories[0].cnic_encrypted = "damaged-ciphertext"
+        elif blocker == "wrong_uid":
+            event.uid = "unknown-uid"
+        elif blocker == "wrong_fingerprint":
+            event.identity_terminal_fingerprint = "b" * 64
+        elif blocker == "missing_source":
+            db.delete(manifest)
+        elif blocker == "noncanonical_source":
+            manifest.canonical_source = False
+        elif blocker == "conflicting_source":
+            manifest.observed_user_id = "another-user"
+        elif blocker == "revoked":
+            for history in histories:
+                history.revoked = True
+        elif blocker == "over_limit":
+            for _ in range(99):
+                db.add(AttendanceIdentityHistory(**{
+                    column.name: getattr(histories[0], column.name)
+                    for column in AttendanceIdentityHistory.__table__.columns
+                    if column.name != "id"
+                }))
+        db.flush()
+        assert identity_evidence(db, event, connector) is None
+        assert not synced_cnic_identity_proven(db, connector, connector.zkt_device, user, event)
+        assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 0
+        assert event.ords_status == "BLOCKED_IDENTITY" and event.manual_release_required
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == event.id
+        )) == 0
 
 
 @pytest.mark.parametrize("receipt_lag_minutes, expected", [(0, 1), (11, 0)])

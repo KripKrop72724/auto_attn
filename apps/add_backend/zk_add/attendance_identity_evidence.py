@@ -311,11 +311,16 @@ def identity_evidence(
     ).all()
     # Duplicate observation intervals can overlap after snapshot backfills.
     # They prove one identity only when every interval has the same person,
-    # fingerprint and CNIC; a transition or unbounded overlap stays held.
+    # fingerprint and CNIC. An authenticated saved record carries the same
+    # retained punch-time proof when its capture was delayed; a transition or
+    # unbounded overlap stays held.
     equivalent_overlap = bool(
         1 < len(histories) <= 100
         and event.identity_terminal_fingerprint
-        and near_live_reconcile_capture(event)
+        and (
+            near_live_reconcile_capture(event)
+            or source["kind"] == "SAVED_TERMINAL_RECORD"
+        )
         and all(
             (
                 h.device_user_id, h.terminal_serial, h.user_id, h.uid,

@@ -150,7 +150,10 @@ def test_manual_hold_reports_internal_event_id_without_releasing(force_pg):
 
 
 @pytest.mark.parametrize(
-    "record_case", ["near_live_record_uid", "saved_exact_uid", "saved_record_uid"]
+    "record_case", [
+        "near_live_record_uid", "saved_exact_uid", "saved_record_uid",
+        "saved_equivalent_record_uid",
+    ]
 )
 def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
     force_pg, record_case,
@@ -193,6 +196,22 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
             observed_from=when - timedelta(minutes=1),
             observed_until=when + timedelta(minutes=1),
         ))
+        if record_case == "saved_equivalent_record_uid":
+            db.flush()
+            history = db.scalar(select(AttendanceIdentityHistory).where(
+                AttendanceIdentityHistory.device_user_id == user.id,
+                AttendanceIdentityHistory.observed_from <= when,
+                AttendanceIdentityHistory.observed_until >= when,
+            ))
+            history.closed = True
+            equivalent = {
+                column.name: getattr(history, column.name)
+                for column in AttendanceIdentityHistory.__table__.columns
+                if column.name != "id"
+            }
+            equivalent["closed"] = False
+            equivalent["observed_until"] = event.received_at + timedelta(minutes=1)
+            db.add(AttendanceIdentityHistory(**equivalent))
         db.add(TerminalRecordManifest(
             connector_id=connector.id, zkt_device_id=zkt.id,
             terminal_serial=zkt.serial, generation=1, ordinal=0,
@@ -238,6 +257,12 @@ def test_reconciled_cnic_migration_releases_only_matching_record_and_history(
         event = db.get(AttendanceEvent, event_id)
         connector = db.get(Connector, event.connector_id)
         user = db.get(DeviceUser, event.device_user_id)
+        if record_case == "saved_equivalent_record_uid":
+            from zk_add.attendance_identity_evidence import identity_evidence
+
+            evidence = identity_evidence(db, event, connector)
+            assert evidence.proof["kind"] == "RETAINED_EQUIVALENT_INTERVALS"
+            assert evidence.proof["source"]["kind"] == "SAVED_TERMINAL_RECORD"
         assert release_synced_cnic_attendance(db, zkt=connector.zkt_device, user=user) == 1
         db.commit()
     with sessions() as db:
