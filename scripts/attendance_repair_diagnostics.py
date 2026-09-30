@@ -12,6 +12,11 @@ CHECK_ERROR_CODES = {
     "CONTRACT_VERSION_UNSUPPORTED", "BATCH_LIMIT", "INVALID_CHECK_ITEM",
     "CHECK_VALIDATION_FAILED", "ADD_ONLY_AUTH_REQUIRED",
 }
+CHECK_CLASSIFICATIONS = {
+    "MATCH", "MISSING", "MISMATCH", "IMMUTABLE_MISMATCH", "CROSS_DEVICE_UID_COLLISION",
+    "LEGACY_SOURCE_MATCH", "LEGACY_SOURCE_MISSING", "LEGACY_SOURCE_CONFLICT",
+    "LEGACY_SOURCE_AMBIGUOUS",
+}
 
 
 def check_payload_shape(payload):
@@ -52,7 +57,10 @@ def check_payload_shape(payload):
 
 def check_response_summary(response, payload):
     """A fixed error allowlist prevents arbitrary Oracle bodies reaching logs."""
-    summary = {"http_status": response.status_code, "shape": check_payload_shape(payload)}
+    summary = {
+        "http_status": response.status_code, "shape": check_payload_shape(payload),
+        "classification": None, "token_format_valid": False,
+    }
     try:
         body = response.json()
     except ValueError:
@@ -66,6 +74,16 @@ def check_response_summary(response, payload):
         "UNRECOGNIZED_ERROR_CODE" if code is not None else None
     )
     results = body.get("results")
+    row = results[0] if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict) else {}
+    classification = row.get("classification")
+    summary["classification"] = (
+        classification if isinstance(classification, str) and classification in CHECK_CLASSIFICATIONS
+        else "UNRECOGNIZED_CLASSIFICATION" if classification is not None else None
+    )
+    token = row.get("current_content_token")
+    summary["token_format_valid"] = bool(
+        isinstance(token, str) and re.fullmatch(r"[0-9a-f]{64}", token)
+    )
     summary["response_shape_valid"] = bool(
         body.get("success") is True and isinstance(results, list) and len(results) == 1
         and isinstance(results[0], dict)
@@ -96,7 +114,7 @@ def probe_saved_direct_checks(checks):
     return {"configured": True, "checks": results}
 
 
-def oracle_direct_run_diagnostics(direct_run_id):
+def oracle_direct_run_diagnostics(direct_run_id, attendance_event_ids=None):
     from sqlalchemy import text
     from zk_add.attendance_repair import _identity_digest, _protected_digest
     from zk_add.crypto import decrypt_json
@@ -115,8 +133,13 @@ def oracle_direct_run_diagnostics(direct_run_id):
                 JOIN add_connectors c ON c.id=e.connector_id
                 WHERE j.job_id=:run_id AND j.action='MANUAL_DIRECT_ORDS'
                   AND d.proof->>'policy'='manual-direct-ords-v1'
+                  AND (:filter_events=false OR e.id=ANY(:event_ids))
                 ORDER BY d.id LIMIT 3
-            """), {"run_id": direct_run_id}).mappings().all()
+            """), {
+                "run_id": direct_run_id,
+                "filter_events": bool(attendance_event_ids),
+                "event_ids": attendance_event_ids or [],
+            }).mappings().all()
             connection.rollback()
         checks = []
         for row in rows:
@@ -136,6 +159,107 @@ def oracle_direct_run_diagnostics(direct_run_id):
         return probe_saved_direct_checks(checks)
     except Exception:
         return {"error_code": "SAVED_APPROVAL_DIAGNOSTIC_FAILED"}
+
+
+def direct_approval_guard_shape(session, event, connector, decision):
+    """Compare the actual direct-delivery guards without exporting their inputs."""
+    from zk_add import attendance_direct_ords as direct
+    from zk_add.attendance_manual_guard import decision_for
+    from zk_add.attendance_recovery import _digest
+    from zk_add.attendance_repair import _immutable_facts
+    from zk_add.crypto import cnic_lookup, decrypt_json
+    from zk_add.models import ZKTDevice
+
+    flags = {
+        name: False for name in (
+            "decision_present", "saved_policy_matches", "connector_present",
+            "source_digest_matches", "immutable_facts_match", "saved_decision_is_current",
+            "known_current_user", "current_cnic_usable", "payload_readable",
+            "payload_digest_matches", "legacy_identity_proof", "terminal_present",
+            "cnic_source_matches", "current_user_key_matches", "current_cnic_hash_matches",
+            "frozen_payload_matches_current_payload", "approval_authorized",
+            "guard_evaluation_failed",
+        )
+    }
+    flags["decision_present"] = decision is not None
+    flags["connector_present"] = connector is not None
+    if decision is None or connector is None:
+        return flags
+    try:
+        proof = decision.proof
+        flags["saved_policy_matches"] = proof.get("policy") == direct.POLICY
+        flags["source_digest_matches"] = direct._source_digest(event, connector) == proof.get("source_digest")
+        flags["immutable_facts_match"] = _immutable_facts(event) == proof.get("immutable_facts")
+        current_decision = decision_for(session, event)
+        flags["saved_decision_is_current"] = bool(current_decision and current_decision.id == decision.id)
+        user, cnic, source, current_cnic, error = direct._known_user_and_cnic(session, event)
+        flags["known_current_user"] = user is not None
+        flags["current_cnic_usable"] = error is None and current_cnic is not None
+        try:
+            payload = decrypt_json(decision.payload_encrypted)
+            flags["payload_readable"] = isinstance(payload, dict)
+        except Exception:
+            payload = None
+        flags["payload_digest_matches"] = bool(
+            payload is not None and _digest(payload) == decision.payload_digest
+        )
+        flags["legacy_identity_proof"] = proof.get("cnic_source") is None
+        terminal = session.get(ZKTDevice, event.zkt_device_id)
+        flags["terminal_present"] = terminal is not None
+        flags["cnic_source_matches"] = proof.get("cnic_source") == source
+        flags["current_user_key_matches"] = bool(user and proof.get("current_user_key") == user.user_key)
+        flags["current_cnic_hash_matches"] = bool(
+            current_cnic and proof.get("current_cnic_hash") == cnic_lookup(current_cnic)
+        )
+        flags["frozen_payload_matches_current_payload"] = bool(
+            payload is not None and terminal is not None and user is not None and cnic
+            and payload == direct._payload(connector, terminal, event, user, cnic, source)
+        )
+        flags["approval_authorized"] = direct.approved_payload(session, event, connector, decision) is not None
+    except Exception:
+        flags["guard_evaluation_failed"] = True
+    return flags
+
+
+def direct_approval_guard_diagnostics(direct_run_id, attendance_event_ids=None):
+    """Read only the requested run's saved approvals; identifiers stay in memory."""
+    from sqlalchemy import select, text
+    from sqlalchemy.orm import Session
+    from zk_add.db import engine
+    from zk_add.models import (
+        AttendanceEvent, AttendanceForceReleaseDecision, AttendanceRecoveryItem,
+        AttendanceRecoveryJob, Connector,
+    )
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("SET LOCAL statement_timeout = '5s'"))
+            connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+            with Session(bind=connection, autoflush=False) as session:
+                statement = (
+                    select(AttendanceRecoveryItem, AttendanceEvent, Connector, AttendanceForceReleaseDecision)
+                    .select_from(AttendanceRecoveryItem)
+                    .join(AttendanceRecoveryJob, AttendanceRecoveryJob.id == AttendanceRecoveryItem.job_id)
+                    .join(AttendanceEvent, AttendanceEvent.id == AttendanceRecoveryItem.attendance_event_id)
+                    .join(Connector, Connector.id == AttendanceEvent.connector_id)
+                    .outerjoin(AttendanceForceReleaseDecision,
+                               AttendanceForceReleaseDecision.item_id == AttendanceRecoveryItem.id)
+                    .where(AttendanceRecoveryJob.job_id == direct_run_id,
+                           AttendanceRecoveryJob.action == "MANUAL_DIRECT_ORDS")
+                    .order_by(AttendanceRecoveryItem.id)
+                    .limit(30 if attendance_event_ids else 3)
+                )
+                if attendance_event_ids:
+                    statement = statement.where(AttendanceEvent.id.in_(attendance_event_ids))
+                rows = [
+                    {"event_id": event.id, "shape": direct_approval_guard_shape(session, event, connector, decision)}
+                    for _item, event, connector, decision in session.execute(statement).all()
+                ]
+            connection.rollback()
+        return {"rows": rows}
+    except Exception:
+        return {"error_code": "DIRECT_APPROVAL_GUARD_DIAGNOSTIC_FAILED"}
 
 
 # Bound the input before examining identity history. Only internal run/item IDs
@@ -417,6 +541,10 @@ def database_report(direct_run_id=None, attendance_event_ids=None):
                 connection.rollback()
         except Exception as exc:
             result[name] = {"error_type": type(exc).__name__}
+    if direct_run_id:
+        result["direct_approval_guard"] = direct_approval_guard_diagnostics(
+            direct_run_id, attendance_event_ids,
+        )
     return result
 
 
@@ -442,7 +570,9 @@ def main():
         else database_report(args.direct_run_id, attendance_event_ids)
     )
     if args.direct_run_id and not args.logs:
-        result["direct_oracle_check"] = oracle_direct_run_diagnostics(args.direct_run_id)
+        result["direct_oracle_check"] = oracle_direct_run_diagnostics(
+            args.direct_run_id, attendance_event_ids,
+        )
     print(json.dumps(result, default=str, sort_keys=True))
 
 

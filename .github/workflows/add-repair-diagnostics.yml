@@ -58,13 +58,14 @@ jobs:
           & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
           if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
           $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
+          $diagnosticArgs = @()
           if ($env:ATTENDANCE_EVENT_ID) {
-            $script | & docker exec -i $api python - --attendance-event-id $env:ATTENDANCE_EVENT_ID
-          } elseif ($env:DIRECT_RUN_ID) {
-            $script | & docker exec -i $api python - --direct-run-id $env:DIRECT_RUN_ID
-          } else {
-            $script | & docker exec -i $api python -
+            $diagnosticArgs += @('--attendance-event-id', $env:ATTENDANCE_EVENT_ID)
           }
+          if ($env:DIRECT_RUN_ID) {
+            $diagnosticArgs += @('--direct-run-id', $env:DIRECT_RUN_ID)
+          }
+          $script | & docker exec -i $api python - @diagnosticArgs
           if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
 
       - name: Check protected Oracle verification capability without sending attendance
