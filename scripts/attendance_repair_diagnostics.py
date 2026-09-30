@@ -8,6 +8,136 @@ import re
 import sys
 
 
+CHECK_ERROR_CODES = {
+    "CONTRACT_VERSION_UNSUPPORTED", "BATCH_LIMIT", "INVALID_CHECK_ITEM",
+    "CHECK_VALIDATION_FAILED", "ADD_ONLY_AUTH_REQUIRED",
+}
+
+
+def check_payload_shape(payload):
+    """Export validation booleans only, never an approved identity or source value."""
+    from datetime import datetime
+
+    items = payload.get("items")
+    item = items[0] if isinstance(items, list) and len(items) == 1 else {}
+    item = item if isinstance(item, dict) else {}
+    facts = item.get("immutable_facts")
+    facts = facts if isinstance(facts, dict) else {}
+    identity = item.get("desired_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    timestamp = facts.get("device_event_time")
+    timestamp_valid = bool(isinstance(timestamp, str) and re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})",
+        timestamp,
+    ))
+    if timestamp_valid:
+        try:
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            timestamp_valid = False
+    return {
+        "contract_version_valid": payload.get("contract_version") == "1",
+        "single_item": isinstance(items, list) and len(items) == 1,
+        "event_uid_format_valid": bool(isinstance(item.get("event_uid"), str)
+                                       and re.fullmatch(r"[0-9a-f]{64}", item["event_uid"])),
+        "device_serial_present": bool(facts.get("device_serial")),
+        "source_user_id_present": bool(facts.get("source_user_id")),
+        "timestamp_oracle_format_valid": timestamp_valid,
+        "raw_punch_valid": facts.get("raw_punch") in ("T", "F"),
+        "employee_name_present": bool(identity.get("employee_name")),
+        "cnic_format_valid": bool(isinstance(identity.get("cnic"), str)
+                                  and re.fullmatch(r"[0-9]{13}", identity["cnic"])),
+    }
+
+
+def check_response_summary(response, payload):
+    """A fixed error allowlist prevents arbitrary Oracle bodies reaching logs."""
+    summary = {"http_status": response.status_code, "shape": check_payload_shape(payload)}
+    try:
+        body = response.json()
+    except ValueError:
+        summary["error_code"] = "ORDS_MALFORMED_RESPONSE"
+        return summary
+    if not isinstance(body, dict):
+        summary["error_code"] = "ORDS_MALFORMED_RESPONSE"
+        return summary
+    code = body.get("error_code")
+    summary["error_code"] = code if isinstance(code, str) and code in CHECK_ERROR_CODES else (
+        "UNRECOGNIZED_ERROR_CODE" if code is not None else None
+    )
+    results = body.get("results")
+    summary["response_shape_valid"] = bool(
+        body.get("success") is True and isinstance(results, list) and len(results) == 1
+        and isinstance(results[0], dict)
+        and results[0].get("event_uid") == payload["items"][0]["event_uid"]
+    )
+    return summary
+
+
+def probe_saved_direct_checks(checks):
+    """POST only the read-only content verifier; never send an attendance write."""
+    import httpx
+    from zk_add.settings import settings
+
+    if not (settings.ords_base_url and settings.attendance_repair_ords_username
+            and settings.attendance_repair_ords_password):
+        return {"configured": False}
+    url = settings.ords_base_url.rstrip("/") + "/raw-captures/identity-repairs/check"
+    results = []
+    with httpx.Client(timeout=15, headers={
+        "X-API-Username": settings.attendance_repair_ords_username,
+        "X-API-Password": settings.attendance_repair_ords_password,
+    }, follow_redirects=False) as client:
+        for check in checks[:3]:
+            try:
+                results.append(check_response_summary(client.post(url, json=check), check))
+            except httpx.RequestError:
+                results.append({"error_code": "ORDS_TRANSPORT_ERROR", "shape": check_payload_shape(check)})
+    return {"configured": True, "checks": results}
+
+
+def oracle_direct_run_diagnostics(direct_run_id):
+    from sqlalchemy import text
+    from zk_add.attendance_repair import _identity_digest, _protected_digest
+    from zk_add.crypto import decrypt_json
+    from zk_add.db import engine
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("SET LOCAL statement_timeout = '5s'"))
+            connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+            rows = connection.execute(text("""
+                SELECT d.payload_encrypted, d.proof, c.connector_id, e.device_serial
+                FROM add_attendance_force_release_decisions d
+                JOIN add_attendance_recovery_jobs j ON j.id=d.job_id
+                JOIN add_attendance_events e ON e.id=d.attendance_event_id
+                JOIN add_connectors c ON c.id=e.connector_id
+                WHERE j.job_id=:run_id AND j.action='MANUAL_DIRECT_ORDS'
+                  AND d.proof->>'policy'='manual-direct-ords-v1'
+                ORDER BY d.id LIMIT 3
+            """), {"run_id": direct_run_id}).mappings().all()
+            connection.rollback()
+        checks = []
+        for row in rows:
+            payload = decrypt_json(row["payload_encrypted"])
+            facts = row["proof"]["immutable_facts"]
+            checks.append({
+                "contract_version": "1", "connector_id": row["connector_id"],
+                "terminal_serial": row["device_serial"], "items": [{
+                    "event_uid": payload["event_uid"], "immutable_facts": facts,
+                    "immutable_facts_digest": _protected_digest(facts),
+                    "desired_identity": {
+                        "employee_name": payload["employee_name"], "cnic": payload["cnic"],
+                        "identity_digest": _identity_digest(payload["employee_name"], payload["cnic"]),
+                    },
+                }],
+            })
+        return probe_saved_direct_checks(checks)
+    except Exception:
+        return {"error_code": "SAVED_APPROVAL_DIAGNOSTIC_FAILED"}
+
+
 # Bound the input before examining identity history. Only internal run/item IDs
 # and booleans leave the database; names, identifiers, CNICs and hashes do not.
 FORCE_CONFLICT_SQL = """
@@ -311,6 +441,8 @@ def main():
         summarize_logs(sys.stdin) if args.logs
         else database_report(args.direct_run_id, attendance_event_ids)
     )
+    if args.direct_run_id and not args.logs:
+        result["direct_oracle_check"] = oracle_direct_run_diagnostics(args.direct_run_id)
     print(json.dumps(result, default=str, sort_keys=True))
 
 
