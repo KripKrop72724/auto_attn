@@ -32,7 +32,7 @@ export const statusPattern = (state: unknown): StatusPattern => {
   )
     return 'confirmed'
   if (
-    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'HIGH', 'EXPIRED', 'INVALIDATED', 'QUARANTINED', 'BLOCKED_IDENTITY', 'REVOKED'].some(
+    ['OFFLINE', 'FAILED', 'PARTIAL', 'CRITICAL', 'HIGH', 'EXPIRED', 'INVALIDATED', 'QUARANTINED', 'BLOCKED_IDENTITY', 'CNIC_NOT_LINKED', 'REVOKED'].some(
       (item) => normalized.includes(item),
     )
   )

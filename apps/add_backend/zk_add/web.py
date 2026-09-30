@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from zk_add import APP_VERSION
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
+from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
 from zk_add.audit import append_audit
@@ -3043,6 +3044,9 @@ def attendance_identity_evidence_report(
         AttendanceIdentityHistory.observed_from <= event.device_event_time,
         AttendanceIdentityHistory.observed_until >= event.device_event_time,
     ).order_by(AttendanceIdentityHistory.id).limit(5)).all()
+    latest_history = db.scalars(select(AttendanceIdentityHistory).where(
+        *history_filters,
+    ).order_by(AttendanceIdentityHistory.id.desc()).limit(5)).all()
     from zk_add.attendance_identity_evidence import manifest_identity_matches_event
 
     source = source_evidence(db, event, connector) if connector else None
@@ -3107,6 +3111,28 @@ def attendance_identity_evidence_report(
             }
             for row in covering_rows
         ],
+        "history_latest_rows": [
+            {
+                "revoked": row.revoked,
+                "closed": row.closed,
+                "device_user_matches_current": bool(user and row.device_user_id == user.id),
+                "cnic_matches_current": bool(user and user.cnic_lookup_hash == row.cnic_lookup_hash),
+                "fingerprint_matches_current": bool(
+                    user and user.terminal_identity_fingerprint == row.fingerprint
+                ),
+                "fingerprint_matches_event": bool(
+                    event.identity_terminal_fingerprint
+                    and row.fingerprint == event.identity_terminal_fingerprint
+                ),
+                "observed_from": row.observed_from,
+                "observed_until": row.observed_until,
+                "last_revision": row.last_revision,
+            }
+            for row in latest_history
+        ],
+        "snapshot_observed_at": zkt.identity_snapshot_observed_at if zkt else None,
+        "snapshot_revision": zkt.identity_snapshot_revision if zkt else None,
+        "last_identity_change_at": zkt.last_identity_change_at if zkt else None,
         "identity_proof": evidence.proof["kind"] if evidence else None,
         "active_user_count": len(users),
         "active_user_uid_matches": bool(user and event.uid and user.uid == event.uid),
@@ -3140,7 +3166,8 @@ def attendance(
     db, _context = auth
     # The immutable ledger also shows invalid-UID quarantine rows. They remain
     # visibly locked and can never enter the identity-release candidate set.
-    statement = select(AttendanceEvent)
+    cnic_not_linked = cnic_not_linked_expression()
+    statement = select(AttendanceEvent, cnic_not_linked.label("cnic_not_linked"))
     if len(ords_status) > 30 or any(not value or len(value) > 40 for value in ords_status):
         raise HTTPException(status_code=422, detail="Select at most 30 valid Oracle delivery statuses.")
     if forced:
@@ -3180,7 +3207,11 @@ def attendance(
             )
         )
     if ords_status:
-        statement = statement.where(AttendanceEvent.ords_status.in_(set(ords_status)))
+        stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
+        selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
+        if "CNIC_NOT_LINKED" in ords_status:
+            selected_states.append(cnic_not_linked)
+        statement = statement.where(or_(*selected_states))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:
@@ -3191,7 +3222,8 @@ def attendance(
         statement = statement.where(AttendanceEvent.device_event_time >= parse_datetime(from_time))
     if to_time:
         statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
-    rows = db.scalars(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
+    results = db.execute(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
+    rows = [event for event, _cnic_not_linked in results]
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
     page_rows = rows[:limit]
     release_states = attendance_release_states(db, page_rows)
@@ -3203,13 +3235,14 @@ def attendance(
                 **serialize_attendance(row, release_states.get(row.id)),
                 "force_release": force_metadata.get(row.id),
                 "direct_ords_identity": direct_ords_identity.get(row.id),
+                "cnic_not_linked": bool(results[index][1]),
             }
-            for row in page_rows
+            for index, row in enumerate(page_rows)
         ],
         "next_cursor": next_cursor,
         "status_options": db.scalars(
             select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
-        ).all(),
+        ).all() + ["CNIC_NOT_LINKED"],
     }
 
 

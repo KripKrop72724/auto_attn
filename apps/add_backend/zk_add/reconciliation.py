@@ -595,6 +595,35 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
     return events
 
 
+def _release_source_synced_attendance(session, *, connector, events) -> set[int]:
+    """Resolve this source batch only after its canonical manifests are durable."""
+    candidates = [
+        row for row in events
+        if row.source == "CURRENT_RECONCILE"
+        and row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+    ]
+    if not candidates:
+        return set()
+    session.flush()
+    from zk_add.models import DeviceUser
+    from zk_add.service import release_synced_cnic_attendance_event
+
+    zkt = connector.zkt_device
+    users = {
+        user.user_id: user
+        for user in session.scalars(select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_id.in_({row.user_id for row in candidates}),
+            DeviceUser.lifecycle_state == "ACTIVE",
+        )).all()
+    }
+    return {
+        row.id for row in candidates
+        if (user := users.get(row.user_id)) is not None
+        and release_synced_cnic_attendance_event(session, zkt=zkt, user=user, row=row)
+    }
+
+
 def apply_reconciliation_chunk(
     session: Session,
     *,
@@ -739,7 +768,8 @@ def apply_reconciliation_chunk(
     duplicate_uids: set[str] = set()
     if attendance:
         accepted, duplicates = ingest_attendance(
-            session, connector=connector, events=attendance
+            session, connector=connector, events=attendance,
+            defer_synced_identity_release=True,
         )
         accepted_uids = set(accepted)
         duplicate_uids = set(duplicates)
@@ -765,6 +795,7 @@ def apply_reconciliation_chunk(
     session.add(chunk)
     session.flush()
     blocked = 0
+    blocked_events = []
     quarantined = 0
     terminal_duplicates = 0
     current_terminal_keys = [row.terminal_record_key for row in payload.records]
@@ -792,6 +823,7 @@ def apply_reconciliation_chunk(
         seen_terminal_keys.add(source.terminal_record_key)
         if disposition == "BLOCKED_IDENTITY":
             blocked += 1
+            blocked_events.append(event)
         if disposition in {"INVALID_TIME", "MALFORMED"}:
             quarantined += 1
         if disposition == "TERMINAL_DUPLICATE":
@@ -821,6 +853,10 @@ def apply_reconciliation_chunk(
                 observed_uid=source.observed_uid,
                 observed_user_id=source.observed_user_id,
             ))
+    released = _release_source_synced_attendance(
+        session, connector=connector, events=events_by_uid.values()
+    )
+    blocked -= sum(row is not None and row.id in released for row in blocked_events)
     chunk.accepted_count = len(accepted_uids)
     chunk.already_present_count = len(duplicate_uids)
     chunk.blocked_identity_count = blocked
@@ -1177,7 +1213,10 @@ def apply_source_tail_chunk(
         records=payload.records,
     )
     if attendance:
-        ingest_attendance(session, connector=connector, events=attendance)
+        ingest_attendance(
+            session, connector=connector, events=attendance,
+            defer_synced_identity_release=True,
+        )
     session.flush()
     event_uids = [row.event.event_uid for row in payload.records if row.event]
     events_by_uid = (
@@ -1206,6 +1245,7 @@ def apply_source_tail_chunk(
     session.add(chunk)
     session.flush()
     blocked = 0
+    blocked_events = []
     exceptions = 0
     event_count = 0
     current_terminal_keys = [row.terminal_record_key for row in payload.records]
@@ -1235,6 +1275,7 @@ def apply_source_tail_chunk(
         seen_terminal_keys.add(source.terminal_record_key)
         if disposition == "BLOCKED_IDENTITY":
             blocked += 1
+            blocked_events.append(event)
         if disposition in {"INVALID_TIME", "MALFORMED"}:
             exceptions += 1
         session.add(
@@ -1262,6 +1303,10 @@ def apply_source_tail_chunk(
                 observed_user_id=source.observed_user_id,
             )
         )
+    released = _release_source_synced_attendance(
+        session, connector=connector, events=events_by_uid.values()
+    )
+    blocked -= sum(row is not None and row.id in released for row in blocked_events)
     chunk.event_count = event_count
     chunk.blocked_identity_count = blocked
     chunk.exception_count = exceptions

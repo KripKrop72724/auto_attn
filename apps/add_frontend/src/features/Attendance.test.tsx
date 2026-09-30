@@ -366,6 +366,7 @@ describe('Live attendance workspace', () => {
     render(<AttendanceView {...attendanceProps} />)
     const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
     expect(within(row).getByText(/CNIC on synced user/i)).toBeTruthy()
+    expect(within(row).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
     fireEvent.click(within(row).getByRole('button', { name: 'Send to ORDS' }))
     const dialog = screen.getByRole('dialog')
     expect(dialog.textContent).toMatch(/current synced user CNIC because the saved punch has none/i)
@@ -380,8 +381,97 @@ describe('Live attendance workspace', () => {
     vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [held], next_cursor: null })))
     render(<AttendanceView {...attendanceProps} />)
     const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
+    const delivery = row.querySelector('[data-label="Oracle delivery"]') as HTMLElement
+    expect(within(delivery).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
+    expect(within(delivery).getByLabelText('Status: CNIC NOT LINKED').getAttribute('data-pattern')).toBe('blocked')
+    expect(within(delivery).getByText('CNIC not linked')).toBeTruthy()
     expect(within(row).queryByRole('button', { name: 'Send to ORDS' })).toBeNull()
     expect(within(row).getByRole('checkbox').hasAttribute('disabled')).toBe(true)
+  })
+
+  it('uses server CNIC linkage for delivery pills and filters it with other Oracle states', async () => {
+    const missing = event({
+      display_name: 'Unlinked Employee', user_id: '14', cnic_masked: null,
+      cnic_not_linked: true, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: false, cnic_source: null, exclusion: 'CNIC_MISSING' },
+    })
+    const synced = event({
+      id: 2, event_uid: 'synced-user', display_name: 'Synced Employee', user_id: '11',
+      cnic_masked: null, cnic_not_linked: false, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
+    })
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://add.test')
+      const statuses = url.searchParams.getAll('ords_status')
+      return response({
+        rows: statuses.includes('CNIC_NOT_LINKED') && !statuses.includes('BLOCKED_IDENTITY') ? [missing] : [missing, synced],
+        next_cursor: null,
+        status_options: ['ACKED', 'BLOCKED_IDENTITY', 'CNIC_NOT_LINKED'],
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    const missingRow = await screen.findByRole('article', { name: /Unlinked Employee/i })
+    const syncedRow = screen.getByRole('article', { name: /Synced Employee/i })
+    expect(within(missingRow).getByLabelText('Status: CNIC NOT LINKED')).toBeTruthy()
+    expect(within(syncedRow).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
+
+    fireEvent.click(screen.getByText(/^Filters$/i))
+    fireEvent.click(screen.getByLabelText('CNIC not linked'))
+    await waitFor(() => {
+      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['CNIC_NOT_LINKED'])
+      expect(screen.queryByRole('article', { name: /Synced Employee/i })).toBeNull()
+    })
+    expect(screen.getByRole('article', { name: /Unlinked Employee/i })).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('Blocked identity'))
+    await waitFor(() => {
+      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['CNIC_NOT_LINKED', 'BLOCKED_IDENTITY'])
+      expect(screen.getByRole('article', { name: /Synced Employee/i })).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Oracle: CNIC not linked/i }))
+    await waitFor(() => {
+      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['BLOCKED_IDENTITY'])
+    })
+  })
+
+  it('shows audited approved identity for an unnamed punch without inventing identity for unapproved punches', async () => {
+    const approvedIdentity = { display_name: 'Approved Employee', cnic_masked: '*****-****123-1' }
+    const approval: NonNullable<AttendanceEvent['force_release']> = {
+      run_id: 'approved-send', policy: 'manual-direct-ords-v1', administrator: 'StateHealthAdmin',
+      approved_at: '2026-08-12T09:00:00Z', reason: 'Identified this punch', audit_id: 17,
+      snapshot_id: null, sync_command_id: null, approved_identity: approvedIdentity,
+    }
+    const approved = event({
+      display_name: null, cnic_masked: null, cnic_not_linked: true, force_release: approval,
+      ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
+    })
+    const unapproved = event({
+      id: 2, event_uid: 'unapproved-punch', display_name: null, cnic_masked: null,
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
+    })
+    const captured = event({ id: 3, event_uid: 'captured-identity', force_release: approval })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [approved, unapproved, captured], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+    const approvedRow = await screen.findByRole('article', { name: /Approved Employee, Check in/i })
+    expect(within(approvedRow).getByText(approvedIdentity.cnic_masked)).toBeTruthy()
+    expect(within(approvedRow).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
+    expect(within(approvedRow).getByLabelText('Status: ACKED')).toBeTruthy()
+    const unknownRow = screen.getByRole('article', { name: /Unknown identity, Check in/i })
+    expect(within(unknownRow).getByText('User 1007 · CNIC on synced user')).toBeTruthy()
+    expect(within(unknownRow).queryByText('Approved Employee')).toBeNull()
+    const capturedRow = screen.getByRole('article', { name: /Ayesha Khan, Check in/i })
+    expect(within(capturedRow).getByText('*****-****567-1')).toBeTruthy()
+    expect(within(capturedRow).queryByText(approvedIdentity.cnic_masked)).toBeNull()
+    expect(screen.getByText('Data-quality attention').closest('article')?.textContent).toContain('1')
+    fireEvent.click(within(approvedRow).getByRole('button', { name: /Forced attendance/i }))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText('Administrator Oracle send')).toBeTruthy()
+    expect(within(dialog).getByText('Audit 17')).toBeTruthy()
+    expect(approved.display_name).toBeNull()
+    expect(approved.cnic_masked).toBeNull()
   })
 
   it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
