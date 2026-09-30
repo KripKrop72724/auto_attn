@@ -293,7 +293,7 @@ create or replace package body slic_zkt_identity_repair_api as
                    || to_char(d.event_timestamp at time zone 'UTC',
                               'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') || chr(31)
                    || d.raw_punch || chr(31) || nvl(d.employee_name, chr(0))
-                   || chr(31) || nvl(d.cnic, chr(0))
+                   || chr(31) || nvl(to_char(d.cnic, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''), chr(0))
           into l_material
           from hr_raw_attn_capture_events d
          where d.event_uid = p_event_uid;
