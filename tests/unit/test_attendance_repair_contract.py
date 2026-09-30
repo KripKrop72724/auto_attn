@@ -27,6 +27,9 @@ CHECK_HANDLER_FIX = (
 LEGACY_SOURCE_CHECK = (
     ROOT / "deploy/add/oracle/20260924_verify_damaged_legacy_ids_without_insert.sql"
 )
+NUMERIC_CNIC_TOKEN_FIX = (
+    ROOT / "deploy/add/oracle/20260930_fix_numeric_cnic_content_token.sql"
+)
 TRUTH_API = ROOT / "deploy/add/oracle/slic_zkt_truth_api.sql"
 DEPLOY_SCRIPT = ROOT / "deploy/add/deploy.ps1"
 DEPLOY_WORKFLOW = ROOT / ".github/workflows/add-deploy.yml"
@@ -98,6 +101,40 @@ def test_oracle_identity_repair_contract_is_add_only_and_non_destructive() -> No
     repair_body = repair_and_status.split("procedure post_status", maxsplit=1)[0]
     assert "l_before_count := l_count" not in check_body
     assert "l_before_count := l_count" in repair_body
+
+
+def test_content_token_converts_numeric_cnic_before_null_sentinel() -> None:
+    source = CONTRACT.read_text().lower()
+    token = source.split("function content_token", 1)[1].split("end content_token", 1)[0]
+    safe = "nvl(to_char(d.cnic, 'tm9', 'nls_numeric_characters=''.,'''), chr(0))"
+    assert safe in token
+    assert "nvl(d.cnic, chr(0))" not in token
+    # Preserve the other content fields and missing-row token behavior.
+    for field in ("d.event_uid", "d.device_serial", "d.user_id", "d.event_timestamp", "d.raw_punch", "d.employee_name"):
+        assert field in token
+    assert "return sha256('missing' || chr(31) || p_event_uid)" in token
+
+
+def test_numeric_cnic_patch_is_one_guarded_replacement_with_exact_restore() -> None:
+    source = NUMERIC_CNIC_TOKEN_FIX.read_text().lower()
+    assert "q'~nvl(d.cnic, chr(0))~'" in source
+    assert "q'~nvl(to_char(d.cnic, 'tm9', 'nls_numeric_characters=''.,'''), chr(0))~'" in source
+    assert "occurrence_count(l_previous_body, l_old_expression) <> 1" in source
+    assert "occurrence_count(l_previous_body, l_new_expression) = 1" in source
+    assert "replace(l_previous_body, l_old_expression, l_new_expression)" in source
+    assert "l_normalized_body" not in source
+    assert "rtrim(" not in source
+    assert "length(source_line.text), source_line.text" in source
+    assert "l_change_attempted := true;" in source
+    assert "execute immediate l_candidate_body;" in source
+    assert "if l_change_attempted then" in source
+    assert "execute immediate l_previous_body;" in source
+    assert "l_status <> 'valid' or l_errors <> 0" in source
+    assert "order by line" in source
+    assert "attendance_rows_changed=0" in source
+    assert not re.search(r"\b(?:update|insert\s+into|delete\s+from|merge\s+into)\s+hr_raw_attn_capture_events\b", source)
+    assert "dbms_output.put_line(l_previous_body" not in source
+    assert "dbms_output.put_line(l_candidate_body" not in source
 
 
 def test_oracle_rollout_implements_verified_production_downstream_semantics() -> None:
