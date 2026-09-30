@@ -63,6 +63,11 @@ const punchLabel = (punch: string | null) => {
 const captureLabel = (source: string) =>
   sourceLabels[source] || source.replaceAll('_', ' ').toLowerCase().replace(/^./, (value) => value.toUpperCase())
 
+const displayIdentity = (row: AttendanceEvent) => ({
+  display_name: row.display_name || row.force_release?.approved_identity?.display_name,
+  cnic_masked: row.cnic_masked || row.force_release?.approved_identity?.cnic_masked,
+})
+
 const pktInputValue = (value: Date) => {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -336,9 +341,10 @@ function AllAttendanceEvents({
   })
   const refreshDirectProgress = useCallback(() => { void refreshFeed(true) }, [refreshFeed])
   const confirmed = rows.filter((row) => Boolean(row.oracle_confirmed_at) || row.ords_status.startsWith('ACK')).length
-  const dataQualityAttention = rows.filter((row) =>
-    !row.display_name || !row.cnic_masked || row.clock_quality !== 'OK',
-  ).length
+  const dataQualityAttention = rows.filter((row) => {
+    const identity = displayIdentity(row)
+    return !identity.display_name || !identity.cnic_masked || row.clock_quality !== 'OK'
+  }).length
   const filtered = Object.entries(filters).filter(([key, value]) => key !== 'ords_statuses' && Boolean(value)) as Array<[keyof AttendanceFilters, string]>
   const activeFilterCount = filtered.length + filters.ords_statuses.length
   const filterLabels: Partial<Record<keyof AttendanceFilters, string>> = {
@@ -432,17 +438,18 @@ function AllAttendanceEvents({
           {loading && !rows.length && <AttendanceSkeleton />}
           {rows.map((row) => {
             const terminal = row.device_serial ? deviceBySerial.get(row.device_serial) : undefined
-            const rowAttention = !row.display_name || !row.cnic_masked || row.clock_quality !== 'OK' || statusPattern(row.ords_status) === 'blocked' || row.release_state === 'LOCKED'
+            const identity = displayIdentity(row)
+            const rowAttention = !identity.display_name || !identity.cnic_masked || row.clock_quality !== 'OK' || statusPattern(row.ords_status) === 'blocked' || row.release_state === 'LOCKED'
             return (
-              <article className={`attendance-event ${rowAttention ? 'attendance-event-attention' : ''}`} key={row.event_uid} aria-label={`${row.display_name || 'Unknown identity'}, ${punchLabel(row.punch)}, ${dateTime(row.device_event_time)}`}>
+              <article className={`attendance-event ${rowAttention ? 'attendance-event-attention' : ''}`} key={row.event_uid} aria-label={`${identity.display_name || 'Unknown identity'}, ${punchLabel(row.punch)}, ${dateTime(row.device_event_time)}`}>
                 <label className="attendance-row-select"><input type="checkbox" aria-label={`Select punch for user ${row.user_id} at ${dateTime(row.device_event_time)}`} checked={selected.has(row.id)} disabled={!canSelect(row) || selected.size >= 500 && !selected.has(row.id)} onChange={() => toggleSelection(row)} /></label>
-                <div className="attendance-event-cell attendance-person" data-label="Employee"><span className="avatar">{(row.display_name || '?').slice(0, 2).toUpperCase()}</span><span><strong>{row.display_name || 'Unknown identity'}</strong><small>{row.cnic_masked || (row.direct_ords_identity?.cnic_source === 'SYNCED_USER' ? `User ${row.user_id} · CNIC on synced user` : `User ${row.user_id} · CNIC not linked to punch`)}</small></span></div>
+                <div className="attendance-event-cell attendance-person" data-label="Employee"><span className="avatar">{(identity.display_name || '?').slice(0, 2).toUpperCase()}</span><span><strong>{identity.display_name || 'Unknown identity'}</strong><small>{identity.cnic_masked || (row.direct_ords_identity?.cnic_source === 'SYNCED_USER' ? `User ${row.user_id} · CNIC on synced user` : `User ${row.user_id} · CNIC not linked to punch`)}</small></span></div>
                 <div className="attendance-event-cell" data-label="Event"><strong>{punchLabel(row.punch)}</strong><small>{dateTime(row.device_event_time)}<span className="attendance-received"> · received {relativeTime(row.received_at)}</span></small></div>
                 <div className="attendance-event-cell" data-label="Terminal"><strong>{terminal?.display_name || row.device_serial || 'Terminal provenance unavailable'}</strong><small>{terminal ? row.device_serial : row.terminal_provenance?.explanation || 'Terminal provenance requires review'}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Capture"><StatusBadge state={captureLabel(row.source)} /><small title={row.clock_quality === 'UNKNOWN' ? 'No contemporaneous terminal clock sample exists for this punch. A current sample cannot verify historical clock accuracy.' : undefined} className={row.clock_quality === 'OK' ? '' : 'attention-copy'}>{row.clock_quality === 'OK' ? 'Clock verified' : `Clock ${row.clock_quality.toLowerCase()}`}</small></div>
                 <div className="attendance-event-cell attendance-status-stack" data-label="Oracle delivery">
                   <StatusBadge state={row.force_release?.needs_attention ? 'Needs attention' : row.force_release && ['PENDING', 'IN_FLIGHT', 'FAILED_RETRYABLE'].includes(row.ords_status) ? 'Waiting for Oracle' : row.ords_status} />
-                  {(row.cnic_not_linked ?? (!row.cnic_masked && !row.direct_ords_identity?.cnic_source)) && <StatusBadge state="CNIC_NOT_LINKED" />}
+                  {!identity.cnic_masked && (row.cnic_not_linked ?? !row.direct_ords_identity?.cnic_source) && <StatusBadge state="CNIC_NOT_LINKED" />}
                   {row.force_release && <ForcedPill evidence={row.force_release} />}
                   {row.release_state && row.release_state !== 'NOT_APPLICABLE' && <StatusBadge state={row.release_state_label || row.release_state} />}
                   <small>{row.release_state === 'RELEASED' && row.effective_identity_downstream_confirmed_at ? `Oracle and downstream verified ${relativeTime(row.effective_identity_downstream_confirmed_at)}` : row.oracle_confirmed_at ? `${row.release_state && row.release_state !== 'NOT_APPLICABLE' ? 'Original disposition confirmed' : 'Confirmed'} ${relativeTime(row.oracle_confirmed_at)}` : row.release_lock_reason ? explainReleaseLock(row.release_lock_reason) : 'Confirmation pending'}</small>
@@ -450,7 +457,7 @@ function AllAttendanceEvents({
                   {canSelect(row) && <button className="text-button" type="button" onClick={() => { setSelected(new Map([[row.id, row]])); setSingleSendRequest((value) => value + 1) }}>Send to ORDS</button>}
                   {row.direct_ords_identity?.exclusion === 'INVALID_EVENT_UID' && !row.oracle_confirmed_at && <small className="attention-copy">Older punch ID needs repair before Oracle can accept it.</small>}
                 </div>
-                <details className="attendance-event-details"><summary aria-label={`View event details for ${row.display_name || `user ${row.user_id}`}`} title="Event details"><Icon name="chevron" /><span>Details</span></summary><div><span><small>Terminal IDs</small><strong>UID {row.uid || '—'} · User {row.user_id}</strong></span><span><small>Captured / received</small><strong>{dateTime(row.captured_at)} / {dateTime(row.received_at)}</strong></span><span><small>Clock evidence</small><strong>{row.clock_drift_seconds == null ? humanizeStatus(row.clock_quality) : `${Math.round(row.clock_drift_seconds)}s drift · ${humanizeStatus(row.clock_quality)}`}</strong></span><span><small>Event UID</small><code>{row.event_uid}</code></span><span><small>Original Oracle disposition</small><strong>{humanizeStatus(row.ords_status)}</strong></span><span><small>Effective release state</small><strong>{row.release_state_label || 'Not released'}{row.latest_release_job_id ? ` · job ${row.latest_release_job_id}` : ''}</strong></span></div></details>
+                <details className="attendance-event-details"><summary aria-label={`View event details for ${identity.display_name || `user ${row.user_id}`}`} title="Event details"><Icon name="chevron" /><span>Details</span></summary><div><span><small>Terminal IDs</small><strong>UID {row.uid || '—'} · User {row.user_id}</strong></span><span><small>Captured / received</small><strong>{dateTime(row.captured_at)} / {dateTime(row.received_at)}</strong></span><span><small>Clock evidence</small><strong>{row.clock_drift_seconds == null ? humanizeStatus(row.clock_quality) : `${Math.round(row.clock_drift_seconds)}s drift · ${humanizeStatus(row.clock_quality)}`}</strong></span><span><small>Event UID</small><code>{row.event_uid}</code></span><span><small>Original Oracle disposition</small><strong>{humanizeStatus(row.ords_status)}</strong></span><span><small>Effective release state</small><strong>{row.release_state_label || 'Not released'}{row.latest_release_job_id ? ` · job ${row.latest_release_job_id}` : ''}</strong></span></div></details>
               </article>
             )
           })}

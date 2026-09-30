@@ -437,6 +437,43 @@ describe('Live attendance workspace', () => {
     })
   })
 
+  it('shows audited approved identity for an unnamed punch without inventing identity for unapproved punches', async () => {
+    const approvedIdentity = { display_name: 'Approved Employee', cnic_masked: '*****-****123-1' }
+    const approval: NonNullable<AttendanceEvent['force_release']> = {
+      run_id: 'approved-send', policy: 'manual-direct-ords-v1', administrator: 'StateHealthAdmin',
+      approved_at: '2026-08-12T09:00:00Z', reason: 'Identified this punch', audit_id: 17,
+      snapshot_id: null, sync_command_id: null, approved_identity: approvedIdentity,
+    }
+    const approved = event({
+      display_name: null, cnic_masked: null, cnic_not_linked: true, force_release: approval,
+      ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
+    })
+    const unapproved = event({
+      id: 2, event_uid: 'unapproved-punch', display_name: null, cnic_masked: null,
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
+    })
+    const captured = event({ id: 3, event_uid: 'captured-identity', force_release: approval })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [approved, unapproved, captured], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+    const approvedRow = await screen.findByRole('article', { name: /Approved Employee, Check in/i })
+    expect(within(approvedRow).getByText(approvedIdentity.cnic_masked)).toBeTruthy()
+    expect(within(approvedRow).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
+    expect(within(approvedRow).getByLabelText('Status: ACKED')).toBeTruthy()
+    const unknownRow = screen.getByRole('article', { name: /Unknown identity, Check in/i })
+    expect(within(unknownRow).getByText('User 1007 · CNIC on synced user')).toBeTruthy()
+    expect(within(unknownRow).queryByText('Approved Employee')).toBeNull()
+    const capturedRow = screen.getByRole('article', { name: /Ayesha Khan, Check in/i })
+    expect(within(capturedRow).getByText('*****-****567-1')).toBeTruthy()
+    expect(within(capturedRow).queryByText(approvedIdentity.cnic_masked)).toBeNull()
+    expect(screen.getByText('Data-quality attention').closest('article')?.textContent).toContain('1')
+    fireEvent.click(within(approvedRow).getByRole('button', { name: /Forced attendance/i }))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText('Administrator Oracle send')).toBeTruthy()
+    expect(within(dialog).getByText('Audit 17')).toBeTruthy()
+    expect(approved.display_name).toBeNull()
+    expect(approved.cnic_masked).toBeNull()
+  })
+
   it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
     const second = event({ id: 2, event_uid: 'event-two', user_id: '1008', display_name: 'Bilal Ahmed' })
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

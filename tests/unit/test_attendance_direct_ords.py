@@ -12,11 +12,12 @@ from test_attendance_force_release import store as store
 from test_attendance_repair import CORRECT_CNIC, WRONG_CNIC, repair_store as repair_store
 from zk_add import attendance_direct_ords as direct
 from zk_add import attendance_force_delivery as delivery
+from zk_add import attendance_force_release as force
 from zk_add import worker
 from zk_add.attendance_legacy_uid import matches_original, potentially_recoverable
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.attendance_recovery import RecoveryError
-from zk_add.crypto import encrypt_cnic
+from zk_add.crypto import encrypt_cnic, mask_cnic
 from zk_add.models import (
     AttendanceEvent,
     AttendanceForceReleaseDecision as Decision,
@@ -212,6 +213,7 @@ def test_held_punch_without_saved_cnic_uses_synced_user_and_keeps_source_unchang
         event_id = event.id
         original_uid = event.event_uid
         event.cnic_encrypted = None
+        event.display_name = None
         event.ords_status = "BLOCKED_IDENTITY"
         db.commit()
     with sessions() as db:
@@ -235,9 +237,18 @@ def test_held_punch_without_saved_cnic_uses_synced_user_and_keeps_source_unchang
         assert payload["cnic"] == CORRECT_CNIC
         assert payload["employee_name"] == db.scalar(select(DeviceUser)).display_name
         assert event.cnic_encrypted is None
+        assert event.display_name is None
         assert event.event_uid == original_uid
         assert event.ords_status == "PENDING"
         assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        approved = force.metadata_for_page(db, [event])[event_id]["approved_identity"]
+        assert approved == {
+            "display_name": payload["employee_name"],
+            "cnic_masked": mask_cnic(CORRECT_CNIC),
+        }
+        assert CORRECT_CNIC not in str(approved)
+        decision.payload_digest = "0" * 64
+        assert force.metadata_for_page(db, [event])[event_id]["approved_identity"] is None
 
 
 def test_synced_cnic_change_after_approval_stops_dispatch(store):

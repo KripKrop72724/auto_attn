@@ -26,6 +26,8 @@ from zk_add.crypto import (
     decrypt_text,
     encrypt_json,
     encrypt_text,
+    mask_cnic,
+    normalize_cnic,
 )
 from zk_add.identity import parse_machine_name
 from zk_add.models import (
@@ -1341,6 +1343,23 @@ def metadata_for_page(session, events):
 
 
 def _decision_metadata(decision, job, item):
+    approved_identity = None
+    if (
+        decision.proof.get("policy") == "manual-direct-ords-v1"
+        and item.status in {"WAITING_ORACLE", "CONFIRMED"}
+    ):
+        try:
+            payload = decrypt_json(decision.payload_encrypted)
+            if isinstance(payload, dict) and _digest(payload) == decision.payload_digest:
+                cnic = normalize_cnic(payload.get("cnic"))
+                name = payload.get("employee_name")
+                if cnic:
+                    approved_identity = {
+                        "display_name": name if isinstance(name, str) else None,
+                        "cnic_masked": mask_cnic(cnic),
+                    }
+        except Exception:
+            pass
     return {
         "run_id": job.job_id,
         "policy": decision.proof.get("policy"),
@@ -1353,4 +1372,5 @@ def _decision_metadata(decision, job, item):
         "needs_attention": bool(
             item.status == "NEEDS_REVIEW" or item.result.get("needs_attention")
         ),
+        "approved_identity": approved_identity,
     }

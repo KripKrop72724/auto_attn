@@ -1327,7 +1327,7 @@ export interface HistoricalIdentityReport {
 
 export interface AttendanceEvent {
   cnic_not_linked?: boolean
-  force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean } | null
+  force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean; approved_identity?: { display_name: string | null; cnic_masked: string | null } | null } | null
   direct_ords_identity?: { eligible: boolean; cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null; exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | null } | null
   id: number
   event_uid: string
