@@ -4,6 +4,10 @@ import json
 
 import httpx
 import pytest
+from sqlalchemy import select
+
+from test_attendance_force_release import store as store
+from test_attendance_repair import repair_store as repair_store, CORRECT_CNIC, WRONG_CNIC
 
 
 @pytest.fixture()
@@ -13,6 +17,132 @@ def diagnostics():
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture()
+def queued_direct_approval(store):
+    from zk_add import attendance_direct_ords as direct
+    from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
+    from zk_add.models import AttendanceEvent
+
+    sessions, _connector_id, _event_uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.display_name = event.cnic_encrypted = event.cnic_lookup_hash = None
+        event_id = event.id
+        direct.create(db, actor="test", request=DirectOrdsStartRequest(
+            event_ids=[event_id], reason="Test saved approval", password="test-password",
+            idempotency_key="diagnostic-approval",
+        ))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    return sessions, event_id
+
+
+@pytest.mark.parametrize("change, failing_flag", [
+    ("none", None),
+    ("missing_user", "known_current_user"),
+    ("changed_cnic", "current_cnic_hash_matches"),
+    ("changed_user_key", "current_user_key_matches"),
+    ("changed_name", "frozen_payload_matches_current_payload"),
+    ("changed_saved_source", "source_digest_matches"),
+    ("changed_payload_digest", "payload_digest_matches"),
+])
+def test_saved_approval_diagnostics_distinguish_guards_without_exporting_identity(
+    diagnostics, queued_direct_approval, change, failing_flag,
+):
+    from zk_add.crypto import cnic_lookup, encrypt_cnic
+    from zk_add.models import AttendanceEvent, Connector, DeviceUser, AttendanceForceReleaseDecision
+
+    sessions, event_id = queued_direct_approval
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        user = db.scalar(select(DeviceUser))
+        decision = db.scalar(select(AttendanceForceReleaseDecision))
+        if change == "missing_user":
+            user.present = False
+        elif change == "changed_cnic":
+            user.cnic_encrypted = encrypt_cnic(WRONG_CNIC)
+            user.cnic_lookup_hash = cnic_lookup(WRONG_CNIC)
+        elif change == "changed_user_key":
+            user.user_key = "22222222-2222-4222-8222-222222222222"
+        elif change == "changed_name":
+            user.display_name = "PRIVATE-CHANGED-NAME"
+        elif change == "changed_saved_source":
+            event.display_name = "PRIVATE-SOURCE-NAME"
+        elif change == "changed_payload_digest":
+            decision.payload_digest = "0" * 64
+        db.flush()
+        shape = diagnostics.direct_approval_guard_shape(
+            db, event, db.get(Connector, event.connector_id), decision,
+        )
+        assert shape["approval_authorized"] is (change == "none")
+        assert shape["guard_evaluation_failed"] is False
+        if failing_flag:
+            assert shape[failing_flag] is False
+        if change in {"changed_name", "changed_user_key", "changed_cnic"}:
+            assert shape["source_digest_matches"] is True
+        if change == "changed_saved_source":
+            assert shape["immutable_facts_match"] is True
+            assert shape["frozen_payload_matches_current_payload"] is True
+        assert all(isinstance(value, bool) for value in shape.values())
+        rendered = json.dumps(shape)
+        for private in (CORRECT_CNIC, WRONG_CNIC, user.display_name, user.user_key,
+                        event.event_uid, decision.payload_digest):
+            assert private not in rendered
+
+
+def test_diagnostic_cli_keeps_both_run_and_event_filters(diagnostics, monkeypatch, capsys):
+    run_id = "11111111-2222-4333-8444-555555555555"
+    event_ids = [101, 103, 107]
+    calls = []
+    monkeypatch.setattr(diagnostics, "database_report", lambda run, ids: calls.append(
+        ("database", run, ids),
+    ) or {})
+    monkeypatch.setattr(diagnostics, "oracle_direct_run_diagnostics", lambda run, ids: calls.append(
+        ("oracle", run, ids),
+    ) or {"checks": []})
+    monkeypatch.setattr("sys.argv", [
+        "diagnostics", "--direct-run-id", run_id,
+        "--attendance-event-id", ",".join(map(str, event_ids)),
+    ])
+    diagnostics.main()
+    assert calls == [("database", run_id, event_ids), ("oracle", run_id, event_ids)]
+    assert json.loads(capsys.readouterr().out) == {"direct_oracle_check": {"checks": []}}
+
+
+@pytest.mark.parametrize("event_ids", [None, [101, 103, 107]])
+def test_saved_oracle_checks_bind_exact_event_scope_inside_run(diagnostics, monkeypatch, event_ids):
+    import zk_add.db
+
+    calls = []
+
+    class Result:
+        def mappings(self): return self
+        def all(self): return []
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def rollback(self): calls.append(("rollback",))
+        def execute(self, statement, params=None):
+            calls.append((str(statement), params))
+            return Result()
+
+    class Engine:
+        def connect(self): return Connection()
+
+    monkeypatch.setattr(zk_add.db, "engine", Engine())
+    monkeypatch.setattr(diagnostics, "probe_saved_direct_checks", lambda checks: {"checks": checks})
+    result = diagnostics.oracle_direct_run_diagnostics("test-run", event_ids)
+    query, params = next(call for call in calls if len(call) == 2 and "FROM add_attendance_force" in call[0])
+    assert params == {"run_id": "test-run", "filter_events": bool(event_ids), "event_ids": event_ids or []}
+    assert query.index("e.id=ANY(:event_ids)") < query.index("LIMIT 3")
+    assert "j.job_id=:run_id" in query and "j.action='MANUAL_DIRECT_ORDS'" in query
+    assert result == {"checks": []}
+    assert calls[0][0] == "SET TRANSACTION READ ONLY"
 
 
 def saved_check():
@@ -52,6 +182,47 @@ def test_check_diagnostic_detects_fractional_timestamp_without_exporting_it(diag
     assert diagnostics.check_payload_shape(check)["timestamp_oracle_format_valid"]
     check["items"][0]["immutable_facts"]["device_event_time"] = "2026-09-30T04:31:07.123456+00:00"
     assert not diagnostics.check_payload_shape(check)["timestamp_oracle_format_valid"]
+
+
+@pytest.mark.parametrize("classification, expected", [
+    ("MATCH", "MATCH"), ("MISSING", "MISSING"), ("MISMATCH", "MISMATCH"),
+    ("IMMUTABLE_MISMATCH", "IMMUTABLE_MISMATCH"),
+    ("CROSS_DEVICE_UID_COLLISION", "CROSS_DEVICE_UID_COLLISION"),
+    ("LEGACY_SOURCE_MATCH", "LEGACY_SOURCE_MATCH"),
+    ("LEGACY_SOURCE_MISSING", "LEGACY_SOURCE_MISSING"),
+    ("LEGACY_SOURCE_CONFLICT", "LEGACY_SOURCE_CONFLICT"),
+    ("LEGACY_SOURCE_AMBIGUOUS", "LEGACY_SOURCE_AMBIGUOUS"),
+    ("LEGACY_SOURCE_PRIVATE-NAME-3520212345671", "UNRECOGNIZED_CLASSIFICATION"),
+    ({"cnic": "3520212345671"}, "UNRECOGNIZED_CLASSIFICATION"),
+    (None, None),
+])
+def test_check_diagnostics_allowlist_classification_and_export_token_boolean_only(
+    diagnostics, classification, expected,
+):
+    check = saved_check()
+    token = "f" * 64
+    response = httpx.Response(200, json={"success": True, "results": [{
+        "event_uid": check["items"][0]["event_uid"],
+        "classification": classification, "current_content_token": token,
+        "employee_name": "PRIVATE-NAME", "cnic": "3520212345671",
+    }]})
+    result = diagnostics.check_response_summary(response, check)
+    assert result["classification"] == expected
+    assert result["token_format_valid"] is True
+    assert result["response_shape_valid"] is True
+    for private in (token, "PRIVATE-NAME", "3520212345671", check["items"][0]["event_uid"]):
+        assert private not in json.dumps(result)
+
+
+def test_check_diagnostics_reject_malformed_token_without_exporting_it(diagnostics):
+    check = saved_check()
+    response = httpx.Response(200, json={"success": True, "results": [{
+        "event_uid": check["items"][0]["event_uid"],
+        "classification": "MATCH", "current_content_token": "PRIVATE-TOKEN",
+    }]})
+    result = diagnostics.check_response_summary(response, check)
+    assert result["token_format_valid"] is False
+    assert "PRIVATE-TOKEN" not in json.dumps(result)
 
 
 def test_direct_diagnostic_calls_only_bounded_read_only_verifier(diagnostics, monkeypatch):
