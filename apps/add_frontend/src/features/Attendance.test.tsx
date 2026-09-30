@@ -445,7 +445,7 @@ describe('Live attendance workspace', () => {
       snapshot_id: null, sync_command_id: null, approved_identity: approvedIdentity,
     }
     const approved = event({
-      display_name: null, cnic_masked: null, cnic_not_linked: true, force_release: approval,
+      display_name: null, cnic_masked: null, cnic_not_linked: false, force_release: approval,
       ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
     })
     const unapproved = event({
@@ -472,6 +472,26 @@ describe('Live attendance workspace', () => {
     expect(within(dialog).getByText('Audit 17')).toBeTruthy()
     expect(approved.display_name).toBeNull()
     expect(approved.cnic_masked).toBeNull()
+  })
+
+  it.each([true, false, undefined])('keeps server CNIC linkage classification authoritative after approval (%s)', async (cnicNotLinked) => {
+    const approved = event({
+      display_name: null, cnic_masked: null, cnic_not_linked: cnicNotLinked,
+      ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
+      force_release: {
+        run_id: 'approved-send', policy: 'manual-direct-ords-v1', administrator: 'StateHealthAdmin',
+        approved_at: '2026-08-12T09:00:00Z', reason: 'Identified this punch', audit_id: 17,
+        snapshot_id: null, sync_command_id: null,
+        approved_identity: { display_name: 'Approved employee', cnic_masked: '*****-****123-1' },
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [approved], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+    const row = await screen.findByRole('article', { name: /Approved employee, Check in/i })
+    expect(within(row).getByText('*****-****123-1')).toBeTruthy()
+    const missingCnicBadge = within(row).queryByLabelText('Status: CNIC NOT LINKED')
+    if (cnicNotLinked) expect(missingCnicBadge).toBeTruthy()
+    else expect(missingCnicBadge).toBeNull()
   })
 
   it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
