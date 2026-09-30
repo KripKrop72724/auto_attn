@@ -1389,8 +1389,18 @@ def _replace_user_snapshot(
         if row.id is not None:
             affected[row.id] = row
     for row in affected.values():
-        if not row.cnic_lookup_hash or row.identity_conflict_code is not None:
+        resolved_same_employee = bool(
+            row.identity_conflict_code == IDENTITY_CONFLICT_DUPLICATE_CNIC
+            and valid_resolution_for_user(session, zkt=zkt, user=row) is not None
+        )
+        if not row.cnic_lookup_hash or (
+            row.identity_conflict_code is not None and not resolved_same_employee
+        ):
             block_undelivered_attendance(
+                session, zkt=zkt, user=row, snapshot=snapshot_record
+            )
+        elif resolved_same_employee and stable_complete:
+            restore_resolved_alias_direct_approvals(
                 session, zkt=zkt, user=row, snapshot=snapshot_record
             )
     from zk_add.attendance_identity_evidence import record_identity_observation
@@ -3252,6 +3262,121 @@ def repair_verified_active_identity_backlog(
 ) -> int:
     """Retired: held attendance requires an explicit manual force-release run."""
     return 0
+
+
+def restore_resolved_alias_direct_approvals(
+    session: Session,
+    *,
+    zkt: ZKTDevice,
+    user: DeviceUser,
+    snapshot: DeviceUserSnapshot,
+) -> int:
+    """Resume an unchanged sealed approval held by a resolved duplicate snapshot.
+
+    Captured identity/source fields and the original approval remain untouched.
+    The ordinary forced worker still verifies Oracle content before any write.
+    """
+    from zk_add import attendance_direct_ords as direct
+    from zk_add.attendance_manual_guard import decision_for
+    from zk_add.attendance_repair import _immutable_facts
+    from zk_add.identity_conflicts import RESOLUTION_SAME_EMPLOYEE
+    from zk_add.models import (
+        AttendanceForceReleaseDecision as Decision,
+        AttendanceRecoveryItem as Item,
+        AttendanceRecoveryJob as Job,
+    )
+
+    if not (
+        snapshot.complete and snapshot.stable
+        and snapshot.zkt_device_id == zkt.id
+        and zkt.snapshot_complete and zkt.identity_snapshot_stable
+        and zkt.identity_snapshot_id == snapshot.id
+        and zkt.identity_snapshot_revision == snapshot.revision
+        and user.present and user.lifecycle_state == "ACTIVE"
+        and user.snapshot_revision == snapshot.revision
+        and user.identity_conflict_code == IDENTITY_CONFLICT_DUPLICATE_CNIC
+    ):
+        return 0
+    resolution = valid_resolution_for_user(session, zkt=zkt, user=user)
+    if resolution is None or resolution.resolution_type != RESOLUTION_SAME_EMPLOYEE:
+        return 0
+    # Serialize a concurrent revocation with checkpoint recovery.
+    resolution = session.get(
+        IdentityConflictResolution, resolution.id,
+        with_for_update=True, populate_existing=True,
+    )
+    if (
+        resolution is None
+        or resolution.resolution_type != RESOLUTION_SAME_EMPLOYEE
+        or valid_resolution_for_user(session, zkt=zkt, user=user) is None
+    ):
+        return 0
+    latest_decision_id = (
+        select(func.max(Decision.id))
+        .where(Decision.attendance_event_id == AttendanceEvent.id)
+        .correlate(AttendanceEvent).scalar_subquery()
+    )
+    rows = session.execute(
+        select(AttendanceEvent, OrdsOutbox, Decision, Item, Job)
+        .join(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
+        .join(Decision, Decision.attendance_event_id == AttendanceEvent.id)
+        .join(Item, Item.id == Decision.item_id)
+        .join(Job, Job.id == Decision.job_id)
+        .where(
+            AttendanceEvent.zkt_device_id == zkt.id,
+            AttendanceEvent.user_id == user.user_id,
+            AttendanceEvent.ords_status == "BLOCKED_IDENTITY",
+            AttendanceEvent.oracle_confirmed_at.is_(None),
+            AttendanceEvent.oracle_confirmation_path.is_(None),
+            OrdsOutbox.status == "BLOCKED_IDENTITY",
+            OrdsOutbox.acknowledged_at.is_(None),
+            Decision.id == latest_decision_id,
+            Decision.proof["policy"].as_string() == direct.POLICY,
+            Item.attendance_event_id == AttendanceEvent.id,
+            Item.job_id == Job.id,
+            Item.status == "NEEDS_REVIEW",
+            Item.error_code == "BLOCKED_IDENTITY",
+            Job.action == direct.ACTION,
+            Job.status.in_(("RUNNING", "WAITING_ORACLE", "COMPLETED_WITH_REVIEW")),
+        ).order_by(AttendanceEvent.id).limit(100).with_for_update(skip_locked=True)
+    ).all()
+    restored = 0
+    for row, outbox, decision, item, job in rows:
+        connector = session.get(Connector, row.connector_id)
+        if (
+            connector is None
+            or decision_for(session, row) is not decision
+            or decision.actor != job.actor
+            or decision.proof.get("immutable_facts") != _immutable_facts(row)
+            or "terminal" not in decision.proof
+            or decision.proof["terminal"] != row.device_serial
+            or decision.proof.get("hardware_id") != connector.hardware_id
+            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH"}
+            or decision.proof.get("current_user_key") != user.user_key
+            or item.connector_id != row.connector_id
+            or direct.approved_payload(session, row, connector, decision) is None
+        ):
+            continue
+        now = utc_now()
+        row.ords_status = outbox.status = "PENDING"
+        outbox.next_attempt_at = outbox.last_error = None
+        item.status, item.error_code, item.completed_at = "WAITING_ORACLE", None, None
+        item.result = {
+            **item.result,
+            "reason": "Saved approval revalidated after the current same-employee snapshot.",
+            "needs_attention": False,
+        }
+        item.updated_at = now
+        job.status, job.completed_at, job.updated_at = "WAITING_ORACLE", None, now
+        append_audit(
+            session, actor="system:snapshot-validation",
+            action="ATTENDANCE_DIRECT_ORDS_APPROVAL_REVALIDATED",
+            target_type="attendance_event", target_id=str(row.id),
+            outcome="WAITING_ORACLE",
+            after={"job_id": job.job_id, "decision_id": decision.id, "item_id": item.id},
+        )
+        restored += 1
+    return restored
 
 
 def block_undelivered_attendance(

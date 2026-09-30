@@ -1,6 +1,7 @@
 """Direct Oracle approval still has durable custody and two explicit exclusions."""
 
 import asyncio
+from copy import deepcopy
 from datetime import timedelta
 
 import httpx
@@ -17,7 +18,7 @@ from zk_add import worker
 from zk_add.attendance_legacy_uid import matches_original, potentially_recoverable
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
 from zk_add.attendance_recovery import RecoveryError
-from zk_add.crypto import encrypt_cnic, mask_cnic
+from zk_add.crypto import decrypt_json, encrypt_cnic, mask_cnic
 from zk_add.models import (
     AttendanceEvent,
     AttendanceForceReleaseDecision as Decision,
@@ -249,6 +250,110 @@ def test_held_punch_without_saved_cnic_uses_synced_user_and_keeps_source_unchang
         assert CORRECT_CNIC not in str(approved)
         decision.payload_digest = "0" * 64
         assert force.metadata_for_page(db, [event])[event_id]["approved_identity"] is None
+
+
+@pytest.mark.parametrize("missing_serial", [None, ""])
+def test_approved_direct_missing_serial_checks_frozen_unknown_namespace(
+    store, monkeypatch, missing_serial,
+):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.device_serial = missing_serial
+        event_id = event.id
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+        decision = db.scalar(select(Decision))
+        frozen_proof = deepcopy(decision.proof)
+        frozen_payload = decrypt_json(decision.payload_encrypted)
+        frozen_digest = decision.payload_digest
+        assert frozen_proof["terminal"] == missing_serial
+        assert frozen_proof["immutable_facts"]["device_serial"] == missing_serial
+        assert frozen_payload["device_serial"] == "unknown"
+
+    ordinary, claims = delivery.split_claims(worker.claim_ords_batch(1))
+    assert not ordinary and len(claims) == 1
+    claim = claims[0]
+    assert claim["payload"] == frozen_payload
+    assert claim["check"]["terminal_serial"] == "unknown"
+    checked_facts = claim["check"]["items"][0]["immutable_facts"]
+    assert checked_facts == {**frozen_proof["immutable_facts"], "device_serial": "unknown"}
+    assert claim["check"]["items"][0]["immutable_facts_digest"] == delivery._protected_digest(checked_facts)
+    calls = []
+
+    async def checked(path, *, payload):
+        calls.append(path)
+        assert payload["items"][0]["immutable_facts"]["device_serial"] == "unknown"
+        return {"success": True, "results": [{
+            "event_uid": payload["items"][0]["event_uid"],
+            "classification": "MATCH", "current_content_token": "c" * 64,
+        }]}
+
+    monkeypatch.setattr(delivery, "_ords_request", checked)
+    asyncio.run(delivery.deliver_forced(claims, concurrency=1))
+    assert calls == ["raw-captures/identity-repairs/check"]
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        decision = db.scalar(select(Decision))
+        assert event.device_serial == missing_serial
+        assert event.ords_status == "ACKED_CHECK"
+        assert decision.proof == frozen_proof
+        assert decision.payload_digest == frozen_digest
+        assert decrypt_json(decision.payload_encrypted) == frozen_payload
+        assert db.scalar(select(Item)).status == "CONFIRMED"
+
+
+@pytest.mark.parametrize("incompatible", [
+    "other_policy", "missing_policy", "real_proof_terminal", "real_fact_serial",
+    "different_payload_serial", "absent_proof_terminal", "absent_fact_serial",
+])
+def test_missing_serial_check_placeholder_requires_exact_direct_approval(incompatible):
+    proof = {
+        "policy": direct.POLICY, "terminal": None,
+        "immutable_facts": {"device_serial": None, "source_user_id": "1007"},
+    }
+    payload = {"device_serial": "unknown"}
+    if incompatible == "other_policy":
+        proof["policy"] = force.POLICY
+    elif incompatible == "missing_policy":
+        del proof["policy"]
+    elif incompatible == "real_proof_terminal":
+        proof["terminal"] = "REAL-SERIAL"
+    elif incompatible == "real_fact_serial":
+        proof["immutable_facts"]["device_serial"] = "REAL-SERIAL"
+    elif incompatible == "different_payload_serial":
+        payload["device_serial"] = "REAL-SERIAL"
+    elif incompatible == "absent_proof_terminal":
+        del proof["terminal"]
+    elif incompatible == "absent_fact_serial":
+        del proof["immutable_facts"]["device_serial"]
+    frozen = deepcopy(proof)
+    assert delivery.content_check_facts(proof, payload) == frozen["immutable_facts"]
+    assert proof == frozen
+
+
+def test_real_serial_added_after_missing_serial_approval_still_blocks_dispatch(store):
+    sessions, _connector_id, _uid = store
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        event.device_serial = None
+        event_id = event.id
+        direct.create(db, actor="operator", request=request(event_id))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        event.device_serial = "REAL-SERIAL"
+        decision = db.scalar(select(Decision))
+        assert direct.approved_payload(
+            db, event, db.get(Connector, event.connector_id), decision,
+        ) is None
+        assert decision.proof["immutable_facts"]["device_serial"] is None
 
 
 def test_synced_cnic_change_after_approval_stops_dispatch(store):

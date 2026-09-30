@@ -71,14 +71,15 @@ def valid_identity_resolutions(
     """
 
     groups = groups if groups is not None else active_identity_groups(session, zkt=zkt)
-    resolutions = list(
-        session.scalars(
-            select(IdentityConflictResolution).where(
-                IdentityConflictResolution.zkt_device_id == zkt.id,
-                IdentityConflictResolution.status == "ACTIVE",
-            )
-        ).all()
+    statement = select(IdentityConflictResolution).where(
+        IdentityConflictResolution.zkt_device_id == zkt.id,
+        IdentityConflictResolution.status == "ACTIVE",
     )
+    if mark_stale:
+        # Acquire every resolution before stale-validation audits lock the head.
+        statement = statement.order_by(IdentityConflictResolution.id).with_for_update()
+        statement = statement.execution_options(populate_existing=True)
+    resolutions = list(session.scalars(statement).all())
     valid: dict[str, IdentityConflictResolution] = {}
     now = utc_now()
     for resolution in resolutions:
@@ -413,7 +414,7 @@ def revoke_identity_resolution(
         select(IdentityConflictResolution).where(
             IdentityConflictResolution.zkt_device_id == zkt.id,
             IdentityConflictResolution.resolution_id == resolution_id,
-        )
+        ).with_for_update().execution_options(populate_existing=True)
     )
     if resolution is None:
         raise ValueError("Identity resolution was not found for this terminal.")
