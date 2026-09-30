@@ -1402,6 +1402,10 @@ def _replace_user_snapshot(
         card_transition_user_ids=card_transition_user_ids,
     )
     if stable_complete:
+        # Sessions intentionally disable autoflush. The release queries must
+        # see the identity interval extended by this snapshot in the same
+        # transaction, including an unchanged user across another user's edit.
+        session.flush()
         held_user_ids = session.scalars(select(AttendanceEvent.user_id).where(
             AttendanceEvent.zkt_device_id == zkt.id,
             AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
@@ -2967,26 +2971,39 @@ def release_synced_cnic_attendance(
             AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
         ).order_by(AttendanceEvent.id).limit(limit).with_for_update(skip_locked=True)
     ).all()
-    changed = 0
-    for row in rows:
-        if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
-            continue
-        row.device_user_id = user.id
-        row.identity_snapshot_id = zkt.identity_snapshot_id
-        row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
-        row.identity_resolved_at = row.identity_repaired_at = utc_now()
-        row.identity_repair_reason = "VERIFIED_SYNCED_CNIC"
-        row.display_name = user.display_name
-        row.cnic_encrypted = user.cnic_encrypted
-        row.cnic_lookup_hash = user.cnic_lookup_hash
-        row.cnic_last4 = user.cnic_last4
-        row.manual_release_required = False
-        row.ords_status = "PENDING"
-        outbox, _ = ensure_attendance_ords_outbox(session, row, status="PENDING")
-        outbox.next_attempt_at = None
-        outbox.last_error = None
-        changed += 1
-    return changed
+    return sum(
+        release_synced_cnic_attendance_event(session, zkt=zkt, user=user, row=row)
+        for row in rows
+    )
+
+
+def release_synced_cnic_attendance_event(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+) -> bool:
+    """Use the same retained proof for newly ingested punches and backlog repair."""
+    if row.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+        return False
+    if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
+        return False
+    from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
+
+    if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
+        return False
+    row.device_user_id = user.id
+    row.identity_snapshot_id = zkt.identity_snapshot_id
+    row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
+    row.identity_resolved_at = row.identity_repaired_at = utc_now()
+    row.identity_repair_reason = "VERIFIED_SYNCED_CNIC"
+    row.display_name = user.display_name
+    row.cnic_encrypted = user.cnic_encrypted
+    row.cnic_lookup_hash = user.cnic_lookup_hash
+    row.cnic_last4 = user.cnic_last4
+    row.manual_release_required = False
+    row.ords_status = "PENDING"
+    outbox, _ = ensure_attendance_ords_outbox(session, row, status="PENDING")
+    outbox.next_attempt_at = None
+    outbox.last_error = None
+    return True
 
 
 def _ords_delivery_type_for_event(row: AttendanceEvent) -> str:
@@ -3439,7 +3456,8 @@ def repair_verified_source_identity_backlog(session: Session, *, limit: int = 10
 
 
 def ingest_attendance(
-    session: Session, *, connector: Connector, events: list[AttendanceEventIn]
+    session: Session, *, connector: Connector, events: list[AttendanceEventIn],
+    defer_synced_identity_release: bool = False,
 ) -> tuple[list[str], list[str]]:
     if connector.firmware_family == "hikvision":
         raise ValueError("Hikvision attendance requires source-evidence ingestion.")
@@ -3790,6 +3808,19 @@ def ingest_attendance(
                     status="FIRMWARE_RECEIPT_UNVERIFIED",
                 )
             )
+        elif (
+            not has_cnic and row.source == "CURRENT_RECONCILE"
+            and not defer_synced_identity_release
+        ):
+            # A roster change elsewhere on the terminal may have made the
+            # global continuity check conservative. Retained per-user proof
+            # can already cover this exact punch; use it now instead of
+            # waiting for another snapshot or the maintenance sweep.
+            user = users_by_id.get(row.user_id)
+            if user is not None:
+                release_synced_cnic_attendance_event(
+                    session, zkt=zkt, user=user, row=row
+                )
         elif has_cnic:
             session.add(
                 OrdsOutbox(

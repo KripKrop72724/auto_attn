@@ -363,6 +363,115 @@ def test_reconciled_legacy_continuity_matches_postgres_guard(force_pg):
         ), {"id": event_id}) is False
 
 
+@pytest.mark.parametrize("proof_case", ["verified", "missing_fingerprint", "open_tolerance"])
+def test_immediate_reconcile_release_obeys_installed_postgres_guard(force_pg, proof_case):
+    """An application/SQL proof mismatch must not roll back an attendance batch."""
+    from datetime import timedelta
+    from zk_add.models import AttendanceIdentityHistory, OrdsOutbox
+    from zk_add.schemas import AttendanceEventIn
+    from zk_add.service import ingest_attendance, synced_cnic_identity_proven
+    from zk_add.time_utils import utc_now
+
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    for filename in (
+        "20260925_0036_auto_synced_cnic.py",
+        "20260929_0037_reconciled_cnic_guard.py",
+        "20260929_0038_saved_reconcile_cnic_guard.py",
+        "20260929_0039_delayed_record_uid_guard.py",
+        "20260929_0040_manual_hold_event_diagnostic.py",
+        "20260929_0041_legacy_reconcile_cnic_guard.py",
+    ):
+        path = Path(__file__).parents[2] / "apps/add_backend/migrations/versions" / filename
+        spec = spec_from_file_location(filename.removesuffix(".py"), path)
+        migration = module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        with engine.begin() as conn:
+            with Operations.context(MigrationContext.configure(conn)):
+                migration.upgrade()
+
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        zkt = connector.zkt_device
+        user = db.scalar(select(DeviceUser).where(DeviceUser.zkt_device_id == zkt.id))
+        when = utc_now() - timedelta(minutes=4)
+        user.terminal_identity_fingerprint = "a" * 64
+        # Aggregate continuity begins later than this punch; only the retained
+        # employee interval can supply its original identity.
+        zkt.last_identity_change_at = when + timedelta(minutes=1)
+        db.add(AttendanceIdentityHistory(
+            zkt_device_id=zkt.id, device_user_id=user.id,
+            terminal_serial=zkt.serial, user_id=user.user_id, uid=user.uid,
+            fingerprint=user.terminal_identity_fingerprint,
+            cnic_encrypted=user.cnic_encrypted, cnic_lookup_hash=user.cnic_lookup_hash,
+            first_snapshot_id=zkt.identity_snapshot_id,
+            last_snapshot_id=zkt.identity_snapshot_id,
+            last_revision=zkt.identity_snapshot_revision,
+            observed_from=when - timedelta(minutes=1),
+            observed_until=when + timedelta(seconds=-1 if proof_case == "open_tolerance" else 1),
+            closed=False,
+        ))
+        db.flush()
+        incoming = AttendanceEventIn(
+            event_uid="d" * 64, user_id=user.user_id, uid=user.uid,
+            terminal_serial=zkt.serial,
+            terminal_identity_fingerprint=(
+                None if proof_case == "missing_fingerprint" else user.terminal_identity_fingerprint
+            ),
+            device_event_time=when, captured_at=when + timedelta(minutes=3),
+            source="CURRENT_RECONCILE", clock_quality="OK", raw_event={},
+        )
+        assert ingest_attendance(db, connector=connector, events=[incoming]) == (
+            [incoming.event_uid], []
+        )
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == incoming.event_uid))
+        # All three pass the Python proof. The installed SQL guard accepts
+        # only the strict interval and captured fingerprint in this release.
+        assert synced_cnic_identity_proven(db, connector, zkt, user, row)
+        event_id = row.id
+        db.commit()
+
+    with sessions() as db:
+        row = db.get(AttendanceEvent, event_id)
+        verified = proof_case == "verified"
+        assert row.ords_status == ("PENDING" if verified else "BLOCKED_IDENTITY")
+        assert row.manual_release_required is (not verified)
+        assert bool(row.cnic_lookup_hash) is verified
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == row.id
+        )) == int(verified)
+
+
+def test_database_guard_refusal_leaves_python_verified_event_held(store, monkeypatch):
+    from zk_add.service import release_synced_cnic_attendance_event, synced_cnic_identity_proven
+
+    sessions, _, uid = store
+    with sessions() as db:
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == uid))
+        connector = db.get(Connector, row.connector_id)
+        zkt = connector.zkt_device
+        user = db.get(DeviceUser, row.device_user_id)
+        row.source = "CURRENT_RECONCILE"
+        row.identity_resolution_status = "BLOCKED_IDENTITY"
+        row.received_at = row.captured_at
+        row.captured_cnic_lookup_hash = None
+        db.flush()
+        assert synced_cnic_identity_proven(db, connector, zkt, user, row)
+        monkeypatch.setattr(
+            "zk_add.attendance_auto_release_guard.database_synced_cnic_release_proven",
+            lambda *_args, **_kwargs: False,
+        )
+        assert not release_synced_cnic_attendance_event(db, zkt=zkt, user=user, row=row)
+        db.commit()
+        assert row.ords_status == "BLOCKED_IDENTITY"
+        assert row.manual_release_required
+        assert row.cnic_lookup_hash is None
+        from zk_add.models import OrdsOutbox
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == row.id
+        )) == 0
+
+
 def test_concurrent_duplicate_checks_are_one_saved_request(force_pg):
     sessions, connector_id, _ = force_pg
     # Seed singleton exactly as production migration does.
