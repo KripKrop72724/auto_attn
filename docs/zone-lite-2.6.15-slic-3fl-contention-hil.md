@@ -54,6 +54,14 @@ queues and runtime health before committing its boot. Start the saved HIL
 observation only after the exact 2.6.15 application digest and healthy current
 boot telemetry are confirmed. OTA success alone does not constitute HIL acceptance.
 
+The original published 2.4.12 progress messages omit application digest and
+partition fields. The BLD5 bridge adapter acknowledges its runtime-health
+handshake without advancing installation state. After 2.4.12 sends a fresh
+signed capability report with the exact published digest in an OTA slot, ADD
+records the checked boot/reconciliation transitions. A subsequent authenticated
+success report completes the bridge. Changed identity, another image, stale
+telemetry or proof from another boot cannot use this adapter.
+
 Run `firmware-extend-2-6-0-hil.yml` with scope `2.6.15-bld5` from green main after
 deploying the backend scope support. The workflow pins the original source, artifact and
 application digests, previews the extension, and atomically replaces only the
