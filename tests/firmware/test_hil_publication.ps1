@@ -549,7 +549,8 @@ foreach ($field in @('ExpectedGitSha', 'ExpectedImageSha256', 'ExpectedApplicati
 }
 foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
     $changed = $bld5Arguments.Clone()
-    $changedTargets = @(ConvertFrom-Json -InputObject $changed.ExtendedTargetsJson)
+    $changedTargets = ConvertFrom-Json -InputObject $changed.ExtendedTargetsJson
+    $changedTargets = @($changedTargets)
     $changedTargets[5].$field = 'replacement'
     $changed.ExtendedTargetsJson = ConvertTo-Json -InputObject $changedTargets -Depth 5 -Compress
     $rejected = $false

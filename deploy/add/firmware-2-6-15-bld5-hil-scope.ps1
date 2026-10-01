@@ -13,7 +13,8 @@ function Assert-Zkt2615Bld5HilExtension {
     }
     . (Join-Path $PSScriptRoot 'firmware-2-6-15-hil-scope.ps1')
     Assert-Zkt2615HilScope $ExistingTargetsJson
-    $extended = @(ConvertFrom-Json -InputObject $ExtendedTargetsJson)
+    $extended = ConvertFrom-Json -InputObject $ExtendedTargetsJson
+    $extended = @($extended)
     if ($extended.Count -ne 6) { throw 'BLD5 HIL extension requires exactly six ordered targets' }
     $prefix = ConvertTo-Json -InputObject @($extended[0..4]) -Depth 5 -Compress
     Assert-Zkt2615HilScope $prefix
