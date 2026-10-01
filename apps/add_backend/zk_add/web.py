@@ -4820,6 +4820,12 @@ async def report_firmware_capability(
     connector.ota_signing_key_id = body.signing_key_id or "fleet-key-0"
     connector.ota_state = "OTA_READY" if eligible else "OTA_BLOCKED"
     connector.firmware_version = body.running_version
+    from zk_add.legacy_bld5_bridge import verify_legacy_capability
+
+    try:
+        verify_legacy_capability(db, connector=connector, capability=body.model_dump())
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     db.commit()
     return {"accepted": eligible, "ota_state": connector.ota_state}
 
@@ -4848,6 +4854,14 @@ async def firmware_progress(
 ):
     db, connector = auth
     try:
+        from zk_add.legacy_bld5_bridge import accept_legacy_progress
+
+        legacy = accept_legacy_progress(
+            db, connector=connector, deployment_id=deployment_id, report=body.model_dump(),
+        )
+        if legacy is not None:
+            db.commit()
+            return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
         deployment = _record_firmware_progress(
             db,
             connector=connector,

@@ -529,6 +529,34 @@ if (-not $rejected) { throw 'Partial 2.6.15 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode HIL_ONLY -HilTargetsJson $exact2615
 $zkt2615Marker = Get-Content -LiteralPath (Join-Path $store '2.6.15/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cne ('e'*64)) { throw '2.6.15 HIL marker is incomplete' }
+# The later BLD5 extension changes only the quarantine marker of the exact
+# already published image; it cannot authorize another image or device.
+. (Join-Path $repo 'deploy/add/firmware-2-6-15-bld5-hil-scope.ps1')
+$bld5Arguments = @{
+    ExpectedGitSha = 'a88998346d5b1ce1ddf4d19e3963b7245e46633b'
+    ExpectedImageSha256 = 'e2a2167fca307d73dbeb495bcc26baa535591794066b02a3de2848589c28887f'
+    ExpectedApplicationSha256 = '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6'
+    ExistingTargetsJson = $exact2615
+    ExtendedTargetsJson = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.15-bld5.json') -Raw
+}
+Assert-Zkt2615Bld5HilExtension @bld5Arguments
+foreach ($field in @('ExpectedGitSha', 'ExpectedImageSha256', 'ExpectedApplicationSha256')) {
+    $changed = $bld5Arguments.Clone()
+    $changed[$field] = '0' * $changed[$field].Length
+    $rejected = $false
+    try { Assert-Zkt2615Bld5HilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "BLD5 extension accepted changed $field" }
+}
+foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
+    $changed = $bld5Arguments.Clone()
+    $changedTargets = ConvertFrom-Json -InputObject $changed.ExtendedTargetsJson
+    $changedTargets = @($changedTargets)
+    $changedTargets[5].$field = 'replacement'
+    $changed.ExtendedTargetsJson = ConvertTo-Json -InputObject $changedTargets -Depth 5 -Compress
+    $rejected = $false
+    try { Assert-Zkt2615Bld5HilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "BLD5 extension accepted changed $field" }
+}
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

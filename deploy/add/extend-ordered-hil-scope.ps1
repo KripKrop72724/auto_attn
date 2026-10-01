@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$StoreDirectory,
-    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0')][string]$Version,
+    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0', '2.6.15')][string]$Version,
     [Parameter(Mandatory = $true)][string]$ExpectedGitSha,
     [Parameter(Mandatory = $true)][string]$ExpectedImageSha256,
     [Parameter(Mandatory = $true)][string]$ExpectedApplicationSha256,
@@ -61,6 +61,15 @@ function Assert-SameTargets($Actual, $Expected) {
 
 $existingTargets = Read-ExactTargets $ExistingTargetsJson
 $extendedTargets = Read-ExactTargets $ExtendedTargetsJson
+if ($Version -eq '2.6.15') {
+    . (Join-Path $PSScriptRoot 'firmware-2-6-15-bld5-hil-scope.ps1')
+    Assert-Zkt2615Bld5HilExtension `
+        -ExpectedGitSha $ExpectedGitSha `
+        -ExpectedImageSha256 $ExpectedImageSha256 `
+        -ExpectedApplicationSha256 $ExpectedApplicationSha256 `
+        -ExistingTargetsJson $ExistingTargetsJson `
+        -ExtendedTargetsJson $ExtendedTargetsJson
+}
 if ($extendedTargets.Count -le $existingTargets.Count) { throw 'HIL extension must append targets' }
 for ($index = 0; $index -lt $existingTargets.Count; $index++) {
     foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {

@@ -68,6 +68,19 @@ HIL_269_EXACT_TARGETS = (
     HilTarget(connector_id="233dac02-eb1b-4598-a876-e3a7b1ecfd54",
               mac="e0:72:a1:d5:08:a0", terminal_serial="CJH9211060002"),
 )
+# Append BLD5 only to these already published, immutable 2.6.15 bytes. The
+# original five configured targets remain valid for every earlier release.
+HIL_2615_BLD5_IDENTITY = (
+    "zone-lite-2.6.15", "2.6.15",
+    "a88998346d5b1ce1ddf4d19e3963b7245e46633b",
+    "e2a2167fca307d73dbeb495bcc26baa535591794066b02a3de2848589c28887f",
+    "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6",
+)
+HIL_2615_BLD5_TARGET = HilTarget(
+    connector_id="510baddb-8eff-4817-bc48-549ee34bbd0f",
+    mac="ac:27:6e:a4:4e:d4", terminal_serial="PGB1261300022",
+)
+HIL_2615_BLD5_TARGETS = (*HIL_269_EXACT_TARGETS, HIL_2615_BLD5_TARGET)
 # The live 3FL connector boots the signed 2.4.12 application from factory.
 # A direct 2.6.x boot would lack a qualified predecessor in the other OTA
 # slot. Bridge only this exact device through the already published 2.5.2
@@ -275,6 +288,15 @@ def _parallel_hil_prefix(release: FirmwareRelease, targets: list[HilTarget]) -> 
     return HIL_269_PARALLEL_PREFIX_SIZE if exact_scope and (published_269 or signed_patch) else 0
 
 
+def _is_2615_bld5_extension(release: FirmwareRelease, targets: list[HilTarget]) -> bool:
+    return (
+        release.state == "HIL_ONLY"
+        and (release.release_id, release.version, release.git_sha,
+             release.image_sha256, _application_sha256(release)) == HIL_2615_BLD5_IDENTITY
+        and tuple(targets) == HIL_2615_BLD5_TARGETS
+    )
+
+
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
@@ -283,7 +305,10 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
     targets = parse_hil_targets(raw)
     configured = parse_hil_targets(json.loads(settings.firmware_hil_targets_json))
-    if targets != configured:
+    bld5_extension = _is_2615_bld5_extension(release, targets)
+    if targets != configured and not (
+        bld5_extension and tuple(configured) == HIL_269_EXACT_TARGETS
+    ):
         raise ValueError("Ordered HIL targets do not match the configured exact scope.")
     events = list(session.execute(
         select(FirmwareEvent, Connector, FirmwareDeployment)
@@ -310,12 +335,17 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
                 and deployment.status == "SUCCEEDED")
 
-    parallel_prefix = _parallel_hil_prefix(release, targets)
+    parallel_prefix = (HIL_269_PARALLEL_PREFIX_SIZE if bld5_extension
+                       else _parallel_hil_prefix(release, targets))
     if parallel_prefix:
-        pending = [target for target in targets[:parallel_prefix] if not accepted(target)]
+        independent = targets[:parallel_prefix]
+        if bld5_extension:
+            independent = [*independent, HIL_2615_BLD5_TARGET]
+        pending = [target for target in independent if not accepted(target)]
         if pending:
             return pending
-    for index, target in enumerate(targets[parallel_prefix:], start=parallel_prefix):
+    ordered_end = len(targets) - 1 if bld5_extension else len(targets)
+    for index, target in enumerate(targets[parallel_prefix:ordered_end], start=parallel_prefix):
         if not accepted(target):
             _require_previous_candidate_acceptance(session, release, targets, index)
             return [target]

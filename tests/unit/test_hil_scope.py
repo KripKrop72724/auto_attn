@@ -396,6 +396,168 @@ def test_signed_patch_exact_scope_keeps_first_three_independent(parallel_269_ses
         _permitted_hil_targets(session, release)
 
 
+@pytest.fixture
+def bld5_2615_session(parallel_269_session):
+    from zk_add.models import Connector, ZKTDevice
+    from zk_add.ota import HIL_2615_BLD5_IDENTITY, HIL_2615_BLD5_TARGET, HIL_2615_BLD5_TARGETS
+    from zk_add.storage_contract import LOCK_BASELINES, LOCK_BASELINE_IMAGES
+
+    session, release, devices, zones = parallel_269_session
+    release.release_id, release.version, release.git_sha, release.image_sha256, application = (
+        HIL_2615_BLD5_IDENTITY
+    )
+    release.manifest = {
+        **release.manifest,
+        "application_sha256": application,
+        "_hil_targets": [target.model_dump() for target in HIL_2615_BLD5_TARGETS],
+        "queue_storage": {
+            **release.manifest["queue_storage"],
+            "allowed_bootstrap_versions": list(LOCK_BASELINES),
+            "allowed_bootstrap_images": LOCK_BASELINE_IMAGES,
+        },
+    }
+    target = HIL_2615_BLD5_TARGET
+    device = Connector(
+        connector_id=target.connector_id, hardware_id=target.mac,
+        zone_id="LF-ZONE-BLD5-01", zone_name="BLD5", device_id="1",
+        display_name="LF-ZONE-BLD5-01", connected=True, is_spare=False,
+        firmware_version="zone-lite-2.4.12", ota_capable=True,
+        ota_secure_boot=True, ota_rollback_enabled=True,
+        ota_partition_layout="zone-lite-ota-v1", ota_running_partition="ota_0",
+        ota_image_sha256=LOCK_BASELINE_IMAGES["2.4.12"],
+    )
+    device.zkt_device = ZKTDevice(
+        serial=target.terminal_serial, expected_serial=target.terminal_serial,
+        confirmed_serial=target.terminal_serial, terminal_binding_state="CONFIRMED",
+    )
+    session.add(device)
+    session.flush()
+    return session, release, [*devices, device], (*zones, device.zone_id)
+
+
+def test_2615_bld5_can_update_independently_with_original_configured_scope(bld5_2615_session):
+    from zk_add.ota import (
+        HIL_2615_BLD5_TARGET, HIL_269_EXACT_TARGETS, _permitted_hil_targets,
+        assignment_for_connector, create_campaign, preview_campaign_scope, resolve_download,
+    )
+
+    session, release, devices, zones = bld5_2615_session
+    assert _permitted_hil_targets(session, release) == [
+        *HIL_269_EXACT_TARGETS[:3], HIL_2615_BLD5_TARGET,
+    ]
+    scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[5])
+    assert [row["connector_id"] for row in scope["eligible"]] == [devices[5].connector_id]
+    run = create_campaign(
+        session, release_public_id=release.release_id, zone_id=zones[5],
+        reason="Requested exact BLD5 HIL", typed_confirmation=release.version,
+        actor="test-admin", scope_token=scope["scope_token"], idempotency_key="bld5-hil",
+    )
+    assert run.eligible_count == 1
+    offer = assignment_for_connector(session, connector=devices[5], public_base="https://test.invalid")
+    assert offer is not None
+    session.flush()
+    grant = offer["download_url"].rsplit("/", 1)[1]
+    assert resolve_download(session, grant)[0] == release
+    devices[5].zkt_device.confirmed_serial = "replacement"
+    with pytest.raises(ValueError, match="exact target mismatch"):
+        resolve_download(session, grant)
+    for index in (3, 4):
+        with pytest.raises(ValueError, match="exact target is not active"):
+            preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[index])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("git_sha", "0" * 40), ("image_sha256", "0" * 64),
+    ("version", "2.6.14"), ("release_id", "other-release"),
+    ("application_sha256", "0" * 64),
+    ("target_serial", "replacement"), ("target_mac", "00:11:22:33:44:55"),
+    ("target_connector", "other-connector"), ("target_order", None),
+])
+def test_bld5_extension_rejects_changed_signed_identity_or_scope(bld5_2615_session, field, value):
+    from zk_add.ota import _permitted_hil_targets
+
+    session, release, _devices, _zones = bld5_2615_session
+    if field == "application_sha256":
+        release.manifest = {**release.manifest, field: value}
+    elif field.startswith("target_"):
+        targets = [dict(row) for row in release.manifest["_hil_targets"]]
+        if field == "target_order":
+            targets[4], targets[5] = targets[5], targets[4]
+        else:
+            key = {"target_serial": "terminal_serial", "target_mac": "mac",
+                   "target_connector": "connector_id"}[field]
+            targets[5][key] = value
+        release.manifest = {**release.manifest, "_hil_targets": targets}
+    else:
+        setattr(release, field, value)
+    with pytest.raises(ValueError, match="configured exact scope"):
+        _permitted_hil_targets(session, release)
+
+
+def test_bld5_factory_requires_verified_ota_predecessor(bld5_2615_session):
+    from zk_add.ota import preview_campaign_scope
+
+    session, release, devices, zones = bld5_2615_session
+    device = devices[5]
+    device.firmware_version = "zone-lite-2.5.2"
+    device.ota_running_partition = "factory"
+    device.ota_image_sha256 = "27128790bde3ce3d0e5e697bb35189379cda8600f5179fab075f127c2dc9671b"
+    with pytest.raises(ValueError, match="DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[5])
+    device.firmware_version = "zone-lite-2.4.12"
+    device.ota_running_partition = "ota_0"
+    with pytest.raises(ValueError, match="DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[5])
+
+
+def test_bld5_extension_keeps_peshawar_gated_on_formal_acceptance(bld5_2615_session):
+    from sqlalchemy import select
+    from zk_add.ota import (
+        FirmwareDeployment, FirmwareEvent, HIL_2615_BLD5_TARGET, HIL_2615_BLD5_TARGETS,
+        HIL_269_EXACT_TARGETS, _permitted_hil_targets, create_campaign, preview_campaign_scope,
+    )
+
+    session, release, _devices, zones = bld5_2615_session
+    for index in (0, 1, 2, 5):
+        if index == 5:
+            assert _permitted_hil_targets(session, release) == [HIL_2615_BLD5_TARGET]
+            with pytest.raises(ValueError, match="exact target is not active"):
+                preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[3])
+        scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zones[index])
+        run = create_campaign(
+            session, release_public_id=release.release_id, zone_id=zones[index],
+            reason="Independent exact HIL", typed_confirmation=release.version,
+            actor="test-admin", scope_token=scope["scope_token"],
+            idempotency_key=f"bld5-accept-{index}",
+        )
+        deployment = session.scalar(select(FirmwareDeployment).where(
+            FirmwareDeployment.campaign_id == run.id,
+        ))
+        deployment.status = "SUCCEEDED"
+        session.add(FirmwareEvent(
+            deployment_id=deployment.id, state="HIL_ACCEPTED",
+            details={
+                "outcome": "PASS", "target": HIL_2615_BLD5_TARGETS[index].model_dump(),
+                "git_sha": release.git_sha, "artifact_sha256": release.image_sha256,
+                "application_sha256": release.manifest["application_sha256"],
+            },
+        ))
+        session.flush()
+    assert _permitted_hil_targets(session, release) == [HIL_269_EXACT_TARGETS[3]]
+
+
+def test_bld5_scope_preserves_original_publication_targets():
+    import json
+    from pathlib import Path
+    from zk_add.ota import HIL_2615_BLD5_TARGETS
+
+    root = Path(__file__).resolve().parents[2] / "deploy/add"
+    original = json.loads((root / "hil-targets-2.6.15.json").read_text())
+    extended = json.loads((root / "hil-targets-2.6.15-bld5.json").read_text())
+    assert extended[:5] == original
+    assert extended == [target.model_dump() for target in HIL_2615_BLD5_TARGETS]
+
+
 def test_252_factory_bridge_selects_only_live_3fl_and_rechecks_grant(parallel_269_session, monkeypatch):
     from zk_add.models import Connector, ZKTDevice
     from zk_add.ota import (
