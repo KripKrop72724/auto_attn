@@ -1,10 +1,16 @@
-name: Extend signed ZKT HIL scope to Swat and Peshawar
+name: Extend reviewed signed ZKT HIL scope
 
 on:
   workflow_dispatch:
     inputs:
+      scope:
+        description: Exact reviewed scope extension
+        required: true
+        default: '2.6.0'
+        type: choice
+        options: ['2.6.0', '2.6.15-bld5']
       confirmation:
-        description: Type EXTEND-2.6.0-HIL to append the reviewed exact devices
+        description: Type EXTEND-2.6.0-HIL or EXTEND-2.6.15-BLD5-HIL for the selected scope
         required: true
         type: string
 
@@ -24,10 +30,15 @@ jobs:
       - name: Require the exact reviewed confirmation and green main commit
         env:
           CONFIRMATION: ${{ inputs.confirmation }}
+          RELEASE_SCOPE: ${{ inputs.scope }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$CONFIRMATION" = 'EXTEND-2.6.0-HIL'
+          case "$RELEASE_SCOPE" in
+            2.6.0) test "$CONFIRMATION" = 'EXTEND-2.6.0-HIL' ;;
+            2.6.15-bld5) test "$CONFIRMATION" = 'EXTEND-2.6.15-BLD5-HIL' ;;
+            *) exit 1 ;;
+          esac
           gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" > /tmp/hil-extension-checks.json
           python3 - <<'PYCODE'
           import json
@@ -53,6 +64,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Preflight both immutable signed releases before changing either marker
+        if: inputs.scope != '2.6.15-bld5'
         run: |
           $ErrorActionPreference = 'Stop'
           if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'Production firmware store is not configured' }
@@ -84,3 +96,19 @@ jobs:
               -ExistingTargetsJson $old `
               -ExtendedTargetsJson $new
           }
+      - name: Extend only the BLD5 quarantine marker for the immutable 2.6.15 image
+        if: inputs.scope == '2.6.15-bld5'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'Production firmware store is not configured' }
+          $arguments = @{
+            StoreDirectory = $env:ADD_FIRMWARE_STORE_HOST_PATH
+            Version = '2.6.15'
+            ExpectedGitSha = 'a88998346d5b1ce1ddf4d19e3963b7245e46633b'
+            ExpectedImageSha256 = 'e2a2167fca307d73dbeb495bcc26baa535591794066b02a3de2848589c28887f'
+            ExpectedApplicationSha256 = '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6'
+            ExistingTargetsJson = Get-Content -LiteralPath 'deploy/add/hil-targets-2.6.15.json' -Raw
+            ExtendedTargetsJson = Get-Content -LiteralPath 'deploy/add/hil-targets-2.6.15-bld5.json' -Raw
+          }
+          ./deploy/add/extend-ordered-hil-scope.ps1 @arguments -PreviewOnly
+          ./deploy/add/extend-ordered-hil-scope.ps1 @arguments
