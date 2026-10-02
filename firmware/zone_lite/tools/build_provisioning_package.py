@@ -58,7 +58,7 @@ def validate_request(values: dict) -> dict:
     zone_id = required_text(values, "zone_id", 64)
     if not IDENTIFIER_PATTERN.fullmatch(zone_device_id):
         raise ValueError("Invalid provisioning field: zone_device_id")
-    if not IDENTIFIER_PATTERN.fullmatch(zone_id):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._&-]*", zone_id):
         raise ValueError("Invalid provisioning field: zone_id")
     zone_name = required_text(values, "zone_name", 120)
     if zone_name != zone_name.strip() or any(ord(char) < 32 or ord(char) == 127 for char in zone_name):
