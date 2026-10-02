@@ -11,6 +11,11 @@ on:
         description: 'Optional comma-separated attendance row IDs (up to 30) for boolean-only CNIC guard diagnostics'
         required: false
         type: string
+      normal_oracle_content_check:
+        description: 'Opt in to read-only Oracle content checks for exact attendance row IDs (up to 30); never sends attendance'
+        required: false
+        default: false
+        type: boolean
       firmware_campaign_id:
         description: 'Optional exact firmware campaign ID for read-only assignment diagnostics'
         required: false
@@ -40,6 +45,7 @@ jobs:
         env:
           DIRECT_RUN_ID: ${{ inputs.direct_run_id }}
           ATTENDANCE_EVENT_ID: ${{ inputs.attendance_event_id }}
+          NORMAL_ORACLE_CONTENT_CHECK: ${{ inputs.normal_oracle_content_check }}
         run: |
           $ErrorActionPreference = 'Stop'
           $api = 'attendance-device-dashboard-add-api-1'
@@ -64,6 +70,9 @@ jobs:
           }
           if ($env:DIRECT_RUN_ID) {
             $diagnosticArgs += @('--direct-run-id', $env:DIRECT_RUN_ID)
+          }
+          if ($env:NORMAL_ORACLE_CONTENT_CHECK -eq 'true') {
+            $diagnosticArgs += '--normal-oracle-content-check'
           }
           $script | & docker exec -i $api python - @diagnosticArgs
           if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }

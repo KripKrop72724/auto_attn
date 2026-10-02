@@ -92,7 +92,7 @@ def check_response_summary(response, payload):
     return summary
 
 
-def probe_saved_direct_checks(checks):
+def probe_saved_direct_checks(checks, *, limit=3, timeout=15):
     """POST only the read-only content verifier; never send an attendance write."""
     import httpx
     from zk_add.settings import settings
@@ -102,16 +102,235 @@ def probe_saved_direct_checks(checks):
         return {"configured": False}
     url = settings.ords_base_url.rstrip("/") + "/raw-captures/identity-repairs/check"
     results = []
-    with httpx.Client(timeout=15, headers={
+    with httpx.Client(timeout=timeout, headers={
         "X-API-Username": settings.attendance_repair_ords_username,
         "X-API-Password": settings.attendance_repair_ords_password,
     }, follow_redirects=False) as client:
-        for check in checks[:3]:
+        for check in checks[:min(30, max(0, limit))]:
             try:
                 results.append(check_response_summary(client.post(url, json=check), check))
             except httpx.RequestError:
                 results.append({"error_code": "ORDS_TRANSPORT_ERROR", "shape": check_payload_shape(check)})
     return {"configured": True, "checks": results}
+
+
+def normal_source_ownership_proven(session, event, connector):
+    """Verify source bytes/custody, keeping record UID separate from identity."""
+    from zoneinfo import ZoneInfo
+    from sqlalchemy import select
+    from zk_add.attendance_recovery import _decode_zkt_record
+    from zk_add.models import TerminalRecordManifest, TerminalSourceEpoch
+    from zk_add.time_utils import ensure_utc
+
+    rows = session.execute(select(TerminalRecordManifest, TerminalSourceEpoch).join(
+        TerminalSourceEpoch, TerminalSourceEpoch.id == TerminalRecordManifest.source_epoch_id,
+    ).where(
+        TerminalRecordManifest.attendance_event_id == event.id,
+        TerminalRecordManifest.canonical_source.is_(True),
+        TerminalSourceEpoch.state == "ACTIVE",
+    ).order_by(TerminalRecordManifest.id.desc()).limit(31)).all()
+    if not rows or len(rows) > 30:
+        return False
+    # Match Zone Lite's decode_zk_time/iso_from_zk_time without normalizing facts.
+    local = ensure_utc(event.device_event_time).astimezone(ZoneInfo("Asia/Karachi"))
+    raw_time = (((((local.year - 2000) * 12 + local.month - 1) * 31 + local.day - 1)
+                 * 24 + local.hour) * 60 + local.minute) * 60 + local.second
+    for manifest, epoch in rows:
+        if not (
+            manifest.connector_id == connector.id == event.connector_id
+            and manifest.zkt_device_id == event.zkt_device_id == epoch.zkt_device_id
+            and manifest.terminal_serial == event.device_serial
+            and epoch.terminal_generation == manifest.generation
+            and manifest.disposition in {"EVENT", "BLOCKED_IDENTITY"}
+            and (not manifest.observed_user_id or manifest.observed_user_id == event.user_id)
+        ):
+            return False
+        decoded = _decode_zkt_record(manifest)
+        record_uid_matches = bool(
+            manifest.record_size == 40 and decoded["uid"] == manifest.observed_uid
+            and decoded["uid"] == (event.raw_event or {}).get("attendance_record_uid")
+            and manifest.observed_user_id == event.user_id
+            and (event.raw_event or {}).get("terminal_provenance") == "VERIFIED_SOURCE_REPLAY"
+        )
+        if not (
+            (decoded["uid"] == event.uid or record_uid_matches)
+            and decoded["user_id"] == event.user_id
+            and decoded["status"] == event.status and decoded["punch"] == event.punch
+            and decoded["raw_timestamp"] == manifest.raw_timestamp == raw_time
+            and event.device_event_time.microsecond == 0
+        ):
+            return False
+    return True
+
+
+def normal_content_check(session, event):
+    """Construct a check only after revalidating the normal delivery proof."""
+    from zk_add.attendance_manual_guard import decision_for, delivery_authorized
+    from zk_add.attendance_recovery import _terminal_provenance_verified
+    from zk_add.attendance_repair import _identity_digest, _immutable_facts, _protected_digest
+    from zk_add.attendance_safe_repair import delivery_proof_valid
+    from zk_add.crypto import cnic_lookup, decrypt_cnic
+    from zk_add.models import Connector, DeviceUser
+    from zk_add.service import oracle_payload, synced_cnic_identity_proven
+
+    guards = {name: False for name in (
+        "event_present", "event_uid_valid", "normal_resolution", "normal_delivery_state",
+        "no_manual_override", "retained_owner_matches", "terminal_provenance_verified",
+        "current_roster_valid", "snapshot_pin_matches", "current_identity_matches", "bound_source_proven",
+        "delivery_authorized", "delivery_proof_valid", "acknowledged_identity_proven",
+        "normal_identity_proven", "check_shape_valid",
+    )}
+    guards["guard_evaluation_failed"] = False
+    guards["event_present"] = event is not None
+    if event is None:
+        return guards, None
+    try:
+        guards["event_uid_valid"] = bool(re.fullmatch(r"[0-9a-f]{64}", event.event_uid or ""))
+        guards["normal_resolution"] = bool(
+            event.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+            and event.identity_repair_reason == "VERIFIED_SYNCED_CNIC"
+        )
+        guards["normal_delivery_state"] = event.ords_status in {
+            "PENDING", "IN_FLIGHT", "FAILED_RETRYABLE", "RETRYING", "ACKED", "ACKED_CHECK",
+        }
+        guards["no_manual_override"] = bool(
+            not event.manual_release_required and decision_for(session, event) is None
+        )
+        connector = session.get(Connector, event.connector_id)
+        zkt = connector.zkt_device if connector else None
+        user = session.get(DeviceUser, event.device_user_id) if event.device_user_id else None
+        guards["retained_owner_matches"] = bool(
+            connector and zkt and connector.firmware_family == "zkt"
+            and zkt.connector_id == event.connector_id and zkt.id == event.zkt_device_id
+        )
+        guards["terminal_provenance_verified"] = bool(
+            guards["retained_owner_matches"] and event.device_serial
+            and zkt.terminal_binding_state == "CONFIRMED"
+            and _terminal_provenance_verified(event, connector)
+        )
+        guards["current_roster_valid"] = bool(
+            zkt and user and zkt.snapshot_complete and zkt.identity_snapshot_stable
+            and zkt.identity_snapshot_id
+            and user.zkt_device_id == zkt.id and user.present
+            and user.user_id == event.user_id and user.uid == event.uid
+            and user.lifecycle_state == "ACTIVE" and user.identity_conflict_code is None
+            and user.snapshot_revision == zkt.identity_snapshot_revision
+        )
+        guards["snapshot_pin_matches"] = bool(
+            zkt and zkt.identity_snapshot_id and event.identity_snapshot_id == zkt.identity_snapshot_id
+        )
+        cnic = decrypt_cnic(event.cnic_encrypted)
+        current_cnic = decrypt_cnic(user.cnic_encrypted) if user else None
+        guards["current_identity_matches"] = bool(
+            cnic and current_cnic and cnic == current_cnic
+            and cnic_lookup(cnic) == event.cnic_lookup_hash == user.cnic_lookup_hash
+        )
+        guards["bound_source_proven"] = bool(
+            guards["terminal_provenance_verified"] and normal_source_ownership_proven(session, event, connector)
+        )
+        guards["delivery_authorized"] = bool(delivery_authorized(session, event))
+        guards["delivery_proof_valid"] = bool(
+            guards["normal_resolution"] and guards["current_roster_valid"]
+            and guards["current_identity_matches"] and guards["bound_source_proven"]
+            and delivery_proof_valid(session, event, connector)
+        )
+        # The pre-send gate stays strict. For an already acknowledged row, a
+        # later identical roster observation need not invalidate its captured
+        # CNIC proof during this read-only comparison; no snapshot is rewritten.
+        guards["acknowledged_identity_proven"] = bool(
+            event.ords_status in {"ACKED", "ACKED_CHECK"} and event.oracle_confirmed_at
+            and guards["normal_resolution"] and guards["current_roster_valid"]
+            and guards["current_identity_matches"] and guards["bound_source_proven"]
+            and event.captured_cnic_lookup_hash
+            and event.captured_cnic_lookup_hash == event.cnic_lookup_hash
+            and synced_cnic_identity_proven(session, connector, zkt, user, event)
+        )
+        guards["normal_identity_proven"] = bool(
+            guards["delivery_proof_valid"] or guards["acknowledged_identity_proven"]
+        )
+        if not all(value for name, value in guards.items() if name not in {
+            "guard_evaluation_failed", "check_shape_valid", "snapshot_pin_matches",
+            "delivery_proof_valid", "acknowledged_identity_proven",
+        }):
+            return guards, None
+        payload = oracle_payload(connector, zkt, event, cnic)
+        facts = _immutable_facts(event)
+        check = {
+            "contract_version": "1", "connector_id": connector.connector_id,
+            "terminal_serial": event.device_serial, "items": [{
+                "event_uid": payload["event_uid"], "immutable_facts": facts,
+                "immutable_facts_digest": _protected_digest(facts),
+                "desired_identity": {
+                    "employee_name": payload["employee_name"], "cnic": payload["cnic"],
+                    "identity_digest": _identity_digest(payload["employee_name"], payload["cnic"]),
+                },
+            }],
+        }
+        guards["check_shape_valid"] = all(check_payload_shape(check).values())
+        return guards, check if guards["check_shape_valid"] else None
+    except Exception:
+        guards["guard_evaluation_failed"] = True
+        return guards, None
+
+
+def oracle_normal_event_diagnostics(attendance_event_ids):
+    """Exact opt-in rows only; rollback the read-only snapshot before HTTP."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+    from zk_add.db import engine
+    from zk_add.models import AttendanceEvent
+
+    if not attendance_event_ids or len(attendance_event_ids) > 30 or any(
+        not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 2_000_000_000
+        for value in attendance_event_ids
+    ):
+        return {"failed": True, "rows": []}
+    event_ids = list(dict.fromkeys(attendance_event_ids))
+    rows, checks = [], []
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("SET LOCAL statement_timeout = '5s'"))
+            connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+            try:
+                with Session(bind=connection, autoflush=False) as session:
+                    for event_id in event_ids:
+                        guards, check = normal_content_check(session, session.get(AttendanceEvent, event_id))
+                        rows.append({
+                            "event_id": event_id, "eligible": check is not None, "guards": guards,
+                            "checked": False, "content_match": False,
+                            "classification": None if check is not None else "SKIPPED",
+                        })
+                        if check is not None:
+                            checks.append((rows[-1], check))
+            finally:
+                connection.rollback()
+        # Only in-memory request material crosses this boundary. No claim,
+        # approval, resend, receipt activation, or identity update is performed.
+        probe = probe_saved_direct_checks([check for _row, check in checks], limit=30, timeout=5)
+        for (row, _check), summary in zip(checks, probe.get("checks", [])):
+            row.update({
+                "checked": True,
+                "classification": summary.get("classification"),
+                "response": {
+                    "http_ok": summary.get("http_status") == 200,
+                    "shape": summary.get("shape", {}),
+                    "response_shape_valid": bool(summary.get("response_shape_valid")),
+                    "token_format_valid": bool(summary.get("token_format_valid")),
+                    "error_present": bool(summary.get("error_code")),
+                },
+                "content_match": bool(
+                    summary.get("http_status") == 200 and summary.get("response_shape_valid")
+                    and summary.get("token_format_valid") and summary.get("classification") == "MATCH"
+                    and not summary.get("error_code")
+                ),
+            })
+        return {"configured": bool(probe.get("configured")), "failed": False, "rows": rows}
+    except Exception:
+        return {"failed": True, "rows": [
+            {"event_id": value, "eligible": False, "checked": False, "content_match": False,
+             "classification": "SKIPPED"} for value in event_ids
+        ]}
 
 
 def oracle_direct_run_diagnostics(direct_run_id, attendance_event_ids=None):
@@ -559,6 +778,7 @@ def main():
     parser.add_argument("--logs", action="store_true")
     parser.add_argument("--direct-run-id")
     parser.add_argument("--attendance-event-id")
+    parser.add_argument("--normal-oracle-content-check", action="store_true")
     args = parser.parse_args()
     if args.direct_run_id and not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.direct_run_id):
         parser.error("direct run ID must be a UUID")
@@ -571,6 +791,10 @@ def main():
         ):
             parser.error("provide up to 30 positive attendance database IDs")
         attendance_event_ids = [int(token) for token in tokens]
+    if args.normal_oracle_content_check and (
+        not attendance_event_ids or args.logs or args.direct_run_id
+    ):
+        parser.error("normal content checks require exact attendance IDs and no logs/direct run mode")
     result = (
         summarize_logs(sys.stdin) if args.logs
         else database_report(args.direct_run_id, attendance_event_ids)
@@ -579,6 +803,8 @@ def main():
         result["direct_oracle_check"] = oracle_direct_run_diagnostics(
             args.direct_run_id, attendance_event_ids,
         )
+    if args.normal_oracle_content_check:
+        result["normal_oracle_check"] = oracle_normal_event_diagnostics(attendance_event_ids)
     print(json.dumps(result, default=str, sort_keys=True))
 
 
