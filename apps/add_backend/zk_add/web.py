@@ -3245,13 +3245,25 @@ def attendance(
     rows = [event for event, _cnic_not_linked in results]
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
     page_rows = rows[:limit]
+    source_connectors = {
+        connector.id: connector
+        for connector in db.scalars(
+            select(Connector).where(
+                Connector.id.in_({row.connector_id for row in page_rows})
+            )
+        ).all()
+    } if page_rows else {}
     release_states = attendance_release_states(db, page_rows)
     force_metadata = force_release.metadata_for_page(db, page_rows)
     direct_ords_identity = direct_ords.identity_hints_for_page(db, page_rows)
     return {
         "rows": [
             {
-                **serialize_attendance(row, release_states.get(row.id)),
+                **serialize_attendance(
+                    row,
+                    release_states.get(row.id),
+                    source_connector=source_connectors.get(row.connector_id),
+                ),
                 "force_release": force_metadata.get(row.id),
                 "direct_ords_identity": direct_ords_identity.get(row.id),
                 "cnic_not_linked": bool(results[index][1]),
@@ -4542,6 +4554,8 @@ def serialize_identity_resolution(row: IdentityConflictResolution) -> dict:
 def serialize_attendance(
     row: AttendanceEvent,
     release: dict | None = None,
+    *,
+    source_connector: Connector | None = None,
 ) -> dict:
     try:
         cnic_masked = mask_cnic(decrypt_cnic(row.cnic_encrypted))
@@ -4549,7 +4563,10 @@ def serialize_attendance(
         # A damaged saved identity must remain visible for manual review.
         cnic_masked = None
     raw_provenance = (row.raw_event or {}).get("terminal_provenance")
-    if raw_provenance == "VERIFIED_CONNECTOR_BINDING":
+    if row.device_serial and raw_provenance == "VERIFIED_SOURCE_REPLAY":
+        provenance_state = "VERIFIED_SOURCE_REPLAY"
+        provenance_explanation = "Terminal serial was verified by a matching terminal source reread."
+    elif row.device_serial and raw_provenance == "VERIFIED_CONNECTOR_BINDING":
         provenance_state = "VERIFIED_CONNECTOR_BINDING"
         provenance_explanation = "Terminal serial was bound to this connector at capture time."
     elif row.device_serial:
@@ -4562,10 +4579,22 @@ def serialize_attendance(
         "id": row.id,
         "event_uid": row.event_uid,
         "device_serial": row.device_serial,
+        # Retained connector custody is distinct from physical terminal proof.
+        # Labels are current inventory metadata for the retained owner FK,
+        # not evidence of the terminal's historical location.
+        # Never infer a missing capture-time serial from the current binding.
+        "source_connector": {
+            "connector_id": source_connector.connector_id,
+            "display_name": source_connector.display_name,
+            "zone_id": source_connector.zone_id,
+            "zone_name": source_connector.zone_name,
+        } if source_connector is not None and source_connector.id == row.connector_id else None,
         "terminal_provenance": {
             "state": provenance_state,
             "serial": row.device_serial,
-            "confidence": "VERIFIED" if provenance_state == "VERIFIED_CONNECTOR_BINDING" else "REVIEW_REQUIRED",
+            "confidence": "VERIFIED" if provenance_state in {
+                "VERIFIED_CONNECTOR_BINDING", "VERIFIED_SOURCE_REPLAY",
+            } else "REVIEW_REQUIRED",
             "explanation": provenance_explanation,
         },
         "uid": row.uid,

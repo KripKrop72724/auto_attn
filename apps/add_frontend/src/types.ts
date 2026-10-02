@@ -1332,6 +1332,12 @@ export interface AttendanceEvent {
   id: number
   event_uid: string
   device_serial: string | null
+  source_connector?: {
+    connector_id: string
+    display_name: string
+    zone_id: string
+    zone_name: string
+  } | null
   terminal_provenance?: {
     state: string
     serial: string | null

@@ -238,6 +238,45 @@ describe('Live attendance workspace', () => {
     expect(within(row).getByText('event-one')).toBeTruthy()
   })
 
+  it('shows retained connector and zone custody without inventing a terminal serial', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [event({
+      device_serial: null,
+      source_connector: {
+        connector_id: 'karachi-connector', display_name: 'ZONE-KARACHI-01',
+        zone_id: 'ZONE-KARACHI', zone_name: 'Karachi',
+      },
+      terminal_provenance: {
+        state: 'MISSING_TERMINAL_PROVENANCE', serial: null, confidence: 'REVIEW_REQUIRED',
+        explanation: 'The saved punch has no verified terminal serial.',
+      },
+      source: 'DUMP_RECONNECT', ords_status: 'BLOCKED_IDENTITY',
+    })], next_cursor: null })))
+    render(<AttendanceView {...attendanceProps} />)
+
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
+    expect(within(row).getByText('Source connector: ZONE-KARACHI-01')).toBeTruthy()
+    expect(within(row).getByText('Current connector zone: Karachi')).toBeTruthy()
+    expect(within(row).queryByText('Zone: Karachi')).toBeNull()
+    const warning = within(row).getByText('Terminal provenance unavailable')
+    expect(warning.getAttribute('title')).toBe('The saved punch has no verified terminal serial.')
+    expect(warning.classList.contains('attention-copy')).toBe(true)
+    expect(within(row).queryByText(device.display_name)).toBeNull()
+    expect(within(row).queryByText(device.zkt!.serial!)).toBeNull()
+    expect(within(row).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
+  })
+
+  it('keeps the provenance warning when connector custody is unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      rows: [event({ device_serial: null, source_connector: null })], next_cursor: null,
+    })))
+    render(<AttendanceView {...attendanceProps} />)
+
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
+    expect(within(row).getByText('Source connector unavailable')).toBeTruthy()
+    expect(within(row).getByText('Terminal provenance unavailable')).toBeTruthy()
+    expect(within(row).queryByText(device.display_name)).toBeNull()
+  })
+
   it('updates delivery state in place and queues unseen events when the reader is away from the top', async () => {
     const first = event()
     const second = event({ id: 2, event_uid: 'event-two', display_name: 'Bilal Ahmed', user_id: '1008', uid: '8', punch: '1' })
