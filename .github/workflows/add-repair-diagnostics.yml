@@ -63,7 +63,8 @@ jobs:
           }
           & docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}}' $api $web
           if ($LASTEXITCODE -ne 0) { throw 'Could not read bounded container resource counters.' }
-          $script = Get-Content -Raw 'scripts/attendance_repair_diagnostics.py'
+          $script = Get-Content -Raw -Encoding UTF8 'scripts/attendance_repair_diagnostics.py'
+          if ([string]::IsNullOrWhiteSpace($script)) { throw 'Read-only diagnostic source is empty.' }
           $diagnosticArgs = @()
           if ($env:ATTENDANCE_EVENT_ID) {
             $diagnosticArgs += @('--attendance-event-id', $env:ATTENDANCE_EVENT_ID)
@@ -74,8 +75,69 @@ jobs:
           if ($env:NORMAL_ORACLE_CONTENT_CHECK -eq 'true') {
             $diagnosticArgs += '--normal-oracle-content-check'
           }
-          $script | & docker exec -i $api python - @diagnosticArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
+          $scriptPath = "/tmp/add-repair-state-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.py"
+          $previousEncoding = $OutputEncoding
+          $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+          $installed = $false
+          $diagnosticFailed = $false
+          try {
+            # Use the same file invocation as the log summary; Python must not
+            # execute a possibly empty/truncated Windows Docker stdin stream.
+            $script | & docker exec -i $api python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())' $scriptPath
+            if ($LASTEXITCODE -ne 0) { throw 'Could not install the temporary diagnostic script.' }
+            $installed = $true
+            # Keep stdout in memory until the sanitized report is validated.
+            try { $reportLines = @(& docker exec $api python $scriptPath @diagnosticArgs 2>$null) }
+            catch { throw 'Read-only database diagnostics failed.' }
+            if ($LASTEXITCODE -ne 0) { throw 'Read-only database diagnostics failed.' }
+            $reportText = $reportLines -join "`n"
+            if ([string]::IsNullOrWhiteSpace($reportText)) { throw 'Read-only diagnostics returned no report.' }
+            try { $report = $reportText | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw 'Read-only diagnostics returned an invalid JSON report.' }
+            if ($null -eq $report -or $report -isnot [System.Management.Automation.PSCustomObject] -or
+                $report.PSObject.Properties.Name -notcontains 'flags') {
+              throw 'Read-only diagnostics returned an invalid report object.'
+            }
+            if ($env:NORMAL_ORACLE_CONTENT_CHECK -eq 'true') {
+              $normal = $report.normal_oracle_check
+              if ($null -eq $normal -or $normal -isnot [System.Management.Automation.PSCustomObject] -or
+                  $normal.failed -isnot [bool] -or
+                  ($normal.PSObject.Properties.Name -contains 'configured' -and $normal.configured -isnot [bool])) {
+                throw 'Normal Oracle content diagnostics returned an invalid report object.'
+              }
+              $expectedIds = @($env:ATTENDANCE_EVENT_ID.Split(',') | ForEach-Object { [long]$_ } | Select-Object -Unique)
+              $rows = @($normal.rows)
+              $actualIds = @($rows | ForEach-Object {
+                if ($null -eq $_ -or ($_.event_id -isnot [long] -and $_.event_id -isnot [int])) {
+                  throw 'Normal Oracle content diagnostics returned an invalid event ID.'
+                }
+                [long]$_.event_id
+              })
+              if ($expectedIds.Count -eq 0 -or $rows.Count -ne $expectedIds.Count -or
+                  @($actualIds | Select-Object -Unique).Count -ne $actualIds.Count -or
+                  @(Compare-Object $expectedIds $actualIds).Count -ne 0) {
+                throw 'Normal Oracle content diagnostics did not return the exact requested events.'
+              }
+            }
+            Write-Output $reportText
+            if ($env:NORMAL_ORACLE_CONTENT_CHECK -eq 'true') {
+              if ($normal.failed -ne $false -or $normal.configured -ne $true) {
+                throw 'Normal Oracle content diagnostics are unavailable or unconfigured.'
+              }
+              if (@($rows | Where-Object { $_.checked -eq $true }).Count -eq 0) {
+                throw 'Normal Oracle content diagnostics performed no checks.'
+              }
+            }
+          } catch {
+            $diagnosticFailed = $true
+            throw
+          } finally {
+            $OutputEncoding = $previousEncoding
+            if ($installed) {
+              & docker exec $api python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)' $scriptPath
+              if ($LASTEXITCODE -ne 0 -and -not $diagnosticFailed) { throw 'Could not remove the temporary diagnostic script.' }
+            }
+          }
 
       - name: Check protected Oracle verification capability without sending attendance
         env:
