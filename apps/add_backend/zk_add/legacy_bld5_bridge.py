@@ -1,4 +1,4 @@
-"""Bridge the original 2.4.12 progress protocol on the exact BLD5 ZKT only.
+"""Bridge the original 2.4.12 protocol on the exact BLD5 and Lahore ZKTs.
 
 Legacy boot reports are transport acknowledgements, not installation proof.
 The ordinary checked transitions run only after a fresh signed capability
@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from zk_add.hil_scope import target_matches
+from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
 from zk_add.models import Connector, DeviceTelemetry
 from zk_add.ota import (
     FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareRelease,
@@ -17,16 +18,17 @@ from zk_add.ota import (
 from zk_add.time_utils import ensure_utc, utc_now
 
 
-BRIDGE_IDENTITY = (
-    "zone-lite-2.4.12", "2.4.12", "45690c400057eb343828fa5c13f4865866f8ed9c",
-    "7a939dff0f9e9787faf47a22ef2b6de21aa0a0352f04e3eae4762c2530107010",
-    "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
-)
+BRIDGE_IDENTITY = SIGNED_BRIDGE_IDENTITIES["2.4.12"]
+BRIDGE_TARGETS = {"LF-ZONE-BLD5-01": HIL_2615_BLD5_TARGET, **{
+    zone: CITY_TARGETS[zone] for zone, predecessor in CITY_FACTORY_PREDECESSORS.items()
+    if predecessor[2] == "2.4.12"
+}}
 
 
 def _bridge(session: Session, connector: Connector, deployment_id: str | None = None):
-    if (connector.firmware_family != "zkt" or connector.zone_id != "LF-ZONE-BLD5-01"
-            or not target_matches(HIL_2615_BLD5_TARGET, connector)):
+    target = BRIDGE_TARGETS.get(connector.zone_id)
+    if (connector.firmware_family != "zkt" or target is None
+            or not target_matches(target, connector)):
         return None
     query = select(FirmwareDeployment).join(FirmwareCampaign).where(
         FirmwareDeployment.connector_id == connector.id,
@@ -56,7 +58,7 @@ def _fresh_boot(session: Session, connector: Connector) -> str:
             or sample.boot_id != connector.boot_id
             or not 0 <= (utc_now() - ensure_utc(sample.created_at)).total_seconds() <= 45
             or not _versions_match((sample.payload or {}).get("firmware_version"), "2.4.12")):
-        raise ValueError("Fresh current-boot telemetry is required for the BLD5 legacy bridge.")
+        raise ValueError("Fresh current-boot telemetry is required for the exact legacy bridge.")
     return sample.boot_id
 
 

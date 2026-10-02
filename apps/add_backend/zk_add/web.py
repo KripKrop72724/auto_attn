@@ -1326,7 +1326,26 @@ async def confirm_device_terminal_binding(
         and zkt.confirmed_serial == zkt.serial
         and zkt.serial_confirmed_by == "MIGRATED_PREEXISTING"
     )
-    if zkt.terminal_binding_state != "SERIAL_CONFIRMATION_REQUIRED" and not migrated_binding_without_pin:
+    # An expired pin can leave the old binding pending even after firmware
+    # recovery. Reissue only the same previously confirmed identity, retaining
+    # password step-up and a new authenticated device acknowledgement.
+    previous_pin = db.scalar(select(DeviceCommand).where(
+        DeviceCommand.connector_id == connector.id,
+        DeviceCommand.command_type == "PIN_TERMINAL_SERIAL",
+    ).order_by(DeviceCommand.id.desc()).limit(1))
+    expired_matching_pin = bool(
+        zkt.terminal_binding_state == "PENDING_DEVICE_ACK"
+        and zkt.expected_serial == zkt.confirmed_serial == zkt.serial == body.observed_serial
+        and previous_pin is not None and previous_pin.status == "EXPIRED"
+        and decrypt_json(previous_pin.desired_state_encrypted).get("expected_serial") == zkt.serial
+        and db.scalar(select(DeviceCommand.id).where(
+            DeviceCommand.connector_id == connector.id,
+            DeviceCommand.command_type == "PIN_TERMINAL_SERIAL",
+            DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
+        ).limit(1)) is None
+    )
+    if (zkt.terminal_binding_state != "SERIAL_CONFIRMATION_REQUIRED"
+            and not migrated_binding_without_pin and not expired_matching_pin):
         raise HTTPException(
             status_code=409,
             detail="This terminal is not awaiting serial confirmation.",

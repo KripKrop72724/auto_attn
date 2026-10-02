@@ -5782,6 +5782,51 @@ def test_admin_can_repin_only_matching_migrated_terminal_binding(
         assert zkt.terminal_binding_state == "CONFIRMED"
 
 
+@pytest.mark.parametrize("changed,expected_status", [
+    (None, 202), ("active", 409), ("successful", 409),
+    ("expected_serial", 409), ("confirmed_serial", 409), ("prior_serial", 409),
+])
+def test_expired_terminal_pin_can_retry_only_the_same_confirmed_identity(
+    db: Session, changed: str | None, expected_status: int,
+):
+    connector = connector_fixture(db)
+    zkt = connector.zkt_device
+    zkt.terminal_binding_state = "PENDING_DEVICE_ACK"
+    zkt.confirmed_serial = zkt.expected_serial = zkt.serial = SERIAL
+    pin = create_command(
+        db, connector=connector, command_type="PIN_TERMINAL_SERIAL",
+        payload={"serial": SERIAL}, expected_state={"serial": SERIAL},
+        desired_state={"expected_serial": "replacement" if changed == "prior_serial" else SERIAL},
+        idempotency_key="old-pin", actor="StateHealthAdmin", expires_in_seconds=600,
+    )
+    pin.status = "WAITING_FOR_DEVICE" if changed == "active" else "SUCCEEDED" if changed == "successful" else "EXPIRED"
+    if changed in {"expected_serial", "confirmed_serial"}:
+        setattr(zkt, changed, "replacement")
+    raw_session, admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest",
+    )
+    db.commit()
+
+    def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(
+        f"/api/v1/devices/{connector.connector_id}/terminal-binding/confirm",
+        json={"observed_serial": SERIAL, "password": "correct-password",
+              "idempotency_key": "expired-pin-retry"},
+        headers={"X-CSRF-Token": admin.csrf_token},
+    )
+    assert response.status_code == expected_status, response.text
+    assert zkt.terminal_binding_state == "PENDING_DEVICE_ACK"
+    if expected_status == 202:
+        assert response.json()["command"]["command_id"] != pin.command_id
+        assert response.json()["command"]["type"] == "PIN_TERMINAL_SERIAL"
+        assert zkt.certification_state == "READ_ONLY"
+
+
 def test_comm_key_recovery_stages_for_250_then_applies_without_secret_leakage(
     db: Session,
 ):
