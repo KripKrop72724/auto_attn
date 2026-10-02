@@ -34,6 +34,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from zk_add.db import Base
 from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
+from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
@@ -81,6 +82,9 @@ HIL_2615_BLD5_TARGET = HilTarget(
     mac="ac:27:6e:a4:4e:d4", terminal_serial="PGB1261300022",
 )
 HIL_2615_BLD5_TARGETS = (*HIL_269_EXACT_TARGETS, HIL_2615_BLD5_TARGET)
+# Preserve the six published identities and append the eight newly reviewed
+# devices. Peshawar's two original identities join this independent city trial.
+HIL_2615_CITY_TARGETS = (*HIL_2615_BLD5_TARGETS, *CITY_TARGETS.values())
 # The live 3FL connector boots the signed 2.4.12 application from factory.
 # A direct 2.6.x boot would lack a qualified predecessor in the other OTA
 # slot. Bridge only this exact device through the already published 2.5.2
@@ -297,17 +301,29 @@ def _is_2615_bld5_extension(release: FirmwareRelease, targets: list[HilTarget]) 
     )
 
 
+def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
+    # The general parser retains its eight-device limit. Only the exact
+    # already signed image and reviewed fourteen-device scope can exceed it.
+    if identity == HIL_2615_BLD5_IDENTITY and raw == [target.model_dump() for target in HIL_2615_CITY_TARGETS]:
+        return list(HIL_2615_CITY_TARGETS)
+    return parse_hil_targets(raw)
+
+
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
     if not settings.firmware_hil_enabled or not settings.firmware_hil_targets_json:
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
-    targets = parse_hil_targets(raw)
+    identity = (release.release_id, release.version, release.git_sha,
+                release.image_sha256, _application_sha256(release))
+    targets = _parse_release_hil_targets(identity, raw)
     configured = parse_hil_targets(json.loads(settings.firmware_hil_targets_json))
     bld5_extension = _is_2615_bld5_extension(release, targets)
+    city_extension = (release.state == "HIL_ONLY" and identity == HIL_2615_BLD5_IDENTITY
+                      and tuple(targets) == HIL_2615_CITY_TARGETS)
     if targets != configured and not (
-        bld5_extension and tuple(configured) == HIL_269_EXACT_TARGETS
+        (bld5_extension or city_extension) and tuple(configured) == HIL_269_EXACT_TARGETS
     ):
         raise ValueError("Ordered HIL targets do not match the configured exact scope.")
     events = list(session.execute(
@@ -335,6 +351,12 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
                 and deployment.status == "SUCCEEDED")
 
+    if city_extension:
+        pending = [target for target in targets if not accepted(target)]
+        if pending:
+            return pending
+        raise ValueError("All reviewed city HIL targets already have acceptance; release remains HIL_ONLY.")
+
     parallel_prefix = (HIL_269_PARALLEL_PREFIX_SIZE if bld5_extension
                        else _parallel_hil_prefix(release, targets))
     if parallel_prefix:
@@ -359,6 +381,13 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
 
 
 def _factory_3fl_bridge_target(release: FirmwareRelease, zone_id: str) -> HilTarget | None:
+    city_predecessor = CITY_FACTORY_PREDECESSORS.get(zone_id)
+    if city_predecessor and release.release_id == f"zone-lite-{city_predecessor[2]}":
+        identity = (release.release_id, release.version, release.git_sha,
+                    release.image_sha256, _application_sha256(release))
+        if release.state != "AVAILABLE" or identity != SIGNED_BRIDGE_IDENTITIES[city_predecessor[2]]:
+            raise ValueError("The city factory bridge requires the exact published signed image.")
+        return CITY_TARGETS[zone_id]
     if zone_id != FACTORY_3FL_BRIDGE_ZONE or release.release_id != "zone-lite-2.5.2":
         return None
     identity = (
@@ -375,9 +404,11 @@ def _factory_3fl_bridge_exclusion(connector: Connector, target: HilTarget) -> st
         return "BRIDGE_EXACT_IDENTITY_MISMATCH"
     if not connector.connected:
         return "BRIDGE_TARGET_OFFLINE"
-    if (not _versions_match(connector.firmware_version, "2.4.12")
+    predecessor = CITY_FACTORY_PREDECESSORS.get(connector.zone_id)
+    version, digest = predecessor[:2] if predecessor else ("2.4.12", DIRECT_BASELINE_IMAGES["2.4.12"])
+    if (not _versions_match(connector.firmware_version, version)
             or connector.ota_running_partition != "factory"
-            or connector.ota_image_sha256 != DIRECT_BASELINE_IMAGES["2.4.12"]):
+            or connector.ota_image_sha256 != digest):
         return "BRIDGE_FACTORY_PREDECESSOR_MISMATCH"
     return None
 
@@ -809,7 +840,9 @@ def sync_release_store(session: Session) -> None:
         if marker_path.is_file():
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
             if "targets" in marker:
-                hil_targets = [target.model_dump() for target in parse_hil_targets(marker["targets"])]
+                identity = (release_id, str(manifest.get("version", "")),
+                            str(manifest["git_sha"]), digest, application_digest)
+                hil_targets = [target.model_dump() for target in _parse_release_hil_targets(identity, marker["targets"])]
                 if marker.get("target_mac"):
                     raise RuntimeError("HIL marker cannot mix ordered and legacy target scopes.")
                 if marker.get("application_sha256") != application_digest:

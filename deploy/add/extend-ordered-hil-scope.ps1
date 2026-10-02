@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ExpectedApplicationSha256,
     [Parameter(Mandatory = $true)][string]$ExistingTargetsJson,
     [Parameter(Mandatory = $true)][string]$ExtendedTargetsJson,
+    [ValidateSet('BLD5', 'Cities')][string]$Scope2615 = 'BLD5',
     [switch]$PreviewOnly
 )
 
@@ -15,7 +16,8 @@ function Read-ExactTargets([string]$Json) {
     if (-not $Json.Trim().StartsWith('[')) { throw 'HIL targets must be a JSON array' }
     $parsed = ConvertFrom-Json -InputObject $Json
     $parsed = @($parsed)
-    if ($parsed.Count -lt 1 -or $parsed.Count -gt 8) { throw 'HIL requires one to eight exact targets' }
+    $limit = if ($Version -eq '2.6.15' -and $Scope2615 -eq 'Cities') { 14 } else { 8 }
+    if ($parsed.Count -lt 1 -or $parsed.Count -gt $limit) { throw 'HIL target count exceeds its exact reviewed scope' }
     $targets = @()
     foreach ($row in $parsed) {
         $keys = @($row.PSObject.Properties | ForEach-Object { [string]$_.Name })
@@ -62,13 +64,20 @@ function Assert-SameTargets($Actual, $Expected) {
 $existingTargets = Read-ExactTargets $ExistingTargetsJson
 $extendedTargets = Read-ExactTargets $ExtendedTargetsJson
 if ($Version -eq '2.6.15') {
-    . (Join-Path $PSScriptRoot 'firmware-2-6-15-bld5-hil-scope.ps1')
-    Assert-Zkt2615Bld5HilExtension `
-        -ExpectedGitSha $ExpectedGitSha `
-        -ExpectedImageSha256 $ExpectedImageSha256 `
-        -ExpectedApplicationSha256 $ExpectedApplicationSha256 `
-        -ExistingTargetsJson $ExistingTargetsJson `
-        -ExtendedTargetsJson $ExtendedTargetsJson
+    $scopeArguments = @{
+        ExpectedGitSha = $ExpectedGitSha
+        ExpectedImageSha256 = $ExpectedImageSha256
+        ExpectedApplicationSha256 = $ExpectedApplicationSha256
+        ExistingTargetsJson = $ExistingTargetsJson
+        ExtendedTargetsJson = $ExtendedTargetsJson
+    }
+    if ($Scope2615 -eq 'Cities') {
+        . (Join-Path $PSScriptRoot 'firmware-2-6-15-city-hil-scope.ps1')
+        Assert-Zkt2615CityHilExtension @scopeArguments
+    } else {
+        . (Join-Path $PSScriptRoot 'firmware-2-6-15-bld5-hil-scope.ps1')
+        Assert-Zkt2615Bld5HilExtension @scopeArguments
+    }
 }
 if ($extendedTargets.Count -le $existingTargets.Count) { throw 'HIL extension must append targets' }
 for ($index = 0; $index -lt $existingTargets.Count; $index++) {

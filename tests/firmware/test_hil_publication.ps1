@@ -557,6 +557,38 @@ foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
     try { Assert-Zkt2615Bld5HilExtension @changed } catch { $rejected = $true }
     if (-not $rejected) { throw "BLD5 extension accepted changed $field" }
 }
+# City extension retains the published six and appends only the reviewed eight.
+. (Join-Path $repo 'deploy/add/firmware-2-6-15-city-hil-scope.ps1')
+$cityArguments = $bld5Arguments.Clone()
+$cityArguments.ExistingTargetsJson = $bld5Arguments.ExtendedTargetsJson
+$cityArguments.ExtendedTargetsJson = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.15-cities.json') -Raw
+Assert-Zkt2615CityHilExtension @cityArguments
+foreach ($field in @('ExpectedGitSha', 'ExpectedImageSha256', 'ExpectedApplicationSha256')) {
+    $changed = $cityArguments.Clone()
+    $changed[$field] = '0' * $changed[$field].Length
+    $rejected = $false
+    try { Assert-Zkt2615CityHilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "City extension accepted changed $field" }
+}
+foreach ($mutation in @('prefix', 'connector', 'mac', 'serial', 'order', 'missing', 'extra', 'extra-key')) {
+    $changed = $cityArguments.Clone()
+    $changedTargets = ConvertFrom-Json -InputObject $changed.ExtendedTargetsJson
+    $changedTargets = @($changedTargets)
+    switch ($mutation) {
+        'prefix' { $changedTargets[5].terminal_serial = 'replacement' }
+        'connector' { $changedTargets[6].connector_id = 'replacement' }
+        'mac' { $changedTargets[6].mac = '00:11:22:33:44:55' }
+        'serial' { $changedTargets[6].terminal_serial = 'replacement' }
+        'order' { $saved = $changedTargets[6]; $changedTargets[6] = $changedTargets[7]; $changedTargets[7] = $saved }
+        'missing' { $changedTargets = @($changedTargets[0..12]) }
+        'extra' { $changedTargets = @($changedTargets) + @($changedTargets[13]) }
+        'extra-key' { $changedTargets[6] | Add-Member -MemberType NoteProperty -Name display_name -Value 'Faisalabad' }
+    }
+    $changed.ExtendedTargetsJson = ConvertTo-Json -InputObject $changedTargets -Depth 5 -Compress
+    $rejected = $false
+    try { Assert-Zkt2615CityHilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "City extension accepted $mutation" }
+}
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')

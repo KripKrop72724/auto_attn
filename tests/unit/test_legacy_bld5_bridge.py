@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from test_hil_scope import bld5_2615_session, hil_session, parallel_269_session  # noqa: F401
+from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS
 from zk_add.legacy_bld5_bridge import BRIDGE_IDENTITY, accept_legacy_progress
 from zk_add.models import DeviceTelemetry
 from zk_add.ota import FirmwareDeployment, FirmwareEvent, FirmwareRelease, create_campaign, preview_campaign_scope
@@ -14,23 +15,30 @@ from zk_add.time_utils import utc_now
 from zk_add.web import _FirmwareCapabilityIn, _FirmwareProgressIn, firmware_progress, report_firmware_capability
 
 
-@pytest.fixture(name="legacy_bridge")
+@pytest.fixture(name="legacy_bridge", params=["LF-ZONE-BLD5-01", "ZONE-LAHORE-01", "ZONE-LAHORE-02"])
 def bridge_fixture(request, monkeypatch):
     from zk_add.settings import settings
 
     session, _release, devices, _zones = request.getfixturevalue("bld5_2615_session")
     monkeypatch.setattr(settings, "firmware_ota_enabled", True)
     device = devices[5]
+    if request.param in CITY_TARGETS:
+        target = CITY_TARGETS[request.param]
+        device.zone_id = request.param
+        device.connector_id, device.hardware_id = target.connector_id, target.mac
+        device.zkt_device.serial = device.zkt_device.expected_serial = device.zkt_device.confirmed_serial = target.terminal_serial
     release = session.scalar(select(FirmwareRelease).where(FirmwareRelease.release_id == BRIDGE_IDENTITY[0]))
     release.release_id, release.version, release.git_sha, release.image_sha256, application = BRIDGE_IDENTITY
     release.manifest = {"application_sha256": application}
     device.firmware_version = "zone-lite-2.5.2"
     device.ota_running_partition = "factory"
     device.ota_image_sha256 = "27128790bde3ce3d0e5e697bb35189379cda8600f5179fab075f127c2dc9671b"
+    if request.param in CITY_FACTORY_PREDECESSORS:
+        device.ota_image_sha256 = CITY_FACTORY_PREDECESSORS[request.param][1]
     scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
     campaign = create_campaign(
         session, release_public_id=release.release_id, zone_id=device.zone_id,
-        reason="Exact BLD5 bridge", typed_confirmation=release.version,
+        reason="Exact legacy bridge", typed_confirmation=release.version,
         actor="test-admin", scope_token=scope["scope_token"], idempotency_key="legacy-bld5-bridge",
     )
     deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id == campaign.id))
