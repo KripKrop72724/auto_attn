@@ -93,6 +93,13 @@ acknowledgement before HIL eligibility. An ordinary signed 2.5.2 upgrade can sup
 the newer expected-serial acknowledgement protocol; do not bypass the confirmed
 binding check or change terminal credentials.
 
+Karachi's previous serial-pin command expired while its binding remained pending.
+The administrator confirmation endpoint permits a fresh command only when the
+latest pin is expired, no pin remains active, and both the previous command and
+the current expected, confirmed and observed serials agree exactly. Password
+step-up remains required, the binding stays pending and read-only, and only the
+new authenticated device result can confirm it.
+
 After green-main checks and backend deployment, run
 `firmware-extend-2-6-0-hil.yml` with scope `2.6.15-cities` and confirmation
 `EXTEND-2.6.15-CITIES-HIL`. The guarded extension changes only the quarantine marker
