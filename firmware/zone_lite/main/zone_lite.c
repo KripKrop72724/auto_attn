@@ -9274,21 +9274,22 @@ void app_main(void)
     // Temporary exact-device diagnostic. Stay inert before NVS/network/storage startup.
     static volatile bool diagnostic_only = true;
     if (diagnostic_only) {
-        const uint8_t target[6] = {0xe0, 0x72, 0xa1, 0xd6, 0xf3, 0x28};
+        const uint8_t target[6] = {0xac, 0x27, 0x6e, 0xa3, 0x0a, 0x58};
         const uint8_t challenge[32] = {
             0x50,0x5e,0x2d,0x42,0x1e,0x38,0x32,0xf8,0x83,0x41,0x0d,0xa5,0x68,0xe4,0x94,0x1d,
             0x48,0x55,0x8d,0x19,0x14,0x4b,0x80,0x62,0x7e,0x98,0x34,0x86,0xd2,0xb3,0xab,0x5f};
         uint8_t mac[6] = {0}, digest[32] = {0};
         esp_err_t result = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        printf("BLD1_ID mac=%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         if (result == ESP_OK && memcmp(mac, target, sizeof(target)) == 0) {
             result = esp_hmac_calculate(HMAC_KEY0, challenge, sizeof(challenge), digest);
             if (result == ESP_OK) {
-                printf("BLD8_HMAC mac=e0:72:a1:d6:f3:28 challenge=505e2d421e3832f883410da568e4941d48558d19144b80627e983486d2b3ab5f digest=");
+                printf("BLD1_HMAC mac=ac:27:6e:a3:0a:58 challenge=505e2d421e3832f883410da568e4941d48558d19144b80627e983486d2b3ab5f digest=");
                 for (unsigned i = 0; i < sizeof(digest); ++i) printf("%02x", digest[i]);
                 printf("\n");
                 fflush(stdout);
-            } else ESP_LOGE(TAG, "BLD8 HMAC diagnostic failed: %s", esp_err_to_name(result));
-        } else ESP_LOGE(TAG, "BLD8 diagnostic refused: device identity mismatch");
+            } else ESP_LOGE(TAG, "BLD1 HMAC diagnostic failed: %s", esp_err_to_name(result));
+        } else ESP_LOGE(TAG, "BLD1 diagnostic refused: device identity mismatch");
         mbedtls_platform_zeroize(digest, sizeof(digest));
         while (diagnostic_only) vTaskDelay(pdMS_TO_TICKS(1000));
         return;
