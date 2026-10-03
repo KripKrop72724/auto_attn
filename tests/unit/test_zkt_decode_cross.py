@@ -6,7 +6,9 @@ import shutil
 import struct
 import subprocess
 
-from zk_add.zkt_decode import PAKISTAN_TIME, decode_live_record, decode_source
+import pytest
+
+from zk_add.zkt_decode import DecodeError, PAKISTAN_TIME, decode_live_record, decode_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -93,4 +95,47 @@ int main(void) {
             inputs.append(f"{kind} {size} {int(local.timestamp())} {raw.hex()}")
             expected.append(f"{facts.user_id or '-'} {facts.encoded_time} {facts.status} {facts.punch} {facts.attendance_uid or 0}")
     result = subprocess.run([str(exe)], input="\n".join(inputs) + "\n", capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == expected
+
+
+def test_c_and_add_reject_missing_historical_text_identity(tmp_path):
+    """Synthetic zeros/spaces reproduce the field pattern without personal data."""
+    main = ROOT / "firmware/zone_lite/main"
+    unit = tmp_path / "invalid.c"
+    unit.write_text(r'''
+#include "zkt_record.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    char hex[81];
+    while (scanf("%80s", hex) == 1) {
+        unsigned char raw[40]; zkt_record_t record;
+        assert(strlen(hex) == 80);
+        for (unsigned i=0; i<40; ++i) {
+            unsigned byte; assert(sscanf(hex + 2*i, "%2x", &byte) == 1); raw[i]=byte;
+        }
+        assert(!zkt_record_decode(raw, sizeof(raw), &record));
+        printf("%u\n", zkt_record_identity_missing(raw, sizeof(raw)));
+    }
+    return 0;
+}
+''')
+    exe = tmp_path / "invalid"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=address,undefined", "-I", str(main), str(unit),
+                    str(main / "zkt_record.c"), "-o", str(exe)], check=True)
+    rows, expected = [], []
+    for field, missing in [(b"", True), (b" " * 24, True), (b" \0", True),
+                           (b"\0garbage", True), (b"A\x01", False), (b"\xff", False)]:
+        raw = bytearray(40)
+        struct.pack_into("<H", raw, 0, 40)
+        raw[2:2 + len(field)] = field
+        struct.pack_into("<I", raw, 27, 859972462)
+        with pytest.raises(DecodeError, match="INVALID_USER_REFERENCE"):
+            decode_source(bytes(raw), record_size=40)
+        rows.append(raw.hex())
+        expected.append(str(int(missing)))
+    result = subprocess.run([str(exe)], input="\n".join(rows) + "\n",
+                            capture_output=True, text=True, check=True)
     assert result.stdout.splitlines() == expected

@@ -3914,38 +3914,23 @@ static bool parse_attendance_record(
     if (!record || !users || !event || !timestamp_out) return false;
     zkt_record_t decoded;
     if (!zkt_record_decode(record, record_size, &decoded)) return false;
+    *timestamp_out = decoded.encoded_time;
+    if (!decoded.user_id[0]) return false;
     char user_id[32];
     memcpy(user_id, decoded.user_id, sizeof(user_id));
-    uint16_t uid = decoded.attendance_uid;
     uint32_t timestamp = decoded.encoded_time;
     uint8_t status = decoded.status;
     uint8_t punch = decoded.punch;
-    if (record_size == 8) {
-        const zkt_user_t *user = find_user_by_uid(users, uid);
-        snprintf(user_id, sizeof(user_id), "%s", user ? user->user_id : "");
-    }
-    *timestamp_out = timestamp;
-
-    uint16_t record_uid = uid;
+    uint16_t record_uid = decoded.attendance_uid;
     bool snapshot_identity = record_size == 16 || record_size == 40;
-    if (record_size == 40 && user_id[0] && uid != 0) {
-        const zkt_user_t *user_by_id = find_user_by_user_id(users, user_id);
-        const zkt_user_t *user_by_uid = find_user_by_uid(users, uid);
-        if (user_by_id && user_by_uid != user_by_id) {
-            // On some ZKT models the first 16-bit field in a 40-byte
-            // attendance record is not in the current enrollment UID
-            // namespace. Treat it as audit evidence, not as an identity veto.
-            // The current signed user snapshot supplies the verified UID and
-            // fingerprint; ADD still enforces captured-at continuity before
-            // any historical CNIC repair.
-            uid = 0;
-        }
-    }
+    // Historical attendance UIDs are audit evidence, never enrollment UIDs.
+    // A snapshot can supply separately verified current identity evidence;
+    // ADD must still prove continuity at the historical time.
     bool built = build_attendance_event(
         event,
         users,
         user_id,
-        uid,
+        0,
         timestamp,
         status,
         punch,
@@ -4009,7 +3994,8 @@ static bool append_terminal_source_record(
     const char *capturetype,
     const char **disposition_out)
 {
-    if (!records || !canonical || !record || !users || !capturetype) return false;
+    if (!cJSON_IsArray(records) || !cJSON_IsArray(canonical) || records == canonical ||
+        !record || !users || !capturetype) return false;
     char raw_digest[65];
     char terminal_key_material[160];
     char terminal_key[65];
@@ -4031,8 +4017,6 @@ static bool append_terminal_source_record(
     if (record_size == 8) {
         uint16_t uid = read_le16(record);
         snprintf(observed_uid, sizeof(observed_uid), "%u", (unsigned)uid);
-        const zkt_user_t *user = find_user_by_uid(users, uid);
-        if (user) strlcpy(observed_user_id, user->user_id, sizeof(observed_user_id));
     } else if (record_size == 16) {
         snprintf(
             observed_user_id,
@@ -4057,7 +4041,9 @@ static bool append_terminal_source_record(
         ? "EVENT"
         : has_timestamp && !zk_attendance_timestamp_is_plausible(timestamp)
             ? "INVALID_TIME"
-            : "MALFORMED";
+            : has_timestamp && zkt_record_identity_missing(record, record_size)
+                ? "IDENTITY_UNRESOLVED"
+                : "MALFORMED";
     if (!encode_record_base64(record, record_size, raw_base64, sizeof(raw_base64))) {
         return false;
     }
@@ -4085,17 +4071,23 @@ static bool append_terminal_source_record(
             cJSON_Delete(canonical_row);
             return false;
         }
-        cJSON_AddItemToObject(source_row, "event", event_row);
+        if (!cJSON_AddItemToObject(source_row, "event", event_row)) {
+            cJSON_Delete(event_row);
+            cJSON_Delete(source_row);
+            cJSON_Delete(canonical_row);
+            return false;
+        }
     } else {
         cJSON_AddStringToObject(
             source_row,
             "error_code",
             strcmp(disposition, "INVALID_TIME") == 0
                 ? "IMPLAUSIBLE_TERMINAL_TIME"
-                : "UNPARSEABLE_TERMINAL_RECORD");
+                : strcmp(disposition, "IDENTITY_UNRESOLVED") == 0
+                    ? "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"
+                    : "UNPARSEABLE_TERMINAL_RECORD");
     }
     cJSON_AddStringToObject(source_row, "raw_record_b64", raw_base64);
-    cJSON_AddItemToArray(records, source_row);
 
     cJSON_AddStringToObject(canonical_row, "disposition", disposition);
     if (parsed) cJSON_AddStringToObject(canonical_row, "event_uid", event.event_uid);
@@ -4104,7 +4096,29 @@ static bool append_terminal_source_record(
     cJSON_AddNumberToObject(canonical_row, "ordinal", ordinal);
     cJSON_AddStringToObject(canonical_row, "raw_record_digest", raw_digest);
     cJSON_AddStringToObject(canonical_row, "terminal_record_key", terminal_key);
-    cJSON_AddItemToArray(canonical, canonical_row);
+    const char *source_required[] = {"ordinal", "raw_record_digest", "terminal_record_key",
+        "occurrence_index", "disposition", "raw_record_b64"};
+    const char *canonical_required[] = {"disposition", "event_uid", "occurrence_index",
+        "ordinal", "raw_record_digest", "terminal_record_key"};
+    bool complete = (!has_timestamp || cJSON_HasObjectItem(source_row, "raw_timestamp")) &&
+        (!observed_uid[0] || cJSON_HasObjectItem(source_row, "observed_uid")) &&
+        (!observed_user_id[0] || cJSON_HasObjectItem(source_row, "observed_user_id")) &&
+        cJSON_HasObjectItem(source_row, parsed ? "event" : "error_code");
+    for (size_t i = 0; i < sizeof(source_required) / sizeof(*source_required); ++i)
+        complete = complete && cJSON_HasObjectItem(source_row, source_required[i]);
+    for (size_t i = 0; i < sizeof(canonical_required) / sizeof(*canonical_required); ++i)
+        complete = complete && cJSON_HasObjectItem(canonical_row, canonical_required[i]);
+    if (!complete || !cJSON_AddItemToArray(records, source_row)) {
+        cJSON_Delete(source_row);
+        cJSON_Delete(canonical_row);
+        return false;
+    }
+    if (!cJSON_AddItemToArray(canonical, canonical_row)) {
+        cJSON_DetachItemViaPointer(records, source_row);
+        cJSON_Delete(source_row);
+        cJSON_Delete(canonical_row);
+        return false;
+    }
     if (disposition_out) *disposition_out = disposition;
     return true;
 }
@@ -4660,6 +4674,7 @@ static bool process_add_incremental_tail(
             &disposition);
         if (ok && disposition &&
             (strcmp(disposition, "INVALID_TIME") == 0 ||
+             strcmp(disposition, "IDENTITY_UNRESOLVED") == 0 ||
              strcmp(disposition, "MALFORMED") == 0)) {
             exception_count++;
         }

@@ -1770,7 +1770,7 @@ def source_exceptions(
             status_code=422,
             detail="The selected device does not belong to the reconciliation job.",
         )
-    if disposition and disposition not in {"INVALID_TIME", "MALFORMED"}:
+    if disposition and disposition not in {"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLVED"}:
         raise HTTPException(status_code=422, detail="Unknown source exception disposition.")
     if review_state and review_state not in {"OPEN", "REVIEWED"}:
         raise HTTPException(status_code=422, detail="Unknown source exception review state.")

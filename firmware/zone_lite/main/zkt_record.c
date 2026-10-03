@@ -35,9 +35,20 @@ bool zkt_record_decode(const uint8_t *raw, size_t length, zkt_record_t *out)
                 out->user_id[n]=(char)raw[2+n]; ++n;
             }
             while (n && out->user_id[n-1]==' ') out->user_id[--n]=0;
+            if (!n) return false;
             out->encoded_time=le32(raw+27); out->status=raw[26]; out->punch=raw[31];
         }
     }
+    return true;
+}
+
+bool zkt_record_identity_missing(const uint8_t *raw, size_t length)
+{
+    if (!raw) return false;
+    if (length == 8) return true; /* Attendance UID has no enrollment proof. */
+    if (length != 40) return false;
+    for (size_t i = 2; i < 26 && raw[i]; ++i)
+        if (raw[i] != ' ') return false;
     return true;
 }
 

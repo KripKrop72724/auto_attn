@@ -416,6 +416,58 @@ describe('Reviewed source-exception continuation', () => {
     expect(String(reviewRequest?.[1]?.body)).not.toContain(job().job_id)
   })
 
+  it('keeps missing historical identity held after an audited review', async () => {
+    let reviewed = false
+    const base = reconciliationFetch()
+    const missingIdentity = () => ({
+      ...sourceException, disposition: 'IDENTITY_UNRESOLVED',
+      observed_uid: '40', observed_user_id: null,
+      oracle_action: 'HELD_IDENTITY_EVIDENCE_REQUIRED',
+      review_state: reviewed ? 'REVIEWED' : 'OPEN',
+    })
+    const pending = () => assurance({
+      state: 'IDENTITY_EVIDENCE_REQUIRED', invalid_time: 0,
+      identity_unresolved: 1, identity_unresolved_open: 1,
+      reviewed: reviewed ? 1 : 0, open: 1,
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}/review`) {
+        reviewed = true
+        return json(missingIdentity())
+      }
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(missingIdentity())
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/reconciliations') {
+        body.rows = [{ ...job(pending()), status: 'NEEDS_ATTENTION',
+          phase: 'WAITING_FOR_IDENTITY', wait_reason: 'SOURCE_IDENTITY_EVIDENCE_REQUIRED' }]
+      } else if (path === '/api/v1/source-exceptions') {
+        body.rows = [missingIdentity()]
+        body.totals.identity_unresolved = 1
+        if (body.scope) body.scope.source_exception_assurance = pending()
+      }
+      return json(body)
+    }))
+    render(<Harness />)
+    expect(await screen.findByText('Historical identity evidence required')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Retry$/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect held source records' }))
+    const row = await screen.findByRole('listitem')
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(await screen.findByText('Held for verified historical identity')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Audited reason'), {
+      target: { value: 'Investigated missing historical user reference.' },
+    })
+    fireEvent.change(screen.getByLabelText('Administrator password'), {
+      target: { value: 'admin-password' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Mark reviewed/i }))
+    expect(await screen.findByText(/Review recorded. The identity hold remains/)).toBeTruthy()
+    expect(screen.queryByText('All certified exclusions reviewed')).toBeNull()
+    expect(screen.queryByText(/assurance resumes automatically from its existing checkpoint/i)).toBeNull()
+  })
+
   it('redirects the retired employee-repair deep link to Attendance review', async () => {
     window.history.replaceState(
       null,

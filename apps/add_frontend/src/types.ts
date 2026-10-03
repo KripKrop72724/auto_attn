@@ -358,7 +358,7 @@ export interface SourceException {
   ordinal: number
   source_kind: 'BASELINE' | 'TAIL'
   record_size: number | null
-  disposition: 'INVALID_TIME' | 'MALFORMED'
+  disposition: 'INVALID_TIME' | 'MALFORMED' | 'IDENTITY_UNRESOLVED'
   error_code: string | null
   raw_timestamp: number | null
   observed_uid: string | null
@@ -374,7 +374,7 @@ export interface SourceException {
   review_reason: string | null
   source_committed_cursor: number
   cursor_advanced: boolean
-  oracle_action: 'EXCLUDED_FAIL_CLOSED'
+  oracle_action: 'EXCLUDED_FAIL_CLOSED' | 'HELD_IDENTITY_EVIDENCE_REQUIRED'
   reviews?: SourceExceptionReview[]
 }
 
@@ -384,6 +384,7 @@ export interface SourceExceptionTotals {
   reviewed: number
   invalid_time: number
   malformed: number
+  identity_unresolved?: number
   affected_terminals: number
 }
 
@@ -408,7 +409,9 @@ export interface SourceExceptionAssurance {
   open: number
   invalid_time: number
   malformed: number
-  state: 'NONE' | 'REVIEW_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+  identity_unresolved?: number
+  identity_unresolved_open?: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
   cohort_digest: string | null
   correction_ids?: string[]
 }

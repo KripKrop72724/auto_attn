@@ -20,6 +20,7 @@ counts are kept outside this public repository.
 | Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte firmware and ADD fact decoders; explicit live layouts, calendar validation, strict count/layout agreement and bounded transport; six model selectors | Sanitized record/transport harnesses, 3,500 cross-language fact/clock vectors and ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
+| Historical attendance UID mistaken for current enrollment identity | Never supply a historical UID to current-roster matching; reject empty 40-byte text identities; preserve missing-reference source rows as `IDENTITY_UNRESOLVED`. Review notes cannot remove the identity hold or certify Oracle delivery | Synthetic empty/space-only fields, C/ADD rejection agreement, actual historical parser, baseline/tail replay and review-gate tests | Implemented guard; historical correction evidence and model qualification remain open |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
 | Custody can outlive an untracked processing obligation | Migration `0044` adds per-packet work and immutable receipt links in the custody transaction; bounded assembly, fair inspection, revision-triggered holds and an authenticated status endpoint | Receipt/work rollback, fragment conflict/replay, per-record decryption failure isolation, bounded repair, PostgreSQL overlapping sockets/SKIP LOCKED and actual dump/restore | Implemented components; profile-qualified interpretation and Oracle creation remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: capture/delivery startup gated; catalog and legacy handoff remain open |
@@ -38,6 +39,19 @@ ordinary punch traces over two working days, wave observation and the final
 fourteen-day fleet observation remain separate gates. No historical alert,
 component test, short smoke run or healthy network connection can substitute for
 these gates. Blocked devices remain in the denominator.
+
+Historical 8-byte records contain an attendance UID without an independently
+supported user reference. They remain raw source evidence with an identity hold;
+the current roster is not proof of historical ownership. The same hold applies
+to a 40-byte record with an empty or space-only user field. Valid 16/40-byte
+references keep their source identifiers and existing event UID construction,
+with the attendance UID retained separately for audit. Current snapshot evidence
+still requires ADD's historical continuity checks. Previously accepted records,
+raw bytes and Oracle keys are not rewritten by this guard. Corrections require
+separate derived evidence; a source review note alone cannot clear this hold.
+Source rows and their canonical chain inputs are constructed together: an
+allocation failure returns failure with neither row appended. Seven pinned
+cJSON harnesses now cover the source encoder as well as the existing serializers.
 
 ## Browser event contract
 
@@ -165,6 +179,15 @@ Unavailable reads, damaged root keys/counters and exhausted recovery capacity
 still block recovery. Encryption identity and nonce allocation never reset.
 
 ## Verification recorded on 3 October 2026
+
+- Historical identity guard: 181 targeted firmware/decoder/reconciliation tests
+  passed, then 61 reconciliation tests passed after bounding the unfinished-scan
+  identity query. Full local regression: 1,500 passed, 29 environment-dependent
+  skips; a separate real PostgreSQL run passed all 26 concurrency/large-backlog
+  tests. Frontend: 153 tests passed, with the final eight reconciliation tests
+  rerun after badge wording changed. Existing browser cases: 82 passed with 14
+  viewport skips; the new identity hold case passed on all eight browser/viewport
+  targets. Both unsigned ESP-IDF family builds and all seven cJSON harnesses passed.
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
   Skips require specific

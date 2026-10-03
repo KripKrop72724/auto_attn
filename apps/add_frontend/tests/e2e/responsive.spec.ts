@@ -668,6 +668,39 @@ test('source exception inspector is responsive, keyboard-operable, and fail-clos
   expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
 })
 
+test('historical source identity holds remain explicit and readable after review', async ({ page }, testInfo) => {
+  const held = { ...sourceException, disposition: 'IDENTITY_UNRESOLVED',
+    error_code: 'HISTORICAL_IDENTITY_EVIDENCE_REQUIRED', observed_uid: '40',
+    observed_user_id: null, raw_timestamp: 859972462, review_state: 'REVIEWED',
+    reviewed_at: '2026-10-03T10:10:00Z', reviewed_by: 'StateHealthAdmin',
+    reviews: [{ review_id: 'source-identity-note', state: 'REVIEWED',
+      reason: 'Missing historical reference remains under investigation.',
+      actor: 'StateHealthAdmin', created_at: '2026-10-03T10:10:00Z' }],
+    oracle_action: 'HELD_IDENTITY_EVIDENCE_REQUIRED' }
+  await page.route(url => url.pathname.startsWith('/api/v1/source-exceptions'), async route => {
+    const path = new URL(route.request().url()).pathname
+    await route.fulfill({ json: path.endsWith('/1') ? held : {
+      totals: { all: 1, open: 0, reviewed: 1, invalid_time: 0, malformed: 0,
+        identity_unresolved: 1, affected_terminals: 1 },
+      rows: [held], next_cursor: null, filtered_total: 1,
+    } })
+  })
+  await page.goto('/reconciliation?tab=source-exceptions')
+  await expect(page.getByText('Missing identity references', { exact: true })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Source exceptions 1', exact: true })).toBeVisible()
+  await expect(page.getByText('Oracle delivery held for identity evidence')).toBeVisible()
+  const viewport = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth }))
+  expect(viewport.scroll).toBeLessThanOrEqual(viewport.width)
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('source-identity-ledger.png'), fullPage: true, animations: 'disabled' })
+  await page.getByRole('listitem').getByRole('button', { name: 'Inspect' }).click()
+  const drawer = page.getByRole('dialog', { name: 'Terminal source exception' })
+  await expect(drawer.getByText('Held for verified historical identity')).toBeVisible()
+  await expect(drawer.getByText(/A review note does not resolve this hold/)).toBeVisible()
+  if (process.env.ADD_VISUAL_QA === '1') await drawer.screenshot({ path: testInfo.outputPath('source-identity-detail.png'), animations: 'disabled' })
+  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(results.violations.filter(violation => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+})
+
 test('large reconciliation evidence stays viewport-bound and progressively reveals events', async ({ page }) => {
   await page.goto('/reconciliation')
   const inspect = page.getByRole('button', { name: 'Inspect evidence' }).first()

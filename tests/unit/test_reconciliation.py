@@ -779,6 +779,48 @@ def test_final_source_exception_review_resumes_assurance_without_rescan(
     ) == 1
 
 
+def test_missing_source_identity_stays_held_after_review_and_other_oracle_success(reconciliation_db):
+    session, connector = reconciliation_db
+    job, manifests = _certify_baseline_with_exceptions(
+        session, connector, ["IDENTITY_UNRESOLVED", "EVENT"]
+    )
+    held = manifests[1]
+    protected, chain = held.protected_raw_record, job.last_chain_digest
+    assert held.attendance_event_id is None
+    assert job.blocked_identity_count == 1 and job.quarantined_count == 1
+    assert job.wait_reason == "SOURCE_IDENTITY_EVIDENCE_REQUIRED"
+    for event in session.scalars(select(AttendanceEvent)):
+        event.ords_status = "ACKED_CHECK"
+    review_source_exception(
+        session, row=held, actor="operator", reason="Investigated missing historical identity.",
+        idempotency_key="held-identity-review-0001",
+    )
+    session.flush()
+    refresh_reconciliations_for_source_exception(session, held)
+    evidence = source_exception_assurance(session, job)
+    assert evidence["reviewed"] == 1 and evidence["open"] == 1
+    assert evidence["identity_unresolved"] == evidence["identity_unresolved_open"] == 1
+    assert evidence["state"] == "IDENTITY_EVIDENCE_REQUIRED"
+    assert job.status == "NEEDS_ATTENTION" and job.blocked_identity_count == 1
+    assert job.ords_confirmed_count == 2 and not job.oracle_certificate
+    assert job.last_chain_digest == chain and job.committed_next_ordinal == 3
+    assert held.protected_raw_record == protected and held.attendance_event_id is None
+    assert source_exception_detail(session, held)["oracle_action"] == "HELD_IDENTITY_EVIDENCE_REQUIRED"
+    report = list_source_exceptions(session, disposition="IDENTITY_UNRESOLVED")
+    assert report["filtered_total"] == report["totals"]["identity_unresolved"] == 1
+    assert serialize_job(session, job)["source_exception_assurance"]["identity_unresolved_open"] == 1
+    with pytest.raises(ValueError, match="verified correction evidence"):
+        control_reconciliation_job(
+            session, job=job, action="retry", actor="operator", reason="Retry preserved source.",
+            idempotency_key="held-identity-retry-0001",
+        )
+
+
+def test_unresolved_identity_contract_rejects_a_fabricated_attendance_event():
+    with pytest.raises(ValueError, match="cannot claim an attendance event"):
+        _tail_source(1, "IDENTITY_UNRESOLVED", event=True)
+
+
 def test_partial_source_exception_review_remains_held_and_tail_is_out_of_scope(
     reconciliation_db,
 ):
@@ -1121,8 +1163,9 @@ def test_oracle_phase_reports_no_false_source_throughput_eta(reconciliation_db):
     }
 
 
+@pytest.mark.parametrize("third_disposition", ["MALFORMED", "IDENTITY_UNRESOLVED"])
 def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
-    reconciliation_db,
+    reconciliation_db, third_disposition,
 ):
     session, connector = reconciliation_db
     coverage = _certify_one_record_baseline(session, connector)
@@ -1130,7 +1173,7 @@ def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
     records = [
         _tail_source(1, "INVALID_TIME"),
         _tail_source(2, "EVENT", event=True),
-        _tail_source(3, "MALFORMED"),
+        _tail_source(3, third_disposition),
     ]
     draft = SourceTailChunkRequest(
         terminal_serial=SERIAL,
@@ -1179,7 +1222,7 @@ def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
     assert [row.disposition for row in manifests[1:]] == [
         "INVALID_TIME",
         "EVENT",
-        "MALFORMED",
+        third_disposition,
     ]
     assert manifests[1].attendance_event_id is None
     assert manifests[2].attendance_event_id is not None
@@ -1207,7 +1250,8 @@ def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
         "open": 2,
         "reviewed": 0,
         "invalid_time": 1,
-        "malformed": 1,
+        "malformed": int(third_disposition == "MALFORMED"),
+        "identity_unresolved": int(third_disposition == "IDENTITY_UNRESOLVED"),
         "affected_terminals": 1,
     }
     assert all(row["cursor_advanced"] for row in report["rows"])
