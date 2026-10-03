@@ -10,6 +10,8 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
     source = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
     reads = source[source.index("static bool recv_exact("):source.index("static bool send_all(")]
     stream = source[source.index("static bool zk_recv_data_stream("):source.index("static bool zk_send_command(")]
+    command = source[source.index("static bool zk_send_command("):
+                     source.index("static bool zk_send_ack_only(int sock, uint16_t session_id)\n{")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -21,10 +23,16 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
 #define CMD_DATA 1501
 #define CMD_ACK_OK 2000
 #define CMD_REG_EVENT 500
+#define CMD_CONNECT 1000
+#define USHRT_MAX_ZK 65535
 #define ZKT_BUFFER_CHUNK_BYTES 65472
 #define ESP_LOGW(...) ((void)0)
+#define ESP_LOGE(...) ((void)0)
+#define ESP_LOGI(...) ((void)0)
 typedef struct {uint16_t command,checksum,session_id,reply_id;} zk_header_t;
 typedef struct {uint16_t marker_1,marker_2;uint32_t length;} zk_tcp_header_t;
+typedef struct {uint16_t session_id,reply_id;} zk_context_t;
+typedef struct {uint16_t code,session_id,reply_id;uint8_t *data;size_t data_len;} zk_response_t;
 static uint8_t input[2048];
 static size_t total,position,fragment=1;
 static unsigned acknowledgements;
@@ -34,6 +42,10 @@ static int recv(int sock,void *out,size_t count,int flags)
  memcpy(out,input+position,count);position+=count;return (int)count;}
 static bool zk_send_ack_only(int sock,uint16_t session)
 {(void)sock;assert(session==12);++acknowledgements;return true;}
+static bool send_all(int sock,const uint8_t *data,size_t count)
+{(void)sock;assert(data&&count);return true;}
+static uint16_t zk_checksum(const uint8_t *data,size_t count)
+{assert(data&&count);return 0;}
 /* PRODUCTION */
 static void frame(uint16_t command,uint16_t session,const char *body,size_t size)
 {zk_tcp_header_t top={MACHINE_PREPARE_DATA_1,MACHINE_PREPARE_DATA_2,sizeof(zk_header_t)+(uint32_t)size};
@@ -58,11 +70,17 @@ int main(void){
  total=position=0;frame(CMD_DATA,12,"abcd",4);((zk_tcp_header_t*)input)->length=UINT32_MAX;
  assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
  assert(!acknowledgements);
+ total=position=0;frame(CMD_DATA,12,"abcd",4);((zk_tcp_header_t*)input)->length=UINT32_MAX;
+ zk_context_t ctx={12,1};zk_response_t response;
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(position==sizeof(zk_tcp_header_t)); /* No drain of untrusted body. */
+ assert(!zk_send_command(1,&ctx,1,(const uint8_t*)"x",SIZE_MAX,(uint8_t*)out,sizeof(out),&response));
+ assert(!zk_send_command(1,&ctx,1,NULL,1,(uint8_t*)out,sizeof(out),&response));
  return 0;
 }
 '''
     unit = tmp_path / "transport.c"
-    unit.write_text(harness.replace("/* PRODUCTION */", reads + stream))
+    unit.write_text(harness.replace("/* PRODUCTION */", reads + stream + command))
     executable = tmp_path / "transport"
     subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", str(unit), "-o", str(executable)], check=True)

@@ -1112,6 +1112,9 @@ static bool zk_send_command(
     zk_response_t *response)
 {
     uint8_t tx[sizeof(zk_tcp_header_t) + 512];
+    if (!ctx || !rx || !response || rx_cap < sizeof(zk_header_t) ||
+        payload_len > sizeof(tx) - sizeof(zk_tcp_header_t) - sizeof(zk_header_t) ||
+        (payload_len && !payload)) return false;
     size_t packet_len = sizeof(zk_header_t) + payload_len;
     if (packet_len > sizeof(tx) - sizeof(zk_tcp_header_t)) {
         ESP_LOGE(TAG, "ZKT command payload too large: %u", (unsigned)payload_len);
@@ -1160,7 +1163,8 @@ static bool zk_send_command(
         }
         if (reply_top.length > rx_cap) {
             ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
-            (void)drain_bytes(sock, reply_top.length);
+            // The advertised length is untrusted. Abort this session's
+            // operation instead of draining an arbitrary multi-gigabyte body.
             return false;
         }
         if (!recv_exact(sock, rx, reply_top.length)) {
