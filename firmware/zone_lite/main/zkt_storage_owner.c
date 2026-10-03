@@ -24,6 +24,7 @@ typedef struct {
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
+    bool opening_store;
     uint64_t retry_at_us;
     char wire_scratch[ZJ_CUSTODY_PAYLOAD_MAX];
 } owner_t;
@@ -97,7 +98,9 @@ static bool journal_absent(void *context)
 }
 static bool admitted(void *context, size_t bytes)
 {
-    (void)context;
+    zj_state_t *state = context;
+    owner_t *o = state->port.context;
+    if (o->opening_store) return qs_local_admit_locked(QS_ADMIT_RECOVERY, bytes);
     /* APPEND already holds the shared budget lock and an admission covering
      * both possible segment metadata and this record. No competing producer
      * can consume that budget before the write finishes. */
@@ -116,7 +119,9 @@ static zj_result_t recover(owner_t *o)
     if (result == ZJ_OK) {
         zj_store_port_t port = {zj_state_checkpoint_load, zj_state_checkpoint_commit,
             zj_state_reserve, admitted, &o->state, zj_crypto_port(&o->key)};
+        o->opening_store = true;
         result = zj_store_open(&o->store, o->prefix, &o->metadata, o->state.limit, port);
+        o->opening_store = false;
     }
     qs_local_end(true, 0);
     o->retry_at_us = result == ZJ_OK ? 0 : now + 5000000;
@@ -204,6 +209,7 @@ static void task(void *context)
         o->health.operation_running = false;
         o->health.recovering = false;
         o->health.ready = o->store.ready && o->state.ready;
+        o->health.checkpoint_recovery_pending = o->store.checkpoint_recovery_pending;
         o->health.last_result = reply.result;
         if (reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
             ++o->health.failures;

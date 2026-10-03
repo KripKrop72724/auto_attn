@@ -37,4 +37,7 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes);
  * capacity has crossed the write ceiling. Success pairs with local_end(true,
  * 0); the caller reports read/NVS errors under its own operation category. */
 bool qs_local_read_begin(void);
+/* Caller already owns the shared lock. Refusal keeps it held; pair the original
+ * begin with one end. Used when recovery discovers that it must preserve bytes. */
+bool qs_local_admit_locked(qs_admission_t policy, size_t bytes);
 void qs_local_end(bool persisted, int captured_error);

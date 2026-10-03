@@ -9,6 +9,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define CHECKPOINT_EVIDENCE_BYTES (8U + ZJ_CHECKPOINT_BYTES)
+static zj_result_t read_bytes(zj_store_t *, uint64_t, uint32_t, uint8_t *, size_t);
+
 static void put32(uint8_t *p, uint32_t v)
 {
     for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i));
@@ -87,6 +90,66 @@ static bool load_checkpoint(zj_store_t *s, const uint8_t cp[ZJ_CHECKPOINT_BYTES]
     s->last_sequence = get64(cp + 32);
     return s->read_segment || (!s->read_offset && !s->last_sequence);
 }
+static void recovery_pending(zj_store_t *s)
+{
+    s->checkpoint_recovery_pending = false;
+    for (unsigned i = 0; i < s->count; ++i) {
+        const zj_segment_t *segment = &s->segments[i];
+        if (segment->checkpoint_evidence && (segment->id > s->read_segment ||
+            (segment->id == s->read_segment && s->read_offset < segment->size)))
+            s->checkpoint_recovery_pending = true;
+    }
+}
+static zj_result_t preserve_checkpoint(zj_store_t *s, const uint8_t cp[ZJ_CHECKPOINT_BYTES])
+{
+    /* Preserve the exact damaged bytes before replacing a retirement cursor.
+     * The fresh segment identity consumes the existing durable nonce allocator;
+     * no encryption root, epoch or counter is reconstructed from file contents.
+     * This opaque segment stays in the ordinary custody lane until ADD commits
+     * its receipt. A reboot before reset reuses the same complete evidence. */
+    uint8_t evidence[CHECKPOINT_EVIDENCE_BYTES];
+    memcpy(evidence, "ZJCPE001", 8);
+    memcpy(evidence + 8, cp, ZJ_CHECKPOINT_BYTES);
+    for (unsigned i = 0; i < s->count; ++i) {
+        const zj_segment_t *segment = &s->segments[i];
+        if (!segment->checkpoint_evidence) continue;
+        uint8_t existing[CHECKPOINT_EVIDENCE_BYTES];
+        zj_result_t result = read_bytes(s, segment->id, 0, existing, sizeof(existing));
+        if (result != ZJ_OK) return result;
+        if (memcmp(existing, evidence, sizeof(existing))) continue;
+        char path[144];
+        if (!filename(s, segment->id, path)) return ZJ_INVALID;
+        errno = 0;
+        FILE *file = fopen(path, "r+b");
+        if (!file) return failure(s, "checkpoint_evidence_open", errno, ZJ_IO);
+        /* A previous failed fsync is not proof of durability just because a
+         * read succeeds. Synchronize and close without rewriting the bytes. */
+        bool ok = fsync(fileno(file)) == 0;
+        int error = ok ? 0 : errno;
+        if (fclose(file) != 0 && ok) { error = errno; ok = false; }
+        return ok ? ZJ_OK : failure(s, "checkpoint_evidence_sync", error, ZJ_UNCERTAIN);
+    }
+    if (s->count == ZJ_SEGMENTS_MAX) return failure(s, "checkpoint_evidence_capacity", ENOSPC, ZJ_FULL);
+    errno = 0;
+    if (!s->port.admit(s->port.context, sizeof(evidence)))
+        return failure(s, "checkpoint_evidence_admission", errno ? errno : ENOSPC,
+                       errno && errno != ENOSPC ? ZJ_IO : ZJ_FULL);
+    uint64_t id;
+    if (!zj_sequence_next(&s->sequence, &id)) return failure(s, "nonce_reservation", EIO, ZJ_IO);
+    char path[144];
+    if (!filename(s, id, path)) return ZJ_INVALID;
+    errno = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return failure(s, "checkpoint_evidence_create", errno, ZJ_IO);
+    FILE *file = fdopen(fd, "wb");
+    if (!file) { int error = errno; close(fd); return failure(s, "checkpoint_evidence_fdopen", error, ZJ_IO); }
+    if (!commit_file(s, file, evidence, sizeof(evidence), false, true)) return ZJ_UNCERTAIN;
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size != sizeof(evidence))
+        return failure(s, "checkpoint_evidence_extent", errno, ZJ_UNCERTAIN);
+    s->segments[s->count++] = (zj_segment_t){.id = id, .size = sizeof(evidence), .checkpoint_evidence = true};
+    return ZJ_OK;
+}
 static int compare_segments(const void *left, const void *right)
 {
     const zj_segment_t *a = left, *b = right;
@@ -123,7 +186,9 @@ zj_result_t zj_store_open(zj_store_t *s, const char *prefix, const zj_metadata_t
     uint8_t cp[ZJ_CHECKPOINT_BYTES];
     int loaded = port.load(port.context, cp);
     if (loaded < 0) return failure(s, "checkpoint_load", EIO, ZJ_IO);
-    if (loaded && !load_checkpoint(s, cp)) return failure(s, "checkpoint_validate", EBADMSG, ZJ_CORRUPT);
+    bool replay = loaded && (!load_checkpoint(s, cp) || s->read_segment >= persisted_limit ||
+                            s->last_sequence >= persisted_limit);
+    if (replay) s->read_segment = s->read_offset = s->last_sequence = s->checkpoint_revision = 0;
     char directory[112];
     const char *base = strrchr(prefix, '/');
     if (base) {
@@ -166,15 +231,34 @@ zj_result_t zj_store_open(zj_store_t *s, const char *prefix, const zj_metadata_t
         zj_result_t checked = read_header(s, &segment, header, &parsed);
         if (checked != ZJ_OK && checked != ZJ_CORRUPT) { result = checked; break; }
         segment.metadata_valid = checked == ZJ_OK;
-        if (id == s->read_segment && s->read_offset > segment.size) {
-            result = failure(s, "checkpoint_extent", EBADMSG, ZJ_CORRUPT);
-            break;
+        if (segment.size == CHECKPOINT_EVIDENCE_BYTES) {
+            uint8_t magic[8];
+            checked = read_bytes(s, segment.id, 0, magic, sizeof(magic));
+            if (checked != ZJ_OK) { result = checked; break; }
+            segment.checkpoint_evidence = !memcmp(magic, "ZJCPE001", sizeof(magic));
         }
+        if (id == s->read_segment && (s->read_offset > segment.size ||
+            (segment.metadata_valid && s->read_offset < ZJ_META_BYTES))) replay = true;
         s->segments[s->count++] = segment;
     }
     if (closedir(dir) != 0 && result == ZJ_OK) result = failure(s, "directory_close", errno, ZJ_IO);
     if (result != ZJ_OK) return result;
     qsort(s->segments, s->count, sizeof(s->segments[0]), compare_segments);
+    if (replay) {
+        s->read_segment = s->read_offset = s->last_sequence = s->checkpoint_revision = 0;
+        result = preserve_checkpoint(s, cp);
+        if (result != ZJ_OK) return result;
+        /* Reset means replay from the earliest retained byte, never infer a
+         * destination receipt from a damaged checkpoint. Already reclaimed
+         * segments are not recreated; their former ADD custody is unchanged. */
+        memset(cp, 0, sizeof(cp));
+        memcpy(cp, "ZJCP0001", 8);
+        put64(cp + 8, 1);
+        put32(cp + 76, dq_crc32(cp, 76));
+        if (!port.commit(port.context, cp)) return failure(s, "checkpoint_replay_commit", EIO, ZJ_UNCERTAIN);
+        if (!load_checkpoint(s, cp)) return ZJ_CORRUPT;
+    }
+    recovery_pending(s);
     s->ready = true;
     return ZJ_OK;
 }
@@ -300,7 +384,8 @@ zj_result_t zj_store_peek(zj_store_t *s, zj_item_t *item)
     size_t length = remaining < ZJ_EXCEPTION_MAX ? remaining : ZJ_EXCEPTION_MAX;
     uint8_t record[ZJ_RECORD_MAX];
     item->kind = ZJ_PRESERVED_EXCEPTION;
-    item->exception = header == ZJ_OK ? ZJ_EXCEPTION_FRAME : ZJ_EXCEPTION_METADATA;
+    item->exception = header == ZJ_OK ? ZJ_EXCEPTION_FRAME :
+        segment->checkpoint_evidence ? ZJ_EXCEPTION_CHECKPOINT : ZJ_EXCEPTION_METADATA;
     if (header == ZJ_OK && remaining >= ZJ_HEADER_BYTES) {
         zj_result_t read = read_bytes(s, segment->id, offset, record, ZJ_HEADER_BYTES);
         if (read != ZJ_OK) return read;
@@ -377,6 +462,7 @@ zj_result_t zj_store_settle(zj_store_t *s, const zj_token_t *token, const uint8_
         return failure(s, "retirement_checkpoint", EIO, ZJ_UNCERTAIN);
     }
     if (!load_checkpoint(s, cp)) { s->ready = false; return ZJ_CORRUPT; }
+    recovery_pending(s);
     return ZJ_OK;
 }
 

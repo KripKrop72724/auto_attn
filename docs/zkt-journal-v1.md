@@ -115,9 +115,20 @@ re-authenticated before interpretation; malformed earlier bytes cannot hide a
 later valid record. Opaque evidence needs an explicit committed ADD receipt
 before it can be reclaimed.
 
-A corrupt retirement checkpoint, unavailable key or inconsistent segment
-identity fails closed without formatting or deleting files. Automatic
-checkpoint reconstruction from ADD evidence is not implemented in this stage.
+A corrupt or impossible retirement checkpoint first becomes an immutable
+88-byte evidence segment (`ZJCPE001` followed by the original 80 bytes). Only
+after synchronization and close succeed can the owner commit a cursor that
+replays from the earliest retained segment. Replay keeps original capture
+identities. A restart between those steps reuses and synchronizes the complete
+evidence segment; partial evidence files stay preserved. The evidence has its
+own `CHECKPOINT` custody exception, and recovery stays pending until its ADD
+receipt has committed. Recovery writes use the shared capacity reserve.
+
+An unavailable checkpoint read, unavailable/corrupt key or counter, inconsistent
+segment identity, or insufficient evidence capacity still fails closed without
+formatting or deleting retained files. No key or nonce is reconstructed. This
+procedure replays retained bytes; it does not reconstruct externally lost bytes
+or infer Oracle completion from a checkpoint.
 The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 

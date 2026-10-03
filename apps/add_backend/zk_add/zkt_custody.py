@@ -109,7 +109,7 @@ class JournalException(BaseModel):
     segment_id: str = Field(pattern=r"^[1-9][0-9]{0,18}$")
     start_offset: int = Field(ge=0, le=2**32 - 1)
     end_offset: int = Field(ge=1, le=2**32 - 1)
-    exception_kind: Literal["METADATA", "FRAME", "AUTH", "TAIL"]
+    exception_kind: Literal["METADATA", "FRAME", "AUTH", "TAIL", "CHECKPOINT"]
     raw_b64: str = Field(min_length=4, max_length=684)
     raw_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
 

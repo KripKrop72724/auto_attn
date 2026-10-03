@@ -132,6 +132,13 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
         errno = EBUSY;
         return false;
     }
+    bool admitted = qs_local_admit_locked(policy, bytes);
+    if (!admitted) xSemaphoreGive(budget_lock);
+    return admitted;
+}
+bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
+{
+    if ((unsigned)policy > QS_ADMIT_OPTIONAL_HISTORICAL) { errno = EINVAL; return false; }
     bool measured = measure();
     sb_class_t kind = policy == QS_ADMIT_HISTORICAL || policy == QS_ADMIT_OPTIONAL_HISTORICAL ? SB_HISTORICAL :
         policy == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
@@ -146,7 +153,6 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
         // Only the optional authenticated catalog may fall back to memory.
         // Refused attendance and recovery writes must still block boot proof.
         if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) health.last_error = error;
-        xSemaphoreGive(budget_lock);
         errno = error;
     }
     return admitted;

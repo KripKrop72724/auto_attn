@@ -46,3 +46,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                         "zkt_custody_wire.c"]),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
+    for scenario in ["--checkpoint", "--recovery-full"]:
+        directory = tmp_path / scenario.removeprefix("--")
+        directory.mkdir()
+        subprocess.run([str(binary), scenario], cwd=directory, check=True, timeout=30)
