@@ -952,10 +952,10 @@ def _decode_zkt_record(manifest: TerminalRecordManifest) -> dict:
     if len(raw) != manifest.record_size:
         raise RecoveryError("The preserved ZKT record size does not match its manifest.", "SOURCE_EVIDENCE_INVALID")
     if manifest.record_size == 8:
-        uid = str(int.from_bytes(raw[0:2], "little"))
-        user_id = manifest.observed_user_id
-        timestamp = int.from_bytes(raw[3:7], "little")
-        status, punch = raw[2], raw[7]
+        raise RecoveryError(
+            "A historical attendance UID is not independent employee identity evidence.",
+            "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED",
+        )
     elif manifest.record_size == 16:
         uid = manifest.observed_uid or ""
         user_id = str(int.from_bytes(raw[0:4], "little"))

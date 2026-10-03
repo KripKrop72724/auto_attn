@@ -53,6 +53,20 @@ Source rows and their canonical chain inputs are constructed together: an
 allocation failure returns failure with neither row appended. Seven pinned
 cJSON harnesses now cover the source encoder as well as the existing serializers.
 
+ADD also checks older firmware's incoming source claims before ingesting or
+recovering attendance. An 8-byte UID-only record, or a 40-byte record whose
+user field is empty, cannot acquire an employee assignment from its submitted
+nested event. Migration `0045` retains that original interpretation encrypted,
+with its declared disposition and the guard version, separately from the raw
+bytes and derived `IDENTITY_UNRESOLVED` custody state. Both baseline and tail
+transactions continue their source chains while preserving this hold. Other
+valid rows in the batch can proceed; replay cannot release an existing event
+through a held claim. Existing accepted manifests and Oracle keys are unchanged.
+Recovery epochs and additive database rollback retain the encrypted claim.
+The audited source reveal shows the submitted interpretation separately from
+the custody result. This is a negative identity check, not profile qualification.
+Clock correction cannot use an 8-byte historical UID as employee identity.
+
 ## Browser event contract
 
 Wire envelopes map to canonical `device`, `users`, `attendance`, `command` and
@@ -204,6 +218,15 @@ still block recovery. Encryption identity and nonce allocation never reset.
   Backend/schema/HIL tests: 258 passed. UI: 15 preservation-health tests and
   all eight browser/viewport cases passed; TypeScript, production build and
   bundle budgets passed. Desktop and narrow mobile screenshots were inspected.
+
+- ADD historical-claim guard: 175 focused reconciliation, identity, evidence and
+  repair tests passed, followed by all 13 dedicated guard tests including source
+  epoch recovery. A real PostgreSQL migration test verifies old rows are not
+  reclassified and new claim evidence survives additive rollback/re-upgrade.
+  A separate actual database dump/restore preserved encrypted raw bytes and
+  submitted claims; Alembic schema drift checks passed. The full unit run passed
+  1,335 tests with 31 environment-dependent skips; the PostgreSQL migration test
+  was also run explicitly against PostgreSQL and passed.
 
 - Historical identity guard: 181 targeted firmware/decoder/reconciliation tests
   passed, then 61 reconciliation tests passed after bounding the unfinished-scan
