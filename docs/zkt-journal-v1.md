@@ -122,6 +122,31 @@ The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 
 The ESP adapter currently owns journal operations only. Catalog and legacy
-queue ownership, live/interleaved capture, delivery-task integration, bridge reader proof,
+queue ownership, capture/delivery activation, bridge reader proof,
 delivery matching and current-incident recovery must be integrated and tested
 before activation. Existing firmware behavior remains gated until then.
+
+## Raw live packet capture
+
+Raw formats 4 (`LIVE_PACKET`) and 5 (`PACKET_FRAGMENT`) preserve the full ZKT
+header and payload before semantic interpretation. Format 4 contains up to
+512 source bytes. Larger packets, bounded to 65,536 bytes, use a 60-byte fragment
+header: `ZJF1`, a 16-byte random group ID, little-endian 32-bit total length and
+offset, and the complete packet's 32-byte SHA-256. Each chunk carries at most
+452 source bytes. Fragment grouping also requires the authenticated connector,
+terminal identity and capture epoch; the random group ID alone is insufficient.
+
+All fragments must durably commit before a protocol ACK. ADD must have every
+nonconflicting extent and verify the complete digest before interpreting a
+packet. Partial captures remain explicit evidence; they cannot become partial
+attendance. A timeout preserves accepted owner work and withholds ACK. The
+capture caller retains an unreleased reply ticket until the owner accepts
+abandonment, preventing repeated timeouts from leaking request slots.
+
+The capture call has a 15-second deadline, with a five-second deadline per
+owner append, and uses no ADD/Oracle network call. These are recovery bounds,
+not measured live-latency guarantees. The normal and both interleaved protocol
+paths call the capture hook before ACK under `ZONE_LITE_JOURNAL_WRITES`. This
+integration-test switch remains off in release workflows. Runtime startup
+still requires persisted reader compatibility; without startup, a writer
+build refuses live ACK rather than falling back to legacy delivery.

@@ -21,7 +21,7 @@ counts are kept outside this public repository.
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
-| Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task | Actual filesystem fault injection, independent crypto vectors, NVS port faults and concurrent owner harness | Partial: journal components implemented; live capture/transport wiring, catalog and legacy handoff remain open |
+| Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: capture/delivery startup gated; catalog and legacy handoff remain open |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
@@ -128,11 +128,19 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
   builds, independent crypto/wire vectors and all five allocation harnesses
   passed. A sixth harness now checks the actual socket custody-ACK dispatcher
   under delayed, duplicate, mismatched and allocation-failure conditions.
+- Raw capture integration: 208 firmware/custody/packet tests passed; native and
+  Linux sanitizer harnesses retained accepted writes after caller timeout and
+  refused ACK for partial captures. Normal ZKT, gated journal-writer and
+  Hikvision ESP-IDF development builds passed. Independent C/Python wire and
+  pinned-mbedTLS vectors include whole packets, fragments and out-of-civil-range
+  capture clocks. CI now compiles the gated writer separately and does not
+  publish that integration image.
 
 ## Work that still blocks the requested release
 
-1. Durable raw capture before acknowledging interleaved live events; the current
-   prepared-read path still relies on terminal-tail recovery and is unqualified.
+1. Qualify and activate durable raw capture before acknowledging live events.
+   The ordinary, command-response and prepared-read hooks are implemented under
+   a disabled writer build switch. Partial packet fragments remain holds.
 2. Activate the journal storage/delivery tasks through the compatible-reader
    gate and wire live capture; transfer catalog and
    legacy storage operations to the same owner. Qualify actual ESP latency,

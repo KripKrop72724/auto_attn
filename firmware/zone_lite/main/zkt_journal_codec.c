@@ -87,12 +87,12 @@ bool zj_metadata_decode(const uint8_t in[ZJ_META_BYTES], zj_metadata_t *m)
 bool zj_observation_valid(const zj_observation_t *o)
 {
     return o && o->sequence && o->sequence <= ZJ_SEQUENCE_MAX &&
-        o->raw_format >= ZJ_LIVE_FRAME && o->raw_format <= ZJ_UNKNOWN &&
+        o->raw_format >= ZJ_LIVE_FRAME && o->raw_format <= ZJ_PACKET_FRAGMENT &&
         o->time_quality >= ZJ_TIME_VERIFIED && o->time_quality <= ZJ_TIME_UNKNOWN &&
         o->raw_length && o->raw_length <= ZJ_RAW_MAX &&
         /* Captured wall time may be unavailable. Never interpret that as a
          * verified punch time; the encoded terminal time remains untouched. */
-        o->captured_at_seconds >= 0 && o->captured_at_seconds <= INT64_C(253402300799) &&
+        o->captured_at_seconds >= 0 &&
         ((o->source_ordinal == UINT32_MAX && !nonzero(o->source_epoch, 16)) ||
          (o->source_ordinal <= INT32_MAX && nonzero(o->source_epoch, 16) &&
           o->raw_format == ZJ_SOURCE_RECORD));
@@ -101,7 +101,7 @@ bool zj_observation_valid(const zj_observation_t *o)
 bool zj_record_length(const uint8_t h[ZJ_HEADER_BYTES], size_t *length)
 {
     if (!h || !length || memcmp(h, "ZJO1", 4) ||
-        h[6] < ZJ_LIVE_FRAME || h[6] > ZJ_UNKNOWN ||
+        h[6] < ZJ_LIVE_FRAME || h[6] > ZJ_PACKET_FRAGMENT ||
         h[7] < ZJ_TIME_VERIFIED || h[7] > ZJ_TIME_UNKNOWN ||
         !get64(h + 8) || get64(h + 8) > ZJ_SEQUENCE_MAX ||
         get16(h + 22)) return false;

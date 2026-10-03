@@ -36,6 +36,10 @@ typedef struct {uint16_t code,session_id,reply_id;uint8_t *data;size_t data_len;
 static uint8_t input[2048];
 static size_t total,position,fragment=1;
 static unsigned acknowledgements;
+static bool preserve_ok = true, preserved;
+static unsigned captures;
+static bool zk_preserve_live_packet(const uint8_t *packet,size_t length)
+{assert(length==9 && packet[8]=='x'); ++captures; preserved=preserve_ok; return preserve_ok;}
 static int recv(int sock,void *out,size_t count,int flags)
 {
     (void)sock;
@@ -54,7 +58,7 @@ static int recv(int sock,void *out,size_t count,int flags)
     return (int)count;
 }
 static bool zk_send_ack_only(int sock,uint16_t session)
-{(void)sock;assert(session==12);++acknowledgements;return true;}
+{(void)sock;assert(session==12 && preserved);preserved=false;++acknowledgements;return true;}
 static bool send_all(int sock,const uint8_t *data,size_t count)
 {(void)sock;assert(data&&count);return true;}
 static uint16_t zk_checksum(const uint8_t *data,size_t count)
@@ -89,6 +93,20 @@ int main(void){
  assert(position==sizeof(zk_tcp_header_t)); /* No drain of untrusted body. */
  assert(!zk_send_command(1,&ctx,1,(const uint8_t*)"x",SIZE_MAX,(uint8_t*)out,sizeof(out),&response));
  assert(!zk_send_command(1,&ctx,1,NULL,1,(uint8_t*)out,sizeof(out),&response));
+ total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
+ assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(captures==1 && acknowledgements==1);
+ preserve_ok=false;
+ total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"abcd",4);
+ assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(captures==2 && acknowledgements==1);
+ total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(captures==3 && acknowledgements==1);
+ preserve_ok=true;
+ total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
+ assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(captures==4 && acknowledgements==2 && response.code==CMD_ACK_OK);
  return 0;
 }
 '''

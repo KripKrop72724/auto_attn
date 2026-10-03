@@ -72,7 +72,8 @@ static bool observation(output_t *out, const zj_item_t *item, zj_crypto_port_t c
         if ((int64_t)seconds != value->captured_at_seconds || !gmtime_r(&seconds, &utc) ||
             !strftime(timestamp, sizeof(timestamp), "\"%Y-%m-%dT%H:%M:%SZ\"", &utc)) return false;
     }
-    static const char *formats[] = {NULL, "LIVE_FRAME", "SOURCE_RECORD", "UNKNOWN"};
+    static const char *formats[] = {NULL, "LIVE_FRAME", "SOURCE_RECORD", "UNKNOWN",
+        "LIVE_PACKET", "PACKET_FRAGMENT"};
     static const char *qualities[] = {NULL, "VERIFIED", "UNSYNCED", "INVALID", "UNKNOWN"};
     append(out, "{\"capture_epoch\":\"%s\",\"capture_sequence\":\"%llu\",\"captured_at\":%s,"
                 "\"captured_at_seconds\":\"%lld\",\"captured_uptime_ms\":\"%llu\","

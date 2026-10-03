@@ -16,7 +16,8 @@
 #define ZJ_RECORD_MAX (ZJ_HEADER_BYTES + ZJ_FACT_BYTES + ZJ_RAW_MAX + ZJ_TAG_BYTES)
 #define ZJ_SEQUENCE_MAX INT64_MAX
 
-typedef enum { ZJ_LIVE_FRAME = 1, ZJ_SOURCE_RECORD = 2, ZJ_UNKNOWN = 3 } zj_raw_format_t;
+typedef enum { ZJ_LIVE_FRAME = 1, ZJ_SOURCE_RECORD = 2, ZJ_UNKNOWN = 3,
+               ZJ_LIVE_PACKET = 4, ZJ_PACKET_FRAGMENT = 5 } zj_raw_format_t;
 typedef enum { ZJ_TIME_VERIFIED = 1, ZJ_TIME_UNSYNCED = 2,
                ZJ_TIME_INVALID = 3, ZJ_TIME_UNKNOWN = 4 } zj_time_quality_t;
 typedef enum { ZJ_CODEC_OK, ZJ_CODEC_INVALID, ZJ_CODEC_SMALL, ZJ_CODEC_AUTH,
