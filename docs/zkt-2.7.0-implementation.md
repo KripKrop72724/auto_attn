@@ -54,8 +54,9 @@ still requires ADD's historical continuity checks. Previously accepted records,
 raw bytes and Oracle keys are not rewritten by this guard. Corrections require
 separate derived evidence; a source review note alone cannot clear this hold.
 Source rows and their canonical chain inputs are constructed together: an
-allocation failure returns failure with neither row appended. Seven pinned
-cJSON harnesses now cover the source encoder as well as the existing serializers.
+allocation failure returns failure with neither row appended. Nine pinned
+cJSON harnesses cover the source encoder, source wire contract, OTA progress
+receipts and existing serializers.
 
 ADD also checks older firmware's incoming source claims before ingesting or
 recovering attendance. An 8-byte UID-only record, or a 40-byte record whose
