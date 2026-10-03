@@ -6,6 +6,8 @@
 
 typedef int esp_err_t;
 typedef unsigned nvs_handle_t;
+typedef struct { char project_name[32], version[32]; } esp_app_desc_t;
+const esp_app_desc_t *esp_app_get_description(void);
 typedef pthread_mutex_t *SemaphoreHandle_t;
 typedef pthread_t *TaskHandle_t;
 #define ESP_OK 0

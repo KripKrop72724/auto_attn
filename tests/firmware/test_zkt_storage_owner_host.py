@@ -23,13 +23,13 @@ def test_journal_key_counter_and_checkpoint_faults(tmp_path):
 
 
 def test_storage_mailbox_saturation_timeout_and_fairness(tmp_path):
-    compile_and_run(tmp_path, "zkt_storage_mailbox", ["zkt_storage_mailbox.c"])
+    compile_and_run(tmp_path, "zkt_storage_mailbox", ["zkt_storage_mailbox.c", "durable_queue.c"])
 
 
 def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"
-    for header in ["esp_heap_caps.h", "esp_random.h", "esp_timer.h", "nvs.h",
+    for header in ["esp_heap_caps.h", "esp_random.h", "esp_timer.h", "esp_app_desc.h", "nvs.h",
                    "freertos/FreeRTOS.h", "freertos/semphr.h", "freertos/task.h",
                    "mbedtls/platform_util.h"]:
         path = tmp_path / header
@@ -41,12 +41,12 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     "-I", str(tmp_path), "-I", str(fixture), "-I", str(main),
                     str(fixture / "zkt_storage_owner_host.c"),
-                    *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c",
+                    *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c", "zkt_runtime_checkpoint.c",
                         "zkt_journal_state.c", "zkt_journal_store.c", "zkt_journal_codec.c", "durable_queue.c",
                         "zkt_custody_wire.c"]),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
-    for scenario in ["--checkpoint", "--recovery-full"]:
+    for scenario in ["--checkpoint", "--recovery-full", "--runtime-corrupt-journal"]:
         directory = tmp_path / scenario.removeprefix("--")
         directory.mkdir()
         subprocess.run([str(binary), scenario], cwd=directory, check=True, timeout=30)
