@@ -22,7 +22,17 @@ target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c")
 if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
     target_sources(${COMPONENT_LIB} PRIVATE "zkt_journal_codec.c" "zkt_journal_crypto.c" "zkt_journal_store.c"
         "zkt_journal_state.c" "zkt_storage_mailbox.c" "zkt_storage_owner.c"
-        "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c")
+        "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
+        "zkt_journal_capture.c" "zkt_capture_runtime.c")
+endif()
+
+# This is an integration-test switch, not release authorization. Signed bridge
+# and candidate registration remain blocked until reader compatibility exists.
+if(ZONE_LITE_JOURNAL_WRITES)
+    if(ZONE_LITE_FAMILY STREQUAL "hikvision")
+        message(FATAL_ERROR "The attendance journal writer is ZKT-only")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITES=1)
 endif()
 if(ZONE_LITE_FAMILY STREQUAL "hikvision")
     if(NOT CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH OR NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC)

@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from zk_add.crypto import encrypt_json
+from zk_add.zkt_packet import parse_fragment
 from zk_add.models import (Connector, TerminalRecordManifest, TerminalSourceEpoch,
                            ZktObservationReceipt, ZktOccurrenceAlias, ZktObservationLink)
 
@@ -56,7 +57,7 @@ class Observation(BaseModel):
     captured_uptime_ms: str | None = Field(default=None, pattern=r"^(0|[1-9][0-9]{0,19})$")
     raw_b64: str = Field(min_length=4, max_length=684)
     raw_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
-    raw_format: Literal["LIVE_FRAME", "SOURCE_RECORD", "UNKNOWN"]
+    raw_format: Literal["LIVE_FRAME", "SOURCE_RECORD", "UNKNOWN", "LIVE_PACKET", "PACKET_FRAGMENT"]
     decoder_profile: str = Field(min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9_.:-]+$")
     decoder_version: str = Field(min_length=1, max_length=40, pattern=r"^[a-zA-Z0-9_.:-]+$")
     time_quality: Literal["VERIFIED", "UNSYNCED", "INVALID", "UNKNOWN"]
@@ -71,6 +72,8 @@ class Observation(BaseModel):
             raise ValueError("RAW_DIGEST_MISMATCH")
         if self.observation_id != observation_id(self.terminal_serial, self.capture_epoch, self.capture_sequence):
             raise ValueError("CAPTURE_IDENTITY_MISMATCH")
+        if self.raw_format == "PACKET_FRAGMENT":
+            parse_fragment(raw)
         if self.occurrence and self.raw_format != "SOURCE_RECORD":
             # Live frames have different wire bytes. A guessed ordinal or a
             # matching timestamp cannot prove the one-to-one association.

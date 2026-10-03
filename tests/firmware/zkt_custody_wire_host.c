@@ -62,8 +62,8 @@ int main(void)
             .source_ordinal = UINT32_MAX, .identity_revision = 7}};
     for (unsigned i = 0; i < 16; ++i) item.metadata.capture_epoch[i] = (uint8_t)i;
     for (unsigned i = 0; i < ZJ_RAW_MAX; ++i) item.observation.raw[i] = (uint8_t)i;
-    const unsigned lengths[] = {1, 2, 3, 512, 40, 512};
-    for (unsigned example = 0; example < 6; ++example) {
+    const unsigned lengths[] = {1, 2, 3, 512, 40, 512, 20, 512, 12};
+    for (unsigned example = 0; example < 9; ++example) {
         item.observation.raw_length = (uint16_t)lengths[example];
         if (example == 4) {
             item.observation.raw_format = ZJ_SOURCE_RECORD;
@@ -81,6 +81,25 @@ int main(void)
             item.token.offset = 65500;
             item.token.end = 65500 + 512;
         }
+        if (example >= 6) {
+            item.kind = ZJ_OBSERVATION;
+            item.observation.source_ordinal = UINT32_MAX;
+            memset(item.observation.source_epoch, 0, 16);
+            item.observation.raw_format = example == 7 ? ZJ_PACKET_FRAGMENT : ZJ_LIVE_PACKET;
+            for (unsigned i = 0; i < ZJ_RAW_MAX; ++i) item.observation.raw[i] = (uint8_t)i;
+        }
+        if (example == 7) {
+            uint8_t packet[600];
+            for (unsigned i = 0; i < sizeof(packet); ++i) packet[i] = (uint8_t)i;
+            uint8_t *raw = item.observation.raw;
+            memcpy(raw, "ZJF1", 4);
+            for (unsigned i = 0; i < 16; ++i) raw[4 + i] = (uint8_t)(i + 1);
+            memset(raw + 20, 0, 8);
+            raw[20] = 600 & 255; raw[21] = 600 >> 8;
+            assert(crypto.digest(crypto.context, packet, sizeof(packet), raw + 28));
+            memcpy(raw + 60, packet, 452);
+        }
+        if (example == 8) item.observation.captured_at_seconds = INT64_MAX;
         char payload[ZJ_CUSTODY_PAYLOAD_MAX];
         zj_custody_expected_t expected;
         assert(zj_custody_encode(&item, crypto, payload, sizeof(payload), &expected));

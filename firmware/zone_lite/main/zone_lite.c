@@ -3,6 +3,9 @@
 #include "storage_upgrade.h"
 #include "zkt_clock.h"
 #include "zkt_record.h"
+#if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
+#include "zkt_capture_runtime.h"
+#endif
 #include "zkt_credential_record.h"
 #include "worker_retry.h"
 #include <errno.h>
@@ -1042,6 +1045,23 @@ static void configure_zkt_socket(int sock)
 
 static bool zk_send_ack_only(int sock, uint16_t session_id);
 
+static bool zk_preserve_live_packet(const uint8_t *packet, size_t length)
+{
+#if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
+    int64_t wall = epoch_now();
+    zj_capture_facts_t facts = {.wall_seconds = wall > 0 ? wall : 0,
+        .uptime_ms = (uint64_t)uptime_ms(), .time_quality = ZJ_TIME_UNKNOWN};
+    /* The complete protocol packet is preserved before layout/time/identity
+     * interpretation. Failure cannot fall through to a protocol ACK. */
+    bool preserved = zj_capture_runtime_packet(packet, length, &facts);
+    if (!preserved) g_force_truth_reconcile = true;
+    return preserved;
+#else
+    (void)packet; (void)length;
+    return true; /* Legacy reader builds retain their existing capture path. */
+#endif
+}
+
 static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, size_t out_len, size_t *actual_len)
 {
     size_t written = 0;
@@ -1083,10 +1103,8 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
             free(packet);
             break;
         } else if (CMD_REG_EVENT == header->command) {
-            // A live punch can interleave with a prepared range response.
-            // Acknowledge it and continue waiting. The post-baseline append
-            // tail reads the durable terminal row from the certified cursor.
-            bool acknowledged = zk_send_ack_only(sock, header->session_id);
+            bool acknowledged = zk_preserve_live_packet(packet, top.length) &&
+                zk_send_ack_only(sock, header->session_id);
             free(packet);
             if (!acknowledged) return false;
             continue;
@@ -1174,10 +1192,9 @@ static bool zk_send_command(
         zk_header_t *reply = (zk_header_t *)rx;
         if (command != CMD_CONNECT && reply->session_id != ctx->session_id) return false;
         if (CMD_REG_EVENT == reply->command) {
-            if (!zk_send_ack_only(sock, reply->session_id)) return false;
-            ESP_LOGI(
-                TAG,
-                "Deferred an interleaved live event to certified append-tail recovery");
+            if (!ctx->session_id || reply->session_id != ctx->session_id) return false;
+            if (!zk_preserve_live_packet(rx, reply_top.length) ||
+                !zk_send_ack_only(sock, reply->session_id)) return false;
             continue;
         }
         ctx->reply_id = reply->reply_id;
@@ -7598,6 +7615,7 @@ static bool discover_zkt(uint32_t *selected_ip, uint32_t skip_ip)
     return false;
 }
 
+#if !defined(ZONE_LITE_JOURNAL_WRITES) || defined(ZONE_LITE_HIKVISION)
 static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users, uint8_t *wire_hint)
 {
     size_t record_size = 0;
@@ -7648,6 +7666,7 @@ static size_t process_live_packet(const uint8_t *data, size_t len, const user_ta
     }
     return observed;
 }
+#endif
 
 static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
 {
@@ -8342,8 +8361,10 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
             }
             zk_header_t *header = (zk_header_t *)packet;
+            if (header->session_id != ctx.session_id) { free(packet); break; }
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
-                if (!zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
+                if (!zk_preserve_live_packet(packet, top.length) ||
+                    !zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
                 // The session starts from a two-read stable user snapshot and
                 // refreshes it periodically or on explicit ADD commands.  Do
                 // not perform another multi-minute full-table refresh while
@@ -8352,11 +8373,19 @@ static int64_t gateway_run(uint32_t host_order_ip)
                 // authenticated session.  Unknown identities remain durable
                 // and fail closed in the ADD identity-blocked queue until a
                 // later verified snapshot or catalog alias repairs them.
+#if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
+                /* The ADD journal path owns interpretation/delivery. Counting
+                 * packets here only schedules source checks; it is not a
+                 * count of decoded punches or an Oracle completion claim. */
+                ++live_events_since_sync;
+                led_status_event(LED_EVENT_LIVE_PUNCH);
+#else
                 live_events_since_sync += process_live_packet(
                     packet + sizeof(zk_header_t),
                     top.length - sizeof(zk_header_t),
                     users,
                     &ctx.live_record_size);
+#endif
                 add_connector_set_activity("LIVE_CAPTURE");
             }
             free(packet);
