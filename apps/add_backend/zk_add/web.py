@@ -1986,6 +1986,22 @@ def zkt_source_evidence_list(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.get("/api/v1/devices/{connector_id}/source-load-baseline")
+def zkt_source_load_baseline(
+    connector_id: str,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    from zk_add.zkt_source_load import source_load_baseline
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    try:
+        return source_load_baseline(db, connector)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/api/v1/devices/{connector_id}/source-evidence/{manifest_id}/reveal")
 def zkt_source_evidence_reveal(
     connector_id: str,

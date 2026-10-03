@@ -33,9 +33,15 @@ counts are kept outside this public repository.
 | OTA boot confirmation waits for ADD or an unused ESP Oracle worker; HTTP success can conceal a rejected state | Exact bridge/writer images validate local preservation, required workers and an authenticated terminal snapshot before contacting ADD; durable stages order reports and typed receipts verify actual deployment state and running image | Local outage, lost-reply, interrupted checkpoint, stale-worker, mark-valid failure, rejected-state and receipt allocation tests; legacy/Hikvision regression builds | Implemented local boot component; remote HIL, operational rollback and signed qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
+| Replayed delivery can inflate workload estimates | Read-only 30-day source-ordinal counts, same-second multiplicity, strict current source scope, bounded query deadlines and explicit unknown/uncertified evidence | SQLite/PostgreSQL tests, concurrent change and 200,000-record measurement | Implemented measurement component; profile, clock/window closure and actual zone capacity qualification remain open |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
 
 ## Required release evidence
+
+The [source-load diagnostic](zkt-source-load-baseline.md) measures observed
+calendar-day and minute counts without using delivery attempts. It cannot turn
+missing source history or an unqualified clock/profile into a complete baseline.
+Its measurement remains separate from the seven-day capacity gate.
 
 ADD backup restore, additive migration and rollback-reader verification precede
 new writers. Candidate signing, a seven-day automated soak, each field device's
