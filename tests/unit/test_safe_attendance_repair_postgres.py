@@ -368,3 +368,41 @@ def test_large_deliverable_backlog_does_not_hide_behind_live_traffic(postgres_st
     with sessions() as db:
         assert db.scalar(select(func.count(AttendanceEvent.id))) == 101001
         assert db.scalar(select(func.count(OrdsOutbox.id))) == 101000
+
+
+def test_custody_source_conflict_commits_other_item_with_postgres_savepoints(postgres_store):
+    import base64
+    from zk_add.models import (TerminalSourceEpoch, TerminalRecordManifest, ZktObservationReceipt,
+                               ZktObservationLink, ZktCustodyWork)
+    from zk_add.zkt_custody import settle_observations, observation_id
+
+    sessions, connector_id = postgres_store
+    raw = b"synthetic source observation"
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id).with_for_update())
+        connector.zkt_custody_enabled = True
+        serial = connector.zkt_device.serial
+        connector.zkt_device.confirmed_serial = serial
+        epoch = TerminalSourceEpoch(zkt_device_id=connector.zkt_device.id, terminal_generation=1, sequence=77)
+        db.add(epoch)
+        db.flush()
+        for ordinal in (0, 1):
+            db.add(TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+                terminal_serial=serial, generation=1, source_epoch_id=epoch.id, ordinal=ordinal,
+                canonical_source=True, raw_record_digest="0" * 64 if ordinal == 0 else raw_digest,
+                terminal_record_key=raw_digest, disposition="MALFORMED"))
+        db.flush()
+        values = [dict(observation_id=observation_id(serial, "c" * 32, index + 1), terminal_serial=serial,
+            capture_epoch="c" * 32, capture_sequence=index + 1, captured_at=utc_now().isoformat(),
+            raw_b64=base64.b64encode(raw).decode(), raw_digest=raw_digest, raw_format="SOURCE_RECORD",
+            decoder_profile="unqualified", decoder_version="1", time_quality="UNKNOWN",
+            occurrence={"source_epoch": epoch.epoch_id, "ordinal": index}) for index in (0, 1)]
+        response = settle_observations(db, connector, {"schema_version": 1, "observations": values})
+        db.commit()
+        assert response["committed"] and response["items"][0]["occurrence_id"] is None
+        assert response["items"][1]["occurrence_id"]
+    with sessions() as db:
+        assert db.scalar(select(func.count(ZktObservationReceipt.id))) == 2
+        assert db.scalar(select(func.count(ZktObservationLink.id))) == 1
+        assert db.scalar(select(ZktCustodyWork.reason_code).where(ZktCustodyWork.state == "HELD_EXCEPTION")) == "SOURCE_RAW_DIGEST_MISMATCH"

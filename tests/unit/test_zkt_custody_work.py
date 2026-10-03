@@ -182,3 +182,131 @@ def test_work_status_is_scoped_paginated_and_contains_no_protected_bytes(custody
     assert "raw_b64" not in rendered and "protected_" not in rendered and "synthetic packet" not in rendered
     db.execute(delete(ZktCustodyWorkReceipt).where(ZktCustodyWorkReceipt.id == 1))
     assert work_status(db, connector)["missing_processing_obligation"]
+
+
+def test_source_commit_after_custody_is_associated_without_replaying_esp(custody):
+    from zk_add.models import TerminalSourceEpoch, TerminalRecordManifest, ZktOccurrenceAlias, ZktObservationLink
+    db, connector = custody
+    epoch = TerminalSourceEpoch(zkt_device_id=connector.zkt_device.id, terminal_generation=1, sequence=1)
+    db.add(epoch)
+    db.flush()
+    def source(sequence, ordinal):
+        return observation(sequence, raw_format="SOURCE_RECORD",
+                           occurrence={"source_epoch": epoch.epoch_id, "ordinal": ordinal})
+    result = settle_observations(db, connector, batch(source(1, 0), source(2, 1)))
+    db.commit()
+    assert advance_work(db) == 2
+    work = db.scalars(select(ZktCustodyWork).order_by(ZktCustodyWork.id)).all()
+    assert all(row.state == "WAIT_SOURCE" and row.reason_code == "CANONICAL_SOURCE_PENDING"
+               and row.next_attempt_at is not None for row in work)
+    assert advance_work(db) == 0
+    for ordinal in (0, 1):
+        db.add(TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            terminal_serial="TEST01", generation=1, source_epoch_id=epoch.id, ordinal=ordinal,
+            canonical_source=True, raw_record_digest=observation()["raw_digest"],
+            terminal_record_key=observation()["raw_digest"], disposition="MALFORMED"))
+    for row in work:
+        row.next_attempt_at = utc_now()
+    db.commit()
+    assert advance_work(db) == 2
+    assert all(row.state == "SOURCE_ASSOCIATED" and row.next_attempt_at is None for row in work)
+    assert count(db, ZktOccurrenceAlias) == count(db, ZktObservationLink) == 2
+    # Identical bytes at distinct ordinals remain distinct occurrences.
+    assert len(set(db.scalars(select(ZktOccurrenceAlias.occurrence_id)))) == 2
+    assert advance_work(db) == 0
+    replay = settle_observations(db, connector, batch(source(1, 0)))
+    assert replay["items"][0]["receipt_id"] == result["items"][0]["receipt_id"]
+    assert count(db, ZktObservationReceipt) == 2
+    assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
+
+
+def test_unreferenced_source_and_changed_binding_are_explicit_holds(custody):
+    db, connector = custody
+    settle_observations(db, connector, batch(observation(1, raw_format="SOURCE_RECORD")))
+    assert advance_work(db) == 1
+    row = db.scalar(select(ZktCustodyWork))
+    assert row.state == "WAIT_SOURCE" and row.reason_code == "SOURCE_REFERENCE_REQUIRED"
+    assert row.next_attempt_at is None
+    connector.zkt_device.confirmed_serial = None
+    row.next_attempt_at = utc_now()
+    db.flush()
+    assert advance_work(db) == 1
+    assert row.reason_code == "TERMINAL_BINDING_CHANGED" and row.next_attempt_at is None
+
+
+def test_late_association_failure_isolated_by_savepoint(custody, monkeypatch):
+    from zk_add import zkt_custody
+    from zk_add.models import TerminalSourceEpoch, TerminalRecordManifest, ZktOccurrenceAlias, ZktObservationLink
+    db, connector = custody
+    epoch = TerminalSourceEpoch(zkt_device_id=connector.zkt_device.id, terminal_generation=1, sequence=1)
+    db.add(epoch)
+    db.flush()
+    values = [observation(index + 1, raw_format="SOURCE_RECORD",
+                          occurrence={"source_epoch": epoch.epoch_id, "ordinal": index}) for index in (0, 1)]
+    settle_observations(db, connector, batch(*values))
+    for ordinal in (0, 1):
+        db.add(TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            terminal_serial="TEST01", generation=1, source_epoch_id=epoch.id, ordinal=ordinal,
+            canonical_source=True, raw_record_digest=observation()["raw_digest"],
+            terminal_record_key=observation()["raw_digest"], disposition="MALFORMED"))
+    db.commit()
+    original = zkt_custody.bind_source_occurrence
+    def interrupted(session, connector, receipt, value):
+        result = original(session, connector, receipt, value)
+        if value.capture_sequence == 1:
+            raise zkt_custody.SourceAssociationError("SOURCE_ASSOCIATION_CONFLICT")
+        return result
+    monkeypatch.setattr(zkt_custody, "bind_source_occurrence", interrupted)
+    assert advance_work(db) == 2
+    first, second = db.scalars(select(ZktCustodyWork).order_by(ZktCustodyWork.id)).all()
+    assert first.state == "HELD_EXCEPTION" and first.reason_code == "SOURCE_ASSOCIATION_CONFLICT"
+    assert second.state == "SOURCE_ASSOCIATED"
+    assert count(db, ZktObservationReceipt) == 2
+    assert count(db, ZktOccurrenceAlias) == count(db, ZktObservationLink) == 1
+
+
+def test_a_replayed_receipt_cannot_bind_after_terminal_confirmation_changes(custody):
+    from zk_add.models import TerminalSourceEpoch, TerminalRecordManifest, ZktObservationLink
+    db, connector = custody
+    epoch = TerminalSourceEpoch(zkt_device_id=connector.zkt_device.id, terminal_generation=1, sequence=1)
+    db.add(epoch)
+    db.flush()
+    value = observation(raw_format="SOURCE_RECORD", occurrence={"source_epoch": epoch.epoch_id, "ordinal": 0})
+    original = settle_observations(db, connector, batch(value))
+    db.add(TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+        terminal_serial="TEST01", generation=1, source_epoch_id=epoch.id, ordinal=0,
+        canonical_source=True, raw_record_digest=value["raw_digest"], terminal_record_key=value["raw_digest"],
+        disposition="MALFORMED"))
+    connector.zkt_device.confirmed_serial = "ANOTHER-TERMINAL"
+    db.commit()
+    replay = settle_observations(db, connector, batch(value))
+    assert replay["items"][0]["receipt_id"] == original["items"][0]["receipt_id"]
+    assert replay["items"][0]["occurrence_id"] is None
+    assert count(db, ZktObservationLink) == 0
+
+
+def test_source_conflict_preserves_custody_and_does_not_stall_next_item(custody):
+    from zk_add.models import TerminalSourceEpoch, TerminalRecordManifest, ZktObservationLink
+    db, connector = custody
+    epoch = TerminalSourceEpoch(zkt_device_id=connector.zkt_device.id, terminal_generation=1, sequence=1)
+    db.add(epoch)
+    db.flush()
+    for ordinal in (0, 1):
+        db.add(TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            terminal_serial="TEST01", generation=1, source_epoch_id=epoch.id, ordinal=ordinal,
+            canonical_source=True, raw_record_digest="0" * 64 if ordinal == 0 else observation()["raw_digest"],
+            terminal_record_key=observation()["raw_digest"], disposition="MALFORMED"))
+    db.commit()
+    values = [observation(index + 1, raw_format="SOURCE_RECORD",
+                          occurrence={"source_epoch": epoch.epoch_id, "ordinal": index}) for index in (0, 1)]
+    receipt = settle_observations(db, connector, batch(*values))
+    db.commit()
+    assert receipt["committed"] and len(receipt["items"]) == 2
+    assert receipt["items"][0]["occurrence_id"] is None and receipt["items"][1]["occurrence_id"]
+    assert count(db, ZktObservationReceipt) == 2 and count(db, ZktObservationLink) == 1
+    first = db.scalar(select(ZktCustodyWork).order_by(ZktCustodyWork.id))
+    assert first.state == "HELD_EXCEPTION" and first.reason_code == "SOURCE_RAW_DIGEST_MISMATCH"
+    assert first.next_attempt_at is None
+    replay = settle_observations(db, connector, batch(values[0]))
+    assert replay["items"][0]["receipt_id"] == receipt["items"][0]["receipt_id"]
+    assert count(db, ZktObservationReceipt) == 2

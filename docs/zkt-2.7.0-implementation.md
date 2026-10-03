@@ -143,6 +143,16 @@ separately from the unrecorded capture-time model; any associated attendance is
 labelled as prior interpretation, not independent ground truth. Protected
 samples must remain outside this public repository.
 
+Source records that arrive before their canonical manifest retain a bounded
+30-second association retry. Exact source bytes, terminal confirmation, epoch
+and ordinal must agree before an alias is created. A savepoint isolates a
+derived source conflict so other items can still commit custody. The original
+receipt stays immutable; a changed terminal binding or conflicting source
+gets a visible hold. Missing source references remain explicit holds.
+`SOURCE_ASSOCIATED` does not create attendance, resolve identity or claim Oracle
+completion. Revision-driven source wakeups and throughput qualification remain
+future work; the inspector's maintenance cadence is not a latency guarantee.
+
 ## Verification recorded on 3 October 2026
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
@@ -201,6 +211,11 @@ samples must remain outside this public repository.
 - Audited source-evidence access: 68 focused tests passed, including session,
   CSRF, password, scope, audit, ciphertext/digest integrity and unchanged
   original dispositions. The protected endpoint is not a qualification grant.
+
+- Late source association: 39 focused custody/packet tests and three PostgreSQL
+  custody/concurrency/savepoint tests passed. Distinct same-byte ordinals retain
+  separate aliases, replay keeps its receipt, changed confirmation cannot bind,
+  and a conflicting item cannot prevent the next receipt from committing.
 
 ## Work that still blocks the requested release
 
