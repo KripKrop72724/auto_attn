@@ -9,6 +9,8 @@ firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
 functions = source[source.index("static bool append_worker_diagnostic("):
                    source.index("static void heartbeat_task(", source.index("static bool append_worker_diagnostic("))]
+runtime_source = (firmware / "zkt_journal_runtime.c").read_text()
+runtime_function = runtime_source[runtime_source.index("bool zj_runtime_append_diagnostics("):]
 program = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -20,6 +22,7 @@ program = r'''
 #include <errno.h>
 #include "cJSON.h"
 #include "queue_store.h"
+#include "zkt_journal_boot.h"
 #define ESP_OK 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
@@ -35,6 +38,8 @@ static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n)
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
 static int64_t monotonic_ms(void){return 5000;}
+static uint32_t now_ms(void){return 5000;}
+static bool zj_runtime_health(zj_boot_t *out){*out=(zj_boot_t){.mode=ZJ_BOOT_BRIDGE,.phase=ZJ_BOOT_READY,.reader_ready=true,.sampled_ms=4000,.owner_starts=1,.transport_starts=1};return true;}
 static const char s_boot_id[]="allocation-test-boot";
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
@@ -53,7 +58,7 @@ static bool s_outbox_buffer_ready=true,s_ords_worker_started=true;
 static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_worker_operation=ADD_WORKER_NETWORK;
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,.admission_reserve_bytes=1048576,.last_error=EIO,.last_operation="local_write_commit"};}
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
-''' + functions + r'''
+''' + runtime_function + functions + r'''
 int main(void){
  cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
  cJSON *payload=cJSON_CreateObject();assert(payload);calls=0;
@@ -61,6 +66,10 @@ int main(void){
  cJSON *diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"APPEND_TAIL_ASSURANCE"));
  assert(cJSON_GetObjectItemCaseSensitive(diagnostics,"committed_source_cursor")->valueint==100);
+ cJSON *runtime=cJSON_GetObjectItemCaseSensitive(diagnostics,"journal_runtime");assert(runtime);
+ assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(runtime,"reader_ready")));
+ assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(runtime,"writer_ready")));
+ assert(cJSON_GetObjectItemCaseSensitive(runtime,"storage_starts")->valueint==1);
  cJSON *storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
@@ -95,5 +104,7 @@ with tempfile.TemporaryDirectory() as directory:
     executable = temporary / "diagnostics"
     subprocess.run(["cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(cjson), "-I", str(firmware),
-                    str(unit), str(cjson / "cJSON.c"), "-lm", "-o", str(executable)], check=True)
+                    str(unit), str(cjson / "cJSON.c"), str(firmware / "zkt_journal_boot.c"),
+                    str(firmware / "zkt_journal_compat.c"), str(firmware / "durable_queue.c"),
+                    "-lm", "-o", str(executable)], check=True)
     subprocess.run([str(executable)], cwd=temporary, check=True)

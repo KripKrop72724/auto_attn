@@ -31,6 +31,8 @@ typedef void *TaskHandle_t;
 static jmp_buf done;
 static uint32_t now,stop_at;
 static unsigned gateway_attempts,ords_attempts,capture_ticks,faults,local_faults,reported_attempts;
+static unsigned journal_ticks;
+void zj_runtime_step(void){++journal_ticks;}
 static bool gateway_created,ords_created,ords_always_fails,first_fails;
 #if !ZONE_LITE_HIKVISION
 #define GATEWAY_STACK_BYTES 24576U
@@ -82,23 +84,30 @@ int main(void)
     if(!setjmp(done))launch();
 #if ZONE_LITE_HIKVISION
     assert(gateway_attempts==1 && ords_attempts==0 && capture_ticks==600 && faults==0);
+    assert(journal_ticks==0);
 #else
     assert(gateway_attempts==1 && ords_attempts==3 && capture_ticks==600 && reported_attempts==3 && faults==600 && local_faults==0);
+    assert(journal_ticks==600);
 #endif
+    journal_ticks=0;
     now=gateway_attempts=ords_attempts=capture_ticks=faults=local_faults=reported_attempts=0;
     gateway_created=ords_created=ords_always_fails=false;first_fails=true;stop_at=700000;
     if(!setjmp(done))launch();
 #if ZONE_LITE_HIKVISION
     assert(gateway_attempts==2 && ords_attempts==0 && capture_ticks==699 && faults==1);
+    assert(journal_ticks==0);
 #else
     assert(gateway_attempts==2 && ords_attempts==2 && capture_ticks==699 && reported_attempts==2 && faults==2 && local_faults==0);
+    assert(journal_ticks==700);
     // A fragmented heap can reject a dynamic ORDS stack. Early caller-owned
     // stacks must still start both workers without entering the fault state.
     now=gateway_attempts=ords_attempts=capture_ticks=faults=local_faults=reported_attempts=0;
     gateway_created=ords_created=first_fails=false;ords_always_fails=true;
     worker_stacks_reserved=true;stop_at=60000;
+    journal_ticks=0;
     if(!setjmp(done))launch();
     assert(gateway_attempts==1 && ords_attempts==1 && capture_ticks==60 && reported_attempts==1 && faults==0 && local_faults==0);
+    assert(journal_ticks==60);
 #endif
     return 0;
 }

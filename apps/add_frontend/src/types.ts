@@ -124,6 +124,21 @@ export interface FirmwareDiagnostics {
   sampled_at?: string | null
   sampled_uptime_ms?: number | null
   delivery_authority?: 'LEGACY_DUAL' | 'ADD' | null
+  journal_runtime?: {
+    observed: boolean
+    phase: string
+    reader_ready: boolean
+    writer_ready: boolean
+    start_attempts: number
+    storage_starts: number
+    delivery_starts: number
+    capture_starts: number
+    proof_attempts: number
+    failures: number
+    sampled_uptime_ms?: number | null
+    last_progress_uptime_ms?: number | null
+    compatibility?: string | null
+  } | null
   storage?: {
     upgrade_contract?: string | null
     upgrade_error?: string | null

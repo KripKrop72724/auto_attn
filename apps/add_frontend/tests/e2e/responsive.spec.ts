@@ -455,6 +455,28 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('nationwide-map.png'), fullPage: true })
 })
 
+test('journal reader holds remain visible without granting writer permission', async ({ page }, testInfo) => {
+  await page.route(/\/api\/v1\/devices(?:\/connector-one)?(?:\?.*)?$/, async route => {
+    const reported = { ...device, boot_id: 'journal-test-boot', firmware_diagnostics_at: new Date().toISOString(),
+      firmware_diagnostics: { schema_version: 2, boot_id: 'journal-test-boot', sampled_uptime_ms: 42000,
+        storage: { durability: 'HEALTHY', persistence_verified: true, recovery_complete: true },
+        workers: [], queues: [], journal_runtime: { observed: true, phase: 'READER_HOLD',
+          reader_ready: true, writer_ready: false, start_attempts: 9, storage_starts: 1,
+          delivery_starts: 1, capture_starts: 0, proof_attempts: 3, failures: 7,
+          sampled_uptime_ms: 41000, compatibility: 'READER_COMPATIBILITY_EVIDENCE_REQUIRED' } } }
+    await route.fulfill({ json: new URL(route.request().url()).pathname.endsWith('/connector-one') ? reported : { rows: [reported] } })
+  })
+  await page.goto('/fleet/connector-one')
+  const preservation = page.getByRole('article', { name: 'Firmware preservation health' })
+  await expect(preservation.getByText('Reader compatibility needs review')).toBeVisible()
+  await expect(preservation.getByText('1 storage · 1 delivery · 0 capture')).toBeVisible()
+  await expect(preservation.getByText('Writer permission not confirmed')).toBeVisible()
+  await expect(preservation.getByText('Local writer permitted')).toHaveCount(0)
+  const bounds = await preservation.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
+  expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
+  if (process.env.ADD_VISUAL_QA === '1') await preservation.screenshot({ path: testInfo.outputPath('journal-startup.png') })
+})
+
 test('primary routes and device deep link remain usable', async ({ page }, testInfo) => {
   await page.goto('/fleet')
   await page.getByRole('button', { name: /Islamabad, 1 device, All online/i }).click()

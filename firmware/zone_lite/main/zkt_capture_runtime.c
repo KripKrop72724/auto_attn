@@ -1,5 +1,6 @@
 #include "zkt_capture_runtime.h"
 #include "zkt_storage_owner.h"
+#include "zkt_journal_runtime.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -51,7 +52,7 @@ bool zj_capture_runtime_start(void)
 }
 bool zj_capture_runtime_packet(const uint8_t *packet, size_t length, const zj_capture_facts_t *facts)
 {
-    if (!capture || xSemaphoreTake(capture_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (!capture || !zj_runtime_writer_ready() || xSemaphoreTake(capture_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     bool preserved = zj_capture_packet(capture, packet, length, facts);
     publish();
     xSemaphoreGive(capture_lock);

@@ -3,6 +3,9 @@
 #include "storage_upgrade.h"
 #include "zkt_clock.h"
 #include "zkt_record.h"
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+#include "zkt_journal_runtime.h"
+#endif
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
 #endif
@@ -9859,6 +9862,7 @@ void app_main(void)
         if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence() &&
             qs_health().last_error)
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        zj_runtime_step();
 #endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

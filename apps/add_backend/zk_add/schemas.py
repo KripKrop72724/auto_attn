@@ -122,6 +122,24 @@ class MemoryDiagnostics(BaseModel):
     internal_largest_block_bytes: int = Field(ge=0)
 
 
+class JournalRuntimeDiagnostics(BaseModel):
+    observed: bool
+    phase: Literal["NOT_STARTED", "DISABLED", "SECURITY_HOLD", "BINDING_HOLD", "STORAGE_WAIT",
+                   "OWNER_START", "RECOVERING", "TRANSPORT_START", "CHECKING_READER", "READER_HOLD",
+                   "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "UNKNOWN"]
+    reader_ready: bool
+    writer_ready: bool
+    start_attempts: int = Field(ge=0, le=0xFFFFFFFF)
+    storage_starts: int = Field(ge=0, le=0xFFFFFFFF)
+    delivery_starts: int = Field(ge=0, le=0xFFFFFFFF)
+    capture_starts: int = Field(ge=0, le=0xFFFFFFFF)
+    proof_attempts: int = Field(ge=0, le=0xFFFFFFFF)
+    failures: int = Field(ge=0, le=0xFFFFFFFF)
+    sampled_uptime_ms: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    last_progress_uptime_ms: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    compatibility: str | None = Field(default=None, max_length=64)
+
+
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1, 2] = 1
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
@@ -133,6 +151,7 @@ class FirmwareDiagnostics(BaseModel):
     sampled_uptime_ms: int | None = Field(default=None, ge=0)
     storage: StorageDiagnostics | None = None
     memory: MemoryDiagnostics | None = None
+    journal_runtime: JournalRuntimeDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
     workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
     reconciliation_mode: str | None = Field(default=None, max_length=40)
