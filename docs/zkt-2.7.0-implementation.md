@@ -132,6 +132,17 @@ valid allowed interpretations remains ambiguous. Model labels only select
 profiles; they do not grant qualification. This module is not yet connected to
 attendance creation, and it does not authenticate the packet checksum.
 
+For model diagnosis, authenticated
+`GET /api/v1/devices/{connector_id}/source-evidence` lists at most 50 retained
+records per page without raw bytes or employee identity. A record's `reveal`
+POST requires CSRF, password confirmation and an audit commit before returning
+its bounded protected source bytes. It checks both ownership keys, stored
+length and digest. Valid records and exceptions are available without changing
+original dispositions or delivery state. Current model metadata is labelled
+separately from the unrecorded capture-time model; any associated attendance is
+labelled as prior interpretation, not independent ground truth. Protected
+samples must remain outside this public repository.
+
 ## Verification recorded on 3 October 2026
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
@@ -183,6 +194,13 @@ attendance creation, and it does not authenticate the packet checksum.
   81 focused policy tests and 19 PostgreSQL tests passed. The unchanged large
   test completed in 55.33 seconds, including responsive login and priority for
   live delivery. Execution still revalidates without the preview cache.
+
+- Full regression after custody work, ADD decoding and preview performance
+  changes (`db1f09d`): 1,509 passed in 292.19 seconds. Both 100,000-row
+  PostgreSQL tests passed with their original deadlines.
+- Audited source-evidence access: 68 focused tests passed, including session,
+  CSRF, password, scope, audit, ciphertext/digest integrity and unchanged
+  original dispositions. The protected endpoint is not a qualification grant.
 
 ## Work that still blocks the requested release
 
