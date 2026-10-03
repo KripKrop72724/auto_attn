@@ -476,6 +476,48 @@ class ZktObservationReceipt(Base):
     committed_at: Mapped[datetime] = utc_column()
 
 
+class ZktCustodyWork(Base):
+    """Derived processing obligation; never changes an immutable receipt."""
+    __tablename__ = "add_zkt_custody_work"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(64), unique=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    terminal_serial: Mapped[str | None] = mapped_column(String(120))
+    capture_epoch: Mapped[str | None] = mapped_column(String(32))
+    decoder_profile: Mapped[str | None] = mapped_column(String(80))
+    decoder_version: Mapped[str | None] = mapped_column(String(40))
+    expected_bytes: Mapped[int | None] = mapped_column(Integer)
+    expected_digest: Mapped[str | None] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(40))
+    reason_code: Mapped[str] = mapped_column(String(80))
+    owner: Mapped[str] = mapped_column(String(60))
+    evidence_revision: Mapped[int] = mapped_column(Integer, default=1)
+    processed_revision: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assembled_digest: Mapped[str | None] = mapped_column(String(64))
+    assembled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
+Index("ix_add_zkt_work_due", ZktCustodyWork.connector_id, ZktCustodyWork.next_attempt_at,
+      ZktCustodyWork.id, postgresql_where=text("next_attempt_at is not null"),
+      sqlite_where=text("next_attempt_at is not null"))
+
+
+class ZktCustodyWorkReceipt(Base):
+    """All received extents, including conflicting ones, retain their receipt."""
+    __tablename__ = "add_zkt_custody_work_receipts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    work_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_custody_work.id"), index=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_observation_receipts.id"), unique=True)
+    packet_offset: Mapped[int | None] = mapped_column(Integer)
+    data_length: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = utc_column()
+
+
 class ZktOccurrenceAlias(Base):
     """Verified source coordinates; identical bytes at two ordinals stay distinct."""
     __tablename__ = "add_zkt_occurrence_aliases"

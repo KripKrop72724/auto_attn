@@ -484,6 +484,8 @@ def prepare_maintenance_tick(
         advance_user_deletion_jobs(session)
         repair_missing_terminal_provenance(session)
         repair_attendance_delivery_backlog(session, limit=ORDS_DELIVERY_BATCH_SIZE)
+        from zk_add.zkt_custody_work import advance_work
+        advance_work(session, limit=100)
         advance_attendance_recovery_jobs(
             session,
             limit=settings.attendance_recovery_batch_size,

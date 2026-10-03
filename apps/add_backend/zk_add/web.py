@@ -1965,6 +1965,19 @@ def reveal_source_exception_endpoint(
     return result
 
 
+@app.get("/api/v1/devices/{connector_id}/zkt-custody")
+def zkt_custody_status(
+    connector_id: str,
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    from zk_add.zkt_custody_work import work_status
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    return work_status(db, connector, before=before, limit=limit)
+
+
 @app.get("/api/v1/devices/{connector_id}/queue-evidence")
 def list_queue_evidence(
     connector_id: str,
