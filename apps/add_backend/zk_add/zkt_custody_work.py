@@ -8,9 +8,11 @@ when a new fragment arrives while a worker inspects its group.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
 import json
+import time
 
 from cryptography.fernet import InvalidToken
 from pydantic import ValidationError
@@ -218,33 +220,69 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
     work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
 
 
-def advance_work(session: Session, *, limit: int = 100) -> int:
+@dataclass(frozen=True)
+class InspectionBatch:
+    processed: int
+    after_connector: int
+    attempted_connectors: int
+    locked_connectors: int = 0
+
+
+def advance_work_batch(session: Session, *, limit: int = 100, after_connector: int = 0,
+                       time_budget_ms: int | None = 250, clock=None) -> InspectionBatch:
     """Fair bounded inspection; connector-first locks match custody ingestion.
 
     This stage deliberately stops at profile qualification. It never emits an
     attendance event or an Oracle outbox based on an unqualified interpretation.
     """
     maximum = max(1, min(limit, 500))
+    clock = clock or time.monotonic
+    deadline = None if time_budget_ms is None else clock() + max(1, min(time_budget_ms, 1000)) / 1000
     now = utc_now()
     due = select(ZktCustodyWork.id).where(ZktCustodyWork.connector_id == Connector.id,
         ZktCustodyWork.next_attempt_at <= now).exists()
     connectors = session.scalars(select(Connector.id).where(Connector.zkt_custody_enabled.is_(True), due)
-        .order_by(Connector.id).limit(maximum)).all()
+        .order_by(Connector.id <= after_connector, Connector.id).limit(maximum)).all()
     quota = max(1, maximum // max(1, len(connectors)))
     processed = 0
+    attempted = 0
+    locked = 0
+    cursor = after_connector
     for connector_id in connectors:
+        # Allow one bounded attempt even when the candidate query consumed its
+        # time budget. Rotate after every attempted connector so a saturated
+        # first site cannot repeatedly consume the entire budget.
+        if attempted and deadline is not None and clock() >= deadline:
+            break
+        attempted += 1
         connector = session.scalar(select(Connector).where(Connector.id == connector_id)
             .with_for_update(skip_locked=True))
         if connector is None:
+            locked += 1
+            cursor = connector_id
             continue
         work = session.scalars(select(ZktCustodyWork).where(ZktCustodyWork.connector_id == connector_id,
             ZktCustodyWork.next_attempt_at <= now).order_by(ZktCustodyWork.next_attempt_at, ZktCustodyWork.id)
             .limit(quota).with_for_update(skip_locked=True)).all()
+        prior_processed = processed
         for row in work:
+            if processed and deadline is not None and clock() >= deadline:
+                break
             inspect_work(session, row)
             processed += 1
+        if work and processed == prior_processed:
+            # Its lock/query used the remaining budget, but no group was
+            # inspected. Keep it first next time rather than skipping it on
+            # every full rotation through an even-sized saturated fleet.
+            break
+        cursor = connector_id
     session.flush()
-    return processed
+    return InspectionBatch(processed, cursor, attempted, locked)
+
+
+def advance_work(session: Session, *, limit: int = 100) -> int:
+    """Compatibility helper for explicit bounded batch callers."""
+    return advance_work_batch(session, limit=limit, time_budget_ms=None).processed
 
 
 def backfill_work(session: Session, *, limit: int = 100) -> int:

@@ -2020,10 +2020,13 @@ def zkt_custody_status(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     from zk_add.zkt_custody_work import work_status
+    from zk_add.zkt_custody_runtime import custody_processor
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     response.headers["Cache-Control"] = "no-store, max-age=0"
-    return work_status(db, connector, before=before, limit=limit)
+    result = work_status(db, connector, before=before, limit=limit)
+    result["processor"] = custody_processor.snapshot()
+    return result
 
 
 @app.get("/api/v1/devices/{connector_id}/queue-evidence")

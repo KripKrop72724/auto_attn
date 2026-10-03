@@ -128,8 +128,22 @@ The bounded inspector locks the connector before its work rows, matching the
 ingestion lock order, and skips connectors currently owned by another worker.
 Per-connector quotas prevent one large backlog from consuming the inspection
 batch within the 17-connector scope. It stops at profile qualification and
-creates no attendance or Oracle rows. The maintenance schedule is not yet a
-qualified throughput path for the proposed burst envelope.
+creates no attendance or Oracle rows. A separate, single-thread inspector now
+runs outside general maintenance and Oracle dispatch. Its maximum 100-group
+batch has a 250 ms budget checked between groups, fair connector rotation and
+short PostgreSQL statement/lock deadlines (2 seconds / 250 ms). Work already in
+progress finishes before its thread can be replaced, including during repeated
+cancellation. Constructor failure and an exited worker retry with bounded
+backoff; attempts and actual thread starts are separate counters.
+
+Runtime evidence has a distinct process-instance UUID, sampling time, active
+operation age, committed inspection totals, lock-wait state, failure categories
+and last useful progress. A pending transaction or stuck dispatcher is visible
+as stalled, while an idle loop cannot imply record or Oracle completion.
+Round-robin state advances only after commit. Failed ticks roll back and retain
+their work obligations; blocked connectors are skipped without holding up other
+sites. These budgets and tests do not yet qualify the proposed load/latency
+envelope or the profile-dependent attendance interpretation path.
 
 Authenticated `GET /api/v1/devices/{connector_id}/zkt-custody` exposes paginated
 work states and missing-work detection, never raw bytes or employee identity.
@@ -169,7 +183,7 @@ receipt stays immutable; a changed terminal binding or conflicting source
 gets a visible hold. Missing source references remain explicit holds.
 `SOURCE_ASSOCIATED` does not create attendance, resolve identity or claim Oracle
 completion. Revision-driven source wakeups and throughput qualification remain
-future work; the inspector's maintenance cadence is not a latency guarantee.
+future work; the inspector's runtime cadence is not a latency guarantee.
 
 Journal retirement corruption has an automatic replay path. The owner first
 preserves the exact damaged checkpoint in a synchronized opaque segment, then
@@ -255,6 +269,14 @@ still block recovery. Encryption identity and nonce allocation never reset.
   Linux ASan/UBSan. Four owner/admission tests include automatic recovery after
   a capacity refusal. Both family builds and ten independent wire/receipt
   vectors passed. These remain software tests, not physical power-cut proof.
+- Independent custody runtime: 1,323 unit tests passed (30 environment-specific
+  skips), plus four PostgreSQL custody tests covering row-lock isolation,
+  enforced statement timeout, rollback and transaction-local settings. Rotation
+  tests cover saturated fleets of 16 and 17 connectors and query-time deadline
+  exhaustion. Cancellation and startup-failure tests distinguish attempts from
+  actual starts and prohibit overlapping transaction owners. All 17 custody
+  panel tests and eight primary-route browser cases passed; the production
+  frontend build and asset budget checks also passed.
 
 ## Work that still blocks the requested release
 

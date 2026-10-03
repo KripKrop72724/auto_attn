@@ -6,11 +6,19 @@ type Work = {
   id: number; state: string; reason_code: string; owner: string;
   updated_at: string; next_attempt_at: string | null;
 }
+type Processor = {
+  schema_version: 1; instance_id: string; sampled_at: string;
+  state: 'NOT_STARTED' | 'STARTING' | 'RUNNING' | 'IDLE' | 'WAITING_FOR_LOCK' | 'RETRYING' | 'STALLED' | 'STOPPED';
+  last_completed_at: string | null; last_progress_at: string | null;
+  inspected_groups_total: number; successful_ticks: number; failed_ticks: number;
+  last_tick_ms: number | null;
+}
 export type CustodySnapshot = {
   connector_id: string; enabled: boolean; sampled_at: string;
   oracle_completion: 'NOT_ASSERTED'; missing_processing_obligation: boolean;
   counts: { state: string; owner: string; count: number }[];
   rows: Work[]; next_cursor: number | null;
+  processor?: Processor;
 }
 const states: Record<string, string> = {
   PENDING: 'Awaiting inspection', WAIT_FRAGMENTS: 'Waiting for packet fragments',
@@ -26,6 +34,16 @@ const label = (state: string) => states[state] || humanizeStatus(state)
 const owner = (value: string) => owners[value] || humanizeStatus(value)
 const date = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Asia/Karachi' })
 const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
+const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+function validProcessor(value: Processor | undefined): value is Processor {
+  return value?.schema_version === 1 && typeof value.instance_id === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.instance_id)
+    && timestamp(value.sampled_at) && Date.parse(value.sampled_at) <= Date.now() + 1000
+    && ['NOT_STARTED', 'STARTING', 'RUNNING', 'IDLE', 'WAITING_FOR_LOCK', 'RETRYING', 'STALLED', 'STOPPED'].includes(value.state)
+    && [value.last_completed_at, value.last_progress_at].every(time => time === null ||
+      (timestamp(time) && Date.parse(time) <= Date.parse(value.sampled_at) + 1000))
+    && [value.inspected_groups_total, value.successful_ticks, value.failed_ticks].every(counter)
+    && (value.last_tick_ms === null || counter(value.last_tick_ms))
+}
 function valid(value: CustodySnapshot, connector: string) {
   return value?.connector_id === connector && typeof value.enabled === 'boolean' && timestamp(value.sampled_at)
     && Date.parse(value.sampled_at) <= Date.now() + 1000
@@ -67,6 +85,8 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
   const failed = failureFor === connectorId
   const age = data ? now - Date.parse(data.sampled_at) : NaN
   const fresh = !failed && age >= -1000 && age <= 45_000
+  const processor = validProcessor(data?.processor) ? data.processor : null
+  const processorFresh = fresh && processor && now - Date.parse(processor.sampled_at) <= 45_000
   const heading = failed ? 'Custody status unavailable' : !data ? 'Loading custody status'
     : !fresh ? 'Custody evidence is stale' : !data.enabled ? 'Journal custody is not enabled'
       : data.missing_processing_obligation ? 'Preserved records need processing repair' : 'ADD custody processing'
@@ -82,6 +102,16 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
         <div><dt>Missing processing obligations</dt><dd>{data.missing_processing_obligation ? 'Detected — needs ADD operations review' : 'None detected in this snapshot'}</dd></div>
         <div><dt>Oracle completion</dt><dd>Not established by custody</dd></div>
       </dl>
+      <h4>ADD worker · all ZKT connectors</h4>
+      {!processor ? <p>Worker progress evidence is unavailable.</p> : <dl>
+        <div><dt>{processorFresh ? 'Worker state' : 'Last reported worker state'}</dt><dd>{humanizeStatus(processor.state)}</dd></div>
+        <div><dt>Last completed inspection (Pakistan)</dt><dd>{processor.last_completed_at ? date(processor.last_completed_at) : 'Not recorded'}</dd></div>
+        <div><dt>Last group progress (Pakistan)</dt><dd>{processor.last_progress_at ? date(processor.last_progress_at) : 'Not recorded'}</dd></div>
+        <div><dt>Last batch duration</dt><dd>{processor.last_tick_ms === null ? 'Unknown' : `${processor.last_tick_ms.toLocaleString()} ms`}</dd></div>
+        <div><dt>Inspected groups · this worker instance</dt><dd>{processor.inspected_groups_total.toLocaleString()}</dd></div>
+        <div><dt>Completed / failed batches</dt><dd>{processor.successful_ticks.toLocaleString()} / {processor.failed_ticks.toLocaleString()}</dd></div>
+      </dl>}
+      <p>Worker activity measures inspection progress. It does not establish identity resolution or Oracle delivery.</p>
       <h4>Processing groups</h4>
       <p>A group can contain several observations. These counts are not punch totals.</p>
       <dl>{data.counts.map(row => <div key={`${row.state}:${row.owner}`}>
