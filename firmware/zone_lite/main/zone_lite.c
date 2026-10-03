@@ -2,6 +2,7 @@
 #include "uid_cache.h"
 #include "storage_upgrade.h"
 #include "zkt_clock.h"
+#include "zkt_record.h"
 #include "zkt_credential_record.h"
 #include "worker_retry.h"
 #include <errno.h>
@@ -1041,7 +1042,7 @@ static void configure_zkt_socket(int sock)
 
 static bool zk_send_ack_only(int sock, uint16_t session_id);
 
-static bool zk_recv_data_stream(int sock, uint8_t *out, size_t out_len, size_t *actual_len)
+static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, size_t out_len, size_t *actual_len)
 {
     size_t written = 0;
     bool saw_ack = false;
@@ -1051,7 +1052,7 @@ static bool zk_recv_data_stream(int sock, uint8_t *out, size_t out_len, size_t *
             return false;
         }
         if (top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
-            top.length < sizeof(zk_header_t)) {
+            top.length < sizeof(zk_header_t) || top.length > ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
             return false;
         }
         uint8_t *packet = malloc(top.length);
@@ -1064,12 +1065,14 @@ static bool zk_recv_data_stream(int sock, uint8_t *out, size_t out_len, size_t *
             return false;
         }
         zk_header_t *header = (zk_header_t *)packet;
+        if (header->session_id != session_id) { free(packet); return false; }
         size_t data_len = top.length - sizeof(zk_header_t);
         uint8_t *data = packet + sizeof(zk_header_t);
         if (header->command == CMD_DATA) {
             size_t copy_len = data_len;
             if (copy_len > out_len - written) {
-                copy_len = out_len - written;
+                free(packet);
+                return false; /* Never silently truncate an oversized frame. */
             }
             if (copy_len > 0) {
                 memcpy(out + written, data, copy_len);
@@ -1165,6 +1168,7 @@ static bool zk_send_command(
         }
 
         zk_header_t *reply = (zk_header_t *)rx;
+        if (command != CMD_CONNECT && reply->session_id != ctx->session_id) return false;
         if (CMD_REG_EVENT == reply->command) {
             if (!zk_send_ack_only(sock, reply->session_id)) return false;
             ESP_LOGI(
@@ -1555,7 +1559,7 @@ static bool zk_read_buffer(
             &chunk_response);
         if (ok && chunk_response.code == CMD_PREPARE_DATA) {
             size_t actual = 0;
-            ok = zk_recv_data_stream(sock, chunk_rx, want, &actual);
+            ok = zk_recv_data_stream(sock, ctx->session_id, chunk_rx, want, &actual);
             chunk_response.data = chunk_rx;
             chunk_response.data_len = actual;
             chunk_response.code = ok ? CMD_DATA : chunk_response.code;
@@ -1687,12 +1691,12 @@ static bool zk_read_bounded_range(
         &response);
     if (ok && response.code == CMD_PREPARE_DATA) {
         size_t actual = 0;
-        ok = zk_recv_data_stream(sock, rx, length, &actual);
+        ok = zk_recv_data_stream(sock, ctx->session_id, rx, length, &actual);
         response.data = rx;
         response.data_len = actual;
         response.code = ok ? CMD_DATA : response.code;
     }
-    ok = ok && response.code == CMD_DATA && response.data_len >= length;
+    ok = ok && response.code == CMD_DATA && response.data_len == length;
     if (ok) memcpy(output, response.data, length);
     free(rx);
     return ok;
@@ -2191,20 +2195,7 @@ static uint32_t choose_zk_record_size(
     const uint32_t *preferred_sizes,
     size_t preferred_count)
 {
-    if (reported_count > 0 && total_size % reported_count == 0) {
-        uint32_t candidate = total_size / reported_count;
-        for (size_t i = 0; i < preferred_count; i++) {
-            if (candidate == preferred_sizes[i]) {
-                return candidate;
-            }
-        }
-    }
-    for (size_t i = 0; i < preferred_count; i++) {
-        if (preferred_sizes[i] > 0 && total_size % preferred_sizes[i] == 0) {
-            return preferred_sizes[i];
-        }
-    }
-    return 0;
+    return zkt_record_size(total_size, reported_count, preferred_sizes, preferred_count);
 }
 
 static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
@@ -2950,6 +2941,8 @@ static bool seen_add(const char *uid)
     return stored;
 }
 
+static legacy_queue_t g_legacy_pending, g_legacy_blocked;
+
 static bool append_line_policy(const char *path, const char *line, qs_admission_t policy)
 {
     if (!path || !line) return false;
@@ -2958,6 +2951,8 @@ static bool append_line_policy(const char *path, const char *line, qs_admission_
             line, strlen(line), policy) == DQ_OK;
     }
     if (!qs_local_begin(policy, strlen(line) + 1)) return false;
+    if (!strcmp(path, PENDING_PATH)) lq_invalidate_empty(&g_legacy_pending);
+    if (!strcmp(path, BLOCKED_PATH)) lq_invalidate_empty(&g_legacy_blocked);
     errno = 0;
     FILE *f = rel_open_append(path);
     bool ok = f && fputs(line, f) >= 0 && fputc('\n', f) != EOF && fflush(f) == 0;
@@ -3050,6 +3045,7 @@ static bool file_has_nonempty_line(const char *path)
 
 static void restore_pending_backup_if_needed(void)
 {
+    lq_invalidate_empty(&g_legacy_pending);
     struct stat st;
     if (stat(PENDING_PATH, &st) == 0) return;
     if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
@@ -3067,6 +3063,7 @@ static void restore_pending_backup_if_needed(void)
 
 static bool restore_blocked_backup_if_needed(void)
 {
+    lq_invalidate_empty(&g_legacy_blocked);
     struct stat st;
     if (stat(BLOCKED_PATH, &st) == 0) return true;
     if (errno != ENOENT) return false;
@@ -3078,12 +3075,12 @@ static bool restore_blocked_backup_if_needed(void)
     return true;
 }
 
-static legacy_queue_t g_legacy_blocked;
 static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint);
 static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoint);
 
 static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *token)
 {
+    if (g_legacy_blocked.ready && g_legacy_blocked.empty_cached) return DQ_EMPTY;
     if (!restore_blocked_backup_if_needed()) return DQ_IO;
     if (!g_legacy_blocked.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, "blocked"};
@@ -3098,6 +3095,7 @@ static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *
             result = lq_peek(&g_legacy_blocked, line, capacity, token);
         } else if (retired != DQ_EMPTY) return retired;
     }
+    if (result == DQ_EMPTY) g_legacy_blocked.empty_cached = true;
     return result;
 }
 
@@ -3893,31 +3891,17 @@ static bool parse_attendance_record(
     uint32_t *timestamp_out)
 {
     if (!record || !users || !event || !timestamp_out) return false;
-    char user_id[32] = "";
-    uint16_t uid = 0;
-    uint32_t timestamp = 0;
-    uint8_t status = 0;
-    uint8_t punch = 0;
+    zkt_record_t decoded;
+    if (!zkt_record_decode(record, record_size, &decoded)) return false;
+    char user_id[32];
+    memcpy(user_id, decoded.user_id, sizeof(user_id));
+    uint16_t uid = decoded.attendance_uid;
+    uint32_t timestamp = decoded.encoded_time;
+    uint8_t status = decoded.status;
+    uint8_t punch = decoded.punch;
     if (record_size == 8) {
-        uid = read_le16(record);
-        status = record[2];
-        timestamp = read_le32(record + 3);
-        punch = record[7];
         const zkt_user_t *user = find_user_by_uid(users, uid);
         snprintf(user_id, sizeof(user_id), "%s", user ? user->user_id : "");
-    } else if (record_size == 16) {
-        snprintf(user_id, sizeof(user_id), "%lu", (unsigned long)read_le32(record));
-        timestamp = read_le32(record + 4);
-        status = record[8];
-        punch = record[9];
-    } else if (record_size == 40) {
-        uid = read_le16(record);
-        copy_zk_string(user_id, sizeof(user_id), record + 2, 24);
-        status = record[26];
-        timestamp = read_le32(record + 27);
-        punch = record[31];
-    } else {
-        return false;
     }
     *timestamp_out = timestamp;
 
@@ -7132,7 +7116,6 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
     }
 }
 
-static legacy_queue_t g_legacy_pending;
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
 #define LEGACY_ORDS_SLICE_RECORDS 16
 static bool g_legacy_probe_head;
@@ -7254,6 +7237,7 @@ static void oracle_drain_pending(bool live_first)
     size_t count = 0;
     bool binary_head = false;
     dq_result_t read = DQ_OK;
+    if (g_legacy_pending.ready && g_legacy_pending.empty_cached) read = DQ_EMPTY;
     if (!g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
         read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
@@ -7271,9 +7255,12 @@ static void oracle_drain_pending(bool live_first)
         if (binary) { binary_head = true; break; }
     }
     if (!count && read == DQ_EMPTY) {
-        dq_result_t reclaim = lq_reclaim(&g_legacy_pending);
+        dq_result_t reclaim = g_legacy_pending.empty_cached ? DQ_EMPTY : lq_reclaim(&g_legacy_pending);
         if (reclaim == DQ_OK) restore_pending_backup_if_needed();
         if (reclaim != DQ_OK && reclaim != DQ_EMPTY) read = reclaim;
+        // A restored backup is checked on the next slice. A verified absent
+        // source stays cached until its producer invalidates it under this lock.
+        if (reclaim == DQ_EMPTY) g_legacy_pending.empty_cached = true;
     }
     xSemaphoreGive(g_storage_lock);
     now_ms = uptime_ms();

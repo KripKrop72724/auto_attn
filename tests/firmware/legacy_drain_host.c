@@ -76,7 +76,7 @@ static int legacy_pending_load(void *context,lq_checkpoint_t *cp)
 static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp)
 { (void)context;assert(storage_lock);if(fail_commit)return false;durable=*cp;exists=true;return true; }
 static bool append_line(const char *path,const char *line)
-{ FILE *f=fopen(path,"a");assert(f);assert(fprintf(f,"%s\n",line)>0);return fclose(f)==0; }
+{ lq_invalidate_empty(&g_legacy_pending); FILE *f=fopen(path,"a");assert(f);assert(fprintf(f,"%s\n",line)>0);return fclose(f)==0; }
 static void request(size_t count)
 {
     assert(!storage_lock && gate_lock);requests++;accepted+=(unsigned)count;
@@ -154,6 +154,7 @@ int main(void)
     oracle_drain_pending(true);
     assert(requests==prior+2 && segmented.checkpoint.depth==0);
     assert(!storage_lock && !gate_lock);
+    lq_invalidate_empty(&g_legacy_pending);
     f=fopen(PENDING_PATH,"wb");assert(f);
     assert(fwrite("bad\0row\n",1,8,f)==8);assert(!fclose(f));
     fail_evidence=true;g_prefer_segmented_ords=true;
@@ -163,6 +164,7 @@ int main(void)
     oracle_drain_pending(true);
     assert(evidence_requests==2 && stat(PENDING_PATH,&st)!=0);
     // A partial tail cannot reach Oracle even if its fragment resembles a row.
+    lq_invalidate_empty(&g_legacy_pending);
     f=fopen(PENDING_PATH,"wb");assert(f);
     assert(fputs("partial",f)>=0);assert(!fclose(f));
     expected_evidence="partial";expected_length=7;

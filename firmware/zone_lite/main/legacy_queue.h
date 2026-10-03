@@ -13,7 +13,7 @@ typedef struct {
     char path[128];
     lq_checkpoint_t checkpoint;
     lq_port_t port;
-    bool ready, recovering;
+    bool ready, recovering, empty_cached;
     uint32_t recovery_offset, recovery_crc;
 } legacy_queue_t;
 typedef struct {
@@ -35,3 +35,6 @@ dq_result_t lq_settle(legacy_queue_t *, const lq_token_t *);
 /* Call only after matching durable custody of the exact bytes. */
 dq_result_t lq_settle_evidence(legacy_queue_t *, const lq_token_t *);
 dq_result_t lq_reclaim(legacy_queue_t *);
+/* Opt-in empty-cache use by a single storage owner. The owner invalidates this
+ * before EVERY append or restored generation, including failed/partial writes. */
+static inline void lq_invalidate_empty(legacy_queue_t *q) { if (q) q->empty_cached=false; }

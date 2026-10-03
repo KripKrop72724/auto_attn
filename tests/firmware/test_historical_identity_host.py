@@ -18,17 +18,13 @@ def test_historical_parser_retains_identifiers_without_current_person(tmp_path):
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "zkt_record.h"
 ''' + event_type + r'''
 typedef struct {char user_id[32];} zkt_user_t;
 typedef struct {int unused;} user_table_t;
 static zkt_user_t current={"7"};
 static const zkt_user_t *find_user_by_uid(const user_table_t *t,uint16_t uid){(void)t;return uid==7?&current:NULL;}
 static const zkt_user_t *find_user_by_user_id(const user_table_t *t,const char *id){(void)t;return !strcmp(id,"7")?&current:NULL;}
-static uint16_t read_le16(const uint8_t *p){return p[0]|((uint16_t)p[1]<<8);}
-static uint32_t read_le32(const uint8_t *p){return p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
-static void copy_zk_string(char *out,size_t capacity,const uint8_t *in,size_t length){
- size_t n=0;while(n<length && n+1<capacity && in[n]){out[n]=(char)in[n];n++;}out[n]=0;
-}
 static bool build_attendance_event(attendance_event_t *out,const user_table_t *t,const char *id,
  uint16_t uid,uint32_t timestamp,uint8_t status,uint8_t punch,bool snapshot){
  (void)t;(void)uid;(void)status;(void)punch;(void)snapshot;
@@ -62,5 +58,7 @@ int main(void){
     unit.write_text(program)
     executable = tmp_path / "historical"
     subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", "-fno-omit-frame-pointer", str(unit), "-o", str(executable)], check=True)
+                    "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                    "-I", str(ROOT / "firmware/zone_lite/main"),
+                    str(ROOT / "firmware/zone_lite/main/zkt_record.c"), str(unit), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

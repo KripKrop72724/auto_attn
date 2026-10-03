@@ -2802,7 +2802,11 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
     (void)force;
     if (!outbox->legacy.ready) return false;
     struct stat st;
-    if (stat(outbox->path, &st) != 0) return errno == ENOENT && !outbox->legacy.checkpoint.offset;
+    if (stat(outbox->path, &st) != 0) {
+        bool empty = errno == ENOENT && !outbox->legacy.checkpoint.offset;
+        if (empty) { outbox->depth = 0; outbox->depth_known = true; }
+        return empty;
+    }
     if ((uint64_t)st.st_size != outbox->legacy.checkpoint.offset) return true;
     // No suffix rewrite or second copy. Clear the predecessor's text cursor
     // before retiring a fully settled file so rollback cannot skip a new file.
@@ -2833,6 +2837,7 @@ static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_
 {
     if (!outbox->legacy.ready) outbox->offset = load_outbox_cursor(outbox);
     if (!outbox->legacy.ready) return false;
+    if (outbox->depth_known && !outbox->depth) return false;
     dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
     if (result == DQ_EMPTY) {
         if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);
