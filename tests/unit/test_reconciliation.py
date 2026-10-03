@@ -74,7 +74,17 @@ from zk_add.time_utils import utc_now
 
 
 SERIAL = "ADZV211860253"
-RAW_RECORD = bytes.fromhex("0700000102030400")
+def _raw_record(*, uid=7, minute=0, hour=13):
+    from zk_add.zkt_decode import PAKISTAN_TIME, encode_time
+    raw = bytearray(40)
+    raw[:2] = uid.to_bytes(2, "little")
+    raw[2:6] = b"1007"
+    encoded = encode_time(datetime(2026, 8, 6, hour, minute, tzinfo=PAKISTAN_TIME))
+    raw[27:31] = encoded.to_bytes(4, "little")
+    return bytes(raw)
+
+
+RAW_RECORD = _raw_record()
 
 
 def test_production_firmware_version_format_is_supported() -> None:
@@ -217,8 +227,8 @@ def _certify_one_record_baseline(session: Session, connector):
             terminal_generation=job.terminal_generation,
             cutoff_count=1,
             latest_terminal_count=1,
-            record_size=8,
-            source_total_bytes=12,
+            record_size=len(RAW_RECORD),
+            source_total_bytes=4 + len(RAW_RECORD),
             first_anchor_digest=raw_digest,
         ),
     )
@@ -276,7 +286,7 @@ def _tail_source(
     *,
     event: bool = False,
 ) -> ReconciliationSourceRecord:
-    raw = bytes([ordinal + 1]) * 8
+    raw = _raw_record(uid=ordinal + 1, hour=14, minute=ordinal)
     attendance = None
     if event:
         attendance = AttendanceEventIn(
@@ -343,8 +353,8 @@ def _certify_baseline_with_exceptions(
             terminal_generation=job.terminal_generation,
             cutoff_count=cutoff,
             latest_terminal_count=cutoff,
-            record_size=8,
-            source_total_bytes=4 + (cutoff * 8),
+            record_size=len(RAW_RECORD),
+            source_total_bytes=4 + (cutoff * len(RAW_RECORD)),
             first_anchor_digest=records[0].raw_record_digest,
         ),
     )
@@ -476,8 +486,8 @@ def test_full_history_reconciliation_is_contiguous_resumable_and_separately_cert
             terminal_generation=job.terminal_generation,
             cutoff_count=1,
             latest_terminal_count=1,
-            record_size=8,
-            source_total_bytes=12,
+            record_size=len(RAW_RECORD),
+            source_total_bytes=4 + len(RAW_RECORD),
             first_anchor_digest=raw_digest,
         ),
     )
@@ -594,8 +604,8 @@ def test_complete_reconcile_binds_legacy_events_without_terminal_serial(
             terminal_generation=job.terminal_generation,
             cutoff_count=1,
             latest_terminal_count=1,
-            record_size=8,
-            source_total_bytes=12,
+            record_size=len(RAW_RECORD),
+            source_total_bytes=4 + len(RAW_RECORD),
             first_anchor_digest=raw_digest,
         ),
     )
@@ -869,7 +879,7 @@ def test_partial_source_exception_review_remains_held_and_tail_is_out_of_scope(
             ordinal=job.cutoff_count,
             source_kind="TAIL",
             canonical_source=True,
-            record_size=8,
+            record_size=len(RAW_RECORD),
             raw_record_digest=hashlib.sha256(b"newer-tail-exception").hexdigest(),
             terminal_record_key=hashlib.sha256(b"newer-tail-key").hexdigest(),
             occurrence_index=1,
@@ -943,13 +953,13 @@ def test_source_record_digest_must_match_protected_raw_evidence(reconciliation_d
             terminal_generation=job.terminal_generation,
             cutoff_count=1,
             latest_terminal_count=1,
-            record_size=8,
-            source_total_bytes=12,
+            record_size=len(RAW_RECORD),
+            source_total_bytes=4 + len(RAW_RECORD),
             first_anchor_digest=raw_digest,
         ),
     )
     source = _source_record().model_copy(
-        update={"raw_record_b64": base64.b64encode(b"tampered").decode()}
+        update={"raw_record_b64": base64.b64encode(b"x" * len(RAW_RECORD)).decode()}
     )
     request = ReconciliationChunkRequest(
         job_id=job.job_id,
@@ -1178,7 +1188,7 @@ def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
     draft = SourceTailChunkRequest(
         terminal_serial=SERIAL,
         terminal_generation=coverage.terminal_generation,
-        record_size=8,
+        record_size=len(RAW_RECORD),
         start_ordinal=1,
         end_ordinal=4,
         latest_terminal_count=4,
@@ -1286,7 +1296,7 @@ def test_source_tail_accounts_for_poison_rows_and_replays_after_ack_loss(
         idempotency_key="reveal-poison-0001",
     )
     assert revealed["raw_record_b64"] == records[0].raw_record_b64
-    assert bytes.fromhex(revealed["raw_record_hex"]) == bytes([2]) * 8
+    assert bytes.fromhex(revealed["raw_record_hex"]) == _raw_record(uid=2, hour=14, minute=1)
 
 
 def test_source_tail_digest_mutation_invalidates_coverage(reconciliation_db):
@@ -1297,7 +1307,7 @@ def test_source_tail_digest_mutation_invalidates_coverage(reconciliation_db):
     draft = SourceTailChunkRequest(
         terminal_serial=SERIAL,
         terminal_generation=coverage.terminal_generation,
-        record_size=8,
+        record_size=len(RAW_RECORD),
         start_ordinal=1,
         end_ordinal=2,
         latest_terminal_count=2,
@@ -1369,7 +1379,7 @@ def test_stream_v2_grants_one_durable_credit_without_resetting_checkpoint(
         idempotency_key="reconcile-stream-v2-0001",
     )
     job.cutoff_count = 500
-    job.record_size = 8
+    job.record_size = len(RAW_RECORD)
     job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
     job.committed_next_ordinal = 100
     job.scanned_count = 100
@@ -1438,7 +1448,7 @@ def test_stream_v2_release_uses_add_cursor_after_ack_lost(reconciliation_db):
         idempotency_key="reconcile-stream-v2-lost-ack",
     )
     job.cutoff_count = 500
-    job.record_size = 8
+    job.record_size = len(RAW_RECORD)
     job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
     job.committed_next_ordinal = 100
     job.scanned_count = 100
@@ -1545,7 +1555,7 @@ def test_stream_v2_offers_manifest_handshake_at_committed_cutoff(
     )
     job.status = "RUNNING"
     job.cutoff_count = 500
-    job.record_size = 8
+    job.record_size = len(RAW_RECORD)
     job.first_anchor_digest = hashlib.sha256(RAW_RECORD).hexdigest()
     job.committed_next_ordinal = 500
     job.scanned_count = 500
@@ -1707,7 +1717,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
         confirmation="RECONCILE 1 FROM START",
         idempotency_key="source-divergence-probe-0001",
     )
-    changed_raw = bytes.fromhex("0800000102030400")
+    changed_raw = _raw_record(uid=8)
     changed = _source_record().model_copy(
         update={
             "raw_record_digest": hashlib.sha256(changed_raw).hexdigest(),
@@ -1717,7 +1727,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     )
     job.status = "RUNNING"
     job.cutoff_count = 1
-    job.record_size = 8
+    job.record_size = len(RAW_RECORD)
     job.first_anchor_digest = changed.raw_record_digest
     session.add(
         TerminalRecordManifest(
@@ -1731,7 +1741,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
             ordinal=0,
             source_kind="TAIL",
             canonical_source=True,
-            record_size=8,
+            record_size=len(RAW_RECORD),
             raw_record_digest=hashlib.sha256(RAW_RECORD).hexdigest(),
             terminal_record_key=hashlib.sha256(b"terminal-record-0").hexdigest(),
             occurrence_index=1,
@@ -1778,7 +1788,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
         generation=job.terminal_generation,
         terminal_serial=SERIAL,
         latest_terminal_count=1,
-        record_size=8,
+        record_size=len(RAW_RECORD),
         ordinal=0,
         record=changed,
     )
@@ -1811,8 +1821,8 @@ def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db)
         confirmation="RECONCILE 1 FROM START",
         idempotency_key="source-divergence-third-digest-0001",
     )
-    changed_raw = bytes.fromhex("0800000102030400")
-    stable_raw = bytes.fromhex("0800000102030401")
+    changed_raw = _raw_record(uid=8)
+    stable_raw = _raw_record(uid=8, minute=1)
     changed = _source_record().model_copy(
         update={
             "raw_record_digest": hashlib.sha256(changed_raw).hexdigest(),
@@ -1829,7 +1839,7 @@ def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db)
     )
     job.status = "RUNNING"
     job.cutoff_count = 1
-    job.record_size = 8
+    job.record_size = len(RAW_RECORD)
     job.first_anchor_digest = changed.raw_record_digest
     session.add(
         TerminalRecordManifest(
@@ -1843,7 +1853,7 @@ def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db)
             ordinal=0,
             source_kind="TAIL",
             canonical_source=True,
-            record_size=8,
+            record_size=len(RAW_RECORD),
             raw_record_digest=hashlib.sha256(RAW_RECORD).hexdigest(),
             terminal_record_key=hashlib.sha256(b"terminal-record-0").hexdigest(),
             occurrence_index=1,
@@ -1886,7 +1896,7 @@ def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db)
         generation=job.terminal_generation,
         terminal_serial=SERIAL,
         latest_terminal_count=1,
-        record_size=8,
+        record_size=len(RAW_RECORD),
         ordinal=0,
         record=stable,
     )

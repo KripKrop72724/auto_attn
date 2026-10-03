@@ -229,7 +229,7 @@ def test_reconciliation_waits_for_manifest_before_releasing_synced_identity(
         payload=ReconciliationAnchorRequest(
             job_id=job.job_id, generation=job.terminal_generation,
             terminal_serial=SERIAL, terminal_generation=job.terminal_generation,
-            cutoff_count=1, latest_terminal_count=1, record_size=8, source_total_bytes=12,
+            cutoff_count=1, latest_terminal_count=1, record_size=len(RAW_RECORD), source_total_bytes=4 + len(RAW_RECORD),
             first_anchor_digest=hashlib.sha256(RAW_RECORD).hexdigest(),
         ),
     )

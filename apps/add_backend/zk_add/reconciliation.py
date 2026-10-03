@@ -70,6 +70,8 @@ SOURCE_EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLV
 SOURCE_EXCEPTION_REVIEW_HOLD = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
 SOURCE_IDENTITY_HOLD = "SOURCE_IDENTITY_EVIDENCE_REQUIRED"
 SOURCE_EXCEPTION_SCOPE_MISMATCH = "SOURCE_EXCEPTION_SCOPE_MISMATCH"
+SOURCE_IDENTITY_GUARD_VERSION = "zkt-source-identity-guard-1"
+SOURCE_MISSING_REFERENCE = "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"
 
 
 def _release_assignment(job: ReconciliationJob) -> None:
@@ -552,6 +554,39 @@ def apply_reconciliation_anchor(
     return job
 
 
+def _source_identity_missing(source) -> bool:
+    """Negative evidence only: this does not qualify any profile or identity.
+
+    Called after raw length/digest verification. An 8-byte attendance UID is
+    not an enrollment reference; a 40-byte empty text field supplies neither.
+    Legacy claims remain encrypted evidence, never a reason to infer an ID.
+    """
+    if source.event is None:
+        return False
+    raw = base64.b64decode(source.raw_record_b64, validate=True)
+    return len(raw) == 8 or (
+        len(raw) == 40 and not raw[2:26].split(b"\0", 1)[0].rstrip(b" ")
+    )
+
+
+def _source_claim_evidence(source, *, identity_missing: bool) -> dict:
+    if not identity_missing:
+        return {"declared_disposition": source.disposition}
+    claim = {
+        "schema_version": 1,
+        "interpretation_version": SOURCE_IDENTITY_GUARD_VERSION,
+        "reason": SOURCE_MISSING_REFERENCE,
+        # The immutable bytes already have their own encrypted field. Keep the
+        # original digest, IDs, classification and nested event together.
+        "record": source.model_dump(mode="json", exclude={"raw_record_b64"}),
+    }
+    return {
+        "declared_disposition": source.disposition,
+        "interpretation_version": SOURCE_IDENTITY_GUARD_VERSION,
+        "protected_source_claim": encrypt_text(json.dumps(claim, sort_keys=True, separators=(",", ":"))),
+    }
+
+
 def _bound_source_attendance(session, *, connector, terminal_serial, records):
     """Bind nested events to the verified source envelope, including legacy rows."""
     zkt = connector.zkt_device
@@ -566,6 +601,8 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
             raise ValueError("Attendance terminal differs from its source envelope.")
         if incoming.source not in {"FULL_HISTORY", "CURRENT_RECONCILE"}:
             raise ValueError("Source history must use a historical capture type.")
+        if _source_identity_missing(source):
+            continue
         events.append(incoming.model_copy(update={
             "terminal_serial": terminal_serial,
             "raw_event": {
@@ -780,7 +817,7 @@ def apply_reconciliation_chunk(
         accepted_uids = set(accepted)
         duplicate_uids = set(duplicates)
     session.flush()
-    event_uids = [row.event.event_uid for row in payload.records if row.event]
+    event_uids = [row.event_uid for row in attendance]
     events_by_uid = {
         row.event_uid: row
         for row in session.scalars(
@@ -818,14 +855,20 @@ def apply_reconciliation_chunk(
         ).all()
     )
     for source in payload.records:
-        event = events_by_uid.get(source.event.event_uid) if source.event else None
-        disposition = source.disposition
+        identity_missing = _source_identity_missing(source)
+        event = events_by_uid.get(source.event.event_uid) if source.event and not identity_missing else None
+        disposition = "IDENTITY_UNRESOLVED" if identity_missing else source.disposition
         if event and source.terminal_record_key in seen_terminal_keys:
             disposition = "TERMINAL_DUPLICATE"
         elif event and event.ords_status == "BLOCKED_IDENTITY":
             disposition = "BLOCKED_IDENTITY"
         elif event and disposition == "BLOCKED_IDENTITY" and event.cnic_lookup_hash:
             disposition = "EVENT"
+        prior = existing_source_rows.get(source.ordinal)
+        if prior is not None:
+            # A new interpretation cannot overwrite a previously committed
+            # source row, including older accepted/Oracle-confirmed evidence.
+            disposition = prior.disposition
         seen_terminal_keys.add(source.terminal_record_key)
         if disposition in {"BLOCKED_IDENTITY", "IDENTITY_UNRESOLVED"}:
             blocked += 1
@@ -834,7 +877,6 @@ def apply_reconciliation_chunk(
             quarantined += 1
         if disposition == "TERMINAL_DUPLICATE":
             terminal_duplicates += 1
-        prior = existing_source_rows.get(source.ordinal)
         if prior is None:
             session.add(TerminalRecordManifest(
                 job_id=job.id,
@@ -854,10 +896,11 @@ def apply_reconciliation_chunk(
                 attendance_event_id=event.id if event else None,
                 disposition=disposition,
                 protected_raw_record=encrypt_text(source.raw_record_b64),
-                error_code=source.error_code,
+                error_code=SOURCE_MISSING_REFERENCE if identity_missing else source.error_code,
                 raw_timestamp=source.raw_timestamp,
                 observed_uid=source.observed_uid,
-                observed_user_id=source.observed_user_id,
+                observed_user_id=None if identity_missing else source.observed_user_id,
+                **_source_claim_evidence(source, identity_missing=identity_missing),
             ))
     released = _release_source_synced_attendance(
         session, connector=connector, events=events_by_uid.values()
@@ -1224,7 +1267,7 @@ def apply_source_tail_chunk(
             defer_synced_identity_release=True,
         )
     session.flush()
-    event_uids = [row.event.event_uid for row in payload.records if row.event]
+    event_uids = [row.event_uid for row in attendance]
     events_by_uid = (
         {
             row.event_uid: row
@@ -1268,8 +1311,9 @@ def apply_source_tail_chunk(
         ).all()
     )
     for source in payload.records:
-        event = events_by_uid.get(source.event.event_uid) if source.event else None
-        disposition = source.disposition
+        identity_missing = _source_identity_missing(source)
+        event = events_by_uid.get(source.event.event_uid) if source.event and not identity_missing else None
+        disposition = "IDENTITY_UNRESOLVED" if identity_missing else source.disposition
         if event is not None:
             event_count += 1
             if source.terminal_record_key in seen_terminal_keys:
@@ -1303,10 +1347,11 @@ def apply_source_tail_chunk(
                 attendance_event_id=event.id if event else None,
                 disposition=disposition,
                 protected_raw_record=encrypt_text(source.raw_record_b64),
-                error_code=source.error_code,
+                error_code=SOURCE_MISSING_REFERENCE if identity_missing else source.error_code,
                 raw_timestamp=source.raw_timestamp,
                 observed_uid=source.observed_uid,
-                observed_user_id=source.observed_user_id,
+                observed_user_id=None if identity_missing else source.observed_user_id,
+                **_source_claim_evidence(source, identity_missing=identity_missing),
             )
         )
     released = _release_source_synced_attendance(
@@ -2923,6 +2968,9 @@ def _activate_recovery_epoch(
                 attendance_event_id=prior.attendance_event_id,
                 disposition=prior.disposition,
                 protected_raw_record=prior.protected_raw_record,
+                declared_disposition=prior.declared_disposition,
+                interpretation_version=prior.interpretation_version,
+                protected_source_claim=prior.protected_source_claim,
                 error_code=prior.error_code,
                 raw_timestamp=prior.raw_timestamp,
                 observed_uid=prior.observed_uid,

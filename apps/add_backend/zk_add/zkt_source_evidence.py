@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 
 from sqlalchemy import select
 
@@ -39,6 +40,9 @@ def list_evidence(session, connector, *, before=None, limit=20, disposition=None
             "source_epoch_id": row.source_epoch_id, "source_kind": row.source_kind,
             "canonical_source": row.canonical_source, "record_size": row.record_size,
             "raw_record_digest": row.raw_record_digest, "disposition": row.disposition,
+            "declared_disposition": row.declared_disposition,
+            "interpretation_version": row.interpretation_version,
+            "source_claim_available": bool(row.protected_source_claim),
             "error_code": row.error_code, "evidence_available": bool(row.protected_raw_record),
             "created_at": ensure_utc(row.created_at)} for row in page],
         "next_cursor": page[-1].id if len(rows) > maximum and page else None}
@@ -58,6 +62,20 @@ def reveal_evidence(session, connector, manifest_id, *, actor, reason, idempoten
         raise ValueError("SOURCE_EVIDENCE_UNAVAILABLE") from exc
     if not 1 <= len(raw) <= 512 or len(raw) != row.record_size or hashlib.sha256(raw).hexdigest() != row.raw_record_digest:
         raise ValueError("SOURCE_EVIDENCE_INTEGRITY")
+    claim = None
+    if row.protected_source_claim:
+        try:
+            claim = json.loads(decrypt_text(row.protected_source_claim))
+            record = claim["record"]
+            if (claim["schema_version"] != 1
+                    or claim["interpretation_version"] != row.interpretation_version
+                    or record["raw_record_digest"] != row.raw_record_digest
+                    or record["ordinal"] != row.ordinal
+                    or record["terminal_record_key"] != row.terminal_record_key
+                    or record["disposition"] != row.declared_disposition):
+                raise ValueError("SOURCE_CLAIM_INTEGRITY")
+        except Exception as exc:
+            raise ValueError("SOURCE_CLAIM_INTEGRITY") from exc
     epoch = session.get(TerminalSourceEpoch, row.source_epoch_id) if row.source_epoch_id else None
     event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
     bound = bool(event and event.connector_id == connector.id
@@ -76,7 +94,11 @@ def reveal_evidence(session, connector, manifest_id, *, actor, reason, idempoten
         "ordinal": row.ordinal, "canonical_source": row.canonical_source,
         "source_kind": row.source_kind, "record_size": row.record_size,
         "raw_record_b64": encoded, "raw_record_digest": row.raw_record_digest,
-        "original_disposition": row.disposition, "original_error_code": row.error_code,
+        "original_disposition": row.declared_disposition or row.disposition,
+        "original_error_code": claim["record"].get("error_code") if claim else row.error_code,
+        "custody_disposition": row.disposition, "custody_error_code": row.error_code,
+        "interpretation_version": row.interpretation_version,
+        "submitted_interpretation": claim,
         "original_encoded_time": row.raw_timestamp, "created_at": ensure_utc(row.created_at),
         "associated_event": {"id": event.id, "event_uid": event.event_uid,
             "user_id": event.user_id, "device_event_time": ensure_utc(event.device_event_time),
