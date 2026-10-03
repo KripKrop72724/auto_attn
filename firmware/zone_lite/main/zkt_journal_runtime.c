@@ -95,6 +95,10 @@ bool zj_runtime_writer_ready(void)
     return mode() == ZJ_BOOT_WRITER && zj_runtime_health(&current) && current.writer_ready &&
         zj_boot_local_ready(&current, now_ms());
 }
+bool zj_runtime_raw_source_required(void)
+{
+    return mode() == ZJ_BOOT_WRITER;
+}
 bool zj_runtime_append_diagnostics(cJSON *diagnostics)
 {
     zj_boot_t current = {0};

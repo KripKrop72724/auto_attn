@@ -30,6 +30,9 @@ program = r'''
 #include "cJSON.h"
 #include "zkt_record.h"
 static unsigned calls, fail_at, builds;
+static bool raw_only, writer_ready;
+static bool zj_runtime_raw_source_required(void) {return raw_only;}
+static bool zj_runtime_writer_ready(void) {return writer_ready;}
 static uint8_t encoded_input[40]; static size_t encoded_length;
 static void *allocate(size_t size) { if (++calls == fail_at) return NULL; return malloc(size); }
 typedef struct {int unused;} user_table_t;
@@ -89,6 +92,11 @@ static void check(const uint8_t *raw,unsigned size,const char *expected,bool has
         assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"observed_uid")),"40"));
         assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"error_code")),"HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"));
     }
+    if(!strcmp(expected,"RAW_PRESERVED")) {
+        assert(!builds && cJSON_IsNull(cJSON_GetObjectItem(digest_row,"event_uid")));
+        assert(!cJSON_HasObjectItem(row,"raw_timestamp") && !cJSON_HasObjectItem(row,"observed_uid"));
+        assert(!cJSON_HasObjectItem(row,"observed_user_id") && !cJSON_HasObjectItem(row,"error_code"));
+    }
     cJSON_Delete(rows);cJSON_Delete(canonical);
     for(unsigned fault=1;fault<=allocations;++fault) {
         fail_at=0;rows=cJSON_CreateArray();canonical=cJSON_CreateArray();
@@ -115,7 +123,25 @@ int main(void) {
     memset(raw,0,sizeof(raw));raw[0]=7;
     for(unsigned i=0;i<4;++i) raw[4+i]=(uint8_t)(time>>(i*8));
     check(raw,16,"EVENT",true);
-    puts("Source identity holds, raw evidence and atomic allocation faults passed");
+    raw_only=writer_ready=true;
+    const unsigned sizes[]={8,16,40};
+    for(unsigned i=0;i<sizeof(sizes)/sizeof(sizes[0]);++i) {
+        unsigned size=sizes[i];
+        memset(raw,0xff,sizeof(raw));check(raw,size,"RAW_PRESERVED",false);
+        memset(raw,0,sizeof(raw));check(raw,size,"RAW_PRESERVED",false);
+    }
+    cJSON *rows=cJSON_CreateArray(),*canonical=cJSON_CreateArray();
+    const char *disposition="unchanged"; calls=builds=encoded_length=0; writer_ready=false;
+    assert(!append_terminal_source_record(rows,canonical,raw,40,NULL,3,NULL,&disposition));
+    assert(!calls&&!builds&&!encoded_length&&!strcmp(disposition,"unchanged"));
+    writer_ready=true;
+    assert(!append_terminal_source_record(rows,canonical,raw,39,NULL,3,NULL,&disposition));
+    assert(!append_terminal_source_record(rows,canonical,raw,40,NULL,UINT32_MAX,NULL,&disposition));
+    assert(!calls&&!builds&&!encoded_length);
+    assert(append_terminal_source_record(rows,canonical,raw,40,NULL,3,NULL,&disposition));
+    assert(!strcmp(disposition,"RAW_PRESERVED")&&!builds);
+    cJSON_Delete(rows);cJSON_Delete(canonical);
+    puts("Source identity holds, raw writer custody, runtime holds and atomic allocation faults passed");
     return 0;
 }
 '''
