@@ -1108,6 +1108,26 @@ def record_progress(
     return deployment
 
 
+def progress_receipt(session: Session, deployment: FirmwareDeployment, *, requested_state: str) -> dict:
+    """Describe transition outcome; the caller commits before returning it to the peer.
+
+    Artifact fields come from the release, never from the device's request. A
+    terminal failure returned for a later progress POST is not acceptance of
+    the requested transition merely because the HTTP request succeeded.
+    """
+    release = session.get(FirmwareRelease, deployment.release_id)
+    if release is None:
+        raise ValueError("Firmware release is unavailable.")
+    return {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "state": deployment.status,
+        "target_version": deployment.target_version,
+        "application_sha256": _application_sha256(release),
+        "confirm": requested_state == "BOOTED_PENDING" and deployment.status == "BOOTED_PENDING",
+    }
+
+
 def previous_firmware_return_evidence(
     session: Session, *, connector: Connector,
     deployment: FirmwareDeployment, payload: Any,

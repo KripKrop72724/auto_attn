@@ -32,6 +32,9 @@ static struct { char deployment_id[48],state[32],target_version[32]; } s_journal
 typedef struct { const char *version; } esp_app_desc_t;
 static esp_app_desc_t app={"2.6.0"};
 static const esp_app_desc_t *esp_app_get_description(void) { return &app; }
+#define ZJ_BRIDGE_VERSION "2.6.16"
+#define ZJ_WRITER_VERSION "2.7.0"
+static bool add_connector_local_boot_health_ready(void) { return boot_ready; }
 static bool add_connector_boot_health_ready(void) { return boot_ready; }
 static int xSemaphoreTake(int *mutex,int timeout) { (void)mutex;(void)timeout;assert(!locked);if(lock_failed)return 0;locked=true;return 1; }
 static void xSemaphoreGive(int *mutex) { (void)mutex;assert(locked);locked=false; }

@@ -4199,6 +4199,47 @@ bool add_connector_is_connected(void)
     return connected;
 }
 
+const char *add_connector_local_boot_health_error(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return "BOOT_LOCAL_UNSUPPORTED_FAMILY";
+#else
+    const esp_app_desc_t *app = esp_app_get_description();
+    bool bridge = app && !strcmp(app->version, ZJ_BRIDGE_VERSION);
+    bool writer = app && !strcmp(app->version, ZJ_WRITER_VERSION);
+    if ((!bridge && !writer) || strcmp(app->project_name, "zone_lite")) return "BOOT_LOCAL_IMAGE_UNSUPPORTED";
+    if (!storage_upgrade_ready()) return "BOOT_LOCAL_STORAGE_UPGRADE";
+    if (!zj_runtime_boot_ready()) return "BOOT_LOCAL_JOURNAL_RECOVERY";
+    qs_health_t storage = qs_health();
+    if (!storage.observed || !storage.available || !storage.recovery_complete ||
+        !storage.persistence_verified || storage.last_error || storage.persistence_probe_error) return "BOOT_LOCAL_STORAGE_UNVERIFIED";
+    const char *error = "BOOT_LOCAL_TELEMETRY_LOCK";
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        time_t now = time(NULL);
+        bool stable = !strcmp(s_zkt.connection_state, "ONLINE") ||
+            (!strcmp(s_zkt.connection_state, "RECOVERING") &&
+             s_zkt.stability_since_epoch > 1700000000 && now >= s_zkt.stability_since_epoch &&
+             (uint64_t)(now - s_zkt.stability_since_epoch) * 1000ULL >= ZONE_LITE_RECOVERY_STABILITY_MS);
+        error = !s_zkt.online || !stable ? "BOOT_LOCAL_TERMINAL_SESSION" :
+            (s_zkt.user_count < 0 || s_zkt.attendance_count < 0) ? "BOOT_LOCAL_TERMINAL_COUNTS" : NULL;
+        /* The bridge still serves retained legacy queues. The new writer's
+         * required owner/capture/transport set is proved by zj_runtime above. */
+        if (bridge && !error && !(s_outbox_task_handle && s_heartbeat_task_handle &&
+            s_outbox_buffer_ready && !s_worker_start_failed && s_ords_worker_started &&
+            s_ords_worker_operation != ADD_WORKER_RESOURCE &&
+            (uint32_t)((uint32_t)monotonic_ms() - s_ords_worker_tick_ms) < 90000U &&
+            (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) < 90000U)) error = "BOOT_LOCAL_LEGACY_WORKERS";
+        xSemaphoreGive(s_lock);
+    }
+    return error;
+#endif
+}
+
+bool add_connector_local_boot_health_ready(void)
+{
+    return add_connector_local_boot_health_error() == NULL;
+}
+
 bool add_connector_boot_health_ready(void)
 {
 #ifdef ZONE_LITE_HIKVISION
@@ -4253,7 +4294,13 @@ bool add_connector_boot_health_ready(void)
 
 bool add_connector_ota_reconcile_ready(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    const esp_app_desc_t *app = esp_app_get_description();
+    bool local = app && (!strcmp(app->version, ZJ_BRIDGE_VERSION) || !strcmp(app->version, ZJ_WRITER_VERSION));
+    if (local ? !add_connector_local_boot_health_ready() : !add_connector_boot_health_ready()) return false;
+#else
     if (!add_connector_boot_health_ready()) return false;
+#endif
 #ifdef ZONE_LITE_HIKVISION
     /* Boot recovery has validated source custody and its persisted checkpoint.
      * Empty means all retained local observations have an ADD durable receipt;

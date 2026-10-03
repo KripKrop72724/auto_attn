@@ -77,6 +77,17 @@ int main(void)
     durable.crc^=1;failure=5;assert(!load_journal());failure=0;assert(load_journal());
     unsigned prior=writes;s_journal_generation=UINT32_MAX;assert(!save_journal() && writes==prior);
     assert(load_journal());s_journal.image_size=0;assert(!save_journal() && writes==prior);
+    failure=0;assert(load_journal());
+    const char *states[]={"LOCAL_VALIDATED","BOOT_REPORTED","RECONCILING"};
+    for(unsigned i=0;i<3;++i){
+        s_journal=download();strcpy(s_journal.target_version,"2.7.0");
+        strcpy(s_journal.state,states[i]);
+        assert(!ota_journal_valid(&s_journal));
+        s_journal.bytes_written=s_journal.image_size;
+        assert(save_journal() && ota_checkpoint_valid(&durable));
+        memset(&s_journal,0,sizeof(s_journal));assert(load_journal());
+        assert(!strcmp(s_journal.state,states[i]));
+    }
     puts("OTA persistence regression tests passed");
 }
 '''
