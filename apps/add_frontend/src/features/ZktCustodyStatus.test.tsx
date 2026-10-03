@@ -14,10 +14,39 @@ const response = (value: unknown, status = 200) => new Response(JSON.stringify(v
   status, headers: { 'Content-Type': 'application/json' },
 })
 const mount = () => render(<ZktCustodyStatus connectorId="fixture-connector" revision={0} />)
+const processor = (updates: Partial<NonNullable<CustodySnapshot['processor']>> = {}): NonNullable<CustodySnapshot['processor']> => ({
+  schema_version: 1, instance_id: '11111111-2222-4333-8444-555555555555', sampled_at: new Date().toISOString(),
+  state: 'IDLE', last_completed_at: new Date().toISOString(), last_progress_at: null,
+  inspected_groups_total: 0, successful_ticks: 3, failed_ticks: 1, last_tick_ms: 8, ...updates,
+})
 beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => response(fixture()))) })
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('ZKT custody evidence', () => {
+  it.each(['IDLE', 'STALLED', 'STOPPED', 'RETRYING'] as const)('reports global worker %s independently of receipt and Oracle counts', async state => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ processor: processor({ state }) })))
+    mount()
+    expect(await screen.findByRole('heading', { name: 'ADD worker · all ZKT connectors' })).toBeTruthy()
+    expect(screen.getByText(state.charAt(0) + state.slice(1).toLowerCase())).toBeTruthy()
+    expect(screen.getByText('3 / 1')).toBeTruthy()
+    expect(screen.getByText('8 ms')).toBeTruthy()
+    expect(screen.getByText('12')).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+    expect(screen.queryByText(/Healthy|All delivered/i)).toBeNull()
+  })
+  it('marks a stale worker sample historical even if the custody query is fresh', async () => {
+    const old = new Date(Date.now() - 60_000).toISOString()
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ processor: processor({ sampled_at: old, last_completed_at: old }) })))
+    mount()
+    expect(await screen.findByText('Last reported worker state')).toBeTruthy()
+    expect(screen.queryByText('Worker state')).toBeNull()
+  })
+  it('keeps invalid future worker evidence unavailable without erasing custody counts', async () => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ processor: processor({ last_completed_at: new Date(Date.now() + 60_000).toISOString() }) })))
+    mount()
+    expect(await screen.findByText('Worker progress evidence is unavailable.')).toBeTruthy()
+    expect(screen.getByText('12')).toBeTruthy()
+  })
   it('shows preserved holds, responsibility and independent Oracle status', async () => {
     mount()
     expect(await screen.findByRole('heading', { name: 'ADD custody processing' })).toBeTruthy()

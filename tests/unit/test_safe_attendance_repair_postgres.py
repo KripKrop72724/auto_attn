@@ -21,6 +21,32 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 
+def test_custody_processor_timeouts_are_local_and_failed_tick_can_retry(postgres_store, monkeypatch):
+    from zk_add import zkt_custody_runtime as runtime
+    from zk_add.zkt_custody_work import InspectionBatch
+
+    sessions, _ = postgres_store
+    names = ("statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout")
+    with sessions() as db:
+        original = tuple(db.scalar(text(f"SHOW {name}")) for name in names)
+    def timed_out(db, **_):
+        assert tuple(db.scalar(text(f"SHOW {name}")) for name in names) == ("2s", "250ms", "5s")
+        db.execute(text("SELECT pg_sleep(2.2)"))
+        pytest.fail("The statement deadline was not enforced")
+    monkeypatch.setattr(runtime, "advance_work_batch", timed_out)
+    processor = runtime.CustodyProcessor()
+    assert processor._one_tick() == (0, "CUSTODY_DATABASE_UNAVAILABLE")
+    assert processor.snapshot()["failed_ticks"] == 1 and processor._cursor == 0
+    def recovered(db, **_):
+        assert db.scalar(text("SELECT 1")) == 1
+        return InspectionBatch(0, 7, 1)
+    monkeypatch.setattr(runtime, "advance_work_batch", recovered)
+    assert processor._one_tick() == (0, None)
+    with sessions() as db:
+        assert tuple(db.scalar(text(f"SHOW {name}")) for name in names) == original
+    assert processor._cursor == 7 and processor.snapshot()["active_error_code"] is None
+
+
 def test_overlapping_device_sockets_commit_a_sequence_once(postgres_store):
     from threading import Barrier
     from zk_add.schemas import Envelope
@@ -93,7 +119,7 @@ def test_overlapping_custody_sockets_return_one_committed_receipt(postgres_store
 def test_custody_inspector_skips_connector_held_by_ingestion(postgres_store):
     from zk_add.models import ZktCustodyWork
     from zk_add.zkt_custody import settle_observations, observation_id
-    from zk_add.zkt_custody_work import advance_work
+    from zk_add.zkt_custody_work import advance_work, advance_work_batch
     import base64
 
     sessions, connector_id = postgres_store
@@ -112,7 +138,8 @@ def test_custody_inspector_skips_connector_held_by_ingestion(postgres_store):
         db.commit()
     with sessions() as ingestion, sessions() as worker:
         ingestion.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
-        assert advance_work(worker) == 0  # No five-second lock timeout or blocked ingest.
+        skipped = advance_work_batch(worker)
+        assert skipped.processed == 0 and skipped.locked_connectors == 1
         worker.commit()
         ingestion.rollback()
         assert advance_work(worker) == 1

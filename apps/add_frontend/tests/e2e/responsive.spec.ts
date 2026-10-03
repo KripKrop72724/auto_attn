@@ -300,6 +300,10 @@ async function mockDashboard(page: Page) {
       counts: [{ state: 'WAIT_PROFILE', owner: 'ADD_PROTOCOL', count: 12 }],
       rows: [{ id: 1, state: 'WAIT_PROFILE', reason_code: 'PROFILE_QUALIFICATION_REQUIRED',
         owner: 'ADD_PROTOCOL', updated_at: new Date().toISOString(), next_attempt_at: null }], next_cursor: null,
+      processor: { schema_version: 1, instance_id: '11111111-2222-4333-8444-555555555555',
+        sampled_at: new Date().toISOString(), state: 'STALLED',
+        last_completed_at: new Date(Date.now() - 6_000).toISOString(), last_progress_at: null,
+        inspected_groups_total: 0, successful_ticks: 3, failed_ticks: 1, last_tick_ms: 8 },
     }
     else if (url.pathname.includes('/connectivity')) json = { rows: [] }
     else if (url.pathname.includes('/logs')) json = { rows: [], next_cursor: null }
@@ -462,6 +466,8 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   await custody.locator('summary').click()
   await expect(custody.getByText('Protocol review', { exact: true })).toBeVisible()
   await expect(custody.getByText('Not established by custody')).toBeVisible()
+  await expect(custody.getByRole('heading', { name: 'ADD worker · all ZKT connectors' })).toBeVisible()
+  await expect(custody.getByText('Stalled', { exact: true })).toBeVisible()
   const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
   expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
   if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
