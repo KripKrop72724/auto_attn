@@ -139,6 +139,15 @@ live/history matcher: live-frame bytes differ from history bytes, so guessed
 ordinals and timestamp-only associations are rejected. No new employee or
 attendance record is inferred by this receiver.
 
+A bounded [occurrence match planner](zkt-occurrence-matching.md) now compares
+complete decoded fact sets without selecting arbitrary same-second pairs.
+Its 2,048-record windows preserve unbound occurrences, immutable observation
+identities and prior one-to-one links. The planner requires independently proved
+profile/coverage inputs and returns proposals only; database integration,
+qualified profile evidence and canonical attendance creation remain open.
+All 101 targeted matcher/decoder tests pass, including saturated ambiguity
+buckets and seeded mixed populations. No model is qualified by these fixtures.
+
 Migration `0043` adds `zkt_custody_enabled=false` for every connector. There is
 no operator activation endpoint in this stage. Do not set the field in
 production until the journal reader, delivery adapter, occurrence matching and
