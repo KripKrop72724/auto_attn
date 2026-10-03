@@ -207,7 +207,7 @@ def _source_record() -> ReconciliationSourceRecord:
     )
 
 
-def _certify_one_record_baseline(session: Session, connector):
+def _certify_one_record_baseline(session: Session, connector, *, bind_epoch=False):
     job = create_reconciliation_job(
         session,
         connector=connector,
@@ -216,11 +216,16 @@ def _certify_one_record_baseline(session: Session, connector):
         confirmation="RECONCILE 1 FROM START",
         idempotency_key="tail-baseline-0001",
     )
+    from zk_add.reconciliation import source_epoch_uuid
+    binding = {"source_epoch": source_epoch_uuid(session, job)} if bind_epoch else {}
+    if bind_epoch:
+        connector.firmware_version = "zone-lite-2.7.0"
     raw_digest = hashlib.sha256(RAW_RECORD).hexdigest()
     apply_reconciliation_anchor(
         session,
         connector=connector,
         payload=ReconciliationAnchorRequest(
+            **binding,
             job_id=job.job_id,
             generation=job.terminal_generation,
             terminal_serial=SERIAL,
@@ -233,6 +238,7 @@ def _certify_one_record_baseline(session: Session, connector):
         ),
     )
     draft = ReconciliationChunkRequest(
+            **binding,
         job_id=job.job_id,
         generation=job.terminal_generation,
         sequence=0,
@@ -264,6 +270,7 @@ def _certify_one_record_baseline(session: Session, connector):
         session,
         connector=connector,
         payload=ReconciliationManifestRequest(
+            **binding,
             job_id=job.job_id,
             generation=job.terminal_generation,
             terminal_serial=SERIAL,
@@ -1698,8 +1705,9 @@ def test_paused_job_reports_its_durable_operator_state(reconciliation_db):
     assert "committed checkpoint is safe" in payload["operator_message"]
 
 
+@pytest.mark.parametrize("bind_epoch", [False, True])
 def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
-    reconciliation_db,
+    reconciliation_db, bind_epoch,
 ):
     session, connector = reconciliation_db
     zkt = connector.zkt_device
@@ -1717,6 +1725,10 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
         confirmation="RECONCILE 1 FROM START",
         idempotency_key="source-divergence-probe-0001",
     )
+    from zk_add.reconciliation import source_epoch_uuid
+    binding = {"source_epoch": source_epoch_uuid(session, job)} if bind_epoch else {}
+    if bind_epoch:
+        connector.firmware_version = "zone-lite-2.7.0"
     changed_raw = _raw_record(uid=8)
     changed = _source_record().model_copy(
         update={
@@ -1751,7 +1763,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     )
     session.flush()
     draft = ReconciliationChunkRequest(
-        job_id=job.job_id,
+        **binding,        job_id=job.job_id,
         generation=job.terminal_generation,
         sequence=0,
         start_ordinal=0,
@@ -1784,7 +1796,7 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     assert divergence is not None
     original_epoch_id = job.source_epoch_id
     probe = SourceProbeResultRequest(
-        job_id=job.job_id,
+        **binding,        job_id=job.job_id,
         generation=job.terminal_generation,
         terminal_serial=SERIAL,
         latest_terminal_count=1,
@@ -1801,6 +1813,15 @@ def test_raw_source_divergence_uses_fresh_probes_and_activates_recovery_epoch(
     assert job.committed_next_ordinal == 0
     assert job.review_required is True
     assert job.completion_outcome == "CURRENT_TRUTH_CERTIFIED_WITH_SOURCE_CHANGE"
+
+    if bind_epoch:
+        assert source_epoch_uuid(session, job) != binding["source_epoch"]
+        generation = job.terminal_generation
+        with pytest.raises(ValueError, match="Source epoch"):
+            apply_source_probe_result(session, connector=connector, payload=probe)
+        with pytest.raises(ValueError, match="Source epoch"):
+            apply_reconciliation_chunk(session, connector=connector, payload=request)
+        assert job.status == "QUEUED" and job.terminal_generation == generation
 
 
 def test_raw_source_divergence_promotes_a_stable_third_digest(reconciliation_db):
@@ -1961,3 +1982,184 @@ def test_historical_identity_requires_verified_device_evidence(reconciliation_db
     row = session.scalar(select(AttendanceEvent))
     assert row.identity_resolution_status == "BLOCKED_PROVENANCE"
     assert row.cnic_lookup_hash is None
+
+
+@pytest.mark.parametrize("kind", ["anchor", "chunk", "manifest", "probe", "release"])
+@pytest.mark.parametrize("version,epoch", [
+    ("zone-lite-2.6.15", "11111111-2222-4333-8444-555555555555"),
+    ("zone-lite-2.6.16", None),
+    ("custody-enabled-legacy", None),
+    ("zone-lite-2.7.0", None),
+    ("zone-lite-2.7.0", "11111111-2222-4333-8444-555555555555"),
+])
+def test_source_epoch_rejects_before_mutating_current_job(reconciliation_db, kind, version, epoch):
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(
+        session, connector=connector, actor="operator", reason="Check stale epoch transport isolation.",
+        confirmation="RECONCILE 1 FROM START", idempotency_key="epoch-wire-job-test",
+    )
+    connector.firmware_version = "zone-lite-2.6.15" if version == "custody-enabled-legacy" else version
+    connector.zkt_custody_enabled = version == "custody-enabled-legacy"
+    common = dict(job_id=job.job_id, generation=job.terminal_generation, source_epoch=epoch)
+    if kind == "anchor":
+        payload = ReconciliationAnchorRequest(**common, terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation, cutoff_count=1, latest_terminal_count=1,
+            record_size=40, source_total_bytes=44, first_anchor_digest="a" * 64)
+        handler = apply_reconciliation_anchor
+    elif kind == "chunk":
+        payload = ReconciliationChunkRequest(**common, sequence=0, start_ordinal=0, end_ordinal=1,
+            chunk_digest="a" * 64, resulting_chain_digest="b" * 64, records=[_source_record()])
+        handler = apply_reconciliation_chunk
+    elif kind == "manifest":
+        payload = ReconciliationManifestRequest(**common, terminal_serial=SERIAL,
+            terminal_generation=job.terminal_generation, cutoff_count=0,
+            latest_terminal_count=0, final_chain_digest="0" * 64)
+        handler = apply_reconciliation_manifest
+    elif kind == "probe":
+        payload = SourceProbeResultRequest(**common, terminal_serial=SERIAL,
+            latest_terminal_count=1, record_size=40, ordinal=0, record=_source_record())
+        handler = apply_source_probe_result
+    else:
+        payload = ReconciliationAssignmentReleaseRequest(**common,
+            assignment_id="11111111-2222-4333-8444-555555555555", committed_next_ordinal=0,
+            reason="COMMAND_PENDING")
+        handler = apply_reconciliation_assignment_release
+    before = (job.status, job.phase, job.source_epoch_id, job.committed_next_ordinal, job.last_chain_digest)
+    with pytest.raises(ValueError, match="Source epoch"):
+        handler(session, connector=connector, payload=payload)
+    assert before == (job.status, job.phase, job.source_epoch_id, job.committed_next_ordinal, job.last_chain_digest)
+    assert not session.new
+
+
+def test_epoch_bound_tail_replay_and_stale_epoch_cannot_invalidate_coverage(reconciliation_db):
+    from zk_add.models import TerminalSourceEpoch
+    from zk_add.reconciliation import serialize_coverage, source_epoch_uuid
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector, bind_epoch=True)
+    expected = source_epoch_uuid(session, coverage)
+    assert expected and expected == serialize_coverage(session, coverage)["source_epoch"]
+    request = SourceTailChunkRequest(
+        source_epoch=expected, terminal_serial=SERIAL, terminal_generation=coverage.terminal_generation,
+        record_size=40, start_ordinal=1, end_ordinal=2, latest_terminal_count=2,
+        chunk_digest="0" * 64, previous_chain_digest=coverage.source_committed_chain_digest,
+        resulting_chain_digest="0" * 64, records=[_tail_source(1, "INVALID_TIME")],
+    )
+    digest = reconciliation_chunk_digest(request)
+    request = request.model_copy(update={"chunk_digest": digest, "resulting_chain_digest":
+        reconciliation_chain_digest(coverage.source_committed_chain_digest,
+            start_ordinal=1, end_ordinal=2, chunk_digest=digest)})
+    result = apply_source_tail_chunk(session, connector=connector, payload=request)
+    assert result[1] and not result[2] and result[3] is None
+    session.flush()
+    replay = apply_source_tail_chunk(session, connector=connector, payload=request)
+    assert replay[1].id == result[1].id and replay[2] and replay[3] is None
+    # The old payload must not receive a duplicate ACK after epoch replacement,
+    # even if its numeric generation, range and digest happen to match.
+    epoch = session.get(TerminalSourceEpoch, coverage.source_epoch_id)
+    original_uuid = epoch.epoch_id
+    replacement = TerminalSourceEpoch(zkt_device_id=epoch.zkt_device_id,
+        terminal_generation=epoch.terminal_generation, sequence=epoch.sequence+1,
+        state="ACTIVE", parent_epoch_id=epoch.id)
+    epoch.state = "SUPERSEDED"
+    session.add(replacement)
+    session.flush()
+    coverage.source_epoch_id = replacement.id
+    session.flush()
+    for stale in (original_uuid, None):
+        with pytest.raises(ValueError, match="Source epoch"):
+            apply_source_tail_chunk(session, connector=connector,
+                payload=request.model_copy(update={"source_epoch": stale, "terminal_serial": "wrong"}))
+        assert coverage.active and coverage.source_committed_cursor == 2
+        assert coverage.source_committed_chain_digest == request.resulting_chain_digest
+
+
+@pytest.mark.parametrize("value", ["", "A" * 36, "1" * 36, 3, True, "11111111-2222-4333-8444-555555555555extra"])
+def test_source_epoch_schema_rejects_noncanonical_wire_values(value):
+    from pydantic import ValidationError
+    from zk_add.schemas import SourceEpochRequest
+    with pytest.raises(ValidationError):
+        SourceEpochRequest(source_epoch=value)
+
+
+def test_source_epoch_assignment_is_uuid_not_database_key(reconciliation_db):
+    from zk_add.reconciliation import source_epoch_uuid
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(session, connector=connector, actor="operator",
+        reason="Check assignment source epoch coordinates.", confirmation="RECONCILE 1 FROM START",
+        idempotency_key="epoch-wire-assignment")
+    assignment = assignment_rows(session)[0][1]
+    assert assignment["source_epoch"] == source_epoch_uuid(session, job)
+    assert len(assignment["source_epoch"]) == 36
+    assert assignment["source_epoch"] != str(job.source_epoch_id)
+
+
+def test_source_epoch_commit_ack_and_bootstrap_are_bound(reconciliation_db, monkeypatch):
+    from contextlib import contextmanager
+    from zk_add import web
+    from zk_add.models import Connector
+    from zk_add.schemas import Envelope
+    from zk_add.reconciliation import source_epoch_uuid
+    session, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(session, connector, bind_epoch=True)
+    pk, public_id, expected = connector.id, connector.connector_id, source_epoch_uuid(session, coverage)
+    request = SourceTailChunkRequest(source_epoch=expected, terminal_serial=SERIAL,
+        terminal_generation=coverage.terminal_generation, record_size=40,
+        start_ordinal=1, end_ordinal=2, latest_terminal_count=2, chunk_digest="0" * 64,
+        previous_chain_digest=coverage.source_committed_chain_digest, resulting_chain_digest="0" * 64,
+        records=[_tail_source(1, "INVALID_TIME")])
+    digest = reconciliation_chunk_digest(request)
+    request = request.model_copy(update={"chunk_digest": digest, "resulting_chain_digest":
+        reconciliation_chain_digest(coverage.source_committed_chain_digest,
+            start_ordinal=1, end_ordinal=2, chunk_digest=digest)})
+    session.commit()
+    commits = []
+
+    @contextmanager
+    def scope():
+        with Session(session.bind) as db:
+            try:
+                yield db
+                db.commit()
+                commits.append(True)
+            except Exception:
+                db.rollback()
+                raise
+
+    monkeypatch.setattr(web, "session_scope", scope)
+    envelope = Envelope(message_id="epoch-tail-commit", connector_id=public_id,
+        boot_id="epoch-wire-test", seq=1, sent_at=utc_now(), type="source_tail_chunk",
+        payload=request.model_dump(mode="json"))
+    outcome = web.persist_envelope(pk, envelope)
+    assert commits and outcome.ack["source_epoch"] == expected
+    assert outcome.ack["type"] == "source_tail_ack" and outcome.ack["committed_next_ordinal"] == 2
+    with Session(session.bind) as db:
+        assert db.get(ReconciliationCoverage, coverage.id).source_committed_cursor == 2
+        assert db.get(Connector, pk).last_sequence == 1
+    replay = web.persist_envelope(pk, envelope.model_copy(update={"seq": 2, "message_id": "lost-reply-retry"}))
+    assert replay.ack["duplicate"] and replay.ack["source_epoch"] == expected
+    _, bootstrap = web.stream_bootstrap(pk)
+    assert bootstrap["source_epoch"] == expected and bootstrap["source_committed_cursor"] == 2
+    prior_commits = len(commits)
+    bad_payload = {**envelope.payload, "source_epoch": "22222222-2222-4333-8444-555555555555"}
+    with pytest.raises(ValueError, match="Source epoch"):
+        web.persist_envelope(pk, envelope.model_copy(update={"seq": 3, "payload": bad_payload}))
+    assert len(commits) == prior_commits
+    with Session(session.bind) as db:
+        assert db.get(Connector, pk).last_sequence == 2
+        assert db.get(ReconciliationCoverage, coverage.id).active
+
+
+def test_bound_anchor_cannot_change_epoch_generation(reconciliation_db):
+    from zk_add.reconciliation import source_epoch_uuid
+    session, connector = reconciliation_db
+    job = create_reconciliation_job(session, connector=connector, actor="operator",
+        reason="Keep the source epoch bound to its terminal generation.",
+        confirmation="RECONCILE 1 FROM START", idempotency_key="epoch-generation-boundary")
+    generation = job.terminal_generation
+    request = ReconciliationAnchorRequest(source_epoch=source_epoch_uuid(session, job),
+        job_id=job.job_id, generation=generation, terminal_serial=SERIAL,
+        terminal_generation=generation+1, cutoff_count=1, latest_terminal_count=1,
+        record_size=40, source_total_bytes=44, first_anchor_digest="a" * 64)
+    with pytest.raises(ValueError, match="Source epoch cannot change terminal generation"):
+        apply_reconciliation_anchor(session, connector=connector, payload=request)
+    assert job.terminal_generation == generation and job.cutoff_count is None

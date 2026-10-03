@@ -1,4 +1,5 @@
 #include "add_connector.h"
+#include "add_source_wire.h"
 #include "firmware_family.h"
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
 #include "hikvision_runtime.h"
@@ -201,6 +202,9 @@ static evidence_receipt_t s_evidence_expected;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
 static add_source_tail_ack_t s_source_tail_ack;
+static bool source_epoch_required(void);
+static char s_waiting_source_epoch[37];
+static const char *s_waiting_source_ack_type;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 static bool s_waiting_zkt_custody;
 static zj_custody_expected_t s_zkt_custody_expected;
@@ -477,6 +481,13 @@ static bool send_payload(
         cJSON_Delete(payload);
         return false;
     }
+    const char *source_ack_type = add_source_ack_type(type);
+    char source_epoch[37] = {0};
+    if ((source_ack_type || !strcmp(type, "reconcile_assignment_release")) &&
+        !add_source_epoch_read(payload, source_epoch, source_epoch_required())) {
+        cJSON_Delete(payload);
+        return false;
+    }
     evidence_receipt_t expected = {0};
     bool evidence = strcmp(type, "queue_evidence") == 0;
     bool hikvision = strcmp(type, "hikvision_observation") == 0;
@@ -555,6 +566,8 @@ static bool send_payload(
         }
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             strlcpy(s_waiting_ack, message_id, sizeof(s_waiting_ack));
+            memcpy(s_waiting_source_epoch, source_epoch, sizeof(source_epoch));
+            s_waiting_source_ack_type = source_ack_type;
             s_waiting_evidence = evidence;
             s_waiting_hikvision = hikvision;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -1634,112 +1647,18 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
     return true;
 }
 
-static bool parse_reconcile_assignment(
-    cJSON *root,
-    add_reconcile_assignment_t *assignment)
+static bool source_epoch_required(void)
 {
-    if (!root || !assignment) return false;
-    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
-    cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
-    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
-    cJSON *expected_serial = cJSON_GetObjectItemCaseSensitive(
-        root,
-        "expected_terminal_serial");
-    cJSON *committed = cJSON_GetObjectItemCaseSensitive(
-        root,
-        "committed_next_ordinal");
-    cJSON *chunk_records = cJSON_GetObjectItemCaseSensitive(root, "chunk_records");
-    bool source_probe = cJSON_IsString(type) &&
-        strcmp(type->valuestring, "source_probe_assignment") == 0;
-    if (!cJSON_IsString(type) ||
-        (!source_probe && strcmp(type->valuestring, "reconcile_assignment") != 0) ||
-        !cJSON_IsString(job_id) || strlen(job_id->valuestring) != 36 ||
-        !cJSON_IsNumber(generation) || generation->valuedouble < 1 ||
-        !cJSON_IsString(expected_serial) || expected_serial->valuestring[0] == '\0' ||
-        (!source_probe && (!cJSON_IsNumber(committed) || committed->valuedouble < 0)) ||
-        (!source_probe && (!cJSON_IsNumber(chunk_records) || chunk_records->valuedouble < 1))) {
-        return false;
-    }
-    memset(assignment, 0, sizeof(*assignment));
-    strlcpy(assignment->job_id, job_id->valuestring, sizeof(assignment->job_id));
-    strlcpy(
-        assignment->expected_terminal_serial,
-        expected_serial->valuestring,
-        sizeof(assignment->expected_terminal_serial));
-    assignment->generation = (uint32_t)generation->valuedouble;
-    assignment->source_probe = source_probe;
-    if (source_probe) {
-        cJSON *ordinal = cJSON_GetObjectItemCaseSensitive(root, "ordinal");
-        if (!cJSON_IsNumber(ordinal) || ordinal->valuedouble < 0) return false;
-        assignment->probe_ordinal = (uint32_t)ordinal->valuedouble;
-        assignment->chunk_records = 1;
-    } else {
-        assignment->committed_next_ordinal = (uint32_t)committed->valuedouble;
-        assignment->chunk_records = (uint16_t)(chunk_records->valueint > 100
-            ? 100
-            : chunk_records->valueint);
-    }
-    cJSON *protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
-    assignment->stream_v2 = cJSON_IsString(protocol) &&
-        strcmp(protocol->valuestring, "history_stream_v2") == 0;
-    cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
-    if (cJSON_IsString(assignment_id) && strlen(assignment_id->valuestring) == 36) {
-        strlcpy(
-            assignment->assignment_id,
-            assignment_id->valuestring,
-            sizeof(assignment->assignment_id));
-    }
-    cJSON *credit_end = cJSON_GetObjectItemCaseSensitive(root, "credit_end_ordinal");
-    if (cJSON_IsNumber(credit_end) && credit_end->valuedouble >= committed->valuedouble) {
-        assignment->credit_end_ordinal = (uint32_t)credit_end->valuedouble;
-    }
-    cJSON *max_chunks = cJSON_GetObjectItemCaseSensitive(root, "max_chunks");
-    if (cJSON_IsNumber(max_chunks) && max_chunks->valueint > 0) {
-        assignment->max_chunks = (uint16_t)(max_chunks->valueint > 20
-            ? 20
-            : max_chunks->valueint);
-    } else {
-        assignment->max_chunks = 1;
-    }
-    cJSON *lease_epoch = cJSON_GetObjectItemCaseSensitive(root, "lease_expires_epoch");
-    if (cJSON_IsNumber(lease_epoch)) {
-        assignment->lease_expires_epoch = (int64_t)lease_epoch->valuedouble;
-    }
-    if (!assignment->source_probe && assignment->stream_v2 &&
-        (assignment->assignment_id[0] == '\0' ||
-         !cJSON_IsNumber(credit_end) ||
-         credit_end->valuedouble < committed->valuedouble)) {
-        return false;
-    }
-    cJSON *cutoff = cJSON_GetObjectItemCaseSensitive(root, "cutoff_count");
-    if (cJSON_IsNumber(cutoff) && cutoff->valuedouble >= 0) {
-        assignment->has_cutoff = true;
-        assignment->cutoff_count = (uint32_t)cutoff->valuedouble;
-    }
-    cJSON *anchor = cJSON_GetObjectItemCaseSensitive(root, "first_anchor_digest");
-    if (cJSON_IsString(anchor) && strlen(anchor->valuestring) == 64) {
-        strlcpy(
-            assignment->first_anchor_digest,
-            anchor->valuestring,
-            sizeof(assignment->first_anchor_digest));
-    }
-    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "preceding_chain_digest");
-    if (cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
-        strlcpy(
-            assignment->preceding_chain_digest,
-            chain->valuestring,
-            sizeof(assignment->preceding_chain_digest));
-    }
-    cJSON *predecessor = cJSON_GetObjectItemCaseSensitive(
-        root,
-        "committed_predecessor_digest");
-    if (cJSON_IsString(predecessor) && strlen(predecessor->valuestring) == 64) {
-        strlcpy(
-            assignment->committed_predecessor_digest,
-            predecessor->valuestring,
-            sizeof(assignment->committed_predecessor_digest));
-    }
-    return true;
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return false;
+#else
+    return add_source_epoch_required(firmware_version(), true);
+#endif
+}
+
+static bool parse_reconcile_assignment(cJSON *root, add_reconcile_assignment_t *assignment)
+{
+    return add_source_parse_assignment(root, assignment, source_epoch_required());
 }
 
 static int command_transaction_load(void *context, ft_checkpoint_t *checkpoint)
@@ -1978,62 +1897,9 @@ static void parse_inbound(const char *data, size_t len)
                     0,
                     sizeof(s_attendance_settlement_ack));
                 if (strcmp(type->valuestring, "reconcile_chunk_ack") == 0) {
-                    cJSON *assignment_id = cJSON_GetObjectItemCaseSensitive(root, "assignment_id");
-                    cJSON *job_id = cJSON_GetObjectItemCaseSensitive(root, "job_id");
-                    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
-                    cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "committed_next_ordinal");
-                    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "resulting_chain_digest");
-                    cJSON *credit_end = cJSON_GetObjectItemCaseSensitive(root, "credit_end_ordinal");
-                    cJSON *continue_allowed = cJSON_GetObjectItemCaseSensitive(root, "continue_allowed");
-                    if (cJSON_IsString(assignment_id) && strlen(assignment_id->valuestring) == 36 &&
-                        cJSON_IsString(job_id) && strlen(job_id->valuestring) == 36 &&
-                        cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
-                        cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
-                        strlcpy(s_reconcile_chunk_ack.assignment_id, assignment_id->valuestring,
-                            sizeof(s_reconcile_chunk_ack.assignment_id));
-                        strlcpy(s_reconcile_chunk_ack.job_id, job_id->valuestring,
-                            sizeof(s_reconcile_chunk_ack.job_id));
-                        strlcpy(s_reconcile_chunk_ack.resulting_chain_digest, chain->valuestring,
-                            sizeof(s_reconcile_chunk_ack.resulting_chain_digest));
-                        s_reconcile_chunk_ack.generation = (uint32_t)generation->valuedouble;
-                        s_reconcile_chunk_ack.committed_next_ordinal = (uint32_t)committed->valuedouble;
-                        s_reconcile_chunk_ack.credit_end_ordinal = cJSON_IsNumber(credit_end)
-                            ? (uint32_t)credit_end->valuedouble
-                            : 0;
-                        s_reconcile_chunk_ack.continue_allowed = cJSON_IsTrue(continue_allowed);
-                        s_reconcile_chunk_ack.valid = true;
-                        strlcpy(s_reconcile_last_job_id, job_id->valuestring,
-                            sizeof(s_reconcile_last_job_id));
-                        s_reconcile_last_generation = s_reconcile_chunk_ack.generation;
-                        s_reconcile_last_committed_ordinal =
-                            s_reconcile_chunk_ack.committed_next_ordinal;
-                    }
+                    (void)add_source_parse_chunk_ack(root, &s_reconcile_chunk_ack, source_epoch_required());
                 } else if (strcmp(type->valuestring, "source_tail_ack") == 0) {
-                    cJSON *terminal_serial = cJSON_GetObjectItemCaseSensitive(root, "terminal_serial");
-                    cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "terminal_generation");
-                    cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "committed_next_ordinal");
-                    cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "resulting_chain_digest");
-                    cJSON *exception_count = cJSON_GetObjectItemCaseSensitive(root, "exception_count");
-                    if (cJSON_IsString(terminal_serial) && terminal_serial->valuestring[0] &&
-                        cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
-                        cJSON_IsString(chain) && strlen(chain->valuestring) == 64) {
-                        strlcpy(
-                            s_source_tail_ack.terminal_serial,
-                            terminal_serial->valuestring,
-                            sizeof(s_source_tail_ack.terminal_serial));
-                        strlcpy(
-                            s_source_tail_ack.resulting_chain_digest,
-                            chain->valuestring,
-                            sizeof(s_source_tail_ack.resulting_chain_digest));
-                        s_source_tail_ack.terminal_generation =
-                            (uint32_t)generation->valuedouble;
-                        s_source_tail_ack.committed_next_ordinal =
-                            (uint32_t)committed->valuedouble;
-                        s_source_tail_ack.exception_count = cJSON_IsNumber(exception_count)
-                            ? (uint32_t)exception_count->valuedouble
-                            : 0;
-                        s_source_tail_ack.valid = true;
-                    }
+                    (void)add_source_parse_tail_ack(root, &s_source_tail_ack, source_epoch_required());
                 } else if (strcmp(type->valuestring, "ack") == 0) {
                     cJSON *message_type = cJSON_GetObjectItemCaseSensitive(
                         root, "message_type");
@@ -2114,7 +1980,14 @@ static void parse_inbound(const char *data, size_t len)
                     s_ack_matched = !strcmp(type->valuestring, "hikvision_observation_ack") &&
                         cJSON_IsTrue(durable) && cJSON_IsString(hash) &&
                         !strcmp(hash->valuestring, s_hikvision_expected);
+                } else if (s_waiting_source_ack_type && s_waiting_source_epoch[0]) {
+                    s_ack_matched = add_source_ack_matches(root, s_waiting_source_ack_type, s_waiting_source_epoch);
                 } else s_ack_matched = true;
+                if (s_ack_matched && s_reconcile_chunk_ack.valid) {
+                    strlcpy(s_reconcile_last_job_id, s_reconcile_chunk_ack.job_id, sizeof(s_reconcile_last_job_id));
+                    s_reconcile_last_generation = s_reconcile_chunk_ack.generation;
+                    s_reconcile_last_committed_ordinal = s_reconcile_chunk_ack.committed_next_ordinal;
+                }
                 xSemaphoreGive(s_ack_sem);
             }
             xSemaphoreGive(s_lock);
@@ -2144,27 +2017,7 @@ static void parse_inbound(const char *data, size_t len)
     }
     if (cJSON_IsString(type) && strcmp(type->valuestring, "source_coverage") == 0) {
         add_source_coverage_t coverage = {0};
-        cJSON *terminal_serial = cJSON_GetObjectItemCaseSensitive(root, "terminal_serial");
-        cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, "terminal_generation");
-        cJSON *committed = cJSON_GetObjectItemCaseSensitive(root, "source_committed_cursor");
-        cJSON *chain = cJSON_GetObjectItemCaseSensitive(root, "source_committed_chain_digest");
-        cJSON *active = cJSON_GetObjectItemCaseSensitive(root, "active");
-        bool valid = cJSON_IsString(terminal_serial) && terminal_serial->valuestring[0] &&
-            cJSON_IsNumber(generation) && cJSON_IsNumber(committed) &&
-            cJSON_IsString(chain) && strlen(chain->valuestring) == 64 &&
-            cJSON_IsBool(active);
-        if (valid && s_source_coverage) {
-            strlcpy(
-                coverage.terminal_serial,
-                terminal_serial->valuestring,
-                sizeof(coverage.terminal_serial));
-            strlcpy(
-                coverage.committed_chain_digest,
-                chain->valuestring,
-                sizeof(coverage.committed_chain_digest));
-            coverage.terminal_generation = (uint32_t)generation->valuedouble;
-            coverage.committed_next_ordinal = (uint32_t)committed->valuedouble;
-            coverage.active = cJSON_IsTrue(active);
+        if (add_source_parse_coverage(root, &coverage, source_epoch_required()) && s_source_coverage) {
             if (xQueueOverwrite(s_source_coverage, &coverage) != pdTRUE) {
                 ESP_LOGW(TAG, "Could not queue authoritative ADD source coverage");
             }
