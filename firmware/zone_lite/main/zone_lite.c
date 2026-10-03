@@ -3,6 +3,7 @@
 #include "storage_upgrade.h"
 #include "zkt_clock.h"
 #include "zkt_record.h"
+#include "zkt_socket_io.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_journal_runtime.h"
 #endif
@@ -984,44 +985,17 @@ static void make_commkey(uint32_t key, uint16_t session_id, uint8_t out[4])
     out[3] = swapped[3] ^ ticks;
 }
 
-static bool recv_exact(int sock, uint8_t *buf, size_t len)
+static int64_t zk_io_deadline(void)
 {
-    size_t offset = 0;
-    while (offset < len) {
-        int got = recv(sock, buf + offset, len - offset, 0);
-        if (got <= 0) {
-            return false;
-        }
-        offset += (size_t)got;
-    }
-    return true;
+    return esp_timer_get_time() + (int64_t)ZKT_IO_TIMEOUT_SEC * 1000000;
 }
-
-static bool drain_bytes(int sock, size_t len)
+static bool recv_exact_until(int sock, uint8_t *buf, size_t len, int64_t deadline)
 {
-    uint8_t scratch[512];
-    while (len > 0) {
-        size_t want = len > sizeof(scratch) ? sizeof(scratch) : len;
-        int got = recv(sock, scratch, want, 0);
-        if (got <= 0) {
-            return false;
-        }
-        len -= (size_t)got;
-    }
-    return true;
+    return zk_io_read_until(sock, buf, len, deadline, esp_timer_get_time);
 }
-
 static bool send_all(int sock, const uint8_t *buf, size_t len)
 {
-    size_t offset = 0;
-    while (offset < len) {
-        int sent = send(sock, buf + offset, len - offset, 0);
-        if (sent <= 0) {
-            return false;
-        }
-        offset += (size_t)sent;
-    }
-    return true;
+    return zk_io_write_until(sock, buf, len, zk_io_deadline(), esp_timer_get_time);
 }
 
 static void configure_zkt_socket(int sock)
@@ -1046,7 +1020,7 @@ static void configure_zkt_socket(int sock)
 #endif
 }
 
-static bool zk_send_ack_only(int sock, uint16_t session_id);
+static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline);
 
 static bool zk_preserve_live_packet(const uint8_t *packet, size_t length)
 {
@@ -1067,11 +1041,12 @@ static bool zk_preserve_live_packet(const uint8_t *packet, size_t length)
 
 static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, size_t out_len, size_t *actual_len)
 {
+    int64_t deadline = zk_io_deadline();
     size_t written = 0;
     bool saw_ack = false;
     while (!saw_ack) {
         zk_tcp_header_t top;
-        if (!recv_exact(sock, (uint8_t *)&top, sizeof(top))) {
+        if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline)) {
             return false;
         }
         if (top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
@@ -1080,10 +1055,11 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
         }
         uint8_t *packet = malloc(top.length);
         if (packet == NULL) {
-            (void)drain_bytes(sock, top.length);
+            /* This session is abandoned on failure. Do not spend another
+             * unbounded body-drain interval after allocation has failed. */
             return false;
         }
-        if (!recv_exact(sock, packet, top.length)) {
+        if (!recv_exact_until(sock, packet, top.length, deadline)) {
             free(packet);
             return false;
         }
@@ -1107,7 +1083,7 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
             break;
         } else if (CMD_REG_EVENT == header->command) {
             bool acknowledged = zk_preserve_live_packet(packet, top.length) &&
-                zk_send_ack_only(sock, header->session_id);
+                zk_send_ack_only(sock, header->session_id, deadline);
             free(packet);
             if (!acknowledged) return false;
             continue;
@@ -1136,6 +1112,7 @@ static bool zk_send_command(
     if (!ctx || !rx || !response || rx_cap < sizeof(zk_header_t) ||
         payload_len > sizeof(tx) - sizeof(zk_tcp_header_t) - sizeof(zk_header_t) ||
         (payload_len && !payload)) return false;
+    int64_t deadline = zk_io_deadline();
     size_t packet_len = sizeof(zk_header_t) + payload_len;
     if (packet_len > sizeof(tx) - sizeof(zk_tcp_header_t)) {
         ESP_LOGE(TAG, "ZKT command payload too large: %u", (unsigned)payload_len);
@@ -1169,13 +1146,13 @@ static bool zk_send_command(
     };
     memcpy(tx, &tcp_header, sizeof(tcp_header));
 
-    if (!send_all(sock, tx, sizeof(zk_tcp_header_t) + packet_len)) {
+    if (!zk_io_write_until(sock, tx, sizeof(zk_tcp_header_t) + packet_len, deadline, esp_timer_get_time)) {
         return false;
     }
 
     for (unsigned interleaved = 0; interleaved < 32; interleaved++) {
         zk_tcp_header_t reply_top;
-        if (!recv_exact(sock, (uint8_t *)&reply_top, sizeof(reply_top))) {
+        if (!recv_exact_until(sock, (uint8_t *)&reply_top, sizeof(reply_top), deadline)) {
             return false;
         }
         if (reply_top.marker_1 != MACHINE_PREPARE_DATA_1 ||
@@ -1188,7 +1165,7 @@ static bool zk_send_command(
             // operation instead of draining an arbitrary multi-gigabyte body.
             return false;
         }
-        if (!recv_exact(sock, rx, reply_top.length)) {
+        if (!recv_exact_until(sock, rx, reply_top.length, deadline)) {
             return false;
         }
 
@@ -1197,7 +1174,7 @@ static bool zk_send_command(
         if (CMD_REG_EVENT == reply->command) {
             if (!ctx->session_id || reply->session_id != ctx->session_id) return false;
             if (!zk_preserve_live_packet(rx, reply_top.length) ||
-                !zk_send_ack_only(sock, reply->session_id)) return false;
+                !zk_send_ack_only(sock, reply->session_id, deadline)) return false;
             continue;
         }
         ctx->reply_id = reply->reply_id;
@@ -1212,7 +1189,7 @@ static bool zk_send_command(
     return false;
 }
 
-static bool zk_send_ack_only(int sock, uint16_t session_id)
+static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)
 {
     uint8_t tx[sizeof(zk_tcp_header_t) + sizeof(zk_header_t)];
     uint16_t reply_id = USHRT_MAX_ZK - 1;
@@ -1238,7 +1215,7 @@ static bool zk_send_ack_only(int sock, uint16_t session_id)
         .length = sizeof(zk_header_t),
     };
     memcpy(tx, &tcp_header, sizeof(tcp_header));
-    return send_all(sock, tx, sizeof(tx));
+    return zk_io_write_until(sock, tx, sizeof(tx), deadline, esp_timer_get_time);
 }
 
 static bool zk_status_ok(uint16_t code)
@@ -8367,22 +8344,23 @@ static int64_t gateway_run(uint32_t host_order_ip)
         struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         int rc = select(sock + 1, &read_fds, NULL, NULL, &tv);
         if (rc > 0 && FD_ISSET(sock, &read_fds)) {
+            int64_t deadline = zk_io_deadline();
             zk_tcp_header_t top;
-            if (!recv_exact(sock, (uint8_t *)&top, sizeof(top)) ||
+            if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline) ||
                 top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
                 top.length < sizeof(zk_header_t) || top.length > 4096) {
                 ESP_LOGW(TAG, "ZKT live socket returned an invalid packet");
                 break;
             }
             uint8_t *packet = malloc(top.length);
-            if (!packet || !recv_exact(sock, packet, top.length)) {
+            if (!packet || !recv_exact_until(sock, packet, top.length, deadline)) {
                 free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
             }
             zk_header_t *header = (zk_header_t *)packet;
             if (header->session_id != ctx.session_id) { free(packet); break; }
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
                 if (!zk_preserve_live_packet(packet, top.length) ||
-                    !zk_send_ack_only(sock, ctx.session_id)) { free(packet); break; }
+                    !zk_send_ack_only(sock, ctx.session_id, deadline)) { free(packet); break; }
                 // The session starts from a two-read stable user snapshot and
                 // refreshes it periodically or on explicit ADD commands.  Do
                 // not perform another multi-minute full-table refresh while

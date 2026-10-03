@@ -32,7 +32,7 @@ def test_242_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert "ack.committed_next_ordinal == end" in ZONE
     assert "zk_close_bounded_buffer(sock, ctx, &source);" in ZONE
     command = ZONE[ZONE.index("static bool zk_send_command("):
-                   ZONE.index("static bool zk_send_ack_only(int sock, uint16_t session_id)\n{")]
+                   ZONE.index("static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)\n{")]
     assert command.index("zk_preserve_live_packet(") < command.index("zk_send_ack_only(")
 
 
