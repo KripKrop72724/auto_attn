@@ -130,6 +130,60 @@ def materialize_packet(session: Session, work: ZktCustodyWork) -> bytes | None:
     return packet
 
 
+def inspect_source(session: Session, work: ZktCustodyWork) -> None:
+    """Associate late source evidence without manufacturing an attendance row."""
+    from zk_add.zkt_custody import Observation, SourceAssociationError, bind_source_occurrence, digest
+
+    receipts = session.scalars(select(ZktObservationReceipt).join(ZktCustodyWorkReceipt).where(
+        ZktCustodyWorkReceipt.work_id == work.id).limit(2)).all()
+    if len(receipts) != 1:
+        raise EvidenceInvalid("SOURCE_EVIDENCE_BOUNDS")
+    if not settings.pii_fernet_key:
+        raise RuntimeError("CUSTODY_KEY_UNAVAILABLE")
+    receipt = receipts[0]
+    value = decrypt_json(receipt.protected_observation).get("observation")
+    if digest(value) != receipt.payload_digest:
+        raise EvidenceInvalid("RECEIPT_DIGEST_MISMATCH")
+    try:
+        parsed = Observation.model_validate(value)
+    except ValidationError as exc:
+        raise EvidenceInvalid("SOURCE_SCHEMA_INVALID") from exc
+    if (receipt.error_code or receipt.connector_id != work.connector_id
+            or parsed.raw_format != "SOURCE_RECORD" or parsed.terminal_serial != work.terminal_serial
+            or parsed.capture_epoch != work.capture_epoch
+            or (parsed.decoder_profile, parsed.decoder_version) != (work.decoder_profile, work.decoder_version)
+            or len(base64.b64decode(parsed.raw_b64)) != work.expected_bytes
+            or parsed.raw_digest != work.expected_digest):
+        raise EvidenceInvalid("SOURCE_EVIDENCE_BINDING")
+    connector = session.get(Connector, work.connector_id)
+    terminal = connector.zkt_device if connector else None
+    work.owner = "ADD_RECONCILIATION"
+    if (terminal is None or terminal.serial != parsed.terminal_serial
+            or terminal.confirmed_serial != parsed.terminal_serial):
+        work.state, work.reason_code = "WAIT_SOURCE", "TERMINAL_BINDING_CHANGED"
+        return
+    if parsed.occurrence is None:
+        work.state, work.reason_code = "WAIT_SOURCE", "SOURCE_REFERENCE_REQUIRED"
+        return
+    try:
+        # Any failed derived association rolls back locally. The committed
+        # custody receipt and unrelated work remain available for recovery.
+        with session.begin_nested():
+            identity = bind_source_occurrence(session, connector, receipt, parsed)
+    except SourceAssociationError as exc:
+        raise EvidenceInvalid(str(exc)) from exc
+    if identity is None:
+        work.state, work.reason_code = "WAIT_SOURCE", "CANONICAL_SOURCE_PENDING"
+        # Missing source evidence is an ordering obligation, not terminal data
+        # corruption. The bounded fair worker retries; unchanged profile holds
+        # and unreferenced records are not continuously rescanned.
+        work.next_attempt_at = utc_now() + timedelta(seconds=30)
+        return
+    work.state, work.reason_code = "SOURCE_ASSOCIATED", "EXACT_CANONICAL_SOURCE_BYTES"
+    # Identity and downstream receipt verification are separate obligations.
+    # An association alone cannot create attendance or mark Oracle complete.
+
+
 def inspect_work(session: Session, work: ZktCustodyWork) -> None:
     """Reassembly is not qualification. Unqualified profiles remain a hold."""
     if work.state == "HELD_EXCEPTION":
@@ -138,16 +192,16 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
     work.processed_revision = work.evidence_revision
     work.attempt_count += 1
     work.updated_at = utc_now()
-    if work.kind == "SOURCE_RECORD":
-        work.state, work.reason_code, work.owner = "WAIT_SOURCE", "SOURCE_ASSOCIATION_REQUIRED", "ADD_RECONCILIATION"
-        return
-    if work.kind not in {"LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"}:
+    if work.kind not in {"SOURCE_RECORD", "LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"}:
         work.state, work.reason_code, work.owner = "WAIT_PROFILE", "UNKNOWN_RAW_FORMAT", "ADD_PROTOCOL"
         return
     try:
+        if work.kind == "SOURCE_RECORD":
+            inspect_source(session, work)
+            return
         packet = materialize_packet(session, work)
-    except EvidenceInvalid:
-        work.state, work.reason_code, work.owner = "HELD_EXCEPTION", "PACKET_EVIDENCE_INVALID", "ADD_EVIDENCE_REVIEW"
+    except EvidenceInvalid as exc:
+        work.state, work.reason_code, work.owner = "HELD_EXCEPTION", str(exc), "ADD_EVIDENCE_REVIEW"
         return
     except (InvalidToken, ValueError, RuntimeError):
         # A key/configuration problem cannot be reclassified as invalid source

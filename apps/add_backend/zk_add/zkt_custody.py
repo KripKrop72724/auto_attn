@@ -39,6 +39,10 @@ def journal_exception_id(serial: str, epoch: str, segment: int,
     return digest(["zkt-journal-exception-v1", serial, epoch, segment, start, end, raw_digest])
 
 
+class SourceAssociationError(ValueError):
+    """A derived source conflict must not roll back custody of unrelated items."""
+
+
 class OccurrenceReference(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     source_epoch: str = Field(pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
@@ -131,7 +135,9 @@ def bind_source_occurrence(session: Session, connector: Connector,
     This handles exact source replay. Ambiguous live/history semantic matching
     is deliberately not inferred from timestamp, enrollment UID or employee ID.
     """
-    if not value.occurrence or not connector.zkt_device:
+    if (not value.occurrence or not connector.zkt_device
+            or connector.zkt_device.serial != value.terminal_serial
+            or connector.zkt_device.confirmed_serial != value.terminal_serial):
         return None
     zkt = connector.zkt_device
     manifest = session.scalar(select(TerminalRecordManifest).join(TerminalSourceEpoch).where(
@@ -143,8 +149,10 @@ def bind_source_occurrence(session: Session, connector: Connector,
         TerminalSourceEpoch.zkt_device_id == zkt.id,
         TerminalRecordManifest.ordinal == value.occurrence.ordinal,
     ))
-    if manifest is None or manifest.raw_record_digest != value.raw_digest:
+    if manifest is None:
         return None
+    if manifest.raw_record_digest != value.raw_digest:
+        raise SourceAssociationError("SOURCE_RAW_DIGEST_MISMATCH")
     identity = occurrence_id(value.terminal_serial, value.occurrence.source_epoch,
                              value.occurrence.ordinal, value.raw_digest)
     alias = session.scalar(select(ZktOccurrenceAlias).where(
@@ -160,13 +168,13 @@ def bind_source_occurrence(session: Session, connector: Connector,
         session.add(alias)
         session.flush()
     elif alias.occurrence_id != identity or alias.manifest_id != manifest.id:
-        raise ValueError("SOURCE_OCCURRENCE_CONFLICT")
+        raise SourceAssociationError("SOURCE_OCCURRENCE_CONFLICT")
     prior = session.scalar(select(ZktObservationLink).where(ZktObservationLink.receipt_id == receipt.id))
     if prior is None:
         session.add(ZktObservationLink(receipt_id=receipt.id, occurrence_alias_id=alias.id,
                                        proof_kind="EXACT_CANONICAL_SOURCE_BYTES"))
     elif prior.occurrence_alias_id != alias.id:
-        raise ValueError("OBSERVATION_ALREADY_BOUND")
+        raise SourceAssociationError("OBSERVATION_ALREADY_BOUND")
     return identity
 
 
@@ -228,10 +236,18 @@ def settle_observations(session: Session, connector: Connector, payload: dict) -
         # Stable custody does not change on replay. Derived associations are
         # separate evidence and may become available after a source scan.
         occurrence = None
-        if isinstance(parsed, Observation) and receipt.error_code is None:
-            occurrence = bind_source_occurrence(session, connector, receipt, parsed)
+        association_error = None
+        if isinstance(parsed, Observation) and parsed.occurrence is not None and receipt.error_code is None:
+            try:
+                with session.begin_nested():
+                    occurrence = bind_source_occurrence(session, connector, receipt, parsed)
+            except SourceAssociationError as exc:
+                association_error = str(exc)
         from zk_add.zkt_custody_work import attach_work
-        attach_work(session, connector, receipt, raw if isinstance(raw, dict) else None)
+        work = attach_work(session, connector, receipt, raw if isinstance(raw, dict) else None)
+        if association_error:
+            work.state, work.reason_code, work.owner = "HELD_EXCEPTION", association_error, "ADD_EVIDENCE_REVIEW"
+            work.next_attempt_at = None
         results.append({"index": index, "observation_id": identity,
                         "payload_digest": material_digest, "receipt_id": receipt.receipt_id,
                         "custody": receipt.disposition, "error_code": receipt.error_code,
