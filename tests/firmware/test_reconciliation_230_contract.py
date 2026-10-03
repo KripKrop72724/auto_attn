@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ZONE = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
 CONNECTOR = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
+SOURCE_WIRE = (ROOT / "firmware/zone_lite/main/add_source_wire.c").read_text()
 CONNECTOR_HEADER = (ROOT / "firmware/zone_lite/main/add_connector.h").read_text()
 PROJECT = (ROOT / "firmware/zone_lite/CMakeLists.txt").read_text()
 HIL_GATE = (ROOT / "firmware/zone_lite/tools/run_ota_hil_gate.py").read_text()
@@ -20,14 +21,14 @@ def test_250_retains_bounded_verified_range_resume_and_add_checkpoints():
     assert "SOURCE_COMMITTED_BOUNDARY_DIVERGED" in ZONE
     assert '"reconcile_chunk"' in ZONE
     assert '"reconcile_source_manifest"' in ZONE
-    assert "committed_predecessor_digest" in CONNECTOR
+    assert "committed_predecessor_digest" in SOURCE_WIRE
 
 
 def test_242_streams_four_durable_100_record_chunks_per_prepared_burst():
     assert '"history_stream_v2"' in CONNECTOR
     assert '"max_chunk_records", 100' in CONNECTOR
     assert '"max_credit_records", 400' in CONNECTOR
-    assert "credit_end_ordinal" in CONNECTOR
+    assert "credit_end_ordinal" in SOURCE_WIRE
     assert "add_connector_send_reconcile_chunk_acknowledged" in ZONE
     assert "ack.committed_next_ordinal == end" in ZONE
     assert "zk_close_bounded_buffer(sock, ctx, &source);" in ZONE

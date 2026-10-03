@@ -11,7 +11,7 @@ def test_runtime_checkpoint_failures_restore_committed_source(tmp_path: Path):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "zone_lite.c").read_text()
     start = source.index("static uint32_t g_runtime_checkpoint_generation;")
-    end = source.index("static void nvs_load_runtime_state(", start)
+    end = source.index("static void zkt_publish_state(", start)
     production = source[start:end]
     globals_ = []
     for name in sorted(set(re.findall(r"\bg_[a-z_]+\b", production))):
@@ -33,9 +33,13 @@ typedef struct { char version[32]; } esp_app_desc_t;
 typedef struct { bool add_source_coverage_certified; uint32_t add_source_coverage_cursor; bool committed_source_known; uint32_t committed_source_generation, committed_source_cursor; } add_zkt_telemetry_t;
 #define ESP_OK 0
 #define NVS_READWRITE 1
+#define NVS_READONLY 0
+#define ESP_ERR_NVS_NOT_FOUND 2
 #define LED_STATUS_LOCAL_FAILURE 1
 #define ZONE_LITE_HISTORY_SCHEMA_VERSION 2
 static unsigned failure, fault_count, writes;
+static bool require_epoch, legacy_keys;
+static bool zkt_source_epoch_required(void) {return require_epoch;}
 static runtime_checkpoint_t pending, durable;
 static size_t strlcpy(char *dst,const char *src,size_t size) {
     size_t n=strlen(src);if(size) {size_t copy=n<size-1?n:size-1;memcpy(dst,src,copy);dst[copy]=0;}return n;
@@ -47,11 +51,25 @@ static bool add_connector_log(const char *level,const char *subsystem,const char
 static const esp_app_desc_t *esp_app_get_description(void)
 { static const esp_app_desc_t description={"2.5.4"};return &description; }
 static esp_err_t nvs_open(const char *space,int mode,nvs_handle_t *handle)
-{ assert(!strcmp(space,"zone_lite") && mode==1);*handle=1;return failure==1?-1:0; }
+{ assert(!strcmp(space,"zone_lite") && (mode==0 || mode==1));*handle=1;return failure==1?-1:0; }
 static esp_err_t nvs_set_blob(nvs_handle_t handle,const char *key,const void *data,size_t length)
 { assert(handle==1 && !strcmp(key,"runtime_v1") && length==sizeof(pending));++writes;pending=*(const runtime_checkpoint_t *)data;return failure==2?-1:0; }
 static esp_err_t nvs_commit(nvs_handle_t handle)
 { assert(handle==1);if(failure==3)return -1;durable=pending;return failure==4?-1:0; }
+static esp_err_t nvs_get_blob(nvs_handle_t handle,const char *key,void *out,size_t *length)
+{assert(handle==1 && !strcmp(key,"runtime_v1") && *length==sizeof(durable));if(legacy_keys)return ESP_ERR_NVS_NOT_FOUND;memcpy(out,&durable,sizeof(durable));return ESP_OK;}
+static esp_err_t nvs_get_u32(nvs_handle_t h,const char *key,uint32_t *out)
+{assert(h==1);*out=!strcmp(key,"add_src_cur")?77:!strcmp(key,"add_src_gen")?9:0;return ESP_OK;}
+static esp_err_t nvs_get_u16(nvs_handle_t h,const char *key,uint16_t *out)
+{assert(h==1 && key);*out=0;return ESP_OK;}
+static esp_err_t nvs_get_u8(nvs_handle_t h,const char *key,uint8_t *out)
+{assert(h==1);*out=!strcmp(key,"hist_schema")?2:!strcmp(key,"add_src_cert")?1:0;return ESP_OK;}
+static esp_err_t nvs_get_i32(nvs_handle_t h,const char *key,int32_t *out)
+{assert(h==1 && key);*out=0;return ESP_OK;}
+static esp_err_t nvs_get_i64(nvs_handle_t h,const char *key,int64_t *out)
+{assert(h==1 && key);*out=0;return ESP_OK;}
+static esp_err_t nvs_get_str(nvs_handle_t h,const char *key,char *out,size_t *length)
+{assert(h==1);if(!strcmp(key,"add_src_hash")){assert(*length>=65);memset(out,'0',64);out[64]=0;}else strlcpy(out,"2.5.4",*length);return ESP_OK;}
 static void nvs_close(nvs_handle_t handle) {assert(handle==1);}
 ''' + '\n'.join(globals_) + production + r'''
 int main(void) {
@@ -61,12 +79,13 @@ int main(void) {
     assert(runtime_checkpoint_valid(&durable));
     assert(g_committed_runtime.source_cursor==100);
     for(failure=1;failure<=4;++failure) {
+        strcpy(g_add_source_epoch,"11111111-2222-4333-8444-555555555555");
         g_force_truth_reconcile=false;g_add_source_coverage_certified=true;
         g_add_zkt.add_source_coverage_certified=true;
         g_add_source_coverage_cursor=200;g_add_source_coverage_generation=10;
         g_last_synced_attendance_count=200;
         assert(!nvs_save_runtime_state());
-        assert(g_force_truth_reconcile && !g_add_source_coverage_certified);
+        assert(g_force_truth_reconcile && !g_add_source_coverage_certified && !g_add_source_epoch[0]);
         assert(!g_add_zkt.add_source_coverage_certified);
         assert(g_add_source_coverage_cursor==100 && g_add_zkt.add_source_coverage_cursor==100);
         assert(g_add_source_coverage_generation==9 && g_last_synced_attendance_count==100);
@@ -89,6 +108,14 @@ int main(void) {
     assert(g_add_source_coverage_chain[0]=='0');
     g_runtime_checkpoint_generation=UINT32_MAX;
     assert(!nvs_save_runtime_state());assert(writes==prior);
+    failure=0;
+    durable.source_certified=1;durable.crc=dq_crc32(&durable,offsetof(runtime_checkpoint_t,crc));
+    for(unsigned legacy=0;legacy<2;++legacy)for(unsigned strict=0;strict<2;++strict){
+        legacy_keys=legacy!=0;require_epoch=strict!=0;g_add_source_epoch[0]=0;
+        g_add_source_coverage_certified=true;nvs_load_runtime_state();
+        assert(g_add_source_coverage_certified==!require_epoch && !g_add_source_epoch[0]);
+        assert(g_add_source_coverage_cursor==(legacy?77:durable.source_cursor));
+    }
     puts("runtime checkpoint NVS regression tests passed");
 }
 '''

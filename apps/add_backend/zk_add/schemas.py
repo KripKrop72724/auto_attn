@@ -390,7 +390,16 @@ class ReconciliationControlRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
-class ReconciliationAnchorRequest(BaseModel):
+class SourceEpochRequest(BaseModel):
+    # Optional on the legacy wire; required by service validation for the
+    # 2.6.16 reader bridge and 2.7+ ZKT firmware. Never the database integer ID.
+    source_epoch: str | None = Field(
+        default=None, strict=True, min_length=36, max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+
+
+class ReconciliationAnchorRequest(SourceEpochRequest):
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)
     terminal_serial: str = Field(min_length=1, max_length=120)
@@ -438,7 +447,7 @@ class ReconciliationSourceRecord(BaseModel):
         return self
 
 
-class SourceProbeResultRequest(BaseModel):
+class SourceProbeResultRequest(SourceEpochRequest):
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)
     terminal_serial: str = Field(min_length=1, max_length=120)
@@ -448,7 +457,7 @@ class SourceProbeResultRequest(BaseModel):
     record: ReconciliationSourceRecord
 
 
-class ReconciliationChunkRequest(BaseModel):
+class ReconciliationChunkRequest(SourceEpochRequest):
     assignment_id: str | None = Field(default=None, min_length=36, max_length=36)
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)
@@ -476,7 +485,7 @@ class ReconciliationChunkRequest(BaseModel):
         return self
 
 
-class ReconciliationManifestRequest(BaseModel):
+class ReconciliationManifestRequest(SourceEpochRequest):
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)
     terminal_serial: str = Field(min_length=1, max_length=120)
@@ -488,7 +497,7 @@ class ReconciliationManifestRequest(BaseModel):
     )
 
 
-class SourceTailChunkRequest(BaseModel):
+class SourceTailChunkRequest(SourceEpochRequest):
     terminal_serial: str = Field(min_length=1, max_length=120)
     terminal_generation: int = Field(ge=1)
     record_size: Literal[8, 16, 40]
@@ -524,7 +533,7 @@ class SourceExceptionActionRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
-class ReconciliationAssignmentReleaseRequest(BaseModel):
+class ReconciliationAssignmentReleaseRequest(SourceEpochRequest):
     assignment_id: str = Field(min_length=36, max_length=36)
     job_id: str = Field(min_length=36, max_length=36)
     generation: int = Field(ge=1)

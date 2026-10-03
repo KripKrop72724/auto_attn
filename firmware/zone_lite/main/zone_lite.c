@@ -4,6 +4,7 @@
 #include "zkt_clock.h"
 #include "zkt_record.h"
 #include "zkt_socket_io.h"
+#include "add_source_wire.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_journal_runtime.h"
 #endif
@@ -537,6 +538,18 @@ static add_zkt_telemetry_t g_add_zkt;
 static bool g_temp_admin_active;
 static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
+// The legacy runtime checkpoint has no epoch UUID. New bridge/writer boots
+// require fresh ADD authority; never infer an epoch from the numeric generation.
+static char g_add_source_epoch[37];
+static bool zkt_source_epoch_required(void)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return add_source_epoch_required(app ? app->version : NULL, false);
+#else
+    return add_source_epoch_required(app ? app->version : NULL, true);
+#endif
+}
 static bool g_add_source_coverage_certified;
 static uint32_t g_add_source_coverage_cursor;
 static uint32_t g_add_source_coverage_generation;
@@ -595,6 +608,7 @@ static bool g_committed_runtime_valid;
 static void runtime_checkpoint_failed(void)
 {
     g_force_truth_reconcile = true;
+    g_add_source_epoch[0] = 0;
     g_add_source_coverage_certified = false;
     g_add_source_coverage_cursor = g_committed_runtime_valid ? g_committed_runtime.source_cursor : 0;
     g_add_source_coverage_generation = g_committed_runtime_valid ? g_committed_runtime.source_generation : 0;
@@ -722,7 +736,7 @@ static void nvs_load_runtime_state(void)
         g_temp_admin_active = state.lease_active;
         g_temp_admin_uid = state.lease_uid;
         g_temp_admin_expires_epoch = state.lease_expiry;
-        g_add_source_coverage_certified = state.source_certified;
+        g_add_source_coverage_certified = state.source_certified && !zkt_source_epoch_required();
         g_add_source_coverage_cursor = state.source_cursor;
         g_add_source_coverage_generation = state.source_generation;
         strlcpy(g_add_source_coverage_chain, state.source_chain, sizeof(g_add_source_coverage_chain));
@@ -800,7 +814,7 @@ static void nvs_load_runtime_state(void)
             "0000000000000000000000000000000000000000000000000000000000000000",
             sizeof(g_add_source_coverage_chain));
     }
-    g_add_source_coverage_certified = add_source_certified != 0;
+    g_add_source_coverage_certified = add_source_certified != 0 && !zkt_source_epoch_required();
     nvs_close(handle);
 }
 
@@ -4119,7 +4133,7 @@ static void release_reconciliation_credit(
         "committed_next_ordinal",
         committed_next_ordinal);
     cJSON_AddStringToObject(release, "reason", reason);
-    char *json = cJSON_PrintUnformatted(release);
+    char *json = add_source_epoch_write(release, assignment->source_epoch) ? cJSON_PrintUnformatted(release) : NULL;
     cJSON_Delete(release);
     if (json) {
         (void)add_connector_send_payload("reconcile_assignment_release", json);
@@ -4141,6 +4155,7 @@ static bool process_add_reconciliation_assignment(
             "ADD source assignment did not match the authenticated ZKT terminal serial.");
         return true;
     }
+    if (zkt_source_epoch_required() && !assignment->source_epoch[0]) return false;
     int32_t current_users = 0;
     int32_t latest_records = 0;
     if (!zk_get_counts(sock, ctx, &current_users, &latest_records) || latest_records < 0) {
@@ -4208,7 +4223,7 @@ static bool process_add_reconciliation_assignment(
             record = NULL;
         }
         cJSON_Delete(record);
-        char *probe_json = probe ? cJSON_PrintUnformatted(probe) : NULL;
+        char *probe_json = add_source_epoch_write(probe, assignment->source_epoch) ? cJSON_PrintUnformatted(probe) : NULL;
         cJSON_Delete(probe);
         probe_ok = probe_json && add_connector_send_payload_acknowledged(
             "source_probe_result",
@@ -4256,7 +4271,7 @@ static bool process_add_reconciliation_assignment(
             assignment->preceding_chain_digest[0]
                 ? assignment->preceding_chain_digest
                 : "0000000000000000000000000000000000000000000000000000000000000000");
-        char *json = cJSON_PrintUnformatted(manifest);
+        char *json = add_source_epoch_write(manifest, assignment->source_epoch) ? cJSON_PrintUnformatted(manifest) : NULL;
         cJSON_Delete(manifest);
         bool ok = json && add_connector_send_payload_acknowledged(
             "reconcile_source_manifest",
@@ -4264,6 +4279,7 @@ static bool process_add_reconciliation_assignment(
             30000);
         free(json);
         if (ok) {
+            strlcpy(g_add_source_epoch, assignment->source_epoch, sizeof(g_add_source_epoch));
             g_add_source_coverage_certified = true;
             g_add_source_coverage_cursor = cutoff;
             g_add_source_coverage_generation = assignment->generation;
@@ -4378,7 +4394,7 @@ static bool process_add_reconciliation_assignment(
         cJSON_AddNumberToObject(anchor, "record_size", record_size);
         cJSON_AddNumberToObject(anchor, "source_total_bytes", source.size);
         cJSON_AddStringToObject(anchor, "first_anchor_digest", first_digest);
-        char *json = cJSON_PrintUnformatted(anchor);
+        char *json = add_source_epoch_write(anchor, assignment->source_epoch) ? cJSON_PrintUnformatted(anchor) : NULL;
         cJSON_Delete(anchor);
         zk_close_bounded_buffer(sock, ctx, &source);
         ok = json && add_connector_send_payload_acknowledged(
@@ -4486,7 +4502,7 @@ static bool process_add_reconciliation_assignment(
         records = NULL;
     }
     cJSON_Delete(records);
-    char *json = chunk ? cJSON_PrintUnformatted(chunk) : NULL;
+    char *json = add_source_epoch_write(chunk, assignment->source_epoch) ? cJSON_PrintUnformatted(chunk) : NULL;
     cJSON_Delete(chunk);
     if (assignment->stream_v2) {
         add_reconcile_chunk_ack_t ack = {0};
@@ -4497,6 +4513,7 @@ static bool process_add_reconciliation_assignment(
         ok = ok && ack.valid &&
             strcmp(ack.assignment_id, assignment->assignment_id) == 0 &&
             strcmp(ack.job_id, assignment->job_id) == 0 &&
+            (!assignment->source_epoch[0] || !strcmp(ack.source_epoch, assignment->source_epoch)) &&
             ack.generation == assignment->generation &&
             ack.committed_next_ordinal == end &&
             strcmp(ack.resulting_chain_digest, resulting_chain) == 0;
@@ -4537,6 +4554,7 @@ static bool process_add_reconciliation_assignment(
 static bool apply_add_source_coverage(const add_source_coverage_t *coverage)
 {
     if (!coverage) return false;
+    g_add_source_epoch[0] = 0;
     if (strcmp(coverage->terminal_serial, g_device_serial) != 0) {
         g_add_source_coverage_certified = false;
         g_add_zkt.add_source_coverage_certified = false;
@@ -4545,7 +4563,7 @@ static bool apply_add_source_coverage(const add_source_coverage_t *coverage)
             "reconcile",
             "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH",
             "ADD source coverage belongs to a different authenticated terminal; tail reconciliation remains disabled.");
-    } else if (!coverage->active) {
+    } else if (!coverage->active || (zkt_source_epoch_required() && !coverage->source_epoch[0])) {
         g_add_source_coverage_certified = false;
         g_add_zkt.add_source_coverage_certified = false;
         g_add_zkt.add_source_coverage_cursor = 0;
@@ -4559,6 +4577,7 @@ static bool apply_add_source_coverage(const add_source_coverage_t *coverage)
                 "ADD_SOURCE_CHECKPOINT_REPLAY",
                 "Local tail cursor was ahead of ADD; replaying from ADD's authoritative durable checkpoint.");
         }
+        strlcpy(g_add_source_epoch, coverage->source_epoch, sizeof(g_add_source_epoch));
         g_add_source_coverage_certified = true;
         g_add_source_coverage_cursor =
             coverage->committed_next_ordinal;
@@ -4572,7 +4591,7 @@ static bool apply_add_source_coverage(const add_source_coverage_t *coverage)
         g_add_zkt.add_source_coverage_cursor =
             coverage->committed_next_ordinal;
     }
-    if (!nvs_save_runtime_state()) return false;
+    if (!nvs_save_runtime_state()) { g_add_source_epoch[0] = 0; return false; }
     if (g_add_source_coverage_certified) {
         add_connector_log("INFO", "reconcile", "ADD_SOURCE_COVERAGE_APPLIED",
             "Committed ADD's authoritative terminal source cursor and chain; bounded tail reconciliation may continue.");
@@ -4588,8 +4607,10 @@ static bool process_add_incremental_tail(
     bool *more_out)
 {
     if (more_out) *more_out = false;
-    if (!g_add_source_coverage_certified || latest_records < 0) return false;
+    if (!g_add_source_coverage_certified || latest_records < 0 ||
+        (zkt_source_epoch_required() && !g_add_source_epoch[0])) return false;
     if ((uint32_t)latest_records < g_add_source_coverage_cursor) {
+        g_add_source_epoch[0] = 0;
         g_add_source_coverage_certified = false;
         g_add_zkt.add_source_coverage_certified = false;
         if (!nvs_save_runtime_state()) {
@@ -4697,13 +4718,14 @@ static bool process_add_incremental_tail(
         records = NULL;
     }
     cJSON_Delete(records);
-    char *json = tail ? cJSON_PrintUnformatted(tail) : NULL;
+    char *json = add_source_epoch_write(tail, g_add_source_epoch) ? cJSON_PrintUnformatted(tail) : NULL;
     cJSON_Delete(tail);
     add_source_tail_ack_t ack = {0};
     ok = json && add_connector_send_source_tail_acknowledged(json, 30000, &ack);
     free(json);
     ok = ok && ack.valid &&
         strcmp(ack.terminal_serial, g_device_serial) == 0 &&
+        (!g_add_source_epoch[0] || !strcmp(ack.source_epoch, g_add_source_epoch)) &&
         ack.terminal_generation == g_add_source_coverage_generation &&
         ack.committed_next_ordinal == end &&
         strcmp(ack.resulting_chain_digest, resulting_chain) == 0;

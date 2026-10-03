@@ -93,6 +93,36 @@ def _version_tuple(value: str | None) -> tuple[int, int, int]:
     return tuple(int(item) for item in match.groups()) if match else (0, 0, 0)
 
 
+def source_epoch_uuid(
+    session: Session, row: ReconciliationJob | ReconciliationCoverage,
+) -> str | None:
+    epoch = session.get(TerminalSourceEpoch, row.source_epoch_id) if row.source_epoch_id else None
+    if epoch is None or (
+        epoch.zkt_device_id != row.zkt_device_id
+        or epoch.terminal_generation != row.terminal_generation
+        or epoch.state not in {"ACTIVE", "CANDIDATE"}
+    ):
+        return None
+    return epoch.epoch_id
+
+
+def _require_source_epoch(
+    session: Session, connector: Connector,
+    row: ReconciliationJob | ReconciliationCoverage, supplied: str | None,
+) -> None:
+    version = _version_tuple(connector.firmware_version)
+    required = connector.firmware_family == "zkt" and (
+        connector.zkt_custody_enabled or version == (2, 6, 16) or version >= (2, 7, 0)
+    )
+    if supplied is None and not required:
+        return
+    expected = source_epoch_uuid(session, row)
+    if supplied is None or expected is None or not hmac.compare_digest(supplied, expected):
+        # Reject stale transport before either duplicate ACK or safety-hold
+        # mutation: an old epoch must not invalidate valid replacement coverage.
+        raise ValueError("Source epoch is missing, stale, or belongs to another terminal.")
+
+
 def _request_digest(*, connector: Connector, reason: str, confirmation: str, scope: str = "ALL_RECORDS") -> str:
     material = json.dumps(
         {
@@ -235,7 +265,7 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
                 }
             )
     coverage = active_coverage(session, zkt) if zkt else None
-    coverage_payload = serialize_coverage(coverage)
+    coverage_payload = serialize_coverage(session, coverage)
     if coverage is not None and coverage_payload is not None:
         source_count, first_ordinal, last_ordinal = session.execute(
             select(
@@ -498,6 +528,9 @@ def apply_reconciliation_anchor(
 ) -> ReconciliationJob:
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
+    _require_source_epoch(session, connector, job, payload.source_epoch)
+    if payload.source_epoch is not None and payload.terminal_generation != job.terminal_generation:
+        raise ValueError("Source epoch cannot change terminal generation while anchoring.")
     if job.terminal_serial and job.terminal_serial != payload.terminal_serial:
         return _safety_hold(
             session, job, "TERMINAL_SERIAL_CHANGED", "Terminal serial changed while anchoring."
@@ -675,6 +708,7 @@ def apply_reconciliation_chunk(
 ) -> tuple[ReconciliationJob, ReconciliationChunk | None, bool]:
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
+    _require_source_epoch(session, connector, job, payload.source_epoch)
     if job.cutoff_count is None or job.record_size is None:
         raise ValueError("Reconciliation must be anchored before accepting chunks.")
     existing = session.scalar(
@@ -959,6 +993,7 @@ def apply_reconciliation_assignment_release(
 
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
+    _require_source_epoch(session, connector, job, payload.source_epoch)
     # A chunk can commit in ADD before the connector receives its ACK.  The
     # connector may then release its credit with the last cursor it knows.
     # ADD's committed cursor remains authoritative; reject only a claimed
@@ -1000,6 +1035,7 @@ def apply_reconciliation_manifest(
 ) -> ReconciliationJob:
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
+    _require_source_epoch(session, connector, job, payload.source_epoch)
     if (
         job.terminal_serial != payload.terminal_serial
         or job.terminal_generation != payload.terminal_generation
@@ -1167,6 +1203,7 @@ def apply_source_tail_chunk(
     )
     if coverage is None:
         raise ValueError("Terminal has no active certified source coverage.")
+    _require_source_epoch(session, connector, coverage, payload.source_epoch)
 
     def invalidate(code: str, message: str):
         _invalidate_tail_coverage(
@@ -2108,6 +2145,7 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                     {
                         "schema_version": "1",
                         "type": "source_probe_assignment",
+                        "source_epoch": source_epoch_uuid(session, job),
                         "job_id": job.job_id,
                         "generation": job.terminal_generation,
                         "expected_terminal_serial": job.terminal_serial,
@@ -2222,6 +2260,7 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
         payload = {
             "schema_version": "2" if assignment_v2 else "1",
             "type": "reconcile_assignment",
+            "source_epoch": source_epoch_uuid(session, job),
             "protocol": "history_stream_v2" if assignment_v2 else "history_stream_v1",
             "assignment_id": assignment_id,
             "job_id": job.job_id,
@@ -2447,12 +2486,13 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
     return result
 
 
-def serialize_coverage(row: ReconciliationCoverage | None) -> dict | None:
+def serialize_coverage(session: Session, row: ReconciliationCoverage | None) -> dict | None:
     if row is None:
         return None
     return {
         "coverage_id": row.coverage_id,
         "source_epoch_id": row.source_epoch_id,
+        "source_epoch": source_epoch_uuid(session, row),
         "terminal_serial": row.terminal_serial,
         "terminal_generation": row.terminal_generation,
         "certified_source_cursor": row.certified_source_cursor,
@@ -2773,6 +2813,7 @@ def apply_source_probe_result(
 
     job = _device_job(session, connector, payload.job_id)
     _require_runnable(job, payload.generation)
+    _require_source_epoch(session, connector, job, payload.source_epoch)
     if job.terminal_serial != payload.terminal_serial:
         return _safety_hold(
             session,

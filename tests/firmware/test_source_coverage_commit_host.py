@@ -17,8 +17,11 @@ def test_source_coverage_application_requires_commit(tmp_path):
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-typedef struct { char terminal_serial[80]; bool active; uint32_t committed_next_ordinal,terminal_generation;char committed_chain_digest[65]; } add_source_coverage_t;
+typedef struct { char terminal_serial[80],source_epoch[37]; bool active; uint32_t committed_next_ordinal,terminal_generation;char committed_chain_digest[65]; } add_source_coverage_t;
 static char g_device_serial[]="PGB1261200077",g_add_source_coverage_chain[65];
+static char g_add_source_epoch[37];
+static bool require_epoch;
+static bool zkt_source_epoch_required(void) { return require_epoch; }
 static bool g_add_source_coverage_certified,failed;
 static uint32_t g_add_source_coverage_cursor,g_add_source_coverage_generation,durable_cursor;
 static struct {bool add_source_coverage_certified;uint32_t add_source_coverage_cursor;} g_add_zkt;
@@ -54,6 +57,12 @@ int main(void)
  strcpy(coverage.terminal_serial,g_device_serial);coverage.active=false;
  assert(apply_add_source_coverage(&coverage));assert(applied==1 && !g_add_source_coverage_certified);
  assert(!apply_add_source_coverage(NULL) && commits==4);
+ require_epoch=true;coverage.active=true;
+ assert(apply_add_source_coverage(&coverage));assert(!g_add_source_coverage_certified && !g_add_source_epoch[0]);
+ strcpy(coverage.source_epoch,"11111111-2222-4333-8444-555555555555");
+ assert(apply_add_source_coverage(&coverage));assert(g_add_source_coverage_certified);
+ assert(!strcmp(g_add_source_epoch,coverage.source_epoch));
+ failed=true;assert(!apply_add_source_coverage(&coverage));assert(!g_add_source_epoch[0] && !g_add_source_coverage_certified);
  return 0;
 }
 """
