@@ -74,6 +74,7 @@ static void owner_step(scenario_t *s)
     switch (s->running.operation) {
         case ZJ_READER_CHECK:
         case ZJ_OTA_CHECK:
+        case ZJ_SELECT_READER:
             assert(!"Delivery must not grant its own reader/writer compatibility");
             reply.result = ZJ_INVALID;
             break;

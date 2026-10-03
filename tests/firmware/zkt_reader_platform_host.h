@@ -12,6 +12,7 @@
 #define ESP_PARTITION_SUBTYPE_APP_OTA_0 16
 #define ESP_PARTITION_SUBTYPE_APP_OTA_1 17
 #define ESP_OTA_IMG_VALID 2
+#define ESP_OTA_IMG_NEW 0
 typedef int esp_err_t;
 typedef int nvs_handle_t;
 typedef int esp_ota_img_states_t;
@@ -21,6 +22,9 @@ typedef struct iterator *esp_partition_iterator_t;
 const esp_app_desc_t *esp_app_get_description(void);
 const esp_partition_t *esp_ota_get_running_partition(void);
 const esp_partition_t *esp_ota_get_next_update_partition(const void *);
+const esp_partition_t *esp_ota_get_boot_partition(void);
+int esp_ota_set_boot_partition(const esp_partition_t *);
+int64_t esp_timer_get_time(void);
 int esp_ota_get_partition_description(const esp_partition_t *, esp_app_desc_t *);
 int esp_partition_get_sha256(const esp_partition_t *, uint8_t *);
 int esp_ota_get_state_partition(const esp_partition_t *, esp_ota_img_states_t *);

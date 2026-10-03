@@ -3,6 +3,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_secure_boot.h"
+#include "esp_timer.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -88,6 +89,11 @@ static bool validated(const esp_partition_t *partition)
     esp_ota_img_states_t state;
     return ota(partition) && esp_ota_get_state_partition(partition, &state) == ESP_OK && state == ESP_OTA_IMG_VALID;
 }
+static bool descriptor_valid(const esp_app_desc_t *app)
+{
+    return app && memchr(app->project_name, 0, sizeof(app->project_name)) &&
+        memchr(app->version, 0, sizeof(app->version));
+}
 static zj_compat_result_t current_reader(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, zj_reader_environment_t *env,
@@ -96,7 +102,7 @@ static zj_compat_result_t current_reader(const char *terminal_serial,
     if (!terminal_serial || !capture_epoch || !strlen(terminal_serial) || strlen(terminal_serial) > 80)
         return ZJ_COMPAT_INVALID;
     const esp_app_desc_t *app = esp_app_get_description();
-    if (!app || strcmp(app->project_name, "zone_lite") ||
+    if (!descriptor_valid(app) || strcmp(app->project_name, "zone_lite") ||
         (strcmp(app->version, ZJ_BRIDGE_VERSION) && strcmp(app->version, ZJ_WRITER_VERSION))) return ZJ_COMPAT_VERSION;
     *env = (zj_reader_environment_t){.application = app->project_name, .version = app->version,
         .secure_boot = esp_secure_boot_enabled(), .reader_ready = reader_ready,
@@ -137,7 +143,7 @@ zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
     esp_app_desc_t previous_app;
     if (!previous) return ZJ_COMPAT_IO;
     if (!ota(previous)) return ZJ_COMPAT_SECURITY;
-    if (esp_ota_get_partition_description(previous, &previous_app) != ESP_OK ||
+    if (esp_ota_get_partition_description(previous, &previous_app) != ESP_OK || !descriptor_valid(&previous_app) ||
         !identity(previous, &current_id, &previous_id)) return ZJ_COMPAT_IO;
     zj_reader_environment_t rollback = {.application = previous_app.project_name, .version = previous_app.version,
         .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
@@ -162,4 +168,68 @@ zj_compat_result_t zj_reader_platform_update(const char *terminal_serial,
         return ZJ_COMPAT_PROTECTED_SLOT;
     zj_reader_proof_port_t port = {read_proof, NULL, NULL};
     return zj_reader_check_update(port, &env, &current_id, target_address, target_size, target_version);
+}
+
+static bool selection_deadline(uint64_t deadline_us)
+{
+    int64_t now = esp_timer_get_time();
+    return now >= 0 && deadline_us > (uint64_t)now &&
+        deadline_us - (uint64_t)now <= 5000000U;
+}
+
+zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending,
+    const uint8_t expected_digest[32], uint64_t deadline_us)
+{
+    if (!expected_digest) return ZJ_COMPAT_INVALID;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+#if defined(CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK) && CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
+    /* IDF 5.5.3's setter can erase an image rejected by anti-rollback. This
+     * release uses secure boot with anti-rollback disabled; do not enter the
+     * destructive code path in an unqualified build configuration. */
+    return ZJ_COMPAT_ANTI_ROLLBACK;
+#endif
+    zj_reader_environment_t env;
+    zj_reader_identity_t current_id, previous_id;
+    zj_compat_result_t result = current_reader(terminal_serial, capture_epoch, reader_ready,
+        delivery_ready, persistence_verified, recovery_pending, &env, &current_id);
+    if (result != ZJ_COMPAT_OK) return result;
+    /* A bridge cannot use this operation to select an arbitrary previous
+     * writer. It is exactly the writer -> attested reader edge. */
+    if (strcmp(env.version, ZJ_WRITER_VERSION)) return ZJ_COMPAT_VERSION;
+    const esp_partition_t *previous = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t previous_app;
+    if (!ota(previous)) return ZJ_COMPAT_SECURITY;
+    if (esp_ota_get_partition_description(previous, &previous_app) != ESP_OK || !descriptor_valid(&previous_app) ||
+        !identity(previous, &current_id, &previous_id)) return ZJ_COMPAT_IO;
+    if (memcmp(expected_digest, previous_id.image_digest, 32)) return ZJ_COMPAT_ROLLBACK;
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    if (!boot) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    bool already_selected = boot->address == previous->address && boot->size == previous->size;
+    esp_ota_img_states_t previous_state;
+    if (esp_ota_get_state_partition(previous, &previous_state) != ESP_OK) return ZJ_COMPAT_IO;
+    if (previous_state != ESP_OTA_IMG_VALID && !(already_selected && previous_state == ESP_OTA_IMG_NEW))
+        return ZJ_COMPAT_SECURITY;
+    zj_reader_environment_t rollback = {.application = previous_app.project_name, .version = previous_app.version,
+        .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
+        .ota_slot = true, .image_validated = previous_state == ESP_OTA_IMG_VALID};
+    zj_reader_proof_port_t port = {read_proof, NULL, NULL};
+    result = already_selected && previous_state == ESP_OTA_IMG_NEW
+        ? zj_reader_check_selected(port, &env, &current_id, &rollback, &previous_id)
+        : zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
+    if (result != ZJ_COMPAT_OK) return result;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    /* Retry after lost success must still verify all proof above, but need
+     * not rewrite otadata. No other task may select/erase a slot concurrently. */
+    if (already_selected) return ZJ_COMPAT_OK;
+    if (boot->address != current_id.slot_address || boot->size != current_id.slot_size)
+        return ZJ_COMPAT_ROLLBACK;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    /* IDF validates the signed image before selecting it. An error or failed
+     * readback may follow a partial otadata write: preserve the uncertainty. */
+    if (esp_ota_set_boot_partition(previous) != ESP_OK) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    boot = esp_ota_get_boot_partition();
+    return boot && boot->address == previous->address && boot->size == previous->size
+        ? ZJ_COMPAT_OK : ZJ_COMPAT_SELECTION_UNCERTAIN;
 }

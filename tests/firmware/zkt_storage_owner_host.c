@@ -162,6 +162,16 @@ zj_compat_result_t zj_reader_platform_update(const char *serial, const uint8_t e
     assert(address == 0x2a0000 && size == 0x280000 && !strcmp(version, ZJ_WRITER_VERSION));
     return delivery && !recovering ? ZJ_COMPAT_PROTECTED_SLOT : ZJ_COMPAT_NOT_READY;
 }
+static bool uncertain_selection;
+zj_compat_result_t zj_reader_platform_select(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, const uint8_t expected[32], uint64_t deadline)
+{
+    assert(pthread_mutex_trylock(&budget) == EBUSY);
+    assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0] && ready && persistence && expected[0] == 17);
+    if (deadline <= (uint64_t)esp_timer_get_time()) return ZJ_COMPAT_SELECTION_EXPIRED;
+    if (!delivery || recovering) return ZJ_COMPAT_NOT_READY;
+    return uncertain_selection ? ZJ_COMPAT_SELECTION_UNCERTAIN : ZJ_COMPAT_OK;
+}
 /* The genuine mbedTLS adapter is independently tested. This port exercises
  * owner/thread/file/NVS interactions, not cryptographic authentication. */
 static bool seal(void *context, const uint8_t *metadata, const uint8_t *nonce,
@@ -301,6 +311,35 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility == ZJ_COMPAT_OK);
     uint64_t gating_operations = health.completed, gating_failures = health.failures;
     assert(gating_operations == 7 && gating_failures == 6);
+    zj_request_t selection = {.operation = ZJ_SELECT_READER,
+        .input.reader_selection = {.image_digest = {17}, .deadline_us = 1}};
+    assert(zj_owner_submit(&selection, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_SELECTION_EXPIRED);
+    assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility_checked);
+    selection.input.reader_selection.deadline_us = (uint64_t)esp_timer_get_time() + 5000000U;
+    atomic_store(&stale_transport, true);
+    assert(zj_owner_submit(&selection, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_NOT_READY);
+    assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility_checked);
+    atomic_store(&stale_transport, false);
+    assert(zj_owner_submit(&selection, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
+    assert(zj_owner_health(&health) && !health.writer_allowed && !health.compatibility_checked);
+    assert(zj_owner_submit(&request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_INVALID);
+    assert(zj_owner_submit(&compatibility, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
+    uncertain_selection = true;
+    assert(zj_owner_submit(&selection, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_SELECTION_UNCERTAIN);
+    assert(zj_owner_health(&health) && !health.writer_allowed && !health.compatibility_checked);
+    uncertain_selection = false;
+    assert(zj_owner_submit(&compatibility, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
+    assert(zj_owner_health(&health) && health.writer_allowed);
+    assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 4);
+    gating_operations = health.completed;
+    gating_failures = health.failures;
     atomic_store(&pause_write, true);
     assert(zj_owner_submit(&request, &ticket));
     request.input.observation.raw[0] = 'B';

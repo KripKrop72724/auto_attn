@@ -37,14 +37,16 @@ def test_platform_facts_and_nvs_failures(tmp_path):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"
     for header in ["esp_app_desc.h", "esp_ota_ops.h", "esp_partition.h",
-                   "esp_secure_boot.h", "mbedtls/sha256.h", "nvs.h", "sdkconfig.h"]:
+                   "esp_secure_boot.h", "esp_timer.h", "mbedtls/sha256.h", "nvs.h", "sdkconfig.h"]:
         path = tmp_path / header
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('#include "zkt_reader_platform_host.h"\n')
-    for encrypted in (1, 0):
-        executable = tmp_path / f"reader-platform-{encrypted}"
+    for encrypted, anti_rollback in ((1, 0), (0, 0), (1, 1)):
+        executable = tmp_path / f"reader-platform-{encrypted}-{anti_rollback}"
         subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
-                        f"-DCONFIG_NVS_ENCRYPTION={encrypted}", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+                        f"-DCONFIG_NVS_ENCRYPTION={encrypted}",
+                        f"-DCONFIG_BOOTLOADER_APP_ANTI_ROLLBACK={anti_rollback}",
+                        "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         "-I", str(tmp_path), "-I", str(fixture), "-I", str(main),
                         str(fixture / "zkt_reader_platform_host.c"),

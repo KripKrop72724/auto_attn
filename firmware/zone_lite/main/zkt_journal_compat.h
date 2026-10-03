@@ -36,7 +36,9 @@ typedef enum {
     ZJ_COMPAT_OK, ZJ_COMPAT_INVALID, ZJ_COMPAT_VERSION, ZJ_COMPAT_SECURITY,
     ZJ_COMPAT_NOT_READY, ZJ_COMPAT_MISSING, ZJ_COMPAT_IO, ZJ_COMPAT_CORRUPT,
     ZJ_COMPAT_BINDING, ZJ_COMPAT_ROLLBACK, ZJ_COMPAT_UNCERTAIN,
-    ZJ_COMPAT_EXHAUSTED, ZJ_COMPAT_UPDATE_TARGET, ZJ_COMPAT_PROTECTED_SLOT
+    ZJ_COMPAT_EXHAUSTED, ZJ_COMPAT_UPDATE_TARGET, ZJ_COMPAT_PROTECTED_SLOT,
+    ZJ_COMPAT_SELECTION_EXPIRED, ZJ_COMPAT_SELECTION_UNCERTAIN,
+    ZJ_COMPAT_ANTI_ROLLBACK
 } zj_compat_result_t;
 
 /* Only a validated bridge can create/renew proof. Existing corrupt or rebound
@@ -47,6 +49,14 @@ zj_compat_result_t zj_reader_attest(zj_reader_proof_port_t port,
 /* A pending writer may preserve data only with an exact validated bridge in
  * the other OTA slot. This reads proof without repairing or replacing it. */
 zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
+    const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
+    const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous);
+
+/* Selection retry only: the adapter must prove the bridge is the selected
+ * boot partition and is NEW (not INVALID/ABORTED/PENDING_VERIFY). Its prior
+ * validated-image attestation must still exactly match. This cannot grant
+ * writer permission or create/renew the attestation. */
+zj_compat_result_t zj_reader_check_selected(zj_reader_proof_port_t port,
     const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
     const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous);
 

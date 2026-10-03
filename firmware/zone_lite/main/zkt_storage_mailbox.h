@@ -6,7 +6,8 @@
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
-typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK } zj_operation_t;
+typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
+    ZJ_SELECT_READER } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
@@ -20,6 +21,10 @@ typedef struct {
             uint32_t address, size;
             char version[32];
         } ota;
+        struct {
+            uint8_t image_digest[32];
+            uint64_t deadline_us;
+        } reader_selection;
     } input;
 } zj_request_t;
 typedef struct {
