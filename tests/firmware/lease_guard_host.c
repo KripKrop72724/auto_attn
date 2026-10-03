@@ -29,5 +29,32 @@ int main(void){
  s=(state_t){.now=1800000000};assert(lg_grant(p,7,600,1800000001)==LG_EXPIRED);assert(!s.active && !s.privilege);
  s=(state_t){.now=1};assert(lg_grant(p,7,600,0)==LG_TIME && !s.writes && !s.mutations);
  s=(state_t){.now=1800000000};assert(lg_grant(p,7,600,1800000601)==LG_TIME && !s.writes);
+ lg_watch_t w={0};
+ assert(lg_watch_due(&w,7,1800000600,1800000000,1000)); /* reboot: no uptime anchor */
+ for(int seconds=1;seconds<=600;seconds++){
+  assert(lg_watch_arm(&w,7,1800000000+seconds,1800000000,UINT32_MAX-500LL));
+  assert(!lg_watch_due(&w,7,1800000000+seconds,1800000000,UINT32_MAX-500LL+seconds*1000-1));
+  assert(lg_watch_due(&w,7,1800000000+seconds,1800000000,UINT32_MAX-500LL+seconds*1000));
+ }
+ assert(lg_watch_arm(&w,7,1800000600,1800000000,1000));
+ assert(!lg_watch_due(&w,7,1800000600,1800000010,11000));
+ assert(lg_watch_due(&w,7,1800000600,1800000009,12000)); /* backward wall clock */
+ assert(lg_watch_due(&w,7,1800000600,1800000011,13000)); /* expiry stays latched */
+ assert(lg_watch_arm(&w,7,1800000600,1800000000,1000));
+ assert(lg_watch_due(&w,7,1800000600,1800000000,999)); /* changed boot/counter */
+ assert(lg_watch_arm(&w,7,1800000600,1800000000,1000));
+ assert(lg_watch_due(&w,7,1800000600,1800000600,1000)); /* forward wall clock */
+ assert(lg_watch_arm(&w,7,1800000600,1800000000,1000));
+ assert(lg_watch_due(&w,8,1800000600,1800000000,1000)); /* changed obligation */
+ assert(lg_watch_arm(&w,7,1800000600,1800000000,1000));
+ assert(lg_watch_due(&w,7,1800000601,1800000000,1000));
+ assert(!lg_watch_arm(&w,7,1800000600,1800000000,INT64_MAX-599999));
+ assert(lg_watch_due(&w,7,1800000600,1800000000,1000));
+ assert(!lg_watch_arm(&w,7,1800000601,1800000000,1000));
+ assert(!lg_watch_arm(&w,7,INT64_MAX,0,1000));
+ assert(!lg_watch_arm(&w,7,INT64_MIN,1800000000,1000));
+ assert(!lg_watch_arm(&w,7,1800000600,1800000000,-1));
+ assert(!lg_watch_arm(NULL,7,1800000600,1800000000,1000));
+ assert(lg_watch_due(NULL,7,1800000600,1800000000,1000));
  puts("lease guard regression tests passed");
 }
