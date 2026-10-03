@@ -33,3 +33,32 @@ lg_result_t lg_grant(lg_port_t p, uint16_t uid, unsigned seconds, int64_t absolu
     }
     return LG_OK;
 }
+
+bool lg_watch_arm(lg_watch_t *watch, uint16_t uid, int64_t deadline,
+                  int64_t now, int64_t uptime)
+{
+    if (!watch) return false;
+    *watch = (lg_watch_t){.uid = uid, .deadline_epoch = deadline, .due = true};
+    if (!uid || now < LG_MIN_TIME || deadline <= now || deadline - now > 600 ||
+        uptime < 0 || uptime > INT64_MAX - (deadline - now) * 1000) return false;
+    *watch = (lg_watch_t){.uid = uid, .deadline_epoch = deadline,
+        .deadline_ms = uptime + (deadline - now) * 1000,
+        .last_epoch = now, .last_ms = uptime, .armed = true};
+    return true;
+}
+
+bool lg_watch_due(lg_watch_t *watch, uint16_t uid, int64_t deadline,
+                  int64_t now, int64_t uptime)
+{
+    if (!watch) return true;
+    if (!watch->armed || watch->due || !uid || uid != watch->uid ||
+        deadline != watch->deadline_epoch || now < LG_MIN_TIME ||
+        now < watch->last_epoch || uptime < watch->last_ms ||
+        now >= deadline || uptime >= watch->deadline_ms) {
+        watch->due = true;
+        return true;
+    }
+    watch->last_epoch = now;
+    watch->last_ms = uptime;
+    return false;
+}

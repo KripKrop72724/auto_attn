@@ -14,3 +14,15 @@ typedef struct {
 /* A durable bounded revocation obligation precedes any terminal elevation.
  * The normal duration begins after verification, with another checked commit. */
 lg_result_t lg_grant(lg_port_t port, uint16_t uid, unsigned duration_seconds, int64_t absolute_deadline);
+
+typedef struct {
+    uint16_t uid;
+    int64_t deadline_epoch, deadline_ms, last_epoch, last_ms;
+    bool armed, due;
+} lg_watch_t;
+/* Uptime is boot-local and must never be reconstructed from wall time after
+ * reboot. A restored durable lease without this anchor is due for revocation. */
+bool lg_watch_arm(lg_watch_t *watch, uint16_t uid, int64_t deadline_epoch,
+                  int64_t epoch_now, int64_t uptime_ms);
+bool lg_watch_due(lg_watch_t *watch, uint16_t uid, int64_t deadline_epoch,
+                  int64_t epoch_now, int64_t uptime_ms);
