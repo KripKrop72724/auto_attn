@@ -280,6 +280,16 @@ still block recovery. Encryption identity and nonce allocation never reset.
 
 ## Work that still blocks the requested release
 
+OTA installation checks the exact downloaded length and expected ESP application
+digest before `esp_https_ota_finish` can select the new boot slot. Aligned complete
+writes leave no encrypted-flash tail for finalization; IDF still verifies the
+signature before selection. Resume checkpoints are whole erase sectors, with
+old partial checkpoints rewound and EOF checkpoints re-reading the last sector.
+Fault tests exercise both firmware families, all 4,095 offsets inside a sector,
+short/long downloads, failed hashing, signature failure and NVS checkpoints.
+These checks do not establish compatible rollback-slot replacement or physical
+power-loss qualification; those remain separate release requirements.
+
 1. Qualify and activate durable raw capture before acknowledging live events.
    The ordinary, command-response and prepared-read hooks are implemented under
    a disabled writer build switch. Partial packet fragments remain holds.
