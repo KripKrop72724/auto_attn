@@ -398,6 +398,7 @@ class ReconciliationSourceRecord(BaseModel):
     disposition: Literal[
         "EVENT",
         "BLOCKED_IDENTITY",
+        "IDENTITY_UNRESOLVED",
         "INVALID_TIME",
         "MALFORMED",
         "TERMINAL_DUPLICATE",
@@ -411,6 +412,8 @@ class ReconciliationSourceRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_record_evidence(self):
+        if self.disposition == "IDENTITY_UNRESOLVED" and self.event is not None:
+            raise ValueError("Unresolved source identity cannot claim an attendance event")
         if self.disposition in {"EVENT", "BLOCKED_IDENTITY"} and self.event is None:
             raise ValueError("Parsed reconciliation rows require an attendance event")
         return self

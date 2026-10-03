@@ -377,8 +377,9 @@ def test_attendance_carries_verified_terminal_identity_to_add():
         source.index("static bool parse_attendance_record(") :
         source.index("static size_t collect_reconcile_window(")
     ]
-    assert "user_by_uid != user_by_id" in parser
-    assert "uid = 0;" in parser
+    historical_parser = parser[:parser.index("static void sha256_bytes_hex(")]
+    assert "find_user_by_uid" not in historical_parser
+    assert "if (!decoded.user_id[0]) return false;" in historical_parser
     assert "snapshot_identity" in parser
     assert "attendance_record_uid" in parser
     assert 'cJSON_AddStringToObject(row, "uid", event->uid);' in add_row

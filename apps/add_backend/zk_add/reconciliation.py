@@ -66,8 +66,9 @@ RECONCILIATION_CAPABILITY = "history_stream_v1"
 RECONCILIATION_V2_CAPABILITY = "history_stream_v2"
 RANGE_RESUME_CAPABILITY = "history_range_resume_verified"
 SOURCE_PROBE_CAPABILITY = "source_divergence_probe_v1"
-SOURCE_EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED"}
+SOURCE_EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLVED"}
 SOURCE_EXCEPTION_REVIEW_HOLD = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
+SOURCE_IDENTITY_HOLD = "SOURCE_IDENTITY_EVIDENCE_REQUIRED"
 SOURCE_EXCEPTION_SCOPE_MISMATCH = "SOURCE_EXCEPTION_SCOPE_MISMATCH"
 
 
@@ -424,6 +425,11 @@ def control_reconciliation_job(
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
     if action == "retry" and job.quarantined_count:
         source_assurance = source_exception_assurance(session, job)
+        if source_assurance["identity_unresolved_open"]:
+            raise ValueError(
+                "Historical source identity requires verified correction evidence; "
+                "review notes and generic retries cannot resolve it."
+            )
         if source_assurance["state"] == "REVIEW_REQUIRED":
             raise ValueError(
                 f"Review the {source_assurance['open']} remaining source exception(s); "
@@ -821,10 +827,10 @@ def apply_reconciliation_chunk(
         elif event and disposition == "BLOCKED_IDENTITY" and event.cnic_lookup_hash:
             disposition = "EVENT"
         seen_terminal_keys.add(source.terminal_record_key)
-        if disposition == "BLOCKED_IDENTITY":
+        if disposition in {"BLOCKED_IDENTITY", "IDENTITY_UNRESOLVED"}:
             blocked += 1
             blocked_events.append(event)
-        if disposition in {"INVALID_TIME", "MALFORMED"}:
+        if disposition in SOURCE_EXCEPTION_DISPOSITIONS:
             quarantined += 1
         if disposition == "TERMINAL_DUPLICATE":
             terminal_duplicates += 1
@@ -1273,10 +1279,10 @@ def apply_source_tail_chunk(
             elif disposition == "BLOCKED_IDENTITY" and event.cnic_lookup_hash:
                 disposition = "EVENT"
         seen_terminal_keys.add(source.terminal_record_key)
-        if disposition == "BLOCKED_IDENTITY":
+        if disposition in {"BLOCKED_IDENTITY", "IDENTITY_UNRESOLVED"}:
             blocked += 1
             blocked_events.append(event)
-        if disposition in {"INVALID_TIME", "MALFORMED"}:
+        if disposition in SOURCE_EXCEPTION_DISPOSITIONS:
             exceptions += 1
         session.add(
             TerminalRecordManifest(
@@ -1324,7 +1330,7 @@ def apply_source_tail_chunk(
             code="TERMINAL_SOURCE_EXCEPTION",
             severity="HIGH",
             message=(
-                "ADD preserved invalid or malformed terminal source rows and safely "
+                "ADD preserved terminal source exceptions and safely "
                 "continued reconciliation."
             ),
             details={
@@ -1352,6 +1358,8 @@ def source_exception_assurance(
         "open": 0,
         "invalid_time": 0,
         "malformed": 0,
+        "identity_unresolved": 0,
+        "identity_unresolved_open": 0,
         "state": "NONE",
         "cohort_digest": None,
         "review_evidence_digest": None,
@@ -1389,9 +1397,13 @@ def source_exception_assurance(
 
     invalid_time = sum(row.disposition == "INVALID_TIME" for row in manifests)
     malformed = sum(row.disposition == "MALFORMED" for row in manifests)
+    identity_manifest_ids = {
+        row.id for row in manifests if row.disposition == "IDENTITY_UNRESOLVED"
+    }
     reviewed = len(earliest_reviews)
     corrections = session.scalars(
         select(AttendanceSourceCorrection)
+        .join(AttendanceEvent, AttendanceEvent.id == AttendanceSourceCorrection.derived_attendance_event_id)
         .where(
             AttendanceSourceCorrection.manifest_id.in_(manifest_ids),
             AttendanceSourceCorrection.status == "CREATED",
@@ -1400,7 +1412,14 @@ def source_exception_assurance(
     ).all() if manifest_ids else []
     corrected_manifest_ids = {row.manifest_id for row in corrections if row.manifest_id is not None}
     corrected = len(corrected_manifest_ids)
-    resolved_manifest_ids = set(earliest_reviews) | corrected_manifest_ids
+    # A reviewed invalid source exclusion can complete its review gate. Missing
+    # identity is different: an audit note cannot turn a possible punch into an
+    # exclusion or prove its employee. Only derived correction evidence may
+    # supply an event, whose identity and Oracle result are checked separately.
+    resolved_manifest_ids = (
+        set(earliest_reviews) - identity_manifest_ids
+    ) | corrected_manifest_ids
+    identity_open = len(identity_manifest_ids - corrected_manifest_ids)
     cohort_material = {
         "job_id": job.job_id,
         "terminal_serial": job.terminal_serial,
@@ -1447,7 +1466,9 @@ def source_exception_assurance(
         "open": max(0, len(manifests) - len(resolved_manifest_ids)),
         "invalid_time": invalid_time,
         "malformed": malformed,
-        "state": "REVIEW_REQUIRED",
+        "identity_unresolved": len(identity_manifest_ids),
+        "identity_unresolved_open": identity_open,
+        "state": "IDENTITY_EVIDENCE_REQUIRED" if identity_open else "REVIEW_REQUIRED",
         "cohort_digest": cohort_digest,
         "review_evidence_digest": review_evidence_digest,
         "review_ids": [
@@ -1585,12 +1606,15 @@ def refresh_reconciliation_assurance(
     if job.mode == "HIKVISION_SERIAL_HISTORY":
         from zk_add.hikvision_reconciliation import refresh_assurance
         return refresh_assurance(session, job)
-    manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
+    manifest_scope = (
         TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
         TerminalRecordManifest.generation == job.terminal_generation,
         TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.ordinal < (job.cutoff_count or 0),
+    )
+    manifest_events = select(TerminalRecordManifest.attendance_event_id).where(
+        *manifest_scope,
         TerminalRecordManifest.attendance_event_id.is_not(None),
     ).distinct()
     corrected_events = (
@@ -1630,7 +1654,27 @@ def refresh_reconciliation_assurance(
         outcome_counts[classify_ords_assurance_status(status)] += count
     target = sum(status_counts.values())
     confirmed = outcome_counts["CONFIRMED"]
-    blocked = outcome_counts["IDENTITY_HELD"]
+    # Do not materialize a growing exception cohort on every unfinished scan.
+    # Sealed review evidence is checked after capture; the ongoing identity
+    # count is a scoped aggregate while capture is still incomplete.
+    source_assurance = source_exception_assurance(session, job) if job.capture_certified_at else None
+    if source_assurance is None:
+        corrected_identity = (
+            select(AttendanceSourceCorrection.id)
+            .join(AttendanceEvent, AttendanceEvent.id == AttendanceSourceCorrection.derived_attendance_event_id)
+            .where(AttendanceSourceCorrection.manifest_id == TerminalRecordManifest.id,
+                   AttendanceSourceCorrection.status == "CREATED")
+            .exists()
+        )
+        source_identity_open = session.scalar(
+            select(func.count(TerminalRecordManifest.id)).where(
+                *manifest_scope, TerminalRecordManifest.disposition == "IDENTITY_UNRESOLVED",
+                ~corrected_identity,
+            )
+        ) or 0
+    else:
+        source_identity_open = source_assurance["identity_unresolved_open"]
+    blocked = outcome_counts["IDENTITY_HELD"] + source_identity_open
     pending = outcome_counts["PENDING"]
     review = outcome_counts["REVIEW_REQUIRED"]
     review_state_counts = {
@@ -1676,18 +1720,17 @@ def refresh_reconciliation_assurance(
         return job
     if job.status in PAUSED_JOB_STATES:
         return job
-    source_assurance = source_exception_assurance(session, job)
     managed_oracle_hold = (
         job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
     )
     managed_source_hold = (
-        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH}
-        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH}
+        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD}
+        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD}
         or (
             job.quarantined_count > 0
             and job.error_code is None
             and job.phase in {"WAITING_FOR_IDENTITY", "FINAL_ASSURANCE"}
-            and job.wait_reason in {None, SOURCE_EXCEPTION_REVIEW_HOLD}
+            and job.wait_reason in {None, SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_IDENTITY_HOLD}
         )
     )
     if (
@@ -1709,6 +1752,19 @@ def refresh_reconciliation_assurance(
             "capture evidence. Automatic continuation remains fail-closed; inspect "
             "the job evidence before taking any further action."
         )
+    elif source_assurance["state"] == "IDENTITY_EVIDENCE_REQUIRED":
+        job.phase = "WAITING_FOR_IDENTITY"
+        job.status = "NEEDS_ATTENTION"
+        job.wait_reason = SOURCE_IDENTITY_HOLD
+        job.error_code = SOURCE_IDENTITY_HOLD
+        job.error_message = (
+            f"{source_assurance['identity_unresolved_open']:,} preserved source record(s) "
+            "lack an independently supported user reference. Historical attendance "
+            "UIDs cannot identify a current employee. Identity operations must supply "
+            "verified correction evidence; review notes alone cannot certify delivery."
+        )
+        if coverage is not None:
+            coverage.oracle_state = "ORACLE_IDENTITY_EVIDENCE_REQUIRED"
     elif source_assurance["state"] == "REVIEW_REQUIRED":
         job.phase = "FINAL_ASSURANCE"
         job.status = "NEEDS_ATTENTION"
@@ -2234,6 +2290,8 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "open": exception_assurance["open"],
             "invalid_time": exception_assurance["invalid_time"],
             "malformed": exception_assurance["malformed"],
+            "identity_unresolved": exception_assurance["identity_unresolved"],
+            "identity_unresolved_open": exception_assurance["identity_unresolved_open"],
             "state": exception_assurance["state"],
             "cohort_digest": exception_assurance.get("cohort_digest"),
             "correction_ids": exception_assurance.get("correction_ids", []),

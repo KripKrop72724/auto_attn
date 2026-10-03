@@ -20,14 +20,12 @@ def test_historical_parser_retains_identifiers_without_current_person(tmp_path):
 #include <string.h>
 #include "zkt_record.h"
 ''' + event_type + r'''
-typedef struct {char user_id[32];} zkt_user_t;
 typedef struct {int unused;} user_table_t;
-static zkt_user_t current={"7"};
-static const zkt_user_t *find_user_by_uid(const user_table_t *t,uint16_t uid){(void)t;return uid==7?&current:NULL;}
-static const zkt_user_t *find_user_by_user_id(const user_table_t *t,const char *id){(void)t;return !strcmp(id,"7")?&current:NULL;}
+static unsigned builder_calls;
 static bool build_attendance_event(attendance_event_t *out,const user_table_t *t,const char *id,
  uint16_t uid,uint32_t timestamp,uint8_t status,uint8_t punch,bool snapshot){
- (void)t;(void)uid;(void)status;(void)punch;(void)snapshot;
+ (void)t;(void)status;(void)punch;
+ ++builder_calls;assert(uid==0 && snapshot && id[0]);
  memset(out,0,sizeof(*out));if(!timestamp)return false;
  snprintf(out->user_id,sizeof(out->user_id),"%s",id);strcpy(out->uid,"7");
  strcpy(out->cnic,"1234567890123");strcpy(out->employee_name,"Current owner");
@@ -37,19 +35,30 @@ static bool build_attendance_event(attendance_event_t *out,const user_table_t *t
 ''' + parser + r'''
 int main(void){
  user_table_t table={0};attendance_event_t event;uint32_t timestamp;
- const unsigned sizes[]={8,16,40};
- for(unsigned i=0;i<3;i++){
+ const unsigned sizes[]={16,40};
+ for(unsigned i=0;i<2;i++){
   uint8_t row[40]={7};
-  if(sizes[i]==8)row[3]=1;
-  else if(sizes[i]==16)row[4]=1;
-  else {row[2]='7';row[27]=1;}
+  if(sizes[i]==16)row[4]=1;
+  else {row[0]=40;row[2]='7';row[27]=1;}
   assert(parse_attendance_record(row,sizes[i],&table,&event,&timestamp));
   assert(!event.cnic[0] && !event.employee_name[0] && !event.raw_punch);
   assert(!strcmp(event.event_uid,"unchanged-event-uid"));
   assert(!strcmp(event.user_id,"7") && !strcmp(event.uid,"7"));
   assert(!strcmp(event.terminal_identity_fingerprint,"current-fingerprint"));
-  if(sizes[i]!=16)assert(!strcmp(event.attendance_record_uid,"7"));
+  if(sizes[i]==40)assert(!strcmp(event.attendance_record_uid,"40"));
  }
+ assert(builder_calls==2);
+ /* A current enrollment with the same numeric UID must never be consulted. */
+ uint8_t missing[40]={40};missing[3]=1;
+ assert(!parse_attendance_record(missing,8,&table,&event,&timestamp));
+ assert(zkt_record_identity_missing(missing,8));
+ missing[3]=0;missing[27]=1;
+ assert(!parse_attendance_record(missing,40,&table,&event,&timestamp));
+ assert(zkt_record_identity_missing(missing,40));
+ memset(missing+2,' ',24);
+ assert(!parse_attendance_record(missing,40,&table,&event,&timestamp));
+ assert(zkt_record_identity_missing(missing,40));
+ assert(builder_calls==2);
  uint8_t row[13]={0};assert(!parse_attendance_record(row,13,&table,&event,&timestamp));
  return 0;
 }

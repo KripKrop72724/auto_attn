@@ -18,7 +18,7 @@ from zk_add.models import (
 from zk_add.time_utils import utc_now
 
 
-EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED"}
+EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLVED"}
 
 
 def exception_or_404_row(session: Session, exception_id: int) -> TerminalRecordManifest | None:
@@ -89,7 +89,10 @@ def _serialize(
         "review_reason": review.reason if review else None,
         "source_committed_cursor": committed_cursor,
         "cursor_advanced": committed_cursor > row.ordinal,
-        "oracle_action": "EXCLUDED_FAIL_CLOSED",
+        "oracle_action": (
+            "HELD_IDENTITY_EVIDENCE_REQUIRED"
+            if row.disposition == "IDENTITY_UNRESOLVED" else "EXCLUDED_FAIL_CLOSED"
+        ),
     }
 
 
@@ -156,12 +159,13 @@ def list_source_exceptions(
         func.count(TerminalRecordManifest.id),
         func.sum(case((TerminalRecordManifest.disposition == "INVALID_TIME", 1), else_=0)),
         func.sum(case((TerminalRecordManifest.disposition == "MALFORMED", 1), else_=0)),
+        func.sum(case((TerminalRecordManifest.disposition == "IDENTITY_UNRESOLVED", 1), else_=0)),
         func.count(func.distinct(TerminalRecordManifest.zkt_device_id)),
     ).where(
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
     )
-    total, invalid_time, malformed, affected_terminals = session.execute(totals_statement).one()
+    total, invalid_time, malformed, identity_unresolved, affected_terminals = session.execute(totals_statement).one()
     reviewed = session.scalar(
         select(func.count(func.distinct(TerminalRecordReview.manifest_id)))
     ) or 0
@@ -172,6 +176,7 @@ def list_source_exceptions(
             "reviewed": int(reviewed),
             "invalid_time": int(invalid_time or 0),
             "malformed": int(malformed or 0),
+            "identity_unresolved": int(identity_unresolved or 0),
             "affected_terminals": int(affected_terminals or 0),
         },
         "rows": [

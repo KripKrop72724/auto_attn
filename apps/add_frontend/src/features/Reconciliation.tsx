@@ -106,6 +106,9 @@ const humanize = (value?: string | null) =>
     .toLowerCase()
     .replace(/^./, (letter) => letter.toUpperCase())
 
+const sourceEvidencePending = (state: SourceExceptionAssurance['state']) =>
+  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED'
+
 const reconciliationEtaLabel = (job: ReconciliationJob) => {
   if (job.eta.high_seconds != null)
     return `${Math.ceil(job.eta.high_seconds / 60)} min`
@@ -125,13 +128,13 @@ const reconciliationEtaLabel = (job: ReconciliationJob) => {
 function WorkspaceTabs({
   section,
   activeJobs,
-  openExceptions,
+  sourceExceptions,
   recoveryCount,
   onChange,
 }: {
   section: ReconciliationSection
   activeJobs: number
-  openExceptions: number
+  sourceExceptions: number
   recoveryCount: number
   onChange: (section: ReconciliationSection) => void
 }) {
@@ -142,7 +145,7 @@ function WorkspaceTabs({
     count: number
   }> = [
     { id: 'jobs', label: 'Jobs', count: activeJobs },
-    { id: 'exceptions', label: 'Source exceptions', count: openExceptions },
+    { id: 'exceptions', label: 'Source exceptions', count: sourceExceptions },
     { id: 'recovery', label: 'Recovery', count: recoveryCount },
   ]
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -516,12 +519,14 @@ function JobDetailDrawer({
             </dl>
             {(job.source_exception_assurance?.total ?? 0) > 0 && (
               <article
-                className={`info-copy pattern-${job.source_exception_assurance.state === 'REVIEW_REQUIRED' ? 'waiting' : job.source_exception_assurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+                className={`info-copy pattern-${sourceEvidencePending(job.source_exception_assurance.state) ? 'waiting' : job.source_exception_assurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
               >
                 <Icon name="shield" />
                 <div>
                   <h3>
-                    {job.source_exception_assurance.state === 'REVIEW_REQUIRED'
+                    {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
+                      ? 'Historical identity evidence required'
+                      : job.source_exception_assurance.state === 'REVIEW_REQUIRED'
                       ? `${job.source_exception_assurance.open.toLocaleString()} source review${job.source_exception_assurance.open === 1 ? '' : 's'} remaining`
                       : job.source_exception_assurance.state === 'SCOPE_MISMATCH'
                         ? 'Source-exception evidence mismatch'
@@ -530,15 +535,16 @@ function JobDetailDrawer({
                   <p>
                     {job.source_exception_assurance.reviewed.toLocaleString()} of{' '}
                     {job.source_exception_assurance.total.toLocaleString()} certified
-                    source exceptions reviewed. They remain immutable and excluded
-                    from attendance and Oracle.
+                    source exceptions reviewed. Original evidence remains immutable.
+                    {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
+                      ' Review notes cannot resolve missing identity or certify Oracle delivery.'}
                   </p>
-                  {job.source_exception_assurance.state === 'REVIEW_REQUIRED' && (
+                  {sourceEvidencePending(job.source_exception_assurance.state) && (
                     <button
                       className="button secondary"
                       onClick={() => onReviewExceptions(job)}
                     >
-                      Review certified exceptions
+                      Inspect certified exceptions
                     </button>
                   )}
                 </div>
@@ -707,7 +713,9 @@ function SourceExceptionDrawer({
           ),
         )
         toast.notice(
-          'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
+          row.disposition === 'IDENTITY_UNRESOLVED'
+            ? 'Review recorded. The identity hold remains until verified correction evidence is available.'
+            : 'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
         )
         await onChanged()
       } else {
@@ -774,12 +782,14 @@ function SourceExceptionDrawer({
             <article className="info-copy pattern-blocked">
               <Icon name="shield" />
               <div>
-                <h3>Excluded from attendance and Oracle</h3>
+                <h3>{row.disposition === 'IDENTITY_UNRESOLVED'
+                  ? 'Held for verified historical identity'
+                  : 'Excluded from attendance and Oracle'}</h3>
                 <p>
                   ADD preserved this terminal ordinal as immutable evidence.
-                  Review never creates, edits, or deletes attendance. Completing
-                  every review in a certified job automatically resumes assurance
-                  for its valid records.
+                  {row.disposition === 'IDENTITY_UNRESOLVED'
+                    ? ' Identity operations must establish an independently supported user reference. A historical attendance UID cannot identify the current enrollment owner. A review note does not resolve this hold or certify Oracle delivery.'
+                    : ' Review never creates, edits, or deletes attendance. Completing every review in a certified job automatically resumes assurance for its valid records.'}
                 </p>
               </div>
             </article>
@@ -809,7 +819,7 @@ function SourceExceptionDrawer({
               <div>
                 <dt>Observed identity</dt>
                 <dd>
-                  UID {row.observed_uid || '—'} · User{' '}
+                  Attendance UID {row.observed_uid || '—'} · User{' '}
                   {row.observed_user_id || '—'}
                 </dd>
               </div>
@@ -831,8 +841,9 @@ function SourceExceptionDrawer({
                 <div>
                   <h3>Review history</h3>
                   <p>
-                    Review accepts this fail-closed exclusion; the preserved source
-                    record itself never changes.
+                    {row.disposition === 'IDENTITY_UNRESOLVED'
+                      ? 'Review records an investigation note; the identity hold and original source evidence remain.'
+                      : 'Review accepts this fail-closed exclusion; the preserved source record itself never changes.'}
                   </p>
                 </div>
                 <StatusBadge state={row.review_state} />
@@ -1642,7 +1653,7 @@ export function ReconciliationView({
       <WorkspaceTabs
         section={section}
         activeJobs={activeJobCount}
-        openExceptions={exceptionTotals.open}
+        sourceExceptions={exceptionTotals.all}
         recoveryCount={recoveryCount}
         onChange={setWorkspaceSection}
       />
@@ -2013,6 +2024,7 @@ export function ReconciliationView({
                   job.source_exception_assurance || emptySourceAssurance
                 const sourceGateActive =
                   sourceAssurance.state === 'REVIEW_REQUIRED' ||
+                  sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
                   sourceAssurance.state === 'SCOPE_MISMATCH'
                 const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> =
                   []
@@ -2145,13 +2157,15 @@ export function ReconciliationView({
                     </dl>
                     {sourceAssurance.total > 0 && (
                       <div
-                        className={`reconciliation-source-assurance pattern-${sourceAssurance.state === 'REVIEW_REQUIRED' ? 'waiting' : sourceAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+                        className={`reconciliation-source-assurance pattern-${sourceEvidencePending(sourceAssurance.state) ? 'waiting' : sourceAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
                       >
                         <Icon name="shield" />
                         <span>
                           <strong>
                             {job.status === 'CANCELLED'
                               ? 'Cancelled — source exceptions remain preserved'
+                              : sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
+                              ? 'Historical identity evidence required'
                               : sourceAssurance.state === 'REVIEW_REQUIRED'
                               ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
                               : sourceAssurance.state === 'SCOPE_MISMATCH'
@@ -2164,7 +2178,9 @@ export function ReconciliationView({
                           </strong>
                           {sourceAssurance.reviewed.toLocaleString()} of{' '}
                           {sourceAssurance.total.toLocaleString()} certified
-                          exceptions reviewed; all remain excluded fail-closed.
+                          exceptions reviewed; original evidence remains preserved.
+                          {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
+                            ' Review notes cannot resolve the identity hold.'}
                         </span>
                       </div>
                     )}
@@ -2194,6 +2210,11 @@ export function ReconciliationView({
                         >
                           Review {sourceAssurance.open.toLocaleString()}{' '}
                           exception{sourceAssurance.open === 1 ? '' : 's'}
+                        </button>
+                      )}
+                      {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' && (
+                        <button className="button primary" onClick={() => reviewJobExceptions(job)}>
+                          Inspect held source records
                         </button>
                       )}
                       {directAction && (
@@ -2286,26 +2307,26 @@ export function ReconciliationView({
               }
             />
             <Metric
-              label={scopedAssurance ? 'Reviewed exclusions' : 'Invalid timestamps'}
+              label={scopedAssurance ? 'Recorded reviews' : 'Invalid timestamps'}
               value={(
                 scopedAssurance?.reviewed ?? exceptionTotals.invalid_time
               ).toLocaleString()}
               detail={
                 scopedAssurance
-                  ? 'Preserved and excluded fail-closed'
+                  ? 'Review alone cannot resolve missing identity'
                   : 'Excluded fail-closed'
               }
               icon={scopedAssurance ? 'shield' : 'clock'}
               tone={scopedAssurance ? 'positive' : 'warning'}
             />
             <Metric
-              label={scopedAssurance ? 'Open reviews' : 'Malformed rows'}
+              label={scopedAssurance ? 'Unresolved exceptions' : 'Malformed rows'}
               value={(
                 scopedAssurance?.open ?? exceptionTotals.malformed
               ).toLocaleString()}
               detail={
                 scopedAssurance
-                  ? 'Automatic continuation when zero'
+                  ? 'Required evidence remains outstanding'
                   : 'Raw evidence preserved'
               }
               icon={scopedAssurance ? 'alert' : 'terminal'}
@@ -2325,6 +2346,13 @@ export function ReconciliationView({
               }
               icon="server"
             />
+            <Metric
+              label="Missing identity references"
+              value={(scopedAssurance ? scopedAssurance.identity_unresolved : exceptionTotals.identity_unresolved)?.toLocaleString() ?? 'Unknown'}
+              detail="Historical source count; review does not prove an employee"
+              icon="shield"
+              tone="warning"
+            />
           </section>
           <section className="panel source-exceptions-panel">
             <div className="panel-header">
@@ -2332,8 +2360,9 @@ export function ReconciliationView({
                 <h2>Immutable source exception ledger</h2>
                 <p>
                   Review never changes a preserved record or creates attendance.
-                  When every exception in a certified job is reviewed, ADD
-                  continues assurance for its valid records automatically.
+                  Invalid source exclusions can be reviewed. Missing identity
+                  references require verified correction evidence before delivery
+                  can be certified.
                 </p>
               </div>
               <span className="badge">
@@ -2342,20 +2371,22 @@ export function ReconciliationView({
             </div>
             {exceptionScope && scopedAssurance && (
               <div
-                className={`info-copy pattern-${scopedAssurance.state === 'REVIEW_REQUIRED' ? 'waiting' : scopedAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
+                className={`info-copy pattern-${sourceEvidencePending(scopedAssurance.state) ? 'waiting' : scopedAssurance.state === 'SCOPE_MISMATCH' ? 'blocked' : 'notice'}`}
                 aria-live="polite"
               >
                 <Icon name="shield" />
                 <div>
                   <h3>
-                    {scopedAssurance.state === 'REVIEW_REQUIRED'
+                    {scopedAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
+                      ? 'Historical identity evidence required'
+                      : scopedAssurance.state === 'REVIEW_REQUIRED'
                       ? `${scopedAssurance.open.toLocaleString()} certified review${scopedAssurance.open === 1 ? '' : 's'} remaining`
                       : scopedAssurance.state === 'SCOPE_MISMATCH'
                         ? 'Certified exception scope needs investigation'
                         : 'All certified exclusions reviewed'}
                   </h3>
                   <p>
-                    Valid rows have already advanced through checkpoint{' '}
+                    Source evidence has advanced through checkpoint{' '}
                     {(exceptionScope.cutoff_count ?? 0).toLocaleString()}. When
                     the open count reaches zero, final assurance resumes
                     automatically without a terminal rescan.
@@ -2435,6 +2466,7 @@ export function ReconciliationView({
                   <option value="">All exceptions</option>
                   <option value="INVALID_TIME">Invalid timestamp</option>
                   <option value="MALFORMED">Malformed record</option>
+                  <option value="IDENTITY_UNRESOLVED">Missing identity reference</option>
                 </select>
               </label>
               <details className="reconciliation-advanced-filters">
@@ -2596,7 +2628,7 @@ export function ReconciliationView({
                 <article
                   key={row.id}
                   role="listitem"
-                  className={`reconciliation-exception-row pattern-${row.review_state === 'OPEN' ? 'waiting' : 'notice'}`}
+                  className={`reconciliation-exception-row pattern-${row.review_state === 'OPEN' || row.disposition === 'IDENTITY_UNRESOLVED' ? 'waiting' : 'notice'}`}
                 >
                   <div data-label="Terminal source">
                     <strong>{row.display_name || row.terminal_serial}</strong>
@@ -2611,7 +2643,7 @@ export function ReconciliationView({
                     <small>{row.error_code || 'No error code'}</small>
                   </div>
                   <div data-label="Observed identity">
-                    <strong>UID {row.observed_uid || '—'}</strong>
+                    <strong>Attendance UID {row.observed_uid || '—'}</strong>
                     <small>
                       User {row.observed_user_id || '—'} · timestamp{' '}
                       {row.raw_timestamp ?? 'invalid'}
@@ -2626,6 +2658,7 @@ export function ReconciliationView({
                         ? `Committed through ${row.source_committed_cursor.toLocaleString()}`
                         : 'Awaiting durable commit'}
                     </small>
+                    {row.disposition === 'IDENTITY_UNRESOLVED' && <small>Oracle delivery held for identity evidence</small>}
                   </div>
                   <div data-label="Review">
                     <StatusBadge state={row.review_state} />
