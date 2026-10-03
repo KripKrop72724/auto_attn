@@ -3549,12 +3549,12 @@ def require_stream_admin(request: Request) -> AdminContext:
 @app.get("/events/v1/stream")
 async def browser_stream(
     request: Request,
-    last_event_id: int | None = Query(default=None),
+    last_event_id: str | None = Query(default=None, max_length=100),
     _context: AdminContext = Depends(require_stream_admin),
 ):
     header_id = request.headers.get("Last-Event-ID")
-    if header_id and header_id.isdigit():
-        last_event_id = int(header_id)
+    if header_id and len(header_id) <= 100:
+        last_event_id = int(header_id) if header_id.isdigit() else header_id
 
     async def stream():
         async for event in browser_events.subscribe(last_event_id):
@@ -3903,7 +3903,8 @@ async def device_stream(websocket: WebSocket):
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
-                if envelope.type == "source_tail_chunk":
+                if envelope.type in {"source_tail_chunk", "queue_evidence", "user_snapshot",
+                                     "attendance_batch", "reconcile_chunk"}:
                     # Pydantic validation traces may echo rejected field input.
                     # Source-tail records contain encrypted-at-rest raw terminal
                     # evidence, so this path records metadata only.
@@ -3986,12 +3987,12 @@ def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
 
 def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
     error_type = type(error).__name__[:80]
-    safe_detail = None
-    if isinstance(error, ValueError):
-        detail = str(error)
-        if detail.startswith(("Duplicate UID ", "Duplicate device user ID ", "Connector has no ")):
-            safe_detail = detail[:300]
-    message = safe_detail or f"{envelope.type} message was rejected ({error_type})."
+    from zk_add.rejection import rejection_category
+
+    category = rejection_category(error)
+    message = f"{envelope.type} message was rejected ({category})."
+    context = {"message_type": envelope.type, "error_type": error_type,
+               "request_id": envelope.message_id, "error_category": category}
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
         if connector is None:
@@ -4010,7 +4011,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     subsystem="add_backend",
                     code="DEVICE_MESSAGE_REJECTED",
                     message=message,
-                    context={"message_type": envelope.type, "error_type": error_type},
+                    context=context,
                     device_time=envelope.sent_at,
                 )
             ],
@@ -4021,7 +4022,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
             code="DEVICE_MESSAGE_REJECTED",
             severity="HIGH",
             message=message,
-            details={"message_type": envelope.type, "error_type": error_type},
+            details=context,
         )
 
 

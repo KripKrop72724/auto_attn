@@ -118,7 +118,12 @@ export interface ZktDevice {
 }
 
 export interface FirmwareDiagnostics {
-  schema_version: 1
+  schema_version: 1 | 2
+  boot_id?: string | null
+  sample_sequence?: number | null
+  sampled_at?: string | null
+  sampled_uptime_ms?: number | null
+  delivery_authority?: 'LEGACY_DUAL' | 'ADD' | null
   storage?: {
     upgrade_contract?: string | null
     upgrade_error?: string | null
@@ -128,6 +133,8 @@ export interface FirmwareDiagnostics {
     admission_reserve_bytes?: number | null
     write_failures?: number | null
     read_failures?: number | null
+    persistence_probe_failures?: number | null
+    fault_class?: string | null
     durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
     persistence_verified: boolean
     recovery_complete: boolean
@@ -185,6 +192,8 @@ export interface HikvisionHealth {
 }
 
 export interface Device {
+  snapshot_at?: string
+  boot_id?: string | null
   firmware_family?: 'zkt' | 'hikvision'
   terminal_vendor?: 'zkt' | 'hikvision'
   hikvision?: HikvisionHealth | null

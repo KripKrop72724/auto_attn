@@ -6,10 +6,32 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import AsyncIterator
+from uuid import uuid4
 
 from fastapi import WebSocket
 
 from zk_add.time_utils import utc_now
+
+
+# Device wire types are not browser topics. Keep this boundary in one place so
+# HTTP and WebSocket producers invalidate the same browser data.
+BROWSER_TOPICS = {
+    "heartbeat": "device",
+    "command_update": "command",
+    "user_snapshot": "users",
+    "attendance_batch": "attendance",
+    "oracle_receipt_batch": "attendance",
+    "queue_evidence": "reconciliation",
+    "reconcile_anchor": "reconciliation",
+    "reconcile_assignment_release": "reconciliation",
+    "reconcile_chunk": "reconciliation",
+    "reconcile_source_manifest": "reconciliation",
+    "source_probe_result": "reconciliation",
+    "source_tail_chunk": "reconciliation",
+    "hikvision_profile_page": "users",
+    "hikvision_history_page": "reconciliation",
+    "hikvision_observation": "attendance",
+}
 
 
 @dataclass(frozen=True)
@@ -18,46 +40,58 @@ class LiveEvent:
     event_type: str
     data: dict
     created_at: datetime
+    generation: str | None = None
 
 
 class BrowserEventHub:
     def __init__(self, history_size: int = 1000) -> None:
         self._next_id = 1
+        self._generation = uuid4().hex
         self._history: deque[LiveEvent] = deque(maxlen=history_size)
         self._subscribers: set[asyncio.Queue[LiveEvent]] = set()
         self._lock = asyncio.Lock()
 
     async def publish(self, event_type: str, data: dict) -> LiveEvent:
         async with self._lock:
-            event = LiveEvent(self._next_id, event_type, data, utc_now())
+            event = LiveEvent(self._next_id, BROWSER_TOPICS.get(event_type, event_type),
+                              data, utc_now(), self._generation)
             self._next_id += 1
             self._history.append(event)
             subscribers = list(self._subscribers)
         for queue in subscribers:
             if queue.full():
-                try:
+                # Losing any invalidation requires a full snapshot. A later
+                # unrelated event cannot stand in for the discarded update.
+                while not queue.empty():
                     queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+                queue.put_nowait(LiveEvent(0, "resync", {"reason": "overflow"}, utc_now()))
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 pass
         return event
 
-    async def subscribe(self, last_event_id: int | None = None) -> AsyncIterator[LiveEvent]:
+    async def subscribe(self, last_event_id: str | int | None = None) -> AsyncIterator[LiveEvent]:
         queue: asyncio.Queue[LiveEvent] = asyncio.Queue(maxsize=500)
+        generation, _, sequence = str(last_event_id or "").rpartition(":")
+        cursor = int(sequence) if sequence.isdigit() and generation == self._generation else None
         async with self._lock:
-            backlog = [item for item in self._history if not last_event_id or item.event_id > last_event_id]
+            can_replay = (cursor is not None and self._history
+                          and self._history[0].event_id - 1 <= cursor < self._next_id)
+            backlog = [item for item in self._history if item.event_id > cursor] if can_replay else []
             self._subscribers.add(queue)
         try:
+            # Always fetch current snapshots on connection, including a server
+            # restart, a legacy cursor or history eviction. SSE is a hint, not
+            # the authoritative device cache.
+            yield LiveEvent(0, "resync", {"generation": self._generation}, utc_now())
             for item in backlog:
                 yield item
             while True:
                 try:
                     yield await asyncio.wait_for(queue.get(), timeout=15)
                 except asyncio.TimeoutError:
-                    yield LiveEvent(0, "keepalive", {}, utc_now())
+                    yield LiveEvent(0, "keepalive", {"generation": self._generation}, utc_now())
         finally:
             async with self._lock:
                 self._subscribers.discard(queue)
@@ -118,7 +152,7 @@ connector_hub = ConnectorHub()
 
 
 def sse_encode(event: LiveEvent) -> str:
-    if event.event_type == "keepalive":
-        return ": keepalive\n\n"
     data = json.dumps(event.data, separators=(",", ":"), default=str)
-    return f"id: {event.event_id}\nevent: {event.event_type}\ndata: {data}\n\n"
+    cursor = f"{event.generation}:{event.event_id}" if event.generation else str(event.event_id)
+    id_line = f"id: {cursor}\n" if event.event_id else ""
+    return f"{id_line}event: {event.event_type}\ndata: {data}\n\n"

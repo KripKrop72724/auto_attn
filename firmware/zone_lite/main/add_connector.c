@@ -2448,7 +2448,16 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     cJSON *memory = cJSON_AddObjectToObject(diagnostics, "memory");
     cJSON *workers = cJSON_AddArrayToObject(diagnostics, "workers");
     cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
-    if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1) ||
+    if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 2) ||
+        !cJSON_AddStringToObject(diagnostics, "boot_id", s_boot_id) ||
+        !cJSON_AddNumberToObject(diagnostics, "sampled_uptime_ms", (double)monotonic_ms()) ||
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+        !cJSON_AddStringToObject(diagnostics, "runtime_profile", "HIKVISION_V1") ||
+        !cJSON_AddStringToObject(diagnostics, "delivery_authority", "ADD") ||
+#else
+        !cJSON_AddStringToObject(diagnostics, "runtime_profile", "ZKT_LEGACY") ||
+        !cJSON_AddStringToObject(diagnostics, "delivery_authority", "LEGACY_DUAL") ||
+#endif
         !cJSON_AddNumberToObject(memory, "internal_free_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) ||
         !cJSON_AddNumberToObject(memory, "internal_largest_block_bytes", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) goto failed;
     size_t total = 0, used = 0;
@@ -2472,10 +2481,9 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     }
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
-    const char *led = led_status_current_name();
     char local_failure_source[80];
     led_status_local_failure_source(local_failure_source, sizeof(local_failure_source));
-    const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
+    const char *durability = measured != ESP_OK || measured_health.last_error
         ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
         ? "HEALTHY" : "UNKNOWN";
     if (!cJSON_AddStringToObject(storage, "durability", durability) ||

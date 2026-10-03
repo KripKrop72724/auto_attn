@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useToast } from '../App'
 import type { CommKeyState, Device } from '../types'
 import { DeviceDrawer } from './DeviceDrawer'
+import { deviceSnapshots } from '../deviceData'
 
 
 const device: Device = {
@@ -53,6 +54,7 @@ let activeDevice = device
 
 describe('DeviceDrawer COMM Key controls', () => {
   beforeEach(() => {
+    deviceSnapshots.clear()
     activeDevice = device
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)

@@ -17,6 +17,7 @@ import { createPortal } from 'react-dom'
 import { createBrowserRouter, RouterProvider, useLocation, useNavigate, useNavigationType, useRouteError } from 'react-router-dom'
 import { api, ApiError, queryString, setCsrfToken } from './api'
 import { queryClient } from './data'
+import { deviceSnapshots, useDevices } from './deviceData'
 import { AppShell } from './AppShell'
 import { Icon } from './Icon'
 import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
@@ -611,7 +612,8 @@ function DashboardApp() {
   const previousScrollContext = useRef<{ key: string; context: string } | null>(null)
   const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
   const [username, setUsername] = useState('')
-  const [devices, setDevices] = useState<Device[]>([])
+  const devices = useDevices()
+  const fleetRequest = useRef(0)
   const [overview, setOverview] = useState<Overview>({ total: 0, open_alerts: 0, active_leases: 0 })
   const [loading, setLoading] = useState(true)
   const [revisions, setRevisions] = useState<Record<RealtimeTopic, number>>({
@@ -692,11 +694,6 @@ function DashboardApp() {
   }, [location.key, navigationType, scrollContext])
 
   useEffect(() => {
-    const timer = window.setInterval(() => setRevisions((current) => ({ ...current })), 60_000)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  useEffect(() => {
     const legacy = window.location.hash.replace(/^#/, '') as View
     if (legacy && ['fleet', 'users', 'attendance', 'reconciliation', 'firmware', 'alerts'].includes(legacy)) {
       navigate(routePath(legacy), { replace: true })
@@ -725,19 +722,21 @@ function DashboardApp() {
   }, [devices, drawer, location.pathname])
 
   const refreshFleet = useCallback(async () => {
+    const request = ++fleetRequest.current
     setLoading(true)
     try {
       const [counts, fleet] = await Promise.all([
         queryClient.fetchQuery({ queryKey: ['overview'], queryFn: ({ signal }) => api<Overview>('/api/v1/overview', { signal }), staleTime: 0 }),
         queryClient.fetchQuery({ queryKey: ['devices'], queryFn: ({ signal }) => api<{ rows: Device[] }>('/api/v1/devices', { signal }), staleTime: 0 }),
       ])
+      if (request !== fleetRequest.current) return
       setOverview(counts)
-      setDevices(fleet.rows)
+      deviceSnapshots.put(fleet.rows)
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
       else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')
     } finally {
-      setLoading(false)
+      if (request === fleetRequest.current) setLoading(false)
     }
   }, [toast.error])
 
@@ -753,7 +752,7 @@ function DashboardApp() {
       })
       return next
     })
-    if (topics.has('device') || topics.has('resync') || topics.has('command')) void refreshFleet()
+    if (['device', 'resync', 'command', 'attendance', 'alert'].some(topic => topics.has(topic as RealtimeTopic))) void refreshFleet()
   }, [refreshFleet])
   const realtime = useRealtime(authState === 'authenticated', handleRealtimeTopics)
 
@@ -771,7 +770,8 @@ function DashboardApp() {
     const handleSessionExpired = () => {
       setCsrfToken('')
       setAuthState('anonymous')
-      setDevices([])
+      ++fleetRequest.current
+      deviceSnapshots.clear()
       queryClient.clear()
       setDrawer(null)
     }
@@ -798,7 +798,8 @@ function DashboardApp() {
     try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally {
       setCsrfToken('')
       setAuthState('anonymous')
-      setDevices([])
+      ++fleetRequest.current
+      deviceSnapshots.clear()
       queryClient.clear()
     }
   }
