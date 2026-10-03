@@ -21,6 +21,59 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 
+def test_source_claim_migration_preserves_old_evidence_and_retains_new_claims(postgres_store, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import inspect
+    from zk_add.crypto import encrypt_text, decrypt_text
+    from zk_add.models import TerminalRecordManifest
+
+    sessions, identifier = postgres_store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == identifier))
+        evidence = encrypt_text("original protected source")
+        row = TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            terminal_serial=connector.zkt_device.serial, generation=1, ordinal=0, canonical_source=True,
+            source_kind="TAIL", record_size=8, raw_record_digest="b" * 64, terminal_record_key="c" * 64,
+            disposition="EVENT", protected_raw_record=evidence)
+        db.add(row)
+        db.commit()
+        identifier = row.id
+        engine = db.get_bind()
+    path = Path(__file__).resolve().parents[2] / "apps/add_backend/migrations/versions/20261004_0045_source_claim_evidence.py"
+    spec = importlib.util.spec_from_file_location("source_claim_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    added = {"declared_disposition", "interpretation_version", "protected_source_claim"}
+    with engine.begin() as connection:
+        for column in sorted(added):
+            connection.execute(text(f'ALTER TABLE add_terminal_record_manifest DROP COLUMN "{column}"'))
+        monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+        migration.upgrade()
+        assert added <= {column["name"] for column in inspect(connection).get_columns("add_terminal_record_manifest")}
+    with sessions() as db:
+        row = db.get(TerminalRecordManifest, identifier)
+        assert row.protected_raw_record == evidence and row.disposition == "EVENT"
+        assert row.declared_disposition is None and row.protected_source_claim is None
+        row.declared_disposition = "EVENT"
+        row.interpretation_version = "zkt-source-identity-guard-1"
+        row.protected_source_claim = encrypt_text("retained submitted interpretation")
+        protected_claim = row.protected_source_claim
+        db.commit()
+    with engine.begin() as connection:
+        monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+        migration.downgrade()
+        migration.upgrade()
+        migration.upgrade()
+    with sessions() as db:
+        row = db.get(TerminalRecordManifest, identifier)
+        assert row.protected_raw_record == evidence and row.protected_source_claim == protected_claim
+        assert decrypt_text(row.protected_source_claim) == "retained submitted interpretation"
+        assert row.disposition == "EVENT" and row.declared_disposition == "EVENT"
+
+
 def test_custody_processor_timeouts_are_local_and_failed_tick_can_retry(postgres_store, monkeypatch):
     from zk_add import zkt_custody_runtime as runtime
     from zk_add.zkt_custody_work import InspectionBatch
