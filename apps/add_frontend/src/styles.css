@@ -1095,3 +1095,6 @@ dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 500
   .live-sync i, .alert-card > .alert-icon { forced-color-adjust: none; }
   .section-tabs button.active, .section-tabs button[aria-selected="true"], .tabs button.active { border-bottom-color: Highlight; }
 }
+
+.custody-work-group { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.custody-work-group summary { cursor: pointer; font-size: 13px; overflow-wrap: anywhere; }

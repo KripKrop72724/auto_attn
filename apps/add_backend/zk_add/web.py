@@ -2014,6 +2014,7 @@ def zkt_source_evidence_reveal(
 @app.get("/api/v1/devices/{connector_id}/zkt-custody")
 def zkt_custody_status(
     connector_id: str,
+    response: Response,
     before: int | None = Query(default=None, ge=1),
     limit: int = Query(default=50, ge=1, le=100),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
@@ -2021,6 +2022,7 @@ def zkt_custody_status(
     from zk_add.zkt_custody_work import work_status
     db, _context = auth
     connector = connector_or_404(db, connector_id)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     return work_status(db, connector, before=before, limit=limit)
 
 

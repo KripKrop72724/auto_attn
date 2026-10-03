@@ -290,7 +290,7 @@ def work_status(session: Session, connector: Connector, *, before: int | None = 
         ~select(ZktCustodyWorkReceipt.id).where(ZktCustodyWorkReceipt.receipt_id == ZktObservationReceipt.id).exists())
         .limit(1))
     page = rows[:maximum]
-    return {"enabled": connector.zkt_custody_enabled, "sampled_at": utc_now(),
+    return {"connector_id": connector.connector_id, "enabled": connector.zkt_custody_enabled, "sampled_at": utc_now(),
         "oracle_completion": "NOT_ASSERTED", "missing_processing_obligation": missing is not None,
         "counts": [{"state": state, "owner": owner, "count": count} for state, owner, count in counts],
         "rows": [{"id": row.id, "kind": row.kind, "state": row.state, "reason_code": row.reason_code,

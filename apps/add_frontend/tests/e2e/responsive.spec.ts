@@ -294,6 +294,13 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/overview') json = { total: 1, online: 1, offline: 0, degraded: 0, flapping: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 12, retrying: 0, blocked_identity: 2, quarantined: 1 } }
     else if (url.pathname === '/api/v1/devices') json = { rows: [device] }
     else if (url.pathname === `/api/v1/devices/${device.connector_id}`) json = device
+    else if (url.pathname.endsWith('/zkt-custody')) json = {
+      connector_id: device.connector_id, enabled: true, sampled_at: new Date().toISOString(),
+      oracle_completion: 'NOT_ASSERTED', missing_processing_obligation: true,
+      counts: [{ state: 'WAIT_PROFILE', owner: 'ADD_PROTOCOL', count: 12 }],
+      rows: [{ id: 1, state: 'WAIT_PROFILE', reason_code: 'PROFILE_QUALIFICATION_REQUIRED',
+        owner: 'ADD_PROTOCOL', updated_at: new Date().toISOString(), next_attempt_at: null }], next_cursor: null,
+    }
     else if (url.pathname.includes('/connectivity')) json = { rows: [] }
     else if (url.pathname.includes('/logs')) json = { rows: [], next_cursor: null }
     else if (url.pathname === '/api/v1/alerts') json = { rows: [{ id: 1, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', state: 'OPEN', message: 'Terminal clock requires review.', details: {}, first_seen_at: '2026-08-01T12:00:00Z', last_seen_at: '2026-08-01T17:00:00Z', acknowledged_at: null, resolved_at: null, device: { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id, hardware_id: device.hardware_id } }], next_cursor: null, totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 } }
@@ -444,12 +451,20 @@ test('nationwide fleet keeps clustered city beacons stable and location details 
   if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('nationwide-map.png'), fullPage: true })
 })
 
-test('primary routes and device deep link remain usable', async ({ page }) => {
+test('primary routes and device deep link remain usable', async ({ page }, testInfo) => {
   await page.goto('/fleet')
   await page.getByRole('button', { name: /Islamabad, 1 device, All online/i }).click()
   await page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' }).click()
   await expect(page).toHaveURL(/\/fleet\/connector-one$/)
   await expect(page.getByRole('dialog', { name: 'SLICTOWER · 3rd Floor' })).toBeVisible()
+  const custody = page.getByRole('article', { name: 'ZKT ADD custody' })
+  await expect(custody.getByRole('heading', { name: 'Preserved records need processing repair' })).toBeVisible()
+  await custody.locator('summary').click()
+  await expect(custody.getByText('Protocol review', { exact: true })).toBeVisible()
+  await expect(custody.getByText('Not established by custody')).toBeVisible()
+  const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
+  expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
+  if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
   await page.getByRole('button', { name: 'Close dialog' }).click()
 
   const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })

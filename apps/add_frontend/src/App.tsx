@@ -838,7 +838,7 @@ function DashboardApp() {
         {view === 'firmware' && <Suspense fallback={<WorkspaceLoading label="Opening firmware" />}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
         {view === 'alerts' && <Suspense fallback={<WorkspaceLoading label="Opening alerts" />}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
-      {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
+      {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} custodyRevision={revisions.attendance + revisions.reconciliation} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
       {toast.toast && createPortal(
         <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}>
           <Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />

@@ -121,7 +121,11 @@ Authenticated `GET /api/v1/devices/{connector_id}/zkt-custody` exposes paginated
 work states and missing-work detection, never raw bytes or employee identity.
 Receipts predating the work contract have a bounded idempotent backfill helper;
 an orphan receipt blocks writer activation until repaired. This is a backend
-status interface; the dashboard presentation still needs integration.
+status interface. The ZKT device overview also presents these work states,
+responsible teams and recent reasons without raw bytes or employee identity.
+Its 30-second refresh, request deadline and per-snapshot evidence age are
+independent of stream liveness. Unknown/failed/old/wrong-device responses do
+not become zero counts, and a source association never becomes an Oracle pass.
 
 The ADD fact decoder supports explicit 8/16/40-byte historical and
 12/32/36/52-byte live layouts. It checks record boundaries and calendar dates,
