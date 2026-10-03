@@ -118,6 +118,7 @@ def start_run(
     if (
         storage.get("durability") != "HEALTHY"
         or storage.get("persistence_verified") is not True
+        or bool(storage.get("persistence_probe_error"))
         or storage.get("recovery_complete") is not True
         or storage.get("error_code")
         or storage.get("upgrade_ready") is not True

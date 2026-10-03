@@ -11,6 +11,20 @@ const healthy: FirmwareDiagnostics = {
   workers: [], queues: [],
 }
 describe('firmware preservation evidence', () => {
+  it('separates an active probe error from historical failures and a healthy claim', () => {
+    const diagnostics = { ...healthy, storage: { ...healthy.storage!, persistence_probe_error: 5,
+      persistence_probe_operation: 'persistence_sync', persistence_probe_failures: 3,
+      persistence_probe_total_failures: 12 } }
+    const { rerender } = render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
+    expect(screen.getByRole('heading', { name: 'Local storage needs attention' })).toBeTruthy()
+    expect(screen.getByText('persistence_sync · 5')).toBeTruthy()
+    rerender(<FirmwareHealth bootId="current" diagnostics={{ ...diagnostics, storage: {
+      ...diagnostics.storage, persistence_probe_error: 0, persistence_probe_failures: 0,
+    } }} observedAt={new Date().toISOString()} />)
+    expect(screen.getByRole('heading', { name: 'Local storage verified' })).toBeTruthy()
+    expect(screen.getByText('12')).toBeTruthy()
+    expect(screen.queryByText('Active persistence probe error')).toBeNull()
+  })
   it('does not turn absent legacy diagnostics into healthy zero values', () => {
     render(<FirmwareHealth />)
     expect(screen.getByRole('heading', { name: 'Local durability not reported' })).toBeTruthy()

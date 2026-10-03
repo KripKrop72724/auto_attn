@@ -1,11 +1,13 @@
 from pathlib import Path
 import shutil
 import subprocess
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path):
+@pytest.mark.parametrize('hikvision', [0, 1])
+def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path, hikvision):
     main = ROOT / 'firmware/zone_lite/main'
     source = (main / 'queue_store.c').read_text()
     start = source.index('bool qs_verify_persistence(void)')
@@ -41,30 +43,69 @@ static int nvs_set_blob(int h,const char *key,const void *p,size_t n){(void)h;as
 static int nvs_commit(int h){(void)h;return fail_nvs?-1:0;}
 static void nvs_close(int h){(void)h;}
 static int nvs_get_blob(int h,const char *key,void *p,size_t *n){(void)h;(void)key;assert(*n==32);memcpy(p,stored,32);if(corrupt_nvs)((char*)p)[0]^=1;return 0;}
+#if ZONE_LITE_HIKVISION
 static void record_queue_result(dq_result_t r,const char *op,bool writing){assert(r==DQ_IO && writing);health.last_error=5;health.last_operation=op;}
+#else
+static int64_t now_us;
+static int64_t esp_timer_get_time(void){return now_us;}
+#endif
 /* PRODUCTION */
+static bool attempt_probe(void){
+#if !ZONE_LITE_HIKVISION
+ now_us+=61000000;
+#endif
+ return qs_verify_persistence();
+}
 int main(void){
- assert(!qs_verify_persistence());assert(writes==0);
- health.recovery_complete=true;assert(qs_verify_persistence());assert(health.persistence_verified && writes==1);
- assert(qs_verify_persistence() && writes==1); /* no recurring flash wear */
+ assert(!attempt_probe());assert(writes==0);
+ health.recovery_complete=true;assert(attempt_probe());assert(health.persistence_verified && writes==1);
+ assert(attempt_probe() && writes==1); /* no recurring flash wear */
  health=(qs_health_t){.recovery_complete=true};fail_fs=1;
- assert(!qs_verify_persistence() && !health.persistence_verified && !health.last_error);
+ assert(!attempt_probe() && !health.persistence_verified && !health.last_error);
  assert(health.persistence_probe_failures==1 && writes==1);
- fail_fs=0;assert(qs_verify_persistence() && health.persistence_verified && !health.last_error);
+ fail_fs=0;assert(attempt_probe() && health.persistence_verified && !health.last_error);
  assert(health.persistence_probe_failures==0 && writes==2); /* transient retry proves both stores */
  health=(qs_health_t){.recovery_complete=true};fail_fs=1;
- for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ for(int i=0;i<3;i++)assert(!attempt_probe());
+#if ZONE_LITE_HIKVISION
  assert(!health.persistence_verified && health.last_error);
  assert(!strcmp(health.last_operation,"persistence_sync"));
- fail_fs=0;assert(!qs_verify_persistence()); /* established fault remains latched */
+ fail_fs=0;assert(!attempt_probe()); /* Hikvision's existing policy is unchanged. */
+#else
+ assert(!health.persistence_verified && !health.last_error && health.persistence_probe_error==EIO);
+ assert(!strcmp(health.persistence_probe_operation,"persistence_sync"));
+ assert(health.persistence_probe_total_failures==3);
+ fail_fs=0;
+ assert(!qs_verify_persistence()); /* Retry deadline avoids recurring flash writes. */
+ assert(writes==2);
+ assert(attempt_probe() && health.persistence_verified && !health.persistence_probe_error);
+ assert(health.persistence_probe_total_failures==3 && !health.persistence_probe_failures);
+#endif
  health=(qs_health_t){.recovery_complete=true};fail_nvs=1;
- for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ for(int i=0;i<3;i++)assert(!attempt_probe());
+#if ZONE_LITE_HIKVISION
  assert(!health.persistence_verified && health.last_error);
  assert(!strcmp(health.last_operation,"persistence_nvs_commit"));
+#else
+ assert(!health.persistence_verified && health.persistence_probe_error==-1 && !health.last_error);
+ assert(!strcmp(health.persistence_probe_operation,"persistence_nvs_commit"));
+ health.last_error=EBADMSG;health.last_operation="segment_verify";
+ int before=writes;fail_nvs=0;
+ assert(!attempt_probe() && writes==before); /* An unrelated incident is not cleared. */
+ assert(health.last_error==EBADMSG && health.persistence_probe_error==-1);
+#endif
  health=(qs_health_t){.recovery_complete=true};fail_nvs=0;corrupt_nvs=1;
- for(int i=0;i<3;i++)assert(!qs_verify_persistence());
+ for(int i=0;i<3;i++)assert(!attempt_probe());
+#if ZONE_LITE_HIKVISION
  assert(!health.persistence_verified && health.last_error);
  assert(!strcmp(health.last_operation,"persistence_nvs_read"));
+#else
+ assert(!health.persistence_verified && health.persistence_probe_error==EIO && !health.last_error);
+ assert(!strcmp(health.persistence_probe_operation,"persistence_nvs_read"));
+ corrupt_nvs=0;health.persistence_verified=true; /* Unrelated append cannot substitute for a probe. */
+ int previous=writes;assert(attempt_probe() && writes==previous+1);
+ assert(!health.persistence_probe_error && !health.persistence_probe_operation);
+#endif
  return 0;
 }
 '''
@@ -72,5 +113,6 @@ int main(void){
     unit.write_text(harness.replace('/* PRODUCTION */', body))
     exe = tmp_path / 'proof'
     subprocess.run([shutil.which('cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra', '-Werror',
-                    '-fsanitize=address,undefined', '-I', str(main), str(unit), '-o', str(exe)], check=True)
+                    '-fsanitize=address,undefined', f'-DZONE_LITE_HIKVISION={hikvision}',
+                    '-I', str(main), str(unit), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

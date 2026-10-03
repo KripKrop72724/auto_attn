@@ -102,6 +102,9 @@ class StorageDiagnostics(BaseModel):
     write_failures: int | None = Field(default=None, ge=0)
     read_failures: int | None = Field(default=None, ge=0)
     persistence_probe_failures: int | None = Field(default=None, ge=0)
+    persistence_probe_total_failures: int | None = Field(default=None, ge=0)
+    persistence_probe_error: int | None = None
+    persistence_probe_operation: str | None = Field(default=None, max_length=80)
     fault_class: Literal["NONE", "LOCK_CONTENTION", "CAPACITY", "MISSING_FILE", "CORRUPTION",
                          "ALLOCATION", "PERSISTENCE", "RECOVERY"] | None = None
     rejected_optional_writes: int | None = Field(default=None, ge=0)

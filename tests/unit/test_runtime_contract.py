@@ -20,10 +20,15 @@ def test_legacy_requirements_are_preserved_and_journal_does_not_need_esp_oracle(
 
 def test_probe_failures_and_restart_attempts_survive_schema_validation():
     value = FirmwareDiagnostics.model_validate({
-        "schema_version": 2, "storage": {"persistence_probe_failures": 7},
+        "schema_version": 2, "storage": {"persistence_probe_failures": 7,
+            "persistence_probe_total_failures": 12, "persistence_probe_error": 5,
+            "persistence_probe_operation": "persistence_sync"},
         "workers": [{"name": "add_delivery", "state": "RUNNING",
                      "restart_count": 1, "restart_attempts": 9}],
     }).model_dump()
     assert value["storage"]["persistence_probe_failures"] == 7
+    assert value["storage"]["persistence_probe_total_failures"] == 12
+    assert value["storage"]["persistence_probe_error"] == 5
+    assert value["storage"]["persistence_probe_operation"] == "persistence_sync"
     assert value["workers"][0]["restart_count"] == 1
     assert value["workers"][0]["restart_attempts"] == 9

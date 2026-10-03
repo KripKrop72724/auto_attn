@@ -23,12 +23,12 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const sameBoot = Boolean(diagnostics?.boot_id && bootId && diagnostics.boot_id === bootId)
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
   const storage = diagnostics?.storage
-  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete
+  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error
   const heading = !diagnostics ? 'Local durability not reported'
     : !sameBoot ? 'Durability boot identity is unverified'
       : !fresh ? 'Durability telemetry is stale'
       : verified ? 'Local storage verified'
-        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' ? 'Local storage needs attention'
+        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error ? 'Local storage needs attention'
           : 'Local recovery checks pending'
   return <article className="detail-card wide" aria-label="Firmware preservation health">
     <p className="eyebrow">ATTENDANCE PRESERVATION</p>
@@ -47,6 +47,8 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Write failures</dt><dd>{storage?.write_failures ?? 'Not reported'}</dd></div>
         <div><dt>Read failures</dt><dd>{storage?.read_failures ?? 'Not reported'}</dd></div>
         <div><dt>Persistence probe failures</dt><dd>{storage?.persistence_probe_failures ?? 'Not reported'}</dd></div>
+        <div><dt>Probe failures since boot</dt><dd>{storage?.persistence_probe_total_failures ?? 'Not reported'}</dd></div>
+        {!!storage?.persistence_probe_error && <div><dt>Active persistence probe error</dt><dd>{storage.persistence_probe_operation || 'Operation not reported'} · {storage.persistence_probe_error}</dd></div>}
         <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
         {storage?.error_operation && <div><dt>Last storage error</dt><dd>{storage.error_operation} · {storage.error_code ?? 'No code reported'}</dd></div>}

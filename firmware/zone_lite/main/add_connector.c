@@ -2474,7 +2474,11 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
             !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
             !cJSON_AddNumberToObject(storage, "persistence_probe_failures", measured_health.persistence_probe_failures) ||
+            !cJSON_AddNumberToObject(storage, "persistence_probe_total_failures", measured_health.persistence_probe_total_failures) ||
             !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
+        if (measured_health.persistence_probe_error &&
+            (!cJSON_AddStringToObject(storage, "persistence_probe_operation", measured_health.persistence_probe_operation) ||
+             !cJSON_AddNumberToObject(storage, "persistence_probe_error", measured_health.persistence_probe_error))) goto failed;
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
              !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
@@ -2483,7 +2487,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     // recovery/write result is available, report UNKNOWN rather than healthy.
     char local_failure_source[80];
     led_status_local_failure_source(local_failure_source, sizeof(local_failure_source));
-    const char *durability = measured != ESP_OK || measured_health.last_error
+    const char *durability = measured != ESP_OK || measured_health.last_error || measured_health.persistence_probe_error
         ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
         ? "HEALTHY" : "UNKNOWN";
     if (!cJSON_AddStringToObject(storage, "durability", durability) ||
@@ -4133,7 +4137,7 @@ bool add_connector_boot_health_ready(void)
     const char *led = led_status_current_name();
     if (esp_spiffs_info(NULL, &storage_total, &storage_used) != ESP_OK ||
         !storage_health.observed || !storage_health.recovery_complete ||
-        !storage_health.persistence_verified || storage_health.last_error ||
+        !storage_health.persistence_verified || storage_health.last_error || storage_health.persistence_probe_error ||
         !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         time_t now = time(NULL);

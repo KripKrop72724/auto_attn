@@ -134,6 +134,9 @@ export interface FirmwareDiagnostics {
     write_failures?: number | null
     read_failures?: number | null
     persistence_probe_failures?: number | null
+    persistence_probe_total_failures?: number | null
+    persistence_probe_error?: number | null
+    persistence_probe_operation?: string | null
     fault_class?: string | null
     durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
     persistence_verified: boolean
