@@ -39,12 +39,12 @@ class OnboardRequest(BaseModel):
 
 class Envelope(BaseModel):
     schema_version: str = "1"
-    message_id: str
-    connector_id: str
-    boot_id: str
-    seq: int = Field(ge=0)
+    message_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9._:-]+$")
+    connector_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    boot_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    seq: int = Field(ge=0, le=2**63 - 1)
     sent_at: datetime
-    type: str
+    type: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
     payload: dict[str, Any] = Field(default_factory=dict)
 
 

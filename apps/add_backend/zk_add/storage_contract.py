@@ -67,6 +67,12 @@ LOCK_MARKER = DELIVERY_MARKER + ",2.6.14"
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
+    # These releases introduce a new persistent format. Never let them fall
+    # through the pre-contract legacy path while bridge/readers are unfinished.
+    # Replace this guard only with binary reader-marker and exact-predecessor
+    # validation, backed by retained-record migration/rollback tests.
+    if version in {"2.6.16", "2.7.0"}:
+        raise ValueError("Journal bridge reader and rollback compatibility are not yet qualified.")
     contract = manifest.get("queue_storage")
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:

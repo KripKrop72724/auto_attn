@@ -20,6 +20,7 @@ BROWSER_TOPICS = {
     "command_update": "command",
     "user_snapshot": "users",
     "attendance_batch": "attendance",
+    "zkt_observation_batch": "attendance",
     "oracle_receipt_batch": "attendance",
     "queue_evidence": "reconciliation",
     "reconcile_anchor": "reconciliation",

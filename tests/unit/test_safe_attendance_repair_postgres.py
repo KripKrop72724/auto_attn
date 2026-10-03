@@ -49,6 +49,45 @@ def test_overlapping_device_sockets_commit_a_sequence_once(postgres_store):
         assert db.get(Connector, connector_pk).last_sequence == 1
 
 
+def test_overlapping_custody_sockets_return_one_committed_receipt(postgres_store):
+    import base64
+    from threading import Barrier
+    from zk_add.models import ZktObservationReceipt
+    from zk_add.schemas import Envelope
+    from zk_add.web import persist_envelope
+    from zk_add.zkt_custody import observation_id
+
+    sessions, connector_id = postgres_store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        connector.zkt_custody_enabled = True
+        serial = connector.zkt_device.serial
+        connector.zkt_device.confirmed_serial = serial
+        connector_pk = connector.id
+        db.commit()
+    raw = b"synthetic source frame"
+    observation = {
+        "observation_id": observation_id(serial, "a" * 32, 1),
+        "terminal_serial": serial, "capture_epoch": "a" * 32, "capture_sequence": 1,
+        "captured_at": utc_now().isoformat(), "raw_b64": base64.b64encode(raw).decode(),
+        "raw_digest": hashlib.sha256(raw).hexdigest(), "raw_format": "UNKNOWN",
+        "decoder_profile": "unqualified", "decoder_version": "1", "time_quality": "UNKNOWN",
+    }
+    envelope = Envelope(message_id="custody-race", connector_id=connector_id, boot_id="test", seq=1,
+                        sent_at=utc_now(), type="zkt_observation_batch",
+                        payload={"schema_version": 1, "observations": [observation]})
+    barrier = Barrier(2)
+    def receive():
+        barrier.wait(timeout=5)
+        return persist_envelope(connector_pk, envelope).ack
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(lambda _: receive(), range(2)))
+    assert receipts[0]["items"][0]["receipt_id"] == receipts[1]["items"][0]["receipt_id"]
+    assert sum(row["items"][0]["replay"] for row in receipts) == 1
+    with sessions() as db:
+        assert db.scalar(select(func.count(ZktObservationReceipt.id))) == 1
+
+
 @pytest.fixture()
 def postgres_store(store, monkeypatch):
     url = os.environ.get("ADD_SAFE_REPAIR_TEST_DATABASE_URL")

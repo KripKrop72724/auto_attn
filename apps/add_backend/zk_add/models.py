@@ -55,6 +55,7 @@ class Connector(Base):
     firmware_family: Mapped[str] = mapped_column(String(16), default="zkt", server_default="zkt")
     terminal_vendor: Mapped[str] = mapped_column(String(16), default="zkt", server_default="zkt")
     terminal_protocol: Mapped[str] = mapped_column(String(24), default="zkt_tcp", server_default="zkt_tcp")
+    zkt_custody_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     firmware_diagnostics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     firmware_diagnostics_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ota_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
@@ -364,6 +365,8 @@ class AttendanceEvent(Base):
     identity_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     identity_repaired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     identity_repair_reason: Mapped[str | None] = mapped_column(String(120))
+    identity_checked_revision: Mapped[int | None] = mapped_column(Integer)
+    identity_retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     manual_release_required: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False, index=True
     )
@@ -446,6 +449,60 @@ Index(
         "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
     ),
 )
+
+
+class ZktObservationReceipt(Base):
+    """Immutable custody, independent of parsing, identity and Oracle success."""
+    __tablename__ = "add_zkt_observation_receipts"
+    __table_args__ = (
+        UniqueConstraint("connector_id", "observation_id", "payload_digest",
+                         name="uq_add_zkt_observation_receipt"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(String(36), unique=True, default=lambda: str(uuid4()))
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    observation_id: Mapped[str] = mapped_column(String(64), index=True)
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    raw_digest: Mapped[str | None] = mapped_column(String(64), index=True)
+    terminal_serial: Mapped[str | None] = mapped_column(String(120))
+    capture_epoch: Mapped[str | None] = mapped_column(String(32))
+    capture_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    decoder_profile: Mapped[str | None] = mapped_column(String(80))
+    decoder_version: Mapped[str | None] = mapped_column(String(40))
+    protected_observation: Mapped[str] = mapped_column(Text)
+    disposition: Mapped[str] = mapped_column(String(40))
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    committed_at: Mapped[datetime] = utc_column()
+
+
+class ZktOccurrenceAlias(Base):
+    """Verified source coordinates; identical bytes at two ordinals stay distinct."""
+    __tablename__ = "add_zkt_occurrence_aliases"
+    __table_args__ = (
+        UniqueConstraint("zkt_device_id", "source_epoch_id", "ordinal",
+                         name="uq_add_zkt_occurrence_coordinates"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    occurrence_id: Mapped[str] = mapped_column(String(64), unique=True)
+    zkt_device_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_devices.id"))
+    source_epoch_id: Mapped[int] = mapped_column(ForeignKey("add_terminal_source_epochs.id"))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    manifest_id: Mapped[int] = mapped_column(ForeignKey("add_terminal_record_manifest.id"), unique=True)
+    raw_digest: Mapped[str] = mapped_column(String(64))
+    # This link preserves an existing event UID and Oracle key, if present.
+    attendance_event_id: Mapped[int | None] = mapped_column(ForeignKey("add_attendance_events.id"))
+    created_at: Mapped[datetime] = utc_column()
+
+
+class ZktObservationLink(Base):
+    """One observation may be bound to at most one proved source occurrence."""
+    __tablename__ = "add_zkt_observation_links"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_observation_receipts.id"), unique=True)
+    occurrence_alias_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_occurrence_aliases.id"), index=True)
+    proof_kind: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = utc_column()
 
 
 class AttendanceBatchReceipt(Base):
