@@ -4779,6 +4779,7 @@ from zk_add.ota import (  # noqa: E402
     parse_single_range as _parse_single_range,
     preview_campaign_scope as _preview_firmware_campaign_scope,
     record_progress as _record_firmware_progress,
+    progress_receipt as _firmware_progress_receipt,
     release_page as _release_page,
     resolve_download as _resolve_firmware_download,
     version_at_least as _firmware_version_at_least,
@@ -5003,8 +5004,9 @@ async def firmware_progress(
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
     db.commit()
-    return {"deployment_id": deployment.deployment_id, "state": deployment.status, "confirm": body.state == "BOOTED_PENDING"}
+    return receipt
 
 
 def _firmware_chunks(path: _Path, start: int, end: int):

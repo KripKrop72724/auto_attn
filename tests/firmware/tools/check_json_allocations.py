@@ -203,8 +203,9 @@ static int esp_partition_get_sha256(const esp_partition_t *p,unsigned char diges
 { assert(p==&partition);memset(digest,0x11,32);return fail_hash?-1:0; }
 static void hex_bytes(const unsigned char *input,size_t length,char *out)
 { (void)input;memset(out,'1',length*2);out[length*2]=0; }
-static bool post_json(const char *path,cJSON *root,int *http_status)
+static bool post_json(const char *path,cJSON *root,int *http_status,const char *progress_state)
 {
+    (void)progress_state;
     if(http_status)*http_status=200;
     assert(path[0]);char *body=cJSON_PrintUnformatted(root);if(!body)return false;
     assert(strstr(body,"running_version") && strstr(body,"running_partition") && strstr(body,"image_sha256"));

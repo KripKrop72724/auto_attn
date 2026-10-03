@@ -1,6 +1,7 @@
 #include "ota_manager.h"
 #include "firmware_family.h"
 #include "ota_checkpoint.h"
+#include "ota_progress_receipt.h"
 #include "setup_portal.h"
 
 #include <stdio.h>
@@ -246,7 +247,9 @@ static bool signed_request(
     return err == ESP_OK;
 }
 
-static bool post_json(const char *path, cJSON *root, int *http_status)
+static bool uses_local_boot_confirmation(void);
+
+static bool post_json(const char *path, cJSON *root, int *http_status, const char *progress_state)
 {
     if (http_status) *http_status = 0;
     char *body = cJSON_PrintUnformatted(root);
@@ -259,6 +262,12 @@ static bool post_json(const char *path, cJSON *root, int *http_status)
     ota_response_t response = {.data = response_data, .capacity = OTA_HTTP_RESPONSE_BYTES};
     int status = 0;
     bool ok = signed_request("POST", path, body, &response, &status) && status >= 200 && status < 300;
+    if (ok && progress_state && uses_local_boot_confirmation()) {
+        cJSON *receipt = cJSON_Parse(response.data);
+        ok = ota_progress_receipt_matches(receipt, s_journal.deployment_id,
+            progress_state, s_journal.target_version, s_running_image_digest);
+        cJSON_Delete(receipt);
+    }
     if (http_status) *http_status = status;
     free(response_data);
     free(body);
@@ -297,7 +306,7 @@ static bool report_state(const char *state, const char *error)
         add_running_image_evidence(root);
     if (valid && error && error[0]) valid = cJSON_AddStringToObject(root, "error_code", error) != NULL;
     int http_status = 0;
-    bool ok = valid && post_json(path, root, &http_status);
+    bool ok = valid && post_json(path, root, &http_status, state);
     s_progress_last_http_status = http_status;
     if (ok) s_progress_successes++;
     cJSON_Delete(root);
@@ -312,7 +321,7 @@ static bool report_capability(void)
         cJSON_AddBoolToObject(root, "rollback_enabled", true) &&
         cJSON_AddStringToObject(root, "partition_layout", ZONE_LITE_OTA_PARTITION_LAYOUT) &&
         add_running_image_evidence(root);
-    bool ok = valid && post_json("/device/v2/firmware/capability", root, NULL);
+    bool ok = valid && post_json("/device/v2/firmware/capability", root, NULL, NULL);
     cJSON_Delete(root);
     return ok;
 }
@@ -532,14 +541,73 @@ static void wait_for_capture_safepoint(void)
     }
 }
 
+static bool uses_local_boot_confirmation(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return false;
+#else
+    const esp_app_desc_t *app = esp_app_get_description();
+    return app && !strcmp(app->project_name, "zone_lite") &&
+        (!strcmp(app->version, "2.6.16") || !strcmp(app->version, "2.7.0"));
+#endif
+}
+
+/* Never report a later transition before its preceding local checkpoint is
+ * durable. A lost HTTP response or NVS commit repeats only an idempotent state. */
+static bool report_local_boot_confirmation(void)
+{
+    if (!strcmp(s_journal.state, "LOCAL_VALIDATED")) {
+        if (!report_state("BOOTED_PENDING", "LOCAL_RUNTIME_HEALTHY")) return false;
+        strlcpy(s_journal.state, "BOOT_REPORTED", sizeof(s_journal.state));
+        if (!save_journal()) return false;
+    }
+    if (!strcmp(s_journal.state, "BOOT_REPORTED")) {
+        if (!report_state("RECONCILING", NULL)) return false;
+        strlcpy(s_journal.state, "RECONCILING", sizeof(s_journal.state));
+        if (!save_journal()) return false;
+    }
+    return !strcmp(s_journal.state, "RECONCILING");
+}
+
+static bool confirm_local_boot(void)
+{
+    int64_t deadline = (esp_timer_get_time() / 1000000) + OTA_BOOT_CONFIRM_SECONDS;
+    while ((esp_timer_get_time() / 1000000) < deadline) {
+        s_boot_health_checks++;
+        const char *local_error = add_connector_local_boot_health_error();
+        s_boot_health_last_ready = local_error == NULL;
+        strlcpy(s_last_error, local_error ? local_error : "", sizeof(s_last_error));
+        if (s_boot_health_last_ready) {
+            if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+                strlcpy(s_last_error, "BOOT_LOCAL_MARK_VALID_FAILED", sizeof(s_last_error));
+                return false;
+            }
+            strlcpy(s_journal.state, "LOCAL_VALIDATED", sizeof(s_journal.state));
+            if (!save_journal()) return false;
+            /* Local validity is durable before the first network request.
+             * Remote progress, source certification and HIL stay separate. */
+            return report_local_boot_confirmation();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    (void)report_state("FAILED", "BOOT_HEALTH_TIMEOUT");
+    (void)esp_ota_mark_app_invalid_rollback_and_reboot();
+    return false;
+}
+
 static bool confirm_or_report_rollback(void)
 {
     const esp_app_desc_t *running = esp_app_get_description();
-    if (!s_journal.deployment_id[0] || strcmp(s_journal.state, "READY_TO_BOOT") != 0) return true;
+    if (!running) return false;
+    bool local_pending = !strcmp(s_journal.state, "LOCAL_VALIDATED") ||
+        !strcmp(s_journal.state, "BOOT_REPORTED");
+    if (!s_journal.deployment_id[0] || (!local_pending && strcmp(s_journal.state, "READY_TO_BOOT"))) return true;
     if (strcmp(running->version, s_journal.target_version) != 0) {
         if (!report_state("ROLLED_BACK", "BOOTLOADER_ROLLBACK")) return false;
         return clear_journal();
     }
+    if (local_pending) return report_local_boot_confirmation();
+    if (uses_local_boot_confirmation()) return confirm_local_boot();
     int64_t deadline = (esp_timer_get_time() / 1000000) + OTA_BOOT_CONFIRM_SECONDS;
     int64_t last_health_report = 0;
     bool add_acknowledged = false;

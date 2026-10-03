@@ -62,7 +62,8 @@ def test_ota_version_matching_accepts_connector_and_app_formats() -> None:
     assert not version_at_least("2.1.99", "2.2.0")
 
 
-def test_ota_progress_requires_legal_monotonic_signed_boot_evidence() -> None:
+@pytest.mark.parametrize("terminal_state", ["FAILED", "SUCCEEDED"])
+def test_ota_progress_requires_legal_monotonic_signed_boot_evidence(terminal_state) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -176,6 +177,29 @@ def test_ota_progress_requires_legal_monotonic_signed_boot_evidence() -> None:
             image_sha256="c" * 64,
         )
         assert deployment.status == "BOOTED_PENDING"
+
+        from zk_add.ota import progress_receipt
+        receipt = progress_receipt(session, deployment, requested_state="BOOTED_PENDING")
+        assert receipt["confirm"] and receipt["application_sha256"] == "c" * 64
+        assert receipt["schema_version"] == 1 and receipt["target_version"] == "2.5.0"
+        if terminal_state == "SUCCEEDED":
+            record_progress(session, connector=connector, deployment_public_id=deployment.deployment_id,
+                state="RECONCILING", bytes_written=1024, running_version="2.5.0",
+                running_partition="ota_1", image_sha256="c" * 64)
+        record_progress(session, connector=connector, deployment_public_id=deployment.deployment_id,
+            state=terminal_state, bytes_written=1024, running_version="2.5.0",
+            running_partition="ota_1", image_sha256="c" * 64)
+        # The real endpoint returns its recorded terminal state and release
+        # proof, never echoes the requested pending state or claimed digest.
+        import asyncio
+        from zk_add import web
+        result = asyncio.run(web.firmware_progress(deployment.deployment_id,
+            web._FirmwareProgressIn(state="BOOTED_PENDING", bytes_written=1024,
+                running_version="2.5.0", running_partition="ota_1", image_sha256="d" * 64),
+            (session, connector)))
+        assert result["state"] == terminal_state and not result["confirm"]
+        assert result["application_sha256"] == "c" * 64
+        assert result["deployment_id"] == deployment.deployment_id
 
 
 def test_ota_progress_recovers_a_fast_download_with_lost_checkpoints() -> None:

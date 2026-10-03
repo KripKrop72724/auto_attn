@@ -30,6 +30,7 @@ counts are kept outside this public repository.
 | Slow repeated identity reads in backlog previews | Connector-locked preview batches reuse shared identity evidence and fetch outboxes once; release and delivery revalidate without the preview cache | Mixed-record proof equality/query bound; next-transaction identity conflict; existing 100,000-row responsiveness test | Implemented; no manual jobs created or approved |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
+| OTA boot confirmation waits for ADD or an unused ESP Oracle worker; HTTP success can conceal a rejected state | Exact bridge/writer images validate local preservation, required workers and an authenticated terminal snapshot before contacting ADD; durable stages order reports and typed receipts verify actual deployment state and running image | Local outage, lost-reply, interrupted checkpoint, stale-worker, mark-valid failure, rejected-state and receipt allocation tests; legacy/Hikvision regression builds | Implemented local boot component; remote HIL, operational rollback and signed qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
@@ -53,8 +54,9 @@ still requires ADD's historical continuity checks. Previously accepted records,
 raw bytes and Oracle keys are not rewritten by this guard. Corrections require
 separate derived evidence; a source review note alone cannot clear this hold.
 Source rows and their canonical chain inputs are constructed together: an
-allocation failure returns failure with neither row appended. Seven pinned
-cJSON harnesses now cover the source encoder as well as the existing serializers.
+allocation failure returns failure with neither row appended. Nine pinned
+cJSON harnesses cover the source encoder, source wire contract, OTA progress
+receipts and existing serializers.
 
 ADD also checks older firmware's incoming source claims before ingesting or
 recovering attendance. An 8-byte UID-only record, or a 40-byte record whose
