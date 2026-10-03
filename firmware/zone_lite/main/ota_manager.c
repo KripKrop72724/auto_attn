@@ -30,6 +30,7 @@
 #include "zone_config.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_ota_guard.h"
+#include "zkt_storage_owner.h"
 #endif
 
 #define OTA_NAMESPACE "zone_ota"
@@ -539,6 +540,16 @@ static void wait_for_capture_safepoint(void)
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (uses_local_boot_confirmation()) {
+        /* A capture timeout releases the caller, not its accepted write.
+         * Stop admission only after the terminal owner finishes, then wait
+         * for all accepted journal work. Never kill a task owning storage. */
+        strlcpy(s_last_error, "WAITING_FOR_JOURNAL_QUIESCE", sizeof(s_last_error));
+        while (!zj_owner_quiesce()) vTaskDelay(pdMS_TO_TICKS(20));
+        s_last_error[0] = '\0';
+    }
+#endif
 }
 
 static bool uses_local_boot_confirmation(void)

@@ -7,6 +7,7 @@
 
 typedef struct {
     bool started, ready, operation_running, recovering, checkpoint_recovery_pending;
+    bool quiescing, quiesced;
     bool compatibility_checked, writer_allowed;
     zj_compat_result_t compatibility;
     zj_operation_t operation;
@@ -27,4 +28,9 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata);
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket);
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete);
 bool zj_owner_abandon(uint64_t ticket);
+/* Irreversible until reboot. Refuse new work, finish every accepted request
+ * (including abandoned callers), then stop recovery and filesystem/NVS work.
+ * True means the owner acknowledged completion, not merely request admission.
+ * No lock remains held; callers may continue polling retained replies. */
+bool zj_owner_quiesce(void);
 bool zj_owner_health(zj_owner_health_t *health);

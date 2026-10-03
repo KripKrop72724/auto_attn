@@ -146,6 +146,12 @@ uint32_t add_connector_outbox_depth(void);
 bool add_connector_get_bulk_outbox_depth(uint32_t *depth_out);
 void add_connector_set_activity(const char *activity);
 bool add_connector_begin_exclusive_activity(const char *activity);
+/* The ZKT session owner brackets its entire session, including cleanup.
+ * A restart request prevents another session and waits for this owner to exit.
+ * Unknown restart state is treated as pending until the short lock recovers. */
+bool add_connector_terminal_session_begin(void);
+bool add_connector_terminal_session_end(void);
+bool add_connector_terminal_restart_pending(void);
 bool add_connector_claim_ota_restart(void);
 bool add_connector_begin_pending_command_activity(void);
 bool add_connector_begin_pending_config_activity(void);

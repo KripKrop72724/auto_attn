@@ -114,6 +114,11 @@ int main(void)
     ready(&s,&f,&in); in.now_ms=46000;
     zj_boot_step(&s,port(&f),&in); assert(s.phase==ZJ_BOOT_STALLED && !s.writer_ready);
     ready(&s,&f,&in); in.writer_build=false; step(&s,&f,&in,105); assert(s.phase==ZJ_BOOT_WRITER_DISABLED && !s.writer_ready);
+    ready(&s,&f,&in); f.owner.quiescing=true; step(&s,&f,&in,105);
+    assert(s.phase==ZJ_BOOT_QUIESCING && !s.writer_ready && !s.reader_ready && !zj_boot_local_ready(&s,105));
+    assert(!strcmp(zj_boot_phase_name(s.phase),"QUIESCING"));
+    f.owner.quiesced=true;step(&s,&f,&in,106);
+    assert(s.phase==ZJ_BOOT_QUIESCING && f.captures==1 && f.submissions==1);
 
     memset(&s,0,sizeof(s)); memset(&f,0,sizeof(f)); in=input(100); in.mode=ZJ_BOOT_BRIDGE; healthy(&f,100);
     step(&s,&f,&in,100); step(&s,&f,&in,101); step(&s,&f,&in,102);

@@ -61,6 +61,7 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
         s->phase = ZJ_BOOT_STALLED;
         return;
     }
+    if (owner.quiescing || owner.quiesced) { s->phase = ZJ_BOOT_QUIESCING; return; }
     if (!owner.ready || owner.checkpoint_recovery_pending) { s->phase = ZJ_BOOT_RECOVERING; }
     /* Delivery must start even during checkpoint recovery: the preserved
      * damaged checkpoint itself needs a committed receipt to finish recovery. */
@@ -141,6 +142,6 @@ const char *zj_boot_phase_name(zj_boot_phase_t phase)
 {
     static const char *const names[] = {"DISABLED", "SECURITY_HOLD", "BINDING_HOLD", "STORAGE_WAIT",
         "OWNER_START", "RECOVERING", "TRANSPORT_START", "CHECKING_READER", "READER_HOLD",
-        "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED"};
+        "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "QUIESCING"};
     return (unsigned)phase < sizeof(names) / sizeof(names[0]) ? names[phase] : "UNKNOWN";
 }

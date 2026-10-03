@@ -189,6 +189,7 @@ static SemaphoreHandle_t s_catalog_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
 static bool s_ota_restart_claimed;
+static bool s_terminal_session_active;
 static char s_boot_id[48];
 static uint64_t s_sequence;
 static bool s_started;
@@ -4236,6 +4237,31 @@ bool add_connector_begin_exclusive_activity(const char *activity)
     return started;
 }
 
+bool add_connector_terminal_session_begin(void)
+{
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    bool allowed = !s_ota_restart_claimed && !s_terminal_session_active;
+    if (allowed) s_terminal_session_active = true;
+    xSemaphoreGive(s_lock);
+    return allowed;
+}
+
+bool add_connector_terminal_session_end(void)
+{
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    s_terminal_session_active = false;
+    xSemaphoreGive(s_lock);
+    return true;
+}
+
+bool add_connector_terminal_restart_pending(void)
+{
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return true;
+    bool pending = s_ota_restart_claimed;
+    xSemaphoreGive(s_lock);
+    return pending;
+}
+
 bool add_connector_claim_ota_restart(void)
 {
     if (!s_lock) return false;
@@ -4254,8 +4280,15 @@ bool add_connector_claim_ota_restart(void)
         if (restart_ready) {
             s_ota_restart_claimed = true;
             strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));
+#ifdef ZONE_LITE_HIKVISION
             claimed = true;
+#endif
         }
+#ifndef ZONE_LITE_HIKVISION
+        /* LIVE_CAPTURE can include an in-flight packet or persistence call.
+         * Only the session owner's completed cleanup releases this gate. */
+        claimed = s_ota_restart_claimed && !s_terminal_session_active;
+#endif
         xSemaphoreGive(s_lock);
     }
     return claimed;

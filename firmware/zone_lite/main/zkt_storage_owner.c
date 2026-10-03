@@ -237,8 +237,16 @@ static void task(void *context)
         while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
         o->health.sampled_uptime_us = (uint64_t)esp_timer_get_time();
         bool work = zj_mailbox_begin(&o->mailbox, &request, &ticket);
-        bool repair = !work && (!o->store.ready || !o->state.ready) &&
+        bool repair = !o->health.quiescing && !work && (!o->store.ready || !o->state.ready) &&
             o->health.sampled_uptime_us >= o->retry_at_us;
+        if (o->health.quiescing && !work) {
+            /* This task is the sole executor. Reaching this boundary means
+             * every admitted request has returned and released its resources.
+             * DONE replies can remain without representing unfinished I/O. */
+            o->health.quiesced = true;
+            o->writer_allowed = o->health.writer_allowed = false;
+            o->compatibility_checked = o->health.compatibility_checked = false;
+        }
         if (work || repair) {
             o->health.operation_running = true;
             o->health.recovering = repair || !o->store.ready || !o->state.ready;
@@ -310,7 +318,8 @@ bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
     if (!owner || !enter()) return false;
-    bool ok = zj_mailbox_submit(&owner->mailbox, request, ticket);
+    bool ok = !owner->health.quiescing && zj_mailbox_submit(&owner->mailbox, request, ticket);
+    if (owner->health.quiescing) ++owner->mailbox.refused;
     xSemaphoreGive(mailbox_lock);
     if (ok) xTaskNotifyGive(owner_task);
     return ok;
@@ -329,6 +338,15 @@ bool zj_owner_abandon(uint64_t ticket)
     bool ok = zj_mailbox_abandon(&owner->mailbox, ticket);
     xSemaphoreGive(mailbox_lock);
     return ok;
+}
+bool zj_owner_quiesce(void)
+{
+    if (!owner || !enter()) return false;
+    owner->health.quiescing = true;
+    bool complete = owner->health.quiesced;
+    xSemaphoreGive(mailbox_lock);
+    xTaskNotifyGive(owner_task);
+    return complete;
 }
 bool zj_owner_health(zj_owner_health_t *health)
 {
