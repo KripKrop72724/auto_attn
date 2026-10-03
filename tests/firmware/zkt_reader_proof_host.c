@@ -89,6 +89,7 @@ int main(void)
     for (unsigned byte = 0; byte < ZJ_READER_PROOF_BYTES; ++byte) {
         storage.bytes[byte] ^= 1;
         assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_CORRUPT);
+        assert(zj_reader_check_selected(port(), &w, &current, &b, &previous) == ZJ_COMPAT_CORRUPT);
         assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_CORRUPT);
         assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_CORRUPT && !storage.writes);
         assert(!zj_reader_proof_decode(storage.bytes, &decoded, &generation) && !generation);
@@ -126,6 +127,8 @@ int main(void)
     assert(zj_reader_check_writer(port(), &w, &current, &changed, &previous) == ZJ_COMPAT_VERSION);
     changed = b; changed.image_validated = false;
     assert(zj_reader_check_writer(port(), &w, &current, &changed, &previous) == ZJ_COMPAT_SECURITY);
+    assert(zj_reader_check_selected(port(), &w, &current, &changed, &previous) == ZJ_COMPAT_OK);
+    assert(!storage.writes); /* Selection retry cannot renew proof or authorize writing. */
     changed = w; changed.reader_ready = false;
     assert(zj_reader_check_writer(port(), &changed, &current, &b, &previous) == ZJ_COMPAT_NOT_READY);
     changed = w; changed.secure_boot = false;
@@ -193,7 +196,7 @@ int main(void)
     assert(!zj_reader_proof_decode(NULL, &decoded, &generation));
     assert(zj_reader_attest((zj_reader_proof_port_t){0}, &b, &previous) == ZJ_COMPAT_INVALID);
     assert(zj_reader_check_writer(port(), NULL, &current, &b, &previous) == ZJ_COMPAT_INVALID);
-    for (unsigned i = ZJ_COMPAT_INVALID; i <= ZJ_COMPAT_PROTECTED_SLOT; ++i)
+    for (unsigned i = ZJ_COMPAT_INVALID; i <= ZJ_COMPAT_ANTI_ROLLBACK; ++i)
         assert(zj_compat_error((zj_compat_result_t)i)[0]);
     assert(!zj_compat_error(ZJ_COMPAT_OK)[0]);
     puts("Durable journal reader proof, rollback identity and interruption checks passed");

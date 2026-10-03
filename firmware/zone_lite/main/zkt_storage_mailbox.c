@@ -28,10 +28,15 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_OTA_CHECK) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_SELECT_READER) return false;
     if (request->operation == ZJ_OTA_CHECK &&
         (!request->input.ota.version[0] || !memchr(request->input.ota.version, 0, sizeof(request->input.ota.version))))
         return false;
+    if (request->operation == ZJ_SELECT_READER) {
+        uint8_t nonzero = 0;
+        for (unsigned i = 0; i < 32; ++i) nonzero |= request->input.reader_selection.image_digest[i];
+        if (!nonzero || !request->input.reader_selection.deadline_us) return false;
+    }
     if (!mailbox->next_ticket || mailbox->occupied == ZJ_REQUEST_SLOTS ||
         (!priority(request->operation) && mailbox->occupied >= ZJ_REQUEST_SLOTS - ZJ_LIVE_RESERVED_SLOTS)) {
         ++mailbox->refused;

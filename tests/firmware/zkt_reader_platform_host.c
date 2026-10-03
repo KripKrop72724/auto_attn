@@ -16,6 +16,9 @@ static esp_partition_t partitions[] = {
 static unsigned running = 3, other = 2, fault, reads, writes, opens, closes, commits, released;
 static bool secure = true, exists, current_valid = true, previous_valid = true, reverse;
 static bool writer_allowed;
+static unsigned boot_slot = 2, selections;
+static int state_override = -1;
+static int64_t clock_us = 1000000;
 static uint8_t durable[ZJ_READER_PROOF_BYTES], pending[ZJ_READER_PROOF_BYTES], epoch[16] = {77};
 struct iterator { unsigned index; };
 static struct iterator iterator;
@@ -26,9 +29,30 @@ const esp_partition_t *esp_ota_get_next_update_partition(const void *p)
 int esp_ota_get_partition_description(const esp_partition_t *p, esp_app_desc_t *out)
 { assert(p == &partitions[other]); *out = prior; return fault == 4 ? -1 : 0; }
 int esp_partition_get_sha256(const esp_partition_t *p, uint8_t *out)
-{ memset(out, p->subtype, 32); if (fault == 5) out[0] ^= 1; return fault == 6 ? -1 : 0; }
+{ memset(out, p->subtype, 32); if (fault == 5) out[0] ^= 1;
+  if (fault == 25) clock_us += 5000001;
+  return fault == 6 ? -1 : 0; }
 int esp_ota_get_state_partition(const esp_partition_t *p, esp_ota_img_states_t *state)
-{ *state = (p == &partitions[running] ? current_valid : previous_valid) ? ESP_OTA_IMG_VALID : 1; return fault == 7 ? -1 : 0; }
+{ *state = p == &partitions[other] && state_override >= 0 ? state_override :
+    (p == &partitions[running] ? current_valid : previous_valid) ? ESP_OTA_IMG_VALID : 1;
+  return fault == 7 ? -1 : 0; }
+int64_t esp_timer_get_time(void) { return clock_us; }
+const esp_partition_t *esp_ota_get_boot_partition(void)
+{
+    if (fault == 26) clock_us += 5000001;
+    if (fault == 18 || (fault == 23 && selections)) return NULL;
+    if (fault == 24 && selections) return &partitions[running];
+    return &partitions[boot_slot];
+}
+int esp_ota_set_boot_partition(const esp_partition_t *p)
+{
+    assert(p == &partitions[other]);
+    ++selections;
+    if (fault == 21) return -1;
+    boot_slot = other;
+    state_override = ESP_OTA_IMG_NEW;
+    return fault == 22 ? -1 : 0;
+}
 esp_partition_iterator_t esp_partition_find(int type, int subtype, const char *label)
 { assert(type == 255 && subtype == 255 && !label); iterator.index = 0; return fault == 8 ? NULL : &iterator; }
 const esp_partition_t *esp_partition_get(esp_partition_iterator_t it)
@@ -90,11 +114,21 @@ static zj_compat_result_t update(void)
     assert(writes == initial && opens == closes);
     return result;
 }
+static zj_compat_result_t select_reader(void)
+{
+    uint8_t expected[32]; memset(expected, 17, sizeof(expected));
+    unsigned initial = writes;
+    zj_compat_result_t result = zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000000U);
+    assert(writes == initial && opens == closes);
+    return result;
+}
 int main(void)
 {
 #if !CONFIG_NVS_ENCRYPTION
     assert(check() == ZJ_COMPAT_SECURITY && !writes);
     assert(update() == ZJ_COMPAT_SECURITY && !writes);
+    assert(select_reader() == ZJ_COMPAT_SECURITY && !selections);
     return 0;
 #else
     current_valid = false;
@@ -122,6 +156,81 @@ int main(void)
     strcpy(app.version, ZJ_WRITER_VERSION); running = 2; other = 3; current_valid = false;
     assert(update() == ZJ_COMPAT_PROTECTED_SLOT);
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
+#if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
+    assert(select_reader() == ZJ_COMPAT_ANTI_ROLLBACK && !selections);
+#else
+    for (unsigned f = 1; f <= 13; ++f) {
+        fault = f;
+        assert(select_reader() != ZJ_COMPAT_OK && !selections);
+    }
+    fault = 0;
+    uint8_t expected[32]; memset(expected, 17, sizeof(expected));
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        NULL, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_INVALID);
+    expected[0] ^= 1;
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_ROLLBACK && !selections);
+    expected[0] ^= 1;
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us) == ZJ_COMPAT_SELECTION_EXPIRED && !selections);
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000001U) == ZJ_COMPAT_SELECTION_EXPIRED && !selections);
+    fault = 25;
+    assert(select_reader() == ZJ_COMPAT_SELECTION_EXPIRED && !selections);
+    fault = 26;
+    assert(select_reader() == ZJ_COMPAT_SELECTION_EXPIRED && !selections);
+    fault = 18;
+    assert(select_reader() == ZJ_COMPAT_SELECTION_UNCERTAIN && !selections);
+    fault = 0;
+    boot_slot = 0;
+    assert(select_reader() == ZJ_COMPAT_ROLLBACK && !selections);
+    boot_slot = running;
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        if (invalid == ESP_OTA_IMG_VALID) continue;
+        state_override = invalid;
+        assert(select_reader() == ZJ_COMPAT_SECURITY && !selections);
+    }
+    state_override = -1;
+    uint8_t saved_proof[ZJ_READER_PROOF_BYTES]; memcpy(saved_proof, durable, sizeof(durable));
+    durable[80] ^= 1;
+    assert(select_reader() == ZJ_COMPAT_CORRUPT && !selections);
+    memcpy(durable, saved_proof, sizeof(durable));
+    assert(zj_reader_platform_select("CHANGED", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_BINDING && !selections);
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, false, false,
+        expected, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_NOT_READY && !selections);
+    memset(prior.version, 'x', sizeof(prior.version));
+    assert(select_reader() == ZJ_COMPAT_IO && !selections);
+    strcpy(prior.version, ZJ_BRIDGE_VERSION);
+    memset(prior.project_name, 'x', sizeof(prior.project_name));
+    assert(select_reader() == ZJ_COMPAT_IO && !selections);
+    strcpy(prior.project_name, "zone_lite");
+    assert(select_reader() == ZJ_COMPAT_OK && selections == 1 && boot_slot == other);
+    /* IDF changes VALID to NEW. Lost success is repeatable without another
+     * otadata write, but cannot grant writer permission from the NEW slot. */
+    assert(select_reader() == ZJ_COMPAT_OK && selections == 1);
+    durable[80] ^= 1;
+    assert(select_reader() == ZJ_COMPAT_CORRUPT && selections == 1);
+    memcpy(durable, saved_proof, sizeof(durable));
+    assert(check() == ZJ_COMPAT_SECURITY && !writer_allowed);
+    expected[0] ^= 1;
+    assert(zj_reader_platform_select("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_ROLLBACK && selections == 1);
+    expected[0] ^= 1;
+    for (int invalid = 1; invalid < 5; ++invalid) {
+        if (invalid == ESP_OTA_IMG_VALID) continue;
+        state_override = invalid;
+        assert(select_reader() == ZJ_COMPAT_SECURITY && selections == 1);
+    }
+    for (unsigned f = 21; f <= 24; ++f) {
+        selections = 0; boot_slot = running; state_override = -1; fault = f;
+        assert(select_reader() == ZJ_COMPAT_SELECTION_UNCERTAIN && selections == 1);
+        fault = 0;
+        assert(select_reader() == ZJ_COMPAT_OK);
+        assert(selections == (f == 21 ? 2U : 1U));
+    }
+    selections = 0; boot_slot = running; state_override = -1;
+#endif
     for (unsigned f = 1; f <= 13; ++f) {
         fault = f;
         assert(check() != ZJ_COMPAT_OK && writes == initial_writes);

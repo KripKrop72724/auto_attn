@@ -133,14 +133,15 @@ zj_compat_result_t zj_reader_attest(zj_reader_proof_port_t port,
         memcmp(proof, verify, sizeof(proof))) return ZJ_COMPAT_UNCERTAIN;
     return ZJ_COMPAT_OK;
 }
-zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
+static zj_compat_result_t check_retained_bridge(zj_reader_proof_port_t port,
     const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
-    const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous)
+    const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous,
+    bool require_validated_state)
 {
     if (!identity_valid(current) || !identity_valid(previous)) return ZJ_COMPAT_INVALID;
     zj_compat_result_t result = environment(writer, ZJ_WRITER_VERSION, false, true);
     if (result != ZJ_COMPAT_OK) return result;
-    result = environment(rollback, ZJ_BRIDGE_VERSION, true, false);
+    result = environment(rollback, ZJ_BRIDGE_VERSION, require_validated_state, false);
     if (result != ZJ_COMPAT_OK) return result;
     if (!separate_slots(current, previous)) return ZJ_COMPAT_ROLLBACK;
     uint8_t proof[ZJ_READER_PROOF_BYTES];
@@ -150,6 +151,18 @@ zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
     if (result != ZJ_COMPAT_OK) return result;
     if (!binding_equal(current, previous) || !binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
     return image_equal(previous, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
+}
+zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
+    const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
+    const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous)
+{
+    return check_retained_bridge(port, writer, current, rollback, previous, true);
+}
+zj_compat_result_t zj_reader_check_selected(zj_reader_proof_port_t port,
+    const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
+    const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous)
+{
+    return check_retained_bridge(port, writer, current, rollback, previous, false);
 }
 zj_compat_result_t zj_reader_check_update(zj_reader_proof_port_t port,
     const zj_reader_environment_t *bridge, const zj_reader_identity_t *current,
@@ -191,6 +204,9 @@ const char *zj_compat_error(zj_compat_result_t result)
         case ZJ_COMPAT_EXHAUSTED: return "JOURNAL_READER_GENERATION_EXHAUSTED";
         case ZJ_COMPAT_UPDATE_TARGET: return "JOURNAL_OTA_TARGET_UNSUPPORTED";
         case ZJ_COMPAT_PROTECTED_SLOT: return "JOURNAL_ROLLBACK_SLOT_PROTECTED";
+        case ZJ_COMPAT_SELECTION_EXPIRED: return "JOURNAL_READER_SELECTION_EXPIRED";
+        case ZJ_COMPAT_SELECTION_UNCERTAIN: return "JOURNAL_READER_SELECTION_UNCERTAIN";
+        case ZJ_COMPAT_ANTI_ROLLBACK: return "JOURNAL_READER_ANTI_ROLLBACK_UNQUALIFIED";
         default: return "JOURNAL_READER_RESULT_UNKNOWN";
     }
 }

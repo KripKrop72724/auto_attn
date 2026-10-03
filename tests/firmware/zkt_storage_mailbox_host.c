@@ -76,5 +76,16 @@ int main(void)
     request.operation = ZJ_APPEND;
     assert(zj_mailbox_submit(&mailbox, &request, &ticket));
     assert(zj_mailbox_begin(&mailbox, &work, &running) && running == ticket);
+    zj_mailbox_init(&mailbox);
+    request = (zj_request_t){.operation = ZJ_SELECT_READER};
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.input.reader_selection.deadline_us = 5000000;
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.input.reader_selection.image_digest[0] = 17;
+    assert(zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.input.reader_selection.image_digest[0] = 99;
+    request.input.reader_selection.deadline_us = 1;
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == ticket);
+    assert(work.input.reader_selection.image_digest[0] == 17 && work.input.reader_selection.deadline_us == 5000000);
     return 0;
 }

@@ -213,6 +213,43 @@ worker starts, attempts and reader-check results. ADD displays their evidence
 age against the parent boot/sample, including 32-bit uptime wrap. A local
 startup pass cannot assert source coverage or Oracle completion.
 
+## Local bridge selection component
+
+The storage owner accepts `ZJ_SELECT_READER` with an exact expected bridge
+application digest and a local monotonic deadline no more than five seconds
+away. The ESP adapter verifies the current writer, retained reader attestation,
+terminal/key epoch, partition layout, actual bridge hash, application family,
+version and OTA state. It then selects the existing slot and reads back boot
+selection. It never downloads or writes an application partition.
+
+The target build configuration uses secure boot and encrypted NVS with
+anti-rollback disabled. Selection refuses anti-rollback builds because the
+pinned ESP-IDF setter can erase an image rejected by its security-version check.
+No security configuration or eFuse is changed by this operation.
+
+Selecting a validated bridge makes its OTA state `NEW`. A retry may recognize
+that same selected-but-unbooted image only after rechecking the complete
+attestation and expected hash. It does not rewrite boot selection or grant
+writer permission. `PENDING_VERIFY`, `INVALID`, `ABORTED`, unknown state, changed
+proof and wrong boot slot all remain holds. Failed selection or readback is
+reported as uncertain. Both success and uncertainty revoke cached writer
+permission; a late mailbox request whose deadline expired cannot select a slot.
+
+This is an internal component, with no remotely callable operation yet. Before
+using it, the coordinator must persist the approved exact-artifact intent,
+serialize with OTA/configuration changes, retain uncertain outcomes, reach a
+capture safepoint and verify the resulting boot. The ADD campaign interface,
+durable coordinator and field qualification remain incomplete. No device has
+been rolled back by this implementation work.
+
+Verification: all 190 firmware regressions passed, along with seven targeted
+Linux GCC ASan/UBSan tests and both unsigned ESP-IDF family builds. Fault cases
+cover missing/changed proof, changed terminal identity, wrong digest/slot,
+expired requests, malformed descriptors, rejected/unconfirmed images,
+anti-rollback configuration, selection before/after a lost response, failed
+readback, and owner permission invalidation. Physical interruption of otadata
+writes and field rollback remain unperformed.
+
 ## Raw live packet capture
 
 Raw formats 4 (`LIVE_PACKET`) and 5 (`PACKET_FRAGMENT`) preserve the full ZKT
