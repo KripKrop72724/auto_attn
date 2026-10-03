@@ -134,7 +134,8 @@ def materialize_packet(session: Session, work: ZktCustodyWork) -> bytes | None:
 
 def inspect_source(session: Session, work: ZktCustodyWork) -> None:
     """Associate late source evidence without manufacturing an attendance row."""
-    from zk_add.zkt_custody import Observation, SourceAssociationError, bind_source_occurrence, digest
+    from zk_add.zkt_custody import (Observation, SourceAssociationError, bind_source_occurrence,
+                                   digest, source_occurrence_delivery_hold)
 
     receipts = session.scalars(select(ZktObservationReceipt).join(ZktCustodyWorkReceipt).where(
         ZktCustodyWorkReceipt.work_id == work.id).limit(2)).all()
@@ -180,6 +181,10 @@ def inspect_source(session: Session, work: ZktCustodyWork) -> None:
         # corruption. The bounded fair worker retries; unchanged profile holds
         # and unreferenced records are not continuously rescanned.
         work.next_attempt_at = utc_now() + timedelta(seconds=30)
+        return
+    hold = source_occurrence_delivery_hold(session, connector, identity)
+    if hold:
+        work.state, work.reason_code = "HELD_OCCURRENCE", hold
         return
     work.state, work.reason_code = "SOURCE_ASSOCIATED", "EXACT_CANONICAL_SOURCE_BYTES"
     # Identity and downstream receipt verification are separate obligations.
