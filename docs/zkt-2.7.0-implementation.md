@@ -21,7 +21,7 @@ counts are kept outside this public repository.
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
 | Dual delivery and same-second occurrence identity | Versioned encrypted ADD observation receipts; exact-source occurrence aliases; replay returns receipt even after later transport sequence | `test_zkt_custody.py`, PostgreSQL overlapping-socket test; additive migration/restore | Partial: receiver disabled; journal transport and live/history semantic matching remain open |
-| Competing writes, empty legacy scans, recovery faults | Verified-empty cache with producer invalidation for legacy queues and ADD outboxes | Blocked/legacy drain and admission fault harnesses | Partial: empty scans fixed; storage owner, journal and recovery state machine remain open |
+| Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task | Actual filesystem fault injection, independent crypto vectors, NVS port faults and concurrent owner harness | Partial: journal components implemented; live capture/transport wiring, catalog and legacy handoff remain open |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Implemented; not deployed; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
@@ -112,8 +112,9 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
 1. Durable raw capture before acknowledging interleaved live events; the current
    prepared-read path still relies on terminal-tail recovery and is unqualified.
-2. Single storage owner, compact authenticated journal, nonce reservation,
-   interrupted-write recovery, incremental reclamation and bounded runtime tasks.
+2. Wire the journal storage task to live capture/transport; transfer catalog and
+   legacy storage operations to the same owner. Qualify actual ESP latency,
+   resource headroom, corrupt-checkpoint recovery and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
    recovery of parser-affected history. No force-send or invented identity is allowed.
@@ -129,3 +130,30 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
 **Nationwide remote HIL: INCOMPLETE. Production qualification: INCOMPLETE.**
 No connector has been upgraded or accepted by this implementation work.
+
+## Journal component implementation
+
+The journal byte format and failure behavior are documented in
+[`zkt-journal-v1.md`](zkt-journal-v1.md). Journal code compiles into the ZKT family
+only. There is no call to `zj_owner_start` from the running firmware yet, no
+writer activation, and no change to the published firmware version.
+
+The owner copies requests into eight bounded slots, reserves three slots for
+capture/retirement, and limits priority bursts so delivery reads can progress.
+Its mailbox mutex never spans filesystem/NVS work. A timed-out caller cannot
+free an in-flight request; abandoning a reply does not cancel accepted capture.
+Only a completed durable write returns a capture sequence. The task reports
+operation start, progress, occupancy, saturation and separate NVS/filesystem
+errors. It never deletes or restarts another task that might own a lock.
+
+Host tests use actual files and injected short writes, open/read/seek/sync/close
+failures, interrupted rotation, malformed tails, corrupted records, uncertain
+retirement and uncertain nonce reservations. The key-state harness verifies
+terminal binding, orphan refusal, corruption detection and exact readback.
+The concurrent owner harness demonstrates timeout safety and delivery at full
+capacity. These are software tests, not physical flash qualification.
+
+The CI failure caused by the transport harness's ambiguous C indentation was
+fixed without disabling compiler warnings or tests. PR #260 and its main-branch
+run passed all six CI jobs. Production deployment and its backup restore remain
+tracked separately from this journal development stage.

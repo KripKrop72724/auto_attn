@@ -33,4 +33,8 @@ qs_health_t qs_health(void);
  * Every successful begin must have exactly one end; never wait on a network
  * while admitted. All producers, including legacy writers, share this budget. */
 bool qs_local_begin(qs_admission_t policy, size_t bytes);
+/* Local reads, retirement checkpoints and reclamation still need to run when
+ * capacity has crossed the write ceiling. Success pairs with local_end(true,
+ * 0); the caller reports read/NVS errors under its own operation category. */
+bool qs_local_read_begin(void);
 void qs_local_end(bool persisted, int captured_error);
