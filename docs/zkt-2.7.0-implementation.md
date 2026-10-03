@@ -74,10 +74,12 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
 ## Verification recorded on 3 October 2026
 
-- Full local backend/firmware regression run: 1,378 passed, 26 skipped before
-  the final additional transport/concurrency checks. Skips require specific
+- Full local backend/firmware/companion regression run: 1,385 passed, 27 skipped.
+  Skips require specific
   environments; they are not qualification passes.
-- Frontend: 137 tests passed; TypeScript, production build and bundle budget passed.
+- Frontend: 138 full-suite tests passed, followed by 34 targeted checks including
+  two additional missing/wrong-boot tests; TypeScript, production build and bundle
+  budget passed. Browser matrix: 82 passed, 14 intentionally skipped by viewport.
 - ESP-IDF 5.5.3: ZKT and Hikvision development images compiled. Images are
   unsigned and retain their existing version identities; neither is a 2.7.0 candidate.
 - PostgreSQL: additive migrations and schema check passed. Existing concurrency
@@ -88,6 +90,9 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
   procedure, not a current production backup.
 - PowerShell restore gate tests cover successful restore, restore failure,
   revision mismatch, generated database identity and cleanup.
+- CI now runs all five pinned-cJSON allocation/persistence harnesses; the prior
+  command passed four script names as arguments to the first Python process.
+  Dormant harness extraction/stubs were repaired and all five passed locally.
 
 ## Work that still blocks the requested release
 

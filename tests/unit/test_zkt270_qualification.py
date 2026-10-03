@@ -51,6 +51,8 @@ def test_capacity_uses_actual_record_cost_retained_storage_and_seven_day_headroo
     assert capacity_gate(evidence.model_copy(update={"baseline_days": 29}))["state"] == "UNTESTED"
     assert capacity_gate(evidence.model_copy(update={"record_bytes_max": 512}))["state"] == "FAILED"
     assert capacity_gate(evidence.model_copy(update={"retained_bytes": 6*1024*1024}))["state"] == "FAILED"
+    assert capacity_gate(evidence.model_copy(update={"retained_bytes": 6*1024*1024,
+                                                      "peak_daily_occurrences": 0}))["state"] == "FAILED"
 
 
 def test_remote_pass_does_not_manufacture_physical_qualification():
@@ -77,6 +79,7 @@ def test_promotion_halts_for_regression(change, reason):
 
 def test_short_stale_or_missing_evidence_never_passes():
     for change in ({"installed_at": NOW-timedelta(hours=1)}, {"gates": {}},
-                   {"traces": ()}, {"maximum_telemetry_gap_seconds": 46}):
+                   {"traces": ()}, {"maximum_telemetry_gap_seconds": 46},
+                   {"incidents": ("NEW_UNCLASSIFIED_FAILURE",)}):
         assert device_gate(ready().model_copy(update=change), candidate_digest="a" * 64,
                            now=NOW)["state"] != "PASSED"

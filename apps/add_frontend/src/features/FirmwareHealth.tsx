@@ -20,12 +20,13 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
     return () => window.clearInterval(timer)
   }, [])
   const observed = observedAt ? Date.parse(observedAt) : NaN
-  const sameBoot = !diagnostics?.boot_id || diagnostics.boot_id === bootId
+  const sameBoot = Boolean(diagnostics?.boot_id && bootId && diagnostics.boot_id === bootId)
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
   const storage = diagnostics?.storage
   const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete
   const heading = !diagnostics ? 'Local durability not reported'
-    : !fresh ? 'Durability telemetry is stale'
+    : !sameBoot ? 'Durability boot identity is unverified'
+      : !fresh ? 'Durability telemetry is stale'
       : verified ? 'Local storage verified'
         : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' ? 'Local storage needs attention'
           : 'Local recovery checks pending'
@@ -38,7 +39,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
       <dl>
         <div><dt>Telemetry received</dt><dd>{observedAt ? new Date(observedAt).toLocaleString() : 'Not reported'}{Number.isFinite(observed) ? ` · ${Math.max(0, Math.floor((now - observed) / 1000))} seconds ago` : ''}</dd></div>
         <div><dt>Telemetry sampled</dt><dd>{diagnostics.sampled_at || 'Not reported'}</dd></div>
-        <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Different boot; health is unverified' : ''}</dd></div>
+        <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Boot identity is unverified' : ''}</dd></div>
         <div><dt>Application digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{imageDigest || 'Not reported'}</dd></div>
         <div><dt>Oracle delivery owner</dt><dd>{diagnostics.delivery_authority === 'ADD' ? 'ADD' : 'Legacy delivery paths'}</dd></div>
         <div><dt>Storage used / total</dt><dd>{bytes(storage?.used_bytes)} / {bytes(storage?.total_bytes)}</dd></div>

@@ -38,9 +38,9 @@ def capacity_gate(evidence: CapacityEvidence) -> dict:
     segments = ceil(observations / records_per_segment)
     needed = ceil((observations * evidence.record_bytes_max + segments * evidence.segment_header_bytes)
                   * evidence.filesystem_amplification)
-    available = max(0, evidence.partition_bytes * 75 // 100
-                    - evidence.retained_bytes - evidence.recovery_reserve_bytes)
-    state = "UNTESTED" if evidence.baseline_days < 30 or not evidence.baseline_complete else (
+    available_raw = evidence.partition_bytes * 75 // 100 - evidence.retained_bytes - evidence.recovery_reserve_bytes
+    available = max(0, available_raw)
+    state = "FAILED" if available_raw < 0 else "UNTESTED" if evidence.baseline_days < 30 or not evidence.baseline_complete else (
         "PASSED" if needed <= available else "FAILED")
     return {"state": state, "seven_day_occurrences": observations,
             "required_bytes": needed, "available_bytes": available,
@@ -95,6 +95,7 @@ def device_gate(value: DeviceQualification, *, candidate_digest: str, now: datet
         raise ValueError("TARGET_OUTSIDE_APPROVED_SCOPE")
     reasons = []
     failed = set(value.incidents) & HALT_INCIDENTS
+    reasons.extend(f"UNCLASSIFIED_INCIDENT:{code}" for code in set(value.incidents) - HALT_INCIDENTS)
     if value.application_sha256 != candidate_digest:
         failed.add("WRONG_APPLICATION")
     if value.observed_until > now or value.observed_until < value.installed_at:
