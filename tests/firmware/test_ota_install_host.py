@@ -23,7 +23,7 @@ def test_installer_checks_identity_and_persists_before_slot_selection(tmp_path, 
 #define OTA_RESUME_CHECKPOINT_BYTES (64*1024)
 #define pdMS_TO_TICKS(x) (x)
 typedef int esp_err_t;
-typedef struct { unsigned size,erase_size; } esp_partition_t;
+typedef struct { unsigned size,erase_size,address; } esp_partition_t;
 typedef struct { char project_name[32],version[32]; } esp_app_desc_t;
 typedef void *esp_https_ota_handle_t;
 typedef struct {const char *url; void *crt_bundle_attach;int timeout_ms;bool keep_alive_enable;} esp_http_client_config_t;
@@ -31,9 +31,15 @@ typedef struct {esp_http_client_config_t *http_config;bool partial_http_download
 static void *esp_crt_bundle_attach;
 static ota_journal_t s_journal;
 static char s_last_error[64];
-static esp_partition_t target={OTA_APPLICATION_MAX_BYTES,4096};
+static esp_partition_t target={OTA_APPLICATION_MAX_BYTES,4096,0x2a0000};
 static unsigned stage,saves,fail_save,performs,aborts,finishes,reboots,hashes,begins;
 static bool handle_live,selected,boot_checkpoint,resumed;
+#if !ZONE_LITE_HIKVISION
+static bool refuse_journal;
+static unsigned journal_checks;
+static const char *zj_ota_before_download(uint32_t address,uint32_t size,const char *version)
+{assert(address==target.address && size==target.size && !strcmp(version,s_journal.target_version) && !begins && !selected);++journal_checks;return refuse_journal?"JOURNAL_ROLLBACK_SLOT_PROTECTED":NULL;}
+#endif
 static size_t strlcpy(char *out,const char *in,size_t n) {size_t len=strlen(in);if(n){size_t k=len<n-1?len:n-1;memcpy(out,in,k);out[k]=0;}return len;}
 static const esp_partition_t *esp_ota_get_next_update_partition(const void *arg){(void)arg;return &target;}
 static int esp_https_ota_begin(const esp_https_ota_config_t *c,esp_https_ota_handle_t *h)
@@ -69,6 +75,14 @@ static void reset(void)
 int main(void)
 {
     reset();assert(perform_update() && reboots==1 && finishes==1 && !handle_live);
+#if !ZONE_LITE_HIKVISION
+    assert(journal_checks==1);
+    refuse_journal=true;
+    reset();assert(!perform_update() && !begins && !performs && !finishes && !selected && !reboots);
+    reset();s_journal.bytes_written=65536;assert(!perform_update() && !begins && !performs && !finishes && !selected && !reboots);
+    assert(!strcmp(s_last_error,"JOURNAL_ROLLBACK_SLOT_PROTECTED") && journal_checks==3);
+    refuse_journal=false;
+#endif
     for(stage=1;stage<=10;++stage){
         reset();assert(!perform_update() && !reboots && !handle_live);
         assert(!selected);

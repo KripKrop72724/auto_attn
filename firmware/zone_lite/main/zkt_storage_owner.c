@@ -183,19 +183,29 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
         }
         case ZJ_PEEK: reply->result = zj_store_peek(&o->store, &reply->item); break;
         case ZJ_RECLAIM: reply->result = zj_store_reclaim_step(&o->store); break;
-        case ZJ_READER_CHECK: {
+        case ZJ_READER_CHECK:
+        case ZJ_OTA_CHECK: {
             qs_health_t health = qs_local_health_locked();
             zj_transport_health_t transport;
             bool delivery_ready = zj_transport_health(&transport) && transport.started &&
                 (uint32_t)((uint32_t)(esp_timer_get_time() / 1000) - transport.sampled_ms) < 45000U;
-            o->compatibility = zj_reader_platform_check(o->metadata.terminal_serial,
-                o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
-                health.observed && health.available && health.recovery_complete && health.persistence_verified &&
-                    !health.last_error && !health.persistence_probe_error,
-                o->store.checkpoint_recovery_pending, &o->writer_allowed);
-            o->compatibility_checked = true;
-            reply->compatibility = o->compatibility;
-            reply->result = o->compatibility == ZJ_COMPAT_OK ? ZJ_OK : ZJ_INVALID;
+            bool persistence = health.observed && health.available && health.recovery_complete && health.persistence_verified &&
+                !health.last_error && !health.persistence_probe_error;
+            if (request->operation == ZJ_OTA_CHECK) {
+                /* A rejected install cannot revoke a valid reader/writer or
+                 * alter proof. This operation holds local storage only. */
+                reply->compatibility = zj_reader_platform_update(o->metadata.terminal_serial,
+                    o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
+                    persistence, o->store.checkpoint_recovery_pending,
+                    request->input.ota.address, request->input.ota.size, request->input.ota.version);
+            } else {
+                o->compatibility = zj_reader_platform_check(o->metadata.terminal_serial,
+                    o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
+                    persistence, o->store.checkpoint_recovery_pending, &o->writer_allowed);
+                o->compatibility_checked = true;
+                reply->compatibility = o->compatibility;
+            }
+            reply->result = reply->compatibility == ZJ_COMPAT_OK ? ZJ_OK : ZJ_INVALID;
             break;
         }
         default: reply->result = ZJ_INVALID; break;

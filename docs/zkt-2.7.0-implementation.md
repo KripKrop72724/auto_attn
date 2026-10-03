@@ -27,7 +27,7 @@ counts are kept outside this public repository.
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: gated startup implemented; ESP qualification, catalog and legacy handoff remain open |
 | Slow repeated identity reads in backlog previews | Connector-locked preview batches reuse shared identity evidence and fetch outboxes once; release and delivery revalidate without the preview cache | Mixed-record proof equality/query bound; next-transaction identity conflict; existing 100,000-row responsiveness test | Implemented; no manual jobs created or approved |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
-| Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing | Native/Linux sanitizer and actual ESP adapter fault harnesses | Partial: OTA replacement policy, complete migration and signed bridge qualification remain open |
+| Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
@@ -226,6 +226,12 @@ still block recovery. Encryption identity and nonce allocation never reset.
   distinct attendance rows with equal same-second facts, replay, recovery
   copies and changed source ownership. All 18 custody-panel tests, the production
   frontend build and bundle budget passed.
+- OTA reader interlock: native Clang and Linux GCC sanitizers cover proof
+  corruption, actual slot/image/security checks, stale delivery evidence,
+  refused/late owner checks and repeated failed abandonment. The actual
+  installer refuses fresh and resumed downloads before opening transport when
+  the bridge would be overwritten. Orphaned legacy state and failed/bounded
+  directory reads are held. Both unsigned ESP-IDF family builds pass.
 - Journal startup: native Clang and Linux GCC sanitizer tests cover bootstrap,
   proof deadlines, retries across clock wrap, checkpoint recovery, binding holds,
   stale/stalled evidence and all encrypted-NVS/writer-build combinations of the
@@ -346,8 +352,13 @@ signature before selection. Resume checkpoints are whole erase sectors, with
 old partial checkpoints rewound and EOF checkpoints re-reading the last sector.
 Fault tests exercise both firmware families, all 4,095 offsets inside a sector,
 short/long downloads, failed hashing, signature failure and NVS checkpoints.
-These checks do not establish compatible rollback-slot replacement or physical
-power-loss qualification; those remain separate release requirements.
+The pre-erase journal interlock now permits only the attested bridge-to-writer
+install edge, rechecking actual reader identity through the storage owner.
+Running 2.7.0 cannot overwrite its rollback bridge. This also prevents using
+ordinary reinstallation as a rollback operation; selecting an already-verified
+reader without erasing it still needs an explicit operational path. Legacy
+firmware refuses direct 2.7.0 installation or retained journal evidence.
+Physical power-loss qualification remains a separate release requirement.
 
 1. Qualify and activate durable raw capture before acknowledging live events.
    The ordinary, command-response and prepared-read hooks are implemented under
@@ -399,8 +410,9 @@ controller requires secure boot, encrypted NVS, a provisioned terminal binding,
 verified local storage and an OTA slot. It starts receipt delivery during
 checkpoint recovery, then checks compatibility before permitting capture.
 Successful starts are counted separately from attempts; stale or stalled
-workers are held without task deletion. This does not qualify an artifact or
-complete the bridge, migration or OTA replacement policy.
+workers are held without task deletion. The pre-erase install interlock preserves
+the certified bridge. These components do not qualify an artifact, complete
+legacy migration or provide the operational compatible-rollback selection path.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain
