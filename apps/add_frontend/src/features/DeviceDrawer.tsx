@@ -295,10 +295,10 @@ export function DeviceDrawer({
             <p>Live polling continues during reconciliation. Slow terminal responses can extend the target interval. Full history and Oracle assurance are reported in Reconciliation.</p>
           </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
-            <h3>{device.zkt?.attendance_count == null ? 'Punch count pending' : `${device.zkt.attendance_count.toLocaleString()} terminal punches`}</h3>
+            <h3>{device.zkt?.attendance_count == null ? 'Current terminal count pending' : `${device.zkt.attendance_count.toLocaleString()} records currently on terminal`}</h3>
             <p>{device.zkt?.user_count == null ? 'User count pending' : `${device.zkt.user_count.toLocaleString()} users`}{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : device.zkt?.last_reconcile_at ? ` · Last full reconciliation ${relativeTime(device.zkt.last_reconcile_at)}` : ' · No full reconciliation yet'}</p>
             {device.zkt?.capabilities.source_coverage_certified ? <dl>
-              <div><dt>Source assurance</dt><dd>Certified source with append-tail verification</dd></div>
+              <div><dt>Current source assurance</dt><dd>Certified through the committed cursor with append-tail verification</dd></div>
               <div><dt>Committed source cursor</dt><dd>{device.firmware_diagnostics?.committed_source_cursor ?? device.zkt?.capabilities.source_coverage_cursor ?? 'Not reported'}</dd></div>
             </dl> : <dl>
               <div>
@@ -318,6 +318,7 @@ export function DeviceDrawer({
                 <dd>{Number(device.zkt?.capabilities.history_failed_windows || 0)}</dd>
               </div>
             </dl>}
+            <p>This count and certificate describe the current terminal source. They do not prove a person's complete monthly attendance. Review saved ADD attendance and earlier source epochs in Reconciliation for historical punches.</p>
           </article>}
           <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} bootId={device.boot_id} imageDigest={device.ota_image_sha256} />
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
