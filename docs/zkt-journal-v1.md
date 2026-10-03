@@ -62,9 +62,13 @@ committed and explicit recovery obligation.
 
 Delivery peeks do not retire data. A token includes the segment, exact byte
 extent, sequence and SHA-256 of the bytes. Settlement re-reads the item and
-rejects a changed/stale token. The caller must supply the verified ADD custody
-receipt digest for that exact item; this low-level function cannot itself
-prove a remote transaction. The transport verifier is a separate release gate.
+rejects a changed/stale token. The websocket adapter correlates the pending
+message ID and checks the typed, committed per-item receipt, observation ID,
+payload digest and custody disposition. Generic ACKs cannot authorize retirement.
+Before changing its checkpoint, the storage task reconstructs the current
+item's canonical payload and compares its identity/digest with that receipt's
+expected item. The low-level file library still relies on its trusted caller
+to provide this verified proof.
 
 An 80-byte retirement checkpoint contains its revision, position, last settled
 sequence and ADD receipt digest, protected against accidental corruption by
@@ -76,6 +80,30 @@ At most one completely settled segment is reclaimed per maintenance request.
 Live writes never rewrite an entire outbox. Startup inventories files once;
 an empty queue read does not rescan the filesystem. Admission for new writes
 does not block reads, retirement or reclamation when space is full.
+
+## ADD wire contract
+
+Each request carries one immutable item in `zkt_observation_batch` schema 1.
+The firmware writes JSON keys in canonical order and verifies that cJSON's
+parse/print round trip preserves them. Capture sequence, segment identity,
+capture seconds and monotonic milliseconds use decimal strings to avoid
+binary64 precision loss. Source ordinals and encoded terminal time are bounded
+32-bit numbers. An out-of-range civil capture time retains its original seconds
+with a null formatted time; it does not replace the terminal's original value.
+
+`JOURNAL_EXCEPTION` items identify the exact retained segment extent and raw
+digest. ADD encrypts and receipts those opaque bytes with an explicit exception
+reason. They never become inferred attendance. Ordinary observations and
+exceptions share transactional replay-stable custody; source matching and Oracle
+completion remain separate.
+
+Retirement proof is SHA-256 of canonical JSON containing the domain
+`zkt-add-custody-v1`, observation ID, payload digest, receipt UUID and custody
+disposition. It binds the committed ADD receipt to the local item. It is not an
+Oracle completion certificate. Independent Python/C fixtures cover 64-bit
+values, all base64 padding cases, raw source references and opaque extents.
+The actual socket dispatcher is tested against delayed/duplicate replies,
+generic ACKs, mismatched content and allocation failures.
 
 ## Recovery boundaries
 
@@ -94,6 +122,6 @@ The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 
 The ESP adapter currently owns journal operations only. Catalog and legacy
-queue ownership, live/interleaved capture, ADD transport, bridge reader proof,
+queue ownership, live/interleaved capture, delivery-task integration, bridge reader proof,
 delivery matching and current-incident recovery must be integrated and tested
 before activation. Existing firmware behavior remains gated until then.

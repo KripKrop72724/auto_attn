@@ -2,6 +2,8 @@
 #include "firmware_family.h"
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
 #include "hikvision_runtime.h"
+#else
+#include "zkt_custody_wire.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -198,6 +200,16 @@ static evidence_receipt_t s_evidence_expected;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static add_reconcile_chunk_ack_t s_reconcile_chunk_ack;
 static add_source_tail_ack_t s_source_tail_ack;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static bool s_waiting_zkt_custody;
+static zj_custody_expected_t s_zkt_custody_expected;
+static uint8_t s_zkt_custody_receipt[32];
+static bool custody_digest(void *context, const uint8_t *bytes, size_t length, uint8_t out[32])
+{
+    (void)context;
+    return mbedtls_sha256(bytes, length, out, 0) == 0;
+}
+#endif
 static char s_reconcile_last_job_id[40];
 static uint32_t s_reconcile_last_generation;
 static uint32_t s_reconcile_last_committed_ordinal;
@@ -467,6 +479,29 @@ static bool send_payload(
     evidence_receipt_t expected = {0};
     bool evidence = strcmp(type, "queue_evidence") == 0;
     bool hikvision = strcmp(type, "hikvision_observation") == 0;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    bool custody = strcmp(type, "zkt_observation_batch") == 0;
+    zj_custody_expected_t custody_expected = {0};
+    if (custody) {
+        cJSON *observations = cJSON_GetObjectItemCaseSensitive(payload, "observations");
+        cJSON *item = cJSON_GetArrayItem(observations, 0);
+        cJSON *identity = cJSON_GetObjectItemCaseSensitive(item, "observation_id");
+        if (sanitized_bytes || strlen(payload_json) >= ZJ_CUSTODY_PAYLOAD_MAX ||
+            !cJSON_IsArray(observations) || cJSON_GetArraySize(observations) != 1 ||
+            !cJSON_IsString(identity) || strlen(identity->valuestring) != 64) {
+            cJSON_Delete(payload);
+            return false;
+        }
+        char *material = cJSON_PrintUnformatted(item);
+        uint8_t digest[32];
+        bool hashed = material && custody_digest(NULL, (const uint8_t *)material, strlen(material), digest);
+        free(material);
+        if (!hashed) { cJSON_Delete(payload); return false; }
+        memcpy(custody_expected.observation_id, identity->valuestring, 65);
+        for (unsigned i = 0; i < 32; ++i)
+            snprintf(custody_expected.payload_digest + i * 2, 3, "%02x", digest[i]);
+    }
+#endif
     cJSON *hik_hash = cJSON_GetObjectItemCaseSensitive(payload, "observation_sha256");
     if (hikvision && (!cJSON_IsString(hik_hash) || strlen(hik_hash->valuestring) != 64 || sanitized_bytes)) {
         cJSON_Delete(payload);
@@ -521,6 +556,11 @@ static bool send_payload(
             strlcpy(s_waiting_ack, message_id, sizeof(s_waiting_ack));
             s_waiting_evidence = evidence;
             s_waiting_hikvision = hikvision;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+            s_waiting_zkt_custody = custody;
+            s_zkt_custody_expected = custody_expected;
+            memset(s_zkt_custody_receipt, 0, sizeof(s_zkt_custody_receipt));
+#endif
             if (hikvision) strlcpy(s_hikvision_expected, hik_hash->valuestring, sizeof(s_hikvision_expected));
             s_evidence_expected = expected;
             s_ack_matched = false;
@@ -548,7 +588,8 @@ static bool send_payload_and_wait_for_ack(
     TickType_t lock_timeout,
     TickType_t ack_timeout,
     add_reconcile_chunk_ack_t *reconcile_ack_out,
-    add_attendance_settlement_ack_t *attendance_ack_out)
+    add_attendance_settlement_ack_t *attendance_ack_out,
+    uint8_t *custody_receipt_out)
 {
     bool background = s_outbox_task_handle && xTaskGetCurrentTaskHandle() == s_outbox_task_handle;
     if (background) {
@@ -579,6 +620,14 @@ static bool send_payload_and_wait_for_ack(
             *attendance_ack_out = s_attendance_settlement_ack;
             acknowledged = attendance_ack_out->valid;
         }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (acknowledged && custody_receipt_out) {
+            acknowledged = s_waiting_zkt_custody;
+            if (acknowledged) memcpy(custody_receipt_out, s_zkt_custody_receipt, 32);
+        }
+#else
+        if (custody_receipt_out) acknowledged = false;
+#endif
         s_ack_matched = false;
         xSemaphoreGive(s_lock);
     }
@@ -607,6 +656,7 @@ bool add_connector_send_payload_acknowledged(
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
         NULL,
+        NULL,
         NULL);
 }
 
@@ -623,6 +673,7 @@ bool add_connector_send_reconcile_chunk_acknowledged(
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
         ack_out,
+        NULL,
         NULL);
 }
 
@@ -643,6 +694,7 @@ bool add_connector_send_source_tail_acknowledged(
         portMAX_DELAY,
         pdMS_TO_TICKS(timeout_ms),
         NULL,
+        NULL,
         NULL);
     if (!acknowledged || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
         return false;
@@ -651,6 +703,18 @@ bool add_connector_send_source_tail_acknowledged(
     xSemaphoreGive(s_lock);
     return ack_out->valid;
 }
+
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+bool add_connector_send_zkt_custody_acknowledged(
+    const char *payload_json, uint32_t timeout_ms, uint8_t receipt_digest[32])
+{
+    if (!receipt_digest) return false;
+    memset(receipt_digest, 0, 32);
+    if (!timeout_ms || timeout_ms > 60000) return false;
+    return send_payload_and_wait_for_ack("zkt_observation_batch", payload_json,
+        pdMS_TO_TICKS(2000), pdMS_TO_TICKS(timeout_ms), NULL, NULL, receipt_digest);
+}
+#endif
 
 static const char *storage_key_material(void)
 {
@@ -1899,6 +1963,9 @@ static void parse_inbound(const char *data, size_t len)
          strcmp(type->valuestring, "source_probe_ack") == 0 ||
          strcmp(type->valuestring, "source_tail_ack") == 0 ||
          strcmp(type->valuestring, "queue_evidence_ack") == 0 ||
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+         strcmp(type->valuestring, "zkt_observation_ack") == 0 ||
+#endif
          strcmp(type->valuestring, "hikvision_observation_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -2029,6 +2096,12 @@ static void parse_inbound(const char *data, size_t len)
                     }
                 }
                 s_waiting_ack[0] = '\0';
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+                if (s_waiting_zkt_custody) {
+                    zj_crypto_port_t crypto = {.digest = custody_digest};
+                    s_ack_matched = zj_custody_verify(root, &s_zkt_custody_expected, crypto, s_zkt_custody_receipt);
+                } else
+#endif
                 if (s_waiting_evidence) {
                     evidence_receipt_t receipt;
                     s_ack_matched = strcmp(type->valuestring, "queue_evidence_ack") == 0 &&
@@ -3097,7 +3170,7 @@ bool add_connector_transfer_queue_evidence(
     char *json = ok ? cJSON_PrintUnformatted(payload) : NULL;
     cJSON_Delete(provenance); cJSON_Delete(payload); free(encoded);
     ok = json && send_payload_and_wait_for_ack("queue_evidence", json,
-        pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+        pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL, NULL);
     free(json);
     return ok;
 }
@@ -3198,7 +3271,8 @@ static bool deliver_attendance_payloads_acknowledged(
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS),
                 pdMS_TO_TICKS(ADD_PRIORITY_ACK_TIMEOUT_MS),
                 NULL,
-                &attendance_ack) ||
+                &attendance_ack,
+                NULL) ||
             !attendance_settlement_matches_payload(payloads[i], &attendance_ack)) {
             ok = false;
             break;
@@ -3486,7 +3560,7 @@ bool add_connector_enqueue_oracle_receipts(
         cJSON *payload = record ? cJSON_GetObjectItemCaseSensitive(record, "payload") : NULL;
         char *json = cJSON_IsObject(payload) ? cJSON_PrintUnformatted(payload) : NULL;
         if (json) ok = send_payload_and_wait_for_ack("oracle_receipt_batch", json,
-            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL);
+            pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS), NULL, NULL, NULL);
         free(json);
         cJSON_Delete(record);
     }
@@ -3761,7 +3835,7 @@ static void outbox_task(void *arg)
         s_add_worker_operation = ADD_WORKER_NETWORK;
         bool acknowledged = send_payload_and_wait_for_ack(type->valuestring, payload_json,
             pdMS_TO_TICKS(ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS), pdMS_TO_TICKS(ADD_OUTBOX_ACK_TIMEOUT_MS),
-            NULL, is_attendance ? &attendance_ack : NULL);
+            NULL, is_attendance ? &attendance_ack : NULL, NULL);
         if (acknowledged && is_attendance && !attendance_settlement_matches_payload(payload_json, &attendance_ack))
             acknowledged = false;
         cJSON_Delete(record);

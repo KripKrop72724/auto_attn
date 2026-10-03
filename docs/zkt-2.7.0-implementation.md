@@ -16,17 +16,17 @@ counts are kept outside this public repository.
 
 | Issue | Change | Verification | Status |
 |---|---|---|---|
-| Fresh APIs with stale screens | Canonical browser topics, reconnect/overflow resync, 30-second polling, focus refresh, shared device snapshots and old-response rejection | `test_browser_reliability.py`, `realtime.test.tsx`, existing drawer/App tests | Implemented; local tests passed; not deployed |
+| Fresh APIs with stale screens | Canonical browser topics, reconnect/overflow resync, 30-second polling, focus refresh, shared device snapshots and old-response rejection | `test_browser_reliability.py`, `realtime.test.tsx`, existing drawer/App tests | Deployed in `bd395cc`; authenticated fleet API returns snapshot identity |
 | Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
-| Dual delivery and same-second occurrence identity | Versioned encrypted ADD observation receipts; exact-source occurrence aliases; replay returns receipt even after later transport sequence | `test_zkt_custody.py`, PostgreSQL overlapping-socket test; additive migration/restore | Partial: receiver disabled; journal transport and live/history semantic matching remain open |
+| Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding and strict typed receipt verification | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher and PostgreSQL overlapping-socket tests | Partial: receiver disabled; delivery-task integration and live/history semantic matching remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task | Actual filesystem fault injection, independent crypto vectors, NVS port faults and concurrent owner harness | Partial: journal components implemented; live capture/transport wiring, catalog and legacy handoff remain open |
-| Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Implemented; not deployed; non-roster evidence scheduling needs wider qualification |
+| Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
-| Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Implemented; production backup has not been taken |
+| Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
 
 ## Required release evidence
 
@@ -70,6 +70,13 @@ infrastructure failures roll back and emit no receipt. A changed payload cannot
 replace the original. Replays keep the original receipt and cannot rewind a
 newer boot's telemetry identity. Oracle completion is never asserted by custody.
 
+The firmware adapter sends one immutable item and checks a typed committed
+receipt for its exact identity/digest. Corrupt journal extents use explicit
+`JOURNAL_EXCEPTION` custody. Decimal strings preserve 64-bit counters through
+cJSON. The storage owner recomputes the payload before retirement, rejecting a
+receipt for different bytes. The delivery task and capture activation remain
+gated; no signed candidate is implied by these component checks.
+
 Exact source references bind only against committed canonical manifests with
 matching connector, terminal, source epoch, ordinal and raw digest. The alias
 keeps any existing attendance ID/Oracle key unchanged. Identical raw bytes at
@@ -107,6 +114,10 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 - CI now runs all five pinned-cJSON allocation/persistence harnesses; the prior
   command passed four script names as arguments to the first Python process.
   Dormant harness extraction/stubs were repaired and all five passed locally.
+- Journal/custody integration: 195 firmware and backend tests passed; both family
+  builds, independent crypto/wire vectors and all five allocation harnesses
+  passed. A sixth harness now checks the actual socket custody-ACK dispatcher
+  under delayed, duplicate, mismatched and allocation-failure conditions.
 
 ## Work that still blocks the requested release
 
@@ -124,9 +135,9 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
    and capacity evaluators cannot be substituted for measured evidence.
 6. Thirty-day zone baselines, all-model fixtures, fleet burst/load/catch-up and
    complete fault matrix, seven-day automated soak and source-to-Oracle traces.
-7. Production backup/restore gate, staged backend deployment, all four approved
-   field waves and fourteen-day fleet observation. Karachi and other prerequisite
-   failures remain in the denominator.
+7. Repeat the backup/restore gate for subsequent backend deployments, then all
+   four approved field waves and fourteen-day fleet observation. Karachi and
+   other prerequisite failures remain in the denominator.
 
 **Nationwide remote HIL: INCOMPLETE. Production qualification: INCOMPLETE.**
 No connector has been upgraded or accepted by this implementation work.
@@ -155,5 +166,7 @@ capacity. These are software tests, not physical flash qualification.
 
 The CI failure caused by the transport harness's ambiguous C indentation was
 fixed without disabling compiler warnings or tests. PR #260 and its main-branch
-run passed all six CI jobs. Production deployment and its backup restore remain
-tracked separately from this journal development stage.
+run passed all six CI jobs. Production deployment `37135387664` passed the
+backup restore gate, migration and origin/public health checks for `bd395cc`.
+An authenticated post-deployment fleet query confirmed snapshot identities.
+Journal development and firmware qualification remain separate.

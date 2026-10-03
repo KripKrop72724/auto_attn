@@ -1,6 +1,7 @@
 #include "zkt_storage_owner.h"
 #include "zkt_journal_crypto.h"
 #include "zkt_journal_state.h"
+#include "zkt_custody_wire.h"
 #include "queue_store.h"
 #include <dirent.h>
 #include <errno.h>
@@ -24,6 +25,7 @@ typedef struct {
     char prefix[112];
     int nvs_error;
     uint64_t retry_at_us;
+    char wire_scratch[ZJ_CUSTODY_PAYLOAD_MAX];
 } owner_t;
 static owner_t *owner;
 static SemaphoreHandle_t mailbox_lock;
@@ -146,10 +148,20 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
         case ZJ_APPEND:
             reply->result = zj_store_append(&o->store, &request->input.observation, &reply->capture_sequence);
             break;
-        case ZJ_SETTLE:
-            reply->result = zj_store_settle(&o->store, &request->input.settlement.token,
-                                           request->input.settlement.receipt_digest);
+        case ZJ_SETTLE: {
+            zj_custody_expected_t actual;
+            reply->result = zj_store_peek(&o->store, &reply->item);
+            if (reply->result != ZJ_OK) break;
+            if (!zj_custody_encode(&reply->item, o->store.port.crypto, o->wire_scratch,
+                                   sizeof(o->wire_scratch), &actual)) reply->result = ZJ_INVALID;
+            else if (memcmp(actual.observation_id, request->input.settlement.observation_id, sizeof(actual.observation_id)) ||
+                     memcmp(actual.payload_digest, request->input.settlement.payload_digest, sizeof(actual.payload_digest)))
+                reply->result = ZJ_STALE;
+            else reply->result = zj_store_settle(&o->store, &request->input.settlement.token,
+                                                 request->input.settlement.receipt_digest);
+            mbedtls_platform_zeroize(o->wire_scratch, sizeof(o->wire_scratch));
             break;
+        }
         case ZJ_PEEK: reply->result = zj_store_peek(&o->store, &reply->item); break;
         case ZJ_RECLAIM: reply->result = zj_store_reclaim_step(&o->store); break;
         default: reply->result = ZJ_INVALID; break;

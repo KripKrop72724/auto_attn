@@ -33,6 +33,11 @@ def occurrence_id(serial: str, epoch: str, ordinal: int, raw_digest: str) -> str
     return digest(["zkt-occurrence-v1", serial, epoch, ordinal, raw_digest])
 
 
+def journal_exception_id(serial: str, epoch: str, segment: int,
+                         start: int, end: int, raw_digest: str) -> str:
+    return digest(["zkt-journal-exception-v1", serial, epoch, segment, start, end, raw_digest])
+
+
 class OccurrenceReference(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     source_epoch: str = Field(pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
@@ -45,7 +50,10 @@ class Observation(BaseModel):
     terminal_serial: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
     capture_epoch: str = Field(pattern=r"^[a-f0-9]{32}$")
     capture_sequence: int = Field(ge=1, le=2**63 - 1)
-    captured_at: AwareDatetime
+    captured_at: AwareDatetime | None
+    captured_at_seconds: str | None = Field(default=None, pattern=r"^(0|[1-9][0-9]{0,18})$")
+    # Decimal text remains exact through cJSON's binary64 number representation.
+    captured_uptime_ms: str | None = Field(default=None, pattern=r"^(0|[1-9][0-9]{0,19})$")
     raw_b64: str = Field(min_length=4, max_length=684)
     raw_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     raw_format: Literal["LIVE_FRAME", "SOURCE_RECORD", "UNKNOWN"]
@@ -67,6 +75,49 @@ class Observation(BaseModel):
             # Live frames have different wire bytes. A guessed ordinal or a
             # matching timestamp cannot prove the one-to-one association.
             raise ValueError("SOURCE_REFERENCE_REQUIRES_SOURCE_BYTES")
+        if self.captured_uptime_ms is not None and int(self.captured_uptime_ms) > 2**64 - 1:
+            raise ValueError("UPTIME_OUT_OF_RANGE")
+        if self.captured_at_seconds is not None:
+            seconds = int(self.captured_at_seconds)
+            if seconds > 2**63 - 1:
+                raise ValueError("CAPTURE_TIME_OUT_OF_RANGE")
+            if self.captured_at is not None and self.captured_at.timestamp() != seconds:
+                raise ValueError("CAPTURE_TIME_REPRESENTATION_MISMATCH")
+        elif self.captured_at is None:
+            raise ValueError("CAPTURE_TIME_EVIDENCE_REQUIRED")
+        return self
+
+
+class JournalException(BaseModel):
+    """Opaque local bytes cannot be reclassified as an attendance observation.
+
+    Their identity belongs to a precise retained extent, including the bytes'
+    digest. Preserving them acknowledges custody only, never Oracle completion.
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    item_type: Literal["JOURNAL_EXCEPTION"]
+    observation_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    terminal_serial: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
+    capture_epoch: str = Field(pattern=r"^[a-f0-9]{32}$")
+    segment_id: str = Field(pattern=r"^[1-9][0-9]{0,18}$")
+    start_offset: int = Field(ge=0, le=2**32 - 1)
+    end_offset: int = Field(ge=1, le=2**32 - 1)
+    exception_kind: Literal["METADATA", "FRAME", "AUTH", "TAIL"]
+    raw_b64: str = Field(min_length=4, max_length=684)
+    raw_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def verify(self):
+        raw = base64.b64decode(self.raw_b64, validate=True)
+        if (not 1 <= len(raw) <= 512 or len(raw) != self.end_offset - self.start_offset
+                or hashlib.sha256(raw).hexdigest() != self.raw_digest):
+            raise ValueError("JOURNAL_EXTENT_MISMATCH")
+        segment = int(self.segment_id)
+        if segment > 2**63 - 1:
+            raise ValueError("JOURNAL_SEGMENT_OUT_OF_RANGE")
+        if self.observation_id != journal_exception_id(self.terminal_serial, self.capture_epoch,
+                segment, self.start_offset, self.end_offset, self.raw_digest):
+            raise ValueError("JOURNAL_EXCEPTION_IDENTITY_MISMATCH")
         return self
 
 
@@ -133,7 +184,10 @@ def settle_observations(session: Session, connector: Connector, payload: dict) -
         parsed = None
         error = None
         try:
-            parsed = Observation.model_validate(raw)
+            kind = raw.get("item_type") if isinstance(raw, dict) else None
+            parsed = JournalException.model_validate(raw) if kind == "JOURNAL_EXCEPTION" else Observation.model_validate(raw)
+            if isinstance(parsed, JournalException):
+                error = f"JOURNAL_{parsed.exception_kind}_EXCEPTION"
             zkt = connector.zkt_device
             if (zkt is None or parsed.terminal_serial != zkt.serial
                     or parsed.terminal_serial != zkt.confirmed_serial):
@@ -159,9 +213,9 @@ def settle_observations(session: Session, connector: Connector, payload: dict) -
                 raw_digest=parsed.raw_digest if parsed else None,
                 terminal_serial=parsed.terminal_serial if parsed else None,
                 capture_epoch=parsed.capture_epoch if parsed else None,
-                capture_sequence=parsed.capture_sequence if parsed else None,
-                decoder_profile=parsed.decoder_profile if parsed else None,
-                decoder_version=parsed.decoder_version if parsed else None,
+                capture_sequence=parsed.capture_sequence if isinstance(parsed, Observation) else None,
+                decoder_profile=parsed.decoder_profile if isinstance(parsed, Observation) else None,
+                decoder_version=parsed.decoder_version if isinstance(parsed, Observation) else None,
                 protected_observation=encrypt_json({"observation": raw}),
                 disposition="PRESERVED_EXCEPTION" if error else "PRESERVED_UNRESOLVED",
                 error_code=error,
@@ -171,7 +225,7 @@ def settle_observations(session: Session, connector: Connector, payload: dict) -
         # Stable custody does not change on replay. Derived associations are
         # separate evidence and may become available after a source scan.
         occurrence = None
-        if parsed and receipt.error_code is None:
+        if isinstance(parsed, Observation) and receipt.error_code is None:
             occurrence = bind_source_occurrence(session, connector, receipt, parsed)
         results.append({"index": index, "observation_id": identity,
                         "payload_digest": material_digest, "receipt_id": receipt.receipt_id,
