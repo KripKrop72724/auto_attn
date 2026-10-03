@@ -182,6 +182,11 @@ bool add_connector_send_source_tail_acknowledged(
     const char *payload_json,
     uint32_t timeout_ms,
     add_source_tail_ack_t *ack_out);
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+/* A typed per-item ADD custody proof, never a generic transport acknowledgement. */
+bool add_connector_send_zkt_custody_acknowledged(
+    const char *payload_json, uint32_t timeout_ms, uint8_t receipt_digest[32]);
+#endif
 bool add_connector_enqueue_attendance(const char *payload_json);
 typedef enum {
     ADD_WORKER_IDLE, ADD_WORKER_READING, ADD_WORKER_NETWORK,

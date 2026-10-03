@@ -130,9 +130,9 @@ static int mbedtls_sha256(const void *data,size_t length,unsigned char digest[32
 { (void)mode;assert(length==3 && !memcmp(data,"abc",3));memset(digest,0x11,32);return 0; }
 static int mbedtls_base64_encode(unsigned char *out,size_t capacity,size_t *written,const void *raw,size_t length)
 { assert(capacity>=5 && length==3 && !memcmp(raw,"abc",3));memcpy(out,"YWJj",5);*written=4;return 0; }
-static bool send_payload_and_wait_for_ack(const char *type,const char *payload,int a,int b,const void *c,const void *d)
+static bool send_payload_and_wait_for_ack(const char *type,const char *payload,int a,int b,const void *c,const void *d,const void *e)
 {
-    (void)a;(void)b;unused_pointer=c;unused_pointer=d;
+    (void)a;(void)b;unused_pointer=c;unused_pointer=d;unused_pointer=e;
     assert(!strcmp(type,"queue_evidence"));
     const char *fields[]={"connector_id","queue_generation","record_id","payload_digest","raw_b64","provenance","terminal_serial","reason","encoding"};
     for(unsigned i=0;i<sizeof(fields)/sizeof(*fields);++i) assert(strstr(payload,fields[i]));

@@ -1,6 +1,8 @@
 import base64
 from contextlib import contextmanager
 import hashlib
+from pathlib import Path
+import runpy
 
 from cryptography.fernet import Fernet
 import pytest
@@ -12,7 +14,7 @@ from zk_add.db import Base
 from zk_add.models import (Connector, ZKTDevice, TerminalSourceEpoch, TerminalRecordManifest,
                            ZktObservationReceipt, ZktOccurrenceAlias, ZktObservationLink, AttendanceEvent)
 from zk_add.settings import settings
-from zk_add.zkt_custody import observation_id, settle_observations
+from zk_add.zkt_custody import journal_exception_id, observation_id, settle_observations
 from zk_add import web
 from zk_add.schemas import Envelope
 from zk_add.time_utils import utc_now
@@ -170,3 +172,67 @@ def test_old_boot_receipt_replay_cannot_replace_current_boot(custody, monkeypatc
                         seq=999, sent_at=utc_now(), type="zkt_observation_batch", payload=batch(observation()))
     assert web.persist_envelope(connector.id, envelope).ack["committed"]
     assert connector.boot_id == "current-boot" and connector.last_sequence == 100
+
+
+def opaque_exception(start=0, raw=b"synthetic corrupt cipher bytes", **updates):
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    end = start + len(raw)
+    segment = 2**63 - 1
+    return dict(item_type="JOURNAL_EXCEPTION",
+                observation_id=journal_exception_id("TEST01", "a" * 32, segment, start, end, raw_digest),
+                terminal_serial="TEST01", capture_epoch="a" * 32, segment_id=str(segment),
+                start_offset=start, end_offset=end, exception_kind="AUTH",
+                raw_b64=base64.b64encode(raw).decode(), raw_digest=raw_digest, **updates)
+
+
+def test_opaque_journal_custody_has_stable_extent_identity_and_no_attendance(custody):
+    db, connector = custody
+    value = opaque_exception()
+    first = settle_observations(db, connector, batch(value))
+    db.commit()
+    replay = settle_observations(db, connector, batch(value))
+    result = first["items"][0]
+    assert result["custody"] == "PRESERVED_EXCEPTION"
+    assert result["error_code"] == "JOURNAL_AUTH_EXCEPTION"
+    assert result["receipt_id"] == replay["items"][0]["receipt_id"]
+    row = db.scalar(select(ZktObservationReceipt))
+    assert row.capture_sequence is None and row.decoder_profile is None
+    assert decrypt_json(row.protected_observation)["observation"] == value
+    adjacent = settle_observations(db, connector, batch(opaque_exception(start=value["end_offset"])))
+    assert adjacent["items"][0]["observation_id"] != result["observation_id"]
+    assert count(db, AttendanceEvent) == count(db, ZktOccurrenceAlias) == 0
+
+
+@pytest.mark.parametrize("changed", [{"end_offset": 1}, {"segment_id": str(2**63)},
+                                    {"raw_digest": "0" * 64}, {"exception_kind": "INVENTED"}])
+def test_invalid_opaque_extent_is_quarantined_without_stalling_valid_capture(custody, changed):
+    db, connector = custody
+    values = batch({**opaque_exception(), **changed}, observation(2))
+    rows = settle_observations(db, connector, values)["items"]
+    assert rows[0]["error_code"] == "OBSERVATION_SCHEMA_INVALID"
+    assert rows[1]["custody"] == "PRESERVED_UNRESOLVED"
+
+
+def test_wire_decimal_identities_preserve_64_bit_values(custody):
+    db, connector = custody
+    value = observation(2**63 - 1, capture_sequence=str(2**63 - 1),
+                        captured_at=None, captured_at_seconds=str(2**63 - 1),
+                        captured_uptime_ms=str(2**64 - 1))
+    result = settle_observations(db, connector, batch(value))
+    assert result["items"][0]["error_code"] is None
+    row = db.scalar(select(ZktObservationReceipt))
+    assert row.capture_sequence == 2**63 - 1
+    assert decrypt_json(row.protected_observation)["observation"] == value
+    invalid = observation(2, captured_at_seconds="0")
+    assert settle_observations(db, connector, batch(invalid))["items"][0]["error_code"] == "OBSERVATION_SCHEMA_INVALID"
+
+
+def test_independent_firmware_wire_vectors_match_backend_schema():
+    from zk_add.zkt_custody import JournalException, Observation, digest
+
+    fixture = Path(__file__).resolve().parents[1] / "firmware/tools/custody_wire_vectors.py"
+    independent = runpy.run_path(str(fixture))
+    for value in independent["vectors"]():
+        model = JournalException if value.get("item_type") == "JOURNAL_EXCEPTION" else Observation
+        assert model.model_validate(value).observation_id == value["observation_id"]
+        assert digest(value) == independent["digest"](value)

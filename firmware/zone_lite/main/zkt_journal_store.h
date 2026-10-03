@@ -22,6 +22,8 @@ typedef struct {
 typedef struct {
     zj_item_kind_t kind;
     zj_exception_t exception;
+    uint8_t custody_epoch[16];
+    char custody_serial[81];
     zj_metadata_t metadata;
     zj_observation_t observation;
     uint16_t exception_length;

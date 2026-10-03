@@ -10,7 +10,11 @@ typedef struct {
     zj_operation_t operation;
     union {
         zj_observation_t observation;
-        struct { zj_token_t token; uint8_t receipt_digest[32]; } settlement;
+        struct {
+            zj_token_t token;
+            uint8_t receipt_digest[32];
+            char observation_id[65], payload_digest[65];
+        } settlement;
     } input;
 } zj_request_t;
 typedef struct {

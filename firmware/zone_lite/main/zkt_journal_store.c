@@ -281,6 +281,8 @@ zj_result_t zj_store_peek(zj_store_t *s, zj_item_t *item)
 {
     if (!s || !s->ready || !item) return ZJ_INVALID;
     memset(item, 0, sizeof(*item));
+    memcpy(item->custody_epoch, s->writer_metadata.capture_epoch, sizeof(item->custody_epoch));
+    memcpy(item->custody_serial, s->writer_metadata.terminal_serial, sizeof(item->custody_serial));
     zj_segment_t *segment = NULL;
     uint32_t offset = 0;
     for (unsigned i = 0; i < s->count; ++i) {

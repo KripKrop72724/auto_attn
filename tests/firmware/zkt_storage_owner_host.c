@@ -2,6 +2,7 @@
 #include "zkt_storage_owner.h"
 #include "zkt_journal_crypto.h"
 #include "zkt_journal_state.h"
+#include "zkt_custody_wire.h"
 #include "queue_store.h"
 #include "durable_queue.h"
 #include <assert.h>
@@ -194,6 +195,10 @@ int main(void)
 
     atomic_store(&full, true);
     zj_token_t token = reply.item.token;
+    char wire[ZJ_CUSTODY_PAYLOAD_MAX];
+    zj_custody_expected_t expected;
+    zj_crypto_port_t crypto = {.digest = digest};
+    assert(zj_custody_encode(&reply.item, crypto, wire, sizeof(wire), &expected));
     request.operation = ZJ_APPEND;
     assert(zj_owner_submit(&request, &ticket));
     reply = wait_reply(ticket);
@@ -201,6 +206,12 @@ int main(void)
     request.operation = ZJ_SETTLE;
     request.input.settlement.token = token;
     memset(request.input.settlement.receipt_digest, 1, 32);
+    memcpy(request.input.settlement.observation_id, expected.observation_id, sizeof(expected.observation_id));
+    memcpy(request.input.settlement.payload_digest, expected.payload_digest, sizeof(expected.payload_digest));
+    request.input.settlement.payload_digest[0] ^= 1;
+    assert(zj_owner_submit(&request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_STALE && !checkpoint_length);
+    request.input.settlement.payload_digest[0] ^= 1;
     assert(zj_owner_submit(&request, &ticket));
     assert(wait_reply(ticket).result == ZJ_OK && checkpoint_length);
     request.operation = ZJ_RECLAIM;
@@ -210,7 +221,7 @@ int main(void)
     assert(zj_owner_submit(&request, &ticket));
     assert(wait_reply(ticket).result == ZJ_EMPTY);
     assert(zj_owner_health(&health) && !health.occupied && !health.operation_running);
-    assert(health.completed == 6 && health.failures == 1 && health.max_operation_us && health.ready);
+    assert(health.completed == 7 && health.failures == 1 && health.max_operation_us && health.ready);
     atomic_store(&stop, true);
     assert(!pthread_join(thread, NULL));
     return 0;
