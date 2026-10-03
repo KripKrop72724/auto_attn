@@ -22,14 +22,19 @@ def test_blocked_generations_drain_without_copying_and_survive_restart(tmp_path)
 #define BLOCKED_RECOVERY_BACKUP_PATH "blocked.bak"
 #define BLOCKED_RECOVERY_TMP_PATH "blocked.tmp"
 static lq_checkpoint_t saved;
+static legacy_queue_t g_legacy_blocked;
 static bool exists, fail_commit;
+static unsigned reads;
+static dq_result_t counted_peek(legacy_queue_t *queue, void *data, size_t size, lq_token_t *token)
+{ ++reads;return lq_peek(queue,data,size,token); }
+#define lq_peek counted_peek
 /* PRODUCTION */
 static int legacy_pending_load(void *context,lq_checkpoint_t *cp)
 { assert(!strcmp(context,"blocked"));*cp=saved;return exists; }
 static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp)
 { assert(!strcmp(context,"blocked"));if(fail_commit)return false;saved=*cp;exists=true;return true; }
 static void append(const char *path,const char *row)
-{ FILE *f=fopen(path,"a");assert(f);assert(fprintf(f,"%s\n",row)>0);assert(!fclose(f)); }
+{ lq_invalidate_empty(&g_legacy_blocked);FILE *f=fopen(path,"a");assert(f);assert(fprintf(f,"%s\n",row)>0);assert(!fclose(f)); }
 int main(void)
 {
     for(unsigned i=0;i<10000;++i)append(BLOCKED_PATH,"preserved-row");
@@ -66,7 +71,11 @@ int main(void)
     assert(stat(BLOCKED_PATH,&st)!=0 && errno==ENOENT);
     assert(stat(BLOCKED_RECOVERY_BACKUP_PATH,&st)!=0 && errno==ENOENT);
     assert(stat(BLOCKED_RECOVERY_TMP_PATH,&st)!=0 && errno==ENOENT);
+    unsigned before=reads;
+    for(unsigned i=0;i<100;++i)assert(read_blocked_locked(row,sizeof(row),&token)==DQ_EMPTY);
+    assert(reads==before); // Known-empty iterations never rescan the file.
     // A truncated tail is preserved, never mistaken for empty or retired.
+    lq_invalidate_empty(&g_legacy_blocked);
     FILE *f=fopen(BLOCKED_PATH,"w");assert(f);assert(fputs("partial",f)>=0);assert(!fclose(f));
     assert(read_blocked_locked(row,sizeof(row),&token)==DQ_OK && token.evidence_required);
     assert(!settle_blocked_locked(&token, false));

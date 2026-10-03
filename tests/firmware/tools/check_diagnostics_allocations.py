@@ -35,7 +35,12 @@ static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n)
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
 static int64_t monotonic_ms(void){return 5000;}
-static const char *led_status_current_name(void){return "HEALTHY";}
+static const char s_boot_id[]="allocation-test-boot";
+#define MALLOC_CAP_INTERNAL 1
+#define MALLOC_CAP_8BIT 2
+static size_t heap_caps_get_free_size(unsigned caps){assert(caps==3);return 100000;}
+static size_t heap_caps_get_largest_free_block(unsigned caps){assert(caps==3);return 64000;}
+static void led_status_local_failure_source(char *out,size_t size){assert(size>0);out[0]=0;}
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
 static const char *storage_upgrade_contract(void){return "contract";}

@@ -223,6 +223,24 @@ def test_historical_delivery_sweep_does_not_reset_ords_retry_backoff(db: Session
     assert outbox.last_error == "HTTP_503"
 
 
+def test_unchanged_identity_holds_wait_for_revision_or_bounded_audit(db: Session):
+    connector = connector_fixture(db)
+    make_writable(connector)
+    ingest_attendance(db, connector=connector, events=[event(event_uid="f1" * 32, user_id="unknown")])
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == "f1" * 32))
+    assert row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+    first = repair_attendance_delivery_backlog(db, limit=10)
+    assert first["scanned"] == 1 and row.identity_retry_after > utc_now()
+    for _ in range(3):
+        assert repair_attendance_delivery_backlog(db, limit=10)["scanned"] == 0
+    connector.zkt_device.identity_snapshot_revision += 1
+    assert repair_attendance_delivery_backlog(db, limit=10)["scanned"] == 1
+    repair_attendance_delivery_backlog(db, limit=10)  # Wrap the bounded cursor.
+    row.identity_retry_after = utc_now() - timedelta(seconds=1)
+    assert repair_attendance_delivery_backlog(db, limit=10)["scanned"] == 1
+    assert row.cnic_lookup_hash is None
+
+
 def test_ords_transport_circuit_uses_bounded_exponential_backoff(monkeypatch):
     monkeypatch.setattr(worker, "_ords_circuit_failures", 0)
     monkeypatch.setattr(worker, "_ords_circuit_open_until", 0.0)

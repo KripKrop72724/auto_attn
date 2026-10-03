@@ -16,7 +16,7 @@ const mobilePrimary = new Set<DashboardRoute>(['fleet', 'users', 'attendance', '
 
 const connectionLabels: Record<RealtimeState, string> = {
   connecting: 'Connecting',
-  live: 'Live sync',
+  live: 'Live transport',
   reconnecting: 'Reconnecting',
   stale: 'Cached data',
 }
@@ -97,7 +97,7 @@ export function AppShell({
   const connectionLabel = connectionLabels[realtimeState]
   const current = navigation.find((item) => item.id === route) || navigation[0]
   const secondaryActive = !mobilePrimary.has(route)
-  const syncDetail = lastSyncAt ? `Last successful sync ${pktTime(lastSyncAt)} PKT` : 'Connecting to live operations'
+  const syncDetail = lastSyncAt ? `Last stream activity ${pktTime(lastSyncAt)} PKT. Each panel shows its own evidence age.` : 'Connecting to live operations'
   return (
     <div className="app-shell">
       <aside className="app-sidebar">

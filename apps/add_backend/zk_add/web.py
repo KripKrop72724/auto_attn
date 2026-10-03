@@ -3549,12 +3549,12 @@ def require_stream_admin(request: Request) -> AdminContext:
 @app.get("/events/v1/stream")
 async def browser_stream(
     request: Request,
-    last_event_id: int | None = Query(default=None),
+    last_event_id: str | None = Query(default=None, max_length=100),
     _context: AdminContext = Depends(require_stream_admin),
 ):
     header_id = request.headers.get("Last-Event-ID")
-    if header_id and header_id.isdigit():
-        last_event_id = int(header_id)
+    if header_id and len(header_id) <= 100:
+        last_event_id = int(header_id) if header_id.isdigit() else header_id
 
     async def stream():
         async for event in browser_events.subscribe(last_event_id):
@@ -3903,25 +3903,15 @@ async def device_stream(websocket: WebSocket):
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
-                if envelope.type == "source_tail_chunk":
-                    # Pydantic validation traces may echo rejected field input.
-                    # Source-tail records contain encrypted-at-rest raw terminal
-                    # evidence, so this path records metadata only.
-                    logger.error(
-                        "Rejected protected source envelope connector_id=%s "
-                        "type=%s message_id=%s error_type=%s",
-                        connector_id,
-                        envelope.type,
-                        envelope.message_id,
-                        type(exc).__name__,
-                    )
-                else:
-                    logger.exception(
-                        "Rejected connector envelope connector_id=%s type=%s message_id=%s",
-                        connector_id,
-                        envelope.type,
-                        envelope.message_id,
-                    )
+                # All device payloads can contain attendance or credential
+                # evidence. Tracebacks from validation/database drivers can
+                # include those inputs, so operational logs use metadata only.
+                logger.error(
+                    "Rejected protected source envelope connector_id=%s "
+                    "type=%s message_id=%s error_type=%s",
+                    connector_id, envelope.type, envelope.message_id,
+                    type(exc).__name__,
+                )
                 await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
                 await websocket.send_json(
                     {
@@ -3986,12 +3976,12 @@ def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
 
 def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
     error_type = type(error).__name__[:80]
-    safe_detail = None
-    if isinstance(error, ValueError):
-        detail = str(error)
-        if detail.startswith(("Duplicate UID ", "Duplicate device user ID ", "Connector has no ")):
-            safe_detail = detail[:300]
-    message = safe_detail or f"{envelope.type} message was rejected ({error_type})."
+    from zk_add.rejection import rejection_category
+
+    category = rejection_category(error)
+    message = f"{envelope.type} message was rejected ({category})."
+    context = {"message_type": envelope.type, "error_type": error_type,
+               "request_id": envelope.message_id, "error_category": category}
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
         if connector is None:
@@ -4010,7 +4000,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     subsystem="add_backend",
                     code="DEVICE_MESSAGE_REJECTED",
                     message=message,
-                    context={"message_type": envelope.type, "error_type": error_type},
+                    context=context,
                     device_time=envelope.sent_at,
                 )
             ],
@@ -4021,7 +4011,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
             code="DEVICE_MESSAGE_REJECTED",
             severity="HIGH",
             message=message,
-            details={"message_type": envelope.type, "error_type": error_type},
+            details=context,
         )
 
 
@@ -4050,12 +4040,20 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         )
         if connector is None:
             return
-        if connector.boot_id == envelope.boot_id and envelope.seq <= connector.last_sequence:
+        sequence_replay = connector.boot_id == envelope.boot_id and envelope.seq <= connector.last_sequence
+        # Custody ACKs must carry the original durable receipt on replay. A
+        # generic transport ACK cannot authorize retiring preserved bytes.
+        receipt_message = envelope.type in {"attendance_batch", "queue_evidence", "zkt_observation_batch"}
+        if sequence_replay and not receipt_message:
             return EnvelopeOutcome(
                 ack={"type": "ack", "message_id": envelope.message_id, "duplicate": True},
             )
-        connector.boot_id = envelope.boot_id
-        connector.last_sequence = envelope.seq
+        # Replaying an older boot's custody must not replace current telemetry
+        # identity. A new boot establishes that identity with its heartbeat.
+        if not sequence_replay and (not receipt_message or connector.boot_id is None
+                                    or connector.boot_id == envelope.boot_id):
+            connector.boot_id = envelope.boot_id
+            connector.last_sequence = envelope.seq
         connector.last_seen_at = utc_now()
         connector.connected = True
         if envelope.type == "heartbeat":
@@ -4119,6 +4117,11 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 db, connector, message_type="user_snapshot"
             )
             event_payload = {"connector_id": connector.connector_id, "count": count}
+        elif envelope.type == "zkt_observation_batch":
+            from zk_add.zkt_custody import settle_observations
+            receipt = settle_observations(db, connector, envelope.payload)
+            ack_payload = {"type": "zkt_observation_ack", "message_id": envelope.message_id, **receipt}
+            event_payload = {"connector_id": connector.connector_id, "count": len(receipt["items"])}
         elif envelope.type == "attendance_batch":
             settlement = settle_attendance_batch(
                 db, connector=connector, payload=envelope.payload

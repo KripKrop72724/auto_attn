@@ -147,6 +147,7 @@ def test_observation_accepts_worker_tick_sampled_after_rounded_uptime(ready):
         "spare",
         "offline",
         "recovery",
+        "probe-error",
         "unknown-queue",
         "worker",
         "reconciling",
@@ -173,6 +174,8 @@ def test_observation_cannot_start_before_every_precondition(ready, change):
         device.connected = False
     if change == "recovery":
         telemetry.payload["diagnostics"]["storage"]["recovery_complete"] = False
+    if change == "probe-error":
+        telemetry.payload["diagnostics"]["storage"]["persistence_probe_error"] = 5
     if change == "unknown-queue":
         telemetry.payload["diagnostics"]["queues"][0]["count_known"] = False
     if change == "worker":

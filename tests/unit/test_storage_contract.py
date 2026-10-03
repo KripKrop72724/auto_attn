@@ -57,6 +57,13 @@ def test_signed_contract_required_for_both_storage_releases():
         validate_storage_contract(candidate, "2.6.0")
 
 
+@pytest.mark.parametrize("version", ["2.6.16", "2.7.0"])
+def test_future_journal_releases_cannot_bypass_bridge_qualification(version):
+    for candidate in ({}, manifest("2.6.15"), manifest("2.6.0")):
+        with pytest.raises(ValueError, match="Journal bridge"):
+            validate_storage_contract(candidate, version)
+
+
 def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     root = Path(__file__).resolve().parents[2]
     guard = (root / "firmware/zone_lite/main/upgrade_guard.c").read_text()

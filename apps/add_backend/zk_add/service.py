@@ -606,9 +606,17 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
         resolve_alert(session, connector, code="USER_SNAPSHOT_TRUNCATED")
 
 
-def apply_firmware_diagnostics(session: Session, connector: Connector, payload: HeartbeatPayload) -> None:
+def apply_firmware_diagnostics(session: Session, connector: Connector, payload: HeartbeatPayload,
+                               *, sampled_at: datetime | None = None) -> None:
+    from zk_add.runtime_contract import runtime_contract
+
     diagnostics = payload.diagnostics
-    connector.firmware_diagnostics = diagnostics.model_dump(mode="json") if diagnostics else None
+    evidence = diagnostics.model_dump(mode="json") if diagnostics else None
+    if evidence is not None:
+        # Identity comes from the authenticated envelope, never a nested claim.
+        evidence.update(boot_id=connector.boot_id, sample_sequence=connector.last_sequence,
+                        sampled_at=ensure_utc(sampled_at).isoformat() if sampled_at else None)
+    connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = utc_now() if diagnostics else None
     storage = diagnostics.storage if diagnostics else None
     storage_failed = storage is not None and storage.durability in {"DEGRADED", "FULL"}
@@ -626,7 +634,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
         for row in workers
     )
-    required_workers = {"add_delivery", "hikvision_source" if connector.firmware_family == "hikvision" else "ords_delivery"}
+    required_workers = runtime_contract(evidence or {}, connector.firmware_family or "zkt").workers
     workers_verified = (
         {row.name for row in workers} >= required_workers
         and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
@@ -639,7 +647,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
     ):
         if failed:
             upsert_alert(session, connector, code=code, severity="HIGH", message=message,
-                         details={"diagnostics_schema_version": 1})
+                         details={"diagnostics_schema_version": diagnostics.schema_version})
         elif verified:
             resolve_alert(session, connector, code=code)
             if connector.last_error_code == code:
@@ -1001,7 +1009,14 @@ def update_heartbeat(
         if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
             connector.last_error_code = None
             connector.last_error_message = None
-    apply_firmware_diagnostics(session, connector, payload)
+    if payload.diagnostics and payload.diagnostics.schema_version == 2:
+        sample = payload.diagnostics
+        if sample.boot_id != boot_id or sample.sampled_uptime_ms is None or (
+            payload.uptime_seconds is None or not -5000 <=
+            payload.uptime_seconds * 1000 - sample.sampled_uptime_ms <= 5000
+        ):
+            raise ValueError("DIAGNOSTICS_SAMPLE_MISMATCH")
+    apply_firmware_diagnostics(session, connector, payload, sampled_at=device_sent_at)
     apply_ota_heartbeat_diagnostics(
         session,
         connector=connector,
@@ -3082,8 +3097,8 @@ def repair_attendance_delivery_backlog(
     """Drain every retained eligible event in oldest-first, restart-safe pages.
 
     The durable cursor advances past held rows so they cannot starve later
-    events. It wraps after each full pass to reconsider newly available identity
-    evidence, while row-level idempotency remains the source of truth.
+    events. A changed roster revision makes holds eligible again. A six-hour
+    bounded audit also covers evidence arriving through other identity paths.
     """
     bounded_limit = max(1, min(int(limit), 500))
     now = utc_now()
@@ -3102,10 +3117,18 @@ def repair_attendance_delivery_backlog(
 
     candidates = session.scalars(
         select(AttendanceEvent)
+        .join(ZKTDevice, ZKTDevice.id == AttendanceEvent.zkt_device_id)
         .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
         .where(
             AttendanceEvent.id > (sweep.last_event_id or 0),
             AttendanceEvent.ords_status.in_(("PENDING", "FAILED_RETRYABLE", "RETRYING", "BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
+            or_(
+                AttendanceEvent.ords_status.not_in(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
+                AttendanceEvent.identity_retry_after.is_(None),
+                AttendanceEvent.identity_retry_after <= now,
+                AttendanceEvent.identity_checked_revision.is_(None),
+                AttendanceEvent.identity_checked_revision != ZKTDevice.identity_snapshot_revision,
+            ),
             or_(
                 OrdsOutbox.id.is_(None),
                 AttendanceEvent.ords_status.in_(
@@ -3126,6 +3149,10 @@ def repair_attendance_delivery_backlog(
     for row in candidates:
         sweep.last_event_id = row.id
         sweep.scanned_count += 1
+        if row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+            zkt = session.get(ZKTDevice, row.zkt_device_id)
+            row.identity_checked_revision = zkt.identity_snapshot_revision if zkt else None
+            row.identity_retry_after = now + timedelta(hours=6)
         event_uid_valid = bool(re.fullmatch(r"[0-9a-f]{64}", row.event_uid or ""))
         if not event_uid_valid:
             row.ords_status = "QUARANTINED_INVALID_EVENT_UID"
@@ -5316,6 +5343,8 @@ def serialize_user_deletion_job(session: Session, job: UserDeletionJob) -> dict:
 def serialize_connector(connector: Connector) -> dict:
     zkt = connector.zkt_device
     return {
+        "snapshot_at": utc_now(),
+        "boot_id": connector.boot_id,
         "connector_id": connector.connector_id,
         "hardware_id": connector.hardware_id,
         "zone_id": connector.zone_id,

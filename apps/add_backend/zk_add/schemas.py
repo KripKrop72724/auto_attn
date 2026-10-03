@@ -39,12 +39,12 @@ class OnboardRequest(BaseModel):
 
 class Envelope(BaseModel):
     schema_version: str = "1"
-    message_id: str
-    connector_id: str
-    boot_id: str
-    seq: int = Field(ge=0)
+    message_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9._:-]+$")
+    connector_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    boot_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    seq: int = Field(ge=0, le=2**63 - 1)
     sent_at: datetime
-    type: str
+    type: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -86,6 +86,9 @@ class WorkerDiagnostics(BaseModel):
     operation: str | None = Field(default=None, max_length=80)
     restart_count: int | None = Field(default=None, ge=0)
     restart_attempts: int | None = Field(default=None, ge=0)
+    last_progress_uptime_ms: int | None = Field(default=None, ge=0)
+    operation_started_uptime_ms: int | None = Field(default=None, ge=0)
+    pending_requests: int | None = Field(default=None, ge=0)
 
 
 class StorageDiagnostics(BaseModel):
@@ -98,6 +101,15 @@ class StorageDiagnostics(BaseModel):
     admission_reserve_bytes: int | None = Field(default=None, ge=0)
     write_failures: int | None = Field(default=None, ge=0)
     read_failures: int | None = Field(default=None, ge=0)
+    persistence_probe_failures: int | None = Field(default=None, ge=0)
+    persistence_probe_total_failures: int | None = Field(default=None, ge=0)
+    persistence_probe_error: int | None = None
+    persistence_probe_operation: str | None = Field(default=None, max_length=80)
+    fault_class: Literal["NONE", "LOCK_CONTENTION", "CAPACITY", "MISSING_FILE", "CORRUPTION",
+                         "ALLOCATION", "PERSISTENCE", "RECOVERY"] | None = None
+    rejected_optional_writes: int | None = Field(default=None, ge=0)
+    live_commit_p99_ms: int | None = Field(default=None, ge=0)
+    recovery_cursor: int | None = Field(default=None, ge=0)
     durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"] = "UNKNOWN"
     persistence_verified: bool = False
     recovery_complete: bool = False
@@ -111,7 +123,14 @@ class MemoryDiagnostics(BaseModel):
 
 
 class FirmwareDiagnostics(BaseModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
+    runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
+    delivery_authority: Literal["LEGACY_DUAL", "ADD"] | None = None
+    journal_format: Literal[1] | None = None
+    boot_id: str | None = Field(default=None, max_length=100)
+    sample_sequence: int | None = Field(default=None, ge=0)
+    sampled_at: datetime | None = None
+    sampled_uptime_ms: int | None = Field(default=None, ge=0)
     storage: StorageDiagnostics | None = None
     memory: MemoryDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
@@ -190,6 +209,10 @@ class HeartbeatPayload(BaseModel):
             raise ValueError("Hikvision requires a versioned terminal payload")
         if self.firmware_family == "zkt" and self.terminal is not None:
             raise ValueError("Legacy ZKT does not accept Hikvision terminal metadata")
+        if self.diagnostics:
+            from zk_add.runtime_contract import runtime_contract
+
+            runtime_contract(self.diagnostics.model_dump(), self.firmware_family)
         return self
 
 

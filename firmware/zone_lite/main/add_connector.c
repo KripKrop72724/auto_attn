@@ -2448,7 +2448,16 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     cJSON *memory = cJSON_AddObjectToObject(diagnostics, "memory");
     cJSON *workers = cJSON_AddArrayToObject(diagnostics, "workers");
     cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
-    if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 1) ||
+    if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 2) ||
+        !cJSON_AddStringToObject(diagnostics, "boot_id", s_boot_id) ||
+        !cJSON_AddNumberToObject(diagnostics, "sampled_uptime_ms", (double)monotonic_ms()) ||
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+        !cJSON_AddStringToObject(diagnostics, "runtime_profile", "HIKVISION_V1") ||
+        !cJSON_AddStringToObject(diagnostics, "delivery_authority", "ADD") ||
+#else
+        !cJSON_AddStringToObject(diagnostics, "runtime_profile", "ZKT_LEGACY") ||
+        !cJSON_AddStringToObject(diagnostics, "delivery_authority", "LEGACY_DUAL") ||
+#endif
         !cJSON_AddNumberToObject(memory, "internal_free_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) ||
         !cJSON_AddNumberToObject(memory, "internal_largest_block_bytes", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) goto failed;
     size_t total = 0, used = 0;
@@ -2465,17 +2474,20 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
             !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
             !cJSON_AddNumberToObject(storage, "persistence_probe_failures", measured_health.persistence_probe_failures) ||
+            !cJSON_AddNumberToObject(storage, "persistence_probe_total_failures", measured_health.persistence_probe_total_failures) ||
             !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
+        if (measured_health.persistence_probe_error &&
+            (!cJSON_AddStringToObject(storage, "persistence_probe_operation", measured_health.persistence_probe_operation) ||
+             !cJSON_AddNumberToObject(storage, "persistence_probe_error", measured_health.persistence_probe_error))) goto failed;
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
              !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
     }
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
-    const char *led = led_status_current_name();
     char local_failure_source[80];
     led_status_local_failure_source(local_failure_source, sizeof(local_failure_source));
-    const char *durability = measured != ESP_OK || measured_health.last_error || !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")
+    const char *durability = measured != ESP_OK || measured_health.last_error || measured_health.persistence_probe_error
         ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
         ? "HEALTHY" : "UNKNOWN";
     if (!cJSON_AddStringToObject(storage, "durability", durability) ||
@@ -2794,7 +2806,11 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
     (void)force;
     if (!outbox->legacy.ready) return false;
     struct stat st;
-    if (stat(outbox->path, &st) != 0) return errno == ENOENT && !outbox->legacy.checkpoint.offset;
+    if (stat(outbox->path, &st) != 0) {
+        bool empty = errno == ENOENT && !outbox->legacy.checkpoint.offset;
+        if (empty) { outbox->depth = 0; outbox->depth_known = true; }
+        return empty;
+    }
     if ((uint64_t)st.st_size != outbox->legacy.checkpoint.offset) return true;
     // No suffix rewrite or second copy. Clear the predecessor's text cursor
     // before retiring a fully settled file so rollback cannot skip a new file.
@@ -2825,6 +2841,7 @@ static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_
 {
     if (!outbox->legacy.ready) outbox->offset = load_outbox_cursor(outbox);
     if (!outbox->legacy.ready) return false;
+    if (outbox->depth_known && !outbox->depth) return false;
     dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
     if (result == DQ_EMPTY) {
         if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -4120,7 +4137,7 @@ bool add_connector_boot_health_ready(void)
     const char *led = led_status_current_name();
     if (esp_spiffs_info(NULL, &storage_total, &storage_used) != ESP_OK ||
         !storage_health.observed || !storage_health.recovery_complete ||
-        !storage_health.persistence_verified || storage_health.last_error ||
+        !storage_health.persistence_verified || storage_health.last_error || storage_health.persistence_probe_error ||
         !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")) return false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         time_t now = time(NULL);

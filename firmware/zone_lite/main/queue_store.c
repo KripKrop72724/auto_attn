@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <string.h>
 #include "esp_random.h"
+#include "esp_timer.h"
 #include <stdio.h>
 #include <unistd.h>
 #include "esp_spiffs.h"
@@ -242,12 +243,21 @@ bool qs_verify_persistence(void)
 {
     if (!storage_upgrade_ready() || !budget_lock ||
         xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-    /* Never erase a fault from an unrelated operation. A failed recovery stays
-     * degraded. This proof covers an otherwise clean boot with no new records. */
+    /* A probe can only resolve its own failure. Queue corruption, refused
+     * attendance and failed local writes need their own recovery evidence. */
     if (!health.recovery_complete || health.last_error) {
         xSemaphoreGive(budget_lock); return false;
     }
-    if (health.persistence_verified) { xSemaphoreGive(budget_lock); return true; }
+    if (health.persistence_verified && !health.persistence_probe_error) {
+        xSemaphoreGive(budget_lock); return true;
+    }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    static int64_t retry_at_us;
+    int64_t now_us = esp_timer_get_time();
+    if (health.persistence_probe_error && now_us < retry_at_us) {
+        xSemaphoreGive(budget_lock); return false;
+    }
+#endif
     unsigned char expected[32], actual[32];
     esp_fill_random(expected, sizeof(expected));
     const char *path = "/storage/persistence-probe";
@@ -338,8 +348,14 @@ bool qs_verify_persistence(void)
         }
     }
     health.persistence_verified = ok;
-    if (ok) health.persistence_probe_failures = 0;
+    if (ok) {
+        health.persistence_probe_failures = 0;
+        health.persistence_probe_error = 0;
+        health.persistence_probe_operation = NULL;
+    }
     else {
+        if (health.persistence_probe_total_failures < UINT32_MAX) health.persistence_probe_total_failures++;
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
         if (health.persistence_probe_failures < 3) health.persistence_probe_failures++;
         // A single interrupted write is not yet an established durability
         // failure. Keep boot proof withheld and retry twice before latching.
@@ -348,6 +364,18 @@ bool qs_verify_persistence(void)
             record_queue_result(DQ_IO, stage, true);
             if (nvs_error != ESP_OK) health.last_error = nvs_error;
         }
+#else
+        if (health.persistence_probe_failures < UINT32_MAX) health.persistence_probe_failures++;
+        health.persistence_probe_operation = stage;
+        health.persistence_probe_error = nvs_error != ESP_OK ? nvs_error : file_error ? file_error : EIO;
+        /* Do not put a recoverable probe into last_error: that would prevent
+         * both the recovery audit and this exact proof from running again.
+         * Back off repeated flash writes; retain the total after recovery. */
+        unsigned shift = health.persistence_probe_failures < 6 ? health.persistence_probe_failures : 6;
+        unsigned seconds = 1U << shift;
+        if (seconds > 60) seconds = 60;
+        retry_at_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+#endif
     }
     xSemaphoreGive(budget_lock);
     return ok;
@@ -373,7 +401,7 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     errno = 0;
     dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
-    if (result == DQ_OK) health.persistence_verified = true;
+    if (result == DQ_OK && !health.persistence_probe_error) health.persistence_verified = true;
     record_queue_result(result, "segment_append", true);
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);

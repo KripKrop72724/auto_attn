@@ -17,6 +17,7 @@ $watchdogImage = "state-life/add-watchdog:production"
 $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
 $applicationStarted = $false
 $environmentPromoted = $false
+. (Join-Path $PSScriptRoot "backup-restore.ps1")
 
 function Invoke-Docker {
     param(
@@ -775,10 +776,20 @@ try {
         "-d", $dbName, "-f", $containerBackup
     ))
     Invoke-Docker -Arguments @("cp", "${postgresContainer}:$containerBackup", $databaseBackup)
-    Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $containerBackup))
     if (-not (Test-Path -LiteralPath $databaseBackup) -or (Get-Item $databaseBackup).Length -lt 100) {
         throw "The pre-deployment PostgreSQL backup is missing or invalid."
     }
+    $backupSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $databaseBackup).Hash
+    $containerBackupHash = Invoke-Docker -Arguments @(
+        "exec", $postgresContainer, "sha256sum", $containerBackup
+    ) -Capture
+    $containerBackupDigest = ($containerBackupHash -split '\s+')[0]
+    if ($containerBackupDigest -notmatch '^[a-fA-F0-9]{64}$' -or $containerBackupDigest -ine $backupSha256) {
+        throw "The saved PostgreSQL backup differs from the dump being restore-tested."
+    }
+    $backupVerifiedAt = Assert-DatabaseBackupRestorable -DatabaseUser $dbUser `
+        -ContainerBackup $containerBackup -ExpectedRevision $preRevision
+    Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $containerBackup))
 
     try {
         Invoke-Docker -Arguments ($compose + @("build", "--pull"))
@@ -799,6 +810,8 @@ try {
             pre_revision = $preRevision
             post_revision = $postRevision
             database_backup = $databaseBackup
+            database_backup_sha256 = $backupSha256
+            database_backup_restore_verified_at_utc = $backupVerifiedAt
             previous_api_image = $preApiImage
             previous_web_image = $preWebImage
             previous_provisioner_image = $preProvisionerImage

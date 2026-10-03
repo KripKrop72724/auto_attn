@@ -118,16 +118,21 @@ def start_run(
     if (
         storage.get("durability") != "HEALTHY"
         or storage.get("persistence_verified") is not True
+        or bool(storage.get("persistence_probe_error"))
         or storage.get("recovery_complete") is not True
         or storage.get("error_code")
         or storage.get("upgrade_ready") is not True
     ):
         raise ValueError("Local persistence and queue recovery must be verified before observation")
+    from zk_add.runtime_contract import runtime_contract
+
+    runtime = runtime_contract(diagnostics, connector.firmware_family or "zkt")
+    manifest_runtime = release.manifest.get("runtime_profile")
+    if manifest_runtime and diagnostics.get("runtime_profile") != manifest_runtime:
+        raise ValueError("Signed runtime profile does not match telemetry")
     workers = diagnostics.get("workers") or []
-    if {row.get("name") for row in workers} != {"add_delivery", "ords_delivery"} or len(
-        workers
-    ) != 2:
-        raise ValueError("Both delivery workers must report their current health")
+    if {row.get("name") for row in workers} != runtime.workers or len(workers) != len(runtime.workers):
+        raise ValueError("All required runtime workers must report their current health")
     for worker in workers:
         tick = worker.get("last_activity_uptime_ms")
         if (
@@ -139,16 +144,7 @@ def start_run(
         ):
             raise ValueError("Delivery workers are not healthy and fresh")
     queues = diagnostics.get("queues") or []
-    required = {
-        "live",
-        "bulk",
-        "segmented_live",
-        "segmented_bulk",
-        "segmented_ords",
-        "segmented_blocked",
-        "segmented_receipts",
-        "segmented_evidence",
-    }
+    required = runtime.queues
     if (
         len({row.get("name") for row in queues}) != len(queues)
         or not required <= {row.get("name") for row in queues}

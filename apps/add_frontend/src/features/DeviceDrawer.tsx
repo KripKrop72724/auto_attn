@@ -1,6 +1,7 @@
 import { deviceActivity } from '../hikvisionHealth'
-import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { api } from '../api'
+import { deviceSnapshots, useDevice } from '../deviceData'
 import {
   CommandProgress, Dialog, StatusBadge, dateTime, drawerTabs, idempotency,
   relativeTime, useToast, type DrawerTab,
@@ -32,7 +33,9 @@ export function DeviceDrawer({
   onInventoryChanged: () => Promise<void>
   toast: ReturnType<typeof useToast>
 }) {
-  const [device, setDevice] = useState(seed)
+  const device = useDevice(seed)
+  const setDevice = (value: Device) => deviceSnapshots.put([value])
+  const requestNumber = useRef(0)
   const [tab, setTab] = useState<DrawerTab>('overview')
   const [logs, setLogs] = useState<DeviceLog[]>([])
   const [connections, setConnections] = useState<ConnectionEvent[]>([])
@@ -54,19 +57,23 @@ export function DeviceDrawer({
   const [revealedKey, setRevealedKey] = useState<CommKeyReveal | null>(null)
   const [busy, setBusy] = useState(false)
   const load = useCallback(async () => {
-    const [detail, logResult, history, keyState] = await Promise.all([
+    const request = ++requestNumber.current
+    const [detail, logResult, history, keyState] = await Promise.allSettled([
       api<Device>(`/api/v1/devices/${seed.connector_id}`),
       api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=250`),
       api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=40`),
       seed.firmware_family === 'hikvision' ? Promise.resolve(null) : api<CommKeyState>(`/api/v1/devices/${seed.connector_id}/comm-key`),
     ])
-    setDevice(detail)
-    setLogs(logResult.rows)
-    setConnections(history.rows)
-    setCommKeyState(keyState)
-    setCommKeySerial((current) => current || detail.zkt?.confirmed_serial || detail.zkt?.expected_serial || detail.zkt?.serial || '')
-  }, [seed.connector_id])
-  useEffect(() => { void load() }, [load, revision])
+    if (request !== requestNumber.current) return
+    if (detail.status === 'fulfilled') {
+      deviceSnapshots.put([detail.value])
+      setCommKeySerial((current) => current || detail.value.zkt?.confirmed_serial || detail.value.zkt?.expected_serial || detail.value.zkt?.serial || '')
+    }
+    if (logResult.status === 'fulfilled') setLogs(logResult.value.rows)
+    if (history.status === 'fulfilled') setConnections(history.value.rows)
+    if (keyState.status === 'fulfilled') setCommKeyState(keyState.value)
+  }, [seed.connector_id, seed.firmware_family])
+  useEffect(() => { void load(); return () => { ++requestNumber.current } }, [load, revision])
   // Install hiding handlers before the revealed value can be painted.
   useLayoutEffect(() => {
     if (!revealedKey) return
@@ -312,7 +319,7 @@ export function DeviceDrawer({
               </div>
             </dl>}
           </article>}
-          <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} />
+          <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} bootId={device.boot_id} imageDigest={device.ota_image_sha256} />
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
           <article className={`detail-card wide inventory-assignment-card ${device.is_spare ? 'is-spare' : ''}`}>
             <span className="inventory-assignment-icon"><Icon name={device.is_spare ? 'server' : 'grid'} /></span>

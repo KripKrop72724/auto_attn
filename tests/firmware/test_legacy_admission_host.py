@@ -15,6 +15,7 @@ def test_legacy_append_shares_reserves_and_releases_budget_on_every_failure(tmp_
     append = runtime[runtime.index("static bool append_line_policy("):runtime.index("static bool extract_event_uid(")]
     harness = r'''
 #include "queue_store.h"
+#include "legacy_queue.h"
 #include "storage_budget.h"
 #include <assert.h>
 #include <errno.h>
@@ -34,6 +35,7 @@ dq_result_t qs_append_with_policy(qs_lane_t lane,const void *data,size_t length,
 static int locked;
 static int *budget_lock=&locked;
 static qs_health_t health;
+static legacy_queue_t g_legacy_pending, g_legacy_blocked;
 static storage_budget_t budget;
 static size_t used, total=8U*1024U*1024U;
 static bool measure_failed;
