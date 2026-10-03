@@ -21,6 +21,7 @@ counts are kept outside this public repository.
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
+| Custody can outlive an untracked processing obligation | Migration `0044` adds per-packet work and immutable receipt links in the custody transaction; bounded assembly, fair inspection, revision-triggered holds and an authenticated status endpoint | Receipt/work rollback, fragment conflict/replay, per-record decryption failure isolation, bounded repair, PostgreSQL overlapping sockets/SKIP LOCKED and actual dump/restore | Implemented components; profile-qualified interpretation and Oracle creation remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: capture/delivery startup gated; catalog and legacy handoff remain open |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
@@ -100,6 +101,27 @@ no operator activation endpoint in this stage. Do not set the field in
 production until the journal reader, delivery adapter, occurrence matching and
 bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
+Migration `0044` adds derived processing obligations without changing immutable
+receipts. Receipt creation and its work link share one commit; a work-storage
+failure emits no custody ACK. A fragmented packet has one work row and retains
+every received extent, including conflicts. New evidence revisions wake a
+group, while an unchanged replay cannot reschedule a hold. Missing fragments,
+unqualified profiles, source associations, conflicting evidence and unavailable
+decryption each have a separate state, reason and responsible component.
+
+The bounded inspector locks the connector before its work rows, matching the
+ingestion lock order, and skips connectors currently owned by another worker.
+Per-connector quotas prevent one large backlog from consuming the inspection
+batch within the 17-connector scope. It stops at profile qualification and
+creates no attendance or Oracle rows. The maintenance schedule is not yet a
+qualified throughput path for the proposed burst envelope.
+
+Authenticated `GET /api/v1/devices/{connector_id}/zkt-custody` exposes paginated
+work states and missing-work detection, never raw bytes or employee identity.
+Receipts predating the work contract have a bounded idempotent backfill helper;
+an orphan receipt blocks writer activation until repaired. This is a backend
+status interface; the dashboard presentation still needs integration.
+
 ## Verification recorded on 3 October 2026
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
@@ -135,6 +157,9 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
   pinned-mbedTLS vectors include whole packets, fragments and out-of-civil-range
   capture clocks. CI now compiles the gated writer separately and does not
   publish that integration image.
+- Custody processing: 34 targeted tests and two real PostgreSQL locking tests
+  passed. Additive migration/schema checks and a real dump/restore preserved
+  encrypted observations, receipt IDs and work links through downgrade/upgrade.
 
 ## Work that still blocks the requested release
 

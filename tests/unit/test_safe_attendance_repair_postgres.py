@@ -52,7 +52,7 @@ def test_overlapping_device_sockets_commit_a_sequence_once(postgres_store):
 def test_overlapping_custody_sockets_return_one_committed_receipt(postgres_store):
     import base64
     from threading import Barrier
-    from zk_add.models import ZktObservationReceipt
+    from zk_add.models import ZktObservationReceipt, ZktCustodyWork, ZktCustodyWorkReceipt
     from zk_add.schemas import Envelope
     from zk_add.web import persist_envelope
     from zk_add.zkt_custody import observation_id
@@ -86,6 +86,38 @@ def test_overlapping_custody_sockets_return_one_committed_receipt(postgres_store
     assert sum(row["items"][0]["replay"] for row in receipts) == 1
     with sessions() as db:
         assert db.scalar(select(func.count(ZktObservationReceipt.id))) == 1
+        assert db.scalar(select(func.count(ZktCustodyWork.id))) == 1
+        assert db.scalar(select(func.count(ZktCustodyWorkReceipt.id))) == 1
+
+
+def test_custody_inspector_skips_connector_held_by_ingestion(postgres_store):
+    from zk_add.models import ZktCustodyWork
+    from zk_add.zkt_custody import settle_observations, observation_id
+    from zk_add.zkt_custody_work import advance_work
+    import base64
+
+    sessions, connector_id = postgres_store
+    with sessions() as db:
+        connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+        connector.zkt_custody_enabled = True
+        serial = connector.zkt_device.serial
+        connector.zkt_device.confirmed_serial = serial
+        connector_pk = connector.id
+        raw = b"synthetic packet evidence"
+        value = dict(observation_id=observation_id(serial, "b" * 32, 1), terminal_serial=serial,
+            capture_epoch="b" * 32, capture_sequence=1, captured_at=utc_now().isoformat(),
+            raw_b64=base64.b64encode(raw).decode(), raw_digest=hashlib.sha256(raw).hexdigest(),
+            raw_format="LIVE_PACKET", decoder_profile="unqualified", decoder_version="1", time_quality="UNKNOWN")
+        settle_observations(db, connector, {"schema_version": 1, "observations": [value]})
+        db.commit()
+    with sessions() as ingestion, sessions() as worker:
+        ingestion.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
+        assert advance_work(worker) == 0  # No five-second lock timeout or blocked ingest.
+        worker.commit()
+        ingestion.rollback()
+        assert advance_work(worker) == 1
+        assert worker.scalar(select(ZktCustodyWork.state)) == "WAIT_PROFILE"
+        worker.commit()
 
 
 @pytest.fixture()

@@ -230,6 +230,8 @@ def settle_observations(session: Session, connector: Connector, payload: dict) -
         occurrence = None
         if isinstance(parsed, Observation) and receipt.error_code is None:
             occurrence = bind_source_occurrence(session, connector, receipt, parsed)
+        from zk_add.zkt_custody_work import attach_work
+        attach_work(session, connector, receipt, raw if isinstance(raw, dict) else None)
         results.append({"index": index, "observation_id": identity,
                         "payload_digest": material_digest, "receipt_id": receipt.receipt_id,
                         "custody": receipt.disposition, "error_code": receipt.error_code,
