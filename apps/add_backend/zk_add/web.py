@@ -1965,6 +1965,49 @@ def reveal_source_exception_endpoint(
     return result
 
 
+@app.get("/api/v1/devices/{connector_id}/source-evidence")
+def zkt_source_evidence_list(
+    connector_id: str,
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=50),
+    disposition: str | None = Query(default=None, max_length=50),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    from zk_add.zkt_source_evidence import list_evidence
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    try:
+        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/devices/{connector_id}/source-evidence/{manifest_id}/reveal")
+def zkt_source_evidence_reveal(
+    connector_id: str,
+    manifest_id: int,
+    body: SourceExceptionActionRequest,
+    response: Response,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.zkt_source_evidence import reveal_evidence
+    db, context = auth
+    require_step_up(body.password, db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        result = reveal_evidence(db, connector, manifest_id, actor=context.username,
+                                reason=body.reason, idempotency_key=body.idempotency_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Source evidence not found.")
+    # No protected bytes leave the service if the audit cannot commit.
+    db.commit()
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return result
+
+
 @app.get("/api/v1/devices/{connector_id}/zkt-custody")
 def zkt_custody_status(
     connector_id: str,
