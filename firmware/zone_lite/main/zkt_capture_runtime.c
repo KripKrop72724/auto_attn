@@ -33,7 +33,8 @@ static bool digest(void *context, const uint8_t *bytes, size_t length, uint8_t o
 bool zj_capture_runtime_start(void)
 {
     zj_owner_health_t owner;
-    if (capture || !zj_owner_health(&owner) || !owner.ready) return false;
+    if (capture || !zj_owner_health(&owner) || !owner.ready ||
+        !owner.compatibility_checked || !owner.writer_allowed) return false;
     capture_lock = xSemaphoreCreateMutex();
     health_lock = xSemaphoreCreateMutex();
     capture = heap_caps_calloc(1, sizeof(*capture), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
