@@ -8,16 +8,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frames(tmp_path):
     source = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
-    reads = source[source.index("static bool recv_exact("):source.index("static bool send_all(")]
+    reads = source[source.index("static int64_t zk_io_deadline("):source.index("static bool send_all(")]
     stream = source[source.index("static bool zk_recv_data_stream("):source.index("static bool zk_send_command(")]
     command = source[source.index("static bool zk_send_command("):
-                     source.index("static bool zk_send_ack_only(int sock, uint16_t session_id)\n{")]
+                     source.index("static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)\n{")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zkt_socket_io.h"
+#define ZKT_IO_TIMEOUT_SEC 90
 #define MACHINE_PREPARE_DATA_1 0x5050
 #define MACHINE_PREPARE_DATA_2 0x7d82
 #define CMD_DATA 1501
@@ -38,8 +40,10 @@ static size_t total,position,fragment=1;
 static unsigned acknowledgements;
 static bool preserve_ok = true, preserved;
 static unsigned captures;
+static int64_t now, fragment_delay, preservation_delay;
+static int64_t esp_timer_get_time(void) { return now; }
 static bool zk_preserve_live_packet(const uint8_t *packet,size_t length)
-{assert(length==9 && packet[8]=='x'); ++captures; preserved=preserve_ok; return preserve_ok;}
+{assert(length==9 && packet[8]=='x'); ++captures; preserved=preserve_ok; now+=preservation_delay; return preserve_ok;}
 static int recv(int sock,void *out,size_t count,int flags)
 {
     (void)sock;
@@ -57,10 +61,23 @@ static int recv(int sock,void *out,size_t count,int flags)
     position += count;
     return (int)count;
 }
-static bool zk_send_ack_only(int sock,uint16_t session)
-{(void)sock;assert(session==12 && preserved);preserved=false;++acknowledgements;return true;}
-static bool send_all(int sock,const uint8_t *data,size_t count)
-{(void)sock;assert(data&&count);return true;}
+static bool zk_send_ack_only(int sock,uint16_t session,int64_t deadline)
+{(void)sock;assert(session==12 && preserved);if(now>=deadline)return false;preserved=false;++acknowledgements;return true;}
+bool zk_io_read_until(int sock,void *data,size_t count,int64_t deadline,zk_io_clock_t clock)
+{
+ size_t offset=0;
+ while(offset<count){
+  if(clock()>=deadline)return false;
+  now+=fragment_delay;
+  if(clock()>=deadline)return false;
+  int got=recv(sock,(uint8_t*)data+offset,count-offset,0);
+  if(got<=0)return false;
+  offset+=(size_t)got;
+ }
+ return true;
+}
+bool zk_io_write_until(int sock,const void *data,size_t count,int64_t deadline,zk_io_clock_t clock)
+{(void)sock;assert(data&&count);return clock()<deadline;}
 static uint16_t zk_checksum(const uint8_t *data,size_t count)
 {assert(data&&count);return 0;}
 /* PRODUCTION */
@@ -107,6 +124,16 @@ int main(void){
  total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
  assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
  assert(captures==4 && acknowledgements==2 && response.code==CMD_ACK_OK);
+ /* A byte trickle does not reset the full operation's 90-second budget. */
+ now=0;fragment_delay=20000000;fragment=1;
+ total=position=0;frame(CMD_DATA,12,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual) && position==4);
+ now=0;total=position=0;frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response) && position==4);
+ fragment_delay=0;fragment=1024;preservation_delay=60000000;
+ now=0;total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(captures==6 && acknowledgements==3); /* Second frame preserved, not falsely ACKed. */
  return 0;
 }
 '''
@@ -114,5 +141,6 @@ int main(void){
     unit.write_text(harness.replace("/* PRODUCTION */", reads + stream + command))
     executable = tmp_path / "transport"
     subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", str(unit), "-o", str(executable)], check=True)
+                    "-fsanitize=address,undefined", "-I", str(ROOT / "firmware/zone_lite/main"),
+                    str(unit), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

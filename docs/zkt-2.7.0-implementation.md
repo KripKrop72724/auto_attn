@@ -20,6 +20,7 @@ counts are kept outside this public repository.
 | Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte firmware and ADD fact decoders; explicit live layouts, calendar validation, strict count/layout agreement and bounded transport; six model selectors | Sanitized record/transport harnesses, 3,500 cross-language fact/clock vectors and ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
+| Short socket reads can extend a terminal operation indefinitely | One absolute monotonic deadline for a command, prepared-buffer transfer or live frame, including interleaved preservation and ACK; per-call nonblocking I/O after readiness | Fragment trickles, repeated events, interrupted waits, readiness races, actual Unix/TCP sockets and both ESP-IDF builds | Implemented transport bound; terminal scheduling and physical-model qualification remain open |
 | Historical attendance UID mistaken for current enrollment identity | Never supply a historical UID to current-roster matching; reject empty 40-byte text identities; preserve missing-reference source rows as `IDENTITY_UNRESOLVED`. Review notes cannot remove the identity hold or certify Oracle delivery | Synthetic empty/space-only fields, C/ADD rejection agreement, actual historical parser, baseline/tail replay and review-gate tests | Implemented guard; historical correction evidence and model qualification remain open |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
 | Legacy event IDs collapse distinct source occurrences | Custody inspection holds a shared attendance link when distinct canonical ordinals in one source epoch point to the same legacy attendance row; changed links and unverified attendance ownership remain explicit holds | Same-second/equal-byte source fixtures, retained acknowledged outboxes, binding/alias faults and independent later-record progress | Negative guard implemented; occurrence-based attendance creation and live/history matching remain open |
@@ -67,6 +68,18 @@ Recovery epochs and additive database rollback retain the encrypted claim.
 The audited source reveal shows the submitted interpretation separately from
 the custody result. This is a negative identity check, not profile qualification.
 Clock correction cannot use an 8-byte historical UID as employee identity.
+
+ZKT commands, prepared-buffer transfers and ordinary live frames each retain
+their existing 90-second allowance as an absolute monotonic deadline. Short
+reads, short writes, interrupted waits and interleaved live events cannot reset
+that allowance. An expired transfer fails and its partial bytes are not parsed
+or acknowledged. A fully preserved interleaved packet can remain in custody
+even when the subsequent ACK deadline expires. An initial prepare command and
+its following data transfer are separate bounded phases; this does not claim
+that an entire historical scan fits in 90 seconds. On allocation failure the
+caller abandons the session instead of draining an untrusted body. This fixes
+an operation-bound defect, not a demonstrated cause of the field's malformed
+source records.
 
 ## Browser event contract
 
@@ -221,6 +234,14 @@ still block recovery. Encryption identity and nonce allocation never reset.
 
 ## Verification recorded during implementation
 
+- Absolute socket deadlines: 13 targeted transport/socket/contract tests pass
+  under native Clang and Linux GCC ASan/UBSan. Actual Unix and loopback TCP
+  sockets cover delayed partial reads and full send buffers. The Linux run
+  leaves sockets blocking and verifies per-call nonblocking flags; Darwin's
+  fixture uses nonblocking sockets because its send-buffer wait does not honor
+  `MSG_DONTWAIT`. Injected libc ports are installed after fortified declarations
+  so faults cannot accidentally call a real socket. All 190 firmware regressions
+  and both unsigned ESP-IDF family builds pass.
 - Legacy occurrence links: 142 custody/runtime/occurrence and reconciliation regressions
   passed, including retained Oracle acknowledgements on a shared legacy UID,
   distinct attendance rows with equal same-second facts, replay, recovery
