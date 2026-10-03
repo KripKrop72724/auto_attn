@@ -466,7 +466,20 @@ def _hikvision_source_valid(session, event, connector):
         return False
 
 
-def identity_proof(session, event, connector, task=None):
+def _scan_cached(cache, key, read):
+    """Reuse shared evidence only inside one connector-locked preview batch.
+
+    Execution and delivery never supply this cache. They must re-read evidence
+    before authorizing each transition, including after a preview was approved.
+    """
+    if cache is None:
+        return read()
+    if key not in cache:
+        cache[key] = read()
+    return cache[key]
+
+
+def identity_proof(session, event, connector, task=None, *, scan_cache=None):
     """Only historical continuity is overridable; contradictory evidence never is."""
     if (
         not _terminal_provenance_verified(event, connector)
@@ -498,7 +511,7 @@ def identity_proof(session, event, connector, task=None):
         "none",
     }:
         return None, "USER_ID_INVALID"
-    users = session.scalars(
+    users = _scan_cached(scan_cache, ("users", terminal.id, event.user_id), lambda: session.scalars(
         select(DeviceUser)
         .where(
             DeviceUser.zkt_device_id == terminal.id,
@@ -507,7 +520,7 @@ def identity_proof(session, event, connector, task=None):
             DeviceUser.lifecycle_state == "ACTIVE",
         )
         .limit(2)
-    ).all()
+    ).all())
     if len(users) != 1:
         return None, "USER_MISSING"
     user = users[0]
@@ -515,7 +528,8 @@ def identity_proof(session, event, connector, task=None):
         not terminal.snapshot_complete
         or not terminal.identity_snapshot_stable
         or user.snapshot_revision != terminal.identity_snapshot_revision
-        or (task and not _snapshot_matches(session, task, terminal))
+        or (task and not _scan_cached(scan_cache, ("snapshot", task.id),
+                                     lambda: _snapshot_matches(session, task, terminal)))
     ):
         return None, "SNAPSHOT_CHANGED"
     if (
@@ -537,7 +551,7 @@ def identity_proof(session, event, connector, task=None):
             return None, "UID_INVALID"
     elif not _uid_optional(session, event, connector):
         return None, "UID_UNPROVEN"
-    cnic, error = _cnic(user)
+    cnic, error = _scan_cached(scan_cache, ("cnic", user.id), lambda: _cnic(user))
     if error:
         return None, error
     if event.cnic_lookup_hash and event.cnic_lookup_hash != user.cnic_lookup_hash:
@@ -553,16 +567,16 @@ def identity_proof(session, event, connector, task=None):
     identifiers = [DeviceUser.user_id == user.user_id]
     if user.uid:
         identifiers.append(DeviceUser.uid == user.uid)
-    if session.scalar(
+    if _scan_cached(scan_cache, ("duplicate", user.id), lambda: session.scalar(
         select(DeviceUser.id)
         .where(DeviceUser.zkt_device_id == terminal.id, DeviceUser.id != user.id, or_(*identifiers))
         .limit(1)
-    ):
+    )):
         return None, "IDENTITY_CONFLICT"
     tombstone_identifiers = [IdentityTombstone.user_id == user.user_id]
     if user.uid:
         tombstone_identifiers.append(IdentityTombstone.uid == user.uid)
-    if session.scalar(
+    if _scan_cached(scan_cache, ("tombstone", user.id), lambda: session.scalar(
         select(IdentityTombstone.id)
         .where(
             IdentityTombstone.zkt_device_id == terminal.id,
@@ -578,9 +592,9 @@ def identity_proof(session, event, connector, task=None):
             ),
         )
         .limit(1)
-    ):
+    )):
         return None, "IDENTITY_CONFLICT"
-    if session.scalar(
+    if _scan_cached(scan_cache, ("history", user.id), lambda: session.scalar(
         select(AttendanceIdentityHistory.id)
         .where(
             AttendanceIdentityHistory.zkt_device_id == terminal.id,
@@ -595,18 +609,18 @@ def identity_proof(session, event, connector, task=None):
             ),
         )
         .limit(1)
-    ):
+    )):
         return None, "IDENTITY_CONFLICT"
     if task:
         baseline_identifiers = [BaselineUser.user_id == user.user_id]
         if user.uid:
             baseline_identifiers.append(BaselineUser.uid == user.uid)
-        before = session.scalars(
+        before = _scan_cached(scan_cache, ("baseline", task.id, user.id), lambda: session.scalars(
             select(BaselineUser).where(
                 BaselineUser.task_id == task.id,
                 or_(*baseline_identifiers),
             )
-        ).all()
+        ).all())
         if any(
             b.device_user_id != user.id
             or (b.cnic_hash and b.cnic_hash != user.cnic_lookup_hash)
@@ -650,10 +664,11 @@ def identity_proof(session, event, connector, task=None):
     }, None
 
 
-def classify(session, event, connector, task):
+def classify(session, event, connector, task, *, scan_cache=None):
     if event.ords_status in ORDS_ACKNOWLEDGED_STATUSES and event.oracle_confirmed_at:
         return "EXCLUDED", "ALREADY_CONFIRMED", {}
-    outbox = session.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id))
+    outbox = _scan_cached(scan_cache, ("outbox", event.id), lambda: session.scalar(
+        select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)))
     if outbox and outbox.status in {"IN_FLIGHT", "PENDING", "FAILED_RETRYABLE", "RETRYING"}:
         return "EXCLUDED", "ALREADY_DELIVERING", {}
     if event.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
@@ -666,7 +681,7 @@ def classify(session, event, connector, task):
         return "NEEDS_REVIEW", code, {}
     if outbox and outbox.status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
         return "NEEDS_REVIEW", "PERMANENT_REVIEW", {}
-    proof, error = identity_proof(session, event, connector, task)
+    proof, error = identity_proof(session, event, connector, task, scan_cache=scan_cache)
     if error:
         return "NEEDS_REVIEW", error, {}
     return "READY", "READY", proof
@@ -679,8 +694,15 @@ def _scan(session, job, task, connector):
         AttendanceEvent.id <= task.high_water_id,
     )
     events = session.scalars(_in_scope(job, query).order_by(AttendanceEvent.id).limit(BATCH)).all()
+    # One outbox query and shared-identity reads per user, rather than repeating
+    # them for each retained punch. Nothing is cached across transactions.
+    scan_cache = {("outbox", event.id): None for event in events}
+    if events:
+        for row in session.scalars(select(OrdsOutbox).where(
+                OrdsOutbox.attendance_event_id.in_([event.id for event in events]))):
+            scan_cache[("outbox", row.attendance_event_id)] = row
     for event in events:
-        state, code, proof = classify(session, event, connector, task)
+        state, code, proof = classify(session, event, connector, task, scan_cache=scan_cache)
         session.add(
             Item(
                 job_id=job.id,
