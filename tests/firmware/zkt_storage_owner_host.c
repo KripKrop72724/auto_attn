@@ -154,6 +154,14 @@ zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t ep
     *writer_allowed = delivery && !recovering && !atomic_load(&refuse_compatibility);
     return *writer_allowed ? ZJ_COMPAT_OK : ZJ_COMPAT_NOT_READY;
 }
+zj_compat_result_t zj_reader_platform_update(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, uint32_t address, uint32_t size, const char *version)
+{
+    assert(pthread_mutex_trylock(&budget) == EBUSY);
+    assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0] && ready && persistence);
+    assert(address == 0x2a0000 && size == 0x280000 && !strcmp(version, ZJ_WRITER_VERSION));
+    return delivery && !recovering ? ZJ_COMPAT_PROTECTED_SLOT : ZJ_COMPAT_NOT_READY;
+}
 /* The genuine mbedTLS adapter is independently tested. This port exercises
  * owner/thread/file/NVS interactions, not cryptographic authentication. */
 static bool seal(void *context, const uint8_t *metadata, const uint8_t *nonce,
@@ -281,8 +289,18 @@ int main(int argc, char **argv)
     assert(zj_owner_submit(&compatibility, &ticket));
     assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
     assert(zj_owner_health(&health) && health.writer_allowed);
+    zj_request_t update = {.operation = ZJ_OTA_CHECK, .input.ota = {
+        .address = 0x2a0000, .size = 0x280000, .version = ZJ_WRITER_VERSION}};
+    assert(zj_owner_submit(&update, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_PROTECTED_SLOT);
+    assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility == ZJ_COMPAT_OK);
+    atomic_store(&stale_transport, true);
+    assert(zj_owner_submit(&update, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_NOT_READY);
+    atomic_store(&stale_transport, false);
+    assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility == ZJ_COMPAT_OK);
     uint64_t gating_operations = health.completed, gating_failures = health.failures;
-    assert(gating_operations == 5 && gating_failures == 4);
+    assert(gating_operations == 7 && gating_failures == 6);
     atomic_store(&pause_write, true);
     assert(zj_owner_submit(&request, &ticket));
     request.input.observation.raw[0] = 'B';

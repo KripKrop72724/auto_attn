@@ -27,6 +27,9 @@
 
 #include "add_connector.h"
 #include "zone_config.h"
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+#include "zkt_ota_guard.h"
+#endif
 
 #define OTA_NAMESPACE "zone_ota"
 #define OTA_POLL_MS 60000
@@ -401,6 +404,14 @@ static bool perform_update(void)
         strlcpy(s_last_error, "PARTITION_ERASE_ALIGNMENT", sizeof(s_last_error));
         return false;
     }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    const char *journal_error = zj_ota_before_download(target->address, target->size, s_journal.target_version);
+    if (journal_error) {
+        strlcpy(s_last_error, journal_error, sizeof(s_last_error));
+        (void)report_state("FAILED", s_last_error);
+        return false;
+    }
+#endif
     // A receive counter may include IDF's buffered encrypted-flash tail.
     // Rewind old unaligned checkpoints to a complete erase sector so restart
     // re-downloads and erases the uncertain tail instead of skipping bytes.

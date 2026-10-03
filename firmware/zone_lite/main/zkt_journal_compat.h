@@ -36,7 +36,7 @@ typedef enum {
     ZJ_COMPAT_OK, ZJ_COMPAT_INVALID, ZJ_COMPAT_VERSION, ZJ_COMPAT_SECURITY,
     ZJ_COMPAT_NOT_READY, ZJ_COMPAT_MISSING, ZJ_COMPAT_IO, ZJ_COMPAT_CORRUPT,
     ZJ_COMPAT_BINDING, ZJ_COMPAT_ROLLBACK, ZJ_COMPAT_UNCERTAIN,
-    ZJ_COMPAT_EXHAUSTED
+    ZJ_COMPAT_EXHAUSTED, ZJ_COMPAT_UPDATE_TARGET, ZJ_COMPAT_PROTECTED_SLOT
 } zj_compat_result_t;
 
 /* Only a validated bridge can create/renew proof. Existing corrupt or rebound
@@ -49,6 +49,13 @@ zj_compat_result_t zj_reader_attest(zj_reader_proof_port_t port,
 zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
     const zj_reader_environment_t *writer, const zj_reader_identity_t *current,
     const zj_reader_environment_t *rollback, const zj_reader_identity_t *previous);
+
+/* The release's only journal-preserving install edge is a validated, attested
+ * bridge -> exact writer, into the other slot. Never overwrite the certified
+ * bridge from the writer. This check is read-only and runs before OTA erase. */
+zj_compat_result_t zj_reader_check_update(zj_reader_proof_port_t port,
+    const zj_reader_environment_t *bridge, const zj_reader_identity_t *current,
+    uint32_t target_address, uint32_t target_size, const char *target_version);
 
 bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
     zj_reader_identity_t *identity, uint64_t *generation);

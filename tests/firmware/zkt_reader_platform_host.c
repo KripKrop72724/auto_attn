@@ -82,21 +82,45 @@ static zj_compat_result_t check(void)
     assert(writer_allowed == (result == ZJ_COMPAT_OK && !strcmp(app.version, ZJ_WRITER_VERSION)));
     return result;
 }
+static zj_compat_result_t update(void)
+{
+    unsigned initial = writes;
+    zj_compat_result_t result = zj_reader_platform_update("TEST-TERMINAL", epoch, true, true, true, false,
+        partitions[other].address, partitions[other].size, ZJ_WRITER_VERSION);
+    assert(writes == initial && opens == closes);
+    return result;
+}
 int main(void)
 {
 #if !CONFIG_NVS_ENCRYPTION
     assert(check() == ZJ_COMPAT_SECURITY && !writes);
+    assert(update() == ZJ_COMPAT_SECURITY && !writes);
     return 0;
 #else
     current_valid = false;
     assert(check() == ZJ_COMPAT_SECURITY && !writes); /* Unconfirmed bridge. */
+    assert(update() == ZJ_COMPAT_SECURITY && !writes);
     current_valid = true;
+    assert(update() == ZJ_COMPAT_MISSING && !writes);
     assert(check() == ZJ_COMPAT_OK && writes == 1 && commits == 1 && released);
+    assert(update() == ZJ_COMPAT_OK);
+    for (unsigned f = 1; f <= 13; ++f) {
+        if (f == 4) continue; /* Target contents are about to be replaced. */
+        fault = f;
+        assert(update() != ZJ_COMPAT_OK);
+    }
+    fault = 0;
+    assert(zj_reader_platform_update("TEST-TERMINAL", epoch, true, true, true, false,
+        partitions[other].address + 0x10000, partitions[other].size, ZJ_WRITER_VERSION) == ZJ_COMPAT_PROTECTED_SLOT);
+    assert(zj_reader_platform_update("TEST-TERMINAL", epoch, true, true, true, false,
+        partitions[other].address, partitions[other].size - 0x10000, ZJ_WRITER_VERSION) == ZJ_COMPAT_PROTECTED_SLOT);
+    epoch[0] ^= 1; assert(update() == ZJ_COMPAT_BINDING); epoch[0] ^= 1;
     unsigned initial_writes = writes;
     reverse = true;
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
     reverse = false;
     strcpy(app.version, ZJ_WRITER_VERSION); running = 2; other = 3; current_valid = false;
+    assert(update() == ZJ_COMPAT_PROTECTED_SLOT);
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
     for (unsigned f = 1; f <= 13; ++f) {
         fault = f;

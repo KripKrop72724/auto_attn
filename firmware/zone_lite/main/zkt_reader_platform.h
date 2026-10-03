@@ -8,3 +8,8 @@
 zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, bool *writer_allowed);
+
+zj_compat_result_t zj_reader_platform_update(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending, uint32_t target_address,
+    uint32_t target_size, const char *target_version);

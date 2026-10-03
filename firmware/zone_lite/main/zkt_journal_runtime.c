@@ -31,7 +31,7 @@ static bool start_owner(void *context, const char *serial)
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .decoder_profile = "zkt-unqualified", .decoder_version = "zkt-raw-1"};
     strcpy(metadata.terminal_serial, serial);
-    return zj_owner_start("/spiffs/zktj", &metadata);
+    return zj_owner_start(ZJ_DEVICE_PREFIX, &metadata);
 }
 static bool owner_health(void *context, zj_owner_health_t *out)
 { (void)context; return zj_owner_health(out); }
