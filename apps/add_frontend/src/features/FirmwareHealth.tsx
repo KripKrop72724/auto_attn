@@ -7,6 +7,15 @@ const labels: Record<string, string> = {
   live: 'Live attendance', bulk: 'Historical attendance', receipts: 'Delivery receipts',
   blocked: 'Identity exceptions', evidence: 'Preserved evidence', ords: 'Oracle pending',
 }
+const journalPhases: Record<string, string> = {
+  NOT_STARTED: 'Not started', DISABLED: 'Inactive for this image', SECURITY_HOLD: 'Security checks required',
+  BINDING_HOLD: 'Terminal binding needs review', STORAGE_WAIT: 'Waiting for storage checks',
+  OWNER_START: 'Starting storage worker', RECOVERING: 'Recovering preserved records',
+  TRANSPORT_START: 'Starting delivery worker', CHECKING_READER: 'Checking rollback reader',
+  READER_HOLD: 'Reader compatibility needs review', CAPTURE_START: 'Starting capture',
+  WRITER_DISABLED: 'Reader active; new capture is disabled', READY: 'Startup checks passed',
+  STALLED: 'Worker progress is stalled', UNKNOWN: 'Unknown',
+}
 
 export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }: {
   diagnostics?: FirmwareDiagnostics | null
@@ -23,6 +32,19 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const sameBoot = Boolean(diagnostics?.boot_id && bootId && diagnostics.boot_id === bootId)
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
   const storage = diagnostics?.storage
+  const journal = diagnostics?.journal_runtime
+  const count = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
+  const journalValid = journal?.observed === true && Object.hasOwn(journalPhases, journal.phase) &&
+    typeof journal.reader_ready === 'boolean' && typeof journal.writer_ready === 'boolean' &&
+    [journal.start_attempts, journal.storage_starts, journal.delivery_starts, journal.capture_starts,
+      journal.proof_attempts, journal.failures].every(count)
+  const parentUptime = diagnostics?.sampled_uptime_ms
+  const journalLag = journalValid && count(journal.sampled_uptime_ms) && typeof parentUptime === 'number' &&
+    Number.isSafeInteger(parentUptime) && parentUptime >= 0
+    ? (parentUptime % 0x100000000 - journal.sampled_uptime_ms! + 0x100000000) % 0x100000000 : Infinity
+  const journalFresh = fresh && journalLag + Math.max(0, now - observed) <= 45_000
+  const journalReader = journalFresh && journal?.reader_ready &&
+    ['CHECKING_READER', 'READER_HOLD', 'CAPTURE_START', 'WRITER_DISABLED', 'READY'].includes(journal.phase)
   const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error
   const heading = !diagnostics ? 'Local durability not reported'
     : !sameBoot ? 'Durability boot identity is unverified'
@@ -52,6 +74,15 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
         {storage?.error_operation && <div><dt>Last storage error</dt><dd>{storage.error_operation} · {storage.error_code ?? 'No code reported'}</dd></div>}
+        {journal && <>
+          <div><dt>Journal startup</dt><dd>{journalFresh ? journalPhases[journal.phase] : 'Current journal state unverified'}</dd></div>
+          <div><dt>Journal reader</dt><dd>{journalReader ? 'Ready for recovery and receipt delivery' : 'Readiness not confirmed'}</dd></div>
+          <div><dt>New journal capture</dt><dd>{journalFresh && journal.writer_ready && journalReader && journal.phase === 'READY' ? 'Local writer permitted' : 'Writer permission not confirmed'}</dd></div>
+          <div><dt>Journal start attempts</dt><dd>{journalValid ? journal.start_attempts : 'Not reported'}</dd></div>
+          <div><dt>Journal workers started</dt><dd>{journalValid ? `${journal.storage_starts} storage · ${journal.delivery_starts} delivery · ${journal.capture_starts} capture` : 'Not reported'}</dd></div>
+          <div><dt>Reader checks</dt><dd>{journalValid ? journal.proof_attempts : 'Not reported'}</dd></div>
+          <div><dt>Last reader compatibility result</dt><dd style={{ overflowWrap: 'anywhere' }}>{journal.compatibility || 'Not reported'}</dd></div>
+        </>}
       </dl>
       {diagnostics.workers.map(worker => <p key={worker.name}>
         {labels[worker.name] || worker.name}: {worker.state === 'UNKNOWN' ? 'Not reported' : worker.state.replaceAll('_', ' ').toLowerCase()}

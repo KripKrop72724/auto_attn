@@ -23,10 +23,10 @@ counts are kept outside this public repository.
 | Historical attendance UID mistaken for current enrollment identity | Never supply a historical UID to current-roster matching; reject empty 40-byte text identities; preserve missing-reference source rows as `IDENTITY_UNRESOLVED`. Review notes cannot remove the identity hold or certify Oracle delivery | Synthetic empty/space-only fields, C/ADD rejection agreement, actual historical parser, baseline/tail replay and review-gate tests | Implemented guard; historical correction evidence and model qualification remain open |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
 | Custody can outlive an untracked processing obligation | Migration `0044` adds per-packet work and immutable receipt links in the custody transaction; bounded assembly, fair inspection, revision-triggered holds and an authenticated status endpoint | Receipt/work rollback, fragment conflict/replay, per-record decryption failure isolation, bounded repair, PostgreSQL overlapping sockets/SKIP LOCKED and actual dump/restore | Implemented components; profile-qualified interpretation and Oracle creation remain open |
-| Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: capture/delivery startup gated; catalog and legacy handoff remain open |
+| Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: gated startup implemented; ESP qualification, catalog and legacy handoff remain open |
 | Slow repeated identity reads in backlog previews | Connector-locked preview batches reuse shared identity evidence and fetch outboxes once; release and delivery revalidate without the preview cache | Mixed-record proof equality/query bound; next-transaction identity conflict; existing 100,000-row responsiveness test | Implemented; no manual jobs created or approved |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
-| Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
+| Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing | Native/Linux sanitizer and actual ESP adapter fault harnesses | Partial: OTA replacement policy, complete migration and signed bridge qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
@@ -192,7 +192,18 @@ The original checkpoint evidence needs its own ADD receipt before reclamation.
 Unavailable reads, damaged root keys/counters and exhausted recovery capacity
 still block recovery. Encryption identity and nonce allocation never reset.
 
-## Verification recorded on 3 October 2026
+## Verification recorded during implementation
+
+- Journal startup: native Clang and Linux GCC sanitizer tests cover bootstrap,
+  proof deadlines, retries across clock wrap, checkpoint recovery, binding holds,
+  stale/stalled evidence and all encrypted-NVS/writer-build combinations of the
+  actual ESP adapter. The firmware run passed 186 regressions; after updating
+  its startup-loop stub, all nine final startup/OTA/runtime tests passed.
+  The expanded diagnostics serializer passed every pinned-cJSON allocation
+  failure. Unsigned ZKT gated-writer and Hikvision ESP-IDF builds passed.
+  Backend/schema/HIL tests: 258 passed. UI: 15 preservation-health tests and
+  all eight browser/viewport cases passed; TypeScript, production build and
+  bundle budgets passed. Desktop and narrow mobile screenshots were inspected.
 
 - Historical identity guard: 181 targeted firmware/decoder/reconciliation tests
   passed, then 61 reconciliation tests passed after bounding the unfinished-scan
@@ -300,8 +311,8 @@ power-loss qualification; those remain separate release requirements.
 1. Qualify and activate durable raw capture before acknowledging live events.
    The ordinary, command-response and prepared-read hooks are implemented under
    a disabled writer build switch. Partial packet fragments remain holds.
-2. Activate the journal storage/delivery tasks through the compatible-reader
-   gate and wire live capture; transfer catalog and
+2. Qualify the implemented journal startup/compatible-reader gate and live
+   capture on actual ESP devices; transfer catalog and
    legacy storage operations to the same owner. Qualify actual ESP latency,
    resource headroom, checkpoint recovery on actual ESP hardware and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
@@ -324,8 +335,9 @@ No connector has been upgraded or accepted by this implementation work.
 
 The journal byte format and failure behavior are documented in
 [`zkt-journal-v1.md`](zkt-journal-v1.md). Journal code compiles into the ZKT family
-only. There is no call to `zj_owner_start` from the running firmware yet, no
-writer activation, and no change to the published firmware version.
+only. The app task now calls a gated startup controller for exact 2.6.16/2.7.0
+identities. Current development images retain their old versions, so this
+does not activate journal workers or change the published firmware version.
 
 The owner copies requests into eight bounded slots, reserves three slots for
 capture/retirement, and limits priority bursts so delivery reads can progress.
@@ -341,9 +353,13 @@ image, OTA slot, terminal, key epoch and partition layout. The ESP adapter reads
 those image/security facts locally and refuses a factory or unconfirmed
 rollback image. Proof writes commit and read back; damaged/missing evidence
 does not open the writer. The bridge can attest reading capability without
-gaining writer permission. Recovery invalidates cached permission. This is
-implemented behind the still-disabled startup path; it does not qualify an
-artifact or complete the bridge, migration or OTA replacement policy.
+gaining writer permission. Recovery invalidates cached permission. The startup
+controller requires secure boot, encrypted NVS, a provisioned terminal binding,
+verified local storage and an OTA slot. It starts receipt delivery during
+checkpoint recovery, then checks compatibility before permitting capture.
+Successful starts are counted separately from attempts; stale or stalled
+workers are held without task deletion. This does not qualify an artifact or
+complete the bridge, migration or OTA replacement policy.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain
@@ -358,7 +374,7 @@ uncertain retirement followed by reopening storage, disconnection between read
 and send, owner stalls across monotonic-clock wrap, failed reply abandonment,
 and bounded saturation. Valid retries preserve the exact wire payload; empty
 polling performs no filesystem scan. Native Clang and Linux GCC sanitizer runs
-passed. ESP task startup remains disabled until compatibility proof exists.
+passed. New capture remains disabled until compatible-reader proof exists.
 
 The CI failure caused by the transport harness's ambiguous C indentation was
 fixed without disabling compiler warnings or tests. PR #260 and its main-branch

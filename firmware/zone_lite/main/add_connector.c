@@ -4,6 +4,7 @@
 #include "hikvision_runtime.h"
 #else
 #include "zkt_custody_wire.h"
+#include "zkt_journal_runtime.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -2617,6 +2618,9 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         (zkt->committed_source_known &&
             (!cJSON_AddNumberToObject(diagnostics, "source_generation", zkt->committed_source_generation) ||
              !cJSON_AddNumberToObject(diagnostics, "committed_source_cursor", zkt->committed_source_cursor)))) goto failed;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (!zj_runtime_append_diagnostics(diagnostics)) goto failed;
+#endif
     if (cJSON_AddItemToObject(payload, "diagnostics", diagnostics)) return;
 failed:
     cJSON_Delete(diagnostics);
@@ -4203,7 +4207,7 @@ bool add_connector_boot_health_ready(void)
         hikvision_boot_health_ready();
 #else
     bool ready = false;
-    if (!storage_upgrade_ready()) return false;
+    if (!storage_upgrade_ready() || !zj_runtime_boot_ready()) return false;
     // An authenticated control connection and healthy workers cannot attest
     // to safe attendance preservation when local storage is degraded.
     size_t storage_total = 0, storage_used = 0;

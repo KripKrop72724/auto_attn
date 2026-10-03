@@ -166,8 +166,31 @@ OTA slot with matching terminal, epoch and storage layout. An unconfirmed bridge
 factory slot, changed image or unknown format refuses writing. Attesting the
 bridge does not enable its journal writer. These are local compatibility checks;
 they do not establish model correctness, migration completion, seven-day
-capacity, signed artifact qualification or HIL acceptance. Boot startup and OTA
-replacement policy remain disabled/incomplete until the full bridge is wired.
+capacity, signed artifact qualification or HIL acceptance. The gated boot
+controller is implemented; OTA replacement policy and the complete bridge
+migration remain release blockers.
+
+The app task starts the reader only for exact 2.6.16/2.7.0 ZKT application
+identities, a provisioned binding, secure boot, encrypted NVS and an OTA slot.
+Legacy versions and Hikvision do not activate it. Failed constructors retry
+with two-to-sixty-second backoff; a successful start is never retried merely
+because its health snapshot is unavailable. Delivery starts during checkpoint
+recovery so the archived checkpoint can obtain its custody receipt. Reader
+proof requests have five-second caller deadlines and retain accepted work.
+
+A pending bridge proves local reader operation before OTA validation; after
+validation it can persist its bridge attestation. Only a writer build with a
+successful compatible-reader check starts raw capture. Recovery clears the
+owner's permission, and each packet also checks the runtime's current gate.
+Changed bindings stay held until reboot. Missing/stale worker evidence and
+storage operations exceeding fifteen seconds block local boot health without
+killing or restarting a possible lock owner. These are software guard bounds,
+not measured ESP latency or hardware qualification.
+
+Diagnostics retain startup phase, independent reader/writer readiness, actual
+worker starts, attempts and reader-check results. ADD displays their evidence
+age against the parent boot/sample, including 32-bit uptime wrap. A local
+startup pass cannot assert source coverage or Oracle completion.
 
 ## Raw live packet capture
 
@@ -190,6 +213,7 @@ The capture call has a 15-second deadline, with a five-second deadline per
 owner append, and uses no ADD/Oracle network call. These are recovery bounds,
 not measured live-latency guarantees. The normal and both interleaved protocol
 paths call the capture hook before ACK under `ZONE_LITE_JOURNAL_WRITES`. This
-integration-test switch remains off in release workflows. Runtime startup
-still requires persisted reader compatibility; without startup, a writer
-build refuses live ACK rather than falling back to legacy delivery.
+integration-test switch remains off in release workflows. Raw writer startup
+requires persisted reader compatibility and the runtime permission must still
+be fresh for each packet. An unready writer refuses live ACK without silently
+falling back to legacy delivery.

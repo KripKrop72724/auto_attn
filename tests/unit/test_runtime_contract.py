@@ -32,3 +32,16 @@ def test_probe_failures_and_restart_attempts_survive_schema_validation():
     assert value["storage"]["persistence_probe_operation"] == "persistence_sync"
     assert value["workers"][0]["restart_count"] == 1
     assert value["workers"][0]["restart_attempts"] == 9
+
+
+def test_journal_start_attempts_are_distinct_from_actual_starts_and_custody():
+    runtime = {"observed": True, "phase": "READER_HOLD", "reader_ready": True, "writer_ready": False,
+               "start_attempts": 9, "storage_starts": 1, "delivery_starts": 1, "capture_starts": 0,
+               "proof_attempts": 3, "failures": 7, "sampled_uptime_ms": 42000,
+               "last_progress_uptime_ms": 40000, "compatibility": "READER_PROOF_MISSING"}
+    value = FirmwareDiagnostics.model_validate({"schema_version": 2, "journal_runtime": runtime}).model_dump()
+    assert value["journal_runtime"] == runtime
+    assert value["runtime_profile"] is None and value["delivery_authority"] is None
+    for field in ("start_attempts", "sampled_uptime_ms"):
+        with pytest.raises(ValueError):
+            FirmwareDiagnostics.model_validate({"journal_runtime": {**runtime, field: -1}})
