@@ -967,8 +967,12 @@ def _validated_firmware_public_base(public_base: str) -> str:
 
 
 def assignment_for_connector(session: Session, *, connector: Connector, public_base: str) -> dict[str, Any] | None:
+    from zk_add.zkt_ota_admission import pending_offer_hold, try_assignment_lock
+
     public_base = _validated_firmware_public_base(public_base)
     if not capability_is_eligible(connector):
+        return None
+    if not try_assignment_lock(session, connector):
         return None
     active = session.scalar(select(FirmwareDeployment).join(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == connector.zone_id, FirmwareCampaign.status == "ACTIVE",
@@ -1026,7 +1030,13 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
     # A heartbeat version string is not boot, digest, or reconciliation evidence.
     # Only the checked progress transitions may complete this deployment.
     if pending_offer:
+        hold = pending_offer_hold(session, connector)
+        if hold:
+            deployment.error_code = hold
+            deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
+            return None
         deployment.status = "OFFERED"
+        deployment.error_code = deployment.error_message = None
         deployment.offered_at = utc_now()
         deployment.attempt_count += 1
         session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details={}))
