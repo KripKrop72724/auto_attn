@@ -20,7 +20,7 @@ counts are kept outside this public repository.
 | Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
-| Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding and strict typed receipt verification | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher and PostgreSQL overlapping-socket tests | Partial: receiver disabled; delivery-task integration and live/history semantic matching remain open |
+| Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task | Actual filesystem fault injection, independent crypto vectors, NVS port faults and concurrent owner harness | Partial: journal components implemented; live capture/transport wiring, catalog and legacy handoff remain open |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
@@ -74,8 +74,18 @@ The firmware adapter sends one immutable item and checks a typed committed
 receipt for its exact identity/digest. Corrupt journal extents use explicit
 `JOURNAL_EXCEPTION` custody. Decimal strings preserve 64-bit counters through
 cJSON. The storage owner recomputes the payload before retirement, rejecting a
-receipt for different bytes. The delivery task and capture activation remain
-gated; no signed candidate is implied by these component checks.
+receipt for different bytes. The delivery task is implemented but startup and
+capture activation remain gated; no signed candidate is implied by these checks.
+
+The delivery worker submits one owner operation at a time and releases all
+storage resources before an ADD exchange. Five-second owner deadlines release
+only the caller's reply; accepted storage work still finishes. Missing custody
+ACKs retry the same immutable bytes with bounded jitter. A receipt remains in
+RAM until the owner commits retirement; uncertain retirement is recovered from
+the durable checkpoint. Reclamation removes at most one settled segment per
+step, including while ADD is offline. Phase/progress snapshots remain readable
+while a network exchange is blocked. The current ACK wait is fifteen seconds,
+with separately bounded connector mutex and socket-send waits.
 
 Exact source references bind only against committed canonical manifests with
 matching connector, terminal, source epoch, ordinal and raw digest. The alias
@@ -123,7 +133,8 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
 1. Durable raw capture before acknowledging interleaved live events; the current
    prepared-read path still relies on terminal-tail recovery and is unqualified.
-2. Wire the journal storage task to live capture/transport; transfer catalog and
+2. Activate the journal storage/delivery tasks through the compatible-reader
+   gate and wire live capture; transfer catalog and
    legacy storage operations to the same owner. Qualify actual ESP latency,
    resource headroom, corrupt-checkpoint recovery and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
@@ -163,6 +174,14 @@ retirement and uncertain nonce reservations. The key-state harness verifies
 terminal binding, orphan refusal, corruption detection and exact readback.
 The concurrent owner harness demonstrates timeout safety and delivery at full
 capacity. These are software tests, not physical flash qualification.
+
+The delivery harness uses actual journal files and the bounded owner mailbox.
+It checks lost responses after simulated ADD commit, a zero receipt proof,
+uncertain retirement followed by reopening storage, disconnection between read
+and send, owner stalls across monotonic-clock wrap, failed reply abandonment,
+and bounded saturation. Valid retries preserve the exact wire payload; empty
+polling performs no filesystem scan. Native Clang and Linux GCC sanitizer runs
+passed. ESP task startup remains disabled until compatibility proof exists.
 
 The CI failure caused by the transport harness's ambiguous C indentation was
 fixed without disabling compiler warnings or tests. PR #260 and its main-branch
