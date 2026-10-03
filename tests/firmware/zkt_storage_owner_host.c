@@ -383,6 +383,36 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && !health.occupied && !health.operation_running);
     assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 1 &&
         health.max_operation_us && health.ready);
+    /* A capture caller can time out while its accepted append is still inside
+     * storage. Quiescence must finish that write and all queued work before
+     * acknowledging; a new producer cannot race the completed barrier. */
+    uint64_t before_quiesce = health.completed, queued_ticket;
+    zj_request_t final_capture = {.operation = ZJ_APPEND, .input.observation = {
+        .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
+        .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'Q'}}};
+    atomic_store(&full, false);
+    atomic_store(&write_waiting, false);
+    atomic_store(&pause_write, true);
+    assert(zj_owner_submit(&final_capture, &ticket));
+    for (unsigned i = 0; i < 2000 && !atomic_load(&write_waiting); ++i) vTaskDelay(1);
+    assert(atomic_load(&write_waiting));
+    assert(zj_owner_submit(&final_capture, &queued_ticket));
+    assert(zj_owner_abandon(queued_ticket));
+    assert(!zj_owner_quiesce());
+    assert(zj_owner_health(&health) && health.quiescing && !health.quiesced && health.operation_running);
+    uint64_t refused_ticket = 99;
+    assert(!zj_owner_submit(&final_capture, &refused_ticket) && !refused_ticket);
+    atomic_store(&pause_write, false);
+    assert(wait_reply(ticket).result == ZJ_OK);
+    for (unsigned i = 0; i < 2000 && !zj_owner_quiesce(); ++i) vTaskDelay(1);
+    assert(zj_owner_quiesce());
+    assert(zj_owner_health(&health) && health.quiesced && !health.operation_running &&
+        !health.writer_allowed && !health.compatibility_checked && health.completed == before_quiesce + 2);
+    assert(!zj_owner_submit(&compatibility, &refused_ticket));
+    vTaskDelay(10);
+    assert(zj_owner_health(&health) && health.completed == before_quiesce + 2);
+    assert(!pthread_mutex_trylock(&budget));
+    assert(!pthread_mutex_unlock(&budget));
     atomic_store(&stop, true);
     assert(!pthread_join(thread, NULL));
     return 0;

@@ -1970,7 +1970,17 @@ static uint32_t zkt_recovery_target_ip(void)
     return preferred != 0 && preferred == g_last_authenticated_zkt_ip ? preferred : 0;
 }
 
+static bool maybe_reboot_zkt_for_recovery_session(uint32_t discovery_failures, int64_t *last_reboot_ms);
+
 static bool maybe_reboot_zkt_for_recovery(uint32_t discovery_failures, int64_t *last_reboot_ms)
+{
+    if (!add_connector_terminal_session_begin()) return false;
+    bool result = maybe_reboot_zkt_for_recovery_session(discovery_failures, last_reboot_ms);
+    while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+    return result;
+}
+
+static bool maybe_reboot_zkt_for_recovery_session(uint32_t discovery_failures, int64_t *last_reboot_ms)
 {
     if (!ZONE_LITE_ZKT_RECOVERY_REBOOT_ENABLED ||
         discovery_failures < ZONE_LITE_ZKT_RECOVERY_FAILURES) {
@@ -5850,7 +5860,17 @@ static uint32_t daily_zkt_reboot_target_ip(void)
     return g_last_authenticated_zkt_ip;
 }
 
+static bool daily_zkt_reboot_try_target_session(uint32_t target_ip, int local_day_key);
+
 static bool daily_zkt_reboot_try_target(uint32_t target_ip, int local_day_key)
+{
+    if (!add_connector_terminal_session_begin()) return false;
+    bool result = daily_zkt_reboot_try_target_session(target_ip, local_day_key);
+    while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+    return result;
+}
+
+static bool daily_zkt_reboot_try_target_session(uint32_t target_ip, int local_day_key)
 {
     if (target_ip == 0) {
         ESP_LOGW(TAG, "Skipping daily ZKT maintenance reboot because no target IP is known");
@@ -7507,6 +7527,7 @@ static void ords_uploader_task(void *arg)
 
 static bool probe_zkt_device(uint32_t host_order_ip, uint32_t *selected_ip)
 {
+    if (add_connector_terminal_restart_pending()) return false;
     int64_t probe_started_ms = uptime_ms();
     int sock = -1;
     if (!tcp_connect_with_timeout(host_order_ip, ZONE_LITE_ZKT_PORT, ZONE_LITE_DISCOVERY_CONNECT_TIMEOUT_MS, &sock)) {
@@ -7577,7 +7598,17 @@ done:
     return ok;
 }
 
+static bool discover_zkt_session(uint32_t *selected_ip, uint32_t skip_ip);
+
 static bool discover_zkt(uint32_t *selected_ip, uint32_t skip_ip)
+{
+    if (!add_connector_terminal_session_begin()) return false;
+    bool result = discover_zkt_session(selected_ip, skip_ip);
+    while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+    return result;
+}
+
+static bool discover_zkt_session(uint32_t *selected_ip, uint32_t skip_ip)
 {
     led_status_set(LED_STATUS_ZKT_DISCOVERING);
     zkt_publish_state("DISCOVERING", "searching for authenticated ZKT terminal", false);
@@ -8254,7 +8285,19 @@ static bool process_add_commands(
     return false;
 }
 
+static int64_t gateway_run_session(uint32_t host_order_ip);
+
 static int64_t gateway_run(uint32_t host_order_ip)
+{
+    if (!add_connector_terminal_session_begin()) return 0;
+    int64_t duration = gateway_run_session(host_order_ip);
+    /* The session's capture and cleanup calls have returned. Lock contention
+     * cannot silently skip the handoff to the OTA controller. */
+    while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+    return duration;
+}
+
+static int64_t gateway_run_session(uint32_t host_order_ip)
 {
     int64_t session_started_ms = uptime_ms();
     bool truth_retry_session = false;
@@ -8356,6 +8399,7 @@ static int64_t gateway_run(uint32_t host_order_ip)
     size_t live_events_since_sync = 0;
     bool restarted = false;
     while (true) {
+        if (add_connector_terminal_restart_pending()) break;
         if (g_comm_key_operation_active || add_connector_has_pending_config_command()) {
             ESP_LOGI(TAG, "Yielding the ZKT session to an authenticated configuration operation");
             break;
@@ -9406,7 +9450,17 @@ static void format_comm_probe_result(
 }
 #endif
 
+static bool process_pending_comm_key_command_session(void);
+
 static bool process_pending_comm_key_command(void)
+{
+    if (!add_connector_terminal_session_begin()) return false;
+    bool result = process_pending_comm_key_command_session();
+    while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+    return result;
+}
+
+static bool process_pending_comm_key_command_session(void)
 {
     if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0 ||
         !add_connector_is_connected() ||
@@ -9616,6 +9670,10 @@ static void gateway_task(void *arg)
     int64_t last_zkt_reboot_ms = 0;
     int64_t offline_started_ms = 0;
     while (true) {
+        if (add_connector_terminal_restart_pending()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         if (add_connector_has_pending_config_command()) {
             if (!process_pending_comm_key_command()) {
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -9644,6 +9702,7 @@ static void gateway_task(void *arg)
             ESP_LOGI(TAG, "Opening one live session to last authenticated ZKT %s:%d", direct_ip, ZONE_LITE_ZKT_PORT);
             zkt_publish_state("CONNECTING", "opening live session to last authenticated terminal", false);
             int64_t session_duration = gateway_run(directly_tried_ip);
+            if (add_connector_terminal_restart_pending()) continue;
             if (g_truth_retry_session_requested) {
                 g_truth_retry_session_requested = false;
                 discovery_failures = 0;
@@ -9674,6 +9733,7 @@ static void gateway_task(void *arg)
             discovery_failures = 0;
             offline_started_ms = 0;
             int64_t session_duration = gateway_run(selected_ip);
+            if (add_connector_terminal_restart_pending()) continue;
             if (g_truth_retry_session_requested) {
                 g_truth_retry_session_requested = false;
                 discovery_failures = 0;
