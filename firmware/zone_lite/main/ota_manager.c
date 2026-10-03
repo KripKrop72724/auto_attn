@@ -384,12 +384,35 @@ static bool fetch_assignment(void)
 
 static bool perform_update(void)
 {
+    // Secure-boot artifacts are padded; aligned complete writes ensure IDF
+    // has no encrypted flash tail waiting for esp_ota_end to flush.
+    if (!s_journal.image_size || s_journal.image_size % 16U) {
+        strlcpy(s_last_error, "IMAGE_SIZE_ALIGNMENT", sizeof(s_last_error));
+        (void)report_state("FAILED", s_last_error);
+        return false;
+    }
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
     if (!target || target->size <= (128 * 1024) || s_journal.image_size > target->size - (128 * 1024)) {
         strlcpy(s_last_error, "IMAGE_TOO_LARGE", sizeof(s_last_error));
         (void)report_state("FAILED", s_last_error);
         return false;
     }
+    if (target->erase_size < 16U || target->erase_size % 16U) {
+        strlcpy(s_last_error, "PARTITION_ERASE_ALIGNMENT", sizeof(s_last_error));
+        return false;
+    }
+    // A receive counter may include IDF's buffered encrypted-flash tail.
+    // Rewind old unaligned checkpoints to a complete erase sector so restart
+    // re-downloads and erases the uncertain tail instead of skipping bytes.
+    if (s_journal.bytes_written > s_journal.image_size) {
+        strlcpy(s_last_error, "OTA_RESUME_OFFSET_INVALID", sizeof(s_last_error));
+        return false;
+    }
+    // The last network step can complete all bytes before finalize/selection.
+    // Re-read the final sector after such a reset; Range starting at EOF is
+    // invalid and would otherwise leave the download permanently retrying.
+    if (s_journal.bytes_written == s_journal.image_size) --s_journal.bytes_written;
+    s_journal.bytes_written -= s_journal.bytes_written % target->erase_size;
     esp_http_client_config_t http = {
         .url = s_journal.download_url,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -421,7 +444,14 @@ static bool perform_update(void)
     esp_err_t result;
     while ((result = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
         int written = esp_https_ota_get_image_len_read(handle);
-        if (written > 0) s_journal.bytes_written = (size_t)written;
+        if (written > 0) {
+            if ((size_t)written > s_journal.image_size) {
+                esp_https_ota_abort(handle);
+                strlcpy(s_last_error, "IMAGE_LENGTH_MISMATCH", sizeof(s_last_error));
+                return false;
+            }
+            s_journal.bytes_written = (size_t)written - (size_t)written % target->erase_size;
+        }
         if (s_journal.bytes_written >= checkpoint + OTA_RESUME_CHECKPOINT_BYTES) {
             checkpoint = s_journal.bytes_written;
             if (!save_journal()) { esp_https_ota_abort(handle); return false; }
@@ -434,6 +464,30 @@ static bool perform_update(void)
         strlcpy(s_last_error, "DOWNLOAD_INCOMPLETE", sizeof(s_last_error));
         return false;
     }
+    int complete_bytes = esp_https_ota_get_image_len_read(handle);
+    if (complete_bytes <= 0 || (size_t)complete_bytes != s_journal.image_size) {
+        esp_https_ota_abort(handle);
+        strlcpy(s_last_error, "IMAGE_LENGTH_MISMATCH", sizeof(s_last_error));
+        (void)report_state("FAILED", s_last_error);
+        return false;
+    }
+    // esp_https_ota_finish verifies the signature AND changes boot selection.
+    // Check the expected application identity first. Selecting then restoring
+    // a different signed image leaves an unsafe reset window between them.
+    unsigned char digest[32];
+    char digest_hex[65];
+    if (esp_partition_get_sha256(target, digest) != ESP_OK) {
+        esp_https_ota_abort(handle);
+        strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
+        return false;
+    }
+    hex_bytes(digest, sizeof(digest), digest_hex);
+    if (strcmp(digest_hex, s_journal.image_sha256) != 0) {
+        esp_https_ota_abort(handle);
+        strlcpy(s_last_error, "IMAGE_HASH_MISMATCH", sizeof(s_last_error));
+        (void)report_state("FAILED", s_last_error);
+        return false;
+    }
     // Persist the boot-recovery journal before finish can select the OTA slot.
     // A reset before finish conservatively reports rollback from the old image;
     // a reset after finish finds the new image's READY_TO_BOOT checkpoint.
@@ -442,24 +496,6 @@ static bool perform_update(void)
     if (!save_journal()) { esp_https_ota_abort(handle); return false; }
     if (esp_https_ota_finish(handle) != ESP_OK) {
         strlcpy(s_last_error, "DOWNLOAD_OR_SIGNATURE_FAILED", sizeof(s_last_error));
-        return false;
-    }
-    unsigned char digest[32];
-    char digest_hex[65];
-    if (esp_partition_get_sha256(target, digest) != ESP_OK) {
-        strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
-        const esp_partition_t *running = esp_ota_get_running_partition();
-        if (!running || esp_ota_set_boot_partition(running) != ESP_OK)
-            strlcpy(s_last_error, "BOOT_SELECTION_RECOVERY_FAILED", sizeof(s_last_error));
-        return false;
-    }
-    hex_bytes(digest, sizeof(digest), digest_hex);
-    if (strcmp(digest_hex, s_journal.image_sha256) != 0) {
-        strlcpy(s_last_error, "IMAGE_HASH_MISMATCH", sizeof(s_last_error));
-        const esp_partition_t *running = esp_ota_get_running_partition();
-        if (!running || esp_ota_set_boot_partition(running) != ESP_OK)
-            strlcpy(s_last_error, "BOOT_SELECTION_RECOVERY_FAILED", sizeof(s_last_error));
-        (void)report_state("FAILED", s_last_error);
         return false;
     }
     (void)report_state("READY_TO_BOOT", NULL);
