@@ -1,22 +1,23 @@
-"""ADD-owned, immutable-payload delivery with separate Oracle core-field proof.
+"""ADD-owned delivery with an explicit raw projection and daily time proof.
 
 Registration is internal to future qualified occurrence creation. No device
 payload, version string or connector toggle registers an intent. Existing
 event UIDs/Oracle keys are never migrated or changed by this module.
-The existing Oracle checker verifies UID, terminal, user reference, timestamp,
-raw-punch flag, name and CNIC. Its receipt does not certify unexamined fields,
-downstream daily processing, or the full 2.7.0 release contract.
+The versioned reader checks every transmitted field stored by the Oracle raw
+table, and independently accounts for the daily punch-time projection. Business
+status, leave and payroll calculations are outside this delivery proof.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 
 import httpx
 from sqlalchemy import select
 
-from zk_add.attendance_repair import _identity_digest, _immutable_facts, _ords_request, _protected_digest
+from zk_add.attendance_repair import _ords_request, _protected_digest
 from zk_add.crypto import decrypt_cnic, decrypt_json, encrypt_json
 from zk_add.db import session_scope
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, ZktOccurrenceAlias,
@@ -27,8 +28,42 @@ from zk_add.zkt_custody import source_occurrence_delivery_hold, occurrence_id
 from zk_add.identity_states import VERIFIED_IDENTITY_RESOLUTION_STATUSES
 
 TOKEN = re.compile(r"^[a-f0-9]{64}$")
-CONFLICTS = frozenset({"MISMATCH", "IMMUTABLE_MISMATCH", "CROSS_DEVICE_UID_COLLISION", "CHANGED"})
-VERIFICATION_SCOPE = "ORACLE_RAW_CORE_V1"
+CONFLICTS = frozenset({"MISMATCH", "IMMUTABLE_MISMATCH", "CROSS_DEVICE_UID_COLLISION", "CHANGED",
+                       "IDENTITY_HOLD", "DOWNSTREAM_HOLD"})
+VERIFICATION_SCOPE = "ORACLE_RAW_DAY_TIMES_V2"
+PROJECTION_FIELDS = ("event_uid", "zone_id", "device_id", "device_serial", "user_id",
+                     "employee_name", "cnic", "timestamp", "raw_punch", "capturetype", "trust_status")
+
+
+def projection_check(payload):
+    """Declare Oracle's timestamp/NUMBER(10,3) representation explicitly.
+
+    The original payload (including fields Oracle does not store) remains frozen
+    independently. Null clock difference is distinct from a measured zero.
+    """
+    projection = {key: payload[key] for key in PROJECTION_FIELDS}
+    try:
+        stamp = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("missing timezone")
+        projection["timestamp"] = stamp.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        drift = payload["clockdiff"]
+        if drift is None:
+            projection["clockdiff"] = None
+        else:
+            if isinstance(drift, bool):
+                raise ValueError("boolean clock")
+            decimal = Decimal(str(drift))
+            if not decimal.is_finite():
+                raise ValueError("nonfinite clock")
+            decimal = decimal.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+            if abs(decimal) >= Decimal("10000000"):
+                raise ValueError("clock overflow")
+            projection["clockdiff"] = format(decimal, ".3f")
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        raise EvidenceChanged("ZKT_ORACLE_PROJECTION_UNREPRESENTABLE") from exc
+    return {"contract_version": "2", "verification_scope": VERIFICATION_SCOPE,
+            "request_digest": _protected_digest(payload), "projection": projection}
 
 
 class EvidenceChanged(ValueError):
@@ -98,12 +133,7 @@ def _current(session, intent, row):
     if not cnic:
         raise EvidenceChanged("ZKT_ORACLE_IDENTITY_UNAVAILABLE")
     payload = oracle_payload(connector, connector.zkt_device, event, cnic)
-    facts = _immutable_facts(event)
-    check = {"contract_version": "1", "connector_id": connector.connector_id,
-             "terminal_serial": event.device_serial, "items": [{"event_uid": event.event_uid,
-                 "immutable_facts": facts, "immutable_facts_digest": _protected_digest(facts),
-                 "desired_identity": {"employee_name": payload["employee_name"], "cnic": cnic,
-                     "identity_digest": _identity_digest(payload["employee_name"], cnic)}}]}
+    check = projection_check(payload)
     return event, payload, check
 
 
@@ -114,9 +144,9 @@ def _hold(row, event, reason):
     row.acknowledged_at = event.oracle_confirmed_at = event.oracle_confirmation_path = None
 
 
-def _retry(row, event):
+def _retry(row, event, reason="ZKT_ORACLE_CONTENT_VERIFICATION_PENDING"):
     row.status = event.ords_status = "FAILED_RETRYABLE"
-    row.last_error = "ZKT_ORACLE_CONTENT_VERIFICATION_PENDING"
+    row.last_error = reason
     row.next_attempt_at = utc_now() + timedelta(seconds=min(600, 2 ** min(row.attempt_count, 9)))
     row.acknowledged_at = event.oracle_confirmed_at = event.oracle_confirmation_path = None
 
@@ -203,23 +233,33 @@ def reserve_post(claim):
 
 
 async def verify(claim):
-    response = await _ords_request("raw-captures/identity-repairs/check", payload=claim["check"])
+    response = await _ords_request("raw-captures/delivery-v2/check", payload=claim["check"])
     if not isinstance(response, dict):
         return "UNKNOWN", None
     rows = response.get("results")
-    if response.get("success") is not True or not isinstance(rows, list) or len(rows) != 1:
+    if (response.get("success") is not True or response.get("contract_version") != "2"
+            or response.get("verification_scope") != VERIFICATION_SCOPE
+            or response.get("request_digest") != claim["check"]["request_digest"]
+            or not isinstance(rows, list) or len(rows) != 1):
         return "UNKNOWN", None
     row = rows[0]
     if not isinstance(row, dict) or row.get("event_uid") != claim["payload"]["event_uid"]:
         return "UNKNOWN", None
     classification, token = row.get("classification"), row.get("current_content_token")
-    if not isinstance(classification, str):
+    if not isinstance(classification, str) or not isinstance(token, str) or not TOKEN.fullmatch(token):
         return "UNKNOWN", None
-    if classification in {"MATCH", "MISSING", "MISMATCH"} and not (
-        isinstance(token, str) and TOKEN.fullmatch(token)
-    ):
-        return "UNKNOWN", None
-    if classification not in {"MATCH", "MISSING", "MISMATCH", "IMMUTABLE_MISMATCH", "CROSS_DEVICE_UID_COLLISION"}:
+    raw, downstream = row.get("raw_projection_verified"), row.get("downstream_status")
+    if classification == "MATCH":
+        required = "RAW_ONLY" if claim["payload"]["raw_punch"] == "T" else "MATCH"
+        if raw is not True or downstream != required:
+            return "UNKNOWN", None
+    elif classification in {"MISSING", "MISMATCH", "CROSS_DEVICE_UID_COLLISION"}:
+        if raw is not False or downstream != "NOT_VERIFIED":
+            return "UNKNOWN", None
+    elif classification in {"DOWNSTREAM_PENDING", "IDENTITY_HOLD", "DOWNSTREAM_HOLD"}:
+        if raw is not True or downstream != "NOT_VERIFIED":
+            return "UNKNOWN", None
+    else:
         return "UNKNOWN", None
     return classification, token
 
@@ -257,13 +297,17 @@ def persist_result(claim, classification, token=None):
             now = utc_now()
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
-            event.oracle_confirmation_path = "ADD_ZKT_CORE_CHECK"
+            event.oracle_confirmation_path = "ADD_ZKT_PROJECTION_V2"
             row.next_attempt_at = row.last_error = None
             row.last_http_status = 200
             # The receipt and completion state commit together, or not at all.
             session.flush()
+        elif classification in {"IDENTITY_HOLD", "DOWNSTREAM_HOLD"}:
+            _hold(row, event, "ZKT_ORACLE_" + classification)
         elif classification in CONFLICTS:
             _hold(row, event, "ZKT_ORACLE_CONTENT_CONFLICT" if classification != "CHANGED" else "ZKT_ORACLE_EVIDENCE_CHANGED")
+        elif classification == "DOWNSTREAM_PENDING":
+            _retry(row, event, "ZKT_ORACLE_DOWNSTREAM_VERIFICATION_PENDING")
         elif classification == "REJECTED":
             _hold(row, event, "ZKT_ORACLE_POST_REJECTED")
         else:
