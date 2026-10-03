@@ -14,6 +14,14 @@ is bound to that state; changing the terminal cannot silently rebind retained
 observations. Missing or corrupt state never causes automatic key replacement
 when journal files or retirement state exist.
 
+Root byte 145 records irreversible delivery authority: zero before cutover,
+one after transfer to ADD; bytes 146–155 remain zero. It is covered by the root
+CRC and encrypted NVS. The owner commits and reads back this bit only after a
+writer's compatible rollback check, before reserving any capture sequence.
+An uncertain commit requires root recovery. A legacy-authority root with a
+sequence limit greater than one is invalid. Reader proof capability bit `0x20`
+requires this contract and bridge capture; proofs predating it are incompatible.
+
 HKDF-SHA256 derives an AES-256-GCM key with the capture epoch as salt and the
 ASCII domain `ZKT-ATTENDANCE-JOURNAL-AES256GCM-V1` followed by the zero-padded
 81-byte terminal identifier as information. Each 12-byte nonce is `ZJ01`
@@ -163,8 +171,9 @@ the trust boundary, not a claim that CRC is authentication.
 
 A 2.7.0 writer requires that exact validated bridge in a separate, nonoverlapping
 OTA slot with matching terminal, epoch and storage layout. An unconfirmed bridge,
-factory slot, changed image or unknown format refuses writing. Attesting the
-bridge does not enable its journal writer. These are local compatibility checks;
+factory slot, changed image or unknown format refuses writing. Attesting an
+initial bridge does not transfer authority. After persisted ADD cutover, a
+validated compatible bridge resumes journal capture after rollback. These are local compatibility checks;
 they do not establish model correctness, migration completion, seven-day
 capacity, signed artifact qualification or HIL acceptance. The gated boot
 controller and pre-erase install interlock are implemented; complete bridge
@@ -200,8 +209,11 @@ recovery so the archived checkpoint can obtain its custody receipt. Reader
 proof requests have five-second caller deadlines and retain accepted work.
 
 A pending bridge proves local reader operation before OTA validation; after
-validation it can persist its bridge attestation. Only a writer build with a
-successful compatible-reader check starts raw capture. Recovery clears the
+validation it can persist its bridge attestation. A running pending bridge's
+local health proof is explicit; it does not depend on winning a race before a
+failed attestation. Both new images require capture support in their build.
+Only persisted ADD authority and a successful compatible-reader check start
+raw capture, including on the bridge after rollback. Recovery clears the
 owner's permission, and each packet also checks the runtime's current gate.
 Changed bindings stay held until reboot. Missing/stale worker evidence and
 storage operations exceeding fifteen seconds block local boot health without

@@ -6,7 +6,7 @@
 #define ZJ_READER_PROOF_BYTES 192U
 #define ZJ_BRIDGE_VERSION "2.6.16"
 #define ZJ_WRITER_VERSION "2.7.0"
-#define ZJ_READER_MASK 0x1fU
+#define ZJ_READER_MASK 0x3fU /* Includes persisted ADD authority and bridge capture. */
 
 /* This is local reader capability, not model, HIL or production qualification.
  * The storage owner supplies the verified key epoch and reader state. The ESP
@@ -38,7 +38,7 @@ typedef enum {
     ZJ_COMPAT_BINDING, ZJ_COMPAT_ROLLBACK, ZJ_COMPAT_UNCERTAIN,
     ZJ_COMPAT_EXHAUSTED, ZJ_COMPAT_UPDATE_TARGET, ZJ_COMPAT_PROTECTED_SLOT,
     ZJ_COMPAT_SELECTION_EXPIRED, ZJ_COMPAT_SELECTION_UNCERTAIN,
-    ZJ_COMPAT_ANTI_ROLLBACK
+    ZJ_COMPAT_ANTI_ROLLBACK, ZJ_COMPAT_CAPTURE_DISABLED
 } zj_compat_result_t;
 
 /* Only a validated bridge can create/renew proof. Existing corrupt or rebound

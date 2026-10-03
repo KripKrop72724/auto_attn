@@ -229,10 +229,25 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
                     persistence, o->store.checkpoint_recovery_pending,
                     request->input.ota.address, request->input.ota.size, request->input.ota.version);
             } else {
+                bool writer_image = false;
                 o->compatibility = zj_reader_platform_check(o->metadata.terminal_serial,
                     o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
-                    persistence, o->store.checkpoint_recovery_pending, &o->writer_allowed);
+                    persistence, o->store.checkpoint_recovery_pending, &writer_image);
                 o->compatibility_checked = true;
+                o->writer_allowed = false;
+                if (o->compatibility == ZJ_COMPAT_OK && writer_image &&
+                    zj_state_enable_add(&o->state) != ZJ_OK) {
+                    /* Commit may have reached NVS. Recover the root before
+                     * trusting authority or retrying; never fall back. */
+                    o->compatibility = ZJ_COMPAT_UNCERTAIN;
+                    o->compatibility_checked = false;
+                    o->store.last_operation = "delivery_authority_commit";
+                }
+                /* OK without writer_image is the exact validated bridge.
+                 * It may keep capturing only after an earlier writer's
+                 * persisted, irreversible transfer to ADD. */
+                o->writer_allowed = o->compatibility == ZJ_COMPAT_OK &&
+                    zj_state_authority(&o->state) == ZJ_AUTHORITY_ADD;
                 reply->compatibility = o->compatibility;
             }
             reply->result = reply->compatibility == ZJ_COMPAT_OK ? ZJ_OK : ZJ_INVALID;
@@ -289,6 +304,7 @@ static void task(void *context)
         o->health.checkpoint_recovery_pending = o->store.checkpoint_recovery_pending;
         o->health.compatibility_checked = o->compatibility_checked;
         o->health.writer_allowed = o->writer_allowed;
+        o->health.delivery_authority = zj_state_authority(&o->state);
         o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;
         if (reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {

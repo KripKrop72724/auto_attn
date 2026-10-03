@@ -123,12 +123,13 @@ export interface FirmwareDiagnostics {
   sample_sequence?: number | null
   sampled_at?: string | null
   sampled_uptime_ms?: number | null
-  delivery_authority?: 'LEGACY_DUAL' | 'ADD' | null
+  delivery_authority?: 'LEGACY_DUAL' | 'ADD' | 'UNKNOWN' | null
   journal_runtime?: {
     observed: boolean
     phase: string
     reader_ready: boolean
     writer_ready: boolean
+    delivery_authority?: 'UNKNOWN' | 'LEGACY' | 'ADD' | null
     start_attempts: number
     storage_starts: number
     delivery_starts: number

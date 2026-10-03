@@ -1,5 +1,6 @@
 #include "zkt_journal_state.h"
 #include "zkt_journal_compat.h"
+#include "durable_queue.h"
 #include <assert.h>
 #include <string.h>
 
@@ -65,14 +66,18 @@ int main(void)
     reset();
     assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
     assert(state.ready && state.limit == 1 && fake.writes == 1 && fake.randoms == 1);
+    assert(zj_state_authority(&state) == ZJ_AUTHORITY_LEGACY);
+    assert(!zj_state_reserve(&state, 257) && state.ready && fake.writes == 1);
     uint8_t key[32], epoch[16], original_key[32], original_epoch[16];
     assert(zj_state_identity(&state, original_key, original_epoch));
+    assert(zj_state_enable_add(&state) == ZJ_OK && zj_state_authority(&state) == ZJ_AUTHORITY_ADD);
+    assert(zj_state_enable_add(&state) == ZJ_OK && fake.writes == 2);
     assert(zj_state_reserve(&state, 257));
     assert(!zj_state_reserve(&state, 257) && !zj_state_reserve(&state, 1));
     assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK && state.limit == 257);
     assert(zj_state_identity(&state, key, epoch));
     assert(!memcmp(key, original_key, 32) && !memcmp(epoch, original_epoch, 16));
-    assert(fake.writes == 2 && fake.randoms == 1);
+    assert(fake.writes == 3 && fake.randoms == 1 && zj_state_authority(&state) == ZJ_AUTHORITY_ADD);
     unsigned writes = fake.writes;
     assert(zj_state_open(&state, port(), "REPLACED-TERMINAL") == ZJ_CORRUPT);
     assert(!state.ready && !zj_state_identity(&state, key, epoch) && writes == fake.writes);
@@ -100,6 +105,26 @@ int main(void)
     assert(!fake.writes && !fake.randoms);
 
     for (unsigned uncertain = 0; uncertain < 2; ++uncertain) {
+        /* Write failure may occur before or after the commit. A readback
+         * failure can also hide success; none permits sequence allocation. */
+        for (unsigned boundary = 1; boundary <= 2; ++boundary) {
+            reset();
+            assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
+            fake.calls = 0; fake.fail_at = boundary; fake.uncertain = uncertain;
+            assert(zj_state_enable_add(&state) == ZJ_UNCERTAIN);
+            assert(zj_state_authority(&state) == ZJ_AUTHORITY_UNKNOWN);
+            assert(!zj_state_reserve(&state, 257));
+            fake.fail_at = 0;
+            assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
+            bool committed = boundary == 2 || uncertain;
+            assert(zj_state_authority(&state) == (committed ? ZJ_AUTHORITY_ADD : ZJ_AUTHORITY_LEGACY));
+            unsigned before = fake.writes;
+            assert(zj_state_enable_add(&state) == ZJ_OK);
+            assert(fake.writes == before + (committed ? 0U : 1U));
+            assert(zj_state_reserve(&state, 257));
+            assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
+            assert(zj_state_authority(&state) == ZJ_AUTHORITY_ADD);
+        }
         for (unsigned boundary = 1; boundary <= 8; ++boundary) {
             reset();
             fake.fail_at = boundary;
@@ -113,6 +138,7 @@ int main(void)
         for (unsigned boundary = 1; boundary <= 2; ++boundary) {
             reset();
             assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
+            assert(zj_state_enable_add(&state) == ZJ_OK);
             fake.calls = 0;
             fake.fail_at = boundary;
             fake.uncertain = uncertain;
@@ -138,6 +164,16 @@ int main(void)
             assert(loaded == 0 || (loaded == 1 && !memcmp(cp, restored, sizeof(cp))));
         }
     }
+    /* Even a checksum-valid root cannot regress authority after reserving
+     * capture identities. Retain it for recovery instead of replacing it. */
+    reset();
+    assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_OK);
+    assert(zj_state_enable_add(&state) == ZJ_OK && zj_state_reserve(&state, 257));
+    fake.root[145] = 0;
+    uint32_t crc = dq_crc32(fake.root, ZJ_ROOT_BYTES - 4);
+    for (unsigned i = 0; i < 4; ++i) fake.root[ZJ_ROOT_BYTES - 4 + i] = (uint8_t)(crc >> (8 * i));
+    writes = fake.writes;
+    assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_CORRUPT && fake.writes == writes);
     zj_state_clear(&state);
     for (size_t i = 0; i < sizeof(state); ++i) assert(!((uint8_t *)&state)[i]);
     return 0;
