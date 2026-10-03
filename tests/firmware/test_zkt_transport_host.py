@@ -37,9 +37,22 @@ static uint8_t input[2048];
 static size_t total,position,fragment=1;
 static unsigned acknowledgements;
 static int recv(int sock,void *out,size_t count,int flags)
-{(void)sock;(void)flags;if(position==total)return 0;
- if(count>fragment)count=fragment;if(count>total-position)count=total-position;
- memcpy(out,input+position,count);position+=count;return (int)count;}
+{
+    (void)sock;
+    (void)flags;
+    if (position == total) {
+        return 0;
+    }
+    if (count > fragment) {
+        count = fragment;
+    }
+    if (count > total - position) {
+        count = total - position;
+    }
+    memcpy(out, input + position, count);
+    position += count;
+    return (int)count;
+}
 static bool zk_send_ack_only(int sock,uint16_t session)
 {(void)sock;assert(session==12);++acknowledgements;return true;}
 static bool send_all(int sock,const uint8_t *data,size_t count)
