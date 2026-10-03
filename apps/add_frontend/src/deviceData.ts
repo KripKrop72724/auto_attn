@@ -5,6 +5,7 @@ import type { Device } from './types'
 // orders concurrent list/detail responses, independently of response arrival.
 export class DeviceSnapshots {
   private rows = new Map<string, Device>()
+  private fleetIds: string[] = []
   private list: Device[] = []
   private listeners = new Set<() => void>()
   subscribe = (listener: () => void) => {
@@ -13,8 +14,10 @@ export class DeviceSnapshots {
   }
   get = (id: string) => this.rows.get(id)
   all = () => this.list
-  put = (incoming: Device[]) => {
-    let changed = false
+  replaceFleet = (incoming: Device[]) => this.put(incoming, true)
+  put = (incoming: Device[], replaceFleet = false) => {
+    let changed = replaceFleet
+    if (replaceFleet) this.fleetIds = incoming.map(row => row.connector_id)
     for (const row of incoming) {
       const prior = this.rows.get(row.connector_id)
       const revision = (value: Device) => Date.parse(value.snapshot_at || value.firmware_diagnostics_at || value.last_seen_at || '')
@@ -24,9 +27,9 @@ export class DeviceSnapshots {
     }
     if (changed) this.notify()
   }
-  clear = () => { this.rows.clear(); this.notify() }
+  clear = () => { this.rows.clear(); this.fleetIds = []; this.notify() }
   private notify = () => {
-    this.list = [...this.rows.values()]
+    this.list = this.fleetIds.map(id => this.rows.get(id)!).filter(Boolean)
     this.listeners.forEach(listener => listener())
   }
 }

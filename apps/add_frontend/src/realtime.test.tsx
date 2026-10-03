@@ -41,11 +41,21 @@ describe('device refresh and stream recovery', () => {
     const old = { connector_id: 'one', snapshot_at: '2026-10-03T10:00:00Z', state: 'OFFLINE' } as Device
     const fresh = { ...old, snapshot_at: '2026-10-03T10:00:01Z', state: 'ONLINE' }
     cache.put([fresh])
-    cache.put([old])
+    cache.replaceFleet([old])
     expect(cache.all()[0]).toEqual(cache.get('one'))
     expect(cache.get('one')?.state).toBe('ONLINE')
     cache.clear()
     expect(cache.all()).toEqual([])
+  })
+  it('removes a connector from fleet membership while retaining its last detail snapshot', () => {
+    const cache = new DeviceSnapshots()
+    const row = { connector_id: 'one', snapshot_at: '2026-10-03T10:00:00Z' } as Device
+    cache.replaceFleet([row])
+    expect(cache.all()).toHaveLength(1)
+    cache.replaceFleet([])
+    cache.put([{ ...row, snapshot_at: '2026-10-03T10:00:01Z' }])
+    expect(cache.all()).toEqual([])
+    expect(cache.get('one')).toBeDefined()
   })
   it('continues polling when EventSource is unavailable', () => {
     vi.useFakeTimers()

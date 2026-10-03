@@ -731,7 +731,7 @@ function DashboardApp() {
       ])
       if (request !== fleetRequest.current) return
       setOverview(counts)
-      deviceSnapshots.put(fleet.rows)
+      deviceSnapshots.replaceFleet(fleet.rows)
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
       else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')

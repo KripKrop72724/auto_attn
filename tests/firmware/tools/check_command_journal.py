@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
 helpers = source[source.index("static int command_transaction_load("):source.index("static bool command_is_scheduled_locked(")]
-complete = source[source.index("bool add_connector_command_complete("):source.index("bool add_connector_lookup_identity(")]
+complete = source[source.index("bool add_connector_command_complete("):source.index("static bool add_connector_lookup_identity_locked(")]
 program = r'''
 #include <assert.h>
 #include <stdbool.h>
