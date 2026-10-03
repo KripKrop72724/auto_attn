@@ -300,6 +300,13 @@ still block recovery. Encryption identity and nonce allocation never reset.
   actual starts and prohibit overlapping transaction owners. All 17 custody
   panel tests and eight primary-route browser cases passed; the production
   frontend build and asset budget checks also passed.
+- Reader compatibility: native Clang and Linux GCC sanitizer harnesses cover
+  every proof-byte corruption and torn prefix, uncertain commit/readback,
+  generation exhaustion, partition/security/image changes and writer refusal.
+  An independent Python fixture fixes the byte contract between artifacts.
+  The owner harness verifies stale transport cannot open the writer and reads/
+  settlement still work while writing is blocked. Both ESP-IDF family builds
+  pass; these development builds remain unsigned and are not release artifacts.
 
 ## Work that still blocks the requested release
 
@@ -340,6 +347,16 @@ free an in-flight request; abandoning a reply does not cancel accepted capture.
 Only a completed durable write returns a capture sequence. The task reports
 operation start, progress, occupancy, saturation and separate NVS/filesystem
 errors. It never deletes or restarts another task that might own a lock.
+
+Journal appends additionally require an owner-executed reader compatibility
+check. The new encrypted-NVS capability binds the exact validated 2.6.16 bridge
+image, OTA slot, terminal, key epoch and partition layout. The ESP adapter reads
+those image/security facts locally and refuses a factory or unconfirmed
+rollback image. Proof writes commit and read back; damaged/missing evidence
+does not open the writer. The bridge can attest reading capability without
+gaining writer permission. Recovery invalidates cached permission. This is
+implemented behind the still-disabled startup path; it does not qualify an
+artifact or complete the bridge, migration or OTA replacement policy.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain

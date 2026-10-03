@@ -133,9 +133,41 @@ The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 
 The ESP adapter currently owns journal operations only. Catalog and legacy
-queue ownership, capture/delivery activation, bridge reader proof,
+queue ownership, capture/delivery activation, bridge boot integration,
 delivery matching and current-incident recovery must be integrated and tested
 before activation. Existing firmware behavior remains gated until then.
+
+## Durable reader capability
+
+The owner refuses `APPEND` until its bounded `READER_CHECK` operation confirms
+compatibility. Reads, committed custody settlement and checkpoint recovery do
+not require writer authorization. The check uses this boot's opened journal,
+recent transport progress and persistence health; storage recovery invalidates
+the cached writer permission. The check does not recursively acquire the shared
+filesystem mutex or hold one across a network operation.
+
+A 192-byte, little-endian `ZJREAD01` blob in encrypted NVS binds the validated
+2.6.16 bridge's application digest and OTA slot to the terminal digest, journal
+capture epoch, canonical partition-layout digest and supported journal/root/
+retirement formats. It includes a monotonic generation, exact capability bits,
+canonical zero padding and CRC32. The platform adapter reads actual ESP image
+digests, partitions, secure-boot state and OTA validation; remote declarations
+cannot supply them. The blob contains no encryption key or attendance bytes.
+
+The bridge commits and reads back the exact proof. Repeating an unchanged proof
+does not write flash. An unavailable, damaged or rebound proof cannot be
+silently replaced. Existing proof also prevents a missing encryption root from
+being regenerated, even when no segment remains. Generation exhaustion refuses
+renewal. CRC covers accidental corruption; secure boot and encrypted NVS are
+the trust boundary, not a claim that CRC is authentication.
+
+A 2.7.0 writer requires that exact validated bridge in a separate, nonoverlapping
+OTA slot with matching terminal, epoch and storage layout. An unconfirmed bridge,
+factory slot, changed image or unknown format refuses writing. Attesting the
+bridge does not enable its journal writer. These are local compatibility checks;
+they do not establish model correctness, migration completion, seven-day
+capacity, signed artifact qualification or HIL acceptance. Boot startup and OTA
+replacement policy remain disabled/incomplete until the full bridge is wired.
 
 ## Raw live packet capture
 

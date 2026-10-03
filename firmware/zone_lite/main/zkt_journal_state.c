@@ -1,4 +1,5 @@
 #include "zkt_journal_state.h"
+#include "zkt_journal_compat.h"
 #include "durable_queue.h"
 #include <string.h>
 
@@ -76,6 +77,11 @@ zj_result_t zj_state_open(zj_state_t *state, zj_state_port_t port, const char *s
         uint8_t checkpoint[ZJ_CHECKPOINT_BYTES];
         int previous = port.read(port.context, "retirement", checkpoint, sizeof(checkpoint));
         erase(checkpoint, sizeof(checkpoint));
+        if (previous < 0) return ZJ_IO;
+        if (previous != 0) return ZJ_CORRUPT;
+        uint8_t reader_proof[ZJ_READER_PROOF_BYTES];
+        previous = port.read(port.context, "reader_v1", reader_proof, sizeof(reader_proof));
+        erase(reader_proof, sizeof(reader_proof));
         if (previous < 0) return ZJ_IO;
         if (previous != 0 || !port.journal_absent(port.context)) return ZJ_CORRUPT;
         memset(state->root, 0, sizeof(state->root));
