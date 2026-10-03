@@ -198,6 +198,7 @@ from zk_add.attendance_recovery import (
 )
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.reconciliation import (
+    source_epoch_uuid,
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
     apply_reconciliation_chunk,
@@ -4022,7 +4023,7 @@ def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
             if connector is not None and connector.zkt_device is not None
             else None
         )
-        coverage_payload = serialize_coverage(coverage)
+        coverage_payload = serialize_coverage(db, coverage)
         if coverage_payload is None and connector is not None and connector.zkt_device is not None:
             terminal_serial = (
                 connector.zkt_device.serial or connector.zkt_device.expected_serial
@@ -4251,6 +4252,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "status": job.status,
                 "phase": job.phase,
             }
@@ -4262,6 +4264,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "code": job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "status": job.status,
                 "committed_next_ordinal": job.committed_next_ordinal,
             }
@@ -4277,6 +4280,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "phase": job.phase,
                 "committed_next_ordinal": job.committed_next_ordinal,
             }
@@ -4288,6 +4292,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "phase": job.phase,
                 "committed_next_ordinal": job.committed_next_ordinal,
             }
@@ -4299,6 +4304,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "code": job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "assignment_id": source_chunk.assignment_id,
                 "generation": chunk.generation if chunk is not None else source_chunk.generation,
                 "sequence": chunk.sequence if chunk is not None else source_chunk.sequence,
@@ -4331,6 +4337,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "status": job.status,
                 "phase": job.phase,
             }
@@ -4344,6 +4351,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "code": job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "status": job.status,
                 "capture_certificate": job.capture_certificate or None,
             }
@@ -4353,6 +4361,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
+                "source_epoch": source_epoch_uuid(db, job),
                 "status": job.status,
                 "phase": job.phase,
             }
@@ -4361,6 +4370,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "message_id": envelope.message_id,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
+                "source_epoch": probe.source_epoch or source_epoch_uuid(db, job),
                 "status": job.status,
                 "phase": job.phase,
                 "committed_next_ordinal": job.committed_next_ordinal,
@@ -4373,6 +4383,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 authoritative_coverage_payload = {
                     "type": "source_coverage",
                     "source_epoch_id": job.source_epoch_id,
+                    "source_epoch": source_epoch_uuid(db, job),
                     "terminal_serial": job.terminal_serial,
                     "terminal_generation": job.terminal_generation,
                     "source_committed_cursor": 0,
@@ -4399,6 +4410,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "message_type": envelope.type,
                 "code": error_code,
                 "terminal_serial": coverage.terminal_serial,
+                "source_epoch": source_epoch_uuid(db, coverage),
                 "terminal_generation": coverage.terminal_generation,
                 "committed_next_ordinal": (
                     chunk.end_ordinal

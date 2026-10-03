@@ -16,6 +16,7 @@ type_end = source.index("} add_attendance_settlement_ack_t;") + len("} add_atten
 attendance_type = source[source.rfind("typedef struct {", 0, type_end):type_end]
 harness = r'''
 #include "add_connector.h"
+#include "add_source_wire.h"
 #include "zkt_custody_wire.h"
 #include "evidence_receipt.h"
 #include "cJSON.h"
@@ -38,6 +39,9 @@ static add_source_tail_ack_t s_source_tail_ack;
 static add_attendance_settlement_ack_t s_attendance_settlement_ack;
 static zj_custody_expected_t s_zkt_custody_expected;
 static uint8_t s_zkt_custody_receipt[32];
+static char s_waiting_source_epoch[37];
+static const char *s_waiting_source_ack_type;
+static bool source_epoch_required(void) { return false; }
 static unsigned allocations, fail_at;
 static void *allocate(size_t bytes) { return ++allocations == fail_at ? NULL : malloc(bytes); }
 static int xSemaphoreTake(int lock, unsigned timeout) { (void)lock; (void)timeout; return pdTRUE; }
@@ -95,6 +99,19 @@ int main(void)
     parse_inbound(ack, strlen(ack));
     assert(!s_ack_matched && !acknowledgements);
 
+    arm();s_waiting_zkt_custody=false;
+    strcpy(s_waiting_source_epoch, "11111111-2222-4333-8444-555555555555");
+    s_waiting_source_ack_type=add_source_ack_type("reconcile_source_manifest");
+    const char *old_epoch="{\"type\":\"reconcile_manifest_ack\",\"message_id\":\"request-2\",\"source_epoch\":\"22222222-2222-4333-8444-555555555555\"}";
+    parse_inbound(old_epoch,strlen(old_epoch));assert(!s_ack_matched);
+    strcpy(s_waiting_ack,"request-2");
+    const char *wrong_type="{\"type\":\"reconcile_anchor_ack\",\"message_id\":\"request-2\",\"source_epoch\":\"11111111-2222-4333-8444-555555555555\"}";
+    parse_inbound(wrong_type,strlen(wrong_type));assert(!s_ack_matched);
+    strcpy(s_waiting_ack,"request-2");
+    const char *right_epoch="{\"type\":\"reconcile_manifest_ack\",\"message_id\":\"request-2\",\"source_epoch\":\"11111111-2222-4333-8444-555555555555\"}";
+    parse_inbound(right_epoch,strlen(right_epoch));assert(s_ack_matched);
+    s_waiting_source_epoch[0]=0;s_waiting_source_ack_type=NULL;
+
     cJSON_Hooks hooks = {allocate, free};
     cJSON_InitHooks(&hooks);
     for (unsigned point = 1; point < 100; ++point) {
@@ -118,5 +135,5 @@ with tempfile.TemporaryDirectory(prefix="zkt-custody-ack-") as temporary:
     subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(MAIN),
                     "-I", str(CJSON), str(unit), str(MAIN / "zkt_custody_receipt.c"),
-                    str(MAIN / "evidence_receipt.c"), str(CJSON / "cJSON.c"), "-lm", "-o", str(binary)], check=True)
+                    str(MAIN / "evidence_receipt.c"), str(MAIN / "add_source_wire.c"), str(CJSON / "cJSON.c"), "-lm", "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=60)

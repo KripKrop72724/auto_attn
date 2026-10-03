@@ -45,6 +45,7 @@ typedef struct {
 } add_command_t;
 
 typedef struct {
+    char source_epoch[37];
     char assignment_id[40];
     char job_id[40];
     char expected_terminal_serial[80];
@@ -65,6 +66,7 @@ typedef struct {
 } add_reconcile_assignment_t;
 
 typedef struct {
+    char source_epoch[37];
     char assignment_id[40];
     char job_id[40];
     char resulting_chain_digest[65];
@@ -76,6 +78,7 @@ typedef struct {
 } add_reconcile_chunk_ack_t;
 
 typedef struct {
+    char source_epoch[37];
     char terminal_serial[80];
     char resulting_chain_digest[65];
     uint32_t terminal_generation;
@@ -85,6 +88,7 @@ typedef struct {
 } add_source_tail_ack_t;
 
 typedef struct {
+    char source_epoch[37];
     char terminal_serial[80];
     char committed_chain_digest[65];
     uint32_t terminal_generation;
