@@ -3,6 +3,8 @@
 #include "zkt_journal_crypto.h"
 #include "zkt_journal_state.h"
 #include "zkt_custody_wire.h"
+#include "zkt_journal_transport.h"
+#include "zkt_reader_platform.h"
 #include "queue_store.h"
 #include "durable_queue.h"
 #include <assert.h>
@@ -13,6 +15,7 @@
 #include <time.h>
 
 static atomic_bool stop, pause_write, write_waiting, full;
+static atomic_bool refuse_compatibility, stale_transport;
 static pthread_t thread;
 static pthread_mutex_t budget = PTHREAD_MUTEX_INITIALIZER;
 static void (*task_function)(void *);
@@ -86,6 +89,7 @@ void nvs_close(nvs_handle_t handle) { assert(handle == 1); }
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t *length)
 {
     assert(handle == 1);
+    if (!strcmp(name, "reader_v1")) return ESP_ERR_NVS_NOT_FOUND;
     bool is_root = !strcmp(name, "root");
     size_t size = is_root ? root_length : checkpoint_length;
     if (!size) return ESP_ERR_NVS_NOT_FOUND;
@@ -128,6 +132,28 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
     return true;
 }
 void qs_local_end(bool persisted, int error) { (void)persisted; (void)error; assert(!pthread_mutex_unlock(&budget)); }
+qs_health_t qs_local_health_locked(void)
+{
+    assert(pthread_mutex_trylock(&budget) == EBUSY);
+    return (qs_health_t){.observed = true, .available = true,
+        .recovery_complete = true, .persistence_verified = true};
+}
+bool zj_transport_health(zj_transport_health_t *health)
+{
+    *health = (zj_transport_health_t){.started = true,
+        .sampled_ms = (uint32_t)(esp_timer_get_time() / 1000) - (atomic_load(&stale_transport) ? 50000U : 0)};
+    return true;
+}
+zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, bool *writer_allowed)
+{
+    assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0]);
+    assert(ready && persistence);
+    /* The actual ESP/NVS/identity checks have their own platform harness.
+     * This spy verifies owner locking, gating and recovery transitions. */
+    *writer_allowed = delivery && !recovering && !atomic_load(&refuse_compatibility);
+    return *writer_allowed ? ZJ_COMPAT_OK : ZJ_COMPAT_NOT_READY;
+}
 /* The genuine mbedTLS adapter is independently tested. This port exercises
  * owner/thread/file/NVS interactions, not cryptographic authentication. */
 static bool seal(void *context, const uint8_t *metadata, const uint8_t *nonce,
@@ -236,6 +262,27 @@ int main(int argc, char **argv)
         .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
         .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'A'}}};
     uint64_t ticket;
+    assert(!health.writer_allowed && !health.compatibility_checked);
+    assert(zj_owner_submit(&request, &ticket));
+    zj_reply_t refused = wait_reply(ticket);
+    assert(refused.result == ZJ_INVALID && !refused.capture_sequence);
+    zj_request_t compatibility = {.operation = ZJ_READER_CHECK};
+    atomic_store(&refuse_compatibility, true);
+    assert(zj_owner_submit(&compatibility, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_NOT_READY);
+    assert(zj_owner_health(&health) && health.compatibility_checked && !health.writer_allowed);
+    assert(zj_owner_submit(&request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_INVALID);
+    atomic_store(&refuse_compatibility, false);
+    atomic_store(&stale_transport, true);
+    assert(zj_owner_submit(&compatibility, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_NOT_READY);
+    atomic_store(&stale_transport, false);
+    assert(zj_owner_submit(&compatibility, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
+    assert(zj_owner_health(&health) && health.writer_allowed);
+    uint64_t gating_operations = health.completed, gating_failures = health.failures;
+    assert(gating_operations == 5 && gating_failures == 4);
     atomic_store(&pause_write, true);
     assert(zj_owner_submit(&request, &ticket));
     request.input.observation.raw[0] = 'B';
@@ -277,7 +324,8 @@ int main(int argc, char **argv)
     assert(zj_owner_submit(&request, &ticket));
     assert(wait_reply(ticket).result == ZJ_EMPTY);
     assert(zj_owner_health(&health) && !health.occupied && !health.operation_running);
-    assert(health.completed == 7 && health.failures == 1 && health.max_operation_us && health.ready);
+    assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 1 &&
+        health.max_operation_us && health.ready);
     atomic_store(&stop, true);
     assert(!pthread_join(thread, NULL));
     return 0;

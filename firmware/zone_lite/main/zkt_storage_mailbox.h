@@ -1,11 +1,12 @@
 #pragma once
 #include "zkt_journal_store.h"
+#include "zkt_journal_compat.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
-typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM } zj_operation_t;
+typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
@@ -19,6 +20,7 @@ typedef struct {
 } zj_request_t;
 typedef struct {
     zj_result_t result;
+    zj_compat_result_t compatibility;
     uint64_t capture_sequence;
     zj_item_t item;
 } zj_reply_t;

@@ -72,6 +72,10 @@ static void owner_step(scenario_t *s)
     if (s->stall) return;
     zj_reply_t reply = {0};
     switch (s->running.operation) {
+        case ZJ_READER_CHECK:
+            assert(!"Delivery must not grant its own reader/writer compatibility");
+            reply.result = ZJ_INVALID;
+            break;
         case ZJ_APPEND:
             reply.result = zj_store_append(&s->store, &s->running.input.observation, &reply.capture_sequence);
             break;

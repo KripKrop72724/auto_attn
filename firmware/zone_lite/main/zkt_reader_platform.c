@@ -1,0 +1,135 @@
+#include "zkt_reader_platform.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_secure_boot.h"
+#include "mbedtls/sha256.h"
+#include "nvs.h"
+#include "sdkconfig.h"
+#include <stdlib.h>
+#include <string.h>
+
+#define LAYOUT_PARTITIONS_MAX 32U
+static int read_proof(void *context, uint8_t bytes[ZJ_READER_PROOF_BYTES])
+{
+    (void)context;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("zkt_journal", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (result != ESP_OK) return -1;
+    size_t length = ZJ_READER_PROOF_BYTES;
+    result = nvs_get_blob(handle, "reader_v1", bytes, &length);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return 0;
+    return result == ESP_OK && length == ZJ_READER_PROOF_BYTES ? 1 : -1;
+}
+static bool write_proof(void *context, const uint8_t bytes[ZJ_READER_PROOF_BYTES])
+{
+    (void)context;
+    nvs_handle_t handle;
+    if (nvs_open("zkt_journal", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t result = nvs_set_blob(handle, "reader_v1", bytes, ZJ_READER_PROOF_BYTES);
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+static void put32(uint8_t *bytes, uint32_t value)
+{
+    for (unsigned i = 0; i < 4; ++i) bytes[i] = (uint8_t)(value >> (8 * i));
+}
+static int partition_order(const void *left, const void *right)
+{
+    /* A total canonical order independent of iterator ordering, with no
+     * native-struct padding or mutable partition contents in the digest. */
+    return memcmp(left, right, 32);
+}
+static bool layout_digest(uint8_t out[32])
+{
+    uint8_t bytes[32 + 32 * LAYOUT_PARTITIONS_MAX] = {0};
+    memcpy(bytes, "ZKT-JOURNAL-LAYOUT-V1", 21);
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    unsigned count = 0;
+    bool valid = it != NULL;
+    while (it) {
+        const esp_partition_t *p = esp_partition_get(it);
+        if (!p || count == LAYOUT_PARTITIONS_MAX || strnlen(p->label, sizeof(p->label)) > 16) { valid = false; break; }
+        uint8_t *entry = bytes + 32 + count++ * 32;
+        entry[0] = (uint8_t)p->type;
+        entry[1] = (uint8_t)p->subtype;
+        entry[2] = p->encrypted ? 1 : 0;
+        put32(entry + 4, p->address);
+        put32(entry + 8, p->size);
+        memcpy(entry + 12, p->label, strlen(p->label));
+        it = esp_partition_next(it);
+    }
+    esp_partition_iterator_release(it);
+    if (!valid || !count) return false;
+    put32(bytes + 24, count);
+    qsort(bytes + 32, count, 32, partition_order);
+    return mbedtls_sha256(bytes, 32 + count * 32, out, 0) == 0;
+}
+static bool identity(const esp_partition_t *partition, const zj_reader_identity_t *binding,
+                      zj_reader_identity_t *out)
+{
+    if (!partition) return false;
+    *out = *binding;
+    out->slot_address = partition->address;
+    out->slot_size = partition->size;
+    return esp_partition_get_sha256(partition, out->image_digest) == ESP_OK;
+}
+static bool ota(const esp_partition_t *partition)
+{
+    return partition && partition->type == ESP_PARTITION_TYPE_APP &&
+        (partition->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ||
+         partition->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
+}
+static bool validated(const esp_partition_t *partition)
+{
+    esp_ota_img_states_t state;
+    return ota(partition) && esp_ota_get_state_partition(partition, &state) == ESP_OK && state == ESP_OTA_IMG_VALID;
+}
+zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending, bool *writer_allowed)
+{
+    if (writer_allowed) *writer_allowed = false;
+    if (!writer_allowed || !terminal_serial || !capture_epoch || !strlen(terminal_serial) || strlen(terminal_serial) > 80)
+        return ZJ_COMPAT_INVALID;
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (!app || strcmp(app->project_name, "zone_lite") ||
+        (strcmp(app->version, ZJ_BRIDGE_VERSION) && strcmp(app->version, ZJ_WRITER_VERSION))) return ZJ_COMPAT_VERSION;
+    zj_reader_environment_t env = {.application = app->project_name, .version = app->version,
+        .secure_boot = esp_secure_boot_enabled(), .reader_ready = reader_ready,
+        .delivery_ready = delivery_ready, .persistence_verified = persistence_verified,
+        .recovery_pending = recovery_pending};
+#if defined(CONFIG_NVS_ENCRYPTION) && CONFIG_NVS_ENCRYPTION
+    env.encrypted_nvs = true;
+#endif
+    if (!env.secure_boot || !env.encrypted_nvs) return ZJ_COMPAT_SECURITY;
+    if (!reader_ready || !delivery_ready || !persistence_verified || recovery_pending) return ZJ_COMPAT_NOT_READY;
+    const esp_partition_t *current = esp_ota_get_running_partition();
+    env.ota_slot = ota(current);
+    env.image_validated = validated(current);
+    if (!env.ota_slot) return ZJ_COMPAT_SECURITY;
+    zj_reader_identity_t binding = {0}, current_id, previous_id;
+    uint8_t terminal_bytes[112] = {0};
+    memcpy(terminal_bytes, "ZKT-JOURNAL-TERMINAL-V1", 23);
+    memcpy(terminal_bytes + 31, terminal_serial, strlen(terminal_serial));
+    memcpy(binding.capture_epoch, capture_epoch, 16);
+    if (mbedtls_sha256(terminal_bytes, sizeof(terminal_bytes), binding.terminal_digest, 0) ||
+        !layout_digest(binding.layout_digest) || !identity(current, &binding, &current_id)) return ZJ_COMPAT_IO;
+    zj_reader_proof_port_t port = {read_proof, write_proof, NULL};
+    if (!strcmp(app->version, ZJ_BRIDGE_VERSION)) return zj_reader_attest(port, &env, &current_id);
+    const esp_partition_t *previous = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t previous_app;
+    if (!previous) return ZJ_COMPAT_IO;
+    if (!ota(previous)) return ZJ_COMPAT_SECURITY;
+    if (esp_ota_get_partition_description(previous, &previous_app) != ESP_OK ||
+        !identity(previous, &binding, &previous_id)) return ZJ_COMPAT_IO;
+    zj_reader_environment_t rollback = {.application = previous_app.project_name, .version = previous_app.version,
+        .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
+        .ota_slot = ota(previous), .image_validated = validated(previous)};
+    zj_compat_result_t result = zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
+    *writer_allowed = result == ZJ_COMPAT_OK;
+    return result;
+}

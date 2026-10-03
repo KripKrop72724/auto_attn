@@ -1,10 +1,11 @@
 #include "zkt_journal_state.h"
+#include "zkt_journal_compat.h"
 #include <assert.h>
 #include <string.h>
 
 typedef struct {
     uint8_t root[ZJ_ROOT_BYTES], retirement[ZJ_CHECKPOINT_BYTES];
-    bool root_exists, retirement_exists, absent, uncertain;
+    bool root_exists, retirement_exists, proof_exists, absent, uncertain;
     unsigned calls, fail_at, writes, randoms;
 } fake_t;
 static fake_t fake;
@@ -13,6 +14,11 @@ static int read_blob(void *context, const char *name, uint8_t *out, size_t lengt
 {
     fake_t *f = context;
     if (fault(f)) return -1;
+    if (!strcmp(name, "reader_v1")) {
+        assert(length == ZJ_READER_PROOF_BYTES);
+        memset(out, 0, length);
+        return f->proof_exists ? 1 : 0;
+    }
     bool root = !strcmp(name, "root");
     assert(length == (root ? ZJ_ROOT_BYTES : ZJ_CHECKPOINT_BYTES));
     if (!(root ? f->root_exists : f->retirement_exists)) return 0;
@@ -83,13 +89,18 @@ int main(void)
     fake.absent = false;
     assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_CORRUPT);
     assert(!fake.writes && !fake.randoms);
-    fake.absent = true;
+
+    reset();
+    fake.proof_exists = true;
+    assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_CORRUPT);
+    assert(!fake.writes && !fake.randoms);
+    reset();
     fake.retirement_exists = true;
     assert(zj_state_open(&state, port(), "TEST-TERMINAL") == ZJ_CORRUPT);
     assert(!fake.writes && !fake.randoms);
 
     for (unsigned uncertain = 0; uncertain < 2; ++uncertain) {
-        for (unsigned boundary = 1; boundary <= 7; ++boundary) {
+        for (unsigned boundary = 1; boundary <= 8; ++boundary) {
             reset();
             fake.fail_at = boundary;
             fake.uncertain = uncertain;
