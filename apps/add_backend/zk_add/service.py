@@ -4057,6 +4057,12 @@ def record_oracle_receipts(
     owned_event_ids = [
         row.id for row in events_by_uid.values() if row.connector_id == connector.id
     ]
+    from zk_add.models import ZktOracleIntent
+    # Resolve the sticky route before mutating the batch. Per-event queries
+    # would autoflush each newly preserved receipt and defeat batched custody.
+    zkt_content_event_ids = set(session.scalars(select(ZktOracleIntent.attendance_event_id).where(
+        ZktOracleIntent.attendance_event_id.in_(owned_event_ids)
+    )).all()) if owned_event_ids else set()
     outboxes_by_event_id = (
         {
             row.attendance_event_id: row
@@ -4122,7 +4128,7 @@ def record_oracle_receipts(
 
         receipt.attendance_event_id = event.id
         from zk_add.attendance_manual_guard import generic_confirmation_allowed
-        if not generic_confirmation_allowed(session, event):
+        if not generic_confirmation_allowed(session, event, zkt_content_event_ids=zkt_content_event_ids):
             # Keep the receipt itself as evidence, without changing the held
             # record or replacing the manual delivery's content verification.
             awaiting_event += 1

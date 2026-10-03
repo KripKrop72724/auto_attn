@@ -368,6 +368,7 @@ def test_ords_delivery_preflight_prevents_transport_failure_fanout(monkeypatch):
 
     monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
     monkeypatch.setattr("zk_add.attendance_force_delivery.split_claims", lambda rows: (rows, []))
+    monkeypatch.setattr("zk_add.zkt_oracle_delivery.split_claims", lambda rows: (rows, []))
     monkeypatch.setattr(worker, "post_ords_membership_check", fail_membership_check)
     monkeypatch.setattr(worker, "post_ords_claim", unexpected_delivery)
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))
@@ -424,6 +425,7 @@ def test_ords_delivery_preflight_sends_only_proven_missing_events(monkeypatch):
 
     monkeypatch.setattr(worker, "claim_ords_batch", lambda _limit: claims)
     monkeypatch.setattr("zk_add.attendance_force_delivery.split_claims", lambda rows: (rows, []))
+    monkeypatch.setattr("zk_add.zkt_oracle_delivery.split_claims", lambda rows: (rows, []))
     monkeypatch.setattr(worker, "post_ords_membership_check", check_membership)
     monkeypatch.setattr(worker, "post_ords_claim", deliver_missing)
     monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(object()))

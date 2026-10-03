@@ -962,6 +962,41 @@ class OrdsOutbox(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class ZktOracleIntent(Base):
+    """Sticky ADD-owned route for a new canonical journal occurrence."""
+    __tablename__ = "add_zkt_oracle_intents"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    outbox_id: Mapped[int] = mapped_column(ForeignKey("add_ords_outbox.id"), unique=True)
+    attendance_event_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_events.id"), unique=True)
+    occurrence_alias_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_occurrence_aliases.id"), unique=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    payload_digest: Mapped[str | None] = mapped_column(String(64))
+    protected_payload: Mapped[str | None] = mapped_column(Text)
+    protected_check: Mapped[str | None] = mapped_column(Text)
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    post_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_post_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+
+
+class ZktOracleContentReceipt(Base):
+    """Retained Oracle core-field proof, separate from device UID claims."""
+    __tablename__ = "add_zkt_oracle_content_receipts"
+    __table_args__ = (
+        UniqueConstraint("intent_id", "payload_digest", "content_token", name="uq_add_zkt_oracle_content"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(String(36), unique=True, default=lambda: str(uuid4()))
+    intent_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_oracle_intents.id"), index=True)
+    event_uid: Mapped[str] = mapped_column(String(64), index=True)
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    verification_scope: Mapped[str] = mapped_column(String(80))
+    content_token: Mapped[str] = mapped_column(String(64))
+    claim_attempt: Mapped[int] = mapped_column(Integer)
+    verified_at: Mapped[datetime] = utc_column()
+
+
 class AttendanceDeliverySweep(Base):
     """Durable progress and health record for the historical ORDS drain.
 
