@@ -717,6 +717,9 @@ test('historical source identity holds remain explicit and readable after review
   await expect(page.getByText('Missing identity references', { exact: true })).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Source exceptions 1', exact: true })).toBeVisible()
   await expect(page.getByText('Oracle delivery held for identity evidence')).toBeVisible()
+  // Jobs load independently of source rows. Its history panel changes the
+  // layout; wait for that known fixture before measuring or clicking below it.
+  await expect(page.getByRole('heading', { name: 'Preserved terminal-history changes' })).toBeVisible()
   const viewport = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth }))
   expect(viewport.scroll).toBeLessThanOrEqual(viewport.width)
   if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('source-identity-ledger.png'), fullPage: true, animations: 'disabled' })
@@ -724,6 +727,9 @@ test('historical source identity holds remain explicit and readable after review
   const drawer = page.getByRole('dialog', { name: 'Terminal source exception' })
   await expect(drawer.getByText('Held for verified historical identity')).toBeVisible()
   await expect(drawer.getByText(/A review note does not resolve this hold/)).toBeVisible()
+  await drawer.evaluate(async node => {
+    await Promise.all(node.getAnimations().map(animation => animation.finished.catch(() => undefined)))
+  })
   if (process.env.ADD_VISUAL_QA === '1') await drawer.screenshot({ path: testInfo.outputPath('source-identity-detail.png'), animations: 'disabled' })
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
   expect(results.violations.filter(violation => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
