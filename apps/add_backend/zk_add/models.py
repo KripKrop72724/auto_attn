@@ -479,9 +479,13 @@ class ZktObservationReceipt(Base):
 class ZktCustodyWork(Base):
     """Derived processing obligation; never changes an immutable receipt."""
     __tablename__ = "add_zkt_custody_work"
+    __table_args__ = (UniqueConstraint("source_manifest_id", name="uq_add_zkt_work_source_manifest"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     work_key: Mapped[str] = mapped_column(String(64), unique=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    source_manifest_id: Mapped[int | None] = mapped_column(
+        ForeignKey("add_terminal_record_manifest.id", name="fk_add_zkt_work_source_manifest")
+    )
     kind: Mapped[str] = mapped_column(String(40))
     terminal_serial: Mapped[str | None] = mapped_column(String(120))
     capture_epoch: Mapped[str | None] = mapped_column(String(32))
@@ -1239,6 +1243,7 @@ class ReconciliationJob(Base):
     terminal_duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
     blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
     quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    raw_preserved_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     ords_target_count: Mapped[int] = mapped_column(Integer, default=0)
     ords_confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
     ords_pending_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -1363,6 +1368,7 @@ class ReconciliationChunk(Base):
     already_present_count: Mapped[int] = mapped_column(Integer, default=0)
     blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
     quarantined_count: Mapped[int] = mapped_column(Integer, default=0)
+    raw_preserved_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     committed_at: Mapped[datetime] = utc_column()
 
 
@@ -1441,6 +1447,7 @@ class SourceTailChunk(Base):
     event_count: Mapped[int] = mapped_column(Integer, default=0)
     blocked_identity_count: Mapped[int] = mapped_column(Integer, default=0)
     exception_count: Mapped[int] = mapped_column(Integer, default=0)
+    raw_preserved_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     committed_at: Mapped[datetime] = utc_column()
 
 
@@ -1494,6 +1501,7 @@ class ReconciliationCoverage(Base):
     source_committed_cursor: Mapped[int] = mapped_column(Integer, default=0)
     source_committed_chain_digest: Mapped[str] = mapped_column(String(64), default="0" * 64)
     tail_exception_count: Mapped[int] = mapped_column(Integer, default=0)
+    raw_preserved_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     tail_last_committed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )

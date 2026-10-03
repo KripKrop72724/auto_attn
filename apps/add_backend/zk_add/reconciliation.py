@@ -69,6 +69,7 @@ SOURCE_PROBE_CAPABILITY = "source_divergence_probe_v1"
 SOURCE_EXCEPTION_DISPOSITIONS = {"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLVED"}
 SOURCE_EXCEPTION_REVIEW_HOLD = "SOURCE_QUARANTINE_REQUIRES_REVIEW"
 SOURCE_IDENTITY_HOLD = "SOURCE_IDENTITY_EVIDENCE_REQUIRED"
+SOURCE_INTERPRETATION_HOLD = "SOURCE_INTERPRETATION_REQUIRED"
 SOURCE_EXCEPTION_SCOPE_MISMATCH = "SOURCE_EXCEPTION_SCOPE_MISMATCH"
 SOURCE_IDENTITY_GUARD_VERSION = "zkt-source-identity-guard-1"
 SOURCE_MISSING_REFERENCE = "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"
@@ -455,8 +456,10 @@ def control_reconciliation_job(
         if action == "retry" and job.status == "FAILED":
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
-    if action == "retry" and job.quarantined_count:
+    if action == "retry" and (job.quarantined_count or job.raw_preserved_count):
         source_assurance = source_exception_assurance(session, job)
+        if source_assurance["raw_interpretation_open"]:
+            raise ValueError("Raw source custody requires qualified interpretation; generic retry cannot certify delivery.")
         if source_assurance["identity_unresolved_open"]:
             raise ValueError(
                 "Historical source identity requires verified correction evidence; "
@@ -602,6 +605,19 @@ def _source_identity_missing(source) -> bool:
     )
 
 
+def _require_raw_custody(connector: Connector, records) -> None:
+    for row in records:
+        if row.disposition != "RAW_PRESERVED":
+            continue
+        if connector.firmware_family != "zkt" or not connector.zkt_custody_enabled:
+            raise ValueError("RAW_SOURCE_CUSTODY_NOT_ENABLED")
+        if any(value is not None for value in (row.event, row.raw_timestamp,
+                row.observed_uid, row.observed_user_id, row.error_code)):
+            raise ValueError("RAW_SOURCE_CUSTODY_CANNOT_CLAIM_INTERPRETATION")
+        if not settings.pii_fernet_key:
+            raise ValueError("RAW_SOURCE_CUSTODY_KEY_UNAVAILABLE")
+
+
 def _source_claim_evidence(source, *, identity_missing: bool) -> dict:
     if not identity_missing:
         return {"declared_disposition": source.disposition}
@@ -707,7 +723,8 @@ def apply_reconciliation_chunk(
     payload: ReconciliationChunkRequest,
 ) -> tuple[ReconciliationJob, ReconciliationChunk | None, bool]:
     job = _device_job(session, connector, payload.job_id)
-    _require_runnable(job, payload.generation)
+    if payload.generation != job.terminal_generation:
+        raise ValueError("Reconciliation generation does not match the assignment.")
     _require_source_epoch(session, connector, job, payload.source_epoch)
     if job.cutoff_count is None or job.record_size is None:
         raise ValueError("Reconciliation must be anchored before accepting chunks.")
@@ -723,7 +740,9 @@ def apply_reconciliation_chunk(
             existing.chunk_digest != payload.chunk_digest
             or existing.end_ordinal != payload.end_ordinal
             or existing.resulting_chain_digest != payload.resulting_chain_digest
+            or (existing.raw_preserved_count and reconciliation_chunk_digest(payload) != payload.chunk_digest)
         ):
+            _require_runnable(job, payload.generation)
             _safety_hold(
                 session,
                 job,
@@ -735,6 +754,8 @@ def apply_reconciliation_chunk(
             # committed. Raising here would roll back the durable hold.
             return job, existing, False
         return job, existing, True
+    _require_runnable(job, payload.generation)
+    _require_raw_custody(connector, payload.records)
     if payload.assignment_id is not None:
         if job.active_assignment_id != payload.assignment_id:
             raise ValueError("Reconciliation assignment lease is no longer active.")
@@ -888,6 +909,7 @@ def apply_reconciliation_chunk(
             )
         ).all()
     )
+    raw_manifests = []
     for source in payload.records:
         identity_missing = _source_identity_missing(source)
         event = events_by_uid.get(source.event.event_uid) if source.event and not identity_missing else None
@@ -912,7 +934,7 @@ def apply_reconciliation_chunk(
         if disposition == "TERMINAL_DUPLICATE":
             terminal_duplicates += 1
         if prior is None:
-            session.add(TerminalRecordManifest(
+            manifest = TerminalRecordManifest(
                 job_id=job.id,
                 chunk_id=chunk.id,
                 connector_id=connector.id,
@@ -935,7 +957,12 @@ def apply_reconciliation_chunk(
                 observed_uid=source.observed_uid,
                 observed_user_id=None if identity_missing else source.observed_user_id,
                 **_source_claim_evidence(source, identity_missing=identity_missing),
-            ))
+            )
+            session.add(manifest)
+        if disposition == "RAW_PRESERVED":
+            raw_manifests.append(prior if prior is not None else manifest)
+    from zk_add.zkt_custody_work import attach_source_work
+    attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
         session, connector=connector, events=events_by_uid.values()
     )
@@ -944,6 +971,7 @@ def apply_reconciliation_chunk(
     chunk.already_present_count = len(duplicate_uids)
     chunk.blocked_identity_count = blocked
     chunk.quarantined_count = quarantined
+    chunk.raw_preserved_count = len(raw_manifests)
     now = utc_now()
     job.committed_next_ordinal = payload.end_ordinal
     job.scanned_count = payload.end_ordinal
@@ -952,6 +980,7 @@ def apply_reconciliation_chunk(
     job.terminal_duplicate_count += terminal_duplicates
     job.blocked_identity_count += blocked
     job.quarantined_count += quarantined
+    job.raw_preserved_count += len(raw_manifests)
     job.last_chain_digest = payload.resulting_chain_digest
     job.last_progress_at = now
     job.updated_at = now
@@ -978,6 +1007,7 @@ def apply_reconciliation_chunk(
             "already_present": chunk.already_present_count,
             "blocked_identity": blocked,
             "quarantined": quarantined,
+            "raw_preserved": len(raw_manifests),
         },
     )
     return job, chunk, False
@@ -1083,11 +1113,14 @@ def apply_reconciliation_manifest(
         "source_chain_digest": payload.final_chain_digest,
         "blocked_identity": job.blocked_identity_count,
         "quarantined": job.quarantined_count,
+        "raw_preserved": job.raw_preserved_count,
         "terminal_duplicates": job.terminal_duplicate_count,
         "firmware_version": job.firmware_version,
         "certified_at": now.isoformat(),
     })
     capture_state = (
+        "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
+        if job.raw_preserved_count else
         "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"
         if job.blocked_identity_count or job.quarantined_count
         else "SOURCE_CAPTURE_CERTIFIED"
@@ -1113,6 +1146,7 @@ def apply_reconciliation_manifest(
         source_committed_cursor=payload.cutoff_count,
         source_committed_chain_digest=payload.final_chain_digest,
         tail_exception_count=0,
+        raw_preserved_count=job.raw_preserved_count,
         capture_state=capture_state,
         oracle_state="ORACLE_MEMBERSHIP_PENDING",
         capture_evidence=evidence,
@@ -1237,12 +1271,14 @@ def apply_source_tail_chunk(
             existing.end_ordinal != payload.end_ordinal
             or existing.chunk_digest != payload.chunk_digest
             or existing.resulting_chain_digest != payload.resulting_chain_digest
+            or (existing.raw_preserved_count and reconciliation_chunk_digest(payload) != payload.chunk_digest)
         ):
             return invalidate(
                 "SOURCE_TAIL_REPLAY_DIVERGED",
                 "A replayed terminal tail range no longer matched its committed evidence.",
             )
         return coverage, existing, True, None
+    _require_raw_custody(connector, payload.records)
     if payload.latest_terminal_count < committed_cursor:
         return invalidate(
             "SOURCE_TAIL_COUNT_REGRESSION",
@@ -1347,6 +1383,7 @@ def apply_source_tail_chunk(
             )
         ).all()
     )
+    raw_manifests = []
     for source in payload.records:
         identity_missing = _source_identity_missing(source)
         event = events_by_uid.get(source.event.event_uid) if source.event and not identity_missing else None
@@ -1365,8 +1402,7 @@ def apply_source_tail_chunk(
             blocked_events.append(event)
         if disposition in SOURCE_EXCEPTION_DISPOSITIONS:
             exceptions += 1
-        session.add(
-            TerminalRecordManifest(
+        manifest = TerminalRecordManifest(
                 job_id=None,
                 chunk_id=None,
                 connector_id=connector.id,
@@ -1389,8 +1425,12 @@ def apply_source_tail_chunk(
                 observed_uid=source.observed_uid,
                 observed_user_id=None if identity_missing else source.observed_user_id,
                 **_source_claim_evidence(source, identity_missing=identity_missing),
-            )
         )
+        session.add(manifest)
+        if disposition == "RAW_PRESERVED":
+            raw_manifests.append(manifest)
+    from zk_add.zkt_custody_work import attach_source_work
+    attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
         session, connector=connector, events=events_by_uid.values()
     )
@@ -1398,12 +1438,18 @@ def apply_source_tail_chunk(
     chunk.event_count = event_count
     chunk.blocked_identity_count = blocked
     chunk.exception_count = exceptions
+    chunk.raw_preserved_count = len(raw_manifests)
     now = utc_now()
     coverage.source_committed_cursor = payload.end_ordinal
     coverage.source_committed_chain_digest = payload.resulting_chain_digest
     coverage.tail_exception_count += exceptions
+    coverage.raw_preserved_count += len(raw_manifests)
     coverage.tail_last_committed_at = now
     coverage.updated_at = now
+    if raw_manifests:
+        coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
+        coverage.oracle_state = "ORACLE_SOURCE_INTERPRETATION_PENDING"
+        coverage.oracle_certified_at = None
     if exceptions:
         coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"
         upsert_alert(
@@ -1442,13 +1488,15 @@ def source_exception_assurance(
         "malformed": 0,
         "identity_unresolved": 0,
         "identity_unresolved_open": 0,
+        "raw_preserved": 0,
+        "raw_interpretation_open": 0,
         "state": "NONE",
         "cohort_digest": None,
         "review_evidence_digest": None,
         "review_ids": [],
         "correction_ids": [],
     }
-    if not job.quarantined_count:
+    if not (job.quarantined_count or job.raw_preserved_count):
         return empty
 
     cutoff = job.cutoff_count or 0
@@ -1460,7 +1508,7 @@ def source_exception_assurance(
             TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
             TerminalRecordManifest.canonical_source == True,  # noqa: E712
             TerminalRecordManifest.ordinal < cutoff,
-            TerminalRecordManifest.disposition.in_(SOURCE_EXCEPTION_DISPOSITIONS),
+            TerminalRecordManifest.disposition.in_(SOURCE_EXCEPTION_DISPOSITIONS | {"RAW_PRESERVED"}),
         )
         .order_by(TerminalRecordManifest.ordinal.asc(), TerminalRecordManifest.id.asc())
     ).all()
@@ -1482,6 +1530,7 @@ def source_exception_assurance(
     identity_manifest_ids = {
         row.id for row in manifests if row.disposition == "IDENTITY_UNRESOLVED"
     }
+    raw_manifest_ids = {row.id for row in manifests if row.disposition == "RAW_PRESERVED"}
     reviewed = len(earliest_reviews)
     corrections = session.scalars(
         select(AttendanceSourceCorrection)
@@ -1492,6 +1541,8 @@ def source_exception_assurance(
         )
         .order_by(AttendanceSourceCorrection.id.asc())
     ).all() if manifest_ids else []
+    # A generic review or clock correction is not qualified source decoding.
+    corrections = [row for row in corrections if row.manifest_id not in raw_manifest_ids]
     corrected_manifest_ids = {row.manifest_id for row in corrections if row.manifest_id is not None}
     corrected = len(corrected_manifest_ids)
     # A reviewed invalid source exclusion can complete its review gate. Missing
@@ -1499,7 +1550,7 @@ def source_exception_assurance(
     # exclusion or prove its employee. Only derived correction evidence may
     # supply an event, whose identity and Oracle result are checked separately.
     resolved_manifest_ids = (
-        set(earliest_reviews) - identity_manifest_ids
+        set(earliest_reviews) - identity_manifest_ids - raw_manifest_ids
     ) | corrected_manifest_ids
     identity_open = len(identity_manifest_ids - corrected_manifest_ids)
     cohort_material = {
@@ -1550,7 +1601,10 @@ def source_exception_assurance(
         "malformed": malformed,
         "identity_unresolved": len(identity_manifest_ids),
         "identity_unresolved_open": identity_open,
-        "state": "IDENTITY_EVIDENCE_REQUIRED" if identity_open else "REVIEW_REQUIRED",
+        "raw_preserved": len(raw_manifest_ids),
+        "raw_interpretation_open": len(raw_manifest_ids),
+        "state": "INTERPRETATION_REQUIRED" if raw_manifest_ids else
+                 "IDENTITY_EVIDENCE_REQUIRED" if identity_open else "REVIEW_REQUIRED",
         "cohort_digest": cohort_digest,
         "review_evidence_digest": review_evidence_digest,
         "review_ids": [
@@ -1580,7 +1634,11 @@ def source_exception_assurance(
         mismatches.append("CERTIFICATE_CHAIN_MISMATCH")
     if certificate.get("quarantined") != job.quarantined_count:
         mismatches.append("CERTIFICATE_EXCEPTION_COUNT_MISMATCH")
-    if len(manifests) != job.quarantined_count:
+    if certificate.get("raw_preserved", 0) != job.raw_preserved_count:
+        mismatches.append("CERTIFICATE_RAW_COUNT_MISMATCH")
+    if len(raw_manifest_ids) != job.raw_preserved_count:
+        mismatches.append("MANIFEST_RAW_COUNT_MISMATCH")
+    if len(manifests) - len(raw_manifest_ids) != job.quarantined_count:
         mismatches.append("MANIFEST_EXCEPTION_COUNT_MISMATCH")
     if any(row.attendance_event_id is not None for row in manifests):
         mismatches.append("EXCEPTION_HAS_ATTENDANCE_EVENT")
@@ -1806,10 +1864,10 @@ def refresh_reconciliation_assurance(
         job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
     )
     managed_source_hold = (
-        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD}
-        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD}
+        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD, SOURCE_INTERPRETATION_HOLD}
+        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD, SOURCE_INTERPRETATION_HOLD}
         or (
-            job.quarantined_count > 0
+            (job.quarantined_count > 0 or job.raw_preserved_count > 0)
             and job.error_code is None
             and job.phase in {"WAITING_FOR_IDENTITY", "FINAL_ASSURANCE"}
             and job.wait_reason in {None, SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_IDENTITY_HOLD}
@@ -1834,6 +1892,15 @@ def refresh_reconciliation_assurance(
             "capture evidence. Automatic continuation remains fail-closed; inspect "
             "the job evidence before taking any further action."
         )
+    elif source_assurance["state"] == "INTERPRETATION_REQUIRED":
+        job.phase, job.status = "WAITING_FOR_PROTOCOL", "NEEDS_ATTENTION"
+        job.wait_reason = job.error_code = SOURCE_INTERPRETATION_HOLD
+        job.error_message = (
+            f"{source_assurance['raw_interpretation_open']:,} source record(s) have committed raw custody "
+            "but still require qualified interpretation. No attendance or Oracle completion is inferred."
+        )
+        if coverage is not None:
+            coverage.oracle_state = "ORACLE_SOURCE_INTERPRETATION_PENDING"
     elif source_assurance["state"] == "IDENTITY_EVIDENCE_REQUIRED":
         job.phase = "WAITING_FOR_IDENTITY"
         job.status = "NEEDS_ATTENTION"
@@ -1971,6 +2038,11 @@ def refresh_reconciliation_assurance(
                 coverage.oracle_certified_at = now
                 coverage.updated_at = now
             _event(session, job, "ORACLE_MEMBERSHIP_CERTIFIED", evidence)
+    # The job certificate covers its sealed cutoff only. Later raw tail custody
+    # must remain visibly unfinished when that older baseline becomes delivered.
+    if coverage is not None and coverage.raw_preserved_count:
+        coverage.oracle_state = "ORACLE_SOURCE_INTERPRETATION_PENDING"
+        coverage.oracle_certified_at = None
     job.updated_at = now
     return job
 
@@ -2376,6 +2448,8 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "malformed": exception_assurance["malformed"],
             "identity_unresolved": exception_assurance["identity_unresolved"],
             "identity_unresolved_open": exception_assurance["identity_unresolved_open"],
+            "raw_preserved": exception_assurance["raw_preserved"],
+            "raw_interpretation_open": exception_assurance["raw_interpretation_open"],
             "state": exception_assurance["state"],
             "cohort_digest": exception_assurance.get("cohort_digest"),
             "correction_ids": exception_assurance.get("correction_ids", []),
@@ -2403,6 +2477,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "terminal_duplicates": job.terminal_duplicate_count,
             "blocked_identity": job.blocked_identity_count,
             "quarantined": job.quarantined_count,
+            "raw_preserved": job.raw_preserved_count,
             "oracle_target": job.ords_target_count,
             "oracle_confirmed": job.ords_confirmed_count,
             "oracle_pending": job.ords_pending_count,
@@ -2500,6 +2575,7 @@ def serialize_coverage(session: Session, row: ReconciliationCoverage | None) -> 
         "source_committed_cursor": row.source_committed_cursor,
         "source_committed_chain_digest": row.source_committed_chain_digest,
         "tail_exception_count": row.tail_exception_count,
+        "raw_preserved_count": row.raw_preserved_count,
         "tail_last_committed_at": row.tail_last_committed_at,
         "capture_state": row.capture_state,
         "oracle_state": row.oracle_state,
@@ -2980,18 +3056,27 @@ def _activate_recovery_epoch(
         old_epoch.state = "SUPERSEDED"
         old_epoch.superseded_at = now
         old_epoch.updated_at = now
-    prefix = session.scalars(
-        select(TerminalRecordManifest).where(
-            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
-            TerminalRecordManifest.generation == job.terminal_generation,
-            TerminalRecordManifest.source_epoch_id == divergence.source_epoch_id,
-            TerminalRecordManifest.canonical_source == True,  # noqa: E712
-            TerminalRecordManifest.ordinal < job.committed_next_ordinal,
-        )
-    ).all()
-    for prior in prefix:
-        session.add(
-            TerminalRecordManifest(
+    # Copy retained custody in bounded pages. The new epoch is not published
+    # unless every copied raw record and its interpretation obligation commit.
+    from zk_add.zkt_custody_work import attach_source_work
+    connector = session.get(Connector, job.connector_id)
+    after_id = 0
+    while True:
+        prefix = session.scalars(
+            select(TerminalRecordManifest).where(
+                TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+                TerminalRecordManifest.generation == job.terminal_generation,
+                TerminalRecordManifest.source_epoch_id == divergence.source_epoch_id,
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.ordinal < job.committed_next_ordinal,
+                TerminalRecordManifest.id > after_id,
+            ).order_by(TerminalRecordManifest.id).limit(100)
+        ).all()
+        if not prefix:
+            break
+        raw_manifests = []
+        for prior in prefix:
+            copied = TerminalRecordManifest(
                 job_id=None,
                 chunk_id=None,
                 connector_id=prior.connector_id,
@@ -3017,7 +3102,12 @@ def _activate_recovery_epoch(
                 observed_uid=prior.observed_uid,
                 observed_user_id=prior.observed_user_id,
             )
-        )
+            session.add(copied)
+            if copied.disposition == "RAW_PRESERVED":
+                raw_manifests.append(copied)
+        attach_source_work(session, connector, raw_manifests)
+        session.flush()
+        after_id = prefix[-1].id
     for coverage in session.scalars(
         select(ReconciliationCoverage).where(
             ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
@@ -3196,7 +3286,7 @@ def _eta(job: ReconciliationJob, *, chunks: int, connected: bool) -> dict:
         unavailable = "COLLECTING_THROUGHPUT"
     elapsed = 0.0
     if job.started_at and job.last_progress_at:
-        elapsed = max(0.0, (job.last_progress_at - job.started_at).total_seconds())
+        elapsed = max(0.0, (ensure_utc(job.last_progress_at) - ensure_utc(job.started_at)).total_seconds())
     if elapsed < 60:
         unavailable = unavailable or "COLLECTING_THROUGHPUT"
     if unavailable or not job.cutoff_count or job.scanned_count <= 0:

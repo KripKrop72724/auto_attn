@@ -416,6 +416,34 @@ describe('Reviewed source-exception continuation', () => {
     expect(String(reviewRequest?.[1]?.body)).not.toContain(job().job_id)
   })
 
+  it('shows raw custody as pending interpretation without review or retry shortcuts', async () => {
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await base(input, init)
+      const body = await response.json()
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === '/api/v1/reconciliations' || path === `/api/v1/reconciliations/${job().job_id}`) {
+        const pending = job(assurance({ state: 'INTERPRETATION_REQUIRED', invalid_time: 0,
+          raw_preserved: 1, raw_interpretation_open: 1 }))
+        const row = { ...pending, status: 'NEEDS_ATTENTION', phase: 'WAITING_FOR_PROTOCOL',
+          wait_reason: 'SOURCE_INTERPRETATION_REQUIRED',
+          progress: { ...pending.progress, quarantined: 0, raw_preserved: 1, oracle_target: 1, oracle_confirmed: 1 } }
+        if (path === '/api/v1/reconciliations') body.rows = [row]
+        else return json(row)
+      }
+      return json(body)
+    }))
+    render(<Harness />)
+    expect(await screen.findByText('Source interpretation pending')).toBeTruthy()
+    expect(screen.getByText(/raw source records preserved; attendance and Oracle completion remain unproven/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Retry$|^Review \d/ })).toBeNull()
+    expect(screen.getByRole('progressbar', { name: 'Oracle assurance progress' }).getAttribute('aria-valuenow')).not.toBe('100')
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence' }))
+    expect(await screen.findByText(/Raw source bytes are preserved. Qualified interpretation is still required/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Inspect certified exceptions' })).toBeNull()
+    expect(screen.queryByText('Reviewed exclusions are preserved')).toBeNull()
+  })
+
   it('keeps missing historical identity held after an audited review', async () => {
     let reviewed = false
     const base = reconciliationFetch()
