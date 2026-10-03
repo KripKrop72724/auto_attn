@@ -341,6 +341,7 @@ export interface ReconciliationCoverage {
   source_committed_cursor: number
   source_committed_chain_digest: string
   tail_exception_count: number
+  raw_preserved_count?: number
   tail_last_committed_at: string | null
   capture_state: string
   oracle_state: string
@@ -426,7 +427,9 @@ export interface SourceExceptionAssurance {
   malformed: number
   identity_unresolved?: number
   identity_unresolved_open?: number
-  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+  raw_preserved?: number
+  raw_interpretation_open?: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
   cohort_digest: string | null
   correction_ids?: string[]
 }
@@ -660,6 +663,7 @@ export interface ReconciliationJob {
     terminal_duplicates: number
     blocked_identity: number
     quarantined: number
+    raw_preserved?: number
     oracle_target: number
     oracle_confirmed: number
     oracle_pending: number

@@ -6,7 +6,7 @@ import time
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, event, insert, select, text
+from sqlalchemy import MetaData, create_engine, event, insert, select, text
 from sqlalchemy.orm import sessionmaker
 
 from zk_add.db import Base
@@ -41,7 +41,12 @@ def store(tmp_path, request):
                 db.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
             admin.dispose()
     request.addfinalizer(cleanup)
-    Base.metadata.create_all(engine)
+    # PostgreSQL defers cyclic constraints by mutating their DDL rules. Keep
+    # that dialect-specific state out of later SQLite fixtures in this process.
+    metadata = MetaData()
+    for table in Base.metadata.tables.values():
+        table.to_metadata(metadata)
+    metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     with sessions() as db:
         connector = Connector(connector_id="synthetic-load", hardware_id="aa:bb:cc:dd:ee:02",

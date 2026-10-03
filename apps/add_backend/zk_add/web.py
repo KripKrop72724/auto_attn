@@ -4314,17 +4314,17 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             }
             ack_payload = {
                 "type": (
-                    "error" if job.status == "NEEDS_ATTENTION" else "reconcile_chunk_ack"
+                    "error" if job.status == "NEEDS_ATTENTION" and not duplicate else "reconcile_chunk_ack"
                 ),
                 "message_id": envelope.message_id,
-                "code": job.error_code,
+                "code": None if duplicate else job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
                 "source_epoch": source_epoch_uuid(db, job),
                 "assignment_id": source_chunk.assignment_id,
                 "generation": chunk.generation if chunk is not None else source_chunk.generation,
                 "sequence": chunk.sequence if chunk is not None else source_chunk.sequence,
-                "committed_next_ordinal": job.committed_next_ordinal,
+                "committed_next_ordinal": chunk.end_ordinal if chunk is not None else job.committed_next_ordinal,
                 "resulting_chain_digest": (
                     chunk.resulting_chain_digest
                     if chunk is not None
@@ -4332,7 +4332,8 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 ),
                 "duplicate": duplicate,
                 "continue_allowed": bool(
-                    source_chunk.assignment_id
+                    job.status in {"QUEUED", "RUNNING"}
+                    and source_chunk.assignment_id
                     and job.active_assignment_id == source_chunk.assignment_id
                     and job.credit_end_ordinal is not None
                     and job.committed_next_ordinal < job.credit_end_ordinal
@@ -4418,6 +4419,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "coverage_id": coverage.coverage_id,
                 "source_committed_cursor": coverage.source_committed_cursor,
                 "tail_exception_count": coverage.tail_exception_count,
+                "raw_preserved_count": coverage.raw_preserved_count,
                 "error_code": error_code,
             }
             ack_payload = {
@@ -4440,6 +4442,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 ),
                 "duplicate": duplicate,
                 "exception_count": chunk.exception_count if chunk is not None else 0,
+                "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}

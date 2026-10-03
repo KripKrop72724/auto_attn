@@ -107,7 +107,7 @@ const humanize = (value?: string | null) =>
     .replace(/^./, (letter) => letter.toUpperCase())
 
 const sourceEvidencePending = (state: SourceExceptionAssurance['state']) =>
-  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED'
+  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED' || state === 'INTERPRETATION_REQUIRED'
 
 const reconciliationEtaLabel = (job: ReconciliationJob) => {
   if (job.eta.high_seconds != null)
@@ -524,7 +524,9 @@ function JobDetailDrawer({
                 <Icon name="shield" />
                 <div>
                   <h3>
-                    {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
+                    {job.source_exception_assurance.state === 'INTERPRETATION_REQUIRED'
+                      ? 'Source interpretation pending'
+                      : job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                       ? 'Historical identity evidence required'
                       : job.source_exception_assurance.state === 'REVIEW_REQUIRED'
                       ? `${job.source_exception_assurance.open.toLocaleString()} source review${job.source_exception_assurance.open === 1 ? '' : 's'} remaining`
@@ -533,13 +535,17 @@ function JobDetailDrawer({
                         : 'Reviewed exclusions are preserved'}
                   </h3>
                   <p>
+                    {job.source_exception_assurance.state === 'INTERPRETATION_REQUIRED' ? (
+                      'Raw source bytes are preserved. Qualified interpretation is still required before attendance and Oracle delivery can be determined.'
+                    ) : <>
                     {job.source_exception_assurance.reviewed.toLocaleString()} of{' '}
                     {job.source_exception_assurance.total.toLocaleString()} certified
                     source exceptions reviewed. Original evidence remains immutable.
                     {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                       ' Review notes cannot resolve missing identity or certify Oracle delivery.'}
+                    </>}
                   </p>
-                  {sourceEvidencePending(job.source_exception_assurance.state) && (
+                  {sourceEvidencePending(job.source_exception_assurance.state) && job.source_exception_assurance.state !== 'INTERPRETATION_REQUIRED' && (
                     <button
                       className="button secondary"
                       onClick={() => onReviewExceptions(job)}
@@ -2011,9 +2017,10 @@ export function ReconciliationView({
                     ? 100
                     : 0
                 const oracleTarget = Math.max(job.progress.oracle_target || 0, job.progress.oracle_confirmed + job.progress.oracle_pending + (job.progress.oracle_review_required || 0) + (job.progress.blocked_identity || 0))
+                const rawPending = job.source_exception_assurance?.raw_interpretation_open ?? 0
                 const oraclePercent = oracleTarget
                   ? Math.min(
-                      100,
+                      rawPending ? 99 : 100,
                       job.progress.oracle_confirmed < oracleTarget ? Math.min(99, Math.floor((job.progress.oracle_confirmed / oracleTarget) * 100)) : 100,
                     )
                   : job.oracle_certified_at
@@ -2025,6 +2032,7 @@ export function ReconciliationView({
                 const sourceGateActive =
                   sourceAssurance.state === 'REVIEW_REQUIRED' ||
                   sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
+                  sourceAssurance.state === 'INTERPRETATION_REQUIRED' ||
                   sourceAssurance.state === 'SCOPE_MISMATCH'
                 const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> =
                   []
@@ -2102,6 +2110,7 @@ export function ReconciliationView({
                           identity held ·{' '}
                           {job.progress.quarantined.toLocaleString()}{' '}
                           quarantined
+                          {!!job.progress.raw_preserved && ` · ${job.progress.raw_preserved.toLocaleString()} awaiting interpretation`}
                         </p>
                       </section>
                       <section>
@@ -2164,6 +2173,8 @@ export function ReconciliationView({
                           <strong>
                             {job.status === 'CANCELLED'
                               ? 'Cancelled — source exceptions remain preserved'
+                              : sourceAssurance.state === 'INTERPRETATION_REQUIRED'
+                              ? 'Source interpretation pending'
                               : sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                               ? 'Historical identity evidence required'
                               : sourceAssurance.state === 'REVIEW_REQUIRED'
@@ -2176,11 +2187,15 @@ export function ReconciliationView({
                                     ? 'Reviewed exclusions — job ended'
                                     : 'Reviewed exclusions — assurance continuing'}
                           </strong>
+                          {sourceAssurance.state === 'INTERPRETATION_REQUIRED' ? (
+                            `${sourceAssurance.raw_interpretation_open ?? 0} raw source records preserved; attendance and Oracle completion remain unproven.`
+                          ) : <>
                           {sourceAssurance.reviewed.toLocaleString()} of{' '}
                           {sourceAssurance.total.toLocaleString()} certified
                           exceptions reviewed; original evidence remains preserved.
                           {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                             ' Review notes cannot resolve the identity hold.'}
+                          </>}
                         </span>
                       </div>
                     )}
