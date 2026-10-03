@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.crypto import encrypt_json
 from zk_add.zkt_packet import parse_fragment
-from zk_add.models import (Connector, TerminalRecordManifest, TerminalSourceEpoch,
+from zk_add.models import (AttendanceEvent, Connector, TerminalRecordManifest, TerminalSourceEpoch,
                            ZktObservationReceipt, ZktOccurrenceAlias, ZktObservationLink)
 
 
@@ -176,6 +176,42 @@ def bind_source_occurrence(session: Session, connector: Connector,
     elif prior.occurrence_alias_id != alias.id:
         raise SourceAssociationError("OBSERVATION_ALREADY_BOUND")
     return identity
+
+
+def source_occurrence_delivery_hold(session: Session, connector: Connector, identity: str) -> str | None:
+    """Reject an ambiguous legacy delivery link, never mint a replacement UID.
+
+    This is a negative check on existing links, not profile, employee or Oracle
+    verification. Different ordinals in one source epoch are different source
+    occurrences even when their raw bytes and legacy event UID are identical.
+    Recovery copies in a later epoch do not alone establish that collision.
+    """
+    alias = session.scalar(select(ZktOccurrenceAlias).where(ZktOccurrenceAlias.occurrence_id == identity))
+    manifest = session.get(TerminalRecordManifest, alias.manifest_id) if alias else None
+    zkt = connector.zkt_device
+    if (alias is None or manifest is None or zkt is None
+            or alias.zkt_device_id != zkt.id or manifest.connector_id != connector.id
+            or manifest.zkt_device_id != zkt.id or not manifest.canonical_source
+            or manifest.terminal_serial != zkt.confirmed_serial
+            or (alias.source_epoch_id, alias.ordinal, alias.raw_digest) !=
+               (manifest.source_epoch_id, manifest.ordinal, manifest.raw_record_digest)):
+        return "SOURCE_OCCURRENCE_LINK_CONFLICT"
+    if alias.attendance_event_id != manifest.attendance_event_id:
+        return "SOURCE_ATTENDANCE_LINK_CHANGED"
+    if alias.attendance_event_id is None:
+        return None  # Preserved exceptions have no attendance delivery claim.
+    event = session.get(AttendanceEvent, alias.attendance_event_id)
+    if (event is None or event.connector_id != connector.id or event.zkt_device_id != zkt.id
+            or event.device_serial != manifest.terminal_serial):
+        return "SOURCE_ATTENDANCE_BINDING_UNVERIFIED"
+    other = session.scalar(select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.attendance_event_id == event.id,
+        TerminalRecordManifest.zkt_device_id == zkt.id,
+        TerminalRecordManifest.source_epoch_id == alias.source_epoch_id,
+        TerminalRecordManifest.canonical_source.is_(True),
+        TerminalRecordManifest.ordinal != alias.ordinal,
+    ).limit(1))
+    return "LEGACY_EVENT_SHARED_BY_SOURCE_OCCURRENCES" if other is not None else None
 
 
 def settle_observations(session: Session, connector: Connector, payload: dict) -> dict:

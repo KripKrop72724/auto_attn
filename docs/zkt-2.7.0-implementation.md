@@ -23,6 +23,7 @@ counts are kept outside this public repository.
 | Short socket reads can extend a terminal operation indefinitely | One absolute monotonic deadline for a command, prepared-buffer transfer or live frame, including interleaved preservation and ACK; per-call nonblocking I/O after readiness | Fragment trickles, repeated events, interrupted waits, readiness races, actual Unix/TCP sockets and both ESP-IDF builds | Implemented transport bound; terminal scheduling and physical-model qualification remain open |
 | Historical attendance UID mistaken for current enrollment identity | Never supply a historical UID to current-roster matching; reject empty 40-byte text identities; preserve missing-reference source rows as `IDENTITY_UNRESOLVED`. Review notes cannot remove the identity hold or certify Oracle delivery | Synthetic empty/space-only fields, C/ADD rejection agreement, actual historical parser, baseline/tail replay and review-gate tests | Implemented guard; historical correction evidence and model qualification remain open |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
+| Legacy event IDs collapse distinct source occurrences | Custody inspection holds a shared attendance link when distinct canonical ordinals in one source epoch point to the same legacy attendance row; changed links and unverified attendance ownership remain explicit holds | Same-second/equal-byte source fixtures, retained acknowledged outboxes, binding/alias faults and independent later-record progress | Negative guard implemented; occurrence-based attendance creation and live/history matching remain open |
 | Custody can outlive an untracked processing obligation | Migration `0044` adds per-packet work and immutable receipt links in the custody transaction; bounded assembly, fair inspection, revision-triggered holds and an authenticated status endpoint | Receipt/work rollback, fragment conflict/replay, per-record decryption failure isolation, bounded repair, PostgreSQL overlapping sockets/SKIP LOCKED and actual dump/restore | Implemented components; profile-qualified interpretation and Oracle creation remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: gated startup implemented; ESP qualification, catalog and legacy handoff remain open |
 | Slow repeated identity reads in backlog previews | Connector-locked preview batches reuse shared identity evidence and fetch outboxes once; release and delivery revalidate without the preview cache | Mixed-record proof equality/query bound; next-transaction identity conflict; existing 100,000-row responsiveness test | Implemented; no manual jobs created or approved |
@@ -221,6 +222,18 @@ gets a visible hold. Missing source references remain explicit holds.
 completion. Revision-driven source wakeups and throughput qualification remain
 future work; the inspector's runtime cadence is not a latency guarantee.
 
+The source inspector also checks the retained attendance link. Distinct
+canonical ordinals in the same epoch cannot use one legacy attendance row as
+proof of independent delivery, even if that row already has an Oracle receipt.
+Both custody receipts and occurrence aliases remain intact; the processing
+obligation becomes `HELD_OCCURRENCE` with a reconciliation owner. A changed
+alias-to-manifest link or unverified attendance ownership has its own reason.
+Later valid observations continue. The guard never assigns an employee, creates
+a replacement attendance UID, changes an Oracle key or resends an old outbox.
+Recovery copies in another epoch and noncanonical evidence do not alone trigger
+this same-epoch collision check. It is a negative check at inspection time,
+not a positive delivery certificate or completed historical ambiguity audit.
+
 Journal retirement corruption has an automatic replay path. The owner first
 preserves the exact damaged checkpoint in a synchronized opaque segment, then
 commits a cursor that replays all retained segments under unchanged identities.
@@ -238,6 +251,11 @@ still block recovery. Encryption identity and nonce allocation never reset.
   `MSG_DONTWAIT`. Injected libc ports are installed after fortified declarations
   so faults cannot accidentally call a real socket. All 190 firmware regressions
   and both unsigned ESP-IDF family builds pass.
+- Legacy occurrence links: 142 custody/runtime/occurrence and reconciliation regressions
+  passed, including retained Oracle acknowledgements on a shared legacy UID,
+  distinct attendance rows with equal same-second facts, replay, recovery
+  copies and changed source ownership. All 18 custody-panel tests, the production
+  frontend build and bundle budget passed.
 - OTA reader interlock: native Clang and Linux GCC sanitizers cover proof
   corruption, actual slot/image/security checks, stale delivery evidence,
   refused/late owner checks and repeated failed abandonment. The actual
