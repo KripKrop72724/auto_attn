@@ -2,6 +2,8 @@
 #include "zkt_journal_crypto.h"
 #include "zkt_journal_state.h"
 #include "zkt_custody_wire.h"
+#include "zkt_journal_transport.h"
+#include "zkt_reader_platform.h"
 #include "queue_store.h"
 #include <dirent.h>
 #include <errno.h>
@@ -25,6 +27,8 @@ typedef struct {
     char prefix[112];
     int nvs_error;
     bool opening_store;
+    bool writer_allowed, compatibility_checked;
+    zj_compat_result_t compatibility;
     uint64_t retry_at_us;
     char wire_scratch[ZJ_CUSTODY_PAYLOAD_MAX];
 } owner_t;
@@ -108,6 +112,8 @@ static bool admitted(void *context, size_t bytes)
 }
 static zj_result_t recover(owner_t *o)
 {
+    o->writer_allowed = o->compatibility_checked = false;
+    o->compatibility = ZJ_COMPAT_NOT_READY;
     uint64_t now = (uint64_t)esp_timer_get_time();
     if (now < o->retry_at_us) return ZJ_IO;
     if (!qs_local_read_begin()) return ZJ_IO;
@@ -134,6 +140,7 @@ static zj_result_t recover(owner_t *o)
 static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
 {
     memset(reply, 0, sizeof(*reply));
+    reply->compatibility = ZJ_COMPAT_NOT_READY;
     o->nvs_error = 0;
     o->store.last_errno = 0;
     o->store.last_operation = NULL;
@@ -142,6 +149,13 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
         if (reply->result != ZJ_OK) return;
     }
     bool writing = request->operation == ZJ_APPEND;
+    if (writing && !o->writer_allowed) {
+        o->store.last_errno = EPERM;
+        o->store.last_operation = "journal_writer_gate";
+        reply->result = ZJ_INVALID;
+        reply->compatibility = o->compatibility;
+        return;
+    }
     bool locked = writing ? qs_local_begin(QS_ADMIT_LIVE, ZJ_META_BYTES + ZJ_RECORD_MAX) : qs_local_read_begin();
     if (!locked) {
         o->store.last_errno = errno;
@@ -169,6 +183,21 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
         }
         case ZJ_PEEK: reply->result = zj_store_peek(&o->store, &reply->item); break;
         case ZJ_RECLAIM: reply->result = zj_store_reclaim_step(&o->store); break;
+        case ZJ_READER_CHECK: {
+            qs_health_t health = qs_local_health_locked();
+            zj_transport_health_t transport;
+            bool delivery_ready = zj_transport_health(&transport) && transport.started &&
+                (uint32_t)((uint32_t)(esp_timer_get_time() / 1000) - transport.sampled_ms) < 45000U;
+            o->compatibility = zj_reader_platform_check(o->metadata.terminal_serial,
+                o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
+                health.observed && health.available && health.recovery_complete && health.persistence_verified &&
+                    !health.last_error && !health.persistence_probe_error,
+                o->store.checkpoint_recovery_pending, &o->writer_allowed);
+            o->compatibility_checked = true;
+            reply->compatibility = o->compatibility;
+            reply->result = o->compatibility == ZJ_COMPAT_OK ? ZJ_OK : ZJ_INVALID;
+            break;
+        }
         default: reply->result = ZJ_INVALID; break;
     }
     bool write_failed = writing && (reply->result == ZJ_IO || reply->result == ZJ_UNCERTAIN);
@@ -210,6 +239,9 @@ static void task(void *context)
         o->health.recovering = false;
         o->health.ready = o->store.ready && o->state.ready;
         o->health.checkpoint_recovery_pending = o->store.checkpoint_recovery_pending;
+        o->health.compatibility_checked = o->compatibility_checked;
+        o->health.writer_allowed = o->writer_allowed;
+        o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;
         if (reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
             ++o->health.failures;
@@ -240,6 +272,7 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     owner->metadata = *metadata;
     zj_mailbox_init(&owner->mailbox);
     owner->health.started = true;
+    owner->compatibility = owner->health.compatibility = ZJ_COMPAT_NOT_READY;
     if (xTaskCreate(task, "zkt_storage", 12288, owner, 5, &owner_task) != pdPASS) {
         heap_caps_free(owner);
         owner = NULL;

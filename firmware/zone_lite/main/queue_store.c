@@ -467,7 +467,14 @@ qs_health_t qs_health(void)
 {
     qs_health_t snapshot = {0};
     if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        (void)measure(); snapshot = health; snapshot.observed = true; xSemaphoreGive(budget_lock);
+        snapshot = qs_local_health_locked(); xSemaphoreGive(budget_lock);
     }
+    return snapshot;
+}
+qs_health_t qs_local_health_locked(void)
+{
+    (void)measure();
+    qs_health_t snapshot = health;
+    snapshot.observed = true;
     return snapshot;
 }

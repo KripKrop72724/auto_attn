@@ -28,7 +28,7 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_RECLAIM) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_READER_CHECK) return false;
     if (!mailbox->next_ticket || mailbox->occupied == ZJ_REQUEST_SLOTS ||
         (!priority(request->operation) && mailbox->occupied >= ZJ_REQUEST_SLOTS - ZJ_LIVE_RESERVED_SLOTS)) {
         ++mailbox->refused;

@@ -3,6 +3,8 @@
 
 typedef struct {
     bool started, ready, operation_running, recovering, checkpoint_recovery_pending;
+    bool compatibility_checked, writer_allowed;
+    zj_compat_result_t compatibility;
     zj_operation_t operation;
     zj_result_t last_result;
     uint64_t sampled_uptime_us, operation_started_us, progress_uptime_us;
