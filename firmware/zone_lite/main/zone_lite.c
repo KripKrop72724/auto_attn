@@ -538,6 +538,7 @@ static add_zkt_telemetry_t g_add_zkt;
 static bool g_temp_admin_active;
 static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
+static lg_watch_t g_temp_admin_watch;
 // The legacy runtime checkpoint has no epoch UUID. New bridge/writer boots
 // require fresh ADD authority; never infer an epoch from the numeric generation.
 static char g_add_source_epoch[37];
@@ -7764,7 +7765,10 @@ static bool temp_admin_clear(void)
     g_temp_admin_active = false;
     g_temp_admin_uid = 0;
     g_temp_admin_expires_epoch = 0;
-    if (nvs_save_runtime_state()) return true;
+    if (nvs_save_runtime_state()) {
+        g_temp_admin_watch = (lg_watch_t){0};
+        return true;
+    }
     // Keep the watchdog obligation until clearing it is durably recorded.
     g_temp_admin_active = active;
     g_temp_admin_uid = uid;
@@ -7783,6 +7787,8 @@ static bool temp_admin_persist(void *arg, uint16_t uid, int64_t deadline, bool a
 {
     (void)arg;
     if (!active) return temp_admin_clear();
+    if (!g_temp_admin_active)
+        (void)lg_watch_arm(&g_temp_admin_watch, uid, deadline, epoch_now(), uptime_ms());
     g_temp_admin_active = true;
     g_temp_admin_uid = uid;
     g_temp_admin_expires_epoch = deadline;
@@ -7817,6 +7823,12 @@ static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *
     const add_command_t *command, const char **error_code, const char **error_message,
     char *result, size_t result_size)
 {
+    if (g_temp_admin_active && lg_watch_due(&g_temp_admin_watch, g_temp_admin_uid,
+            g_temp_admin_expires_epoch, epoch_now(), uptime_ms())) {
+        *error_code = "ADMIN_LEASE_REVOCATION_REQUIRED";
+        *error_message = "The expired or restored administrator lease must be revoked before another grant.";
+        return false;
+    }
     if (!ensure_system_time_synced()) {
         *error_code = "TRUSTED_TIME_UNAVAILABLE";
         *error_message = "Trusted time is required before administrator elevation.";
@@ -7839,7 +7851,12 @@ static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *
     temp_admin_port_t context = {sock, ctx, users, command};
     lg_port_t port = {temp_admin_now, temp_admin_persist, temp_admin_elevate,
         temp_admin_verify, temp_admin_revoke, &context};
+    bool new_lease = !g_temp_admin_active;
     lg_result_t outcome = lg_grant(port, uid, seconds, deadline);
+    /* A fresh grant starts its duration after verified elevation. A retry of
+     * an existing grant must retain its original monotonic bound. */
+    if (outcome == LG_OK && new_lease && !lg_watch_arm(&g_temp_admin_watch, uid,
+            g_temp_admin_expires_epoch, epoch_now(), uptime_ms())) outcome = LG_TIME;
     if (outcome != LG_OK) {
         *error_code = outcome == LG_STORAGE ? "LEASE_CHECKPOINT_FAILED" :
             outcome == LG_EXPIRED ? "COMMAND_EXPIRED" : outcome == LG_TIME ? "TRUSTED_TIME_UNAVAILABLE" : "ZKT_USER_REREAD_FAILED";
@@ -7858,8 +7875,8 @@ static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *
 static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *users)
 {
     if (!g_temp_admin_active) return true;
-    int64_t now = epoch_now();
-    if (now >= ZONE_LITE_MIN_VALID_UNIX_TIME && now < g_temp_admin_expires_epoch) return true;
+    if (!lg_watch_due(&g_temp_admin_watch, g_temp_admin_uid,
+            g_temp_admin_expires_epoch, epoch_now(), uptime_ms())) return true;
     int32_t current_users = 0, current_records = 0;
     if (!zk_get_counts(sock, ctx, &current_users, &current_records) ||
         !zk_refresh_users_preserving_current(sock, ctx, users, current_users)) return false;
@@ -8370,6 +8387,9 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
     if (!zk_refresh_users_stable(sock, &ctx, users, user_count, initial_user_state_hash)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
+    if (!temp_admin_revoke_if_due(sock, &ctx, users)) {
+        zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
+    }
     if (!zk_enforce_credential_policy(sock, &ctx, users, user_count)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
@@ -8400,6 +8420,15 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
     bool restarted = false;
     while (true) {
         if (add_connector_terminal_restart_pending()) break;
+        if (g_temp_admin_active) {
+            if (!add_connector_begin_exclusive_activity("VERIFYING_ADMIN_LEASE")) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            bool lease_ok = temp_admin_revoke_if_due(sock, &ctx, users);
+            add_connector_set_activity("LIVE_CAPTURE");
+            if (!lease_ok) break;
+        }
         if (g_comm_key_operation_active || add_connector_has_pending_config_command()) {
             ESP_LOGI(TAG, "Yielding the ZKT session to an authenticated configuration operation");
             break;
@@ -8563,15 +8592,6 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
                     "IDENTITY_CATALOG_APPLIED",
                     message);
             }
-        }
-        if (g_temp_admin_active) {
-            if (!add_connector_begin_exclusive_activity("VERIFYING_ADMIN_LEASE")) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            bool lease_ok = temp_admin_revoke_if_due(sock, &ctx, users);
-            add_connector_set_activity("LIVE_CAPTURE");
-            if (!lease_ok) break;
         }
 
         if (now_ms - last_user_integrity >= ZONE_LITE_USER_INTEGRITY_INTERVAL_MS) {
