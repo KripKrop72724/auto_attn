@@ -174,6 +174,7 @@ def test_work_status_is_scoped_paginated_and_contains_no_protected_bytes(custody
     db, connector = custody
     settle_observations(db, connector, batch(packet_observation(1), packet_observation(2)))
     status = work_status(db, connector, limit=1)
+    assert status["connector_id"] == connector.connector_id
     assert status["enabled"] and not status["missing_processing_obligation"]
     assert len(status["rows"]) == 1 and status["next_cursor"] == status["rows"][0]["id"]
     next_page = work_status(db, connector, limit=1, before=status["next_cursor"])

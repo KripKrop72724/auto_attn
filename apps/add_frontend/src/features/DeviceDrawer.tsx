@@ -9,6 +9,7 @@ import {
 import { Icon } from '../Icon'
 import { firmwareLabel, humanizeStatus } from '../status'
 import { FirmwareHealth } from './FirmwareHealth'
+import { ZktCustodyStatus } from './ZktCustodyStatus'
 import type {
   Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceLog,
 } from '../types'
@@ -21,6 +22,7 @@ const logLevelPattern = (level: string) => /ERR|FATAL|CRIT/i.test(level) ? 'bloc
 export function DeviceDrawer({
   seed,
   revision,
+  custodyRevision = 0,
   onClose,
   onManageUsers,
   onInventoryChanged,
@@ -28,6 +30,7 @@ export function DeviceDrawer({
 }: {
   seed: Device
   revision: number
+  custodyRevision?: number
   onClose: () => void
   onManageUsers: (device: Device) => void
   onInventoryChanged: () => Promise<void>
@@ -320,6 +323,7 @@ export function DeviceDrawer({
             </dl>}
           </article>}
           <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} bootId={device.boot_id} imageDigest={device.ota_image_sha256} />
+          {device.firmware_family !== 'hikvision' && <ZktCustodyStatus connectorId={device.connector_id} revision={custodyRevision} />}
           <article className="detail-card wide"><div className="detail-title"><div><p className="eyebrow">INTERMITTENT CONNECTIVITY HISTORY</p><h3>Bounded reconnect and anti-flap state</h3></div><StatusBadge state={device.zkt?.connection_state || 'UNKNOWN'} /></div><div className="connection-list">{connections.slice(0, 12).map((row) => <div key={row.id}><time>{dateTime(row.observed_at)}</time><StatusBadge state={row.from_state || 'START'} /><Icon name="chevron" /><StatusBadge state={row.to_state} /><span>{row.reason || 'State observation'} · failures {row.consecutive_failures} · flaps {row.flap_count_15m}</span></div>)}{!connections.length && <p>No connectivity transitions recorded yet.</p>}</div></article>
           <article className={`detail-card wide inventory-assignment-card ${device.is_spare ? 'is-spare' : ''}`}>
             <span className="inventory-assignment-icon"><Icon name={device.is_spare ? 'server' : 'grid'} /></span>
