@@ -35,9 +35,15 @@ counts are kept outside this public repository.
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Concurrent requests can exceed the nationwide upgrade limits | PostgreSQL offer serialization and exact-inventory admission after bridge/writer registration; two reservations and one per physical location, retaining offline/paused/uncertain cancelled offers | Actual assignment transactions, overlapping PostgreSQL sessions, rollback, family and legacy/HIL regressions | Implemented negative admission guard; trusted qualification, wave enforcement and verified stop/recovery remain open |
+| Replayed delivery can inflate workload estimates | Read-only 30-day source-ordinal counts, same-second multiplicity, strict current source scope, bounded query deadlines and explicit unknown/uncertified evidence | SQLite/PostgreSQL tests, concurrent change and 200,000-record measurement | Implemented measurement component; profile, clock/window closure and actual zone capacity qualification remain open |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
 
 ## Required release evidence
+
+The [source-load diagnostic](zkt-source-load-baseline.md) measures observed
+calendar-day and minute counts without using delivery attempts. It cannot turn
+missing source history or an unqualified clock/profile into a complete baseline.
+Its measurement remains separate from the seven-day capacity gate.
 
 ADD backup restore, additive migration and rollback-reader verification precede
 new writers. Candidate signing, a seven-day automated soak, each field device's
