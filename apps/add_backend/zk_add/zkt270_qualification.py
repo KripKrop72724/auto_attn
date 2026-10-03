@@ -62,6 +62,9 @@ class DeviceQualification(BaseModel):
     application_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     installed_at: AwareDatetime
     observed_until: AwareDatetime
+    # First completed device qualification for this exact application. The
+    # trusted collector records this once; later telemetry does not move it.
+    qualified_at: AwareDatetime | None = None
     maximum_telemetry_gap_seconds: int = Field(ge=0)
     minimum_healthy_dependency_minutes: int = Field(ge=0)
     add_p95_ms: int = Field(ge=0)
@@ -110,6 +113,10 @@ def device_gate(value: DeviceQualification, *, candidate_digest: str, now: datet
             reasons.append(f"{key}:{state}")
     if value.observed_until - value.installed_at < timedelta(hours=target.hours):
         reasons.append("OBSERVATION_WINDOW_INCOMPLETE")
+    if value.qualified_at is None:
+        reasons.append("QUALIFICATION_COMPLETION_MISSING")
+    elif not value.installed_at + timedelta(hours=target.hours) <= value.qualified_at <= value.observed_until:
+        failed.add("INVALID_QUALIFICATION_COMPLETION")
     if (now - value.observed_until).total_seconds() > 45 or value.maximum_telemetry_gap_seconds > 45:
         reasons.append("TELEMETRY_COVERAGE_INCOMPLETE")
     traces = {trace.occurrence_id: trace for trace in value.traces}
@@ -117,9 +124,11 @@ def device_gate(value: DeviceQualification, *, candidate_digest: str, now: datet
         failed.add("REPEATED_ATTENDANCE_PROOF")
     if any(not value.installed_at <= trace.observed_at <= value.observed_until for trace in value.traces):
         failed.add("TRACE_OUTSIDE_OBSERVATION")
+    qualified_traces = [trace for trace in traces.values()
+                        if value.qualified_at is not None and trace.observed_at <= value.qualified_at]
     working_days = {trace.observed_at.astimezone(ZoneInfo("Asia/Karachi")).date()
-                    for trace in value.traces if trace.observed_at.astimezone(ZoneInfo("Asia/Karachi")).weekday() < 5}
-    if len(traces) < 20 or len(working_days) < 2:
+                    for trace in qualified_traces if trace.observed_at.astimezone(ZoneInfo("Asia/Karachi")).weekday() < 5}
+    if len(qualified_traces) < 20 or len(working_days) < 2:
         reasons.append("ORDINARY_ATTENDANCE_PROOF_INCOMPLETE")
     if value.minimum_healthy_dependency_minutes < 15:
         reasons.append("HEALTHY_DEPENDENCY_LOAD_WINDOW_MISSING")
@@ -143,9 +152,11 @@ def nationwide_register(evidence: list[DeviceQualification], *, candidate_digest
                    "state": "UNTESTED", "reasons": ["DEVICE_EVIDENCE_MISSING"],
                } for target in TARGETS]
     all_passed = all(row["state"] == "PASSED" for row in results)
-    final_install = max((row.installed_at for row in evidence), default=now)
+    if fleet_observation_started_at is not None and fleet_observation_started_at.tzinfo is None:
+        raise ValueError("Fleet observation time requires a timezone")
+    final_qualification = max((row.qualified_at for row in evidence if row.qualified_at), default=now)
     fleet_passed = bool(all_passed and fleet_observation_started_at and
-                        final_install <= fleet_observation_started_at <= now - timedelta(days=14))
+                        final_qualification <= fleet_observation_started_at <= now - timedelta(days=14))
     return {"denominator": 17, "devices": results,
             "remote_hil": "PASSED" if fleet_passed else "INCOMPLETE",
             "fleet_observation": "PASSED" if fleet_passed else "UNTESTED",

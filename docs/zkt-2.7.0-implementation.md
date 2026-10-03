@@ -13,7 +13,7 @@ Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 | Issue | Change | Verification | Status |
 |---|---|---|---|
 | Fresh APIs with stale screens | Canonical browser topics, reconnect/overflow resync, 30-second polling, focus refresh, shared device snapshots and old-response rejection | `test_browser_reliability.py`, `realtime.test.tsx`, existing drawer/App tests | Implemented; local tests passed; not deployed |
-| Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations | `test_runtime_contract.py`, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: telemetry implemented; precise incident recovery and boot gates remain open |
+| Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
 | Dual delivery and same-second occurrence identity | Versioned encrypted ADD observation receipts; exact-source occurrence aliases; replay returns receipt even after later transport sequence | `test_zkt_custody.py`, PostgreSQL overlapping-socket test; additive migration/restore | Partial: receiver disabled; journal transport and live/history semantic matching remain open |
@@ -21,7 +21,7 @@ Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Implemented; not deployed; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Bridge readers, exact predecessor manifests, persisted compatibility proof | Pending | Open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
-| Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
+| Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Implemented; production backup has not been taken |
 
 ## Required release evidence
@@ -43,6 +43,13 @@ named keepalives measure transport liveness only. Clients also fetch snapshots
 every 30 seconds and on focus/visibility recovery. `snapshot_at` orders shared
 fleet/detail snapshots; `firmware_diagnostics_at` is telemetry receipt time,
 `sampled_at` is device sampling time, and `boot_id` binds health to a boot.
+
+ZKT persistence-probe errors are independent of attendance-write and queue faults.
+Retries back off from two to sixty seconds, rerun both stores' proof, and never
+clear an unrelated storage error. Successful recovery clears the active probe
+error and consecutive count; the total failure count remains visible until reboot.
+Hikvision retains its prior recovery policy. No LED reset substitutes for a
+successful storage check.
 
 The event hub remains process-local. Deploy one ADD web worker until a shared
 event and connector transport is implemented; multiple workers are not qualified.
@@ -77,9 +84,12 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 - Full local backend/firmware/companion regression run: 1,385 passed, 27 skipped.
   Skips require specific
   environments; they are not qualification passes.
-- Frontend: 138 full-suite tests passed, followed by 34 targeted checks including
-  two additional missing/wrong-boot tests; TypeScript, production build and bundle
+- Frontend: 141 full-suite tests passed, including missing/wrong-boot evidence and
+  active-versus-historical probe errors; TypeScript, production build and bundle
   budget passed. Browser matrix: 82 passed, 14 intentionally skipped by viewport.
+- Subsequent storage/protocol changes: all 199 firmware and targeted runtime/HIL
+  tests passed, followed by 33 qualification/HIL/runtime tests. A simulated
+  multi-gigabyte terminal response fails without draining an untrusted body.
 - ESP-IDF 5.5.3: ZKT and Hikvision development images compiled. Images are
   unsigned and retain their existing version identities; neither is a 2.7.0 candidate.
 - PostgreSQL: additive migrations and schema check passed. Existing concurrency

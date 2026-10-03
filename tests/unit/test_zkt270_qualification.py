@@ -15,7 +15,7 @@ def ready(target=TARGETS[0]):
     start = NOW - timedelta(days=8)
     return DeviceQualification(
         connector_id=target.identity.connector_id, application_sha256="a" * 64,
-        installed_at=start, observed_until=NOW, maximum_telemetry_gap_seconds=20,
+        installed_at=start, qualified_at=NOW, observed_until=NOW, maximum_telemetry_gap_seconds=20,
         minimum_healthy_dependency_minutes=30, add_p95_ms=5000, add_p99_ms=15000,
         oracle_p99_ms=60000, local_commit_p99_ms=500, backlog_drain_seconds=86400,
         latency_failure_minutes=0, growing_deliverable_backlog_minutes=0,
@@ -80,6 +80,22 @@ def test_promotion_halts_for_regression(change, reason):
 def test_short_stale_or_missing_evidence_never_passes():
     for change in ({"installed_at": NOW-timedelta(hours=1)}, {"gates": {}},
                    {"traces": ()}, {"maximum_telemetry_gap_seconds": 46},
-                   {"incidents": ("NEW_UNCLASSIFIED_FAILURE",)}):
+                   {"incidents": ("NEW_UNCLASSIFIED_FAILURE",)},
+                   {"qualified_at": None}, {"qualified_at": NOW-timedelta(days=6)}):
         assert device_gate(ready().model_copy(update=change), candidate_digest="a" * 64,
                            now=NOW)["state"] != "PASSED"
+
+
+def test_fleet_observation_starts_after_final_qualification_not_final_install():
+    later = NOW + timedelta(days=14)
+    evidence = [ready(target).model_copy(update={"observed_until": later}) for target in TARGETS]
+    early = nationwide_register(evidence, candidate_digest="a" * 64, now=later,
+                               fleet_observation_started_at=NOW-timedelta(days=7))
+    assert early["remote_hil"] == "INCOMPLETE"
+    valid = nationwide_register(evidence, candidate_digest="a" * 64, now=later,
+                               fleet_observation_started_at=NOW)
+    assert valid["remote_hil"] == "PASSED"
+    assert valid["production_qualification"] == "INCOMPLETE"
+    with pytest.raises(ValueError, match="timezone"):
+        nationwide_register(evidence, candidate_digest="a" * 64, now=later,
+                            fleet_observation_started_at=NOW.replace(tzinfo=None))
