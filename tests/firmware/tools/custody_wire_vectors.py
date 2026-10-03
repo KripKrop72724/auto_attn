@@ -18,7 +18,7 @@ def vectors():
     epoch = bytes(range(16)).hex()
     sequence = 2**63 - 1
     result = []
-    for index, length in enumerate([1, 2, 3, 512, 40, 512, 20, 512, 12]):
+    for index, length in enumerate([1, 2, 3, 512, 40, 512, 20, 512, 12, 88]):
         raw = bytes(position % 256 for position in range(length))
         if index == 7:
             packet = bytes(position % 256 for position in range(600))
@@ -48,5 +48,12 @@ def vectors():
             value["raw_format"] = "PACKET_FRAGMENT" if index == 7 else "LIVE_PACKET"
         if index == 8:
             value.update(captured_at=None, captured_at_seconds=str(2**63 - 1))
+        if index == 9:
+            value = dict(capture_epoch=epoch, end_offset=88, exception_kind="CHECKPOINT",
+                         item_type="JOURNAL_EXCEPTION",
+                         observation_id=digest(["zkt-journal-exception-v1", serial, epoch,
+                                                sequence, 0, 88, raw_digest]),
+                         raw_b64=base64.b64encode(raw).decode(), raw_digest=raw_digest,
+                         segment_id=str(sequence), start_offset=0, terminal_serial=serial)
         result.append(value)
     return result

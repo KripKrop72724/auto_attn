@@ -99,7 +99,7 @@ static bool exception(output_t *out, const zj_item_t *item, zj_crypto_port_t cry
     if (!item->exception_length || item->exception_length > ZJ_EXCEPTION_MAX ||
         item->token.end <= item->token.offset || item->token.end - item->token.offset != item->exception_length ||
         !item->token.segment_id || item->token.segment_id > ZJ_SEQUENCE_MAX ||
-        item->exception < ZJ_EXCEPTION_METADATA || item->exception > ZJ_EXCEPTION_TAIL) return false;
+        item->exception < ZJ_EXCEPTION_METADATA || item->exception > ZJ_EXCEPTION_CHECKPOINT) return false;
     zj_metadata_t binding = {.segment_id = 1, .decoder_profile = "opaque", .decoder_version = "1"};
     memcpy(binding.terminal_serial, item->custody_serial, sizeof(binding.terminal_serial));
     memcpy(binding.capture_epoch, item->custody_epoch, sizeof(binding.capture_epoch));
@@ -114,7 +114,7 @@ static bool exception(output_t *out, const zj_item_t *item, zj_crypto_port_t cry
         (unsigned long)item->token.offset, (unsigned long)item->token.end, raw_digest);
     if (count < 0 || (size_t)count >= sizeof(identity) ||
         !hashed(crypto, identity, (size_t)count, expected->observation_id)) return false;
-    static const char *kinds[] = {NULL, "METADATA", "FRAME", "AUTH", "TAIL"};
+    static const char *kinds[] = {NULL, "METADATA", "FRAME", "AUTH", "TAIL", "CHECKPOINT"};
     append(out, "{\"capture_epoch\":\"%s\",\"end_offset\":%lu,\"exception_kind\":\"%s\","
                 "\"item_type\":\"JOURNAL_EXCEPTION\",\"observation_id\":\"%s\","
                 "\"raw_b64\":\"%s\",\"raw_digest\":\"%s\",\"segment_id\":\"%llu\","

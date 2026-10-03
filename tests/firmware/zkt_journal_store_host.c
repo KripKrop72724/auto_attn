@@ -238,6 +238,92 @@ static unsigned drain(zj_store_t *store, unsigned counts[256])
     assert(result == ZJ_EMPTY);
     return exceptions;
 }
+static void damaged_checkpoint(zj_store_t *store, uint8_t damaged[ZJ_CHECKPOINT_BYTES], unsigned byte)
+{
+    reset(store);
+    assert(append(store, 'A', 40) == ZJ_OK);
+    assert(append(store, 'B', 40) == ZJ_OK);
+    zj_item_t item;
+    assert(zj_store_peek(store, &item) == ZJ_OK);
+    settle(store, &item);
+    state.checkpoint[byte] ^= 1;
+    memcpy(damaged, state.checkpoint, ZJ_CHECKPOINT_BYTES);
+}
+static void check_replay(zj_store_t *store, const uint8_t damaged[ZJ_CHECKPOINT_BYTES])
+{
+    assert(store->checkpoint_recovery_pending);
+    unsigned retained = 0;
+    for (unsigned i = 0; i < store->count; ++i) if (store->segments[i].size) ++retained;
+    zj_result_t reclaimed = zj_store_reclaim_step(store);
+    assert(reclaimed == ZJ_EMPTY || reclaimed == ZJ_OK); /* A failed open can leave an empty file. */
+    unsigned after = 0;
+    for (unsigned i = 0; i < store->count; ++i) if (store->segments[i].size) ++after;
+    assert(retained == after);
+    unsigned observations[256] = {0}, evidence = 0;
+    zj_item_t item;
+    zj_result_t result;
+    while ((result = zj_store_peek(store, &item)) == ZJ_OK) {
+        if (item.kind == ZJ_OBSERVATION) {
+            ++observations[item.observation.raw[0]];
+            assert(item.observation.sequence == (item.observation.raw[0] == 'A' ? 2U : 3U));
+        } else if (item.exception == ZJ_EXCEPTION_CHECKPOINT) {
+            assert(item.exception_length == CHECKPOINT_EVIDENCE_BYTES);
+            assert(!memcmp(item.exception_bytes, "ZJCPE001", 8));
+            assert(!memcmp(item.exception_bytes + 8, damaged, ZJ_CHECKPOINT_BYTES));
+            ++evidence;
+        }
+        settle(store, &item);
+    }
+    assert(result == ZJ_EMPTY && observations['A'] == 1 && observations['B'] == 1 && evidence == 1);
+    assert(!store->checkpoint_recovery_pending);
+    uint64_t reserved = state.limit;
+    reopen(store);
+    assert(!store->checkpoint_recovery_pending && zj_store_peek(store, &item) == ZJ_EMPTY);
+    assert(append(store, 'C', 40) == ZJ_OK);
+    assert(zj_store_peek(store, &item) == ZJ_OK && item.observation.sequence > reserved);
+}
+static void checkpoint_recovery_tests(zj_store_t *store)
+{
+    uint8_t damaged[ZJ_CHECKPOINT_BYTES];
+    for (unsigned byte = 0; byte < ZJ_CHECKPOINT_BYTES; ++byte) {
+        damaged_checkpoint(store, damaged, byte);
+        reopen(store);
+        /* Recovery and its pending evidence survive another immediate reboot. */
+        reopen(store);
+        check_replay(store, damaged);
+    }
+    for (unsigned reused = 0; reused < 2; ++reused) {
+        for (unsigned persisted = 0; persisted < 2; ++persisted) {
+            for (unsigned boundary = 1; boundary <= 64; ++boundary) {
+                damaged_checkpoint(store, damaged, 30);
+                if (reused) {
+                    reopen(store);
+                    memcpy(state.checkpoint, damaged, sizeof(damaged));
+                }
+                calls = 0; fail_at = boundary; uncertain = persisted;
+                zj_result_t result = zj_store_open(store, "fault-journal-", &metadata, state.limit, port());
+                assert(result == ZJ_OK || !store->ready);
+                reopen(store);
+                check_replay(store, damaged);
+            }
+        }
+    }
+    damaged_checkpoint(store, damaged, 30);
+    state.full = true;
+    assert(zj_store_open(store, "fault-journal-", &metadata, state.limit, port()) == ZJ_FULL);
+    assert(!store->ready && !memcmp(state.checkpoint, damaged, sizeof(damaged)));
+    state.full = false;
+    reopen(store);
+    check_replay(store, damaged);
+    /* A correctly checksummed but impossible cursor also replays safely. */
+    damaged_checkpoint(store, damaged, 30);
+    put32(state.checkpoint + 28, 0);
+    put32(state.checkpoint + 24, UINT32_MAX);
+    put32(state.checkpoint + 76, dq_crc32(state.checkpoint, 76));
+    memcpy(damaged, state.checkpoint, sizeof(damaged));
+    reopen(store);
+    check_replay(store, damaged);
+}
 int main(void)
 {
     static zj_store_t store;
@@ -334,9 +420,11 @@ int main(void)
     assert(drain(&store, counts) >= 1 && !counts['A'] && counts['B'] == 1);
     /* Corrupted retirement state never formats or removes retained evidence. */
     state.checkpoint[30] ^= 1;
-    assert(zj_store_open(&store, "fault-journal-", &metadata, state.limit, port()) == ZJ_CORRUPT);
+    reopen(&store);
+    assert(store.checkpoint_recovery_pending);
     struct stat st;
     assert(!stat(path, &st) && st.st_size > ZJ_META_BYTES);
+    checkpoint_recovery_tests(&store);
     /* Rotations are append-only, and each GC step removes at most one file. */
     reset(&store);
     for (unsigned i = 0; i < 250; ++i) assert(append(&store, 'R', ZJ_RAW_MAX) == ZJ_OK);

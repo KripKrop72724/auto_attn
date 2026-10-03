@@ -153,6 +153,13 @@ gets a visible hold. Missing source references remain explicit holds.
 completion. Revision-driven source wakeups and throughput qualification remain
 future work; the inspector's maintenance cadence is not a latency guarantee.
 
+Journal retirement corruption has an automatic replay path. The owner first
+preserves the exact damaged checkpoint in a synchronized opaque segment, then
+commits a cursor that replays all retained segments under unchanged identities.
+The original checkpoint evidence needs its own ADD receipt before reclamation.
+Unavailable reads, damaged root keys/counters and exhausted recovery capacity
+still block recovery. Encryption identity and nonce allocation never reset.
+
 ## Verification recorded on 3 October 2026
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
@@ -216,6 +223,11 @@ future work; the inspector's maintenance cadence is not a latency guarantee.
   custody/concurrency/savepoint tests passed. Distinct same-byte ordinals retain
   separate aliases, replay keeps its receipt, changed confirmation cannot bind,
   and a conflicting item cannot prevent the next receipt from committing.
+- Checkpoint recovery: 223 firmware/custody regressions passed, with retirement
+  byte corruption and interrupted archive/reset operations under native and
+  Linux ASan/UBSan. Four owner/admission tests include automatic recovery after
+  a capacity refusal. Both family builds and ten independent wire/receipt
+  vectors passed. These remain software tests, not physical power-cut proof.
 
 ## Work that still blocks the requested release
 
@@ -225,7 +237,7 @@ future work; the inspector's maintenance cadence is not a latency guarantee.
 2. Activate the journal storage/delivery tasks through the compatible-reader
    gate and wire live capture; transfer catalog and
    legacy storage operations to the same owner. Qualify actual ESP latency,
-   resource headroom, corrupt-checkpoint recovery and remaining runtime tasks.
+   resource headroom, checkpoint recovery on actual ESP hardware and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
    recovery of parser-affected history. No force-send or invented identity is allowed.

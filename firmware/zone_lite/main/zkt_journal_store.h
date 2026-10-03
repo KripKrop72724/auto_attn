@@ -10,7 +10,7 @@ typedef enum { ZJ_OK, ZJ_EMPTY, ZJ_FULL, ZJ_IO, ZJ_CORRUPT, ZJ_STALE,
                ZJ_INVALID, ZJ_UNCERTAIN } zj_result_t;
 typedef enum { ZJ_OBSERVATION, ZJ_PRESERVED_EXCEPTION } zj_item_kind_t;
 typedef enum { ZJ_EXCEPTION_NONE, ZJ_EXCEPTION_METADATA, ZJ_EXCEPTION_FRAME,
-               ZJ_EXCEPTION_AUTH, ZJ_EXCEPTION_TAIL } zj_exception_t;
+               ZJ_EXCEPTION_AUTH, ZJ_EXCEPTION_TAIL, ZJ_EXCEPTION_CHECKPOINT } zj_exception_t;
 
 typedef struct {
     uint64_t segment_id;
@@ -41,7 +41,7 @@ typedef struct {
     zj_crypto_port_t crypto;
 } zj_store_port_t;
 
-typedef struct { uint64_t id; uint32_t size; bool metadata_valid; } zj_segment_t;
+typedef struct { uint64_t id; uint32_t size; bool metadata_valid, checkpoint_evidence; } zj_segment_t;
 typedef struct {
     char prefix[112];
     zj_store_port_t port;
@@ -52,7 +52,7 @@ typedef struct {
     unsigned count;
     uint64_t writer_id, checkpoint_revision, read_segment, last_sequence;
     uint32_t read_offset;
-    bool ready;
+    bool ready, checkpoint_recovery_pending;
     int last_errno;
     const char *last_operation;
 } zj_store_t;

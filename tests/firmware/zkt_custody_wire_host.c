@@ -62,8 +62,8 @@ int main(void)
             .source_ordinal = UINT32_MAX, .identity_revision = 7}};
     for (unsigned i = 0; i < 16; ++i) item.metadata.capture_epoch[i] = (uint8_t)i;
     for (unsigned i = 0; i < ZJ_RAW_MAX; ++i) item.observation.raw[i] = (uint8_t)i;
-    const unsigned lengths[] = {1, 2, 3, 512, 40, 512, 20, 512, 12};
-    for (unsigned example = 0; example < 9; ++example) {
+    const unsigned lengths[] = {1, 2, 3, 512, 40, 512, 20, 512, 12, 88};
+    for (unsigned example = 0; example < 10; ++example) {
         item.observation.raw_length = (uint16_t)lengths[example];
         if (example == 4) {
             item.observation.raw_format = ZJ_SOURCE_RECORD;
@@ -100,6 +100,14 @@ int main(void)
             memcpy(raw + 60, packet, 452);
         }
         if (example == 8) item.observation.captured_at_seconds = INT64_MAX;
+        if (example == 9) {
+            item.kind = ZJ_PRESERVED_EXCEPTION;
+            item.exception = ZJ_EXCEPTION_CHECKPOINT;
+            item.exception_length = 88;
+            memcpy(item.exception_bytes, item.observation.raw, 88);
+            item.token.offset = 0;
+            item.token.end = 88;
+        }
         char payload[ZJ_CUSTODY_PAYLOAD_MAX];
         zj_custody_expected_t expected;
         assert(zj_custody_encode(&item, crypto, payload, sizeof(payload), &expected));

@@ -185,15 +185,16 @@ def opaque_exception(start=0, raw=b"synthetic corrupt cipher bytes", **updates):
                 raw_b64=base64.b64encode(raw).decode(), raw_digest=raw_digest, **updates)
 
 
-def test_opaque_journal_custody_has_stable_extent_identity_and_no_attendance(custody):
+@pytest.mark.parametrize("kind", ["AUTH", "CHECKPOINT"])
+def test_opaque_journal_custody_has_stable_extent_identity_and_no_attendance(custody, kind):
     db, connector = custody
-    value = opaque_exception()
+    value = {**opaque_exception(), "exception_kind": kind}
     first = settle_observations(db, connector, batch(value))
     db.commit()
     replay = settle_observations(db, connector, batch(value))
     result = first["items"][0]
     assert result["custody"] == "PRESERVED_EXCEPTION"
-    assert result["error_code"] == "JOURNAL_AUTH_EXCEPTION"
+    assert result["error_code"] == f"JOURNAL_{kind}_EXCEPTION"
     assert result["receipt_id"] == replay["items"][0]["receipt_id"]
     row = db.scalar(select(ZktObservationReceipt))
     assert row.capture_sequence is None and row.decoder_profile is None

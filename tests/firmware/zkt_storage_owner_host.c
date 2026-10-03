@@ -121,6 +121,12 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
     return true;
 }
 bool qs_local_read_begin(void) { assert(!pthread_mutex_lock(&budget)); return true; }
+bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
+{
+    assert(policy == QS_ADMIT_RECOVERY && bytes == 8U + ZJ_CHECKPOINT_BYTES);
+    if (atomic_load(&full)) { errno = ENOSPC; return false; }
+    return true;
+}
 void qs_local_end(bool persisted, int error) { (void)persisted; (void)error; assert(!pthread_mutex_unlock(&budget)); }
 /* The genuine mbedTLS adapter is independently tested. This port exercises
  * owner/thread/file/NVS interactions, not cryptographic authentication. */
@@ -164,18 +170,68 @@ static zj_reply_t wait_reply(uint64_t ticket)
     assert(!"Storage owner failed to finish bounded host operation");
     return (zj_reply_t){0};
 }
-int main(void)
+int main(int argc, char **argv)
 {
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
+    bool recovering_checkpoint = argc == 2;
+    uint8_t damaged[ZJ_CHECKPOINT_BYTES];
+    if (recovering_checkpoint) {
+        /* A retained encrypted-NVS root is intact; only its retirement blob
+         * is damaged. Use the real owner and recovery admission callbacks. */
+        memcpy(root, "ZJROOT01", 8);
+        root[8] = 1; root[9] = 1; /* Exclusive reserved sequence limit 257. */
+        for (unsigned i = 16; i < 64; ++i) root[i] = (uint8_t)i;
+        memcpy(root + 64, "TEST-TERMINAL", 13);
+        uint32_t crc = dq_crc32(root, ZJ_ROOT_BYTES - 4);
+        for (unsigned i = 0; i < 4; ++i) root[ZJ_ROOT_BYTES - 4 + i] = (uint8_t)(crc >> (8 * i));
+        root_length = sizeof(root);
+        memset(checkpoint, 0xff, sizeof(checkpoint));
+        checkpoint_length = sizeof(checkpoint);
+        memcpy(damaged, checkpoint, sizeof(damaged));
+        atomic_store(&full, !strcmp(argv[1], "--recovery-full"));
+    }
     assert(zj_owner_start("./owner-journal-", &metadata));
     zj_owner_health_t health;
-    for (unsigned i = 0; i < 2000; ++i) {
+    if (recovering_checkpoint && atomic_load(&full)) {
+        for (unsigned i = 0; i < 2000; ++i) {
+            assert(zj_owner_health(&health));
+            if (!health.operation_running && health.last_result == ZJ_FULL) break;
+            vTaskDelay(1);
+        }
+        assert(!health.ready && health.last_result == ZJ_FULL);
+        assert(!memcmp(damaged, checkpoint, sizeof(damaged)));
+        atomic_store(&full, false);
+    }
+    for (unsigned i = 0; i < 8000; ++i) {
         assert(zj_owner_health(&health));
         if (health.ready) break;
         vTaskDelay(1);
     }
     assert(health.ready && root_length && !health.operation_running);
+    if (recovering_checkpoint) {
+        assert(health.checkpoint_recovery_pending);
+        zj_request_t evidence = {.operation = ZJ_PEEK};
+        uint64_t evidence_ticket;
+        assert(zj_owner_submit(&evidence, &evidence_ticket));
+        zj_reply_t preserved = wait_reply(evidence_ticket);
+        assert(preserved.result == ZJ_OK && preserved.item.exception == ZJ_EXCEPTION_CHECKPOINT);
+        assert(preserved.item.exception_length == 8 + sizeof(damaged));
+        assert(!memcmp(preserved.item.exception_bytes + 8, damaged, sizeof(damaged)));
+        char wire[ZJ_CUSTODY_PAYLOAD_MAX];
+        zj_custody_expected_t expected;
+        zj_crypto_port_t crypto = {.digest = digest};
+        assert(zj_custody_encode(&preserved.item, crypto, wire, sizeof(wire), &expected));
+        evidence.operation = ZJ_SETTLE;
+        evidence.input.settlement.token = preserved.item.token;
+        memset(evidence.input.settlement.receipt_digest, 1, 32);
+        memcpy(evidence.input.settlement.observation_id, expected.observation_id, sizeof(expected.observation_id));
+        memcpy(evidence.input.settlement.payload_digest, expected.payload_digest, sizeof(expected.payload_digest));
+        assert(zj_owner_submit(&evidence, &evidence_ticket));
+        assert(wait_reply(evidence_ticket).result == ZJ_OK);
+        assert(zj_owner_health(&health) && !health.checkpoint_recovery_pending);
+        return 0;
+    }
     zj_request_t request = {.operation = ZJ_APPEND, .input.observation = {
         .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
         .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'A'}}};

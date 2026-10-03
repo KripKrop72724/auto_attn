@@ -2,7 +2,7 @@
 #include "zkt_storage_mailbox.h"
 
 typedef struct {
-    bool started, ready, operation_running, recovering;
+    bool started, ready, operation_running, recovering, checkpoint_recovery_pending;
     zj_operation_t operation;
     zj_result_t last_result;
     uint64_t sampled_uptime_us, operation_started_us, progress_uptime_us;
