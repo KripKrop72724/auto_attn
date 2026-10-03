@@ -430,6 +430,7 @@ class ReconciliationSourceRecord(BaseModel):
         "INVALID_TIME",
         "MALFORMED",
         "TERMINAL_DUPLICATE",
+        "RAW_PRESERVED",
     ]
     event: AttendanceEventIn | None = None
     raw_record_b64: str = Field(min_length=4, max_length=512)
@@ -440,6 +441,10 @@ class ReconciliationSourceRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_record_evidence(self):
+        if self.disposition == "RAW_PRESERVED" and any(value is not None for value in (
+            self.event, self.raw_timestamp, self.observed_uid, self.observed_user_id, self.error_code,
+        )):
+            raise ValueError("Raw custody cannot claim decoded time, identity, attendance or invalid source data")
         if self.disposition == "IDENTITY_UNRESOLVED" and self.event is not None:
             raise ValueError("Unresolved source identity cannot claim an attendance event")
         if self.disposition in {"EVENT", "BLOCKED_IDENTITY"} and self.event is None:

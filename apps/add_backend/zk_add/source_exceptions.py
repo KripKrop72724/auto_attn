@@ -225,6 +225,8 @@ def review_source_exception(
     reason: str,
     idempotency_key: str,
 ) -> TerminalRecordReview:
+    if row.disposition == "RAW_PRESERVED":
+        raise ValueError("Raw source custody requires qualified interpretation, not an exclusion review.")
     existing = session.scalar(
         select(TerminalRecordReview).where(
             TerminalRecordReview.manifest_id == row.id,

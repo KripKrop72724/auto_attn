@@ -19,8 +19,8 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from zk_add.crypto import decrypt_json
-from zk_add.models import Connector, ZktCustodyWork, ZktCustodyWorkReceipt, ZktObservationReceipt
+from zk_add.crypto import decrypt_json, decrypt_text
+from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktObservationReceipt
 from zk_add.time_utils import utc_now
 from zk_add.settings import settings
 from zk_add.zkt_packet import FRAGMENT_DATA, PACKET_MAX, parse_fragment, reassemble
@@ -32,6 +32,83 @@ def key(parts: list) -> str:
 
 class EvidenceInvalid(ValueError):
     pass
+
+
+def source_work_key(connector: Connector, manifest: TerminalRecordManifest) -> str:
+    return key(["zkt-source-work-v1", connector.connector_id, manifest.id, manifest.zkt_device_id,
+                manifest.terminal_serial, manifest.generation, manifest.source_epoch_id, manifest.ordinal,
+                manifest.record_size, manifest.raw_record_digest, manifest.terminal_record_key])
+
+
+def attach_source_work(session: Session, connector: Connector,
+                       manifests: list[TerminalRecordManifest]) -> None:
+    """The source chunk, raw rows, obligations and cursor share one commit.
+
+    A reconciliation receipt is already a durable range receipt. It must not
+    manufacture a second journal observation or claim a decoded attendance.
+    The connector lock held by source ingestion serializes these associations.
+    """
+    if len(manifests) > 100:
+        raise ValueError("SOURCE_WORK_BATCH_BOUNDS")
+    if not manifests:
+        return
+    session.flush()
+    existing = {row.source_manifest_id: row for row in session.scalars(select(ZktCustodyWork).where(
+        ZktCustodyWork.source_manifest_id.in_([row.id for row in manifests])))}
+    for manifest in manifests:
+        if (manifest.connector_id != connector.id or not connector.zkt_device
+                or manifest.zkt_device_id != connector.zkt_device.id
+                or manifest.terminal_serial != connector.zkt_device.confirmed_serial
+                or manifest.terminal_serial != connector.zkt_device.serial
+                or not manifest.canonical_source or not manifest.source_epoch_id
+                or manifest.disposition != "RAW_PRESERVED" or manifest.attendance_event_id is not None
+                or not manifest.protected_raw_record or manifest.record_size not in {8, 16, 40}):
+            raise ValueError("SOURCE_WORK_BINDING")
+        prior = existing.get(manifest.id)
+        if prior:
+            if (prior.connector_id, prior.kind, prior.terminal_serial, prior.expected_digest,
+                    prior.expected_bytes, prior.work_key) != (
+                    connector.id, "SOURCE_LEDGER", manifest.terminal_serial, manifest.raw_record_digest,
+                    manifest.record_size, source_work_key(connector, manifest)):
+                raise ValueError("SOURCE_WORK_CONFLICT")
+            continue
+        session.add(ZktCustodyWork(
+            work_key=source_work_key(connector, manifest),
+            connector_id=connector.id, source_manifest_id=manifest.id, kind="SOURCE_LEDGER",
+            terminal_serial=manifest.terminal_serial, expected_bytes=manifest.record_size,
+            expected_digest=manifest.raw_record_digest, state="WAIT_PROFILE",
+            reason_code="PROFILE_QUALIFICATION_REQUIRED", owner="ADD_PROTOCOL",
+            evidence_revision=1, processed_revision=1, next_attempt_at=None,
+        ))
+    session.flush()
+
+
+def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> None:
+    """Keep interpretation pending until qualified decoding owns this work."""
+    if not settings.pii_fernet_key:
+        raise RuntimeError("CUSTODY_KEY_UNAVAILABLE")
+    manifest = session.get(TerminalRecordManifest, work.source_manifest_id) if work.source_manifest_id else None
+    connector = session.get(Connector, work.connector_id)
+    terminal = connector.zkt_device if connector else None
+    epoch = session.get(TerminalSourceEpoch, manifest.source_epoch_id) if manifest and manifest.source_epoch_id else None
+    if (manifest is None or terminal is None or manifest.connector_id != work.connector_id
+            or manifest.zkt_device_id != terminal.id or not manifest.canonical_source
+            or epoch is None or epoch.zkt_device_id != terminal.id or epoch.terminal_generation != manifest.generation
+            or manifest.terminal_serial != work.terminal_serial or manifest.terminal_serial != terminal.confirmed_serial
+            or manifest.terminal_serial != terminal.serial or source_work_key(connector, manifest) != work.work_key
+            or manifest.raw_record_digest != work.expected_digest or manifest.record_size != work.expected_bytes
+            or manifest.disposition != "RAW_PRESERVED" or manifest.attendance_event_id is not None):
+        raise EvidenceInvalid("SOURCE_WORK_EVIDENCE_CHANGED")
+    encoded = decrypt_text(manifest.protected_raw_record)
+    if not encoded or len(encoded) > 684:
+        raise EvidenceInvalid("SOURCE_WORK_BYTES_UNAVAILABLE")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise EvidenceInvalid("SOURCE_WORK_BYTES_CHANGED") from exc
+    if len(raw) != work.expected_bytes or hashlib.sha256(raw).hexdigest() != work.expected_digest:
+        raise EvidenceInvalid("SOURCE_WORK_BYTES_CHANGED")
+    work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
 
 
 def attach_work(session: Session, connector: Connector, receipt: ZktObservationReceipt,
@@ -199,10 +276,13 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
     work.processed_revision = work.evidence_revision
     work.attempt_count += 1
     work.updated_at = utc_now()
-    if work.kind not in {"SOURCE_RECORD", "LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"}:
+    if work.kind not in {"SOURCE_LEDGER", "SOURCE_RECORD", "LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"}:
         work.state, work.reason_code, work.owner = "WAIT_PROFILE", "UNKNOWN_RAW_FORMAT", "ADD_PROTOCOL"
         return
     try:
+        if work.kind == "SOURCE_LEDGER":
+            inspect_source_ledger(session, work)
+            return
         if work.kind == "SOURCE_RECORD":
             inspect_source(session, work)
             return
@@ -332,11 +412,18 @@ def work_status(session: Session, connector: Connector, *, before: int | None = 
         ZktObservationReceipt.connector_id == connector.id,
         ~select(ZktCustodyWorkReceipt.id).where(ZktCustodyWorkReceipt.receipt_id == ZktObservationReceipt.id).exists())
         .limit(1))
+    source_missing = session.scalar(select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.connector_id == connector.id,
+        TerminalRecordManifest.canonical_source.is_(True),
+        TerminalRecordManifest.disposition == "RAW_PRESERVED",
+        ~select(ZktCustodyWork.id).where(ZktCustodyWork.source_manifest_id == TerminalRecordManifest.id).exists())
+        .limit(1))
     page = rows[:maximum]
     return {"connector_id": connector.connector_id, "enabled": connector.zkt_custody_enabled, "sampled_at": utc_now(),
-        "oracle_completion": "NOT_ASSERTED", "missing_processing_obligation": missing is not None,
+        "oracle_completion": "NOT_ASSERTED", "missing_processing_obligation": missing is not None or source_missing is not None,
         "counts": [{"state": state, "owner": owner, "count": count} for state, owner, count in counts],
         "rows": [{"id": row.id, "kind": row.kind, "state": row.state, "reason_code": row.reason_code,
+                  "source_manifest_id": row.source_manifest_id,
                   "owner": row.owner, "evidence_revision": row.evidence_revision,
                   "processed_revision": row.processed_revision, "attempt_count": row.attempt_count,
                   "expected_bytes": row.expected_bytes, "assembled_at": row.assembled_at,
