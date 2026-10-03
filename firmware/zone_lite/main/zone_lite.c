@@ -4023,8 +4023,18 @@ static bool append_terminal_source_record(
     const char *capturetype,
     const char **disposition_out)
 {
+#ifdef ZONE_LITE_HIKVISION
+    bool raw_only = false;
+#else
+    bool raw_only = zj_runtime_raw_source_required();
+    if (raw_only && !zj_runtime_writer_ready()) return false;
+#endif
     if (!cJSON_IsArray(records) || !cJSON_IsArray(canonical) || records == canonical ||
-        !record || !users || !capturetype) return false;
+        !record || (record_size != 8 && record_size != 16 && record_size != 40) ||
+        ordinal == UINT32_MAX || (!raw_only && (!users || !capturetype))) return false;
+    /* The source stream consumes no live flash reserve. ADD commits each raw
+     * range before the source cursor moves; a held writer cannot substitute a
+     * roster-derived event for the required original-byte custody contract. */
     char raw_digest[65];
     char terminal_key_material[160];
     char terminal_key[65];
@@ -4042,17 +4052,17 @@ static bool append_terminal_source_record(
     attendance_event_t event;
     memset(&event, 0, sizeof(event));
     uint32_t timestamp = 0;
-    bool has_timestamp = attendance_record_timestamp(record, record_size, &timestamp);
-    if (record_size == 8) {
+    bool has_timestamp = !raw_only && attendance_record_timestamp(record, record_size, &timestamp);
+    if (!raw_only && record_size == 8) {
         uint16_t uid = read_le16(record);
         snprintf(observed_uid, sizeof(observed_uid), "%u", (unsigned)uid);
-    } else if (record_size == 16) {
+    } else if (!raw_only && record_size == 16) {
         snprintf(
             observed_user_id,
             sizeof(observed_user_id),
             "%lu",
             (unsigned long)read_le32(record));
-    } else if (record_size == 40) {
+    } else if (!raw_only && record_size == 40) {
         snprintf(
             observed_uid,
             sizeof(observed_uid),
@@ -4066,8 +4076,9 @@ static bool append_terminal_source_record(
         users,
         &event,
         &timestamp);
-    const char *disposition = parsed
-        ? "EVENT"
+    const char *disposition = raw_only
+        ? "RAW_PRESERVED"
+        : parsed ? "EVENT"
         : has_timestamp && !zk_attendance_timestamp_is_plausible(timestamp)
             ? "INVALID_TIME"
             : has_timestamp && zkt_record_identity_missing(record, record_size)
@@ -4106,7 +4117,7 @@ static bool append_terminal_source_record(
             cJSON_Delete(canonical_row);
             return false;
         }
-    } else {
+    } else if (!raw_only) {
         cJSON_AddStringToObject(
             source_row,
             "error_code",
@@ -4132,7 +4143,7 @@ static bool append_terminal_source_record(
     bool complete = (!has_timestamp || cJSON_HasObjectItem(source_row, "raw_timestamp")) &&
         (!observed_uid[0] || cJSON_HasObjectItem(source_row, "observed_uid")) &&
         (!observed_user_id[0] || cJSON_HasObjectItem(source_row, "observed_user_id")) &&
-        cJSON_HasObjectItem(source_row, parsed ? "event" : "error_code");
+        (raw_only || cJSON_HasObjectItem(source_row, parsed ? "event" : "error_code"));
     for (size_t i = 0; i < sizeof(source_required) / sizeof(*source_required); ++i)
         complete = complete && cJSON_HasObjectItem(source_row, source_required[i]);
     for (size_t i = 0; i < sizeof(canonical_required) / sizeof(*canonical_required); ++i)
