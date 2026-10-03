@@ -58,10 +58,10 @@ static void reset(void){
 static void tick(void){clock_ms+=1000;zj_runtime_step();}
 int main(void){
  zj_boot_t health;
- assert(zj_runtime_boot_ready());assert(!zj_runtime_writer_ready());
+ assert(zj_runtime_boot_ready());assert(!zj_runtime_writer_ready());assert(!zj_runtime_raw_source_required());
  tick();assert(zj_runtime_health(&health)&&health.phase==ZJ_BOOT_OFF&&!owner_starts);
- strcpy(app.version,"2.7.1");tick();assert(!owner_starts&&!zj_runtime_writer_ready());
- strcpy(app.version,"2.6.16");reset();assert(!zj_runtime_boot_ready());
+ strcpy(app.version,"2.7.1");tick();assert(!owner_starts&&!zj_runtime_writer_ready()&&!zj_runtime_raw_source_required());
+ strcpy(app.version,"2.6.16");reset();assert(!zj_runtime_boot_ready()&&!zj_runtime_raw_source_required());
  mutex_fail=true;tick();assert(!zj_runtime_health(&health)&&!owner_starts);mutex_fail=false;
  secure=false;tick();assert(zj_runtime_health(&health)&&health.phase==ZJ_BOOT_SECURITY_HOLD);
  secure=true;running.subtype=0;tick();assert(!owner_starts);running.subtype=ESP_PARTITION_SUBTYPE_APP_OTA_0;
@@ -72,16 +72,16 @@ int main(void){
  assert(zj_runtime_boot_ready()&&!zj_runtime_writer_ready());
  assert(zj_runtime_health(&health)&&health.reader_ready&&health.phase==ZJ_BOOT_READY);
  lock_fail=true;assert(!zj_runtime_health(&health)&&!zj_runtime_boot_ready());lock_fail=false;
- reset();strcpy(app.version,"2.7.0");
+ reset();strcpy(app.version,"2.7.0");assert(zj_runtime_raw_source_required()&&!zj_runtime_writer_ready());
  for(unsigned i=0;i<5;i++) { tick(); }
  assert(zj_runtime_health(&health)&&health.reader_ready);
 #if ZONE_LITE_JOURNAL_WRITES
  assert(capture_starts==1&&zj_runtime_writer_ready()&&zj_runtime_boot_ready());
- clock_ms+=45000;assert(!zj_runtime_writer_ready()&&!zj_runtime_boot_ready());
+ clock_ms+=45000;assert(!zj_runtime_writer_ready()&&!zj_runtime_boot_ready()&&zj_runtime_raw_source_required());
  tick();assert(zj_runtime_writer_ready()&&capture_starts==1);
  strcpy(config.zkt_expected_serial,"REBOUND");tick();assert(!zj_runtime_writer_ready()&&!zj_runtime_boot_ready());
 #else
- assert(!capture_starts&&!zj_runtime_writer_ready()&&!zj_runtime_boot_ready());
+ assert(!capture_starts&&!zj_runtime_writer_ready()&&!zj_runtime_boot_ready()&&zj_runtime_raw_source_required());
  assert(health.phase==ZJ_BOOT_WRITER_DISABLED);
 #endif
 #else
