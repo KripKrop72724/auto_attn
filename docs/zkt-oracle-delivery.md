@@ -103,6 +103,11 @@ authenticated malformed requests. This is not an ORDS HTTP integration test.
 A 200,001-row synthetic retained set with 2,001 rows on the affected day took
 20–30 ms in two local reads. This is one measured case, not a p99 guarantee.
 
+The read-only `zkt_delivery_projection_v2_preflight.sql` check on 19c parsed the projection's actual column references with
+`WHERE 1=0` on every production table; it returned zero matched rows and preserved
+the synthetic timestamp's microseconds through the UTC-to-Pakistan conversion.
+It did not call a user package or install/compile a stored object.
+
 Production's inspected Oracle engine is 19c. The newer local engine does **not**
 qualify 19c compilation/execution, the production schema's business rules, ORDS
 authentication, downstream writer behavior or concurrent real delivery. Those
