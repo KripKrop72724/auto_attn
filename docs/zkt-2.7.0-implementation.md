@@ -19,7 +19,7 @@ counts are kept outside this public repository.
 | Fresh APIs with stale screens | Canonical browser topics, reconnect/overflow resync, 30-second polling, focus refresh, shared device snapshots and old-response rejection | `test_browser_reliability.py`, `realtime.test.tsx`, existing drawer/App tests | Deployed in `bd395cc`; authenticated fleet API returns snapshot identity |
 | Storage and worker failures conflated | Reported durability no longer derives from LED state; diagnostics v2 keeps probe failures, boot/sample identity and runtime obligations. ZKT persistence probes retry with backoff and clear only their own incident after a complete filesystem/NVS proof | `test_runtime_contract.py`, storage fault injection, ingestion and HIL tests; both ESP-IDF family builds passed | Partial: probe recovery implemented; queue/legacy incident recovery and boot gates remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
-| Source timestamp/layout exceptions | Extracted 8/16/40-byte decoder; strict count/layout agreement; bounded range and session/length checks; six model selectors | Sanitized record and fragmented/coalesced transport harnesses with ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
+| Source timestamp/layout exceptions | Extracted 8/16/40-byte firmware and ADD fact decoders; explicit live layouts, calendar validation, strict count/layout agreement and bounded transport; six model selectors | Sanitized record/transport harnesses, 3,500 cross-language fact/clock vectors and ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
 | Dual delivery and same-second occurrence identity | Encrypted ADD observation/opaque receipts; exact-source occurrence aliases; canonical firmware encoding, strict typed receipt verification and bounded delivery worker | `test_zkt_custody.py`, independent C/Python vectors, socket dispatcher, actual-file delivery faults and PostgreSQL overlapping-socket tests | Partial: receiver disabled; capture activation and live/history semantic matching remain open |
 | Custody can outlive an untracked processing obligation | Migration `0044` adds per-packet work and immutable receipt links in the custody transaction; bounded assembly, fair inspection, revision-triggered holds and an authenticated status endpoint | Receipt/work rollback, fragment conflict/replay, per-record decryption failure isolation, bounded repair, PostgreSQL overlapping sockets/SKIP LOCKED and actual dump/restore | Implemented components; profile-qualified interpretation and Oracle creation remain open |
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: capture/delivery startup gated; catalog and legacy handoff remain open |
@@ -122,6 +122,15 @@ Receipts predating the work contract have a bounded idempotent backfill helper;
 an orphan receipt blocks writer activation until repaired. This is a backend
 status interface; the dashboard presentation still needs integration.
 
+The ADD fact decoder supports explicit 8/16/40-byte historical and
+12/32/36/52-byte live layouts. It checks record boundaries and calendar dates,
+preserves the original encoded clock, and converts Pakistan local time to UTC.
+The historical attendance UID never becomes a current enrollment identity.
+Identical same-second records remain separate facts. A packet with multiple
+valid allowed interpretations remains ambiguous. Model labels only select
+profiles; they do not grant qualification. This module is not yet connected to
+attendance creation, and it does not authenticate the packet checksum.
+
 ## Verification recorded on 3 October 2026
 
 - Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
@@ -160,6 +169,12 @@ status interface; the dashboard presentation still needs integration.
 - Custody processing: 34 targeted tests and two real PostgreSQL locking tests
   passed. Additive migration/schema checks and a real dump/restore preserved
   encrypted observations, receipt IDs and work links through downgrade/upgrade.
+
+- ADD fact decoder: 57 tests passed, including 3,500 synthetic comparisons
+  against production C source/live decoders and the firmware clock under
+  ASan/UBSan. Tests cover invalid dates, UTC boundaries, ambiguous live layouts,
+  preserved historical UID fields and repeated same-second records. These are
+  codec tests, not physical-model qualification.
 
 ## Work that still blocks the requested release
 
