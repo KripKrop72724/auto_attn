@@ -1968,6 +1968,7 @@ def reveal_source_exception_endpoint(
 @app.get("/api/v1/devices/{connector_id}/source-evidence")
 def zkt_source_evidence_list(
     connector_id: str,
+    response: Response,
     before: int | None = Query(default=None, ge=1),
     limit: int = Query(default=20, ge=1, le=50),
     disposition: str | None = Query(default=None, max_length=50),
@@ -1977,6 +1978,8 @@ def zkt_source_evidence_list(
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     try:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         return list_evidence(db, connector, before=before, limit=limit, disposition=disposition)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
