@@ -8,6 +8,10 @@ This register records implementation evidence. It is not a release certificate.
 No signed 2.6.16 bridge or 2.7.0 candidate is qualified by the existence of code.
 Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 
+The separate local nationwide status document records all 17 devices, open
+Wave D prerequisites and a scoped read-only ADD classification. Live operational
+counts are kept outside this public repository.
+
 ## Issue, change and verification
 
 | Issue | Change | Verification | Status |
@@ -81,7 +85,7 @@ bridge/rollback gates are complete. Rollback migrations retain custody evidence.
 
 ## Verification recorded on 3 October 2026
 
-- Full local backend/firmware/companion regression run: 1,385 passed, 27 skipped.
+- Full local backend/firmware/companion regression run: 1,388 passed, 27 skipped.
   Skips require specific
   environments; they are not qualification passes.
 - Frontend: 141 full-suite tests passed, including missing/wrong-boot evidence and
