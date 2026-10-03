@@ -24,7 +24,7 @@ const states: Record<string, string> = {
   PENDING: 'Awaiting inspection', WAIT_FRAGMENTS: 'Waiting for packet fragments',
   WAIT_PROFILE: 'Waiting for profile qualification', WAIT_SOURCE: 'Waiting for source evidence',
   HELD_EXCEPTION: 'Preserved for review', RETRY_SYSTEM: 'System retry pending',
-  SOURCE_ASSOCIATED: 'Source linked',
+  SOURCE_ASSOCIATED: 'Source linked', HELD_OCCURRENCE: 'Occurrence link needs review',
 }
 const owners: Record<string, string> = {
   ADD_PROTOCOL: 'Protocol review', ADD_EVIDENCE_REVIEW: 'Evidence review',

@@ -23,6 +23,18 @@ beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => response(fixture()))
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('ZKT custody evidence', () => {
+  it('keeps ambiguous legacy occurrence links on hold independently of custody and Oracle', async () => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({
+      counts: [{ state: 'HELD_OCCURRENCE', owner: 'ADD_RECONCILIATION', count: 2 }],
+      rows: [{ id: 1, state: 'HELD_OCCURRENCE', reason_code: 'LEGACY_EVENT_SHARED_BY_SOURCE_OCCURRENCES',
+        owner: 'ADD_RECONCILIATION', updated_at: new Date().toISOString(), next_attempt_at: null }],
+    })))
+    mount()
+    expect(await screen.findByText('Occurrence link needs review · Reconciliation')).toBeTruthy()
+    expect(screen.getByText('Waiting for relevant evidence or review')).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+    expect(screen.queryByText('Source association complete')).toBeNull()
+  })
   it.each(['IDLE', 'STALLED', 'STOPPED', 'RETRYING'] as const)('reports global worker %s independently of receipt and Oracle counts', async state => {
     vi.mocked(fetch).mockResolvedValue(response(fixture({ processor: processor({ state }) })))
     mount()
