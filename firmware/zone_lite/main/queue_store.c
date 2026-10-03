@@ -109,6 +109,15 @@ static bool admit(void *arg, size_t bytes)
         lane->admission == QS_ADMIT_LIVE ? SB_LIVE : SB_RECOVERY;
     return storage_budget_admit(&budget, health.total_bytes, health.used_bytes, bytes, kind);
 }
+bool qs_local_read_begin(void)
+{
+    if (!budget_lock) { errno = EINVAL; return false; }
+    if (xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        errno = EBUSY;
+        return false;
+    }
+    return true;
+}
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
     if ((unsigned)policy > QS_ADMIT_OPTIONAL_HISTORICAL || !budget_lock) {

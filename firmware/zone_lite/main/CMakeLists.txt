@@ -19,6 +19,10 @@ idf_component_register(
     REQUIRES esp_wifi esp_netif esp_http_server esp_driver_gpio nvs_flash lwip esp_http_client esp_https_ota app_update esp_partition esp-tls esp_app_format json spiffs mbedtls esp_timer led_strip esp_websocket_client
 )
 target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c")
+if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
+    target_sources(${COMPONENT_LIB} PRIVATE "zkt_journal_codec.c" "zkt_journal_crypto.c" "zkt_journal_store.c"
+        "zkt_journal_state.c" "zkt_storage_mailbox.c" "zkt_storage_owner.c")
+endif()
 if(ZONE_LITE_FAMILY STREQUAL "hikvision")
     if(NOT CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH OR NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC)
         message(FATAL_ERROR "Hikvision requires Digest authentication and PSRAM-capable TLS allocation; regenerate sdkconfig with sdkconfig.hikvision.defaults")
