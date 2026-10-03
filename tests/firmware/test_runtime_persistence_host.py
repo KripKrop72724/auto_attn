@@ -41,6 +41,18 @@ static unsigned failure, fault_count, writes;
 static bool require_epoch, legacy_keys;
 static bool zkt_source_epoch_required(void) {return require_epoch;}
 static runtime_checkpoint_t pending, durable;
+static bool owner_required, owner_success, owner_late;
+static unsigned owner_calls;
+static bool zj_runtime_checkpoint_required(void) {return owner_required;}
+static bool zj_runtime_checkpoint_save(const runtime_checkpoint_t *state, runtime_checkpoint_t *confirmed) {
+    ++owner_calls;memset(confirmed,0,sizeof(*confirmed));
+    if(owner_success || owner_late) {
+        *confirmed=*state;confirmed->generation=40+owner_calls;
+        if(owner_late)confirmed->source_cursor=999;
+        confirmed->crc=dq_crc32(confirmed,offsetof(runtime_checkpoint_t,crc));
+    }
+    return owner_success;
+}
 static size_t strlcpy(char *dst,const char *src,size_t size) {
     size_t n=strlen(src);if(size) {size_t copy=n<size-1?n:size-1;memcpy(dst,src,copy);dst[copy]=0;}return n;
 }
@@ -116,6 +128,15 @@ int main(void) {
         assert(g_add_source_coverage_certified==!require_epoch && !g_add_source_epoch[0]);
         assert(g_add_source_coverage_cursor==(legacy?77:durable.source_cursor));
     }
+    prior=writes;owner_required=true;g_runtime_checkpoint_generation=10;
+    assert(!nvs_save_runtime_state() && writes==prior && owner_calls==1);
+    owner_late=true;
+    assert(!nvs_save_runtime_state() && writes==prior && owner_calls==2);
+    assert(g_runtime_checkpoint_generation==42 && g_committed_runtime.source_cursor==999);
+    assert(g_add_source_coverage_cursor==999 && g_force_truth_reconcile);
+    owner_late=false;owner_success=true;g_add_source_coverage_cursor=1001;
+    assert(nvs_save_runtime_state() && writes==prior && owner_calls==3);
+    assert(g_runtime_checkpoint_generation==43 && g_committed_runtime.source_cursor==1001);
     puts("runtime checkpoint NVS regression tests passed");
 }
 '''

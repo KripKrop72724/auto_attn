@@ -68,6 +68,9 @@
 #include "zone_config.h"
 #include "reliability.h"
 #include "runtime_checkpoint.h"
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+#include "zkt_runtime_checkpoint.h"
+#endif
 #include "legacy_queue.h"
 #include "queue_store.h"
 #include "firmware_family.h"
@@ -663,14 +666,35 @@ static bool nvs_save_runtime_state(void)
     }
     state.crc = dq_crc32(&state, offsetof(runtime_checkpoint_t, crc));
     if (!runtime_checkpoint_valid(&state)) { runtime_checkpoint_failed(); return false; }
-    nvs_handle_t handle;
-    esp_err_t result = nvs_open("zone_lite", NVS_READWRITE, &handle);
-    if (result == ESP_OK) {
-        result = nvs_set_blob(handle, "runtime_v1", &state, sizeof(state));
-        if (result == ESP_OK) result = nvs_commit(handle);
-        nvs_close(handle);
+    bool saved = false;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) {
+        runtime_checkpoint_t confirmed;
+        saved = zj_runtime_checkpoint_save(&state, &confirmed);
+        if (runtime_checkpoint_valid(&confirmed)) {
+            /* A late prior commit is authoritative even if the new request
+             * failed. It is never reported as success for different facts. */
+            g_runtime_checkpoint_generation = confirmed.generation;
+            g_committed_runtime = confirmed;
+            g_committed_runtime_valid = true;
+            g_add_zkt.committed_source_known = true;
+            g_add_zkt.committed_source_generation = confirmed.source_generation;
+            g_add_zkt.committed_source_cursor = confirmed.source_cursor;
+            if (saved) state = confirmed;
+        } else saved = false;
+    } else
+#endif
+    {
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open("zone_lite", NVS_READWRITE, &handle);
+        if (result == ESP_OK) {
+            result = nvs_set_blob(handle, "runtime_v1", &state, sizeof(state));
+            if (result == ESP_OK) result = nvs_commit(handle);
+            nvs_close(handle);
+        }
+        saved = result == ESP_OK;
     }
-    if (result != ESP_OK) {
+    if (!saved) {
         runtime_checkpoint_failed();
         return false;
     }

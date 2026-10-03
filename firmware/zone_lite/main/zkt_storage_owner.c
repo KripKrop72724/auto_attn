@@ -4,6 +4,7 @@
 #include "zkt_custody_wire.h"
 #include "zkt_journal_transport.h"
 #include "zkt_reader_platform.h"
+#include "zkt_runtime_checkpoint.h"
 #include "queue_store.h"
 #include <dirent.h>
 #include <errno.h>
@@ -144,6 +145,21 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
     o->nvs_error = 0;
     o->store.last_errno = 0;
     o->store.last_operation = NULL;
+    if (request->operation == ZJ_RUNTIME_CHECKPOINT) {
+        o->store.last_operation = "runtime_checkpoint";
+        if (!qs_local_read_begin()) {
+            o->store.last_errno = errno;
+            reply->result = ZJ_IO;
+            return;
+        }
+        /* NVS lease/cursor preservation must still work if journal recovery
+         * is held. This operation shares the owner and local lock, but does
+         * not require filesystem capacity or an enabled journal writer. */
+        reply->result = zj_runtime_checkpoint_commit(&request->input.runtime_checkpoint.state,
+            request->input.runtime_checkpoint.deadline_us, &reply->runtime_checkpoint, &o->nvs_error);
+        qs_local_end(true, 0); /* Report NVS separately from attendance file loss. */
+        return;
+    }
     if (!o->store.ready || !o->state.ready) {
         reply->result = recover(o);
         if (reply->result != ZJ_OK) return;

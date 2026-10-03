@@ -1,13 +1,14 @@
 #pragma once
 #include "zkt_journal_store.h"
 #include "zkt_journal_compat.h"
+#include "runtime_checkpoint.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
 typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
-    ZJ_SELECT_READER } zj_operation_t;
+    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
@@ -25,6 +26,10 @@ typedef struct {
             uint8_t image_digest[32];
             uint64_t deadline_us;
         } reader_selection;
+        struct {
+            runtime_checkpoint_t state;
+            uint64_t deadline_us;
+        } runtime_checkpoint;
     } input;
 } zj_request_t;
 typedef struct {
@@ -32,6 +37,7 @@ typedef struct {
     zj_compat_result_t compatibility;
     uint64_t capture_sequence;
     zj_item_t item;
+    runtime_checkpoint_t runtime_checkpoint;
 } zj_reply_t;
 typedef enum { ZJ_SLOT_FREE, ZJ_SLOT_QUEUED, ZJ_SLOT_RUNNING, ZJ_SLOT_DONE } zj_slot_state_t;
 typedef struct {

@@ -4,6 +4,22 @@
 
 int main(void)
 {
+    /* Checkpoint writes cannot consume the three live preservation slots. */
+    zj_mailbox_t checkpoints;
+    zj_mailbox_init(&checkpoints);
+    zj_request_t checkpoint = {.operation = ZJ_RUNTIME_CHECKPOINT,
+        .input.runtime_checkpoint = {.deadline_us = 5000000,
+            .state = {.version = 1, .generation = 1}}};
+    uint64_t checkpoint_ticket;
+    assert(!zj_mailbox_submit(&checkpoints, &checkpoint, &checkpoint_ticket));
+    memset(checkpoint.input.runtime_checkpoint.state.source_chain, '0', 64);
+    checkpoint.input.runtime_checkpoint.state.crc = dq_crc32(&checkpoint.input.runtime_checkpoint.state,
+        offsetof(runtime_checkpoint_t, crc));
+    for (unsigned i = 0; i < ZJ_REQUEST_SLOTS - ZJ_LIVE_RESERVED_SLOTS; ++i)
+        assert(zj_mailbox_submit(&checkpoints, &checkpoint, &checkpoint_ticket));
+    assert(!zj_mailbox_submit(&checkpoints, &checkpoint, &checkpoint_ticket));
+    checkpoint.operation = ZJ_APPEND;
+    assert(zj_mailbox_submit(&checkpoints, &checkpoint, &checkpoint_ticket));
     static zj_mailbox_t mailbox;
     zj_mailbox_init(&mailbox);
     zj_request_t request = {.operation = ZJ_PEEK}, work;

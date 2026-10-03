@@ -5,6 +5,7 @@
 #include "zkt_custody_wire.h"
 #include "zkt_journal_transport.h"
 #include "zkt_reader_platform.h"
+#include "zkt_runtime_checkpoint.h"
 #include "queue_store.h"
 #include "durable_queue.h"
 #include <assert.h>
@@ -22,6 +23,14 @@ static void (*task_function)(void *);
 static void *task_argument;
 static uint8_t root[ZJ_ROOT_BYTES], checkpoint[ZJ_CHECKPOINT_BYTES];
 static size_t root_length, checkpoint_length;
+static runtime_checkpoint_t runtime_blob;
+static bool runtime_present;
+static unsigned runtime_writes;
+const esp_app_desc_t *esp_app_get_description(void)
+{
+    static const esp_app_desc_t app = {.project_name = "zone_lite", .version = "2.7.0"};
+    return &app;
+}
 
 int64_t esp_timer_get_time(void)
 {
@@ -81,13 +90,23 @@ void xTaskNotifyGive(TaskHandle_t handle) { (void)handle; }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 {
     (void)mode;
-    assert(!strcmp(name, "zkt_journal"));
-    *handle = 1;
+    assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite"));
+    if (!strcmp(name, "zone_lite")) {
+        assert(pthread_equal(pthread_self(), thread));
+        assert(pthread_mutex_trylock(&budget) == EBUSY);
+        *handle = 2;
+    } else *handle = 1;
     return ESP_OK;
 }
-void nvs_close(nvs_handle_t handle) { assert(handle == 1); }
+void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2); }
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t *length)
 {
+    if (handle == 2) {
+        assert(!strcmp(name, "runtime_v1") && *length == sizeof(runtime_blob));
+        if (!runtime_present) return ESP_ERR_NVS_NOT_FOUND;
+        memcpy(out, &runtime_blob, sizeof(runtime_blob));
+        return ESP_OK;
+    }
     assert(handle == 1);
     if (!strcmp(name, "reader_v1")) return ESP_ERR_NVS_NOT_FOUND;
     bool is_root = !strcmp(name, "root");
@@ -100,6 +119,13 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
 }
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes, size_t length)
 {
+    if (handle == 2) {
+        assert(!strcmp(name, "runtime_v1") && length == sizeof(runtime_blob));
+        runtime_blob = *(const runtime_checkpoint_t *)bytes;
+        runtime_present = true;
+        ++runtime_writes;
+        return ESP_OK;
+    }
     assert(handle == 1);
     if (!strcmp(name, "root")) {
         assert(length == sizeof(root));
@@ -112,7 +138,7 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
     }
     return ESP_OK;
 }
-esp_err_t nvs_commit(nvs_handle_t handle) { assert(handle == 1); return ESP_OK; }
+esp_err_t nvs_commit(nvs_handle_t handle) { assert(handle == 1 || handle == 2); return ESP_OK; }
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
     assert(policy == QS_ADMIT_LIVE && bytes >= ZJ_RECORD_MAX);
@@ -218,7 +244,8 @@ int main(int argc, char **argv)
 {
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
-    bool recovering_checkpoint = argc == 2;
+    bool corrupt_journal = argc == 2 && !strcmp(argv[1], "--runtime-corrupt-journal");
+    bool recovering_checkpoint = argc == 2 && !corrupt_journal;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {
         /* A retained encrypted-NVS root is intact; only its retirement blob
@@ -235,8 +262,29 @@ int main(int argc, char **argv)
         memcpy(damaged, checkpoint, sizeof(damaged));
         atomic_store(&full, !strcmp(argv[1], "--recovery-full"));
     }
+    if (corrupt_journal) { memset(root, 0xff, sizeof(root)); root_length = sizeof(root); }
     assert(zj_owner_start("./owner-journal-", &metadata));
     zj_owner_health_t health;
+    if (corrupt_journal) {
+        for (unsigned i = 0; i < 2000; ++i) {
+            assert(zj_owner_health(&health));
+            if (!health.operation_running && health.failures) break;
+            vTaskDelay(1);
+        }
+        assert(!health.ready && health.failures);
+        runtime_checkpoint_t state = {.version = 1, .generation = 1, .history_schema = 2,
+            .lease_active = 1, .lease_uid = 42, .lease_expiry = 1900000100};
+        memset(state.source_chain, '0', 64);
+        state.crc = dq_crc32(&state, offsetof(runtime_checkpoint_t, crc));
+        runtime_checkpoint_t confirmed;
+        assert(zj_runtime_checkpoint_save(&state, &confirmed));
+        assert(confirmed.lease_active && confirmed.lease_uid == 42);
+        assert(zj_owner_health(&health) && !health.ready);
+        for (unsigned i = 0; i < sizeof(root); ++i) assert(root[i] == 0xff);
+        atomic_store(&stop, true);
+        assert(!pthread_join(thread, NULL));
+        return 0;
+    }
     if (recovering_checkpoint && atomic_load(&full)) {
         for (unsigned i = 0; i < 2000; ++i) {
             assert(zj_owner_health(&health));
@@ -383,6 +431,16 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && !health.occupied && !health.operation_running);
     assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 1 &&
         health.max_operation_us && health.ready);
+    /* Runtime writes work without journal writer permission or free SPIFFS
+     * space, and execute only on the storage owner under its shared lock. */
+    runtime_checkpoint_t runtime = {.version = 1, .generation = 1, .history_schema = 2,
+        .source_cursor = 99, .lease_active = 1, .lease_uid = 42, .lease_expiry = 1900000100};
+    memset(runtime.source_chain, '0', 64);
+    runtime.crc = dq_crc32(&runtime, offsetof(runtime_checkpoint_t, crc));
+    runtime_checkpoint_t confirmed;
+    assert(zj_runtime_checkpoint_save(&runtime, &confirmed));
+    assert(runtime_writes == 1 && confirmed.source_cursor == 99 && confirmed.generation == 1);
+    assert(zj_owner_health(&health));
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
      * acknowledging; a new producer cannot race the completed barrier. */
@@ -398,6 +456,11 @@ int main(int argc, char **argv)
     assert(atomic_load(&write_waiting));
     assert(zj_owner_submit(&final_capture, &queued_ticket));
     assert(zj_owner_abandon(queued_ticket));
+    zj_request_t final_checkpoint = {.operation = ZJ_RUNTIME_CHECKPOINT,
+        .input.runtime_checkpoint = {.state = runtime,
+            .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U}};
+    assert(zj_owner_submit(&final_checkpoint, &queued_ticket));
+    assert(zj_owner_abandon(queued_ticket));
     assert(!zj_owner_quiesce());
     assert(zj_owner_health(&health) && health.quiescing && !health.quiesced && health.operation_running);
     uint64_t refused_ticket = 99;
@@ -407,10 +470,12 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < 2000 && !zj_owner_quiesce(); ++i) vTaskDelay(1);
     assert(zj_owner_quiesce());
     assert(zj_owner_health(&health) && health.quiesced && !health.operation_running &&
-        !health.writer_allowed && !health.compatibility_checked && health.completed == before_quiesce + 2);
+        !health.writer_allowed && !health.compatibility_checked && health.completed == before_quiesce + 3);
+    assert(runtime_writes == 2 && runtime_blob.generation == 2);
+    assert(!zj_owner_submit(&final_checkpoint, &refused_ticket));
     assert(!zj_owner_submit(&compatibility, &refused_ticket));
     vTaskDelay(10);
-    assert(zj_owner_health(&health) && health.completed == before_quiesce + 2);
+    assert(zj_owner_health(&health) && health.completed == before_quiesce + 3);
     assert(!pthread_mutex_trylock(&budget));
     assert(!pthread_mutex_unlock(&budget));
     atomic_store(&stop, true);
