@@ -133,7 +133,7 @@ The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 
 The ESP adapter currently owns journal operations only. Catalog and legacy
-queue ownership, capture/delivery activation, bridge boot integration,
+queue ownership, capture/delivery qualification, signed bridge integration,
 delivery matching and current-incident recovery must be integrated and tested
 before activation. Existing firmware behavior remains gated until then.
 
@@ -167,8 +167,29 @@ factory slot, changed image or unknown format refuses writing. Attesting the
 bridge does not enable its journal writer. These are local compatibility checks;
 they do not establish model correctness, migration completion, seven-day
 capacity, signed artifact qualification or HIL acceptance. The gated boot
-controller is implemented; OTA replacement policy and the complete bridge
-migration remain release blockers.
+controller and pre-erase install interlock are implemented; complete bridge
+migration and an operational compatible-rollback path remain release blockers.
+
+Every fresh or resumed ZKT OTA checks compatibility before opening its download.
+The only journal-preserving install edge currently allowed is a validated,
+attested 2.6.16 bridge installing exact 2.7.0 into the other OTA slot. The storage
+owner rereads the proof and actual current image, layout, terminal and root
+epoch, with local reader, transport and persistence checks. This read-only check
+cannot create proof, clear an incident or grant writer permission. The download
+starts after all local locks are released. A running 2.7.0 refuses to erase its
+certified bridge, including an attempted reinstall of that bridge; selecting an
+already-verified rollback image without erasing it needs a separate operation.
+Future versions require an explicit, qualified compatibility transition.
+
+The OTA caller waits at most five seconds for the bounded owner operation.
+Accepted checks can finish after timeout, but their results cannot authorize a
+later assignment. Failed reply abandonment retains one ticket until it can be
+released; retries cannot fill the mailbox. OTA checks have no access to the
+three slots reserved for live capture/retirement. Legacy versions refuse direct
+2.7.0 installation and reject any retained journal namespace or orphaned journal
+file. Legacy absence checks scan at most 1,024 directory entries, hold only the
+local storage mutex, and refuse on unavailable or uncertain reads. Hikvision
+does not call this ZKT policy.
 
 The app task starts the reader only for exact 2.6.16/2.7.0 ZKT application
 identities, a provisioned binding, secure boot, encrypted NVS and an OTA slot.

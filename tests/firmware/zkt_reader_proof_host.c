@@ -55,6 +55,7 @@ int main(void)
     current.slot_address = 0x2a0000;
     current.image_digest[0] = 55;
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_MISSING);
+    assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_MISSING);
     assert(!storage.writes);
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && storage.writes == 1);
     uint8_t original[ZJ_READER_PROOF_BYTES];
@@ -65,6 +66,15 @@ int main(void)
     assert(!memcmp(decoded.image_digest, previous.image_digest, 32));
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && storage.writes == 1);
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
+    assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_OK);
+    assert(zj_reader_check_update(port(), &w, &current, previous.slot_address, previous.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_PROTECTED_SLOT);
+    assert(zj_reader_check_update(port(), &b, &previous, previous.slot_address, previous.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_PROTECTED_SLOT);
+    assert(zj_reader_check_update(port(), &b, &previous, previous.slot_address - 0x10000, previous.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_PROTECTED_SLOT);
+    assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, "2.6.15") == ZJ_COMPAT_UPDATE_TARGET);
+    assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, "2.7.1") == ZJ_COMPAT_UPDATE_TARGET);
+    assert(zj_reader_check_update(port(), &b, &previous, 0xffff0000, 0x10000, ZJ_WRITER_VERSION) == ZJ_COMPAT_INVALID);
+    assert(zj_reader_check_update(port(), &b, &previous, 1, current.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_INVALID);
+    assert(storage.writes == 1);
     /* Writer validation and subsequent rollback readers consume the same
      * persisted blob. Neither can infer success from just a version label. */
     FILE *file = fopen("reader-proof.bin", "wb");
@@ -79,6 +89,7 @@ int main(void)
     for (unsigned byte = 0; byte < ZJ_READER_PROOF_BYTES; ++byte) {
         storage.bytes[byte] ^= 1;
         assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_CORRUPT);
+        assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) == ZJ_COMPAT_CORRUPT);
         assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_CORRUPT && !storage.writes);
         assert(!zj_reader_proof_decode(storage.bytes, &decoded, &generation) && !generation);
         for (size_t i = 0; i < sizeof(decoded); ++i) assert(!((uint8_t *)&decoded)[i]);
@@ -106,6 +117,7 @@ int main(void)
             case 7: changed.recovery_pending = true; break;
         }
         assert(zj_reader_attest(port(), &changed, &previous) != ZJ_COMPAT_OK && !storage.writes);
+        assert(zj_reader_check_update(port(), &changed, &previous, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) != ZJ_COMPAT_OK && !storage.writes);
     }
     zj_reader_environment_t changed = b;
     changed.application = "zone_lite_hikvision";
@@ -131,6 +143,7 @@ int main(void)
             case 5: wrong.slot_size -= 0x10000; break;
         }
         assert(zj_reader_check_writer(port(), &w, &current, &b, &wrong) != ZJ_COMPAT_OK);
+        assert(zj_reader_check_update(port(), &b, &wrong, current.slot_address, current.slot_size, ZJ_WRITER_VERSION) != ZJ_COMPAT_OK && !storage.writes);
         if (i >= 1 && i <= 3)
             assert(zj_reader_attest(port(), &b, &wrong) == ZJ_COMPAT_BINDING && !storage.writes);
     }
@@ -180,7 +193,7 @@ int main(void)
     assert(!zj_reader_proof_decode(NULL, &decoded, &generation));
     assert(zj_reader_attest((zj_reader_proof_port_t){0}, &b, &previous) == ZJ_COMPAT_INVALID);
     assert(zj_reader_check_writer(port(), NULL, &current, &b, &previous) == ZJ_COMPAT_INVALID);
-    for (unsigned i = ZJ_COMPAT_INVALID; i <= ZJ_COMPAT_EXHAUSTED; ++i)
+    for (unsigned i = ZJ_COMPAT_INVALID; i <= ZJ_COMPAT_PROTECTED_SLOT; ++i)
         assert(zj_compat_error((zj_compat_result_t)i)[0]);
     assert(!zj_compat_error(ZJ_COMPAT_OK)[0]);
     puts("Durable journal reader proof, rollback identity and interruption checks passed");

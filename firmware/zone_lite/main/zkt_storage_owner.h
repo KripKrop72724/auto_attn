@@ -1,6 +1,10 @@
 #pragma once
 #include "zkt_storage_mailbox.h"
 
+#define ZJ_DEVICE_DIRECTORY "/spiffs"
+#define ZJ_DEVICE_BASENAME "zktj"
+#define ZJ_DEVICE_PREFIX ZJ_DEVICE_DIRECTORY "/" ZJ_DEVICE_BASENAME
+
 typedef struct {
     bool started, ready, operation_running, recovering, checkpoint_recovery_pending;
     bool compatibility_checked, writer_allowed;

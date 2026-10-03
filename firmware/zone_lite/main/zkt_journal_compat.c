@@ -151,6 +151,29 @@ zj_compat_result_t zj_reader_check_writer(zj_reader_proof_port_t port,
     if (!binding_equal(current, previous) || !binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
     return image_equal(previous, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
 }
+zj_compat_result_t zj_reader_check_update(zj_reader_proof_port_t port,
+    const zj_reader_environment_t *bridge, const zj_reader_identity_t *current,
+    uint32_t target_address, uint32_t target_size, const char *target_version)
+{
+    if (!identity_valid(current) || !target_version) return ZJ_COMPAT_INVALID;
+    if (bridge && bridge->version && !strcmp(bridge->version, ZJ_WRITER_VERSION))
+        return ZJ_COMPAT_PROTECTED_SLOT;
+    zj_compat_result_t result = environment(bridge, ZJ_BRIDGE_VERSION, true, true);
+    if (result != ZJ_COMPAT_OK) return result;
+    if (strcmp(target_version, ZJ_WRITER_VERSION)) return ZJ_COMPAT_UPDATE_TARGET;
+    zj_reader_identity_t target = *current;
+    target.slot_address = target_address;
+    target.slot_size = target_size;
+    if (!identity_valid(&target)) return ZJ_COMPAT_INVALID;
+    if (!separate_slots(current, &target)) return ZJ_COMPAT_PROTECTED_SLOT;
+    uint8_t proof[ZJ_READER_PROOF_BYTES];
+    zj_reader_identity_t attested;
+    uint64_t generation;
+    result = load(port, proof, &attested, &generation);
+    if (result != ZJ_COMPAT_OK) return result;
+    if (!binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
+    return image_equal(current, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
+}
 const char *zj_compat_error(zj_compat_result_t result)
 {
     switch (result) {
@@ -166,6 +189,8 @@ const char *zj_compat_error(zj_compat_result_t result)
         case ZJ_COMPAT_ROLLBACK: return "JOURNAL_ROLLBACK_IMAGE_MISMATCH";
         case ZJ_COMPAT_UNCERTAIN: return "JOURNAL_READER_COMMIT_UNCERTAIN";
         case ZJ_COMPAT_EXHAUSTED: return "JOURNAL_READER_GENERATION_EXHAUSTED";
+        case ZJ_COMPAT_UPDATE_TARGET: return "JOURNAL_OTA_TARGET_UNSUPPORTED";
+        case ZJ_COMPAT_PROTECTED_SLOT: return "JOURNAL_ROLLBACK_SLOT_PROTECTED";
         default: return "JOURNAL_READER_RESULT_UNKNOWN";
     }
 }

@@ -64,5 +64,17 @@ int main(void)
     mailbox.next_ticket = UINT64_MAX;
     assert(zj_mailbox_submit(&mailbox, &request, &ticket) && ticket == UINT64_MAX);
     assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    zj_mailbox_init(&mailbox);
+    request = (zj_request_t){.operation = ZJ_OTA_CHECK};
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket) && !mailbox.occupied);
+    memset(request.input.ota.version, 'a', sizeof(request.input.ota.version));
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket) && !mailbox.occupied);
+    strcpy(request.input.ota.version, ZJ_WRITER_VERSION);
+    for (unsigned i = 0; i < ZJ_REQUEST_SLOTS - ZJ_LIVE_RESERVED_SLOTS; ++i)
+        assert(zj_mailbox_submit(&mailbox, &request, &tickets[i]));
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.operation = ZJ_APPEND;
+    assert(zj_mailbox_submit(&mailbox, &request, &ticket));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == ticket);
     return 0;
 }
