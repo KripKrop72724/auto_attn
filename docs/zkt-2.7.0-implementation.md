@@ -385,6 +385,16 @@ No connector has been upgraded or accepted by this implementation work.
 
 ## Journal component implementation
 
+ADD-owned Oracle delivery now has a separate inactive component described in
+[`zkt-oracle-delivery.md`](zkt-oracle-delivery.md). It freezes encrypted payloads,
+retains the route across feature rollback, fences stale claims and commits a
+scoped Oracle content receipt atomically with completion. The existing checker
+proves only core raw attendance/identity fields (`ORACLE_RAW_CORE_V1`); the full
+Oracle projection, downstream processing and live qualification remain open.
+No existing record is registered or rerouted by this component. Qualified
+canonical occurrence creation and backend rollback compatibility are required
+before activation.
+
 The journal byte format and failure behavior are documented in
 [`zkt-journal-v1.md`](zkt-journal-v1.md). Journal code compiles into the ZKT family
 only. The app task now calls a gated startup controller for exact 2.6.16/2.7.0

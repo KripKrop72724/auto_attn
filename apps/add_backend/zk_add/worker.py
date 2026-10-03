@@ -26,6 +26,7 @@ from zk_add.models import (
     DeviceLog,
     DeviceTelemetry,
     OrdsOutbox,
+    ZktOracleIntent,
     ZKTDevice,
 )
 from zk_add.ords_states import (
@@ -1033,6 +1034,7 @@ def claim_firmware_receipt_audit_batch(
             select(OrdsOutbox)
             .where(
                 OrdsOutbox.status == "FIRMWARE_RECEIPT_VERIFYING",
+                OrdsOutbox.id.not_in(select(ZktOracleIntent.outbox_id)),
                 (OrdsOutbox.last_attempt_at == None)  # noqa: E711
                 | (OrdsOutbox.last_attempt_at < stale_before),
             )
@@ -1058,6 +1060,7 @@ def claim_firmware_receipt_audit_batch(
                 OrdsOutbox.status.in_(
                     ["ACKED_FIRMWARE", "FIRMWARE_RECEIPT_UNVERIFIED"]
                 ),
+                OrdsOutbox.id.not_in(select(ZktOracleIntent.outbox_id)),
                 (OrdsOutbox.next_attempt_at == None)  # noqa: E711
                 | (OrdsOutbox.next_attempt_at <= now),
             )
@@ -1285,6 +1288,7 @@ def claim_confirmed_membership_audit_batch(
             select(OrdsOutbox)
             .where(
                 OrdsOutbox.status == "MEMBERSHIP_REVERIFYING",
+                OrdsOutbox.id.not_in(select(ZktOracleIntent.outbox_id)),
                 (OrdsOutbox.last_attempt_at == None)  # noqa: E711
                 | (OrdsOutbox.last_attempt_at < stale_before),
             )
@@ -1317,6 +1321,7 @@ def claim_confirmed_membership_audit_batch(
             )
             .where(
                 AttendanceEvent.id.not_in(select(AttendanceForceReleaseDecision.attendance_event_id)),
+                OrdsOutbox.id.not_in(select(ZktOracleIntent.outbox_id)),
                 or_(
                     (
                         OrdsOutbox.status.in_(["ACKED", "ACKED_CHECK"])
@@ -1765,21 +1770,38 @@ async def deliver_ords_batch(
         claims = await asyncio.to_thread(claim_ords_batch, max(1, limit))
         if not claims:
             return
+        from zk_add.zkt_oracle_delivery import split_claims as split_zkt_claims
+        claims, journal = await asyncio.to_thread(split_zkt_claims, claims)
         from zk_add.attendance_force_delivery import split_claims, deliver_forced
         claims, forced = await asyncio.to_thread(split_claims, claims)
         # Reserve service for live claims while slow content verification runs.
         # Each lane commits its receipts independently of the other's network wait.
-        if forced and claims and concurrency > 1:
+        if forced and (claims or journal) and concurrency > 1:
             background_slots = min(4, max(1, concurrency // 5))
             await asyncio.gather(
-                _deliver_ordinary_claims(claims, concurrency=concurrency - background_slots, limit=limit),
+                _deliver_priority_claims(claims, journal, concurrency=concurrency - background_slots, limit=limit),
                 deliver_forced(forced, concurrency=background_slots),
             )
         else:
-            if claims:
-                await _deliver_ordinary_claims(claims, concurrency=concurrency, limit=limit)
+            if claims or journal:
+                await _deliver_priority_claims(claims, journal, concurrency=concurrency, limit=limit)
             if forced:
                 await deliver_forced(forced, concurrency=concurrency)
+
+
+async def _deliver_priority_claims(claims, journal, *, concurrency, limit):
+    from zk_add.zkt_oracle_delivery import deliver as deliver_journal
+    if claims and journal and concurrency > 1:
+        journal_slots = max(1, concurrency // 2)
+        await asyncio.gather(
+            _deliver_ordinary_claims(claims, concurrency=concurrency - journal_slots, limit=limit),
+            deliver_journal(journal, concurrency=journal_slots),
+        )
+    else:
+        if claims:
+            await _deliver_ordinary_claims(claims, concurrency=concurrency, limit=limit)
+        if journal:
+            await deliver_journal(journal, concurrency=concurrency)
 
 
 async def _deliver_ordinary_claims(claims, *, concurrency, limit):

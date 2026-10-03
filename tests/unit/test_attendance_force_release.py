@@ -744,6 +744,7 @@ def test_slow_force_verification_does_not_delay_ordinary_delivery(monkeypatch):
     monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
     monkeypatch.setattr(worker, "ords_circuit_is_open", lambda: False)
     monkeypatch.setattr(worker, "claim_ords_batch", lambda _: ["live", "forced"])
+    monkeypatch.setattr("zk_add.zkt_oracle_delivery.split_claims", lambda rows: (rows, []))
     monkeypatch.setattr(delivery, "split_claims", lambda _: (["live"], ["forced"]))
 
     async def scenario():

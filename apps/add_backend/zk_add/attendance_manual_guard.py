@@ -87,7 +87,14 @@ def delivery_authorized(session: Session, row) -> bool:
     )
 
 
-def generic_confirmation_allowed(session: Session, row) -> bool:
+def generic_confirmation_allowed(session: Session, row, *, zkt_content_event_ids: set[int] | None = None) -> bool:
+    from zk_add.models import ZktOracleIntent
+
+    requires_content = (row.id in zkt_content_event_ids if zkt_content_event_ids is not None else
+        session.scalar(select(ZktOracleIntent.id).where(
+            ZktOracleIntent.attendance_event_id == row.id).limit(1)) is not None)
+    if requires_content:
+        return False  # Only its immutable-payload content check may complete it.
     # A UID-only firmware receipt or membership check cannot establish which
     # employee Oracle accepted for a manual identity override.
     if not requires_approval(row):
