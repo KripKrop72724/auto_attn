@@ -634,6 +634,19 @@ int main(int argc, char **argv)
     assert(command_checkpoint.version && catalog_checkpoint.version);
     assert(zj_owner_submit(&catalog, &ticket)); reply = wait_reply(ticket);
     assert(reply.result == ZJ_OK && reply.catalog.bytes[0] == 'C');
+    /* Both command callers use the actual owner. Distinct files remain
+     * independent; a timeout never supplies a false absence or durable ACK. */
+    assert(zi_cache_contains(ZI_PROCESSED, "owner-receipt") == REL_ID_ABSENT);
+    assert(zi_cache_remember(ZI_PROCESSED, "owner-receipt"));
+    assert(zi_cache_remember(ZI_PROCESSED, "owner-receipt"));
+    assert(zi_cache_contains(ZI_PROCESSED, "owner-receipt") == REL_ID_PRESENT);
+    assert(zi_cache_contains(ZI_CANCELLED, "owner-receipt") == REL_ID_ABSENT);
+    atomic_store(&full, true);
+    assert(!zi_cache_remember(ZI_CANCELLED, "owner-receipt"));
+    assert(zi_cache_contains(ZI_CANCELLED, "owner-receipt") == REL_ID_ABSENT);
+    assert(zi_cache_remember(ZI_PROCESSED, "owner-receipt")); /* replay needs no new capacity */
+    atomic_store(&full, false);
+    assert(zi_cache_remember(ZI_CANCELLED, "owner-receipt"));
     assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before

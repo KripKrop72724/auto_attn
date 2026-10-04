@@ -71,6 +71,7 @@
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_runtime_checkpoint.h"
 #include "zkt_lease_store.h"
+#include "zkt_command_ids.h"
 #endif
 #include "legacy_queue.h"
 #include "queue_store.h"
@@ -7794,16 +7795,25 @@ static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
 
 static rel_id_result_t command_was_processed(const char *command_id)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) return zi_cache_contains(ZI_PROCESSED, command_id);
+#endif
     return rel_id_file_contains(PROCESSED_COMMANDS_PATH, command_id, COMMAND_ID_MAX_BYTES);
 }
 
 static rel_id_result_t command_was_cancelled(const char *command_id)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) return zi_cache_contains(ZI_CANCELLED, command_id);
+#endif
     return rel_id_file_contains(CANCELLED_COMMANDS_PATH, command_id, COMMAND_ID_MAX_BYTES);
 }
 
 static bool mark_command_processed(const char *command_id)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) return zi_cache_remember(ZI_PROCESSED, command_id);
+#endif
     rel_id_result_t state = command_was_processed(command_id);
     if (state == REL_ID_PRESENT) return true;
     if (state == REL_ID_ERROR) return false;
