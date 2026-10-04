@@ -101,6 +101,13 @@ zj_result_t zl_lease_commit(const zl_lease_record_t *proposed, uint64_t deadline
         }
     } else if (result != ZJ_OK) goto done;
     else {
+        /* Preserve the current obligation when its independent witness is
+         * corrupt or unreadable. Check before a successor overwrites the
+         * record; discovering this only at readback is already too late.
+         * An absent witness can be an interrupted first commit, whose
+         * existing exact-replay path below still completes the witness. */
+        zj_result_t root = read_root(handle, nvs_error);
+        if (root != ZJ_OK && root != ZJ_EMPTY) { result = root; goto done; }
         if (proposed->generation == current.generation && same_facts(proposed, &current)) {
             goto witness; /* Commit succeeded, acknowledgement was lost. */
         }

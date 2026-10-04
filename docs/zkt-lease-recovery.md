@@ -18,6 +18,9 @@ acknowledged. Afterward, a missing lease record is an evidence failure rather
 than a new empty store. A cut between the record and witness writes preserves
 the proposed active obligation; exact replay completes the witness. Corrupt
 records and witnesses are retained, never formatted or silently overwritten.
+An existing witness is read before changing a retained lease; a corrupt witness
+or a failed witness read preserves the preceding record without a successor
+write. Interrupted first-witness creation can still resume through exact replay.
 CRC validation detects changed data; it is not a substitute for encrypted NVS
 or physical fault qualification.
 
