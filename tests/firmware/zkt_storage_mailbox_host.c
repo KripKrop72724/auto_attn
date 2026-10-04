@@ -117,6 +117,25 @@ int main(void)
     assert(zj_mailbox_begin(&mailbox, &work, &running) && running == catalog_ticket);
     assert(zj_mailbox_finish(&mailbox, running, &reply));
     request = (zj_request_t){.operation = ZJ_APPEND};
+    /* A receipt scan reserves its namespace while yielding to live work. */
+    zj_mailbox_init(&mailbox);
+    request = (zj_request_t){.operation = ZJ_COMMAND_IDS};
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.input.command_ids = (zi_request_t){.kind = ZI_PROCESSED, .id = "A", .deadline_us = 100};
+    assert(zj_mailbox_submit(&mailbox, &request, &catalog_ticket));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == catalog_ticket);
+    assert(zj_mailbox_yield(&mailbox, running));
+    request.input.command_ids.kind = ZI_CANCELLED;
+    assert(zj_mailbox_submit(&mailbox, &request, &ticket));
+    request.operation = ZJ_APPEND;
+    assert(zj_mailbox_submit(&mailbox, &request, &live_ticket));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == live_ticket);
+    assert(zj_mailbox_finish(&mailbox, running, &reply));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == catalog_ticket);
+    assert(zj_mailbox_finish(&mailbox, running, &reply));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == ticket);
+    assert(zj_mailbox_finish(&mailbox, running, &reply));
+    request = (zj_request_t){.operation = ZJ_APPEND};
     zj_mailbox_init(&mailbox);
     mailbox.next_ticket = UINT64_MAX;
     assert(zj_mailbox_submit(&mailbox, &request, &ticket) && ticket == UINT64_MAX);

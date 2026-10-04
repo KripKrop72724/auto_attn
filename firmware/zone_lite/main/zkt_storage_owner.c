@@ -26,6 +26,7 @@ typedef struct {
     zj_metadata_t metadata;
     zc_store_t catalog;
     zc_store_t commands;
+    zi_store_t command_ids;
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
@@ -98,6 +99,25 @@ static int commands_load(void *context, ft_checkpoint_t *checkpoint)
 { return file_checkpoint_load(context, "commands", checkpoint); }
 static bool commands_commit(void *context, const ft_checkpoint_t *checkpoint)
 { return file_checkpoint_commit(context, "commands", checkpoint); }
+static bool command_id_admit(void *context, size_t bytes)
+{ (void)context; return qs_local_admit_locked(QS_ADMIT_RECOVERY, bytes); }
+static bool execute_command_ids(owner_t *o, uint64_t ticket, const zj_request_t *request, zj_reply_t *reply)
+{
+    memset(reply, 0, sizeof(*reply)); o->nvs_error = 0;
+    o->store.last_errno = 0; o->store.last_operation = NULL;
+    if (!qs_local_read_begin()) {
+        reply->result = ZJ_IO;
+        reply->command_ids.error = errno; reply->command_ids.operation = "command_id_lock";
+        o->store.last_errno = reply->command_ids.error; o->store.last_operation = reply->command_ids.operation;
+        return o->command_ids.work_ticket == ticket;
+    }
+    bool pending = zi_store_step(&o->command_ids, ticket, (uint64_t)esp_timer_get_time(),
+        &request->input.command_ids, &reply->command_ids, &reply->result);
+    /* Command receipts have their own hold/error, not an attendance verdict. */
+    qs_local_end(true, 0);
+    o->store.last_errno = reply->command_ids.error; o->store.last_operation = reply->command_ids.operation;
+    return pending;
+}
 static bool execute_catalog(owner_t *o, uint64_t ticket, const zj_request_t *request, zj_reply_t *reply)
 {
     const zc_request_t *catalog = &request->input.catalog;
@@ -378,6 +398,7 @@ static void task(void *context)
         bool pending = false;
         if (work && (request.operation == ZJ_CATALOG || request.operation == ZJ_COMMANDS))
             pending = execute_catalog(o, ticket, &request, &reply);
+        else if (work && request.operation == ZJ_COMMAND_IDS) pending = execute_command_ids(o, ticket, &request, &reply);
         else if (work) execute(o, &request, &reply);
         else {
             memset(&reply, 0, sizeof(reply));
@@ -446,7 +467,8 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     if (!zc_store_init(&owner->catalog, ZC_ACTIVE_PATH, ZC_COMMIT_PATH, ZC_BACKUP_PATH,
                       ZC_TEMP_PATH, ZC_STAGE_PATH, catalog_port) ||
         !zc_store_init(&owner->commands, ZC_COMMAND_ACTIVE_PATH, ZC_COMMAND_COMMIT_PATH,
-                      ZC_COMMAND_BACKUP_PATH, ZC_COMMAND_TEMP_PATH, ZC_COMMAND_STAGE_PATH, command_port)) {
+                      ZC_COMMAND_BACKUP_PATH, ZC_COMMAND_TEMP_PATH, ZC_COMMAND_STAGE_PATH, command_port) ||
+        !zi_store_init(&owner->command_ids, ZI_PROCESSED_PATH, ZI_CANCELLED_PATH, command_id_admit, owner)) {
         heap_caps_free(owner);
         owner = NULL;
         vSemaphoreDelete(mailbox_lock);

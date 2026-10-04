@@ -86,7 +86,7 @@ static void led_status_fault(int state) { (void)state; assert(false); }
 static bool qs_local_begin(int policy, size_t bytes)
 { (void)policy; (void)bytes; assert(false); return false; }
 static void qs_local_end(bool ok, int error) { (void)ok; (void)error; assert(false); }
-static FILE *rel_open_append(const char *path) { (void)path; assert(false); return NULL; }
+FILE *rel_open_append(const char *path) { (void)path; assert(false); return NULL; }
 static int nvs_open(const char *name, int mode, int *handle)
 { (void)name; (void)mode; (void)handle; assert(false); return -1; }
 static void nvs_close(int handle) { (void)handle; assert(false); }

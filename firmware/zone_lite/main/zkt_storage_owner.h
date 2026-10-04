@@ -35,8 +35,9 @@ typedef struct {
  * This module exclusively owns journal files, its NVS namespace and new-image
  * runtime_v1 checkpoint writes in zone_lite, plus new-image catalog mutations
  * and the existing catalog NVS checkpoint. New-image command inbox reads,
- * replacements and their existing NVS checkpoint also run here. Legacy
- * attendance and processed/cancelled command-ID caches still require handoff. */
+ * replacements and their existing NVS checkpoint also run here, along with
+ * processed/cancelled command-ID cache operations. Legacy attendance still
+ * requires handoff. */
 bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata);
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket);
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete);

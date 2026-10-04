@@ -39,8 +39,8 @@ counts are kept outside this public repository.
 | Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
 | Rollback restores dual delivery for new punches | Irreversible ADD authority commits before sequence allocation; the validated bridge resumes raw journal capture after cutover; uncertain authority and disabled builds cannot fall back | Root/NVS commit/readback faults, actual owner, bridge boot/reboot, live dispatch and UI uncertainty checks | Implemented cutover component; legacy migration, full runtime telemetry and signed qualification remain open |
 | OTA boot confirmation waits for ADD or an unused ESP Oracle worker; HTTP success can conceal a rejected state | Exact bridge/writer images validate local preservation, required workers and an authenticated terminal snapshot before contacting ADD; durable stages order reports and typed receipts verify actual deployment state and running image | Local outage, lost-reply, interrupted checkpoint, stale-worker, mark-valid failure, rejected-state and receipt allocation tests; legacy/Hikvision regression builds | Implemented local boot component; remote HIL, operational rollback and signed qualification remain open |
-| OTA restart can race a live read or a timed-out caller's accepted write | A terminal-owner handoff blocks new sessions; the journal owner drains accepted work before acknowledging quiescence | Production gateway/OTA control flow, blocked threaded writes, abandoned callers, lock failures and Hikvision regression | Implemented component; legacy attendance and processed/cancelled-ID cache handoff and physical qualification remain open |
-| Command-inbox replacement competes with attendance storage | Exact bridge/writer images stream encrypted inbox reads and replacements through the storage owner, retain uncertain replies, and serialize transaction recovery | Production adapter allocation/replay/malformed-line tests, abandoned activation and owner-task fairness | Command-inbox component; processed/cancelled-ID caches and legacy attendance handoff remain open |
+| OTA restart can race a live read or a timed-out caller's accepted write | A terminal-owner handoff blocks new sessions; the journal owner drains accepted work before acknowledging quiescence | Production gateway/OTA control flow, blocked threaded writes, abandoned callers, lock failures and Hikvision regression | Implemented component; legacy attendance handoff and physical qualification remain open |
+| Command storage competes with attendance preservation | Exact bridge/writer images stream encrypted inbox work and bounded processed/cancelled-ID scans through the storage owner, retain uncertain replies, and serialize recovery | Production adapters, allocation/replay/malformed-line tests, short writes, failed sync/close, late completion and owner-task fairness | Command-storage component; remaining catalog reads and legacy attendance handoff remain open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
@@ -425,8 +425,8 @@ Physical power-loss qualification remains a separate release requirement.
    The ordinary, command-response and prepared-read hooks are implemented under
    a disabled writer build switch. Partial packet fragments remain holds.
 2. Qualify the implemented journal startup/compatible-reader gate and live
-   capture on actual ESP devices; complete catalog reads, processed/cancelled-ID
-   caches and legacy attendance handoff to the same owner. Qualify actual ESP latency,
+   capture on actual ESP devices; complete catalog reads and legacy attendance
+   handoff to the same owner. Qualify actual ESP latency,
    resource headroom, checkpoint recovery on actual ESP hardware and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
@@ -481,7 +481,17 @@ promoted without a committed transaction. A timed-out activation retains its
 ticket and invalidates the restored-inbox snapshot when collected. Replay
 checks preserve command IDs; queue refusal remains retryable. ADD remains the
 durable command authority. These changes do not migrate legacy attendance or
-the processed/cancelled-ID caches, and they do not qualify ESP timing or flash.
+qualify ESP timing or flash.
+
+The same owner handles `processed_commands.txt` and `add_cancelled.txt` for
+exact bridge/writer images. Each scan reads at most 4 KiB and closes its handle
+before yielding. The two 64 KiB caches retain every existing ID; saturation
+causes an explicit refusal, never automatic eviction. An append is acknowledged
+only after write, flush, sync and close. A replay of a retained ID syncs it again
+before claiming durable completion, covering a previous lost/failed sync result.
+Partial tails and read failures hold execution. One retained client ticket per
+cache survives caller timeout; collecting it never answers a request for another
+ID. Existing legacy/Hikvision paths and cache formats remain unchanged.
 
 Journal appends additionally require an owner-executed reader compatibility
 check. The new encrypted-NVS capability binds the exact validated 2.6.16 bridge

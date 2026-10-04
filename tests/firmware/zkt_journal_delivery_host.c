@@ -87,6 +87,7 @@ static void owner_step(scenario_t *s)
         case ZJ_CATALOG:
         case ZJ_LEASE:
         case ZJ_COMMANDS:
+        case ZJ_COMMAND_IDS:
             assert(!"Delivery must not grant its own reader/writer compatibility");
             reply.result = ZJ_INVALID;
             break;

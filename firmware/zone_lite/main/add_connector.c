@@ -7,6 +7,7 @@
 #include "zkt_custody_wire.h"
 #include "zkt_journal_runtime.h"
 #include "zkt_catalog_client.h"
+#include "zkt_command_ids.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -1668,6 +1669,12 @@ bool add_connector_persist_command_tombstone(const add_command_t *command)
 
 static bool append_cancelled_command(const char *command_id)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        return command_id && strlen(command_id) < sizeof(((add_command_t *)0)->command_id) &&
+            zi_cache_remember(ZI_CANCELLED, command_id);
+    }
+#endif
     rel_id_result_t existing = rel_id_file_contains(
         ADD_CANCELLED_COMMANDS_PATH,
         command_id,
