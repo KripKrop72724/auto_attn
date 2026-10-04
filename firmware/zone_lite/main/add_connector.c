@@ -5004,6 +5004,22 @@ bool add_connector_claim_ota_restart(void)
     return claimed;
 }
 
+bool add_connector_claim_failed_boot_restart(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return false;
+#else
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (!app || strcmp(app->project_name, "zone_lite") || strcmp(app->version, ZJ_WRITER_VERSION) ||
+        !s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    s_ota_restart_claimed = true;
+    strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));
+    bool claimed = !s_terminal_session_active;
+    xSemaphoreGive(s_lock);
+    return claimed;
+#endif
+}
+
 bool add_connector_begin_pending_command_activity(void)
 {
     if (!s_lock || !s_commands) return false;

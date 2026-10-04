@@ -34,6 +34,7 @@ typedef struct {
         struct {
             uint8_t image_digest[32];
             uint64_t deadline_us;
+            bool failed_boot;
         } reader_selection;
         struct {
             runtime_checkpoint_t state;
