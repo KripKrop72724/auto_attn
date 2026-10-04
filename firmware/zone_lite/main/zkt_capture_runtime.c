@@ -16,6 +16,7 @@ static void publish(void)
 {
     if (xSemaphoreTake(health_lock, pdMS_TO_TICKS(20)) != pdTRUE) return;
     snapshot = capture->health;
+    snapshot.sampled_ms = (uint32_t)(esp_timer_get_time() / 1000);
     xSemaphoreGive(health_lock);
 }
 static uint32_t now_ms(void *context) { (void)context; return (uint32_t)(esp_timer_get_time() / 1000); }
@@ -48,11 +49,22 @@ bool zj_capture_runtime_start(void)
         capture = NULL;
         return false;
     }
+    publish();
     return true;
 }
 bool zj_capture_runtime_packet(const uint8_t *packet, size_t length, const zj_capture_facts_t *facts)
 {
     if (!capture || !zj_runtime_writer_ready() || xSemaphoreTake(capture_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    /* Publish entry before hashing/submission so an operation stuck before
+     * the first wait is still visible. Do not change the core's run guard. */
+    if (xSemaphoreTake(health_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        xSemaphoreGive(capture_lock);
+        return false;
+    }
+    snapshot = capture->health;
+    snapshot.running = true;
+    snapshot.started_ms = snapshot.sampled_ms = now_ms(NULL);
+    xSemaphoreGive(health_lock);
     bool preserved = zj_capture_packet(capture, packet, length, facts);
     publish();
     xSemaphoreGive(capture_lock);

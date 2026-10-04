@@ -1,5 +1,6 @@
 #include "zkt_reader_platform_host.h"
 #include "zkt_journal_runtime.h"
+#include "zkt_journal_diagnostics.h"
 #include "queue_store.h"
 #include "zone_config.h"
 #include "freertos/semphr.h"
@@ -36,6 +37,10 @@ bool zj_owner_health(zj_owner_health_t *out){owner.sampled_uptime_us=(uint64_t)c
 bool zj_transport_start(void){++transport_starts;transport.started=true;return true;}
 bool zj_transport_health(zj_transport_health_t *out){transport.sampled_ms=clock_ms;*out=transport;return true;}
 bool zj_capture_runtime_start(void){assert(owner.writer_allowed);++capture_starts;return true;}
+bool zj_capture_runtime_health(zj_capture_health_t *out){*out=(zj_capture_health_t){0};return capture_starts>0;}
+bool zj_diagnostics_append(cJSON *j,const zj_boot_t *b,bool r,bool l,const zj_diagnostics_snapshot_t *s,uint64_t n){
+ (void)j;(void)b;(void)r;(void)l;(void)s;(void)n;return true;
+}
 bool zj_owner_submit(const zj_request_t *request,uint64_t *ticket){assert(request->operation==ZJ_READER_CHECK);*ticket=++proofs;return true;}
 bool zj_owner_poll(uint64_t ticket,zj_reply_t *reply,bool *complete){
  assert(ticket==proofs);*complete=true;*reply=(zj_reply_t){.result=ZJ_OK,.compatibility=ZJ_COMPAT_OK};

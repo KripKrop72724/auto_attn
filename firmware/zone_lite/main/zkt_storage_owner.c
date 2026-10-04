@@ -115,10 +115,16 @@ static zj_result_t recover(owner_t *o)
 {
     o->writer_allowed = o->compatibility_checked = false;
     o->compatibility = ZJ_COMPAT_NOT_READY;
+    o->nvs_error = 0;
+    o->store.last_errno = 0;
+    o->store.last_operation = "journal_recovery";
     uint64_t now = (uint64_t)esp_timer_get_time();
     if (now < o->retry_at_us) return ZJ_IO;
-    if (!qs_local_read_begin()) return ZJ_IO;
-    o->nvs_error = 0;
+    if (!qs_local_read_begin()) {
+        o->store.last_errno = errno;
+        o->store.last_operation = "storage_recovery_lock";
+        return ZJ_IO;
+    }
     zj_state_port_t state_port = {state_read, state_write, state_random, journal_absent, o};
     zj_result_t result = zj_state_open(&o->state, state_port, o->metadata.terminal_serial);
     if (result == ZJ_OK && !zj_state_identity(&o->state, o->key.master, o->metadata.capture_epoch))
@@ -283,6 +289,8 @@ static void task(void *context)
             o->health.recovering = repair || !o->store.ready || !o->state.ready;
             if (work) o->health.operation = request.operation;
             o->health.operation_started_us = o->health.sampled_uptime_us;
+            o->health.inventory_known = false;
+            if (repair || (work && request.operation == ZJ_APPEND)) o->health.verified_empty = false;
         }
         xSemaphoreGive(mailbox_lock);
         if (!work && !repair) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)); continue; }
@@ -307,6 +315,17 @@ static void task(void *context)
         o->health.delivery_authority = zj_state_authority(&o->state);
         o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;
+        o->health.inventory_known = o->health.ready;
+        o->health.journal_segments = o->store.count;
+        o->health.journal_bytes = 0;
+        for (unsigned i = 0; i < o->store.count; ++i) o->health.journal_bytes += o->store.segments[i].size;
+        if (!o->health.ready || o->health.checkpoint_recovery_pending) o->health.verified_empty = false;
+        else if (work && request.operation == ZJ_PEEK) o->health.verified_empty = reply.result == ZJ_EMPTY;
+        if (work && request.operation == ZJ_APPEND) {
+            o->health.append_observed = true;
+            o->health.last_append_result = reply.result;
+            o->health.last_append_uptime_us = finished;
+        }
         if (reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
             ++o->health.failures;
             o->health.filesystem_error = o->store.last_errno;
@@ -351,6 +370,7 @@ bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
     if (ticket) *ticket = 0;
     if (!owner || !enter()) return false;
     bool ok = !owner->health.quiescing && zj_mailbox_submit(&owner->mailbox, request, ticket);
+    if (ok && request->operation == ZJ_APPEND) owner->health.verified_empty = false;
     if (owner->health.quiescing) ++owner->mailbox.refused;
     xSemaphoreGive(mailbox_lock);
     if (ok) xTaskNotifyGive(owner_task);
@@ -388,6 +408,15 @@ bool zj_owner_health(zj_owner_health_t *health)
     health->refused = owner->mailbox.refused;
     health->occupied = owner->mailbox.occupied;
     health->high_watermark = owner->mailbox.high_watermark;
+    health->pending_appends = 0;
+    for (unsigned i = 0; i < ZJ_REQUEST_SLOTS; ++i) {
+        const zj_request_slot_t *slot = &owner->mailbox.slots[i];
+        if ((slot->state == ZJ_SLOT_QUEUED || slot->state == ZJ_SLOT_RUNNING) &&
+            slot->request.operation == ZJ_APPEND) ++health->pending_appends;
+    }
+    /* A PEEK can finish after another producer admits an append. Check the
+     * mailbox under the same lock; that snapshot must never advertise zero. */
+    if (health->pending_appends) health->verified_empty = false;
     xSemaphoreGive(mailbox_lock);
     return true;
 }

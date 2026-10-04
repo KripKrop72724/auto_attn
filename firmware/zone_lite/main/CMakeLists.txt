@@ -24,7 +24,8 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
         "zkt_journal_state.c" "zkt_journal_compat.c" "zkt_reader_platform.c" "zkt_ota_guard.c"
         "zkt_storage_mailbox.c" "zkt_storage_owner.c" "zkt_runtime_checkpoint.c"
         "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
-        "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c")
+        "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c"
+        "zkt_journal_diagnostics.c")
 endif()
 
 # This is an integration-test switch, not release authorization. Signed bridge
