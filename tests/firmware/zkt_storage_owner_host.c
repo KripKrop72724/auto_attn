@@ -32,6 +32,10 @@ static zl_lease_record_t lease_blob;
 static unsigned lease_writes;
 static uint64_t lease_root;
 static ft_checkpoint_t catalog_checkpoint, command_checkpoint;
+static ota_checkpoint_t ota_blob, ota_pending;
+static atomic_int ota_failure;
+static atomic_bool ota_pause, ota_waiting;
+static unsigned ota_writes, selection_calls;
 const esp_app_desc_t *esp_app_get_description(void)
 {
     static const esp_app_desc_t app = {.project_name = "zone_lite", .version = "2.7.0"};
@@ -98,7 +102,12 @@ TaskHandle_t xTaskGetCurrentTaskHandle(void)
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 {
     (void)mode;
-    assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite") || !strcmp(name, "file_tx"));
+    assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite") || !strcmp(name, "file_tx") || !strcmp(name, "zone_ota"));
+    if (!strcmp(name, "zone_ota")) {
+        assert(pthread_equal(pthread_self(), thread));
+        assert(pthread_mutex_trylock(&budget) == EBUSY);
+        *handle = 4; return ESP_OK;
+    }
     if (!strcmp(name, "file_tx")) {
         assert(pthread_equal(pthread_self(), thread));
         assert(pthread_mutex_trylock(&budget) == EBUSY);
@@ -111,9 +120,14 @@ esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
     } else *handle = 1;
     return ESP_OK;
 }
-void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handle == 3); }
+void nvs_close(nvs_handle_t handle) { assert(handle >= 1 && handle <= 4); }
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t *length)
 {
+    if (handle == 4) {
+        assert(!strcmp(name, "journal_v1") && *length == sizeof(ota_blob));
+        if (!ota_blob.version) return ESP_ERR_NVS_NOT_FOUND;
+        memcpy(out, &ota_blob, sizeof(ota_blob)); return ESP_OK;
+    }
     if (handle == 3) {
         assert((!strcmp(name, "catalog") || !strcmp(name, "commands")) && *length == sizeof(catalog_checkpoint));
         ft_checkpoint_t *checkpoint = !strcmp(name, "catalog") ? &catalog_checkpoint : &command_checkpoint;
@@ -150,6 +164,12 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
 }
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes, size_t length)
 {
+    if (handle == 4) {
+        assert(!strcmp(name, "journal_v1") && length == sizeof(ota_blob));
+        ++ota_writes;
+        ota_pending = *(const ota_checkpoint_t *)bytes;
+        return ESP_OK;
+    }
     if (handle == 3) {
         assert((!strcmp(name, "catalog") || !strcmp(name, "commands")) && length == sizeof(catalog_checkpoint));
         memcpy(!strcmp(name, "catalog") ? &catalog_checkpoint : &command_checkpoint, bytes, length); return ESP_OK;
@@ -188,7 +208,17 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
     }
     return ESP_OK;
 }
-esp_err_t nvs_commit(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handle == 3); return ESP_OK; }
+esp_err_t nvs_commit(nvs_handle_t handle)
+{
+    assert(handle >= 1 && handle <= 4);
+    if (handle == 4) {
+        while (atomic_load(&ota_pause)) { atomic_store(&ota_waiting, true); vTaskDelay(1); }
+        int failure = atomic_exchange(&ota_failure, 0);
+        if (failure != 1) ota_blob = ota_pending;
+        return failure ? -7 : ESP_OK;
+    }
+    return ESP_OK;
+}
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
     assert((policy == QS_ADMIT_LIVE && bytes >= ZJ_RECORD_MAX) ||
@@ -329,6 +359,10 @@ zj_compat_result_t zj_reader_platform_select(const char *serial, const uint8_t e
 {
     assert(pthread_mutex_trylock(&budget) == EBUSY);
     assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0] && ready && persistence && expected[0] == 17);
+    assert(ota_checkpoint_valid(&ota_blob) && !strcmp(ota_blob.journal.state, "READER_INTENT"));
+    zj_owner_health_t health;
+    assert(zj_owner_health(&health) && health.quiescing && !health.pending_appends);
+    ++selection_calls;
     if (deadline <= (uint64_t)esp_timer_get_time()) return ZJ_COMPAT_SELECTION_EXPIRED;
     if (!delivery || recovering) return ZJ_COMPAT_NOT_READY;
     return uncertain_selection ? ZJ_COMPAT_SELECTION_UNCERTAIN : ZJ_COMPAT_OK;
@@ -375,6 +409,73 @@ static zj_reply_t wait_reply(uint64_t ticket)
     assert(!"Storage owner failed to finish bounded host operation");
     return (zj_reply_t){0};
 }
+static void rollback_with_full_mailbox(void)
+{
+    ota_checkpoint_t expected = {.version = 1, .generation = 7};
+    strcpy(expected.journal.deployment_id, "synthetic-operation");
+    strcpy(expected.journal.release_id, "synthetic-reader");
+    strcpy(expected.journal.target_version, ZJ_BRIDGE_VERSION);
+    memset(expected.journal.image_sha256, '1', 64);
+    strcpy(expected.journal.download_url, "https://example.invalid/unused");
+    strcpy(expected.journal.state, "DOWNLOADING"); expected.journal.image_size = 131072;
+    expected.crc = dq_crc32(&expected, offsetof(ota_checkpoint_t, crc));
+    ota_blob = expected;
+    uint64_t ticket, retained[ZJ_REQUEST_SLOTS];
+    assert(!zj_owner_select_quiesced_reader(&expected, &ticket) && !ticket);
+    zj_request_t proof = {.operation = ZJ_READER_CHECK};
+    assert(zj_owner_submit(&proof, &ticket));
+    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
+    zj_request_t capture = {.operation = ZJ_APPEND, .input.observation = {
+        .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
+        .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'R'}}};
+    atomic_store(&pause_write, true);
+    for (unsigned i = 0; i < ZJ_REQUEST_SLOTS; ++i) assert(zj_owner_submit(&capture, &retained[i]));
+    for (unsigned i = 0; i < 2000 && !atomic_load(&write_waiting); ++i) vTaskDelay(1);
+    assert(atomic_load(&write_waiting) && !zj_owner_quiesce());
+    assert(!zj_owner_select_quiesced_reader(&expected, &ticket) && !ticket);
+    atomic_store(&pause_write, false);
+    for (unsigned i = 0; i < 2000 && !zj_owner_quiesce(); ++i) vTaskDelay(1);
+    assert(zj_owner_quiesce());
+    zj_owner_health_t health;
+    assert(zj_owner_health(&health) && health.occupied == ZJ_REQUEST_SLOTS &&
+        !health.pending_appends && health.completed == ZJ_REQUEST_SLOTS + 1 && !selection_calls);
+    atomic_store(&ota_failure, 1); atomic_store(&ota_pause, true);
+    assert(zj_owner_select_quiesced_reader(&expected, &ticket) && ticket);
+    for (unsigned i = 0; i < 2000 && !atomic_load(&ota_waiting); ++i) vTaskDelay(1);
+    assert(atomic_load(&ota_waiting) && !zj_owner_abandon(ticket));
+    uint64_t refused;
+    assert(!zj_owner_select_quiesced_reader(&expected, &refused) && !refused);
+    assert(!zj_owner_submit(&capture, &refused));
+    assert(!zj_owner_quiesce() && !selection_calls);
+    atomic_store(&ota_pause, false);
+    zj_reply_t reply = wait_reply(ticket);
+    assert(reply.result == ZJ_UNCERTAIN && !selection_calls && !reply.rollback_intent.version);
+    atomic_store(&ota_failure, 2); /* intent persisted but its reply failed */
+    assert(zj_owner_select_quiesced_reader(&expected, &ticket));
+    reply = wait_reply(ticket);
+    assert(reply.result == ZJ_UNCERTAIN && !selection_calls && ota_blob.generation == 8);
+    assert(!strcmp(ota_blob.journal.state, "READER_INTENT"));
+    uncertain_selection = true;
+    assert(zj_owner_select_quiesced_reader(&expected, &ticket));
+    reply = wait_reply(ticket);
+    assert(reply.compatibility == ZJ_COMPAT_SELECTION_UNCERTAIN && selection_calls == 1 && ota_writes == 2);
+    assert(ota_checkpoint_valid(&reply.rollback_intent) && reply.rollback_intent.generation == 8);
+    uncertain_selection = false;
+    assert(zj_owner_select_quiesced_reader(&expected, &ticket));
+    reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK && reply.compatibility == ZJ_COMPAT_OK && selection_calls == 2 && ota_writes == 2);
+    strcpy(expected.journal.deployment_id, "changed-operation");
+    expected.crc = dq_crc32(&expected, offsetof(ota_checkpoint_t, crc));
+    assert(!zj_owner_select_quiesced_reader(&expected, &ticket));
+    for (unsigned i = 0; i < ZJ_REQUEST_SLOTS; ++i) {
+        reply = wait_reply(retained[i]);
+        assert(reply.result == ZJ_OK && reply.capture_sequence == i + 2);
+    }
+    assert(zj_owner_health(&health) && health.quiesced && !health.occupied && !health.writer_allowed);
+    atomic_store(&stop, true);
+    assert(!pthread_join(thread, NULL));
+}
+
 int main(int argc, char **argv)
 {
     assert(!zj_owner_started() && !zj_owner_is_current_task());
@@ -385,7 +486,8 @@ int main(int argc, char **argv)
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
     bool corrupt_journal = argc == 2 && !strcmp(argv[1], "--runtime-corrupt-journal");
     bool authority_test = argc == 2 && !strncmp(argv[1], "--authority-", 12);
-    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test;
+    bool rollback_test = argc == 2 && !strcmp(argv[1], "--rollback-full");
+    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {
         /* A retained encrypted-NVS root is intact; only its retirement blob
@@ -442,6 +544,7 @@ int main(int argc, char **argv)
         vTaskDelay(1);
     }
     assert(health.ready && root_length && !health.operation_running);
+    if (rollback_test) { rollback_with_full_mailbox(); return 0; }
     if (authority_test) {
         assert(health.delivery_authority == ZJ_AUTHORITY_LEGACY && root[145] == 0);
         zj_request_t proof = {.operation = ZJ_READER_CHECK};
@@ -546,35 +649,13 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility == ZJ_COMPAT_OK);
     uint64_t gating_operations = health.completed, gating_failures = health.failures;
     assert(gating_operations == 7 && gating_failures == 6);
+    /* Selection has no ordinary admission path: it requires the drained
+     * owner's reserved control plus a durable approved OTA assignment. */
     zj_request_t selection = {.operation = ZJ_SELECT_READER,
         .input.reader_selection = {.image_digest = {17}, .deadline_us = 1}};
-    assert(zj_owner_submit(&selection, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_SELECTION_EXPIRED);
+    assert(!zj_owner_submit(&selection, &ticket) && !ticket);
     assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility_checked);
-    selection.input.reader_selection.deadline_us = (uint64_t)esp_timer_get_time() + 5000000U;
-    atomic_store(&stale_transport, true);
-    assert(zj_owner_submit(&selection, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_NOT_READY);
-    assert(zj_owner_health(&health) && health.writer_allowed && health.compatibility_checked);
-    atomic_store(&stale_transport, false);
-    assert(zj_owner_submit(&selection, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
-    assert(zj_owner_health(&health) && !health.writer_allowed && !health.compatibility_checked);
-    assert(zj_owner_submit(&request, &ticket));
-    assert(wait_reply(ticket).result == ZJ_INVALID);
-    assert(zj_owner_submit(&compatibility, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
-    uncertain_selection = true;
-    assert(zj_owner_submit(&selection, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_SELECTION_UNCERTAIN);
-    assert(zj_owner_health(&health) && !health.writer_allowed && !health.compatibility_checked);
-    uncertain_selection = false;
-    assert(zj_owner_submit(&compatibility, &ticket));
-    assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
-    assert(zj_owner_health(&health) && health.writer_allowed);
-    assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 4);
-    gating_operations = health.completed;
-    gating_failures = health.failures;
+    assert(health.completed == gating_operations && health.failures == gating_failures);
     atomic_store(&pause_write, true);
     assert(zj_owner_submit(&request, &ticket));
     request.input.observation.raw[0] = 'B';

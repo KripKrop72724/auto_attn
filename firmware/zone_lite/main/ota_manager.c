@@ -31,6 +31,7 @@
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_ota_guard.h"
 #include "zkt_storage_owner.h"
+#include "zkt_rollback.h"
 #endif
 
 #define OTA_NAMESPACE "zone_ota"
@@ -66,6 +67,9 @@ static volatile int s_progress_last_http_status;
 // workers consume the internal heap, then reuse the verified digest for every
 // authenticated progress report and heartbeat on this boot.
 static char s_running_image_digest[65];
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static uint64_t s_reader_ticket;
+#endif
 
 static void wait_for_capture_safepoint(void);
 static bool acknowledge_pending_success(void);
@@ -395,6 +399,92 @@ static bool fetch_assignment(void)
     return valid;
 }
 
+/* The existing attested bridge is selected locally. A network download must
+ * never overwrite that rollback slot. This task is the only coordinator;
+ * each turn is bounded and leaves accepted owner work intact on timeout. */
+static bool advance_reader_rollback(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return true;
+#else
+    const esp_app_desc_t *app = esp_app_get_description();
+    bool intent = !strcmp(s_journal.state, "READER_INTENT");
+    bool writer = app && !strcmp(app->project_name, "zone_lite") && !strcmp(app->version, ZJ_WRITER_VERSION);
+    bool offered = writer && !strcmp(s_journal.target_version, ZJ_BRIDGE_VERSION) &&
+        !strcmp(s_journal.state, "DOWNLOADING");
+    if (!intent && !offered && !s_reader_ticket) return true;
+    s_busy = true;
+    if (intent && app && !strcmp(app->project_name, "zone_lite") && !strcmp(app->version, ZJ_BRIDGE_VERSION)) {
+        /* A version alone cannot complete the intent. Re-establish exact
+         * running-image evidence before entering the normal local boot proof. */
+        if (s_reader_ticket || !cache_running_image_digest() ||
+            strcmp(s_running_image_digest, s_journal.image_sha256)) {
+            strlcpy(s_last_error, "JOURNAL_READER_BOOT_IMAGE_MISMATCH", sizeof(s_last_error));
+            return false;
+        }
+        s_journal.bytes_written = s_journal.image_size;
+        strlcpy(s_journal.state, "READY_TO_BOOT", sizeof(s_journal.state));
+        if (!save_journal()) return false;
+        s_busy = false;
+        return true;
+    }
+    if (!writer || (!intent && !offered)) {
+        strlcpy(s_last_error, "JOURNAL_READER_INTENT_IMAGE_MISMATCH", sizeof(s_last_error));
+        return false;
+    }
+    ota_checkpoint_t expected = {.version = OTA_CHECKPOINT_VERSION,
+        .generation = s_journal_generation, .journal = s_committed_journal};
+    expected.crc = dq_crc32(&expected, offsetof(ota_checkpoint_t, crc));
+    if (!zj_rollback_request_valid(&expected)) {
+        strlcpy(s_last_error, "JOURNAL_READER_INTENT_INVALID", sizeof(s_last_error));
+        return false;
+    }
+    if (s_reader_ticket) {
+        zj_reply_t reply;
+        bool complete = false;
+        if (!zj_owner_poll(s_reader_ticket, &reply, &complete) || !complete) {
+            strlcpy(s_last_error, "JOURNAL_READER_SELECTION_PENDING", sizeof(s_last_error));
+            return false;
+        }
+        s_reader_ticket = 0;
+        bool committed = zj_rollback_same_target(&expected, &reply.rollback_intent) &&
+            !strcmp(reply.rollback_intent.journal.state, "READER_INTENT") &&
+            reply.rollback_intent.generation >= expected.generation;
+        if (committed) {
+            s_committed_journal = s_journal = reply.rollback_intent.journal;
+            s_journal_generation = reply.rollback_intent.generation;
+        }
+        if (reply.result == ZJ_OK && reply.compatibility == ZJ_COMPAT_OK && committed) {
+            /* No network or additional persistence is required between the
+             * confirmed selection and restart. Post-boot identity/health and
+             * ADD's committed progress remain separate checks. */
+            esp_restart();
+            return false;
+        }
+        const char *error = reply.result == ZJ_OK ? "JOURNAL_READER_INTENT_REPLY_INVALID" :
+            reply.result == ZJ_UNCERTAIN ? "JOURNAL_READER_INTENT_UNCERTAIN" :
+            reply.compatibility != ZJ_COMPAT_NOT_READY ? zj_compat_error(reply.compatibility) :
+            "JOURNAL_READER_SELECTION_HELD";
+        strlcpy(s_last_error, error, sizeof(s_last_error));
+        return false;
+    }
+    if (!add_connector_claim_ota_restart()) {
+        strlcpy(s_last_error, "WAITING_FOR_ZKT_SAFEPOINT", sizeof(s_last_error));
+        return false;
+    }
+    if (!zj_owner_quiesce()) {
+        strlcpy(s_last_error, "WAITING_FOR_JOURNAL_QUIESCE", sizeof(s_last_error));
+        return false;
+    }
+    if (!zj_owner_select_quiesced_reader(&expected, &s_reader_ticket) || !s_reader_ticket) {
+        strlcpy(s_last_error, "JOURNAL_READER_SELECTION_UNAVAILABLE", sizeof(s_last_error));
+        return false;
+    }
+    strlcpy(s_last_error, "JOURNAL_READER_SELECTION_PENDING", sizeof(s_last_error));
+    return false;
+#endif
+}
+
 static bool perform_update(void)
 {
     // Secure-boot artifacts are padded; aligned complete writes ensure IDF
@@ -694,6 +784,10 @@ static void ota_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
             continue;
         }
+        if (!advance_reader_rollback()) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         if (!boot_checked) {
             boot_checked = confirm_or_report_rollback();
             if (!boot_checked) { vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS)); continue; }
@@ -714,9 +808,11 @@ static void ota_task(void *argument)
                 }
                 /* A local network change and an OTA write never run concurrently. */
                 if (!setup_portal_active() && fetch_assignment()) {
-                    s_busy = true;
-                    (void)perform_update();
-                    s_busy = false;
+                    if (advance_reader_rollback()) {
+                        s_busy = true;
+                        (void)perform_update();
+                        s_busy = false;
+                    }
                 }
             }
         }

@@ -6,6 +6,7 @@
 #include "zkt_lease_store.h"
 #include "zkt_command_ids.h"
 #include "zkt_segmented_owner.h"
+#include "ota_checkpoint.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
@@ -53,6 +54,7 @@ typedef struct {
         zc_reply_t catalog;
         zi_reply_t command_ids;
         zq_reply_t segmented;
+        ota_checkpoint_t rollback_intent;
     };
     runtime_checkpoint_t runtime_checkpoint;
     zl_lease_record_t lease;
