@@ -6413,7 +6413,7 @@ def test_queue_evidence_admin_reveal_requires_csrf_and_step_up(db):
     assert db.scalar(select(AuditEvent).where(AuditEvent.action == "QUEUE_EVIDENCE_REVEALED")) is not None
 
 
-@pytest.mark.parametrize("kind", ["source", "queue", "divergence"])
+@pytest.mark.parametrize("kind", ["source", "queue", "divergence", "hikvision"])
 @pytest.mark.parametrize("commit_fails", [False, True])
 def test_protected_evidence_response_requires_committed_audit(db, monkeypatch, kind, commit_fails):
     from zk_add.models import ReconciliationDivergence, ReconciliationJob
@@ -6423,6 +6423,7 @@ def test_protected_evidence_response_requires_committed_audit(db, monkeypatch, k
     raw = b"SYNTHETIC-PRIVATE-RAW".ljust(40, b"\0")
     encoded = base64.b64encode(raw).decode()
     digest = hashlib.sha256(raw).hexdigest()
+    expected_value = encoded
     if kind == "queue":
         row = preserve_queue_evidence(db, connector, QueueEvidenceRequest.model_validate(
             queue_evidence_payload(connector, raw),
@@ -6439,6 +6440,19 @@ def test_protected_evidence_response_requires_committed_audit(db, monkeypatch, k
         db.flush()
         path = f"/api/v1/source-exceptions/{row.id}/reveal"
         action, field = "TERMINAL_SOURCE_EXCEPTION_REVEALED", "raw_record_b64"
+    elif kind == "hikvision":
+        from zk_add.hikvision_evidence import HikvisionEvidence
+
+        connector.firmware_family = "hikvision"
+        expected_value = '{"synthetic":"PRIVATE_HIK_TEST"}'
+        row = HikvisionEvidence(connector_id=connector.id, terminal_serial=SERIAL,
+            source_epoch="synthetic-epoch", channel="HISTORY", disposition="INVALID_TIME",
+            observation_sha256=hashlib.sha256(expected_value.encode()).hexdigest(),
+            raw_encrypted=encrypt_text(expected_value), captured_epoch=1790000000)
+        db.add(row)
+        db.flush()
+        path = f"/api/v2/source-corrections/evidence/{row.id}/reveal"
+        action, field = "HIKVISION_SOURCE_EVIDENCE_REVEALED", "raw"
     else:
         job = ReconciliationJob(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
             actor="test", reason="Synthetic audit test", idempotency_key="audit-test", request_digest=digest)
@@ -6482,11 +6496,11 @@ def test_protected_evidence_response_requires_committed_audit(db, monkeypatch, k
     })
     if commit_fails:
         assert response.status_code == 500
-        assert encoded not in response.text and raw.hex() not in response.text
+        assert encoded not in response.text and raw.hex() not in response.text and "PRIVATE_HIK_TEST" not in response.text
         assert committed == []
     else:
         assert response.status_code == 200 and committed == [True]
-        assert response.json()[field] == encoded
+        assert response.json()[field] == expected_value
         assert response.headers["cache-control"] == "no-store, max-age=0"
     assert db.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.action == action)) == (
         0 if commit_fails else 1
