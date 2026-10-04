@@ -68,7 +68,16 @@ static int xSemaphoreTake(int *lock,unsigned timeout)
 static void xSemaphoreGive(int *lock) { assert(*lock);*lock=0; }
 static void led_status_set_backlog(bool pending) { (void)pending; }
 static void led_status_fault(int state) { (void)state;faults++; }
+static bool fail_restore_rename, fail_restore_stat;
+static int restore_rename(const char *from, const char *to)
+{ if(fail_restore_rename){errno=EIO;return -1;}return rename(from,to); }
+static int restore_stat(const char *path,struct stat *st)
+{ if(fail_restore_stat){errno=EIO;return -1;}return stat(path,st); }
+#define rename restore_rename
+#define stat(...) restore_stat(__VA_ARGS__)
 /* INSERT_PRODUCTION_RESTORE */
+#undef rename
+#undef stat
 static void ords_drain_preserved_deferred(const char *stage,int error)
 { assert(!storage_lock);(void)stage;(void)error;faults++; }
 static int legacy_pending_load(void *context,lq_checkpoint_t *cp)
@@ -141,6 +150,26 @@ int main(void)
     assert(stat(PENDING_PATH,&st)!=0 && errno==ENOENT);
     assert(stat(PENDING_BACKUP_PATH,&st)!=0 && errno==ENOENT);
     assert(stat(PENDING_TMP_PATH,&st)!=0 && errno==ENOENT);
+    /* Retirement removes the settled active file, but a failed restore must
+     * not hide either retained generation behind a verified-empty cache. */
+    assert(append_line(PENDING_PATH,"settled-active"));
+    assert(append_line(PENDING_BACKUP_PATH,"retained-backup"));
+    assert(append_line(PENDING_TMP_PATH,"retained-temporary"));
+    fail_restore_rename=true;prior=requests;
+    oracle_drain_pending(true);
+    assert(requests==prior+1 && !g_legacy_pending.empty_cached);
+    assert(stat(PENDING_PATH,&st)!=0 && !stat(PENDING_BACKUP_PATH,&st) && !stat(PENDING_TMP_PATH,&st));
+    oracle_drain_pending(true);
+    assert(requests==prior+1 && !g_legacy_pending.empty_cached && !storage_lock && !gate_lock);
+    fail_restore_rename=false;
+    oracle_drain_pending(true);oracle_drain_pending(true);
+    assert(requests==prior+3 && stat(PENDING_PATH,&st)!=0 && stat(PENDING_BACKUP_PATH,&st)!=0 && stat(PENDING_TMP_PATH,&st)!=0);
+    /* Inaccessibility is not absence and cannot authorize a read/send. */
+    assert(append_line(PENDING_PATH,"stat-held"));prior=requests;fail_restore_stat=true;
+    oracle_drain_pending(true);
+    assert(requests==prior && !g_legacy_pending.empty_cached && !stat(PENDING_PATH,&st));
+    fail_restore_stat=false;oracle_drain_pending(true);
+    assert(requests==prior+1 && stat(PENDING_PATH,&st)!=0 && !storage_lock && !gate_lock);
     assert(dq_append(&segmented,"segmented",9)==DQ_OK);
     unsigned prior_faults=faults;
     peek_pending=true;

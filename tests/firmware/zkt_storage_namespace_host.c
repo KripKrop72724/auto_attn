@@ -23,6 +23,8 @@ static uint8_t g_seen_occupied[SEEN_UID_CAPACITY];
 static uid_cache_t g_seen_cache;
 static char mounted[64], journal_prefix[128];
 static unsigned legacy_reads;
+static bool pending_restored = true, blocked_restored = true, backlog;
+static unsigned storage_faults;
 static int xSemaphoreCreateMutex(void) { return 1; }
 static void *heap_caps_calloc(size_t count, size_t bytes, unsigned flags)
 { assert(flags == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)); return calloc(count, bytes); }
@@ -36,12 +38,12 @@ static bool in_mount(const char *path)
 { return mounted[0] && !strncmp(path, mounted, strlen(mounted)) && path[strlen(mounted)] == '/'; }
 static bool storage_upgrade_init(void) { return true; }
 bool qs_init(void) { return true; }
-static void restore_pending_backup_if_needed(void) { assert(mounted[0]); }
-static bool restore_blocked_backup_if_needed(void) { return mounted[0] != 0; }
+static bool restore_pending_backup_if_needed(void) { assert(mounted[0]); return pending_restored; }
+static bool restore_blocked_backup_if_needed(void) { assert(mounted[0]); return blocked_restored; }
 static void load_seen_from_file(const char *path) { assert(in_mount(path)); ++legacy_reads; }
 static bool file_has_nonempty_line(const char *path) { assert(in_mount(path)); return false; }
-static void led_status_set_backlog(bool backlog) { assert(!backlog); }
-static void led_status_fault(int code) { (void)code; assert(false); }
+static void led_status_set_backlog(bool pending) { backlog = pending; }
+static void led_status_fault(int code) { assert(code == LED_STATUS_LOCAL_FAILURE); ++storage_faults; }
 bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
 {
     assert(in_mount(prefix) && metadata && !strcmp(metadata->terminal_serial, "SYNTHETIC-TERMINAL"));
@@ -51,12 +53,20 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
 int main(void)
 {
     storage_init(); /* Actual boot function records the actual VFS mount. */
-    assert(g_queue_store_ready && g_seen_lock && legacy_reads == 3);
+    assert(g_queue_store_ready && g_seen_lock && legacy_reads == 3 && !backlog && !storage_faults);
     assert(start_owner(NULL, "SYNTHETIC-TERMINAL")); /* Actual runtime adapter. */
     assert(!strcmp(mounted, ZJ_DEVICE_DIRECTORY)); /* OTA evidence directory. */
     assert(!strcmp(journal_prefix, ZJ_DEVICE_PREFIX));
     const char *paths[] = {PENDING_PATH, BLOCKED_PATH, ACKED_PATH, ZC_ACTIVE_PATH,
         ZC_COMMAND_ACTIVE_PATH, ZI_PROCESSED_PATH, ZI_CANCELLED_PATH};
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) assert(in_mount(paths[i]));
+    free(g_seen_cache.keys);
+    pending_restored = false;
+    storage_init();
+    assert(backlog && storage_faults == 1); /* Later file probing cannot erase the failed restore. */
+    free(g_seen_cache.keys);
+    pending_restored = true; blocked_restored = false;
+    storage_init();
+    assert(backlog && storage_faults == 2);
     free(g_seen_cache.keys);
 }
