@@ -140,10 +140,26 @@ or infer Oracle completion from a checkpoint.
 The low-level library cannot establish whether externally missing files were
 physically lost. Physical fault qualification remains separate.
 
-The ESP adapter currently owns journal operations only. Catalog and legacy
+The ESP adapter owns journal, catalog and runtime-checkpoint operations. Legacy
 queue ownership, capture/delivery qualification, signed bridge integration,
 delivery matching and current-incident recovery must be integrated and tested
 before activation. Existing firmware behavior remains gated until then.
+
+The transport drives at most eight state transitions and one network exchange
+per task activation, checking a two-millisecond cooperative budget between
+operations. An incomplete owner poll or pending retry delay ends the activation.
+The task always yields at least one scheduler tick, and publishes the current
+phase before entering each operation so a blocked send stays observable. A
+single port call retains its own deadline; this budget cannot interrupt it.
+
+Failure backoff and the verified-empty poll delay remain in force. A reclaim
+operation returning no deletable segment does not prove the journal empty: after
+a receipt, the transport checks the next record without an artificial 250-ms
+pause. This removes fixed per-transition and per-record sleeps during catch-up.
+It does not establish network throughput, live priority during a retained
+backlog, or the 24-hour drain target; those still require integrated work and
+qualification. Host fault tests cover exact replay, failed retirement, owner
+stalls, bounded activations, monotonic wrap and continued empty-poll caching.
 
 ## Durable reader capability
 
