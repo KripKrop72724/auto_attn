@@ -17,6 +17,14 @@ typedef struct {
     uint64_t sampled_uptime_us, operation_started_us, progress_uptime_us;
     uint64_t completed, refused, failures, max_operation_us;
     unsigned occupied, high_watermark;
+    /* RAM catalog measurements, published only at owner boundaries. An empty
+     * result is invalidated by append admission and recovery. Nonempty record
+     * counts are deliberately unknown until a qualified index exists. */
+    unsigned pending_appends, journal_segments;
+    uint64_t journal_bytes;
+    bool inventory_known, verified_empty, append_observed;
+    zj_result_t last_append_result;
+    uint64_t last_append_uptime_us;
     int filesystem_error, nvs_error;
     const char *failed_operation;
 } zj_owner_health_t;

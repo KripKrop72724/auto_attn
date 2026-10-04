@@ -23,6 +23,7 @@ program = r'''
 #include "cJSON.h"
 #include "queue_store.h"
 #include "zkt_journal_boot.h"
+#include "zkt_journal_diagnostics.h"
 #define ESP_OK 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
@@ -37,13 +38,23 @@ static size_t calls,fail_at;
 static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n);}
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
-static int64_t monotonic_ms(void){return 5000;}
-static uint32_t now_ms(void){return 5000;}
+static uint64_t sample_clock=5000;
+static int64_t monotonic_ms(void){return (int64_t)sample_clock;}
+static uint32_t now_ms(void){return (uint32_t)sample_clock;}
+static int64_t esp_timer_get_time(void){return (int64_t)sample_clock*1000;}
 static zj_boot_mode_t configured_mode=ZJ_BOOT_BRIDGE;
 static bool observed=true;
 static zj_boot_t health={.mode=ZJ_BOOT_BRIDGE,.phase=ZJ_BOOT_READY,.delivery_authority=ZJ_AUTHORITY_LEGACY,.reader_ready=true,.sampled_ms=4000,.owner_starts=1,.transport_starts=1};
 static zj_boot_mode_t mode(void){return configured_mode;}
 static bool zj_runtime_health(zj_boot_t *out){*out=health;return observed;}
+static bool owner_observed=true, transport_observed=true, capture_observed=true;
+static zj_owner_health_t owner={.started=true,.ready=true,.sampled_uptime_us=4000000,
+ .inventory_known=true,.verified_empty=true};
+static zj_transport_health_t transport={.started=true,.sampled_ms=4000};
+static zj_capture_health_t capture={.sampled_ms=4000};
+bool zj_owner_health(zj_owner_health_t *out){*out=owner;return owner_observed;}
+bool zj_transport_health(zj_transport_health_t *out){*out=transport;return transport_observed;}
+static bool zj_capture_runtime_health(zj_capture_health_t *out){*out=capture;return capture_observed;}
 static const char s_boot_id[]="allocation-test-boot";
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
@@ -60,9 +71,21 @@ static int *s_outbox_task_handle=&held;
 static uint32_t s_outbox_tick_ms=4000,s_ords_worker_tick_ms=4000;
 static bool s_outbox_buffer_ready=true,s_ords_worker_started=true;
 static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_worker_operation=ADD_WORKER_NETWORK;
-qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,.admission_reserve_bytes=1048576,.last_error=EIO,.last_operation="local_write_commit"};}
+static bool legacy_healthy;
+qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,
+ .recovery_complete=legacy_healthy,.persistence_verified=legacy_healthy,
+ .admission_reserve_bytes=1048576,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit"};}
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
 ''' + runtime_function + functions + r'''
+static cJSON *named(cJSON *array,const char *name){
+ cJSON *item; cJSON_ArrayForEach(item,array){
+  cJSON *key=cJSON_GetObjectItemCaseSensitive(item,"name");
+  if(cJSON_IsString(key)&&!strcmp(key->valuestring,name))return item;
+ }return NULL;
+}
+static const char *string(cJSON *object,const char *key){
+ cJSON *value=cJSON_GetObjectItemCaseSensitive(object,key);assert(cJSON_IsString(value));return value->valuestring;
+}
 static void check_ownership(const char *profile,const char *authority,bool writer){
  fail_at=0;cJSON *payload=cJSON_CreateObject();assert(payload);calls=0;
  append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");size_t total=calls;
@@ -71,6 +94,12 @@ static void check_ownership(const char *profile,const char *authority,bool write
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"delivery_authority")->valuestring,authority));
  cJSON *runtime=cJSON_GetObjectItemCaseSensitive(diagnostics,"journal_runtime");assert(runtime);
  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(runtime,"writer_ready"))==writer);
+ cJSON *workers=cJSON_GetObjectItemCaseSensitive(diagnostics,"workers");
+ assert(named(workers,"add_delivery"));
+ if(!strcmp(profile,"ZKT_JOURNAL_V1")){
+  assert(cJSON_GetArraySize(workers)==5 && named(workers,"capture") && named(workers,"storage_owner"));
+  assert(named(workers,"legacy_add_delivery") && named(workers,"legacy_ords_delivery") && !named(workers,"ords_delivery"));
+ }
  cJSON_Delete(payload);
  for(size_t i=1;i<=total;i++){
   fail_at=0;payload=cJSON_CreateObject();assert(payload);calls=0;fail_at=i;
@@ -94,7 +123,7 @@ int main(void){
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
- cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==9);
+ cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==11);
  cJSON *unknown=cJSON_GetArrayItem(queues,2+QS_BLOCKED);assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(unknown,"count_known")));
  assert(!cJSON_HasObjectItem(unknown,"records"));cJSON_Delete(payload);
  for(size_t i=1;i<=total;i++){
@@ -128,6 +157,55 @@ int main(void){
  check_ownership("ZKT_JOURNAL_V1","UNKNOWN",false);
  configured_mode=health.mode=ZJ_BOOT_DISABLED;
  check_ownership("ZKT_LEGACY","LEGACY_DUAL",false);
+ /* Actual serialization of idle, failed, stale and wrapping snapshots. */
+ configured_mode=health.mode=ZJ_BOOT_WRITER;health.delivery_authority=ZJ_AUTHORITY_ADD;
+ health.writer_ready=health.capture_started=true;health.phase=ZJ_BOOT_READY;health.sampled_ms=4000;
+ legacy_healthy=true;
+ for(unsigned scenario=0;scenario<13;scenario++){
+  sample_clock=5000;
+  owner=(zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=4000000,
+   .inventory_known=true,.verified_empty=true};
+  capture=(zj_capture_health_t){.sampled_ms=1}; /* Quiet site is not a stalled capture task. */
+  transport=(zj_transport_health_t){.started=true,.sampled_ms=4000};
+  owner_observed=true;
+  if(scenario==1){owner.append_observed=true;owner.last_append_result=ZJ_FULL;}
+  if(scenario==2){owner_observed=false;}
+  if(scenario==3){owner.operation_running=true;owner.operation_started_us=1;owner.sampled_uptime_us=6000000;}
+  if(scenario==4){owner.pending_appends=1;}
+  if(scenario==5){capture.running=true;capture.started_ms=5000U-15000U;}
+  if(scenario==6){transport.delivery.phase=ZJ_DELIVERY_SEND;transport.delivery.phase_started_ms=5000U-20000U;}
+  if(scenario==7){owner.failures=7;owner.filesystem_error=EIO;owner.failed_operation="old_sync";}
+  if(scenario==8){transport.delivery.phase=ZJ_DELIVERY_WAIT;transport.delivery.phase_started_ms=4000;}
+  if(scenario==9){transport.delivery.consecutive_failures=2;transport.delivery.last_failure="add_custody";}
+  if(scenario==10){sample_clock=25000;owner.sampled_uptime_us=24000000;owner.operation_running=true;owner.operation_started_us=10000000;}
+  if(scenario==11){transport.sampled_ms=5000U-45000U;}
+  if(scenario==12){sample_clock=(uint64_t)UINT32_MAX+5000;owner.sampled_uptime_us=(sample_clock-1000)*1000;capture.sampled_ms=UINT32_MAX-999;}
+  payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
+  diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+  storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
+  cJSON *workers=cJSON_GetObjectItemCaseSensitive(diagnostics,"workers");
+  queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");
+  cJSON *journal=named(queues,"journal"),*migration=named(queues,"legacy_migration");assert(journal&&migration);
+  assert(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(migration,"count_known")) && !cJSON_HasObjectItem(migration,"records"));
+  assert(!strcmp(string(storage,"durability"),scenario==1?"FULL":scenario==2||scenario==3?"UNKNOWN":scenario==10?"DEGRADED":"HEALTHY"));
+  if(scenario==4)assert(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"count_known"))&&!cJSON_HasObjectItem(journal,"records"));
+  if(scenario==5)assert(!strcmp(string(named(workers,"capture"),"state"),"FAULT"));
+  if(scenario==6)assert(!strcmp(string(named(workers,"add_delivery"),"state"),"FAULT"));
+  if(scenario==8)assert(!strcmp(string(named(workers,"add_delivery"),"state"),"RUNNING"));
+  if(scenario==9)assert(!strcmp(string(named(workers,"add_delivery"),"state"),"WAITING_NETWORK"));
+  if(scenario==10)assert(!strcmp(string(named(workers,"storage_owner"),"state"),"FAULT"));
+  if(scenario==11)assert(!strcmp(string(named(workers,"add_delivery"),"state"),"FAULT"));
+  if(scenario==12)assert(cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"last_activity_uptime_ms")->valuedouble==(double)(UINT32_MAX-999));
+  if(!scenario){
+   assert(!strcmp(string(named(workers,"capture"),"state"),"RUNNING"));
+   assert(!strcmp(string(named(workers,"capture"),"execution_model"),"ON_DEMAND"));
+   assert(cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"last_activity_uptime_ms")->valueint==1);
+   assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"count_known")));
+   assert(cJSON_GetObjectItemCaseSensitive(journal,"records")->valueint==0);
+  }
+  cJSON_Delete(payload);
+  check_ownership("ZKT_JOURNAL_V1","ADD",true);
+ }
  puts("diagnostics allocation regressions passed");
 }
 '''
@@ -141,5 +219,6 @@ with tempfile.TemporaryDirectory() as directory:
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(cjson), "-I", str(firmware),
                     str(unit), str(cjson / "cJSON.c"), str(firmware / "zkt_journal_boot.c"),
                     str(firmware / "zkt_journal_compat.c"), str(firmware / "durable_queue.c"),
+                    str(firmware / "zkt_journal_diagnostics.c"),
                     "-lm", "-o", str(executable)], check=True)
     subprocess.run([str(executable)], cwd=temporary, check=True)

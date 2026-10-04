@@ -451,12 +451,16 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < 2000 && !atomic_load(&write_waiting); ++i) vTaskDelay(1);
     assert(atomic_load(&write_waiting));
     assert(zj_owner_health(&health) && health.operation_running && health.occupied == 1);
+    assert(!health.inventory_known && !health.verified_empty && health.pending_appends == 1);
     assert(zj_owner_abandon(ticket));
     atomic_store(&pause_write, false);
     request.operation = ZJ_PEEK;
     assert(zj_owner_submit(&request, &ticket));
     zj_reply_t reply = wait_reply(ticket);
     assert(reply.result == ZJ_OK && reply.item.kind == ZJ_OBSERVATION && reply.item.observation.raw[0] == 'A');
+    assert(zj_owner_health(&health) && health.inventory_known && !health.verified_empty &&
+        health.journal_bytes > ZJ_META_BYTES && health.journal_segments == 1 && !health.pending_appends);
+    assert(health.append_observed && health.last_append_result == ZJ_OK);
 
     atomic_store(&full, true);
     zj_token_t token = reply.item.token;
@@ -468,6 +472,7 @@ int main(int argc, char **argv)
     assert(zj_owner_submit(&request, &ticket));
     reply = wait_reply(ticket);
     assert(reply.result == ZJ_FULL && !reply.capture_sequence);
+    assert(zj_owner_health(&health) && health.last_append_result == ZJ_FULL);
     request.operation = ZJ_SETTLE;
     request.input.settlement.token = token;
     memset(request.input.settlement.receipt_digest, 1, 32);
@@ -488,6 +493,8 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && !health.occupied && !health.operation_running);
     assert(health.completed == gating_operations + 7 && health.failures == gating_failures + 1 &&
         health.max_operation_us && health.ready);
+    assert(health.inventory_known && health.verified_empty && !health.journal_bytes && !health.journal_segments);
+    assert(health.last_append_result == ZJ_FULL); /* Reads/reclamation cannot clear an append fault. */
     /* Runtime writes work without journal writer permission or free SPIFFS
      * space, and execute only on the storage owner under its shared lock. */
     runtime_checkpoint_t runtime = {.version = 1, .generation = 1, .history_schema = 2,
@@ -520,6 +527,7 @@ int main(int argc, char **argv)
     assert(zj_owner_abandon(queued_ticket));
     assert(!zj_owner_quiesce());
     assert(zj_owner_health(&health) && health.quiescing && !health.quiesced && health.operation_running);
+    assert(health.pending_appends == 2 && !health.verified_empty && !health.inventory_known);
     uint64_t refused_ticket = 99;
     assert(!zj_owner_submit(&final_capture, &refused_ticket) && !refused_ticket);
     atomic_store(&pause_write, false);
@@ -529,6 +537,7 @@ int main(int argc, char **argv)
     assert(zj_owner_health(&health) && health.quiesced && !health.operation_running &&
         !health.writer_allowed && !health.compatibility_checked && health.completed == before_quiesce + 3);
     assert(runtime_writes == 2 && runtime_blob.generation == 2);
+    assert(health.last_append_result == ZJ_OK && !health.verified_empty && !health.pending_appends);
     assert(!zj_owner_submit(&final_checkpoint, &refused_ticket));
     assert(!zj_owner_submit(&compatibility, &refused_ticket));
     vTaskDelay(10);

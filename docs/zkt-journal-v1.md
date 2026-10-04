@@ -287,3 +287,40 @@ integration-test switch remains off in release workflows. Raw writer startup
 requires persisted reader compatibility and the runtime permission must still
 be fresh for each packet. An unready writer refuses live ACK without silently
 falling back to legacy delivery.
+
+## Journal diagnostics
+
+Exact bridge/writer images report the actual storage-owner, capture and journal
+ADD-transport snapshots. After custody authority transfers, retained delivery
+workers are named `legacy_add_delivery` and `legacy_ords_delivery`; the required
+`add_delivery` worker is the journal transport. The initial bridge retains its
+legacy runtime profile and reports the journal reader as `journal_add_delivery`.
+Hikvision's worker set is unchanged. HIL accepts only the profile's required
+workers and its explicitly enumerated auxiliary workers, without duplicates.
+
+Capture runs synchronously in the terminal-session owner. It reports
+`execution_model: ON_DEMAND`, the time its snapshot was read, the actual last
+activity and an in-flight operation start. An idle site does not need invented
+capture progress; an operation exceeding its 15-second deadline fails freshness
+checks. Task workers continue to report actual execution ticks. A stuck owner
+operation or ADD send has a separate deadline even when its snapshot is readable.
+These checks report stalls without restarting a task that might own a lock.
+
+`journal_storage` distinguishes current readiness, checkpoint recovery and the
+last append result from historical error totals. Only a subsequent completed
+append replaces an append failure; a successful read, reclamation, runtime
+checkpoint or optional operation cannot clear it. General durability can be
+downgraded by journal evidence and cannot be promoted over a legacy storage
+incident. ADD and HIL independently require fresh journal preservation evidence.
+`UNKNOWN` custody authority remains accepted telemetry, but cannot satisfy the
+strict runtime contract or clear a worker incident.
+
+Queue bytes and segment counts come from the owner's bounded RAM catalog, never
+a heartbeat filesystem scan. A zero count requires a successful empty peek,
+current recovery, no in-flight operation and no admitted append. Admission,
+execution and recovery invalidate that result; the snapshot also checks queued
+appends under the mailbox lock to cover admission during a peek. Nonempty record
+counts remain unknown. `legacy_migration` remains explicitly unverified until
+the separate custody migration is implemented and proven, so these diagnostics
+cannot make a candidate pass that release gate. Byte counts include settled
+segments awaiting reclamation; they are not a seven-day capacity certificate.

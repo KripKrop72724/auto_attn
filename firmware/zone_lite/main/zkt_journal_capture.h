@@ -23,7 +23,7 @@ typedef struct {
 } zj_capture_facts_t;
 typedef struct {
     uint64_t pending_ticket, packets, fragments, failures, timeouts, first_sequence, last_sequence;
-    uint32_t started_ms, progress_ms;
+    uint32_t started_ms, progress_ms, sampled_ms;
     size_t committed_bytes;
     zj_result_t last_result;
     bool running;

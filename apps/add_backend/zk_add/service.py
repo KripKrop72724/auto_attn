@@ -608,7 +608,7 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
 
 def apply_firmware_diagnostics(session: Session, connector: Connector, payload: HeartbeatPayload,
                                *, sampled_at: datetime | None = None) -> None:
-    from zk_add.runtime_contract import runtime_contract
+    from zk_add.runtime_contract import journal_storage_status, runtime_contract, worker_snapshot_fresh
 
     diagnostics = payload.diagnostics
     evidence = diagnostics.model_dump(mode="json") if diagnostics else None
@@ -619,24 +619,31 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
     connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = utc_now() if diagnostics else None
     storage = diagnostics.storage if diagnostics else None
-    storage_failed = storage is not None and storage.durability in {"DEGRADED", "FULL"}
+    journal_status = journal_storage_status(evidence or {}, payload.uptime_seconds)
+    storage_failed = (storage is not None and storage.durability in {"DEGRADED", "FULL"}) or journal_status in {"DEGRADED", "FULL"}
     storage_verified = bool(storage and storage.durability == "HEALTHY"
-                            and storage.persistence_verified and storage.recovery_complete)
+                            and storage.persistence_verified and storage.recovery_complete
+                            and journal_status in {None, "HEALTHY"})
     workers = diagnostics.workers if diagnostics else []
+    try:
+        runtime = runtime_contract(evidence or {}, connector.firmware_family or "zkt")
+    except ValueError:
+        # A recovering writer can legitimately report UNKNOWN authority.
+        # Preserve that diagnostic instead of rejecting the heartbeat, but
+        # never let an incomplete capability claim clear a worker incident.
+        runtime = None
     def activity_fresh(row) -> bool:
-        return (payload.uptime_seconds is not None and row.last_activity_uptime_ms is not None
-                # Firmware samples uptime before collecting the worker ticks.
-                # Allow that bounded collection delay as well as second truncation.
-                and -5_000 <= payload.uptime_seconds * 1000 - row.last_activity_uptime_ms <= 90_000)
+        return runtime is not None and worker_snapshot_fresh(row.model_dump(), payload.uptime_seconds, runtime)
 
     workers_failed = any(
         row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
         or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
         for row in workers
     )
-    required_workers = runtime_contract(evidence or {}, connector.firmware_family or "zkt").workers
     workers_verified = (
-        {row.name for row in workers} >= required_workers
+        runtime is not None and {row.name for row in workers} >= runtime.workers
+        and {row.name for row in workers} <= runtime.workers | runtime.auxiliary_workers
+        and len({row.name for row in workers}) == len(workers)
         and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
     )
     for code, failed, verified, message in (

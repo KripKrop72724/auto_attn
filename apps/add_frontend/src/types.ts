@@ -119,6 +119,7 @@ export interface ZktDevice {
 
 export interface FirmwareDiagnostics {
   schema_version: 1 | 2
+  runtime_profile?: 'ZKT_LEGACY' | 'HIKVISION_V1' | 'ZKT_JOURNAL_V1' | null
   boot_id?: string | null
   sample_sequence?: number | null
   sampled_at?: string | null
@@ -139,6 +140,23 @@ export interface FirmwareDiagnostics {
     sampled_uptime_ms?: number | null
     last_progress_uptime_ms?: number | null
     compatibility?: string | null
+  } | null
+  journal_storage?: {
+    observed: boolean
+    fresh: boolean
+    ready: boolean
+    durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
+    checkpoint_recovery_pending: boolean
+    mailbox_capacity: number
+    mailbox_high_watermark: number
+    pending_appends: number
+    sampled_uptime_ms?: number | null
+    segments?: number | null
+    last_append_result?: string | null
+    last_append_uptime_ms?: number | null
+    last_failure_operation?: string | null
+    last_filesystem_error?: number | null
+    last_nvs_error?: number | null
   } | null
   storage?: {
     upgrade_contract?: string | null
@@ -165,6 +183,7 @@ export interface FirmwareDiagnostics {
     bytes?: number | null
     records?: number | null
     count_known: boolean
+    count_reason?: string | null
     oldest_pending_age_seconds?: number | null
     last_progress_uptime_ms?: number | null
   }>
@@ -175,6 +194,17 @@ export interface FirmwareDiagnostics {
     operation?: string | null
     restart_count?: number | null
     restart_attempts?: number | null
+    execution_model?: 'TASK' | 'ON_DEMAND'
+    sampled_uptime_ms?: number | null
+    last_progress_uptime_ms?: number | null
+    operation_started_uptime_ms?: number | null
+    pending_requests?: number | null
+    completed_operations?: number | null
+    failures?: number | null
+    consecutive_failures?: number | null
+    timeouts?: number | null
+    refusals?: number | null
+    max_operation_ms?: number | null
   }>
   reconciliation_mode?: string | null
   last_light_check_uptime_ms?: number | null
