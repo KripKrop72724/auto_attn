@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXACT_SHA}/check-runs?per_page=100")"
-          for required in repository-contract backend frontend firmware containers; do
+          for required in repository-contract windows-publication backend frontend firmware oracle-projection containers; do
             jq -e --arg name "$required" \
               '[.check_runs[] | select(.name == $name and .conclusion == "success")] | length > 0' \
               <<<"$checks" >/dev/null || {

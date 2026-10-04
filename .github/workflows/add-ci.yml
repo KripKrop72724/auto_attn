@@ -342,8 +342,23 @@ jobs:
             firmware/zone_lite/build-ci/zone_lite.bin
             firmware/zone_lite/build-ci/flasher_args.json
 
+  oracle-projection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile and execute the Oracle reader with synthetic data
+        run: |
+          python3 tests/oracle/oracle_test_container.py start --container zkt-oracle-ci
+          python3 tests/oracle/run_projection_checks.py --container zkt-oracle-ci
+      - name: Remove the isolated Oracle test database
+        if: always()
+        run: python3 tests/oracle/oracle_test_container.py stop --container zkt-oracle-ci
+
   containers:
-    needs: [repository-contract, windows-publication, backend, frontend, firmware]
+    needs: [repository-contract, windows-publication, backend, frontend, firmware, oracle-projection]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

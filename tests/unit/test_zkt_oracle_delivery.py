@@ -91,6 +91,16 @@ def store(tmp_path, monkeypatch, request):
     yield sessions
 
 
+def verification_response(check, classification):
+    matched = classification == "MATCH"
+    raw = matched or classification in {"DOWNSTREAM_PENDING", "DOWNSTREAM_HOLD", "IDENTITY_HOLD"}
+    downstream = ("RAW_ONLY" if check["projection"]["raw_punch"] == "T" else "MATCH") if matched else "NOT_VERIFIED"
+    return {"success": True, "contract_version": "2", "verification_scope": "ORACLE_RAW_DAY_TIMES_V2",
+        "request_digest": check["request_digest"], "results": [{"event_uid": check["projection"]["event_uid"],
+            "classification": classification, "current_content_token": "a" * 64,
+            "raw_projection_verified": raw, "downstream_status": downstream}]}
+
+
 def claim(store):
     values = worker.claim_ords_batch(10)
     assert len(values) == 1
@@ -140,8 +150,8 @@ def test_uid_membership_http_success_and_firmware_claim_cannot_complete_an_inten
         proof = db.scalar(select(ZktOracleContentReceipt))
         assert row.status == event.ords_status == "ACKED_CHECK"
         assert proof.payload_digest == value["payload_digest"] and proof.claim_attempt == value["attempt"]
-        assert proof.verification_scope == "ORACLE_RAW_CORE_V1"
-        assert event.oracle_confirmation_path == "ADD_ZKT_CORE_CHECK"
+        assert proof.verification_scope == "ORACLE_RAW_DAY_TIMES_V2"
+        assert event.oracle_confirmation_path == "ADD_ZKT_PROJECTION_V2"
         event.oracle_confirmed_at = row.acknowledged_at = utc_now() - timedelta(days=1)
         row.last_attempt_at = utc_now() - timedelta(days=2)
         db.commit()
@@ -283,12 +293,11 @@ def test_oracle_commit_then_lost_response_is_verified_before_retiring(store, mon
     checks = []
     posts = []
     async def request(_path, *, payload):
-        assert _path == "raw-captures/identity-repairs/check"
+        assert _path == "raw-captures/delivery-v2/check"
         checks.append(payload)
-        uid = payload["items"][0]["event_uid"]
+        uid = payload["projection"]["event_uid"]
         classification = "MATCH" if uid in oracle else "MISSING"
-        return {"success": True, "results": [{"event_uid": uid,
-            "classification": classification, "current_content_token": "a" * 64}]}
+        return verification_response(payload, classification)
     class Client:
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
@@ -323,9 +332,8 @@ def test_successful_post_without_verification_keeps_retry_and_never_reposts_a_ma
         checks += 1
         if checks == 2:
             raise RuntimeError("synthetic check outage after commit")
-        uid = payload["items"][0]["event_uid"]
-        return {"success": True, "results": [{"event_uid": uid,
-            "classification": "MATCH" if uid in oracle else "MISSING", "current_content_token": "a" * 64}]}
+        uid = payload["projection"]["event_uid"]
+        return verification_response(payload, "MATCH" if uid in oracle else "MISSING")
     class Client:
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
@@ -437,3 +445,89 @@ def test_split_retains_legacy_route_and_refuses_registration_of_legacy_identity(
     values = worker.claim_ords_batch(10)
     ordinary, content = delivery.split_claims(values)
     assert ordinary == values and not content
+
+
+@pytest.mark.parametrize("change", ["version", "scope", "request", "core_only", "raw_false", "raw_string", "pending_day", "wrong_raw_only"])
+def test_v2_rejects_weaker_wrong_request_and_partial_proof(store, monkeypatch, change):
+    value = claim(store)
+    response = verification_response(value["check"], "MATCH")
+    if change == "version":
+        response["contract_version"] = "1"
+    elif change == "scope":
+        response["verification_scope"] = "ORACLE_RAW_CORE_V1"
+    elif change == "request":
+        response["request_digest"] = "f" * 64
+    elif change == "core_only":
+        response.pop("verification_scope")
+    elif change == "raw_false":
+        response["results"][0]["raw_projection_verified"] = False
+    elif change == "raw_string":
+        response["results"][0]["raw_projection_verified"] = "true"
+    elif change == "pending_day":
+        response["results"][0]["downstream_status"] = "NOT_VERIFIED"
+    else:
+        response["results"][0]["downstream_status"] = "RAW_ONLY"
+    async def request(*_args, **_kwargs): return response
+    monkeypatch.setattr(delivery, "_ords_request", request)
+    assert asyncio.run(delivery.verify(value)) == ("UNKNOWN", None)
+
+
+@pytest.mark.parametrize("classification", ["DOWNSTREAM_PENDING", "DOWNSTREAM_HOLD", "IDENTITY_HOLD"])
+def test_raw_match_with_unfinished_day_never_posts_or_completes(store, monkeypatch, classification):
+    value = claim(store)
+    async def request(*_args, **_kwargs): return verification_response(value["check"], classification)
+    class ForbiddenClient:
+        def __init__(self, **_kwargs): pytest.fail("Preserved raw record was reposted")
+    monkeypatch.setattr(delivery, "_ords_request", request)
+    monkeypatch.setattr(delivery.httpx, "AsyncClient", ForbiddenClient)
+    asyncio.run(delivery.deliver([value], concurrency=1))
+    with store() as db:
+        row = db.scalar(select(OrdsOutbox))
+        assert row.status == ("FAILED_RETRYABLE" if classification == "DOWNSTREAM_PENDING" else "QUARANTINED_IDENTITY_CONFLICT")
+        assert row.last_error.endswith(classification if classification != "DOWNSTREAM_PENDING" else "DOWNSTREAM_VERIFICATION_PENDING")
+        assert not row.acknowledged_at and count(db, ZktOracleContentReceipt) == 0
+
+
+@pytest.mark.parametrize("drift, expected", [(None, None), (0, "0.000"), (1.2345, "1.235"), (-1.2345, "-1.235")])
+def test_projection_declares_precision_and_timezone_without_changing_original(store, drift, expected):
+    value = claim(store)
+    payload = dict(value["payload"], clockdiff=drift, timestamp="2026-10-01T09:23:45.123456+05:00")
+    check = delivery.projection_check(payload)
+    assert check["projection"]["clockdiff"] == expected
+    assert check["projection"]["timestamp"] == "2026-10-01T04:23:45.123456Z"
+    assert payload["timestamp"].endswith("+05:00") and payload["clockdiff"] == drift
+    assert {"status", "punch", "zone_name"}.isdisjoint(check["projection"])
+    assert set(delivery.PROJECTION_FIELDS) | {"clockdiff"} == set(check["projection"])
+
+
+@pytest.mark.parametrize("drift", [True, "NaN", "Infinity", "10000000", "9999999.9999"])
+def test_unrepresentable_clock_does_not_get_silently_truncated(store, drift):
+    value = claim(store)
+    with pytest.raises(delivery.EvidenceChanged, match="UNREPRESENTABLE"):
+        delivery.projection_check(dict(value["payload"], clockdiff=drift))
+
+
+@pytest.mark.parametrize("older_reader", [False, True])
+def test_frozen_verification_contract_cannot_be_silently_upgraded_or_downgraded(store, monkeypatch, older_reader):
+    from zk_add.crypto import encrypt_json
+    first = claim(store)
+    delivery.persist_result(first, "UNKNOWN")
+    legacy = {"contract_version": "1", "items": [{"event_uid": first["payload"]["event_uid"]}]}
+    if older_reader:
+        current = delivery._current
+        def older(session, intent, row):
+            event, payload, _ = current(session, intent, row)
+            return event, payload, legacy
+        monkeypatch.setattr(delivery, "_current", older)
+    else:
+        with store() as db:
+            db.scalar(select(ZktOracleIntent)).protected_check = encrypt_json(legacy)
+            db.commit()
+    with store() as db:
+        frozen = db.scalar(select(ZktOracleIntent)).protected_check
+    retry_now(store)
+    assert delivery.split_claims(worker.claim_ords_batch(10)) == ([], [])
+    with store() as db:
+        assert db.scalar(select(OrdsOutbox)).status == "QUARANTINED_IDENTITY_CONFLICT"
+        assert db.scalar(select(ZktOracleIntent)).protected_check == frozen
+        assert count(db, ZktOracleContentReceipt) == 0

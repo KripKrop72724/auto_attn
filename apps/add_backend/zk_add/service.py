@@ -4208,7 +4208,7 @@ def oracle_payload(connector: Connector, zkt: ZKTDevice, row: AttendanceEvent, c
         "user_id": row.user_id,
         "employee_name": row.display_name,
         "cnic": cnic,
-        "timestamp": row.device_event_time.isoformat().replace("+00:00", "Z"),
+        "timestamp": ensure_utc(row.device_event_time).isoformat().replace("+00:00", "Z"),
         "status": row.status,
         "punch": row.punch,
         "raw_punch": "T" if row.raw_punch else "F",

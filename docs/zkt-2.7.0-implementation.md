@@ -31,6 +31,7 @@ counts are kept outside this public repository.
 | Competing writes, empty legacy scans, recovery faults | Verified-empty legacy cache; compact AES-GCM journal, reserved nonces, append-only segments, receipt-bound retirement and bounded journal storage task; raw capture hooks before live/interleaved ACK | Actual filesystem fault injection, independent crypto vectors, NVS port faults, concurrent owner and capture harnesses | Partial: gated startup implemented; ESP qualification, catalog and legacy handoff remain open |
 | Runtime checkpoint writes compete with the storage task; a timed-out commit can reuse an old generation | Exact bridge/writer versions route runtime NVS through the owner, retain unfinished replies, allocate generations from actual NVS and verify committed readback | NVS failure and late-result injection, actual owner thread, corruption/capacity isolation and quiescence; gateway fallback refusal | Implemented component; legacy/catalog handoff, corrupt-lease recovery and physical qualification remain open |
 | Slow repeated identity reads in backlog previews | Connector-locked preview batches reuse shared identity evidence and fetch outboxes once; release and delivery revalidate without the preview cache | Mixed-record proof equality/query bound; next-transaction identity conflict; existing 100,000-row responsiveness test | Implemented; no manual jobs created or approved |
+| Oracle core-field check can miss changed zone/device/capture/clock/trust data or unfinished daily processing | Versioned full stored-raw projection and independently verified daily punch times; weaker responses and pending daily work cannot acknowledge delivery | SQLite/PostgreSQL replay/fencing regressions and an actual isolated Oracle compile/execution job with a 200,001-row synthetic retained set | Implemented component only; production 19c, ORDS and business-policy qualification remain open; field intents inactive |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
 | Rollback restores dual delivery for new punches | Irreversible ADD authority commits before sequence allocation; the validated bridge resumes raw journal capture after cutover; uncertain authority and disabled builds cannot fall back | Root/NVS commit/readback faults, actual owner, bridge boot/reboot, live dispatch and UI uncertainty checks | Implemented cutover component; legacy migration, full runtime telemetry and signed qualification remain open |
@@ -434,9 +435,11 @@ No connector has been upgraded or accepted by this implementation work.
 ADD-owned Oracle delivery now has a separate inactive component described in
 [`zkt-oracle-delivery.md`](zkt-oracle-delivery.md). It freezes encrypted payloads,
 retains the route across feature rollback, fences stale claims and commits a
-scoped Oracle content receipt atomically with completion. The existing checker
-proves only core raw attendance/identity fields (`ORACLE_RAW_CORE_V1`); the full
-Oracle projection, downstream processing and live qualification remain open.
+scoped Oracle content receipt atomically with completion. New intents require
+contract 2's stored raw projection and separate daily punch-time proof
+(`ORACLE_RAW_DAY_TIMES_V2`). The independent read-only Oracle package is supplied
+for review and synthetic CI; it is not installed by ADD deployment. Production
+19c, ORDS, downstream business-policy and live-delivery qualification remain open.
 No existing record is registered or rerouted by this component. Qualified
 canonical occurrence creation and backend rollback compatibility are required
 before activation.
