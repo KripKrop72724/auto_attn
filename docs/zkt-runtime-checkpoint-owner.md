@@ -47,7 +47,7 @@ missing state, exhausted generations, expired requests, lost polling, repeated
 timeouts, reentry, full storage, a corrupt journal and shutdown with queued work.
 The tests also verify that a new-image save cannot fall back to direct NVS.
 
-This is one storage-ownership component. Legacy queue and optional catalog
-handoff, corrupt-lease evidence recovery, enrollment reuse, physical power-cut
+This is one storage-ownership component. The [catalog owner handoff](zkt-bounded-file-transactions.md) is implemented in
+gated builds. Legacy queue/command handoff, corrupt-lease evidence recovery, enrollment reuse, physical power-cut
 testing, firmware resource/latency qualification and signed bridge qualification
 remain separate release requirements. Physical qualification is **NOT_PERFORMED**.

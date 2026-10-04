@@ -15,6 +15,7 @@ def test_catalog_replacement_keeps_committed_generation(tmp_path):
                         source.index("static bool persist_identity_catalog_locked(")]
     program = r'''
 #include "file_transaction.h"
+#define ZONE_LITE_HIKVISION 1
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

@@ -2,17 +2,19 @@
 #include "zkt_journal_store.h"
 #include "zkt_journal_compat.h"
 #include "runtime_checkpoint.h"
+#include "zkt_catalog_store.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
 typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
-    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT } zj_operation_t;
+    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
         zj_observation_t observation;
+        zc_request_t catalog;
         struct {
             zj_token_t token;
             uint8_t receipt_digest[32];
@@ -36,9 +38,14 @@ typedef struct {
     zj_result_t result;
     zj_compat_result_t compatibility;
     uint64_t capture_sequence;
-    zj_item_t item;
+    union {
+        zj_item_t item;
+        zc_reply_t catalog;
+    };
     runtime_checkpoint_t runtime_checkpoint;
 } zj_reply_t;
+_Static_assert(sizeof(zc_request_t) <= sizeof(zj_observation_t), "Catalog requests must fit the existing bounded request envelope");
+_Static_assert(sizeof(zc_reply_t) <= sizeof(zj_item_t), "Catalog replies must fit the existing bounded reply envelope");
 typedef enum { ZJ_SLOT_FREE, ZJ_SLOT_QUEUED, ZJ_SLOT_RUNNING, ZJ_SLOT_DONE } zj_slot_state_t;
 typedef struct {
     zj_slot_state_t state;
@@ -50,6 +57,8 @@ typedef struct {
 typedef struct {
     zj_request_slot_t slots[ZJ_REQUEST_SLOTS];
     uint64_t next_ticket, running_ticket, completed, refused;
+    uint64_t resume_ticket;
+    bool yield_to_other;
     unsigned occupied, high_watermark, priority_burst;
 } zj_mailbox_t;
 
@@ -61,6 +70,9 @@ void zj_mailbox_init(zj_mailbox_t *mailbox);
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket);
 bool zj_mailbox_begin(zj_mailbox_t *mailbox, zj_request_t *request, uint64_t *ticket);
 bool zj_mailbox_finish(zj_mailbox_t *mailbox, uint64_t ticket, const zj_reply_t *reply);
+/* Only resumable catalog work may yield. The copied input, ticket and caller
+ * abandonment survive; live work is scheduled before the next bounded step. */
+bool zj_mailbox_yield(zj_mailbox_t *mailbox, uint64_t ticket);
 bool zj_mailbox_poll(zj_mailbox_t *mailbox, uint64_t ticket, zj_reply_t *reply, bool *complete);
 /* Abandon only releases the reply. Accepted work still executes, including a
  * queued append. A caller retry must rely on source-occurrence deduplication. */

@@ -4,7 +4,9 @@ The existing synchronous catalog/command replacement API remains unchanged.
 `ft_work_begin` and `ft_work_step` provide an additional path for the single
 storage owner: verification reads at most 4,096 bytes in a call and closes every
 file before returning. The owner can schedule attendance work between calls.
-This component is not yet wired into catalog production or activation.
+Exact bridge and writer images route catalog staging, activation, deletion and
+transaction recovery through this owner. Legacy firmware and Hikvision retain
+their existing path.
 
 The caller owns the state and must serialize every mutation of the three
 distinct active, staging and backup paths until the operation finishes or is
@@ -35,7 +37,32 @@ handle after returning. These are software recovery tests. A filesystem or NVS
 primitive may still stall, including during SPIFFS garbage collection; the
 component does not establish a flash-latency percentile or power-cut guarantee.
 
-The remaining integration must give catalog writes/activation/recovery one
-owner, preserve the caller's timeout and retained-operation identity, prioritize
-live append/receipt work, and report optional catalog refusals independently.
-No bridge or writer release is enabled by this component.
+The owner's mailbox keeps the original catalog ticket queued between steps.
+Live appends and receipt checkpoints retain priority; later catalog mutations
+cannot overtake the transaction. Delivery reads and runtime checkpoints also
+receive turns between catalog steps, so the oldest catalog ticket cannot
+monopolize lower-priority work. Each producer gets a boot-local generation
+token and exact append offset. Writes copy at most 512 encrypted bytes per
+request; partial writes, flush/sync/close failures, altered lengths and stale
+tokens prevent activation. The mailbox still reserves three slots for live work.
+Resetting a retained optional producer can reclaim its space at the write
+ceiling; a new file still requires metadata admission. Failed producer cleanup
+keeps the original failure reason. Optional catalog admission or I/O failure
+does not mark attendance persistence
+as failed. Its result contains the captured operation/error.
+
+A command deadline is checked before its first operation. Accepted recovery or
+activation continues after the caller's wait expires, including after its reply
+is abandoned. The connector retains at most one unfinished reply, defers further
+catalog use until it is collected, and invalidates obsolete RAM aliases when an
+activation may have changed the active file. The regular supervisor collects
+late completions. Catalog requests never keep a filesystem handle or admission
+lock across a caller wait. The initial catalog restore can defer until the owner
+has started; the startup path cannot write catalog NVS independently.
+
+Catalog semantic readers still execute under the connector's catalog lock after
+an owner recovery/read barrier. They do not mutate files, and a pending owner
+activation blocks those reads. Moving the remaining legacy attendance queues
+and command persistence to the owner, measuring catalog latency under flash
+pressure, and qualifying all rollback/capacity paths remain open. No bridge or
+writer release is enabled by this implementation.
