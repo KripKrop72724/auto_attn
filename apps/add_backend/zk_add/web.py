@@ -481,15 +481,6 @@ def login(request: Request, body: LoginRequest, response: Response, db: Session 
         ip_address=client_ip(request),
         user_agent=request.headers.get("User-Agent"),
     )
-    response.set_cookie(
-        ADMIN_COOKIE,
-        raw,
-        httponly=True,
-        secure=settings.admin_cookie_secure,
-        samesite="strict",
-        max_age=settings.admin_session_absolute_seconds,
-        path="/",
-    )
     append_audit(
         db,
         actor=body.username,
@@ -498,6 +489,19 @@ def login(request: Request, body: LoginRequest, response: Response, db: Session 
         target_id=str(row.id),
         outcome="SUCCESS",
         ip_address=client_ip(request),
+    )
+    # Yield-dependency cleanup can run after the response has been sent.
+    # An immediate authenticated request must see both the session and audit;
+    # a failed commit must never issue a successful login cookie.
+    db.commit()
+    response.set_cookie(
+        ADMIN_COOKIE,
+        raw,
+        httponly=True,
+        secure=settings.admin_cookie_secure,
+        samesite="strict",
+        max_age=settings.admin_session_absolute_seconds,
+        path="/",
     )
     return {"ok": True, "username": row.username, "csrf_token": row.csrf_token}
 
@@ -512,7 +516,6 @@ def logout(
     row = db.get(AdminSession, context.row_id)
     if row:
         row.revoked_at = utc_now()
-    response.delete_cookie(ADMIN_COOKIE, path="/")
     append_audit(
         db,
         actor=context.username,
@@ -522,6 +525,10 @@ def logout(
         outcome="SUCCESS",
         ip_address=client_ip(request),
     )
+    # Successful logout means the old token is durably revoked, including
+    # requests on another connection immediately after this response.
+    db.commit()
+    response.delete_cookie(ADMIN_COOKIE, path="/")
     return {"ok": True}
 
 
