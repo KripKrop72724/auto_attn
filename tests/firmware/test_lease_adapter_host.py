@@ -10,12 +10,13 @@ def test_lease_command_adapter_preserves_revocation_obligation(tmp_path):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "zone_lite.c").read_text()
     clear = source[source.index("static bool temp_admin_clear(void)"):
-                   source.index("typedef struct {", source.index("static bool temp_admin_clear(void)"))]
+                   source.index("static bool temp_admin_clear_owned(")]
     persist = source[source.index("static bool temp_admin_persist("):
                      source.index("static bool temp_admin_write(")]
     execute = source[source.index("static bool execute_temp_admin_grant("):
                      source.index("static bool temp_admin_revoke_if_due(")]
     program = r'''
+#define ZONE_LITE_HIKVISION 1
 #include "lease_guard.h"
 #include <assert.h>
 #include <stdint.h>
@@ -29,13 +30,14 @@ static int64_t g_temp_admin_expires_epoch,clock_now=1800000000,mono_now=1000;
 static int64_t epoch_now(void){return clock_now;}
 static int64_t uptime_ms(void){return mono_now;}
 static unsigned writes,fail_at,mutations;
-static bool nvs_save_runtime_state(void){return ++writes!=fail_at;}
+static bool temp_admin_checkpoint(void){return ++writes!=fail_at;}
 typedef struct {int unused;} zk_context_t;
 typedef struct {int unused;} user_table_t;
 typedef struct {int duration_seconds;char uid[16];int64_t lease_expires_epoch;} add_command_t;
 typedef struct {int sock;zk_context_t *ctx;user_table_t *users;const add_command_t *command;} temp_admin_port_t;
 typedef struct {char terminal_identity_fingerprint[65],terminal_state_fingerprint[65];} zkt_user_t;
 static zkt_user_t row={"identity","state"};
+static bool temp_admin_prepare_binding(const zkt_user_t *user,uint16_t uid){assert(user==&row&&uid==7);return true;}
 static bool ensure_system_time_synced(void){return true;}
 static const zkt_user_t *find_user_by_uid(const user_table_t *t,uint16_t uid){(void)t;assert(uid==7);return &row;}
 static int64_t temp_admin_now(void *arg){(void)arg;return clock_now;}
@@ -85,10 +87,11 @@ def test_local_revocation_uses_monotonic_expiry_and_retains_failed_obligations(t
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "zone_lite.c").read_text()
     clear = source[source.index("static bool temp_admin_clear(void)"):
-                   source.index("typedef struct {", source.index("static bool temp_admin_clear(void)"))]
+                   source.index("static bool temp_admin_clear_owned(")]
     revoke = source[source.index("static bool temp_admin_revoke_if_due("):
-                    source.index("static bool process_add_commands(")]
+                    source.index("static bool temp_admin_command_held(")]
     program = r'''
+#define ZONE_LITE_HIKVISION 1
 #include "lease_guard.h"
 #include <assert.h>
 #include <stdio.h>
@@ -101,11 +104,13 @@ static bool connected=true,exists=true,commit=true,write_ok=true,apply=true;
 static unsigned reads,writes,saves;
 static int64_t epoch_now(void){return wall;}
 static int64_t uptime_ms(void){return monotonic;}
-static bool nvs_save_runtime_state(void){++saves;return commit;}
+static bool temp_admin_checkpoint(void){++saves;return commit;}
 typedef struct {int unused;} zk_context_t;
 typedef struct {int unused;} user_table_t;
 typedef struct {int privilege;} zkt_user_t;
 static zkt_user_t row={14};
+static bool temp_admin_evidence_ready(void){return true;}
+static bool temp_admin_identity_matches(const zkt_user_t *user){return user==&row;}
 static struct {int user_count,attendance_count;} g_add_zkt;
 static bool zk_get_counts(int sock,zk_context_t *ctx,int32_t *users,int32_t *records)
 {(void)sock;(void)ctx;++reads;*users=11;*records=22;return connected;}
