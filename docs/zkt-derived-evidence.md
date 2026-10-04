@@ -89,8 +89,14 @@ against a fresh database in an explicitly named local PostgreSQL container. Its
 default load is 17 synthetic connectors, ten single-item envelopes per second
 each, for 900 seconds. It uses 2,048 synthetic user references per connector,
 replays a committed response every 97 observations, and restarts the inspector
-object every five minutes. An independent emitter generates inputs during a
-hard 900-second window, using a bounded 150-item queue per connector. Receipt
+object every five minutes. A separately spawned Python process generates inputs
+during a hard 900-second window, using a bounded 150-item queue per connector.
+It confirms readiness before the measured window starts and shares the system's
+monotonic clock with the receipt workers. Backend execution, Python garbage
+collection and report serialization therefore do not share its interpreter lock.
+Fixed per-connector offered/taken counters track pending inputs without relying
+on platform-specific queue-size support. Emitter failure, startup failure or
+unfinished process shutdown cannot produce a passing result. Receipt
 waits and response replays cannot stop source arrivals. Queue refusal, missed
 input, emission lag exceeding one 100-ms interval, or an incomplete input set
 fails the offered-load gate. Already offered inputs have up to 15 seconds after
