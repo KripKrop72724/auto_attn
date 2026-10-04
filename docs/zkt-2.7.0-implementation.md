@@ -47,6 +47,7 @@ counts are kept outside this public repository.
 | Retained corrupt-file evidence bypasses the storage task | New-image quarantine reads and exact-receipt retirement use copied owner requests, existing NVS checkpoints and bounded prefix recovery | Actual production adapters and delivery slice, raw/binary/oversized tails, lost receipts/replies, NVS/read/close/stat/remove faults, empty cache and both family paths | Implemented evidence component; raw custody does not resolve identity or deliver attendance to Oracle |
 | Legacy Oracle and identity-blocked files still compete with capture | New-image producers, readers, identity recovery and retirement use the storage task; initial recovery is deferred from boot and yields between prefix slices | Actual adapter and gateway/Oracle/blocked consumers, unchanged checkpoint reader, surviving generations, failed writes/restores/checkpoints, exact receipt ordering, allocation faults and family isolation | Storage-owner component; complete migration records, incident recovery and measured ESP/catch-up qualification remain open |
 | Legacy read and retirement failures can be missing from shared health | Fixed per-queue read/append/retirement incidents, captured I/O errors, active versus recovered counts in ADD, and a HIL precondition | Actual queue adapters, shared health/probe/recovery functions, short reads and failed close/NVS/reclamation, partial retry, unrelated progress, ingestion and UI tests | Read faults recover only after a complete affected-queue retry; write/retirement proof and durable incident history remain open |
+| Maximum storage-task duration cannot establish capture p99 | Fixed-size capture-session histograms measure complete packet preservation and individual fragment submission-to-commit; ADD retains their counts and shows conservative p99 bounds separately from failures | Actual file-backed capture and queue waits, clock wrap, partial packets, counter exhaustion, allocation failures, heartbeat storage and stale/invalid UI evidence | Measurement component; per-occurrence latency, ESP performance, qualified windows and release acceptance remain open |
 | Development journal and OTA scan use an unmounted directory | Journal runtime and OTA evidence scans share the actual `/storage` boot mount constant | Production boot initialization and runtime adapter compare journal/OTA/catalog/command paths to the captured VFS mount | Integration defect corrected; signed-device boot and physical qualification remain open |
 | Identity lookup can expose a row before a later read or close fails | New-image catalog restoration, lookup and tombstone loading read copied owner chunks; lookup validates complete row counts and clears unresolved outputs | Actual consumer functions, every allocation site, late reads, changed revisions, extra/missing rows, truncated tails and legacy close failure | Implemented read component; ESP catalog latency and legacy custody migration stay open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
@@ -58,6 +59,23 @@ counts are kept outside this public repository.
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
 
 ## Required release evidence
+
+Capture latency schema 1 uses thirteen inclusive, non-cumulative millisecond
+buckets: 0, 1, 5, 10, 25, 50, 100, 250, 500, 1,000, 5,000, 15,000, and
+the remaining uint32 range. Packet timing starts at entry to raw preservation
+and ends after every fragment commits and temporary buffers are cleared.
+Fragment timing includes the owner submission and reply wait. It excludes
+terminal socket receipt before preservation, the capture runtime's entry lock,
+ADD transport, interpretation and Oracle work. Failed or uncertain operations
+do not become successful samples; their existing failure/timeout counters remain
+independent. Partial packets can contribute committed fragments but no complete
+packet sample. One millisecond is added to elapsed clock ticks to avoid
+understating time lost to the millisecond clock's truncation. Counters freeze
+visibly on exhaustion, and old capture snapshots
+do not publish a fresh histogram. Boot identity plus capture restart count binds
+each series; collectors must not join series or average percentiles. ADD's p99
+is a bucket upper bound, limited by the actual measured maximum. It is not a
+qualified per-attendance latency or a substitute for a timed workload test.
 
 The [source-load diagnostic](zkt-source-load-baseline.md) measures observed
 calendar-day and minute counts without using delivery attempts. It cannot turn

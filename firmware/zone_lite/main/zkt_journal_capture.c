@@ -8,6 +8,13 @@ static void put32(uint8_t *out, uint32_t value)
 static void wipe(void *data, size_t size)
 { volatile uint8_t *bytes = data; while (size--) *bytes++ = 0; }
 static uint32_t clock_ms(zj_capture_t *c) { return c->port.now_ms(c->port.context); }
+static uint32_t elapsed_upper_ms(uint32_t start, uint32_t end)
+{
+    uint32_t elapsed = end - start;
+    /* Both clock readings are truncated to milliseconds. Their difference
+     * can undercount by less than one millisecond; do not publish a low bound. */
+    return elapsed == UINT32_MAX ? elapsed : elapsed + 1;
+}
 static bool release_reply(zj_capture_t *c)
 {
     if (!c->health.pending_ticket) return true;
@@ -26,6 +33,7 @@ bool zj_capture_init(zj_capture_t *c, zj_capture_port_t port)
 }
 static bool append(zj_capture_t *c)
 {
+    uint32_t measured_start = clock_ms(c);
     uint64_t ticket = 0;
     if (!c->port.submit(c->port.context, &c->request, &ticket) || !ticket) {
         c->health.last_result = ZJ_FULL;
@@ -44,6 +52,8 @@ static bool append(zj_capture_t *c)
             c->health.last_sequence = c->reply.capture_sequence;
             ++c->health.fragments;
             c->health.progress_ms = clock_ms(c);
+            zj_capture_latency_record(&c->health.fragment_commit_latency,
+                elapsed_upper_ms(measured_start, c->health.progress_ms));
             return true;
         }
         if ((uint32_t)(clock_ms(c) - start) >= APPEND_DEADLINE_MS ||
@@ -119,5 +129,7 @@ done:
     wipe(&c->reply, sizeof(c->reply));
     wipe(group, sizeof(group));
     wipe(digest, sizeof(digest));
+    if (ok) zj_capture_latency_record(&c->health.packet_commit_latency,
+        elapsed_upper_ms(c->health.started_ms, clock_ms(c)));
     return ok;
 }

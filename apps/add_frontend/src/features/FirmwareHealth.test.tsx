@@ -18,6 +18,21 @@ const journal: NonNullable<FirmwareDiagnostics['journal_runtime']> = {
   proof_attempts: 3, failures: 7, sampled_uptime_ms: 40000, compatibility: 'READER_OK',
 }
 describe('firmware preservation evidence', () => {
+  it('keeps packet timing separate from failed attempts and stale or wrong-boot reports', () => {
+    const diagnostics: FirmwareDiagnostics = { ...healthy, sampled_uptime_ms: 100000, workers: [
+      { name: 'capture', state: 'RUNNING', last_activity_uptime_ms: 99000, failures: 3,
+        packet_commit_latency_ms: { schema_version: 1, samples: 100, max_ms: 900,
+          buckets: [0, 0, 0, 95, 0, 0, 0, 0, 4, 1, 0, 0, 0], saturated: false } }] }
+    const { rerender } = render(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()} diagnostics={diagnostics} />)
+    expect(screen.getByText('p99 ≤ 500 ms · 100 complete samples')).toBeTruthy()
+    expect(screen.getByText(/3 failures since boot/)).toBeTruthy()
+    expect(screen.getByText(/does not certify attendance delivery latency/)).toBeTruthy()
+    for (const altered of [{ ...diagnostics, sampled_uptime_ms: 200000 }, { ...diagnostics, boot_id: 'old' }]) {
+      rerender(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()} diagnostics={altered} />)
+      expect(screen.queryByText('p99 ≤ 500 ms · 100 complete samples')).toBeNull()
+      expect(screen.getAllByText('Current capture timing unverified')).toHaveLength(2)
+    }
+  })
   it.each(['legacy_read_faults', 'legacy_append_faults', 'legacy_retire_faults', 'legacy_error_code'] as const)('keeps an active %s separate from recovered history', field => {
     const diagnostics = { ...healthy, storage: { ...healthy.storage!, legacy_read_recoveries: 42,
       legacy_error_queue: 'ords_pending', legacy_error_operation: 'legacy_read', [field]: 1 } }

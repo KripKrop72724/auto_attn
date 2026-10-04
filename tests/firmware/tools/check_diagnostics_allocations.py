@@ -182,11 +182,16 @@ int main(void){
  configured_mode=health.mode=ZJ_BOOT_WRITER;health.delivery_authority=ZJ_AUTHORITY_ADD;
  health.writer_ready=health.capture_started=true;health.phase=ZJ_BOOT_READY;health.sampled_ms=4000;
  legacy_healthy=true;
- for(unsigned scenario=0;scenario<13;scenario++){
+ for(unsigned scenario=0;scenario<14;scenario++){
   sample_clock=5000;
   owner=(zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=4000000,
    .inventory_known=true,.verified_empty=true};
   capture=(zj_capture_health_t){.sampled_ms=1}; /* Quiet site is not a stalled capture task. */
+  for(unsigned i=0;i<100;i++){
+   zj_capture_latency_record(&capture.packet_commit_latency,i<99?251:900);
+   zj_capture_latency_record(&capture.fragment_commit_latency,10);
+  }
+  capture.packets=capture.fragments=100;capture.failures=3;capture.timeouts=1;
   transport=(zj_transport_health_t){.started=true,.sampled_ms=4000};
   owner_observed=true;
   if(scenario==1){owner.append_observed=true;owner.last_append_result=ZJ_FULL;}
@@ -201,10 +206,22 @@ int main(void){
   if(scenario==10){sample_clock=25000;owner.sampled_uptime_us=24000000;owner.operation_running=true;owner.operation_started_us=10000000;}
   if(scenario==11){transport.sampled_ms=5000U-45000U;}
   if(scenario==12){sample_clock=(uint64_t)UINT32_MAX+5000;owner.sampled_uptime_us=(sample_clock-1000)*1000;capture.sampled_ms=UINT32_MAX-999;}
+  if(scenario==13)capture.sampled_ms=5000U-45000U;
   payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
   diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
   storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
   cJSON *workers=cJSON_GetObjectItemCaseSensitive(diagnostics,"workers");
+  cJSON *timing=cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"packet_commit_latency_ms");
+  if(scenario==13)assert(!timing);
+  else{
+   assert(timing && cJSON_GetObjectItemCaseSensitive(timing,"schema_version")->valueint==1);
+   assert(cJSON_GetObjectItemCaseSensitive(timing,"samples")->valueint==100);
+   assert(cJSON_GetObjectItemCaseSensitive(timing,"max_ms")->valueint==900);
+   cJSON *bins=cJSON_GetObjectItemCaseSensitive(timing,"buckets");
+   assert(cJSON_GetArraySize(bins)==13 && cJSON_GetArrayItem(bins,8)->valueint==99 && cJSON_GetArrayItem(bins,9)->valueint==1);
+   assert(cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"failures")->valueint==3);
+   assert(cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"timeouts")->valueint==1);
+  }
   queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");
   cJSON *journal=named(queues,"journal"),*migration=named(queues,"legacy_migration");assert(journal&&migration);
   assert(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(migration,"count_known")) && !cJSON_HasObjectItem(migration,"records"));
