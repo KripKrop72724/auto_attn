@@ -43,3 +43,10 @@ bool zj_delivery_init(zj_delivery_t *delivery, zj_delivery_port_t port);
  * caller owns this state and must never run concurrent steps. No filesystem
  * handle or storage lock crosses the network port. */
 void zj_delivery_step(zj_delivery_t *delivery);
+/* Drive at most eight transitions and one network exchange. The two-ms
+ * cooperative budget is checked between operations; it cannot preempt an
+ * individual owner/network port call. Observe each phase before entering it
+ * so a blocked SEND remains visible. Return a suggested delay in ms; the
+ * task must always yield at least one scheduler tick. */
+uint32_t zj_delivery_pump(zj_delivery_t *delivery,
+    void (*observe)(const zj_delivery_t *delivery, void *context), void *context);

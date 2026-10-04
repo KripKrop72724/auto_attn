@@ -102,7 +102,10 @@ void zj_delivery_step(zj_delivery_t *d)
                 phase(d, ZJ_DELIVERY_SUBMIT_RECLAIM);
             } else if (d->reply.result == ZJ_EMPTY && d->health.pending_operation == ZJ_RECLAIM) {
                 if (d->verified_empty) d->health.consecutive_failures = 0;
-                idle(d, d->port.connected(d->port.context) ? 250 : 1000);
+                /* No reclaimable segment does not mean no pending records.
+                 * Only a verified empty PEEK permits the empty-queue delay. */
+                uint32_t delay = d->verified_empty ? 250 : 0;
+                idle(d, d->port.connected(d->port.context) ? delay : 1000);
             } else if (d->reply.result != ZJ_OK) {
                 failed(d, d->health.pending_operation == ZJ_SETTLE ? "retirement" : "journal_read_or_reclaim", d->reply.result);
                 retry(d);
@@ -166,4 +169,29 @@ void zj_delivery_step(zj_delivery_t *d)
             }
             break;
     }
+}
+
+uint32_t zj_delivery_pump(zj_delivery_t *d,
+    void (*observe)(const zj_delivery_t *, void *), void *context)
+{
+    if (!d || !d->initialized) return 100;
+    uint32_t started = now(d);
+    for (unsigned i = 0; i < 8; ++i) {
+        zj_delivery_phase_t before = d->health.phase;
+        if (observe) observe(d, context);
+        zj_delivery_step(d);
+        /* An incomplete poll, a refused abandonment, or an idle delay needs
+         * another task/clock advance. Never spin inside this activation. */
+        if (d->health.phase == before || before == ZJ_DELIVERY_SEND ||
+            (uint32_t)(now(d) - started) >= 2) break;
+    }
+    if (observe) observe(d, context);
+    if (d->health.phase == ZJ_DELIVERY_IDLE) {
+        uint32_t elapsed = now(d) - d->health.wait_started_ms;
+        if (elapsed < d->health.wait_ms) {
+            uint32_t remaining = d->health.wait_ms - elapsed;
+            return remaining < 100 ? remaining : 100;
+        }
+    }
+    return 1;
 }
