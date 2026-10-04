@@ -68,7 +68,20 @@ int main(void)
  cJSON_ReplaceItemInObjectCaseSensitive(reply,"schema_version",cJSON_CreateNumber(1));
  assert(!ota_progress_receipt_matches(reply,s_journal.deployment_id,"BOOTED_PENDING","2.6.16",s_running_image_digest));
  cJSON_Delete(reply);
+ response("ROLLED_BACK",s_journal.deployment_id,"writer-artifact-digest");
+ assert(!post_json("/progress",request,&status,"ROLLED_BACK"));
+ reply=cJSON_Parse(response_body);assert(reply);
+ cJSON_AddStringToObject(reply,"rollback_application_sha256","wrong-reader");
+ assert(!ota_progress_receipt_matches(reply,s_journal.deployment_id,"ROLLED_BACK","2.7.0",s_running_image_digest));
+ cJSON_ReplaceItemInObjectCaseSensitive(reply,"rollback_application_sha256",cJSON_CreateString(s_running_image_digest));
+ char *encoded=cJSON_PrintUnformatted(reply);assert(encoded);strcpy(response_body,encoded);free(encoded);cJSON_Delete(reply);
+ assert(post_json("/progress",request,&status,"ROLLED_BACK"));
  cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
+ for(unsigned point=1;point<120;++point){
+  allocations=0;fail_at=point;bool ok=post_json("/progress",request,&status,"ROLLED_BACK");
+  assert(!ok || allocations<point);
+ }
+ response("BOOTED_PENDING",s_journal.deployment_id,s_running_image_digest);
  for(unsigned point=1;point<120;++point){
   allocations=0;fail_at=point;bool ok=post_json("/progress",request,&status,"BOOTED_PENDING");
   assert(!ok || allocations<point);

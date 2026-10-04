@@ -38,6 +38,7 @@ static ota_journal_t s_journal,durable;
 static char s_last_error[64];
 static unsigned s_boot_health_checks,reports,saves,marked,rollbacks,remote_state,fail_save,fail_report;
 static bool s_boot_health_last_ready,local_ready=true,network,legacy_ready=true,lost_response,actual_valid,fail_mark;
+static bool s_failed_boot_pending;
 static uint64_t now_us;
 static const esp_app_desc_t *esp_app_get_description(void){return &app;}
 static int64_t esp_timer_get_time(void){return now_us;}
@@ -66,6 +67,7 @@ static void reset(void)
     strcpy(s_journal.target_version,"2.7.0");strcpy(s_journal.state,"READY_TO_BOOT");durable=s_journal;
     reports=saves=marked=rollbacks=remote_state=fail_save=fail_report=s_boot_health_checks=0;
     local_ready=legacy_ready=true;network=false;lost_response=actual_valid=fail_mark=false;now_us=0;
+    s_failed_boot_pending=false;
     strcpy(app.project_name,"zone_lite");strcpy(app.version,"2.7.0");
 }
 int main(void)
@@ -96,7 +98,7 @@ int main(void)
         assert(confirm_or_report_rollback() && marked==1 && remote_state==2);
     }
     reset();local_ready=false;legacy_ready=false;
-    assert(!confirm_or_report_rollback() && !marked && rollbacks==1);
+    assert(!confirm_or_report_rollback() && !marked && !rollbacks && s_failed_boot_pending);
     assert(now_us>=OTA_BOOT_CONFIRM_SECONDS*1000000ULL);
     reset();strcpy(app.version,"2.6.16");strcpy(s_journal.target_version,"2.6.16");durable=s_journal;
     assert(uses_local_boot_confirmation() && !confirm_or_report_rollback());

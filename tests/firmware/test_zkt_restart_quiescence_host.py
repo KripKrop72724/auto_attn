@@ -47,6 +47,10 @@ static bool s_ota_restart_claimed,s_terminal_session_active,body_finished;
 static unsigned fail_locks,delays,bodies;
 static char s_activity[32]="LIVE_CAPTURE";
 static struct {bool online;char connection_state[32];} s_zkt={true,"ONLINE"};
+#define ZJ_WRITER_VERSION "2.7.0"
+typedef struct {char project_name[32],version[32];} esp_app_desc_t;
+static esp_app_desc_t app={"zone_lite","2.7.0"};
+static const esp_app_desc_t *esp_app_get_description(void){return &app;}
 static int xSemaphoreTake(int *lock,int timeout)
 {(void)timeout;assert(lock==&mutex && !mutex);if(fail_locks){--fail_locks;return 0;}mutex=1;return pdTRUE;}
 static void xSemaphoreGive(int *lock){assert(lock==&mutex&&mutex);mutex=0;}
@@ -93,6 +97,15 @@ int main(void)
     assert(!add_connector_terminal_restart_pending());
     s_zkt.online=false;assert(!add_connector_claim_ota_restart()&&!s_ota_restart_claimed);s_zkt.online=true;
     strcpy(s_activity,"RECONCILING");assert(!add_connector_claim_ota_restart()&&!s_ota_restart_claimed);
+    s_zkt.online=false;strcpy(app.version,"2.6.16");
+    assert(!add_connector_claim_failed_boot_restart()&&!s_ota_restart_claimed);
+    strcpy(app.version,"2.7.0");fail_locks=1;
+    assert(!add_connector_claim_failed_boot_restart()&&!s_ota_restart_claimed);
+    assert(add_connector_terminal_session_begin());
+    assert(!add_connector_claim_failed_boot_restart()&&s_ota_restart_claimed);
+    assert(!add_connector_terminal_session_begin());
+    assert(add_connector_terminal_session_end()&&add_connector_claim_failed_boot_restart());
+    s_zkt.online=true;
     reset();assert(gateway_run(7)==17);finished();assert(gateway_run(7)==0&&bodies==1);
     int64_t last=3;reset();assert(maybe_reboot_zkt_for_recovery(2,&last));finished();
     reset();assert(daily_zkt_reboot_try_target(7,4));finished();

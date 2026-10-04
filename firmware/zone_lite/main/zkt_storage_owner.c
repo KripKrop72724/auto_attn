@@ -333,7 +333,8 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
             bool persistence = health.observed && health.available && health.recovery_complete && health.persistence_verified &&
                 !health.last_error && !health.persistence_probe_error;
             if (request->operation == ZJ_SELECT_READER) {
-                reply->compatibility = zj_reader_platform_select(o->metadata.terminal_serial,
+                reply->compatibility = (request->input.reader_selection.failed_boot
+                    ? zj_reader_platform_failed_boot : zj_reader_platform_select)(o->metadata.terminal_serial,
                     o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
                     persistence, o->store.checkpoint_recovery_pending,
                     request->input.reader_selection.image_digest,
@@ -406,6 +407,7 @@ static void execute_reader_shutdown(owner_t *o, zj_request_t *request, zj_reply_
         request->input.reader_selection.deadline_us, &o->reader_committed, &o->nvs_error);
     qs_local_end(true, 0);
     if (reply->result != ZJ_OK) return;
+    request->input.reader_selection.failed_boot = zj_rollback_failed_boot(&o->reader_committed);
     const char *hex = o->reader_committed.journal.image_sha256;
     for (unsigned i = 0; i < 32; ++i) {
         unsigned a = hex[i * 2] <= '9' ? (unsigned)(hex[i * 2] - '0') : (unsigned)(hex[i * 2] - 'a' + 10);

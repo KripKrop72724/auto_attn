@@ -32,6 +32,7 @@
 #include "zkt_ota_guard.h"
 #include "zkt_storage_owner.h"
 #include "zkt_rollback.h"
+#include "zkt_journal_runtime.h"
 #endif
 
 #define OTA_NAMESPACE "zone_ota"
@@ -57,6 +58,7 @@ static uint32_t s_journal_generation;
 static bool s_journal_ready;
 static bool s_started;
 static bool s_busy;
+static bool s_failed_boot_pending;
 static char s_last_error[64];
 static volatile uint32_t s_boot_health_checks;
 static volatile bool s_boot_health_last_ready;
@@ -69,6 +71,7 @@ static volatile int s_progress_last_http_status;
 static char s_running_image_digest[65];
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 static uint64_t s_reader_ticket;
+static uint64_t s_failed_boot_ticket;
 #endif
 
 static void wait_for_capture_safepoint(void);
@@ -402,6 +405,90 @@ static bool fetch_assignment(void)
 /* The existing attested bridge is selected locally. A network download must
  * never overwrite that rollback slot. This task is the only coordinator;
  * each turn is bounded and leaves accepted owner work intact on timeout. */
+static bool advance_failed_boot_rollback(void)
+{
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    return true;
+#else
+    const esp_app_desc_t *app = esp_app_get_description();
+    bool zkt = app && !strcmp(app->project_name, "zone_lite");
+    bool bridge = zkt && !strcmp(app->version, ZJ_BRIDGE_VERSION);
+    bool intent = !strcmp(s_journal.state, "FAILED_BOOT_INTENT");
+    bool observed_return = bridge && s_journal.deployment_id[0] &&
+        !strcmp(s_journal.target_version, ZJ_WRITER_VERSION) &&
+        (!strcmp(s_journal.state, "READY_TO_BOOT") || !strcmp(s_journal.state, "LOCAL_VALIDATED") ||
+         !strcmp(s_journal.state, "BOOT_REPORTED") || !strcmp(s_journal.state, "RECONCILING"));
+    if (!intent && !observed_return && !s_failed_boot_pending && !s_failed_boot_ticket) return true;
+    s_busy = true;
+    if ((intent || observed_return) && bridge) {
+        /* IDF returns to the previously VALID bridge. Local journal recovery
+         * must finish before reporting rollback; terminal/remote HIL health
+         * is not inferred and the original deployment identity is retained. */
+        if (s_failed_boot_ticket || !zj_runtime_boot_ready()) {
+            strlcpy(s_last_error, "BOOT_ROLLBACK_READER_RECOVERY", sizeof(s_last_error));
+            return false;
+        }
+        /* A return before the failure intent commits has no proved reset
+         * cause. Preserve that distinction in the original deployment. */
+        if (!report_state("ROLLED_BACK", intent ? "BOOT_HEALTH_TIMEOUT" : "PREVIOUS_FIRMWARE_OBSERVED") ||
+            !clear_journal()) return false;
+        s_failed_boot_pending = s_busy = false;
+        return true;
+    }
+    if (!zkt || strcmp(app->version, ZJ_WRITER_VERSION)) {
+        /* No reader certificate exists for bridge -> legacy/factory or an
+         * arbitrary image. Keep that failed boot explicit, never invalidate
+         * it based only on version ordering. */
+        strlcpy(s_last_error, "BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED", sizeof(s_last_error));
+        return false;
+    }
+    ota_checkpoint_t expected = {.version = OTA_CHECKPOINT_VERSION,
+        .generation = s_journal_generation, .journal = s_committed_journal};
+    expected.crc = dq_crc32(&expected, offsetof(ota_checkpoint_t, crc));
+    if (!zj_rollback_failed_boot(&expected) || !cache_running_image_digest() ||
+        strcmp(s_running_image_digest, expected.journal.image_sha256)) {
+        strlcpy(s_last_error, "BOOT_ROLLBACK_WRITER_IDENTITY", sizeof(s_last_error));
+        return false;
+    }
+    if (s_failed_boot_ticket) {
+        zj_reply_t reply;
+        bool complete = false;
+        if (!zj_owner_poll(s_failed_boot_ticket, &reply, &complete) || !complete) {
+            strlcpy(s_last_error, "BOOT_ROLLBACK_SELECTION_PENDING", sizeof(s_last_error));
+            return false;
+        }
+        s_failed_boot_ticket = 0;
+        bool committed = zj_rollback_same_target(&expected, &reply.rollback_intent) &&
+            !strcmp(reply.rollback_intent.journal.state, "FAILED_BOOT_INTENT") &&
+            reply.rollback_intent.generation >= expected.generation;
+        if (committed) {
+            s_committed_journal = s_journal = reply.rollback_intent.journal;
+            s_journal_generation = reply.rollback_intent.generation;
+        }
+        if (committed && reply.result == ZJ_OK && reply.compatibility == ZJ_COMPAT_OK) {
+            esp_restart();
+            return false;
+        }
+        strlcpy(s_last_error, "BOOT_ROLLBACK_SELECTION_HELD", sizeof(s_last_error));
+        return false;
+    }
+    if (!add_connector_claim_failed_boot_restart()) {
+        strlcpy(s_last_error, "BOOT_ROLLBACK_SESSION_CLEANUP", sizeof(s_last_error));
+        return false;
+    }
+    if (!zj_owner_quiesce()) {
+        strlcpy(s_last_error, "BOOT_ROLLBACK_STORAGE_DRAIN", sizeof(s_last_error));
+        return false;
+    }
+    if (!zj_owner_select_quiesced_reader(&expected, &s_failed_boot_ticket) || !s_failed_boot_ticket) {
+        strlcpy(s_last_error, "BOOT_ROLLBACK_SELECTION_UNAVAILABLE", sizeof(s_last_error));
+        return false;
+    }
+    strlcpy(s_last_error, "BOOT_ROLLBACK_SELECTION_PENDING", sizeof(s_last_error));
+    return false;
+#endif
+}
+
 static bool advance_reader_rollback(void)
 {
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
@@ -692,7 +779,9 @@ static bool confirm_local_boot(void)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     (void)report_state("FAILED", "BOOT_HEALTH_TIMEOUT");
-    (void)esp_ota_mark_app_invalid_rollback_and_reboot();
+    s_failed_boot_pending = true;
+    /* The next bounded coordinator turn drains accepted work and verifies
+     * the retained reader. A health timeout is not rollback authority. */
     return false;
 }
 
@@ -784,7 +873,7 @@ static void ota_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
             continue;
         }
-        if (!advance_reader_rollback()) {
+        if (!advance_failed_boot_rollback() || !advance_reader_rollback()) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }

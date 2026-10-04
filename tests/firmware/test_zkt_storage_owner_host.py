@@ -52,7 +52,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
     for scenario in ["--checkpoint", "--recovery-full", "--runtime-corrupt-journal",
                      "--authority-before", "--authority-after", "--authority-readback", "--authority-bridge",
-                     "--rollback-full"]:
+                     "--rollback-full", "--failed-boot-full"]:
         directory = tmp_path / scenario.removeprefix("--")
         directory.mkdir()
         subprocess.run([str(binary), scenario], cwd=directory, check=True, timeout=30)

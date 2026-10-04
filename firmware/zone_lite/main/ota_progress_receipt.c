@@ -25,5 +25,12 @@ bool ota_progress_receipt_matches(const cJSON *reply, const char *deployment_id,
     if (boot && (!running_digest || strlen(running_digest) != 64 ||
         strspn(running_digest, "0123456789abcdef") != 64 ||
         !same(reply, "application_sha256", running_digest))) return false;
+    /* A recovered writer attempt still names the writer artifact. Bind the
+     * rollback acknowledgement to ADD's stored, verified bridge boot evidence;
+     * a terminal state or an echoed caller digest cannot retire the intent. */
+    if (!strcmp(requested_state, "ROLLED_BACK") && !strcmp(target_version, "2.7.0") &&
+        (!running_digest || strlen(running_digest) != 64 ||
+         strspn(running_digest, "0123456789abcdef") != 64 ||
+         !same(reply, "rollback_application_sha256", running_digest))) return false;
     return true;
 }

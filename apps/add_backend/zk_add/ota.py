@@ -1069,17 +1069,29 @@ def record_progress(
         raise ValueError("Unknown firmware deployment state.")
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,
-        FirmwareDeployment.connector_id == connector.id))
+        FirmwareDeployment.connector_id == connector.id).with_for_update().execution_options(populate_existing=True))
     if deployment is None:
         raise ValueError("Unknown firmware deployment.")
-    if deployment.status in TERMINAL_DEPLOYMENT_STATES:
+    failed_boot_return = (state == "ROLLED_BACK" and deployment.target_version == "2.7.0"
+        and error_code in {"BOOT_HEALTH_TIMEOUT", "PREVIOUS_FIRMWARE_OBSERVED"}
+        and (deployment.status in {"READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"}
+        or (deployment.status == "FAILED" and deployment.error_code == "BOOT_HEALTH_TIMEOUT")))
+    if deployment.status in TERMINAL_DEPLOYMENT_STATES and not failed_boot_return:
         return deployment
     allowed = DEPLOYMENT_TRANSITIONS.get(deployment.status, set())
-    if state not in allowed:
+    if state not in allowed and not failed_boot_return:
         raise ValueError(f"Illegal firmware transition {deployment.status} -> {state}.")
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None:
         raise ValueError("Firmware release is unavailable.")
+    recovery = None
+    if failed_boot_return:
+        from zk_add.zkt_rollback_receipt import verify_failed_boot_return
+
+        recovery = verify_failed_boot_return(session, connector, deployment, release,
+            bytes_written=bytes_written, running_version=running_version,
+            running_partition=running_partition, image_sha256=image_sha256)
+        recovery["reported_reason"] = error_code
     if bytes_written < deployment.bytes_written or bytes_written > release.image_size:
         raise ValueError("Firmware byte progress is outside the signed artifact bounds.")
     if state in {"READY_TO_BOOT", "BOOTED_PENDING"} and bytes_written != release.image_size:
@@ -1104,6 +1116,7 @@ def record_progress(
                                   "running_version": running_version,
                                   "running_partition": running_partition,
                                   "image_sha256": image_sha256,
+                                  **({"recovery": recovery} if recovery else {}),
                               }))
     if state in TERMINAL_DEPLOYMENT_STATES:
         deployment.completed_at = utc_now()
@@ -1128,7 +1141,7 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None:
         raise ValueError("Firmware release is unavailable.")
-    return {
+    receipt = {
         "schema_version": 1,
         "deployment_id": deployment.deployment_id,
         "state": deployment.status,
@@ -1136,6 +1149,14 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         "application_sha256": _application_sha256(release),
         "confirm": requested_state == "BOOTED_PENDING" and deployment.status == "BOOTED_PENDING",
     }
+    if deployment.status == "ROLLED_BACK" and deployment.target_version == "2.7.0":
+        event = session.scalar(select(FirmwareEvent).where(
+            FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == "ROLLED_BACK")
+            .order_by(FirmwareEvent.id.desc()).limit(1))
+        details = (event.details or {}) if event else {}
+        if (details.get("recovery") or {}).get("schema_version") == 1:
+            receipt["rollback_application_sha256"] = details.get("image_sha256")
+    return receipt
 
 
 def previous_firmware_return_evidence(
