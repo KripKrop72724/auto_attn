@@ -8,10 +8,11 @@ ROOT = Path(__file__).resolve().parents[3]
 firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
 functions = source[source.index("static const char *s_catalog_writer_failure_reason"):
-                   source.index("static void recover_identity_catalog_backup_if_active_missing(")]
+                   source.index("#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION\nstatic zc_client_t s_catalog_client;")]
 persist = source[source.index("static bool persist_identity_catalog_locked("):
                  source.index("static bool persist_identity_catalog(")]
 program = r'''
+#define ZONE_LITE_HIKVISION 1
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>

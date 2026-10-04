@@ -26,6 +26,7 @@ static const char *owner_operation(zj_operation_t operation)
         case ZJ_OTA_CHECK: return "checking upgrade target";
         case ZJ_SELECT_READER: return "selecting compatible reader";
         case ZJ_RUNTIME_CHECKPOINT: return "committing runtime checkpoint";
+        case ZJ_CATALOG: return "updating optional identity catalog";
         default: return "unknown operation";
     }
 }

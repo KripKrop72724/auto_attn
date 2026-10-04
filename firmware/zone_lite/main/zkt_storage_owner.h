@@ -33,8 +33,9 @@ typedef struct {
  * Wi-Fi entropy source are initialized. Only a qualified reader/writer gate
  * may enable this task. Starting it is NOT a compatibility certificate.
  * This module exclusively owns journal files, its NVS namespace and new-image
- * runtime_v1 checkpoint writes in zone_lite; legacy
- * and catalog migration must separately transfer their operations here. */
+ * runtime_v1 checkpoint writes in zone_lite, plus new-image catalog mutations
+ * and the existing catalog NVS checkpoint. Legacy attendance and command
+ * persistence must separately transfer their operations here. */
 bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata);
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket);
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete);
