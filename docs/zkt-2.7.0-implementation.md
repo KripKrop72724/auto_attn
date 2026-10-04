@@ -48,6 +48,7 @@ counts are kept outside this public repository.
 | Identity lookup can expose a row before a later read or close fails | New-image catalog restoration, lookup and tombstone loading read copied owner chunks; lookup validates complete row counts and clears unresolved outputs | Actual consumer functions, every allocation site, late reads, changed revisions, extra/missing rows, truncated tails and legacy close failure | Implemented read component; ESP catalog latency and remaining legacy attendance handoff stay open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
+| CI compiles a bridge that cannot resume capture after rollback | Compile the development 2.6.16 bridge with journal capture included; runtime authority and persisted reader proof still gate its use | Actual boot/runtime and platform tests cover both build flags, legacy authority before cutover and journal capture after rollback | Build configuration corrected; no signed artifact or field compatibility qualification |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
 | Concurrent requests can exceed the nationwide upgrade limits | PostgreSQL offer serialization and exact-inventory admission after bridge/writer registration; two reservations and one per physical location, retaining offline/paused/uncertain cancelled offers | Actual assignment transactions, overlapping PostgreSQL sessions, rollback, family and legacy/HIL regressions | Implemented negative admission guard; trusted qualification, wave enforcement and verified stop/recovery remain open |
 | Replayed delivery can inflate workload estimates | Read-only 30-day source-ordinal counts, same-second multiplicity, strict current source scope, bounded query deadlines and explicit unknown/uncertified evidence | SQLite/PostgreSQL tests, concurrent change and 200,000-record measurement | Implemented measurement component; profile, clock/window closure and actual zone capacity qualification remain open |
@@ -522,6 +523,17 @@ Successful starts are counted separately from attempts; stale or stalled
 workers are held without task deletion. The pre-erase install interlock preserves
 the certified bridge. These components do not qualify an artifact, complete
 legacy migration or provide the operational compatible-rollback selection path.
+
+Both development images include journal capture code. The 2.6.16 bridge initially
+keeps the persisted legacy authority; including that code does not authorize a
+writer cutover. After a verified cutover and compatible rollback, the bridge
+must resume preservation under the persisted ADD authority. A bridge compiled
+with `ZONE_LITE_JOURNAL_WRITES=OFF` intentionally fails boot and reader-proof
+checks, so it cannot satisfy this role. Earlier successful compilation and image
+descriptor checks for that disabled configuration were not compatibility
+qualification. CI now builds the capture-capable bridge, while the host matrices
+continue to test refusal of capture-disabled builds. Signing, security and
+persisted-proof requirements remain unchanged.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain
