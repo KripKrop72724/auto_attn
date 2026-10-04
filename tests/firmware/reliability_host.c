@@ -52,7 +52,14 @@ int main(void)
         compact[offset + 10] = 55; compact[offset + 11] = 17;
     }
     assert(rel_live_frame_size(compact, 36, 0, &shape) && shape == 12);
+    /* Both alternatives must be genuinely valid. A control-character text
+     * ID is a rejected extended record, not evidence of ambiguity. */
+    compact[0] = '7';
     compact[27] = 9; compact[28] = 1; compact[29] = 1;
+    rel_live_record_t alternate;
+    assert(rel_parse_live_record(compact, 36, &alternate));
+    for (size_t offset = 0; offset < sizeof(compact); offset += 12)
+        assert(rel_parse_live_record(compact + offset, 12, &alternate));
     assert(!rel_live_frame_size(compact, 36, 0, &shape));
     unsigned char malformed[65] = {0};
     assert(!rel_live_frame_size(malformed, 36, 0, &shape));
