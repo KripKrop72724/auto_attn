@@ -1,5 +1,13 @@
 # Retained segmented queues on the ZKT storage task
 
+Boot mounts SPIFFS at `/storage`. The journal runtime and legacy OTA evidence
+scan now share that actual mount constant. Their earlier development prefix,
+`/spiffs`, was never mounted; native component tests using temporary directories
+did not expose the startup failure. A regression executes the production boot
+initialization and runtime adapter, comparing the journal, OTA, command and
+catalog paths to the captured VFS mount. No partition or retained filename is
+changed by this correction, and no candidate with the old prefix was qualified.
+
 Exact 2.6.16 and 2.7.0 development images route the existing segmented queue
 API through the journal storage task. Append, peek, settlement, depth and
 generation requests have no direct fallback when that task is unavailable or

@@ -6,8 +6,9 @@
 bool zj_owner_started(void);
 bool zj_owner_is_current_task(void);
 #include "zkt_journal_state.h"
+#include "zone_storage_paths.h"
 
-#define ZJ_DEVICE_DIRECTORY "/spiffs"
+#define ZJ_DEVICE_DIRECTORY ZONE_STORAGE_BASE
 #define ZJ_DEVICE_BASENAME "zktj"
 #define ZJ_DEVICE_PREFIX ZJ_DEVICE_DIRECTORY "/" ZJ_DEVICE_BASENAME
 

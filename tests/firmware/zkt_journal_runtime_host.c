@@ -29,7 +29,7 @@ int xSemaphoreTake(SemaphoreHandle_t h,unsigned timeout){assert(h);(void)timeout
 void xSemaphoreGive(SemaphoreHandle_t h){assert(h);}
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.recovery_complete=true,.persistence_verified=true};}
 bool zj_owner_start(const char *prefix,const zj_metadata_t *metadata){
- assert(!strcmp(prefix,"/spiffs/zktj"));assert(!strcmp(metadata->terminal_serial,"TEST-SERIAL"));
+ assert(!strcmp(prefix,"/storage/zktj"));assert(!strcmp(metadata->terminal_serial,"TEST-SERIAL"));
  assert(!strcmp(metadata->decoder_profile,"zkt-unqualified"));assert(!strcmp(metadata->decoder_version,"zkt-raw-1"));
  ++owner_starts;owner=(zj_owner_health_t){.started=true,.ready=true,.compatibility=ZJ_COMPAT_NOT_READY,.delivery_authority=cutover?ZJ_AUTHORITY_ADD:ZJ_AUTHORITY_LEGACY};return true;
 }
