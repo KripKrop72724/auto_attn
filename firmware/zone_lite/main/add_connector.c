@@ -4252,6 +4252,33 @@ static bool settle_legacy_delivery(add_outbox_t *outbox, const lq_token_t *token
     return ok;
 }
 
+/* Retained rows have identities predating the compact journal. Delivery alone
+ * does not retain their original bytes, queue generation or checkpoint extent.
+ * The bridge/writer needs that second, exact ADD custody receipt before local
+ * retirement. Reuse the malformed-row identity so uncertain replies replay the
+ * same immutable object, without holding a storage or terminal lock. */
+static bool preserve_retained_outbox(unsigned selected, const char *line, size_t length,
+    const dq_token_t *token, const lq_token_t *legacy_token)
+{
+    if (!add_legacy_owner_required()) return true;
+    if (selected >= 6 || !line || !length || !token || !legacy_token) return false;
+    char instance[33], generation[80], record_id[80];
+    if (!qs_generation(instance)) return false;
+    if (selected != 0 && selected != 2) {
+        snprintf(generation, sizeof(generation), "%s-segmented-v2", instance);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)token->segment,
+            (unsigned long)token->offset, (unsigned long)token->sequence);
+    } else {
+        snprintf(generation, sizeof(generation), "%s-legacy-%lu", instance,
+            (unsigned long)legacy_token->generation);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)legacy_token->offset,
+            (unsigned long)legacy_token->crc);
+    }
+    const char *names[] = {"add_live_legacy", "add_live", "add_bulk_legacy", "add_bulk", "receipts", "evidence"};
+    return add_connector_transfer_queue_evidence(names[selected], generation, record_id,
+        line, length, NULL, "LEGACY_RECOVERY");
+}
+
 static void outbox_task(void *arg)
 {
     (void)arg;
@@ -4379,6 +4406,8 @@ static void outbox_task(void *arg)
             acknowledged = false;
         cJSON_Delete(record);
         free(payload_json);
+        if (acknowledged)
+            acknowledged = preserve_retained_outbox((unsigned)selected, line, raw_length, &token, &legacy_token);
         if (acknowledged && attendance_ack.valid && attendance_ack.quarantined > 0) {
             ESP_LOGW(TAG, "ADD durably quarantined %lu attendance row(s) without blocking",
                 (unsigned long)attendance_ack.quarantined);

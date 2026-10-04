@@ -16,7 +16,7 @@ def test_actual_legacy_drain_preserves_records_and_releases_lock(tmp_path: Path)
     restore_start = source.index("static bool restore_pending_backup_if_needed(")
     restore_end = source.index("static bool restore_blocked_backup_if_needed(", restore_start)
     harness = harness.replace("/* INSERT_PRODUCTION_RESTORE */", source[restore_start:restore_end])
-    segmented_start = source.index("static bool oracle_drain_segmented_slice(")
+    segmented_start = source.index("static bool preserve_delivered_ords(")
     segmented_end = source.index("static int legacy_pending_load(", segmented_start)
     harness = harness.replace("/* INSERT_PRODUCTION_SEGMENTED */", source[segmented_start:segmented_end])
     unit = tmp_path / "drain.c"

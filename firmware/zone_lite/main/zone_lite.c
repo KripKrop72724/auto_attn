@@ -7289,8 +7289,27 @@ static int64_t g_segmented_ords_retry_ms;
 static bool g_legacy_owner_progress;
 #endif
 
-/* Compatibility reader: one request per slice, with no storage mutex held
+/* Compatibility reader: one retained record per slice, with no storage mutex held
  * across transport or receipt delivery. New-format production remains gated. */
+static bool preserve_delivered_ords(const void *bytes, size_t length,
+    const dq_token_t *segmented, const lq_token_t *legacy)
+{
+    if (!legacy_attendance_owner_required()) return true;
+    if (!bytes || !length || (!segmented && !legacy) || (segmented && legacy)) return false;
+    char instance[33], generation[80], record_id[80];
+    if (!qs_generation(instance)) return false;
+    if (segmented) {
+        snprintf(generation, sizeof(generation), "%s", instance);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)segmented->segment,
+            (unsigned long)segmented->offset, (unsigned long)segmented->sequence);
+    } else {
+        snprintf(generation, sizeof(generation), "%s-legacy-%lu", instance, (unsigned long)legacy->generation);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)legacy->offset, (unsigned long)legacy->crc);
+    }
+    return add_connector_transfer_queue_evidence(segmented ? "ords" : "ords_legacy",
+        generation, record_id, bytes, length, NULL, "LEGACY_RECOVERY");
+}
+
 static bool oracle_drain_segmented_slice(void)
 {
     int64_t now = uptime_ms();
@@ -7335,6 +7354,11 @@ static bool oracle_drain_segmented_slice(void)
         }
     }
     free(quarantine);
+    if (settled && (delivery == ORACLE_DELIVERY_ACKED || delivery == ORACLE_DELIVERY_PERMANENT_REJECTION)) {
+        add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+        settled = preserve_delivered_ords(event, length, &token, NULL);
+        add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    }
     if (settled && qs_settle(QS_ORDS, &token) != DQ_OK) {
         settled = false;
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -7407,6 +7431,11 @@ static void oracle_drain_owned_pending(void)
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
     free(quarantine);
+    if (settled && !custody) {
+        add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+        settled = preserve_delivered_ords(event, length, NULL, &token);
+        add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    }
     if (!settled) return;
     dq_result_t committed = zq_attendance_legacy_settle(ZOL_PENDING, &token, custody);
     if (committed == DQ_OK) {
