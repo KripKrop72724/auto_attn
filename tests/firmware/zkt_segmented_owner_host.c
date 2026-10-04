@@ -140,7 +140,9 @@ int main(void)
     memcpy(request.bytes, "third", 5); before = appends;
     assert(execute(&request).result == DQ_STALE && appends == before);
     request.transfer = second; request.lane = QS_LIVE; assert(execute(&request).result == DQ_STALE);
-    request.lane = QS_BULK; ++request.deadline_us; assert(execute(&request).result == DQ_STALE);
+    request.lane = QS_BULK; request.domain = ZQ_ADD_LEGACY;
+    assert(execute(&request).result == DQ_STALE); /* Same lane and bytes cannot switch queue format. */
+    request.domain = ZQ_SEGMENTED; ++request.deadline_us; assert(execute(&request).result == DQ_STALE);
     --request.deadline_us; request.operation = ZQ_APPEND_COMMIT; request.length = 0;
     assert(execute(&request).result == DQ_STALE && appends == before);
     request.operation = ZQ_APPEND_CHUNK; request.length = 5;

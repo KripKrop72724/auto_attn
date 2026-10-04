@@ -30,7 +30,7 @@ static const char *owner_operation(zj_operation_t operation)
         case ZJ_LEASE: return "committing administrator lease";
         case ZJ_COMMANDS: return "updating durable command inbox";
         case ZJ_COMMAND_IDS: return "checking durable command receipts";
-        case ZJ_SEGMENTED_QUEUE: return "servicing retained segmented queues";
+        case ZJ_SEGMENTED_QUEUE: return "servicing retained attendance queues";
         default: return "unknown operation";
     }
 }

@@ -254,6 +254,38 @@ bool qs_generation(char output[33])
 { assert(zj_owner_is_current_task()); memset(output, 'a', 32); output[32] = 0; return true; }
 bool qs_recover_step(void) { assert(zj_owner_is_current_task()); return true; }
 bool qs_verify_persistence(void) { assert(zj_owner_is_current_task()); return true; }
+static legacy_queue_t flat[2];
+static lq_checkpoint_t flat_checkpoints[2];
+static int flat_load(void *context, lq_checkpoint_t *out)
+{ unsigned lane=(unsigned)(uintptr_t)context; *out=flat_checkpoints[lane]; return out->version ? 1 : 0; }
+static bool flat_commit(void *context, const lq_checkpoint_t *in)
+{ flat_checkpoints[(unsigned)(uintptr_t)context]=*in; return true; }
+static legacy_queue_t *flat_queue(unsigned lane)
+{
+    assert(zj_owner_is_current_task() && lane < 2);
+    if (!flat[lane].ready) {
+        const char *path=lane ? "flat-bulk.jsonl" : "flat-live.jsonl";
+        assert(lq_open(&flat[lane],path,(lq_port_t){flat_load,flat_commit,(void *)(uintptr_t)lane})==DQ_OK);
+    }
+    return &flat[lane];
+}
+dq_result_t add_legacy_owner_append(unsigned lane,const void *bytes,size_t length,qs_admission_t policy)
+{
+    assert((unsigned)policy<=QS_ADMIT_RECOVERY);
+    legacy_queue_t *q=flat_queue(lane);
+    if(atomic_load(&full))return DQ_FULL;
+    FILE *f=fopen(q->path,"ab");
+    assert(f && fwrite(bytes,1,length,f)==length && fputc('\n',f)!=EOF && fclose(f)==0);
+    return DQ_OK;
+}
+dq_result_t add_legacy_owner_peek(unsigned lane,void *bytes,size_t capacity,size_t *length,lq_token_t *token)
+{
+    dq_result_t result=lq_peek(flat_queue(lane),bytes,capacity,token);
+    if(result==DQ_OK)*length=token->end-token->offset;
+    return result;
+}
+dq_result_t add_legacy_owner_settle(unsigned lane,const lq_token_t *token,bool custody)
+{ return custody ? lq_settle_evidence(flat_queue(lane),token) : lq_settle(flat_queue(lane),token); }
 bool zj_transport_health(zj_transport_health_t *health)
 {
     *health = (zj_transport_health_t){.started = true,
@@ -335,6 +367,7 @@ int main(int argc, char **argv)
 {
     assert(!zj_owner_started() && !zj_owner_is_current_task());
     assert(zq_append(QS_LIVE, "before-owner", 12, QS_ADMIT_LIVE) == DQ_PENDING);
+    assert(zq_legacy_append(0, "before-owner", 12, QS_ADMIT_LIVE) == DQ_PENDING && !flat[0].ready);
     assert(!retained[QS_LIVE].ready); /* No direct storage fallback. */
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
@@ -715,6 +748,14 @@ int main(int argc, char **argv)
     assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_EMPTY);
     atomic_store(&full, false);
     assert(zj_owner_health(&health) && !health.occupied);
+    lq_token_t flat_token;
+    assert(zq_legacy_append(0, "owner-flat", 10, QS_ADMIT_LIVE) == DQ_OK);
+    assert(zq_legacy_peek(0, retained_output, sizeof(retained_output), &retained_length, &flat_token) == DQ_OK);
+    assert(retained_length == 11 && !memcmp(retained_output, "owner-flat\n", 11));
+    assert(zq_legacy_settle(0, &flat_token, false) == DQ_OK);
+    assert(zq_legacy_settle(0, &flat_token, false) == DQ_STALE);
+    assert(zq_legacy_peek(0, retained_output, sizeof(retained_output), &retained_length, &flat_token) == DQ_EMPTY);
+    assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
      * acknowledging; a new producer cannot race the completed barrier. */
@@ -751,6 +792,7 @@ int main(int argc, char **argv)
     assert(!zj_owner_submit(&final_checkpoint, &refused_ticket));
     assert(!zj_owner_submit(&compatibility, &refused_ticket));
     assert(zq_append(QS_LIVE, "after-quiescence", 16, QS_ADMIT_LIVE) == DQ_PENDING);
+    assert(zq_legacy_append(0, "after-quiescence", 16, QS_ADMIT_LIVE) == DQ_PENDING);
     assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_PENDING);
     assert(!retained_length && !retained_token.end && !zq_probe());
     vTaskDelay(10);

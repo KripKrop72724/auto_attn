@@ -8,6 +8,8 @@
 #include "zkt_journal_runtime.h"
 #include "zkt_catalog_client.h"
 #include "zkt_command_ids.h"
+#include "zkt_add_legacy_owner.h"
+#include "zkt_runtime_checkpoint.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -141,12 +143,23 @@ typedef struct {
     off_t offset;
     uint32_t depth;
     bool depth_known;
+    bool owner_initialized, owner_bytes_known;
+    uint32_t owner_bytes;
     uint32_t ack_since_checkpoint;
     const char *label;
     SemaphoreHandle_t lock;
     legacy_queue_t legacy;
     lq_token_t pending_token;
 } add_outbox_t;
+
+static bool add_legacy_owner_required(void)
+{
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    return zj_runtime_checkpoint_required();
+#else
+    return false;
+#endif
+}
 
 typedef struct {
     char receipt_id[40];
@@ -2926,9 +2939,14 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         if (outbox->lock && xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             bool fields_ok = cJSON_AddBoolToObject(queue, "count_known", outbox->depth_known) &&
                 (!outbox->depth_known || cJSON_AddNumberToObject(queue, "records", outbox->depth));
-            struct stat st;
-            if (stat(outbox->path, &st) == 0) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
-            else if (errno == ENOENT) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", 0);
+            if (add_legacy_owner_required()) {
+                if (outbox->owner_bytes_known)
+                    fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", outbox->owner_bytes);
+            } else {
+                struct stat st;
+                if (stat(outbox->path, &st) == 0) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", (double)st.st_size);
+                else if (errno == ENOENT) fields_ok = fields_ok && cJSON_AddNumberToObject(queue, "bytes", 0);
+            }
             xSemaphoreGive(outbox->lock);
             if (!fields_ok) goto failed;
         }
@@ -3131,23 +3149,27 @@ static bool write_outbox_cursor(const add_outbox_t *outbox, off_t offset)
     return true;
 }
 
-static void restore_outbox_if_needed(add_outbox_t *outbox)
+static bool restore_outbox_if_needed(add_outbox_t *outbox)
 {
     struct stat st;
-    if (stat(outbox->path, &st) == 0) return;
-    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    if (stat(outbox->path, &st) == 0) return true;
+    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
     const char *generations[] = {outbox->backup_path, outbox->tmp_path};
     for (size_t i = 0; i < 2; i++) {
         if (stat(generations[i], &st) == 0) {
-            if (rename(generations[i], outbox->path) != 0)
+            if (rename(generations[i], outbox->path) != 0) {
                 led_status_fault(LED_STATUS_LOCAL_FAILURE);
+                return false;
+            }
             outbox->depth_known = false;
-            return;
+            lq_invalidate_empty(&outbox->legacy);
+            return true;
         }
-        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
     }
     // Each surviving generation is streamed independently. Existence of a
     // newer active file is never permission to discard an older backup/temp.
+    return true;
 }
 
 static int add_legacy_load(void *context, lq_checkpoint_t *checkpoint)
@@ -3234,7 +3256,11 @@ static bool compact_outbox_locked(add_outbox_t *outbox, bool force)
     outbox->depth = 0;
     outbox->depth_known = true;
     outbox->ack_since_checkpoint = 0;
-    restore_outbox_if_needed(outbox);
+    if (!restore_outbox_if_needed(outbox)) {
+        outbox->depth_known = false;
+        outbox->owner_initialized = false; /* Retry a failed generation restore before trusting empty. */
+        return false;
+    }
     if (stat(outbox->path, &st) == 0) outbox->depth_known = false;
     return true;
 }
@@ -3270,6 +3296,131 @@ static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_
     *row_end = (off_t)outbox->pending_token.end;
     return true;
 }
+
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+static add_outbox_t *add_legacy_owner_lock(unsigned lane)
+{
+    if (lane > 1 || !add_legacy_owner_required() || !zj_owner_is_current_task()) return NULL;
+    add_outbox_t *outbox = lane == 0 ? &s_live_outbox : &s_bulk_outbox;
+    if (!outbox->lock || xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(100)) != pdTRUE) return NULL;
+    if (!qs_local_read_begin()) { xSemaphoreGive(outbox->lock); return NULL; }
+    return outbox;
+}
+static dq_result_t add_legacy_owner_prepare(add_outbox_t *outbox)
+{
+    if (!outbox->owner_initialized) {
+        if (!restore_outbox_if_needed(outbox)) return DQ_IO;
+        outbox->owner_initialized = true;
+        outbox->depth_known = false;
+    }
+    if (outbox->legacy.ready) {
+        outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
+        return DQ_OK;
+    }
+    lq_port_t port = {add_legacy_load, add_legacy_commit, outbox};
+    /* One consumed-prefix slice per request; capture can run between slices. */
+    dq_result_t result = lq_open_step(&outbox->legacy, outbox->path, port);
+    if (result == DQ_OK) outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
+    else outbox->depth_known = false;
+    return result;
+}
+static dq_result_t add_legacy_owner_done(add_outbox_t *outbox, dq_result_t result,
+                                         bool write_attempted, int captured_error)
+{
+    if (!(result == DQ_EMPTY && outbox->legacy.empty_cached &&
+          outbox->owner_bytes_known && !outbox->owner_bytes)) {
+        struct stat st;
+        outbox->owner_bytes_known = false;
+        int status = stat(outbox->path, &st);
+        if (status == 0 && st.st_size >= 0 && (uint64_t)st.st_size <= UINT32_MAX) {
+            outbox->owner_bytes = (uint32_t)st.st_size;
+            outbox->owner_bytes_known = true;
+        } else if (status != 0 && errno == ENOENT && !outbox->legacy.checkpoint.offset) {
+            outbox->owner_bytes = 0;
+            outbox->owner_bytes_known = true;
+        }
+    }
+    if (result != DQ_OK && result != DQ_EMPTY && result != DQ_PENDING && result != DQ_FULL)
+        outbox->depth_known = false;
+    /* Refused admission and reads are not failed attendance writes. The
+     * actual write result, including close failure, remains latched by QS. */
+    qs_local_end(!write_attempted || result == DQ_OK, captured_error);
+    xSemaphoreGive(outbox->lock);
+    return result;
+}
+dq_result_t add_legacy_owner_append(unsigned lane, const void *bytes, size_t length, qs_admission_t policy)
+{
+    if (!bytes || !length || length > ADD_OUTBOX_LINE_BYTES - 2 || (unsigned)policy > QS_ADMIT_RECOVERY ||
+        memchr(bytes, 0, length) || memchr(bytes, '\n', length)) return DQ_IO;
+    add_outbox_t *outbox = add_legacy_owner_lock(lane);
+    if (!outbox) return DQ_PENDING;
+    dq_result_t result = add_legacy_owner_prepare(outbox);
+    bool attempted = false; int error = 0;
+    if (result != DQ_OK) goto done;
+    struct stat st;
+    uint64_t current = 0;
+    if (stat(outbox->path, &st) == 0) {
+        if (st.st_size < 0) { result = DQ_CORRUPT; goto done; }
+        current = (uint64_t)st.st_size;
+    } else if (errno != ENOENT) { error = errno; result = DQ_IO; goto done; }
+    if (current > (uint64_t)outbox->max_bytes || length + 1 > (uint64_t)outbox->max_bytes - current) {
+        result = DQ_FULL; goto done;
+    }
+    if (!qs_local_admit_locked(policy, length + 1)) { result = errno == ENOSPC ? DQ_FULL : DQ_PENDING; goto done; }
+    /* Invalidate even if open/write/sync fails after a partial append. */
+    lq_invalidate_empty(&outbox->legacy);
+    bool counted = outbox->depth_known;
+    outbox->depth_known = false;
+    attempted = true; errno = 0;
+    FILE *file = rel_open_append(outbox->path);
+    bool ok = file && fwrite(bytes, 1, length, file) == length && fputc('\n', file) != EOF &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (!ok) error = errno ? errno : EIO;
+    if (file && fclose(file) != 0) { ok = false; if (!error) error = errno ? errno : EIO; }
+    /* Restored nonempty files keep an unknown count; no full-file scan runs
+     * on this path. Only an established empty queue can start an exact count. */
+    if (ok && counted && outbox->depth < UINT32_MAX) { ++outbox->depth; outbox->depth_known = true; }
+    result = ok ? DQ_OK : DQ_IO;
+done:
+    return add_legacy_owner_done(outbox, result, attempted, error);
+}
+dq_result_t add_legacy_owner_peek(unsigned lane, void *bytes, size_t capacity, size_t *length, lq_token_t *token)
+{
+    if (length) *length = 0;
+    if (token) memset(token, 0, sizeof(*token));
+    if (!bytes || capacity < 2 || capacity > ADD_OUTBOX_LINE_BYTES || !length || !token) return DQ_IO;
+    add_outbox_t *outbox = add_legacy_owner_lock(lane);
+    if (!outbox) return DQ_PENDING;
+    dq_result_t result = add_legacy_owner_prepare(outbox);
+    if (result != DQ_OK) goto done;
+    if (outbox->legacy.empty_cached) { result = DQ_EMPTY; goto done; }
+    result = lq_peek(&outbox->legacy, bytes, capacity, token);
+    if (result == DQ_OK) *length = token->end - token->offset;
+    else if (result == DQ_EMPTY) {
+        if (!compact_outbox_locked(outbox, true)) result = DQ_IO;
+        else if (!outbox->depth_known || outbox->depth) result = DQ_PENDING; /* Restored generation. */
+        else outbox->legacy.empty_cached = true;
+    }
+done:
+    return add_legacy_owner_done(outbox, result, false, 0);
+}
+dq_result_t add_legacy_owner_settle(unsigned lane, const lq_token_t *token, bool custody)
+{
+    if (!token || token->end <= token->offset) return DQ_IO;
+    add_outbox_t *outbox = add_legacy_owner_lock(lane);
+    if (!outbox) return DQ_PENDING;
+    dq_result_t result = add_legacy_owner_prepare(outbox);
+    if (result == DQ_OK) {
+        result = custody ? lq_settle_evidence(&outbox->legacy, token) : lq_settle(&outbox->legacy, token);
+        if (result == DQ_OK) {
+            outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
+            if (outbox->depth_known && outbox->depth) --outbox->depth;
+            if (!compact_outbox_locked(outbox, false)) result = DQ_IO;
+        }
+    }
+    return add_legacy_owner_done(outbox, result, false, 0);
+}
+#endif
 
 static bool attendance_payload_is_live(const cJSON *payload)
 {
@@ -3677,6 +3828,17 @@ static bool add_connector_enqueue_validated_line_with_policy(const char *line, b
         qs_lane_t lane = policy == QS_ADMIT_RECOVERY ? QS_RECEIPTS : live ? QS_LIVE : QS_BULK;
         return qs_append_with_policy(lane, line, strlen(line), policy) == DQ_OK;
     }
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (add_legacy_owner_required()) {
+        int64_t until = monotonic_ms() + (live ? 0 : ADD_BULK_CAPACITY_WAIT_MS);
+        do {
+            dq_result_t result = zq_legacy_append(live ? 0 : 1, line, strlen(line), policy);
+            if (result == DQ_OK) return true;
+            if (live || (result != DQ_PENDING && result != DQ_FULL) || monotonic_ms() >= until) return false;
+            vTaskDelay(pdMS_TO_TICKS(ADD_BULK_CAPACITY_POLL_MS));
+        } while (true);
+    }
+#endif
     bool ok = false;
     add_outbox_t *outbox = live ? &s_live_outbox : &s_bulk_outbox;
     TickType_t lock_timeout = pdMS_TO_TICKS(live ? 2000 : 10000);
@@ -3918,11 +4080,11 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         return false;
     }
 
-    if (storage_upgrade_segmented_writes()) {
+    if (storage_upgrade_segmented_writes() || add_legacy_owner_required()) {
         for (size_t i = 0; i < count; ++i) {
             bool live = false;
             char *line = attendance_outbox_record_line(payloads[i], &live);
-            bool ok = line && !live && qs_append_with_policy(QS_BULK, line, strlen(line), QS_ADMIT_HISTORICAL) == DQ_OK;
+            bool ok = line && !live && add_connector_enqueue_validated_line_with_policy(line, false, QS_ADMIT_HISTORICAL);
             free(line);
             if (!ok) return false; // Partial durable batches may replay idempotently.
         }
@@ -4044,6 +4206,38 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
     }
 }
 
+static bool read_legacy_delivery(add_outbox_t *outbox, char *line, size_t *length, lq_token_t *token)
+{
+    *length = 0;
+    memset(token, 0, sizeof(*token));
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (add_legacy_owner_required()) {
+        dq_result_t result = zq_legacy_peek(outbox == &s_live_outbox ? 0 : 1, line,
+            ADD_OUTBOX_LINE_BYTES - 1, length, token);
+        if (result == DQ_OK) line[*length] = 0;
+        else if (result != DQ_EMPTY && result != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        return result == DQ_OK;
+    }
+#endif
+    if (!outbox->lock || xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    off_t row_end;
+    bool ok = read_outbox_row_locked(outbox, line, &row_end);
+    if (ok) { *token = outbox->pending_token; *length = token->end - token->offset; }
+    xSemaphoreGive(outbox->lock);
+    return ok;
+}
+static bool settle_legacy_delivery(add_outbox_t *outbox, const lq_token_t *token, bool custody)
+{
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (add_legacy_owner_required())
+        return zq_legacy_settle(outbox == &s_live_outbox ? 0 : 1, token, custody) == DQ_OK;
+#endif
+    if (!outbox->lock || xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+    bool ok = advance_outbox_locked(outbox, (off_t)token->end, custody);
+    xSemaphoreGive(outbox->lock);
+    return ok;
+}
+
 static void outbox_task(void *arg)
 {
     (void)arg;
@@ -4096,7 +4290,6 @@ static void outbox_task(void *arg)
         }
         bool segmented = selected != 0 && selected != 2;
         add_outbox_t *outbox = selected == 0 ? &s_live_outbox : &s_bulk_outbox;
-        off_t row_end = 0;
         dq_token_t token = {0};
         lq_token_t legacy_token = {0};
         size_t raw_length = 0;
@@ -4108,14 +4301,7 @@ static void outbox_task(void *arg)
             if (have_row) { line[length] = 0; raw_length = length; }
             else if (read != DQ_EMPTY && read != DQ_PENDING)
                 led_status_fault(LED_STATUS_LOCAL_FAILURE);
-        } else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            have_row = read_outbox_row_locked(outbox, line, &row_end);
-            if (have_row) {
-                legacy_token = outbox->pending_token;
-                raw_length = legacy_token.end - legacy_token.offset;
-            }
-            xSemaphoreGive(outbox->lock);
-        }
+        } else have_row = read_legacy_delivery(outbox, line, &raw_length, &legacy_token);
         if (!have_row) {
             scheduler.retry_at[selected] = (uint64_t)monotonic_ms() + 1000;
             continue;
@@ -4162,10 +4348,7 @@ static void outbox_task(void *arg)
             s_add_worker_operation = ADD_WORKER_COMMITTING;
             if (preserved) {
                 if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
-                else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                    preserved = advance_outbox_locked(outbox, row_end, true);
-                    xSemaphoreGive(outbox->lock);
-                } else preserved = false;
+                else preserved = settle_legacy_delivery(outbox, &legacy_token, true);
             }
             // Failed custody transfer leaves the exact original row in place.
             if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -4190,10 +4373,7 @@ static void outbox_task(void *arg)
         bool committed = false;
         if (acknowledged) {
             if (segmented) committed = qs_settle(lanes[selected], &token) == DQ_OK;
-            else if (xSemaphoreTake(outbox->lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                committed = advance_outbox_locked(outbox, row_end, false);
-                xSemaphoreGive(outbox->lock);
-            }
+            else committed = settle_legacy_delivery(outbox, &legacy_token, false);
             if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         }
         if (committed) s_outbox_progress_ms = (uint32_t)monotonic_ms();
@@ -4466,14 +4646,14 @@ static void start_websocket(void)
         s_client = NULL;
         return;
     }
-    if (xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (!add_legacy_owner_required() && xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_live_outbox);
         s_live_outbox.offset = load_outbox_cursor(&s_live_outbox);
         (void)count_outbox_rows(&s_live_outbox);
         if (s_live_outbox.depth_known && !s_live_outbox.depth) (void)compact_outbox_locked(&s_live_outbox, true);
         xSemaphoreGive(s_live_outbox.lock);
     }
-    if (xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (!add_legacy_owner_required() && xSemaphoreTake(s_bulk_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_bulk_outbox);
         s_bulk_outbox.offset = load_outbox_cursor(&s_bulk_outbox);
         (void)count_outbox_rows(&s_bulk_outbox);

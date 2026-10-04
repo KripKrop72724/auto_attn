@@ -43,7 +43,8 @@ typedef struct {
  * and the existing catalog NVS checkpoint. New-image command inbox reads,
  * replacements and their existing NVS checkpoint also run here, along with
  * processed/cancelled command-ID cache operations and retained segmented
- * queue work. Flat-file legacy attendance still requires handoff. */
+ * queue work, plus the two ADD flat-file queues and their existing checkpoints.
+ * Flat-file Oracle/blocked attendance still requires handoff. */
 bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata);
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket);
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete);
