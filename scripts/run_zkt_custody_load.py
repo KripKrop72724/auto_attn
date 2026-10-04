@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -39,14 +40,44 @@ class BurstInputs:
     These RAM queues model only a test source, not ESP durable preservation.
     """
 
-    def __init__(self, sites: int, rate: int, seconds: int, *, capacity: int):
+    def __init__(self, sites: int, rate: int, seconds: int, *, capacity: int, context=None):
         if min(sites, rate, seconds, capacity) < 1:
             raise ValueError("Positive bounded input dimensions required")
-        self.queues = [Queue(maxsize=capacity) for _ in range(sites)]
+        self.queues = [(context.Queue if context else Queue)(maxsize=capacity) for _ in range(sites)]
         self.rate, self.seconds, self.capacity = rate, seconds, capacity
-        self.done, self.lock = Event(), Lock()
-        self.offered = self.refused = 0
-        self.last_offer_elapsed_s = self.max_emitter_lag_ms = 0.0
+        self.done = (context.Event if context else Event)()
+        self.lock = (context.Lock if context else Lock)()
+        # Fixed shared counters avoid Queue.qsize(), which is unavailable on
+        # macOS, and never retain an unbounded list of emitted observations.
+        self.counters = context.Array('d', 4, lock=False) if context else [0.0] * 4
+        self.offered_by_site = context.Array('q', sites, lock=False) if context else [0] * sites
+        self.taken_by_site = context.Array('q', sites, lock=False) if context else [0] * sites
+
+    @property
+    def offered(self):
+        return int(self.counters[0])
+
+    @property
+    def refused(self):
+        return int(self.counters[1])
+
+    @property
+    def last_offer_elapsed_s(self):
+        return self.counters[2]
+
+    @property
+    def max_emitter_lag_ms(self):
+        return self.counters[3]
+
+    def take(self, site: int, timeout: float):
+        value = self.queues[site].get(timeout=timeout)
+        with self.lock:
+            self.taken_by_site[site] += 1
+        return value
+
+    def pending_depths(self):
+        with self.lock:
+            return [offered - taken for offered, taken in zip(self.offered_by_site, self.taken_by_site)]
 
     def emit(self, start: float, stop: Event, *, now=time.monotonic, wait=None):
         pause = wait or stop.wait
@@ -54,19 +85,20 @@ class BurstInputs:
             for sequence in range(1, self.rate * self.seconds + 1):
                 due = start + (sequence - 1) / self.rate
                 pause(max(0, due - now()))
-                for queue in self.queues:
+                for site, queue in enumerate(self.queues):
                     instant = now()
                     if stop.is_set() or instant >= start + self.seconds:
                         return
                     with self.lock:
-                        self.max_emitter_lag_ms = max(self.max_emitter_lag_ms, (instant - due) * 1000)
+                        self.counters[3] = max(self.counters[3], (instant - due) * 1000)
                         try:
                             queue.put_nowait((sequence, due))
                         except Full:
-                            self.refused += 1
+                            self.counters[1] += 1
                         else:
-                            self.offered += 1
-                            self.last_offer_elapsed_s = instant - start
+                            self.counters[0] += 1
+                            self.offered_by_site[site] += 1
+                            self.counters[2] = instant - start
         finally:
             self.done.set()
 
@@ -77,6 +109,16 @@ class BurstInputs:
                         input_queue_capacity_per_site=self.capacity,
                         last_offer_elapsed_s=round(self.last_offer_elapsed_s, 3),
                         max_emitter_lag_ms=round(self.max_emitter_lag_ms, 3))
+
+
+def emit_in_process(inputs, start_value, start_gate, ready, stop):
+    """A fresh interpreter owns arrivals; backend Python work cannot hold its GIL."""
+    ready.set()
+    while not start_gate.wait(0.1):
+        if stop.is_set():
+            inputs.done.set()
+            return
+    inputs.emit(start_value.value, stop)
 
 
 def quantiles(values):
@@ -146,12 +188,16 @@ def main() -> int:
     from zk_add.zkt_custody import observation_id
     from zk_add.zkt_custody_runtime import BUSY_SECONDS, IDLE_SECONDS, CustodyProcessor
 
-    lock, stop_intake, stop_worker = Lock(), Event(), Event()
+    input_context = multiprocessing.get_context("spawn")
+    lock, stop_intake, stop_worker = Lock(), input_context.Event(), Event()
+    input_start_value = input_context.Value('d', 0.0)
+    input_start_gate, input_ready = input_context.Event(), input_context.Event()
     barrier = Barrier(SITES + 1)
     metrics = dict(committed=0, replays=0, errors=0, interrupted=False, last_commit_elapsed_s=0.0)
     service_ms, scheduled_ms, lag_ms, errors, samples, restarts = [], [], [], [], [], []
     processor = CustodyProcessor()
-    inputs = BurstInputs(SITES, RATE, args.seconds, capacity=RATE * DELIVERY_GRACE_SECONDS)
+    inputs = BurstInputs(SITES, RATE, args.seconds, capacity=RATE * DELIVERY_GRACE_SECONDS,
+                         context=input_context)
     start = 0.0
     expected = SITES * RATE * args.seconds
     base_time = datetime.now(timezone.utc)
@@ -161,6 +207,7 @@ def main() -> int:
                    harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                    sites=SITES, rate_per_site=RATE, requested_duration_s=args.seconds,
                    receipt_grace_seconds=DELIVERY_GRACE_SECONDS,
+                   input_emitter="SPAWNED_PROCESS",
                    expected=expected, database_name=name)
 
     def save(value):
@@ -194,14 +241,15 @@ def main() -> int:
     def send(site):
         pk, serial, epoch, index = site
         barrier.wait()
-        incoming = inputs.queues[index]
         while not stop_intake.is_set():
             if time.monotonic() >= start + args.seconds + DELIVERY_GRACE_SECONDS:
                 break
             try:
-                sequence, due = incoming.get(timeout=0.1)
+                sequence, due = inputs.take(index, timeout=0.1)
             except Empty:
-                if inputs.done.is_set():
+                # A multiprocessing feeder may still be publishing an item
+                # after generation completes. Account for it before exiting.
+                if inputs.done.is_set() and inputs.pending_depths()[index] == 0:
                     break
                 continue
             began = time.monotonic()
@@ -239,8 +287,6 @@ def main() -> int:
                     metrics["errors"] += 1
                     if len(errors) < 20:
                         errors.append(dict(site=index, sequence=sequence, type=type(exc).__name__))
-            finally:
-                incoming.task_done()
 
     def inspect():
         nonlocal processor
@@ -277,15 +323,23 @@ def main() -> int:
                 db.flush()
                 connector.zkt_device = ZKTDevice(connector_id=connector.id, serial=serial, confirmed_serial=serial)
                 sites.append((connector.id, serial, f"{index+1:032x}", index))
+        emitter = input_context.Process(target=emit_in_process,
+            args=(inputs, input_start_value, input_start_gate, input_ready, stop_intake), daemon=True)
+        emitter.start()
+        if not input_ready.wait(15):
+            raise RuntimeError("INPUT_EMITTER_DID_NOT_START")
+        context["input_emitter_pid"] = emitter.pid
         worker = Thread(target=inspect, daemon=True)
         worker.start()
         with ThreadPoolExecutor(max_workers=SITES) as executor:
             futures = [executor.submit(send, site) for site in sites]
-            start = time.monotonic()
-            base_time = datetime.now(timezone.utc)
+            # Startup and interpreter imports happen before this measured
+            # window. Both processes use the same system monotonic clock.
+            start = time.monotonic() + 0.1
+            base_time = datetime.now(timezone.utc) + timedelta(seconds=0.1)
+            input_start_value.value = start
             barrier.wait()
-            emitter = Thread(target=inputs.emit, args=(start, stop_intake), daemon=True)
-            emitter.start()
+            input_start_gate.set()
             save(snapshot("RUNNING"))
             while not all(future.done() for future in futures):
                 time.sleep(min(30, max(1, start+args.seconds-time.monotonic())))
@@ -293,11 +347,16 @@ def main() -> int:
                 samples.append(sample)
                 save({**sample, "samples": samples})
                 print(json.dumps({key: sample[key] for key in ("elapsed_s", "committed", "replays", "errors")}), flush=True)
+                if emitter.exitcode not in (None, 0):
+                    stop_intake.set()
+                    raise RuntimeError("INPUT_EMITTER_FAILED")
             for future in futures:
                 future.result()
         emitter.join(timeout=1)
         if emitter.is_alive():
             raise RuntimeError("INPUT_EMITTER_DID_NOT_STOP")
+        if emitter.exitcode != 0:
+            raise RuntimeError("INPUT_EMITTER_FAILED")
         delivery_elapsed = time.monotonic()-start
         deadline = time.monotonic()+args.drain_seconds
         while time.monotonic() < deadline and not metrics["interrupted"]:
@@ -320,7 +379,8 @@ def main() -> int:
         result = {**snapshot("COMPLETE"), "delivery_elapsed_s": round(delivery_elapsed, 3), "totals": totals,
                   "unoffered_inputs": expected-inputs.offered-inputs.refused,
                   "uncommitted_offered_inputs": inputs.offered-metrics["committed"],
-                  "pending_input_queue_depths": [queue.qsize() for queue in inputs.queues],
+                  "pending_input_queue_depths": inputs.pending_depths(),
+                  "input_emitter_exitcode": emitter.exitcode,
                   "per_synthetic_site": per_site, "work_states": states, "pending_after_drain": pending,
                   "interpretation_results": interpretations,
                   "samples": samples, "prior_processors": restarts,
@@ -352,6 +412,9 @@ def main() -> int:
         stop_worker.set()
         if emitter is not None:
             emitter.join(timeout=1)
+            if emitter.is_alive():
+                emitter.terminate()
+                emitter.join(timeout=1)
         if worker is not None:
             worker.join(timeout=45)
         database.engine.dispose()

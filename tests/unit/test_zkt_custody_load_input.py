@@ -1,9 +1,12 @@
 """The load source must not stop producing punches while awaiting receipts."""
 from threading import Event
+import multiprocessing
+import sys
+import time
 
 import pytest
 
-from scripts.run_zkt_custody_load import BurstInputs
+from scripts.run_zkt_custody_load import BurstInputs, emit_in_process
 
 
 class Clock:
@@ -66,3 +69,81 @@ def test_interruption_is_not_treated_as_a_complete_input_set():
     assert inputs.done.is_set() and inputs.offered == 0
     with pytest.raises(ValueError, match="Positive"):
         BurstInputs(0, 10, 1, capacity=20)
+
+
+def test_pending_depths_account_for_taken_inputs_without_platform_qsize(monkeypatch):
+    clock = Clock()
+    inputs = BurstInputs(2, 10, 1, capacity=10)
+    inputs.emit(100.0, Event(), now=clock.now, wait=clock.wait)
+
+    def unsupported():
+        raise NotImplementedError("macOS does not implement multiprocessing Queue.qsize")
+
+    for queue in inputs.queues:
+        monkeypatch.setattr(queue, "qsize", unsupported)
+    assert inputs.pending_depths() == [10, 10]
+    assert inputs.take(0, timeout=0.1)[0] == 1
+    assert inputs.pending_depths() == [9, 10]
+    assert inputs.snapshot()["offered"] == 20
+
+
+def test_spawned_source_finishes_while_parent_python_execution_is_busy():
+    context = multiprocessing.get_context("spawn")
+    inputs = BurstInputs(2, 10, 1, capacity=10, context=context)
+    start = context.Value('d', 0)
+    gate, ready, stop = context.Event(), context.Event(), context.Event()
+    process = context.Process(target=emit_in_process, args=(inputs, start, gate, ready, stop))
+    process.start()
+    previous_interval = sys.getswitchinterval()
+    try:
+        assert ready.wait(10)
+        start.value = time.monotonic() + 0.1
+        # Hold this interpreter's GIL across the whole input window. A source
+        # thread in this process could not meet the original hard deadline.
+        sys.setswitchinterval(2)
+        gate.set()
+        while time.monotonic() < start.value + 1.05:
+            pass
+        sys.setswitchinterval(previous_interval)
+        assert inputs.done.wait(2)
+        process.join(timeout=2)
+        assert process.exitcode == 0
+        assert inputs.snapshot()["offered"] == 20 and inputs.refused == 0
+        assert inputs.pending_depths() == [10, 10]
+        for site in range(2):
+            assert [inputs.take(site, timeout=1)[0] for _ in range(10)] == list(range(1, 11))
+        assert inputs.pending_depths() == [0, 0]
+    finally:
+        sys.setswitchinterval(previous_interval)
+        stop.set()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        for queue in inputs.queues:
+            queue.close()
+            queue.join_thread()
+
+
+def test_spawned_source_can_stop_before_the_window_starts():
+    context = multiprocessing.get_context("spawn")
+    inputs = BurstInputs(1, 10, 1, capacity=10, context=context)
+    start = context.Value('d', 0)
+    gate, ready, stop = context.Event(), context.Event(), context.Event()
+    process = context.Process(target=emit_in_process, args=(inputs, start, gate, ready, stop))
+    process.start()
+    try:
+        assert ready.wait(10)
+        stop.set()
+        process.join(timeout=2)
+        assert process.exitcode == 0 and inputs.done.is_set()
+        assert inputs.offered == 0 and inputs.pending_depths() == [0]
+    finally:
+        stop.set()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        for queue in inputs.queues:
+            queue.close()
+            queue.join_thread()
