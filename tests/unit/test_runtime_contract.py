@@ -40,8 +40,22 @@ def test_journal_start_attempts_are_distinct_from_actual_starts_and_custody():
                "proof_attempts": 3, "failures": 7, "sampled_uptime_ms": 42000,
                "last_progress_uptime_ms": 40000, "compatibility": "READER_PROOF_MISSING"}
     value = FirmwareDiagnostics.model_validate({"schema_version": 2, "journal_runtime": runtime}).model_dump()
-    assert value["journal_runtime"] == runtime
+    assert value["journal_runtime"] == {**runtime, "delivery_authority": None}
     assert value["runtime_profile"] is None and value["delivery_authority"] is None
     for field in ("start_attempts", "sampled_uptime_ms"):
         with pytest.raises(ValueError):
             FirmwareDiagnostics.model_validate({"journal_runtime": {**runtime, field: -1}})
+
+
+@pytest.mark.parametrize("phase", ["QUIESCING", "AUTHORITY_HOLD", "BRIDGE_VALIDATION"])
+def test_cutover_and_bridge_recovery_diagnostics_remain_visible(phase):
+    runtime = {"observed": True, "phase": phase, "reader_ready": False, "writer_ready": False,
+               "delivery_authority": "UNKNOWN", "start_attempts": 1, "storage_starts": 1,
+               "delivery_starts": 1, "capture_starts": 0, "proof_attempts": 1, "failures": 1}
+    report = FirmwareDiagnostics.model_validate({"schema_version": 2, "runtime_profile": "ZKT_JOURNAL_V1",
+                                                "delivery_authority": "UNKNOWN", "journal_format": 1,
+                                                "journal_runtime": runtime})
+    assert report.journal_runtime.phase == phase
+    assert report.journal_runtime.delivery_authority == "UNKNOWN"
+    with pytest.raises(ValueError, match="JOURNAL_CAPABILITIES_INCOMPLETE"):
+        runtime_contract(report.model_dump())

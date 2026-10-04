@@ -7,15 +7,39 @@ afterEach(cleanup)
 const healthy: FirmwareDiagnostics = {
   schema_version: 1,
   boot_id: 'current',
+  delivery_authority: 'ADD',
   storage: { durability: 'HEALTHY', persistence_verified: true, recovery_complete: true },
   workers: [], queues: [],
 }
 const journal: NonNullable<FirmwareDiagnostics['journal_runtime']> = {
   observed: true, phase: 'READY', reader_ready: true, writer_ready: false,
+  delivery_authority: 'ADD',
   start_attempts: 9, storage_starts: 1, delivery_starts: 1, capture_starts: 0,
   proof_attempts: 3, failures: 7, sampled_uptime_ms: 40000, compatibility: 'READER_OK',
 }
 describe('firmware preservation evidence', () => {
+  it.each(['UNKNOWN', 'LEGACY', undefined] as const)('does not infer ADD ownership from writer-ready: %s', authority => {
+    render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, sampled_uptime_ms: 41000,
+      journal_runtime: { ...journal, writer_ready: true, delivery_authority: authority } }} observedAt={new Date().toISOString()} />)
+    expect(screen.queryByText('Local writer permitted')).toBeNull()
+  })
+  it.each(['UNKNOWN', undefined] as const)('shows uncertain delivery ownership explicitly: %s', authority => {
+    render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, delivery_authority: authority,
+      sampled_uptime_ms: 41000, journal_runtime: { ...journal, writer_ready: true } }} observedAt={new Date().toISOString()} />)
+    expect(screen.getByText('Current ownership unverified')).toBeTruthy()
+    expect(screen.queryByText('Legacy delivery paths')).toBeNull()
+    expect(screen.queryByText('Local writer permitted')).toBeNull()
+  })
+  it.each([
+    ['QUIESCING', 'Finishing storage work before restart'],
+    ['AUTHORITY_HOLD', 'Delivery ownership needs recovery'],
+    ['BRIDGE_VALIDATION', 'Verifying the bridge reader before boot confirmation'],
+  ])('shows %s without granting capture permission', (phase, label) => {
+    render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, sampled_uptime_ms: 41000,
+      journal_runtime: { ...journal, phase, writer_ready: true } }} observedAt={new Date().toISOString()} />)
+    expect(screen.getByText(label)).toBeTruthy()
+    expect(screen.queryByText('Local writer permitted')).toBeNull()
+  })
   it('shows actual journal starts independently from attempts and writer permission', () => {
     render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, sampled_uptime_ms: 41000, journal_runtime: journal }} observedAt={new Date().toISOString()} />)
     expect(screen.getByText('Startup checks passed')).toBeTruthy()

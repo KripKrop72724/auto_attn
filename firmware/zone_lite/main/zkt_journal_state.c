@@ -37,7 +37,8 @@ static bool valid(const uint8_t bytes[ZJ_ROOT_BYTES], const char *serial)
     uint64_t limit = get64(bytes + 8);
     bool ok = !memcmp(bytes, "ZJROOT01", 8) && limit && limit <= (uint64_t)ZJ_SEQUENCE_MAX + 1 &&
         present(bytes + 16, 32) && present(bytes + 48, 16) &&
-        !memcmp(bytes, canonical, sizeof(canonical)) && !present(bytes + 145, 11);
+        !memcmp(bytes, canonical, sizeof(canonical)) && bytes[145] <= 1 &&
+        !present(bytes + 146, 10) && (bytes[145] == 1 || limit == 1);
     char expected[81] = {0};
     size_t length = strlen(serial);
     if (!length || length >= sizeof(expected)) ok = false;
@@ -106,10 +107,28 @@ bool zj_state_identity(const zj_state_t *state, uint8_t master[32], uint8_t epoc
     memcpy(epoch, state->root + 48, 16);
     return true;
 }
+zj_delivery_authority_t zj_state_authority(const zj_state_t *state)
+{
+    if (!state || !state->ready) return ZJ_AUTHORITY_UNKNOWN;
+    return state->root[145] == 1 ? ZJ_AUTHORITY_ADD : ZJ_AUTHORITY_LEGACY;
+}
+zj_result_t zj_state_enable_add(zj_state_t *state)
+{
+    if (!state || !state->ready) return ZJ_INVALID;
+    if (zj_state_authority(state) == ZJ_AUTHORITY_ADD) return ZJ_OK;
+    uint8_t updated[ZJ_ROOT_BYTES];
+    memcpy(updated, state->root, sizeof(updated));
+    updated[145] = 1;
+    checksum(updated);
+    bool ok = save(state, "root", updated, sizeof(updated));
+    if (ok) memcpy(state->root, updated, sizeof(updated));
+    erase(updated, sizeof(updated));
+    return ok ? ZJ_OK : ZJ_UNCERTAIN;
+}
 bool zj_state_reserve(void *context, uint64_t exclusive_limit)
 {
     zj_state_t *state = context;
-    if (!state || !state->ready || exclusive_limit <= state->limit ||
+    if (zj_state_authority(state) != ZJ_AUTHORITY_ADD || exclusive_limit <= state->limit ||
         exclusive_limit > (uint64_t)ZJ_SEQUENCE_MAX + 1) return false;
     uint8_t updated[ZJ_ROOT_BYTES];
     memcpy(updated, state->root, sizeof(updated));

@@ -1061,9 +1061,21 @@ static void configure_zkt_socket(int sock)
 
 static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline);
 
-static bool zk_preserve_live_packet(const uint8_t *packet, size_t length)
+typedef enum { ZK_LIVE_HELD, ZK_LIVE_LEGACY, ZK_LIVE_JOURNAL } zk_live_path_t;
+
+static bool zkt_legacy_capture_allowed(void)
 {
-#if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
+#ifdef ZONE_LITE_HIKVISION
+    return true;
+#else
+    return zj_runtime_legacy_capture_allowed();
+#endif
+}
+
+static zk_live_path_t zk_preserve_live_packet(const uint8_t *packet, size_t length)
+{
+    if (zkt_legacy_capture_allowed()) return ZK_LIVE_LEGACY;
+#if defined(ZONE_LITE_JOURNAL_WRITES) && ZONE_LITE_JOURNAL_WRITES && !defined(ZONE_LITE_HIKVISION)
     int64_t wall = epoch_now();
     zj_capture_facts_t facts = {.wall_seconds = wall > 0 ? wall : 0,
         .uptime_ms = (uint64_t)uptime_ms(), .time_quality = ZJ_TIME_UNKNOWN};
@@ -1071,10 +1083,11 @@ static bool zk_preserve_live_packet(const uint8_t *packet, size_t length)
      * interpretation. Failure cannot fall through to a protocol ACK. */
     bool preserved = zj_capture_runtime_packet(packet, length, &facts);
     if (!preserved) g_force_truth_reconcile = true;
-    return preserved;
+    return preserved ? ZK_LIVE_JOURNAL : ZK_LIVE_HELD;
 #else
     (void)packet; (void)length;
-    return true; /* Legacy reader builds retain their existing capture path. */
+    g_force_truth_reconcile = true;
+    return ZK_LIVE_HELD; /* A new image without capture support cannot use a fallback. */
 #endif
 }
 
@@ -4900,6 +4913,9 @@ static bool reconcile_attendance_dump(
     if (history_exhausted_out) *history_exhausted_out = false;
     if (fresh_session_retryable_out) *fresh_session_retryable_out = false;
     if (ords_gate_deferred_out) *ords_gate_deferred_out = false;
+    /* New history follows the committed raw source ledger. Retained legacy
+     * queues still have their own drain; a new full sweep cannot refill them. */
+    if (!zkt_legacy_capture_allowed()) return false;
     uint8_t *data = NULL;
     size_t len = 0;
     uint32_t record_size = 0;
@@ -7699,7 +7715,6 @@ static bool discover_zkt_session(uint32_t *selected_ip, uint32_t skip_ip)
     return false;
 }
 
-#if !defined(ZONE_LITE_JOURNAL_WRITES) || defined(ZONE_LITE_HIKVISION)
 static size_t process_live_packet(const uint8_t *data, size_t len, const user_table_t *users, uint8_t *wire_hint)
 {
     size_t record_size = 0;
@@ -7750,7 +7765,6 @@ static size_t process_live_packet(const uint8_t *data, size_t len, const user_ta
     }
     return observed;
 }
-#endif
 
 static bool zk_register_attlog_events(int sock, zk_context_t *ctx, bool enable)
 {
@@ -8489,7 +8503,8 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
             zk_header_t *header = (zk_header_t *)packet;
             if (header->session_id != ctx.session_id) { free(packet); break; }
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
-                if (!zk_preserve_live_packet(packet, top.length) ||
+                zk_live_path_t captured_path = zk_preserve_live_packet(packet, top.length);
+                if (captured_path == ZK_LIVE_HELD ||
                     !zk_send_ack_only(sock, ctx.session_id, deadline)) { free(packet); break; }
                 // The session starts from a two-read stable user snapshot and
                 // refreshes it periodically or on explicit ADD commands.  Do
@@ -8499,19 +8514,20 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
                 // authenticated session.  Unknown identities remain durable
                 // and fail closed in the ADD identity-blocked queue until a
                 // later verified snapshot or catalog alias repairs them.
-#if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
-                /* The ADD journal path owns interpretation/delivery. Counting
-                 * packets here only schedules source checks; it is not a
-                 * count of decoded punches or an Oracle completion claim. */
-                ++live_events_since_sync;
-                led_status_event(LED_EVENT_LIVE_PUNCH);
-#else
-                live_events_since_sync += process_live_packet(
-                    packet + sizeof(zk_header_t),
-                    top.length - sizeof(zk_header_t),
-                    users,
-                    &ctx.live_record_size);
-#endif
+                /* Keep this packet's route even if a later health read fails.
+                 * A stale snapshot cannot skip its required legacy enqueue. */
+                if (captured_path == ZK_LIVE_LEGACY) {
+                    live_events_since_sync += process_live_packet(
+                        packet + sizeof(zk_header_t),
+                        top.length - sizeof(zk_header_t),
+                        users,
+                        &ctx.live_record_size);
+                } else {
+                    /* ADD owns interpretation/delivery. A preserved packet
+                     * count is not a decoded punch or Oracle completion. */
+                    ++live_events_since_sync;
+                    led_status_event(LED_EVENT_LIVE_PUNCH);
+                }
                 add_connector_set_activity("LIVE_CAPTURE");
             }
             free(packet);
@@ -8710,7 +8726,8 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
             // The operator-requested ADD source job owns historical truth.
             // Never run the legacy full-dump reconciler concurrently.
             last_reconcile = now_ms;
-        } else if (!g_add_source_coverage_certified && !add_source_job_active &&
+        } else if (zkt_legacy_capture_allowed() &&
+            !g_add_source_coverage_certified && !add_source_job_active &&
             now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
             (g_truth_retry_not_before_ms == 0 ||
              now_ms >= g_truth_retry_not_before_ms) &&

@@ -130,6 +130,11 @@ int main(void)
     assert(update() == ZJ_COMPAT_SECURITY && !writes);
     assert(select_reader() == ZJ_COMPAT_SECURITY && !selections);
     return 0;
+#elif !ZONE_LITE_JOURNAL_WRITES
+    assert(check() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
+    assert(update() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
+    assert(select_reader() == ZJ_COMPAT_CAPTURE_DISABLED && !selections);
+    return 0;
 #else
     current_valid = false;
     assert(check() == ZJ_COMPAT_SECURITY && !writes); /* Unconfirmed bridge. */

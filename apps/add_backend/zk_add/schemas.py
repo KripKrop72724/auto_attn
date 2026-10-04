@@ -126,9 +126,11 @@ class JournalRuntimeDiagnostics(BaseModel):
     observed: bool
     phase: Literal["NOT_STARTED", "DISABLED", "SECURITY_HOLD", "BINDING_HOLD", "STORAGE_WAIT",
                    "OWNER_START", "RECOVERING", "TRANSPORT_START", "CHECKING_READER", "READER_HOLD",
-                   "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "UNKNOWN"]
+                   "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "QUIESCING",
+                   "AUTHORITY_HOLD", "BRIDGE_VALIDATION", "UNKNOWN"]
     reader_ready: bool
     writer_ready: bool
+    delivery_authority: Literal["UNKNOWN", "LEGACY", "ADD"] | None = None
     start_attempts: int = Field(ge=0, le=0xFFFFFFFF)
     storage_starts: int = Field(ge=0, le=0xFFFFFFFF)
     delivery_starts: int = Field(ge=0, le=0xFFFFFFFF)
@@ -143,7 +145,7 @@ class JournalRuntimeDiagnostics(BaseModel):
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1, 2] = 1
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
-    delivery_authority: Literal["LEGACY_DUAL", "ADD"] | None = None
+    delivery_authority: Literal["LEGACY_DUAL", "ADD", "UNKNOWN"] | None = None
     journal_format: Literal[1] | None = None
     boot_id: str | None = Field(default=None, max_length=100)
     sample_sequence: int | None = Field(default=None, ge=0)

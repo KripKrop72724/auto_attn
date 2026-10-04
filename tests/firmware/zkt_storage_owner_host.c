@@ -17,6 +17,8 @@
 
 static atomic_bool stop, pause_write, write_waiting, full;
 static atomic_bool refuse_compatibility, stale_transport;
+static atomic_bool bridge_image, cutover_readback_failure;
+static atomic_int cutover_failure;
 static pthread_t thread;
 static pthread_mutex_t budget = PTHREAD_MUTEX_INITIALIZER;
 static void (*task_function)(void *);
@@ -110,6 +112,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
     assert(handle == 1);
     if (!strcmp(name, "reader_v1")) return ESP_ERR_NVS_NOT_FOUND;
     bool is_root = !strcmp(name, "root");
+    if (is_root && atomic_exchange(&cutover_readback_failure, false)) return -7;
     size_t size = is_root ? root_length : checkpoint_length;
     if (!size) return ESP_ERR_NVS_NOT_FOUND;
     if (size > *length) return ESP_ERR_INVALID_SIZE;
@@ -129,8 +132,13 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
     assert(handle == 1);
     if (!strcmp(name, "root")) {
         assert(length == sizeof(root));
+        int failure = ((const uint8_t *)bytes)[145] == 1 && root[145] == 0
+            ? atomic_exchange(&cutover_failure, 0) : 0;
+        if (failure == 1) return -7;
         memcpy(root, bytes, length);
         root_length = length;
+        if (failure == 2) return -7;
+        if (failure == 3) atomic_store(&cutover_readback_failure, true);
     } else {
         assert(!strcmp(name, "retirement") && length == sizeof(checkpoint));
         memcpy(checkpoint, bytes, length);
@@ -177,8 +185,9 @@ zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t ep
     assert(ready && persistence);
     /* The actual ESP/NVS/identity checks have their own platform harness.
      * This spy verifies owner locking, gating and recovery transitions. */
-    *writer_allowed = delivery && !recovering && !atomic_load(&refuse_compatibility);
-    return *writer_allowed ? ZJ_COMPAT_OK : ZJ_COMPAT_NOT_READY;
+    bool compatible = delivery && !recovering && !atomic_load(&refuse_compatibility);
+    *writer_allowed = compatible && !atomic_load(&bridge_image);
+    return compatible ? ZJ_COMPAT_OK : ZJ_COMPAT_NOT_READY;
 }
 zj_compat_result_t zj_reader_platform_update(const char *serial, const uint8_t epoch[16],
     bool ready, bool delivery, bool persistence, bool recovering, uint32_t address, uint32_t size, const char *version)
@@ -245,13 +254,15 @@ int main(int argc, char **argv)
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
     bool corrupt_journal = argc == 2 && !strcmp(argv[1], "--runtime-corrupt-journal");
-    bool recovering_checkpoint = argc == 2 && !corrupt_journal;
+    bool authority_test = argc == 2 && !strncmp(argv[1], "--authority-", 12);
+    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {
         /* A retained encrypted-NVS root is intact; only its retirement blob
          * is damaged. Use the real owner and recovery admission callbacks. */
         memcpy(root, "ZJROOT01", 8);
         root[8] = 1; root[9] = 1; /* Exclusive reserved sequence limit 257. */
+        root[145] = 1; /* ADD cutover committed before sequence reservation. */
         for (unsigned i = 16; i < 64; ++i) root[i] = (uint8_t)i;
         memcpy(root + 64, "TEST-TERMINAL", 13);
         uint32_t crc = dq_crc32(root, ZJ_ROOT_BYTES - 4);
@@ -301,6 +312,51 @@ int main(int argc, char **argv)
         vTaskDelay(1);
     }
     assert(health.ready && root_length && !health.operation_running);
+    if (authority_test) {
+        assert(health.delivery_authority == ZJ_AUTHORITY_LEGACY && root[145] == 0);
+        zj_request_t proof = {.operation = ZJ_READER_CHECK};
+        zj_request_t append = {.operation = ZJ_APPEND, .input.observation = {
+            .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
+            .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'A'}}};
+        uint64_t attempt;
+        /* An initial bridge may read/attest, but cannot initiate cutover. */
+        atomic_store(&bridge_image, true);
+        assert(zj_owner_submit(&proof, &attempt));
+        assert(wait_reply(attempt).compatibility == ZJ_COMPAT_OK);
+        assert(zj_owner_health(&health) && !health.writer_allowed && health.delivery_authority == ZJ_AUTHORITY_LEGACY);
+        assert(zj_owner_submit(&append, &attempt));
+        assert(wait_reply(attempt).result == ZJ_INVALID && root[145] == 0 && root[8] == 1 && root[9] == 0);
+        atomic_store(&bridge_image, false);
+        int fault = !strcmp(argv[1], "--authority-before") ? 1 :
+            !strcmp(argv[1], "--authority-after") ? 2 :
+            !strcmp(argv[1], "--authority-readback") ? 3 : 0;
+        atomic_store(&cutover_failure, fault);
+        assert(zj_owner_submit(&proof, &attempt));
+        zj_reply_t result = wait_reply(attempt);
+        if (fault) {
+            assert(result.compatibility == ZJ_COMPAT_UNCERTAIN);
+            assert(zj_owner_health(&health) && !health.writer_allowed);
+            assert(root[145] == (fault == 1 ? 0 : 1));
+            assert(zj_owner_submit(&append, &attempt));
+            assert(wait_reply(attempt).result == ZJ_INVALID && root[8] == 1 && root[9] == 0);
+            assert(zj_owner_submit(&proof, &attempt));
+            result = wait_reply(attempt);
+        }
+        assert(result.compatibility == ZJ_COMPAT_OK && root[145] == 1);
+        assert(zj_owner_health(&health) && health.writer_allowed && health.delivery_authority == ZJ_AUTHORITY_ADD);
+        /* The verified bridge must now preserve new records through ADD. */
+        atomic_store(&bridge_image, true);
+        assert(zj_owner_submit(&proof, &attempt));
+        assert(wait_reply(attempt).compatibility == ZJ_COMPAT_OK);
+        assert(zj_owner_health(&health) && health.writer_allowed && health.delivery_authority == ZJ_AUTHORITY_ADD);
+        assert(zj_owner_submit(&append, &attempt));
+        zj_reply_t captured = wait_reply(attempt);
+        /* Segment identity consumes sequence one; the first observation is two. */
+        assert(captured.result == ZJ_OK && captured.capture_sequence == 2 && root[145] == 1);
+        atomic_store(&stop, true);
+        assert(!pthread_join(thread, NULL));
+        return 0;
+    }
     if (recovering_checkpoint) {
         assert(health.checkpoint_recovery_pending);
         zj_request_t evidence = {.operation = ZJ_PEEK};
@@ -329,6 +385,7 @@ int main(int argc, char **argv)
         .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'A'}}};
     uint64_t ticket;
     assert(!health.writer_allowed && !health.compatibility_checked);
+    assert(health.delivery_authority == ZJ_AUTHORITY_LEGACY);
     assert(zj_owner_submit(&request, &ticket));
     zj_reply_t refused = wait_reply(ticket);
     assert(refused.result == ZJ_INVALID && !refused.capture_sequence);
@@ -346,7 +403,7 @@ int main(int argc, char **argv)
     atomic_store(&stale_transport, false);
     assert(zj_owner_submit(&compatibility, &ticket));
     assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
-    assert(zj_owner_health(&health) && health.writer_allowed);
+    assert(zj_owner_health(&health) && health.writer_allowed && health.delivery_authority == ZJ_AUTHORITY_ADD);
     zj_request_t update = {.operation = ZJ_OTA_CHECK, .input.ota = {
         .address = 0x2a0000, .size = 0x280000, .version = ZJ_WRITER_VERSION}};
     assert(zj_owner_submit(&update, &ticket));

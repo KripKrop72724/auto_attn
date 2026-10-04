@@ -15,6 +15,8 @@ const journalPhases: Record<string, string> = {
   READER_HOLD: 'Reader compatibility needs review', CAPTURE_START: 'Starting capture',
   WRITER_DISABLED: 'Reader active; new capture is disabled', READY: 'Startup checks passed',
   STALLED: 'Worker progress is stalled', UNKNOWN: 'Unknown',
+  QUIESCING: 'Finishing storage work before restart', AUTHORITY_HOLD: 'Delivery ownership needs recovery',
+  BRIDGE_VALIDATION: 'Verifying the bridge reader before boot confirmation',
 }
 
 export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }: {
@@ -44,7 +46,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
     ? (parentUptime % 0x100000000 - journal.sampled_uptime_ms! + 0x100000000) % 0x100000000 : Infinity
   const journalFresh = fresh && journalLag + Math.max(0, now - observed) <= 45_000
   const journalReader = journalFresh && journal?.reader_ready &&
-    ['CHECKING_READER', 'READER_HOLD', 'CAPTURE_START', 'WRITER_DISABLED', 'READY'].includes(journal.phase)
+    ['CHECKING_READER', 'READER_HOLD', 'CAPTURE_START', 'WRITER_DISABLED', 'BRIDGE_VALIDATION', 'READY'].includes(journal.phase)
   const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error
   const heading = !diagnostics ? 'Local durability not reported'
     : !sameBoot ? 'Durability boot identity is unverified'
@@ -63,7 +65,8 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Telemetry sampled</dt><dd>{diagnostics.sampled_at || 'Not reported'}</dd></div>
         <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Boot identity is unverified' : ''}</dd></div>
         <div><dt>Application digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{imageDigest || 'Not reported'}</dd></div>
-        <div><dt>Oracle delivery owner</dt><dd>{diagnostics.delivery_authority === 'ADD' ? 'ADD' : 'Legacy delivery paths'}</dd></div>
+        <div><dt>Oracle delivery owner</dt><dd>{fresh && diagnostics.delivery_authority === 'ADD' ? 'ADD'
+          : fresh && diagnostics.delivery_authority === 'LEGACY_DUAL' ? 'Legacy delivery paths' : 'Current ownership unverified'}</dd></div>
         <div><dt>Storage used / total</dt><dd>{bytes(storage?.used_bytes)} / {bytes(storage?.total_bytes)}</dd></div>
         <div><dt>Reserved admission space</dt><dd>{bytes(storage?.admission_reserve_bytes)}</dd></div>
         <div><dt>Write failures</dt><dd>{storage?.write_failures ?? 'Not reported'}</dd></div>
@@ -77,7 +80,8 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         {journal && <>
           <div><dt>Journal startup</dt><dd>{journalFresh ? journalPhases[journal.phase] : 'Current journal state unverified'}</dd></div>
           <div><dt>Journal reader</dt><dd>{journalReader ? 'Ready for recovery and receipt delivery' : 'Readiness not confirmed'}</dd></div>
-          <div><dt>New journal capture</dt><dd>{journalFresh && journal.writer_ready && journalReader && journal.phase === 'READY' ? 'Local writer permitted' : 'Writer permission not confirmed'}</dd></div>
+          <div><dt>New journal capture</dt><dd>{journalFresh && journal.delivery_authority === 'ADD' && diagnostics.delivery_authority === 'ADD' &&
+            journal.writer_ready && journalReader && journal.phase === 'READY' ? 'Local writer permitted' : 'Writer permission not confirmed'}</dd></div>
           <div><dt>Journal start attempts</dt><dd>{journalValid ? journal.start_attempts : 'Not reported'}</dd></div>
           <div><dt>Journal workers started</dt><dd>{journalValid ? `${journal.storage_starts} storage · ${journal.delivery_starts} delivery · ${journal.capture_starts} capture` : 'Not reported'}</dd></div>
           <div><dt>Reader checks</dt><dd>{journalValid ? journal.proof_attempts : 'Not reported'}</dd></div>

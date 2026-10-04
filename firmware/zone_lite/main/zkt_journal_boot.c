@@ -35,6 +35,7 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
     s->sampled_ms = now;
     s->reader_ready = s->writer_ready = false;
     s->mode = in->mode;
+    s->bridge_validation_pending = in->mode == ZJ_BOOT_BRIDGE && in->bridge_validation_pending;
     if (in->mode == ZJ_BOOT_DISABLED) { s->phase = ZJ_BOOT_OFF; return; }
     if (!in->secure || (in->mode != ZJ_BOOT_BRIDGE && in->mode != ZJ_BOOT_WRITER)) {
         s->phase = ZJ_BOOT_SECURITY_HOLD; return;
@@ -62,6 +63,13 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
         return;
     }
     if (owner.quiescing || owner.quiesced) { s->phase = ZJ_BOOT_QUIESCING; return; }
+    if (s->delivery_authority == ZJ_AUTHORITY_ADD && owner.delivery_authority == ZJ_AUTHORITY_LEGACY) {
+        s->phase = ZJ_BOOT_AUTHORITY_HOLD; return;
+    }
+    /* Unknown never restores legacy authority. Retain an observed ADD cutover
+     * while recovery is unavailable, without granting writer readiness. */
+    if (owner.delivery_authority != ZJ_AUTHORITY_UNKNOWN)
+        s->delivery_authority = owner.delivery_authority;
     if (!owner.ready || owner.checkpoint_recovery_pending) { s->phase = ZJ_BOOT_RECOVERING; }
     /* Delivery must start even during checkpoint recovery: the preserved
      * damaged checkpoint itself needs a committed receipt to finish recovery. */
@@ -98,8 +106,17 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
         return;
     }
     if (!owner.ready || owner.checkpoint_recovery_pending) { s->phase = ZJ_BOOT_RECOVERING; return; }
+    if (owner.delivery_authority == ZJ_AUTHORITY_UNKNOWN) { s->phase = ZJ_BOOT_AUTHORITY_HOLD; return; }
+    if (!in->writer_build) { s->phase = ZJ_BOOT_WRITER_DISABLED; return; }
     s->reader_ready = true;
     s->compatibility = owner.compatibility;
+    if (s->bridge_validation_pending) {
+        /* OTA can now confirm this secure bridge's actual local reader and
+         * transport. Attestation/capture wait for the next step's platform
+         * VALID state, rather than relying on a race before a failed proof. */
+        s->phase = ZJ_BOOT_BRIDGE_VALIDATION;
+        return;
+    }
     if (!owner.compatibility_checked || owner.compatibility != ZJ_COMPAT_OK) {
         s->phase = ZJ_BOOT_READER_HOLD;
         if (!due(s, now)) return;
@@ -114,8 +131,10 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
         s->phase = ZJ_BOOT_CHECKING_READER;
         return;
     }
-    if (in->mode == ZJ_BOOT_BRIDGE) { s->phase = ZJ_BOOT_READY; return; }
-    if (!in->writer_build) { s->phase = ZJ_BOOT_WRITER_DISABLED; return; }
+    if (in->mode == ZJ_BOOT_BRIDGE && s->delivery_authority == ZJ_AUTHORITY_LEGACY) {
+        s->phase = ZJ_BOOT_READY; return;
+    }
+    if (s->delivery_authority != ZJ_AUTHORITY_ADD) { s->phase = ZJ_BOOT_AUTHORITY_HOLD; return; }
     if (!owner.writer_allowed) { s->phase = ZJ_BOOT_READER_HOLD; return; }
     if (!s->capture_started) {
         s->phase = ZJ_BOOT_CAPTURE_START;
@@ -135,13 +154,14 @@ bool zj_boot_local_ready(const zj_boot_t *s, uint32_t now)
     if (s->mode == ZJ_BOOT_DISABLED) return true;
     /* A pending bridge must prove its reader before OTA marks it valid; only
      * then may the owner persist its validated-image reader attestation. */
-    return s->reader_ready && ((s->mode == ZJ_BOOT_BRIDGE &&
-        (s->compatibility == ZJ_COMPAT_OK || s->compatibility == ZJ_COMPAT_NOT_READY)) || s->writer_ready);
+    return s->reader_ready && (s->writer_ready || (s->mode == ZJ_BOOT_BRIDGE &&
+        ((s->bridge_validation_pending && s->phase == ZJ_BOOT_BRIDGE_VALIDATION) ||
+         (s->delivery_authority == ZJ_AUTHORITY_LEGACY && s->compatibility == ZJ_COMPAT_OK))));
 }
 const char *zj_boot_phase_name(zj_boot_phase_t phase)
 {
     static const char *const names[] = {"DISABLED", "SECURITY_HOLD", "BINDING_HOLD", "STORAGE_WAIT",
         "OWNER_START", "RECOVERING", "TRANSPORT_START", "CHECKING_READER", "READER_HOLD",
-        "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "QUIESCING"};
+        "CAPTURE_START", "WRITER_DISABLED", "READY", "STALLED", "QUIESCING", "AUTHORITY_HOLD", "BRIDGE_VALIDATION"};
     return (unsigned)phase < sizeof(names) / sizeof(names[0]) ? names[phase] : "UNKNOWN";
 }

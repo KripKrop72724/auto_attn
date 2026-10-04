@@ -39,7 +39,11 @@ static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*loc
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
 static int64_t monotonic_ms(void){return 5000;}
 static uint32_t now_ms(void){return 5000;}
-static bool zj_runtime_health(zj_boot_t *out){*out=(zj_boot_t){.mode=ZJ_BOOT_BRIDGE,.phase=ZJ_BOOT_READY,.reader_ready=true,.sampled_ms=4000,.owner_starts=1,.transport_starts=1};return true;}
+static zj_boot_mode_t configured_mode=ZJ_BOOT_BRIDGE;
+static bool observed=true;
+static zj_boot_t health={.mode=ZJ_BOOT_BRIDGE,.phase=ZJ_BOOT_READY,.delivery_authority=ZJ_AUTHORITY_LEGACY,.reader_ready=true,.sampled_ms=4000,.owner_starts=1,.transport_starts=1};
+static zj_boot_mode_t mode(void){return configured_mode;}
+static bool zj_runtime_health(zj_boot_t *out){*out=health;return observed;}
 static const char s_boot_id[]="allocation-test-boot";
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
@@ -59,6 +63,22 @@ static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_work
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,.admission_reserve_bytes=1048576,.last_error=EIO,.last_operation="local_write_commit"};}
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
 ''' + runtime_function + functions + r'''
+static void check_ownership(const char *profile,const char *authority,bool writer){
+ fail_at=0;cJSON *payload=cJSON_CreateObject();assert(payload);calls=0;
+ append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");size_t total=calls;
+ cJSON *diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+ assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"runtime_profile")->valuestring,profile));
+ assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"delivery_authority")->valuestring,authority));
+ cJSON *runtime=cJSON_GetObjectItemCaseSensitive(diagnostics,"journal_runtime");assert(runtime);
+ assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(runtime,"writer_ready"))==writer);
+ cJSON_Delete(payload);
+ for(size_t i=1;i<=total;i++){
+  fail_at=0;payload=cJSON_CreateObject();assert(payload);calls=0;fail_at=i;
+  append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
+  assert(!cJSON_HasObjectItem(payload,"diagnostics")&&!held);cJSON_Delete(payload);
+ }
+ fail_at=0;
+}
 int main(void){
  cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
  cJSON *payload=cJSON_CreateObject();assert(payload);calls=0;
@@ -93,6 +113,21 @@ int main(void){
  diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"FULL_RECONCILE"));
  cJSON_Delete(payload);
+ check_ownership("ZKT_LEGACY","LEGACY_DUAL",false);
+ health.delivery_authority=ZJ_AUTHORITY_ADD;health.writer_ready=true;
+ check_ownership("ZKT_JOURNAL_V1","ADD",true); /* Compatible rollback bridge. */
+ configured_mode=health.mode=ZJ_BOOT_WRITER;
+ check_ownership("ZKT_JOURNAL_V1","ADD",true);
+ health.sampled_ms=5000U-45000U;
+ check_ownership("ZKT_JOURNAL_V1","UNKNOWN",false);
+ health.sampled_ms=4000;observed=false;
+ check_ownership("ZKT_JOURNAL_V1","UNKNOWN",false);
+ observed=true;health.delivery_authority=ZJ_AUTHORITY_UNKNOWN;health.writer_ready=false;
+ check_ownership("ZKT_JOURNAL_V1","UNKNOWN",false);
+ configured_mode=ZJ_BOOT_BRIDGE; /* A mismatched old snapshot cannot authorize capture. */
+ check_ownership("ZKT_JOURNAL_V1","UNKNOWN",false);
+ configured_mode=health.mode=ZJ_BOOT_DISABLED;
+ check_ownership("ZKT_LEGACY","LEGACY_DUAL",false);
  puts("diagnostics allocation regressions passed");
 }
 '''
