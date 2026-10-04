@@ -117,6 +117,14 @@ export interface ZktDevice {
   next_restart_at: string | null
 }
 
+export interface CaptureLatencyHistogram {
+  schema_version: 1
+  buckets: number[]
+  samples: number
+  max_ms: number
+  saturated: boolean
+}
+
 export interface FirmwareDiagnostics {
   schema_version: 1 | 2
   runtime_profile?: 'ZKT_LEGACY' | 'HIKVISION_V1' | 'ZKT_JOURNAL_V1' | null
@@ -212,6 +220,8 @@ export interface FirmwareDiagnostics {
     timeouts?: number | null
     refusals?: number | null
     max_operation_ms?: number | null
+    packet_commit_latency_ms?: CaptureLatencyHistogram | null
+    fragment_commit_latency_ms?: CaptureLatencyHistogram | null
   }>
   reconciliation_mode?: string | null
   last_light_check_uptime_ms?: number | null

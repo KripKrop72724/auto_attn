@@ -9,7 +9,7 @@ typedef struct {
     zj_capture_t capture;
     zj_request_t request;
     uint64_t ticket;
-    uint32_t clock, operation_started, delay_ms;
+    uint32_t clock, operation_started, delay_ms, submit_delay_ms;
     unsigned writes, refuse_write, abandon_failures;
     bool stalled, entropy_failure;
 } capture_scenario_t;
@@ -43,7 +43,11 @@ static bool capture_random(void *context, uint8_t *out, size_t length)
     return true;
 }
 static bool capture_submit(void *context, const zj_request_t *request, uint64_t *ticket)
-{ return zj_mailbox_submit(&((capture_scenario_t *)context)->mailbox, request, ticket); }
+{
+    capture_scenario_t *s = context;
+    s->clock += s->submit_delay_ms;
+    return zj_mailbox_submit(&s->mailbox, request, ticket);
+}
 static bool capture_poll(void *context, uint64_t ticket, zj_reply_t *reply, bool *complete)
 {
     capture_scenario_t *s = context;
@@ -110,6 +114,9 @@ int main(void)
         reopen(&s->store);
         unsigned pieces = reconstruct(s, size, size);
         assert(pieces == (size <= 512 ? 1 : (size + ZJ_FRAGMENT_DATA - 1) / ZJ_FRAGMENT_DATA));
+        assert(s->capture.health.packet_commit_latency.samples == 1);
+        assert(s->capture.health.fragment_commit_latency.samples == pieces);
+        assert(s->capture.health.fragment_commit_latency.max_ms == 1);
     }
     initialize(s);
     assert(!zj_capture_packet(&s->capture, packet, 7, &facts));
@@ -124,6 +131,8 @@ int main(void)
     assert(!zj_capture_packet(&s->capture, packet, 1000, &facts));
     assert(s->capture.health.committed_bytes == ZJ_FRAGMENT_DATA);
     assert(s->capture.health.last_result == ZJ_FULL && !s->capture.health.packets);
+    assert(!s->capture.health.packet_commit_latency.samples);
+    assert(s->capture.health.fragment_commit_latency.samples == 1);
     reopen(&s->store);
     assert(reconstruct(s, 1000, ZJ_FRAGMENT_DATA) == 1);
 
@@ -156,6 +165,43 @@ int main(void)
     assert(s->clock == 15000 && s->capture.health.timeouts == 1);
     assert(s->capture.health.committed_bytes > 0 && s->capture.health.committed_bytes < 10000);
     assert(!s->capture.health.packets);
+    assert(!s->capture.health.packet_commit_latency.samples);
+
+    /* Include submit contention and every fragment, with wrapping monotonic
+     * time. The poll port completes 45 ms I/O at the next 10 ms tick. */
+    initialize(s);
+    s->clock = UINT32_MAX - 40;
+    s->submit_delay_ms = 20;
+    s->delay_ms = 45;
+    assert(zj_capture_packet(&s->capture, packet, 1000, &facts));
+    assert(s->capture.health.fragment_commit_latency.samples == 3);
+    assert(s->capture.health.fragment_commit_latency.buckets[6] == 3);
+    assert(s->capture.health.fragment_commit_latency.max_ms == 71);
+    assert(s->capture.health.packet_commit_latency.samples == 1);
+    assert(s->capture.health.packet_commit_latency.buckets[7] == 1);
+    assert(s->capture.health.packet_commit_latency.max_ms == 211);
+    assert(s->capture.health.failures == 0);
+
+    initialize(s);
+    s->delay_ms = 500;
+    assert(zj_capture_packet(&s->capture, packet, 40, &facts));
+    assert(s->capture.health.packet_commit_latency.max_ms == 501);
+    assert(s->capture.health.packet_commit_latency.buckets[9] == 1);
+    assert(!s->capture.health.packet_commit_latency.buckets[8]);
+
+    zj_capture_latency_t timing = {.samples = UINT32_MAX - 1, .max_ms = 500};
+    timing.buckets[8] = UINT32_MAX - 1;
+    zj_capture_latency_record(&timing, 1000);
+    assert(timing.samples == UINT32_MAX && timing.buckets[9] == 1 && !timing.saturated);
+    zj_capture_latency_record(&timing, UINT32_MAX);
+    assert(timing.saturated && timing.samples == UINT32_MAX && timing.max_ms == 1000);
+    assert(!timing.buckets[12]); /* Never continue a biased distribution. */
+    memset(&timing, 0, sizeof(timing));
+    for (unsigned i = 0; i < ZJ_LATENCY_BUCKETS; ++i) {
+        zj_capture_latency_record(&timing, zj_latency_upper_ms[i]);
+        assert(timing.buckets[i] == 1);
+    }
+    assert(timing.samples == ZJ_LATENCY_BUCKETS && timing.max_ms == UINT32_MAX);
     clean();
     puts("raw packet capture, fragment preservation, bounded deadlines and reply ownership: ok");
     return 0;
