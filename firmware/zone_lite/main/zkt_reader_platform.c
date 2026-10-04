@@ -112,6 +112,11 @@ static zj_compat_result_t current_reader(const char *terminal_serial,
     env->encrypted_nvs = true;
 #endif
     if (!env->secure_boot || !env->encrypted_nvs) return ZJ_COMPAT_SECURITY;
+#if !defined(ZONE_LITE_JOURNAL_WRITES) || !ZONE_LITE_JOURNAL_WRITES
+    /* A bridge that cannot capture after rollback is not a compatible reader
+     * for this release, even while it is still using the legacy path. */
+    return ZJ_COMPAT_CAPTURE_DISABLED;
+#endif
     if (!reader_ready || !delivery_ready || !persistence_verified || recovery_pending) return ZJ_COMPAT_NOT_READY;
     const esp_partition_t *current = esp_ota_get_running_partition();
     env->ota_slot = ota(current);

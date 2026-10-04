@@ -7,7 +7,8 @@ typedef enum {
     ZJ_BOOT_OFF, ZJ_BOOT_SECURITY_HOLD, ZJ_BOOT_BINDING_HOLD, ZJ_BOOT_STORAGE_WAIT,
     ZJ_BOOT_OWNER_START, ZJ_BOOT_RECOVERING, ZJ_BOOT_TRANSPORT_START,
     ZJ_BOOT_CHECKING_READER, ZJ_BOOT_READER_HOLD, ZJ_BOOT_CAPTURE_START,
-    ZJ_BOOT_WRITER_DISABLED, ZJ_BOOT_READY, ZJ_BOOT_STALLED, ZJ_BOOT_QUIESCING
+    ZJ_BOOT_WRITER_DISABLED, ZJ_BOOT_READY, ZJ_BOOT_STALLED, ZJ_BOOT_QUIESCING,
+    ZJ_BOOT_AUTHORITY_HOLD, ZJ_BOOT_BRIDGE_VALIDATION
 } zj_boot_phase_t;
 typedef struct {
     bool (*owner_start)(void *, const char *);
@@ -24,13 +25,15 @@ typedef struct {
     uint32_t now_ms;
     zj_boot_mode_t mode;
     const char *terminal_serial;
-    bool secure, storage_ready, writer_build;
+    bool secure, storage_ready, writer_build, bridge_validation_pending;
 } zj_boot_input_t;
 typedef struct {
     zj_boot_mode_t mode;
     zj_boot_phase_t phase;
     bool owner_started, transport_started, capture_started, reader_ready, writer_ready;
     bool binding_changed;
+    bool bridge_validation_pending;
+    zj_delivery_authority_t delivery_authority;
     uint32_t sampled_ms, progress_ms, start_attempts, owner_starts, transport_starts, capture_starts;
     uint32_t proof_attempts, failures, next_attempt_ms, retry_delay_ms, ticket_started_ms;
     uint64_t ticket;

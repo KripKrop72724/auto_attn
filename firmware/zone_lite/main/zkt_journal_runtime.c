@@ -56,6 +56,10 @@ void zj_runtime_step(void)
         input.terminal_serial = config->zkt_expected_serial;
 #if defined(CONFIG_NVS_ENCRYPTION) && CONFIG_NVS_ENCRYPTION
         const esp_partition_t *running = esp_ota_get_running_partition();
+        esp_ota_img_states_t running_state;
+        input.bridge_validation_pending = input.mode == ZJ_BOOT_BRIDGE && running &&
+            esp_ota_get_state_partition(running, &running_state) == ESP_OK &&
+            running_state == ESP_OTA_IMG_PENDING_VERIFY;
         input.secure = config->provisioned && !strcmp(config->firmware_family, "zkt") &&
             esp_secure_boot_enabled() && running && running->type == ESP_PARTITION_TYPE_APP &&
             (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
@@ -85,31 +89,52 @@ bool zj_runtime_health(zj_boot_t *out)
 }
 bool zj_runtime_boot_ready(void)
 {
-    if (mode() == ZJ_BOOT_DISABLED) return true;
+    zj_boot_mode_t required = mode();
+    if (required == ZJ_BOOT_DISABLED) return true;
     zj_boot_t current;
-    return zj_runtime_health(&current) && zj_boot_local_ready(&current, now_ms());
+    return zj_runtime_health(&current) && current.mode == required && zj_boot_local_ready(&current, now_ms());
 }
 bool zj_runtime_writer_ready(void)
 {
     zj_boot_t current;
-    return mode() == ZJ_BOOT_WRITER && zj_runtime_health(&current) && current.writer_ready &&
+    zj_boot_mode_t required = mode();
+    return required != ZJ_BOOT_DISABLED && zj_runtime_health(&current) && current.mode == required &&
+        current.delivery_authority == ZJ_AUTHORITY_ADD && current.writer_ready &&
         zj_boot_local_ready(&current, now_ms());
+}
+bool zj_runtime_legacy_capture_allowed(void)
+{
+    zj_boot_mode_t required = mode();
+    if (required == ZJ_BOOT_DISABLED) return true;
+    zj_boot_t current;
+    return required == ZJ_BOOT_BRIDGE && zj_runtime_health(&current) && current.mode == required &&
+        current.delivery_authority == ZJ_AUTHORITY_LEGACY && zj_boot_local_ready(&current, now_ms());
 }
 bool zj_runtime_raw_source_required(void)
 {
-    return mode() == ZJ_BOOT_WRITER;
+    return !zj_runtime_legacy_capture_allowed();
 }
 bool zj_runtime_append_diagnostics(cJSON *diagnostics)
 {
     zj_boot_t current = {0};
     bool observed = zj_runtime_health(&current);
-    bool recent = observed && (uint32_t)(now_ms() - current.sampled_ms) < 45000U;
+    zj_boot_mode_t required = mode();
+    bool recent = observed && current.mode == required && (uint32_t)(now_ms() - current.sampled_ms) < 45000U;
+    bool legacy = required == ZJ_BOOT_DISABLED || (recent && required == ZJ_BOOT_BRIDGE &&
+        current.delivery_authority == ZJ_AUTHORITY_LEGACY);
     cJSON *runtime = cJSON_CreateObject();
     if (!runtime) return false;
-    bool ok = cJSON_AddBoolToObject(runtime, "observed", observed) &&
+    bool ok = cJSON_AddStringToObject(diagnostics, "runtime_profile", legacy ? "ZKT_LEGACY" : "ZKT_JOURNAL_V1") &&
+        cJSON_AddStringToObject(diagnostics, "delivery_authority", legacy ? "LEGACY_DUAL" :
+            recent && current.delivery_authority == ZJ_AUTHORITY_ADD ? "ADD" : "UNKNOWN") &&
+        (required == ZJ_BOOT_DISABLED || cJSON_AddNumberToObject(diagnostics, "journal_format", 1)) &&
+        cJSON_AddBoolToObject(runtime, "observed", observed) &&
         cJSON_AddStringToObject(runtime, "phase", observed ? zj_boot_phase_name(current.phase) : "NOT_STARTED") &&
         cJSON_AddBoolToObject(runtime, "reader_ready", recent && current.reader_ready) &&
-        cJSON_AddBoolToObject(runtime, "writer_ready", observed && current.writer_ready && zj_boot_local_ready(&current, now_ms())) &&
+        cJSON_AddStringToObject(runtime, "delivery_authority", !recent ? "UNKNOWN" :
+            current.delivery_authority == ZJ_AUTHORITY_ADD ? "ADD" :
+            current.delivery_authority == ZJ_AUTHORITY_LEGACY ? "LEGACY" : "UNKNOWN") &&
+        cJSON_AddBoolToObject(runtime, "writer_ready", recent && current.writer_ready && zj_boot_local_ready(&current, now_ms())) &&
         cJSON_AddNumberToObject(runtime, "start_attempts", current.start_attempts) &&
         cJSON_AddNumberToObject(runtime, "storage_starts", current.owner_starts) &&
         cJSON_AddNumberToObject(runtime, "delivery_starts", current.transport_starts) &&

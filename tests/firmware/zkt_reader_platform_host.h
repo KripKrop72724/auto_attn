@@ -13,6 +13,7 @@
 #define ESP_PARTITION_SUBTYPE_APP_OTA_1 17
 #define ESP_OTA_IMG_VALID 2
 #define ESP_OTA_IMG_NEW 0
+#define ESP_OTA_IMG_PENDING_VERIFY 1
 typedef int esp_err_t;
 typedef int nvs_handle_t;
 typedef int esp_ota_img_states_t;

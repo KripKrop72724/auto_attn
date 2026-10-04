@@ -46,7 +46,7 @@ static zj_boot_input_t input(uint32_t now)
 { return (zj_boot_input_t){.now_ms=now,.mode=ZJ_BOOT_WRITER,.terminal_serial="TEST-SERIAL",.secure=true,.storage_ready=true,.writer_build=true}; }
 static void healthy(fixture_t *f, uint32_t now)
 {
-    f->owner = (zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=(uint64_t)now*1000,.compatibility=ZJ_COMPAT_NOT_READY};
+    f->owner = (zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=(uint64_t)now*1000,.compatibility=ZJ_COMPAT_NOT_READY,.delivery_authority=ZJ_AUTHORITY_LEGACY};
     f->transport = (zj_transport_health_t){.started=true,.sampled_ms=now};
 }
 static void step(zj_boot_t *s, fixture_t *f, zj_boot_input_t *in, uint32_t now)
@@ -63,7 +63,7 @@ static void ready(zj_boot_t *s, fixture_t *f, zj_boot_input_t *in)
     step(s,f,in,100); assert(f->owners==1);
     step(s,f,in,101); assert(f->transports==1);
     step(s,f,in,102); assert(s->ticket && f->submissions==1 && !s->writer_ready);
-    f->complete=true; f->owner.compatibility_checked=true; f->owner.compatibility=ZJ_COMPAT_OK; f->owner.writer_allowed=true;
+    f->complete=true; f->owner.compatibility_checked=true; f->owner.compatibility=ZJ_COMPAT_OK; f->owner.writer_allowed=true; f->owner.delivery_authority=ZJ_AUTHORITY_ADD;
     step(s,f,in,103); assert(!s->ticket && !s->writer_ready);
     step(s,f,in,104); assert(s->writer_ready && s->phase==ZJ_BOOT_READY && f->captures==1);
     assert(zj_boot_local_ready(s,104));
@@ -91,7 +91,7 @@ int main(void)
     f.owner.checkpoint_recovery_pending=false; step(&s,&f,&in,7988); assert(s.ticket);
     f.poll_lost=true; f.abandon_fails=true;
     step(&s,&f,&in,12988); assert(s.ticket && f.abandonments==1 && !f.captures);
-    f.owner.compatibility_checked=true; f.owner.compatibility=ZJ_COMPAT_OK; f.owner.writer_allowed=true;
+    f.owner.compatibility_checked=true; f.owner.compatibility=ZJ_COMPAT_OK; f.owner.writer_allowed=true; f.owner.delivery_authority=ZJ_AUTHORITY_ADD;
     f.abandon_fails=false; step(&s,&f,&in,12989); assert(!s.ticket && !f.captures);
     step(&s,&f,&in,13000); assert(!f.captures);
     step(&s,&f,&in,14989); assert(s.writer_ready && f.captures==1 && f.submissions==1);
@@ -121,21 +121,46 @@ int main(void)
     assert(s.phase==ZJ_BOOT_QUIESCING && f.captures==1 && f.submissions==1);
 
     memset(&s,0,sizeof(s)); memset(&f,0,sizeof(f)); in=input(100); in.mode=ZJ_BOOT_BRIDGE; healthy(&f,100);
+    in.bridge_validation_pending=true;
     step(&s,&f,&in,100); step(&s,&f,&in,101); step(&s,&f,&in,102);
-    assert(s.ticket && s.reader_ready && zj_boot_local_ready(&s,102) && !f.captures);
-    f.complete=true; f.result=ZJ_COMPAT_NOT_READY; step(&s,&f,&in,103);
-    step(&s,&f,&in,104); assert(s.reader_ready && zj_boot_local_ready(&s,104) && !f.captures);
-    f.owner.compatibility_checked=true; f.owner.compatibility=ZJ_COMPAT_OK;
-    step(&s,&f,&in,105); assert(s.phase==ZJ_BOOT_READY && !s.writer_ready && !f.captures);
-    f.owner.compatibility=ZJ_COMPAT_CORRUPT;step(&s,&f,&in,106);
-    assert(!zj_boot_local_ready(&s,106)&&!f.captures);
+    assert(!s.ticket && s.reader_ready && zj_boot_local_ready(&s,102) && !f.captures && !f.submissions);
+    assert(s.phase==ZJ_BOOT_BRIDGE_VALIDATION);
+    step(&s,&f,&in,103); assert(!s.ticket && zj_boot_local_ready(&s,103));
+    in.bridge_validation_pending=false; step(&s,&f,&in,104);
+    assert(s.ticket && !zj_boot_local_ready(&s,104));
+    f.complete=true; f.owner.compatibility_checked=true; f.owner.compatibility=ZJ_COMPAT_OK;
+    step(&s,&f,&in,105); step(&s,&f,&in,106);
+    assert(s.phase==ZJ_BOOT_READY && !s.writer_ready && !f.captures && zj_boot_local_ready(&s,106));
+    f.owner.compatibility=ZJ_COMPAT_CORRUPT;step(&s,&f,&in,107);
+    assert(!zj_boot_local_ready(&s,107)&&!f.captures);
+
+    /* A rollback bridge has the exact same ADD capture obligations. */
+    ready(&s,&f,&in); in.mode=ZJ_BOOT_BRIDGE;
+    step(&s,&f,&in,105); assert(s.writer_ready && s.delivery_authority==ZJ_AUTHORITY_ADD);
+    f.owner.writer_allowed=false; step(&s,&f,&in,106);
+    assert(!s.writer_ready && !zj_boot_local_ready(&s,106));
+    f.owner.delivery_authority=ZJ_AUTHORITY_UNKNOWN;step(&s,&f,&in,107);
+    assert(s.phase==ZJ_BOOT_AUTHORITY_HOLD && s.delivery_authority==ZJ_AUTHORITY_ADD);
+    f.owner.delivery_authority=ZJ_AUTHORITY_LEGACY;step(&s,&f,&in,108);
+    assert(s.phase==ZJ_BOOT_AUTHORITY_HOLD && !zj_boot_local_ready(&s,108));
+    f.owner.delivery_authority=ZJ_AUTHORITY_ADD;f.owner.writer_allowed=true;step(&s,&f,&in,109);
+    assert(s.writer_ready && f.captures==1);
+    in.writer_build=false;step(&s,&f,&in,110);
+    assert(s.phase==ZJ_BOOT_WRITER_DISABLED && !zj_boot_local_ready(&s,110));
+
+    /* Pending bridge health is a local reader proof, never capture permission. */
+    memset(&s,0,sizeof(s));memset(&f,0,sizeof(f));in=input(100);in.mode=ZJ_BOOT_BRIDGE;
+    in.bridge_validation_pending=true;healthy(&f,100);f.owner.delivery_authority=ZJ_AUTHORITY_ADD;
+    step(&s,&f,&in,100);step(&s,&f,&in,101);step(&s,&f,&in,102);
+    assert(zj_boot_local_ready(&s,102) && !s.writer_ready && !f.captures && !f.submissions);
+    in.writer_build=false;step(&s,&f,&in,103);assert(!zj_boot_local_ready(&s,103));
 
     memset(&s,0,sizeof(s));memset(&f,0,sizeof(f));in=input(100);healthy(&f,100);
     step(&s,&f,&in,100);step(&s,&f,&in,101);f.fail_submit=true;
     step(&s,&f,&in,102);assert(!s.ticket&&s.failures==1&&f.submissions==1);
     step(&s,&f,&in,103);assert(f.submissions==1);f.fail_submit=false;
     step(&s,&f,&in,2102);assert(s.ticket&&f.submissions==2);
-    f.complete=true;f.owner.compatibility_checked=true;f.owner.compatibility=ZJ_COMPAT_OK;f.owner.writer_allowed=true;
+    f.complete=true;f.owner.compatibility_checked=true;f.owner.compatibility=ZJ_COMPAT_OK;f.owner.writer_allowed=true; f.owner.delivery_authority=ZJ_AUTHORITY_ADD;
     step(&s,&f,&in,2103);f.fail_capture=true;step(&s,&f,&in,2104);
     assert(f.captures==1&&!s.capture_started&&!s.writer_ready);
     step(&s,&f,&in,2105);assert(f.captures==1);f.fail_capture=false;step(&s,&f,&in,4104);

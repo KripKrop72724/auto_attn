@@ -3,6 +3,8 @@
 
 #define ZJ_ROOT_BYTES 160U
 
+typedef enum { ZJ_AUTHORITY_UNKNOWN, ZJ_AUTHORITY_LEGACY, ZJ_AUTHORITY_ADD } zj_delivery_authority_t;
+
 /* On ESP these blobs live in encrypted NVS. A write must commit; the common
  * code independently reads back the exact bytes before trusting it. No key,
  * counter or checkpoint is replaced after an unavailable/corrupt read. */
@@ -23,6 +25,11 @@ typedef struct {
 
 zj_result_t zj_state_open(zj_state_t *state, zj_state_port_t port, const char *terminal_serial);
 bool zj_state_identity(const zj_state_t *state, uint8_t master[32], uint8_t epoch[16]);
+zj_delivery_authority_t zj_state_authority(const zj_state_t *state);
+/* Owner only, after proving the running writer's exact compatible rollback
+ * image. Commit and read back before allocating any capture sequence. There
+ * is no reverse transition; a bridge must honor this bit after rollback. */
+zj_result_t zj_state_enable_add(zj_state_t *state);
 bool zj_state_reserve(void *state, uint64_t exclusive_limit);
 int zj_state_checkpoint_load(void *state, uint8_t checkpoint[ZJ_CHECKPOINT_BYTES]);
 bool zj_state_checkpoint_commit(void *state, const uint8_t checkpoint[ZJ_CHECKPOINT_BYTES]);
