@@ -12,8 +12,7 @@ def test_command_receipts_bounded_reads_replay_and_storage_faults(tmp_path):
              "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
              "-I", str(main)]
     obj = tmp_path / "ids.o"
-    subprocess.run([*flags, *(f"-D{name}=zi_{name}" for name in
-                    ("fopen", "fread", "fwrite", "fflush", "fsync", "fclose", "fstat", "fseek")),
+    subprocess.run([*flags, "-include", str(ROOT / "tests/firmware/zkt_command_ids_io_faults.h"),
                     "-c", str(main / "zkt_command_id_store.c"), "-o", str(obj)], check=True)
     binary = tmp_path / "command-ids"
     subprocess.run([*flags, str(ROOT / "tests/firmware/zkt_command_id_store_host.c"), str(obj),

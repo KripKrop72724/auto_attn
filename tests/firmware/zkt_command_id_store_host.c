@@ -78,6 +78,7 @@ int main(void)
         if (point == WRITE || point == FLUSH || point == SYNC) continue;
         reset("A\n"); fault = point;
         assert(run(ZI_PROCESSED, "missing", false, &reply) == ZJ_IO && !reply.present && size("processed") == 2);
+        assert(fault == NONE); /* The failure must reach the production call. */
     }
     reset("A\n"); fault = SYNC;
     assert(run(ZI_PROCESSED, "A", true, &reply) == ZJ_UNCERTAIN && !reply.present);
