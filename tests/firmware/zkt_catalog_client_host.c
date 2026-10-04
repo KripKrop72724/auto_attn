@@ -8,6 +8,7 @@ static zj_mailbox_t mailbox;
 static uint64_t now = 1;
 static bool stalled, poll_failed;
 static unsigned submissions;
+static zj_operation_t expected_operation = ZJ_CATALOG;
 static uint64_t clock_us(void *context) { (void)context; return now; }
 static void wait_step(void *context) { (void)context; now += 10; }
 static bool submit(void *context, const zj_request_t *request, uint64_t *ticket)
@@ -22,7 +23,7 @@ static bool poll(void *context, uint64_t ticket, zj_reply_t *reply, bool *comple
     if (!stalled && !mailbox.running_ticket) {
         zj_request_t request; uint64_t running;
         if (zj_mailbox_begin(&mailbox, &request, &running)) {
-            assert(request.operation == ZJ_CATALOG);
+            assert(request.operation == expected_operation);
             zj_reply_t result = {.result = ZJ_OK, .catalog = {.id = 77}};
             assert(zj_mailbox_finish(&mailbox, running, &result));
         }
@@ -61,5 +62,13 @@ int main(void)
         assert(zj_mailbox_submit(&mailbox, &filler, &ticket));
     assert(zc_client_call(&client, port, &request, &reply) == ZJ_IO);
     assert(!client.pending_ticket && reply.error == EBUSY);
+    zj_mailbox_init(&mailbox);
+    client = (zc_client_t){.commands = true}; expected_operation = ZJ_COMMANDS;
+    request.deadline_us = now + 100;
+    assert(zc_client_call(&client, port, &request, &reply) == ZJ_OK && reply.id == 77);
+    stalled = true; request.operation = ZC_ACTIVATE; request.id = 77;
+    assert(zc_client_call(&client, port, &request, &reply) == ZJ_UNCERTAIN && client.pending_ticket);
+    stalled = false;
+    assert(zc_client_drain(&client, port) && client.active_may_have_changed && !mailbox.occupied);
     puts("retained catalog timeout and admission checks passed");
 }

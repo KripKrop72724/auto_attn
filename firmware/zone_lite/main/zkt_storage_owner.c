@@ -25,6 +25,7 @@ typedef struct {
     zj_crypto_key_t key;
     zj_metadata_t metadata;
     zc_store_t catalog;
+    zc_store_t commands;
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
@@ -59,7 +60,7 @@ static int state_read(void *context, const char *name, uint8_t *out, size_t leng
     }
     return 1;
 }
-static int catalog_load(void *context, ft_checkpoint_t *checkpoint)
+static int file_checkpoint_load(void *context, const char *key, ft_checkpoint_t *checkpoint)
 {
     owner_t *o = context;
     nvs_handle_t handle;
@@ -67,7 +68,7 @@ static int catalog_load(void *context, ft_checkpoint_t *checkpoint)
     if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
     if (status != ESP_OK) { o->nvs_error = status; return -1; }
     size_t length = sizeof(*checkpoint);
-    status = nvs_get_blob(handle, "catalog", checkpoint, &length);
+    status = nvs_get_blob(handle, key, checkpoint, &length);
     nvs_close(handle);
     if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
     if (status != ESP_OK || length != sizeof(*checkpoint)) {
@@ -76,22 +77,32 @@ static int catalog_load(void *context, ft_checkpoint_t *checkpoint)
     }
     return 1;
 }
-static bool catalog_commit(void *context, const ft_checkpoint_t *checkpoint)
+static bool file_checkpoint_commit(void *context, const char *key, const ft_checkpoint_t *checkpoint)
 {
     owner_t *o = context;
     nvs_handle_t handle;
     esp_err_t status = nvs_open("file_tx", NVS_READWRITE, &handle);
     if (status == ESP_OK) {
-        status = nvs_set_blob(handle, "catalog", checkpoint, sizeof(*checkpoint));
+        status = nvs_set_blob(handle, key, checkpoint, sizeof(*checkpoint));
         if (status == ESP_OK) status = nvs_commit(handle);
         nvs_close(handle);
     }
     if (status != ESP_OK) o->nvs_error = status;
     return status == ESP_OK;
 }
+static int catalog_load(void *context, ft_checkpoint_t *checkpoint)
+{ return file_checkpoint_load(context, "catalog", checkpoint); }
+static bool catalog_commit(void *context, const ft_checkpoint_t *checkpoint)
+{ return file_checkpoint_commit(context, "catalog", checkpoint); }
+static int commands_load(void *context, ft_checkpoint_t *checkpoint)
+{ return file_checkpoint_load(context, "commands", checkpoint); }
+static bool commands_commit(void *context, const ft_checkpoint_t *checkpoint)
+{ return file_checkpoint_commit(context, "commands", checkpoint); }
 static bool execute_catalog(owner_t *o, uint64_t ticket, const zj_request_t *request, zj_reply_t *reply)
 {
     const zc_request_t *catalog = &request->input.catalog;
+    bool commands = request->operation == ZJ_COMMANDS;
+    zc_store_t *files = commands ? &o->commands : &o->catalog;
     memset(reply, 0, sizeof(*reply));
     o->nvs_error = 0;
     o->store.last_errno = 0;
@@ -99,20 +110,23 @@ static bool execute_catalog(owner_t *o, uint64_t ticket, const zj_request_t *req
     /* Do not inherit the legacy optional producer's ten-second lock wait on
      * the attendance owner. Take its short local lock, then check capacity. */
     bool locked = qs_local_read_begin();
-    size_t bytes = locked ? zc_store_admission_bytes(&o->catalog, catalog) : 0;
-    bool admitted = locked && (!bytes || qs_local_admit_locked(QS_ADMIT_OPTIONAL_HISTORICAL, bytes));
+    size_t bytes = locked ? zc_store_admission_bytes(files, catalog) : 0;
+    bool admitted = locked && (!bytes || qs_local_admit_locked(
+        commands ? QS_ADMIT_RECOVERY : QS_ADMIT_OPTIONAL_HISTORICAL, bytes));
     if (!admitted) {
         reply->catalog.error = errno;
-        reply->catalog.operation = errno == EBUSY ? "catalog_lock" : "catalog_admission";
+        reply->catalog.operation = commands ?
+            (errno == EBUSY ? "commands_lock" : "commands_admission") :
+            (errno == EBUSY ? "catalog_lock" : "catalog_admission");
         reply->result = errno == ENOSPC ? ZJ_FULL : ZJ_IO;
         if (locked) qs_local_end(true, 0);
         o->store.last_errno = reply->catalog.error;
         o->store.last_operation = reply->catalog.operation;
         /* A yielded activation must retain its transaction and ticket if
          * a later lock acquisition fails. No admitted intent is discarded. */
-        return o->catalog.work_ticket == ticket;
+        return files->work_ticket == ticket;
     }
-    bool pending = zc_store_step(&o->catalog, ticket, (uint64_t)esp_timer_get_time(), catalog,
+    bool pending = zc_store_step(files, ticket, (uint64_t)esp_timer_get_time(), catalog,
         &reply->catalog, &reply->result);
     /* Optional catalog failure cannot become an attendance write failure.
      * Its captured filesystem/NVS error remains in this request's reply. */
@@ -362,7 +376,8 @@ static void task(void *context)
         xSemaphoreGive(mailbox_lock);
         if (!work && !repair) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)); continue; }
         bool pending = false;
-        if (work && request.operation == ZJ_CATALOG) pending = execute_catalog(o, ticket, &request, &reply);
+        if (work && (request.operation == ZJ_CATALOG || request.operation == ZJ_COMMANDS))
+            pending = execute_catalog(o, ticket, &request, &reply);
         else if (work) execute(o, &request, &reply);
         else {
             memset(&reply, 0, sizeof(reply));
@@ -427,14 +442,21 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     strcpy(owner->prefix, prefix);
     owner->metadata = *metadata;
     ft_port_t catalog_port = {catalog_load, catalog_commit, owner};
+    ft_port_t command_port = {commands_load, commands_commit, owner};
     if (!zc_store_init(&owner->catalog, ZC_ACTIVE_PATH, ZC_COMMIT_PATH, ZC_BACKUP_PATH,
-                      ZC_TEMP_PATH, ZC_STAGE_PATH, catalog_port)) {
+                      ZC_TEMP_PATH, ZC_STAGE_PATH, catalog_port) ||
+        !zc_store_init(&owner->commands, ZC_COMMAND_ACTIVE_PATH, ZC_COMMAND_COMMIT_PATH,
+                      ZC_COMMAND_BACKUP_PATH, ZC_COMMAND_TEMP_PATH, ZC_COMMAND_STAGE_PATH, command_port)) {
         heap_caps_free(owner);
         owner = NULL;
         vSemaphoreDelete(mailbox_lock);
         mailbox_lock = NULL;
         return false;
     }
+    owner->commands.limit = ZC_COMMAND_LIMIT_BYTES;
+    /* Legacy command .tmp files can contain an incomplete filtered inbox.
+     * Recovery must never promote one without its committed replacement intent. */
+    owner->commands.allow_first_recovery = false;
     zj_mailbox_init(&owner->mailbox);
     owner->health.started = true;
     owner->compatibility = owner->health.compatibility = ZJ_COMPAT_NOT_READY;

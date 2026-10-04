@@ -39,7 +39,8 @@ counts are kept outside this public repository.
 | Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
 | Rollback restores dual delivery for new punches | Irreversible ADD authority commits before sequence allocation; the validated bridge resumes raw journal capture after cutover; uncertain authority and disabled builds cannot fall back | Root/NVS commit/readback faults, actual owner, bridge boot/reboot, live dispatch and UI uncertainty checks | Implemented cutover component; legacy migration, full runtime telemetry and signed qualification remain open |
 | OTA boot confirmation waits for ADD or an unused ESP Oracle worker; HTTP success can conceal a rejected state | Exact bridge/writer images validate local preservation, required workers and an authenticated terminal snapshot before contacting ADD; durable stages order reports and typed receipts verify actual deployment state and running image | Local outage, lost-reply, interrupted checkpoint, stale-worker, mark-valid failure, rejected-state and receipt allocation tests; legacy/Hikvision regression builds | Implemented local boot component; remote HIL, operational rollback and signed qualification remain open |
-| OTA restart can race a live read or a timed-out caller's accepted write | A terminal-owner handoff blocks new sessions; the journal owner drains accepted work before acknowledging quiescence | Production gateway/OTA control flow, blocked threaded writes, abandoned callers, lock failures and Hikvision regression | Implemented component; full legacy/command storage handoff and physical qualification remain open |
+| OTA restart can race a live read or a timed-out caller's accepted write | A terminal-owner handoff blocks new sessions; the journal owner drains accepted work before acknowledging quiescence | Production gateway/OTA control flow, blocked threaded writes, abandoned callers, lock failures and Hikvision regression | Implemented component; legacy attendance and processed/cancelled-ID cache handoff and physical qualification remain open |
+| Command-inbox replacement competes with attendance storage | Exact bridge/writer images stream encrypted inbox reads and replacements through the storage owner, retain uncertain replies, and serialize transaction recovery | Production adapter allocation/replay/malformed-line tests, abandoned activation and owner-task fairness | Command-inbox component; processed/cancelled-ID caches and legacy attendance handoff remain open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
 | New release can bypass legacy storage-contract validation | 2.6.16/2.7.0 registration rejects until reader/rollback validation is implemented | `test_storage_contract.py` | Guard implemented; release intentionally blocked |
 | Nationwide capacity and promotion evidence | Fixed 17-device scope; 75% partition budget, doubled peak and seven-day calculation; wave/location/concurrency and evidence evaluators. Fourteen-day fleet observation begins after the last device qualification, not installation | `test_zkt270_qualification.py` | Partial: offline evaluators only; not an OTA authorization service |
@@ -424,8 +425,8 @@ Physical power-loss qualification remains a separate release requirement.
    The ordinary, command-response and prepared-read hooks are implemented under
    a disabled writer build switch. Partial packet fragments remain holds.
 2. Qualify the implemented journal startup/compatible-reader gate and live
-   capture on actual ESP devices; transfer catalog and
-   legacy storage operations to the same owner. Qualify actual ESP latency,
+   capture on actual ESP devices; complete catalog reads, processed/cancelled-ID
+   caches and legacy attendance handoff to the same owner. Qualify actual ESP latency,
    resource headroom, checkpoint recovery on actual ESP hardware and remaining runtime tasks.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
@@ -470,6 +471,17 @@ free an in-flight request; abandoning a reply does not cancel accepted capture.
 Only a completed durable write returns a capture sequence. The task reports
 operation start, progress, occupancy, saturation and separate NVS/filesystem
 errors. It never deletes or restarts another task that might own a lock.
+
+Exact 2.6.16/2.7.0 command inboxes use this owner for encrypted line reads,
+replacement and the existing `file_tx/commands` checkpoint. Requests copy at
+most 512 bytes; transaction hashes advance in bounded steps between live
+writes. The 64 KiB inbox limit remains enforced. An incomplete producer never
+becomes a recovery intent, and an orphan legacy filtered `.tmp` cannot be
+promoted without a committed transaction. A timed-out activation retains its
+ticket and invalidates the restored-inbox snapshot when collected. Replay
+checks preserve command IDs; queue refusal remains retryable. ADD remains the
+durable command authority. These changes do not migrate legacy attendance or
+the processed/cancelled-ID caches, and they do not qualify ESP timing or flash.
 
 Journal appends additionally require an owner-executed reader compatibility
 check. The new encrypted-NVS capability binds the exact validated 2.6.16 bridge

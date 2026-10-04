@@ -10,7 +10,7 @@
 #define ZJ_PRIORITY_BURST 8U
 
 typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
-    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG, ZJ_LEASE } zj_operation_t;
+    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG, ZJ_LEASE, ZJ_COMMANDS } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {

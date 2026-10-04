@@ -11,6 +11,14 @@
 #define ZC_TEMP_PATH "/storage/add_identities.tmp"
 #define ZC_STAGE_PATH "/storage/add_identities.stage"
 #endif
+#define ZC_COMMAND_LIMIT_BYTES (64U * 1024U)
+#ifndef ZC_COMMAND_ACTIVE_PATH
+#define ZC_COMMAND_ACTIVE_PATH "/storage/add_commands.jsonl"
+#define ZC_COMMAND_COMMIT_PATH "/storage/add_commands.tmp"
+#define ZC_COMMAND_BACKUP_PATH "/storage/add_commands.bak"
+#define ZC_COMMAND_TEMP_PATH "/storage/add_commands.producer"
+#define ZC_COMMAND_STAGE_PATH "/storage/add_commands.spare"
+#endif
 
 typedef enum { ZC_RECOVER, ZC_RESET, ZC_APPEND, ZC_REMOVE, ZC_ACTIVATE, ZC_READ } zc_operation_t;
 typedef struct {
@@ -35,6 +43,8 @@ typedef struct {
     ft_work_t transaction;
     uint64_t next_id, ids[2], revision, work_ticket;
     uint32_t sizes[2];
+    uint32_t limit;
+    bool allow_first_recovery;
     bool poisoned[2], recovered;
     uint8_t work_phase;
     int error;
@@ -44,10 +54,10 @@ typedef struct {
 /* Owner-only state. Inputs contain copied bytes and fixed file selectors, no
  * caller-owned pointers or arbitrary paths. Every step closes every file.
  * The caller holds the shared filesystem lock for one step and releases it
- * before yielding. A pending ticket must be resumed before another catalog
- * command (journal append/settlement may run between steps).
+ * before yielding. A pending ticket must finish before another catalog or
+ * inbox request (journal append/settlement may run between steps).
  * Paths are parameters only for host qualification; the ESP owner uses the
- * five fixed catalog paths above. Catalog data is already encrypted. */
+ * fixed catalog/command paths above. Payload bytes are already encrypted. */
 bool zc_store_init(zc_store_t *store, const char *active, const char *commit,
                    const char *backup, const char *temporary, const char *stage, ft_port_t port);
 /* Called under the same owner/local lock as the ensuing step. Resetting an

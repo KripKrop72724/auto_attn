@@ -18,6 +18,8 @@ bool zc_store_init(zc_store_t *store, const char *active, const char *commit,
     }
     store->port = port;
     store->next_id = 1;
+    store->limit = ZC_LIMIT_BYTES;
+    store->allow_first_recovery = true;
     return true;
 }
 static zj_result_t failed(zc_store_t *store, const char *operation, int error)
@@ -39,7 +41,7 @@ size_t zc_store_admission_bytes(const zc_store_t *store, const zc_request_t *req
 static bool transaction_begin(zc_store_t *store, bool replacement)
 {
     return ft_work_begin(&store->transaction, store->paths[0], store->paths[1], store->paths[2],
-        ZC_LIMIT_BYTES, store->port, replacement);
+        store->limit, store->port, replacement);
 }
 enum { ZC_WORK_RECOVER = 1, ZC_WORK_FIRST, ZC_WORK_MOVE, ZC_WORK_REPLACE };
 static bool transaction_step(zc_store_t *store, const zc_request_t *request, zj_result_t *result)
@@ -62,7 +64,7 @@ static bool transaction_step(zc_store_t *store, const zc_request_t *request, zj_
     }
     ft_work_result_t progress = ft_work_step(&store->transaction);
     if (progress == FT_WORK_PENDING) return true;
-    if (progress == FT_WORK_FAILED && store->work_phase == ZC_WORK_RECOVER) {
+    if (progress == FT_WORK_FAILED && store->work_phase == ZC_WORK_RECOVER && store->allow_first_recovery) {
         /* A canonical commit file is renamed here only after the complete
          * producer has closed it. Match the existing first-install reader. */
         if (!transaction_begin(store, true)) {
@@ -91,7 +93,7 @@ static zj_result_t stream_write(zc_store_t *store, const zc_request_t *request, 
     if (reset && (!store->next_id || store->next_id == UINT64_MAX)) return failed(store, "catalog_id_exhausted", EOVERFLOW);
     if (!reset && (store->ids[slot] != request->id || store->poisoned[slot] || store->sizes[slot] != request->offset))
         return failed(store, "catalog_stale_producer", ESTALE);
-    if (!reset && request->length > ZC_LIMIT_BYTES - store->sizes[slot])
+    if (!reset && (store->sizes[slot] > store->limit || request->length > store->limit - store->sizes[slot]))
         return failed(store, "catalog_size_limit", EFBIG);
     const char *path = store->paths[3 + slot];
     store->poisoned[slot] = true;
@@ -132,7 +134,7 @@ static zj_result_t read_active(zc_store_t *store, const zc_request_t *request, z
     int error = 0;
     const char *operation = "catalog_read_stat";
     if (fstat(fileno(file), &st) != 0) error = errno;
-    else if (st.st_size < 0 || (uint64_t)st.st_size > ZC_LIMIT_BYTES || request->offset > (uint64_t)st.st_size) error = EINVAL;
+    else if (st.st_size < 0 || (uint64_t)st.st_size > store->limit || request->offset > (uint64_t)st.st_size) error = EINVAL;
     if (!error) {
         reply->total = (uint32_t)st.st_size;
         operation = "catalog_read_seek";

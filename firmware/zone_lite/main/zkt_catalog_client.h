@@ -12,10 +12,11 @@ typedef struct {
     uint64_t pending_ticket;
     uint8_t pending_operation;
     bool active_may_have_changed;
+    bool commands;
 } zc_client_t;
 
-/* Serialized by the catalog caller's lock, never the storage mailbox lock.
- * A timeout retains at most one reply ticket. Further catalog use waits for
+/* Serialized by the catalog or command caller's lock, never the mailbox lock.
+ * A timeout retains at most one reply ticket. Further use of that client waits for
  * that operation, so a timed-out activation cannot race a file reader or a
  * new producer. No request owns caller memory after submit returns. */
 bool zc_client_drain(zc_client_t *client, zc_client_port_t port);

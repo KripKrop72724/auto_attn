@@ -1878,6 +1878,149 @@ static bool parse_reconcile_assignment(cJSON *root, add_reconcile_assignment_t *
     return add_source_parse_assignment(root, assignment, source_epoch_required());
 }
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static zc_client_t s_command_storage_client = {.commands = true};
+typedef struct {
+    zc_reply_t chunk;
+    size_t position;
+    uint64_t deadline_us;
+} command_owner_reader_t;
+typedef struct { uint64_t id, deadline_us; uint32_t offset; } command_owner_writer_t;
+_Static_assert(ADD_COMMAND_INBOX_MAX_BYTES == ZC_COMMAND_LIMIT_BYTES, "Command storage bounds must agree");
+
+/* The command mutex serializes these clients. The storage owner alone opens
+ * and mutates their files, in bounded steps with no retained caller pointers. */
+static void command_owner_invalidate(void)
+{
+    if (s_command_storage_client.active_may_have_changed) {
+        s_command_inbox_restored = false;
+        s_command_storage_client.active_may_have_changed = false;
+    }
+}
+static bool command_owner_idle(void)
+{
+    bool idle = zc_client_drain(&s_command_storage_client, catalog_client_port);
+    command_owner_invalidate();
+    return idle;
+}
+static zj_result_t command_owner_call(zc_request_t request, zc_reply_t *reply, uint64_t deadline_us)
+{
+    request.deadline_us = deadline_us;
+    zj_result_t result = zc_client_call(&s_command_storage_client, catalog_client_port, &request, reply);
+    command_owner_invalidate();
+    return result;
+}
+static bool command_owner_recover(uint64_t deadline_us)
+{
+    zc_reply_t reply;
+    return command_owner_call((zc_request_t){.operation = ZC_RECOVER}, &reply, deadline_us) == ZJ_OK;
+}
+/* 1 = complete encrypted line, 0 = verified EOF, -1 = unresolved input.
+ * No file handle survives a wait, and the revision binds every chunk. */
+static int command_owner_line(command_owner_reader_t *reader, char *line, size_t capacity)
+{
+    if (!reader || !line || capacity < 2) return -1;
+    size_t used = 0;
+    for (;;) {
+        if (reader->position == reader->chunk.length) {
+            if (reader->chunk.eof) return used ? -1 : 0;
+            zc_request_t request = {.operation = ZC_READ, .offset = reader->chunk.offset,
+                .revision = reader->chunk.revision};
+            zj_result_t result = command_owner_call(request, &reader->chunk, reader->deadline_us);
+            reader->position = 0;
+            if (result == ZJ_EMPTY && !request.offset) { reader->chunk.eof = true; return used ? -1 : 0; }
+            if (result != ZJ_OK || reader->chunk.total > ADD_COMMAND_INBOX_MAX_BYTES ||
+                (!reader->chunk.length && !reader->chunk.eof)) return -1;
+            if (!reader->chunk.length) return used ? -1 : 0;
+        }
+        uint8_t byte = reader->chunk.bytes[reader->position++];
+        if (!byte || used == capacity - 1) return -1;
+        line[used++] = (char)byte;
+        if (byte == '\n') { line[used] = 0; return 1; }
+    }
+}
+static bool command_owner_bytes(command_owner_writer_t *writer, const char *bytes, size_t length)
+{
+    if (!writer || !bytes || writer->offset > ADD_COMMAND_INBOX_MAX_BYTES ||
+        length > ADD_COMMAND_INBOX_MAX_BYTES - writer->offset) return false;
+    for (size_t position = 0; position < length;) {
+        size_t count = length - position;
+        if (count > ZC_CHUNK_BYTES) count = ZC_CHUNK_BYTES;
+        zc_request_t request = {.operation = ZC_APPEND, .id = writer->id,
+            .offset = writer->offset, .length = (uint16_t)count};
+        memcpy(request.bytes, bytes + position, count);
+        zc_reply_t reply;
+        if (command_owner_call(request, &reply, writer->deadline_us) != ZJ_OK) return false;
+        writer->offset = reply.offset;
+        position += count;
+    }
+    return true;
+}
+static int command_owner_contains(const char *command_id)
+{
+    uint64_t deadline = (uint64_t)esp_timer_get_time() + 30000000ULL;
+    if (!command_owner_recover(deadline)) return -1;
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    if (!line) return -1;
+    command_owner_reader_t reader = {.deadline_us = deadline};
+    int result = 0, next;
+    while ((next = command_owner_line(&reader, line, ADD_COMMAND_LINE_BYTES)) == 1) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+        if (!cJSON_IsString(id)) result = -1;
+        else if (!strcmp(id->valuestring, command_id)) result = 1;
+        cJSON_Delete(root);
+        free(plain);
+        if (result) break;
+    }
+    if (next < 0) result = -1;
+    free(line);
+    return result;
+}
+static bool command_owner_replace(cJSON *append, const char *remove_id)
+{
+    uint64_t deadline = (uint64_t)esp_timer_get_time() + 30000000ULL;
+    if (!command_owner_recover(deadline)) return false;
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
+    if (!line) return false;
+    zc_reply_t reply;
+    bool ok = command_owner_call((zc_request_t){.operation = ZC_RESET}, &reply, deadline) == ZJ_OK;
+    command_owner_writer_t writer = {.id = reply.id, .deadline_us = deadline};
+    command_owner_reader_t reader = {.deadline_us = deadline};
+    bool removed = false;
+    int next = 0;
+    while (ok && (next = command_owner_line(&reader, line, ADD_COMMAND_LINE_BYTES)) == 1) {
+        char *plain = decrypt_storage_line(line);
+        cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+        cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+        bool skip = cJSON_IsString(id) && remove_id && !strcmp(id->valuestring, remove_id);
+        ok = cJSON_IsString(id);
+        cJSON_Delete(root);
+        free(plain);
+        removed |= skip;
+        if (ok && !skip) ok = command_owner_bytes(&writer, line, strlen(line));
+    }
+    if (next < 0) ok = false;
+    free(line);
+    if (ok && append) {
+        char *plain = cJSON_PrintUnformatted(append);
+        char *encrypted = encrypt_storage_json(plain);
+        size_t length = encrypted ? strlen(encrypted) : 0;
+        ok = length && length < ADD_COMMAND_LINE_BYTES - 1U &&
+            command_owner_bytes(&writer, encrypted, length) && command_owner_bytes(&writer, "\n", 1);
+        free(encrypted);
+        free(plain);
+    }
+    /* If the preceding uncertain activation already retired this ID, leave
+     * the current generation alone. The unused producer is never acknowledged. */
+    if (ok && remove_id && !removed) return true;
+    if (ok) ok = command_owner_call((zc_request_t){.operation = ZC_ACTIVATE,
+        .id = writer.id, .offset = writer.offset}, &reply, deadline) == ZJ_OK;
+    return ok;
+}
+#endif
+
 static int command_transaction_load(void *context, ft_checkpoint_t *checkpoint)
 {
     (void)context;
@@ -1907,6 +2050,10 @@ static bool command_transaction_commit(void *context, const ft_checkpoint_t *che
 static const ft_port_t command_transaction_port = {command_transaction_load, command_transaction_commit, NULL};
 static bool command_journal_recover_locked(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required())
+        return command_owner_recover((uint64_t)esp_timer_get_time() + 30000000ULL);
+#endif
     bool ok = ft_recover(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
         ADD_COMMAND_INBOX_BACKUP_PATH, command_transaction_port);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -1916,6 +2063,9 @@ static bool command_journal_recover_locked(void)
 /* -1 means unavailable; it is never permission to append a duplicate command. */
 static int command_journal_contains_locked(const char *command_id)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return command_owner_contains(command_id);
+#endif
     if (!command_journal_recover_locked()) return -1;
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!file) return errno == ENOENT ? 0 : -1;
@@ -1949,6 +2099,13 @@ static bool command_journal_append(cJSON *root, const char *command_id)
         xSemaphoreGive(s_command_lock);
         return existing == 1;
     }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        bool ok = command_owner_replace(root, NULL);
+        xSemaphoreGive(s_command_lock);
+        return ok;
+    }
+#endif
     char *plain = cJSON_PrintUnformatted(root);
     char *line = encrypt_storage_json(plain);
     struct stat st;
@@ -2028,20 +2185,36 @@ static bool queue_command_if_idle(const add_command_t *command)
 
 static void restore_command_inbox(void)
 {
-    if (s_command_inbox_restored || !s_command_lock ||
+    if (!s_command_lock ||
         xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return;
     }
+    bool managed = false;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    managed = catalog_owner_required();
+    /* Collect even when an earlier inbox snapshot was fully restored. A late
+     * activation must invalidate that snapshot and release its retained slot. */
+    if (managed && !command_owner_idle()) { xSemaphoreGive(s_command_lock); return; }
+    command_owner_reader_t reader = {.deadline_us = (uint64_t)esp_timer_get_time() + 30000000ULL};
+#endif
+    if (s_command_inbox_restored) { xSemaphoreGive(s_command_lock); return; }
     if (!command_journal_recover_locked()) {
         xSemaphoreGive(s_command_lock);
         return;
     }
-    FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
-    bool complete = file != NULL || errno == ENOENT;
-    char *line = file ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
-    if (file && !line) complete = false;
+    FILE *file = managed ? NULL : fopen(ADD_COMMAND_INBOX_PATH, "r");
+    bool complete = managed || file != NULL || errno == ENOENT;
+    char *line = managed || file ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    if ((managed || file) && !line) complete = false;
     uint32_t restored = 0;
-    while (complete && file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    while (complete && line) {
+        int next;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (managed) next = command_owner_line(&reader, line, ADD_COMMAND_LINE_BYTES);
+        else
+#endif
+        next = file && fgets(line, ADD_COMMAND_LINE_BYTES, file) ? 1 : 0;
+        if (next <= 0) { if (next < 0) complete = false; break; }
         size_t length = strlen(line);
         if (!length || line[length - 1] != '\n') { complete = false; break; }
         char *plain = decrypt_storage_line(line);
@@ -4610,6 +4783,18 @@ bool add_connector_command_complete(const char *command_id)
 {
     if (!command_id || !s_command_lock ||
         xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        int present = command_owner_contains(command_id);
+        bool ok = present == 0 || (present == 1 && command_owner_replace(NULL, command_id));
+        if (ok) {
+            if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
+            command_unmark_queued_locked(command_id);
+        }
+        xSemaphoreGive(s_command_lock);
+        return ok;
+    }
+#endif
     if (!command_journal_recover_locked()) { xSemaphoreGive(s_command_lock); return false; }
     FILE *input = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!input) {

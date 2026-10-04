@@ -146,5 +146,19 @@ int main(void)
     initialize(); seed("active", "old"); seed("backup", "ambiguous");
     assert(run((zc_request_t){.operation=ZC_RECOVER}) != ZJ_OK);
     assert(is("active", "old") && is("backup", "ambiguous"));
+    /* A legacy command stage may be an interrupted, partial filtered inbox.
+     * Without a checkpoint, only explicit complete-producer activation may
+     * create its first generation. The catalog's first-install policy differs. */
+    initialize(); store.allow_first_recovery = false; store.limit = ZC_COMMAND_LIMIT_BYTES;
+    seed("commit", "partial command");
+    assert(run((zc_request_t){.operation=ZC_RECOVER}) != ZJ_OK);
+    assert(access("active", F_OK) != 0 && is("commit", "partial command"));
+    initialize(); store.allow_first_recovery = false; store.limit = ZC_COMMAND_LIMIT_BYTES;
+    assert(run((zc_request_t){.operation=ZC_RECOVER}) == ZJ_OK);
+    request = producer(); memcpy(request.bytes, "complete command\n", 17); request.length = 17;
+    assert(run(request) == ZJ_OK); request.offset = reply.offset; request.operation = ZC_ACTIVATE;
+    assert(run(request) == ZJ_OK && is("active", "complete command\n"));
+    request = producer(); store.sizes[0] = ZC_COMMAND_LIMIT_BYTES; request.offset = ZC_COMMAND_LIMIT_BYTES;
+    assert(run(request) != ZJ_OK && reply.error == EFBIG);
     puts("catalog owner token, recovery, deadline, read and write-fault checks passed");
 }
