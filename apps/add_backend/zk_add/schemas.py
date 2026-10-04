@@ -6,6 +6,7 @@ import re
 from typing import Any, Literal
 
 from zk_add.hikvision_clock import HikvisionClockSample
+from zk_add.capture_latency import CaptureLatencyHistogram
 
 from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
 
@@ -99,6 +100,8 @@ class WorkerDiagnostics(BaseModel):
     timeouts: int | None = Field(default=None, ge=0)
     refusals: int | None = Field(default=None, ge=0)
     max_operation_ms: int | None = Field(default=None, ge=0)
+    packet_commit_latency_ms: CaptureLatencyHistogram | None = None
+    fragment_commit_latency_ms: CaptureLatencyHistogram | None = None
 
 
 class JournalStorageDiagnostics(BaseModel):

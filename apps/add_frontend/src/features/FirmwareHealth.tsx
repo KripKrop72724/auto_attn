@@ -1,5 +1,6 @@
 import type { FirmwareDiagnostics } from '../types'
 import { useEffect, useState } from 'react'
+import { captureLatencyLabel } from './captureLatency'
 
 const bytes = (value?: number | null) => value == null ? 'Not reported' : `${(value / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} KiB`
 const labels: Record<string, string> = {
@@ -52,6 +53,12 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const storage = diagnostics?.storage
   const journal = diagnostics?.journal_runtime
   const journalStorage = diagnostics?.journal_storage
+  const capture = diagnostics?.workers.find(worker => worker.name === 'capture')
+  const captureSample = capture?.last_activity_uptime_ms
+  const captureAge = typeof diagnostics?.sampled_uptime_ms === 'number' && typeof captureSample === 'number' &&
+    Number.isSafeInteger(diagnostics.sampled_uptime_ms) && diagnostics.sampled_uptime_ms >= 0 && Number.isSafeInteger(captureSample) && captureSample >= 0
+    ? diagnostics.sampled_uptime_ms - captureSample : Infinity
+  const captureFresh = fresh && captureAge >= 0 && captureAge + Math.max(0, now - observed) <= 45_000
   const count = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
   const journalValid = journal?.observed === true && Object.hasOwn(journalPhases, journal.phase) &&
     typeof journal.reader_ready === 'boolean' && typeof journal.writer_ready === 'boolean' &&
@@ -111,6 +118,10 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         {!!storage?.persistence_probe_error && <div><dt>Active persistence probe error</dt><dd>{storage.persistence_probe_operation || 'Operation not reported'} · {storage.persistence_probe_error}</dd></div>}
         <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
+        {capture && <>
+          <div><dt>Complete packet preservation time</dt><dd>{captureFresh ? captureLatencyLabel(capture.packet_commit_latency_ms) : 'Current capture timing unverified'}</dd></div>
+          <div><dt>Fragment preservation time</dt><dd>{captureFresh ? captureLatencyLabel(capture.fragment_commit_latency_ms) : 'Current capture timing unverified'}</dd></div>
+        </>}
         {storage?.error_operation && <div><dt>Last storage error</dt><dd>{storage.error_operation} · {storage.error_code ?? 'No code reported'}</dd></div>}
         {journalStorage && <>
           <div><dt>Journal preservation</dt><dd>{ownerFresh ? journalStorage.durability.toLowerCase() : 'Current journal storage unverified'}</dd></div>
@@ -131,6 +142,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
           <div><dt>Last reader compatibility result</dt><dd style={{ overflowWrap: 'anywhere' }}>{journal.compatibility || 'Not reported'}</dd></div>
         </>}
       </dl>
+      {capture?.packet_commit_latency_ms && <p>Timing covers successful preservation in this capture session. Failed or incomplete packets remain separate; this does not certify attendance delivery latency.</p>}
       {diagnostics.workers.map(worker => <p key={worker.name}>
         {labels[worker.name] || worker.name}: {worker.state === 'UNKNOWN' ? 'Not reported' : worker.state.replaceAll('_', ' ').toLowerCase()}
         {worker.operation ? ` · ${worker.operation}` : ''}

@@ -1,5 +1,6 @@
 #pragma once
 #include "zkt_storage_mailbox.h"
+#include "zkt_capture_latency.h"
 
 #define ZJ_PACKET_MAX 65536U
 #define ZJ_FRAGMENT_HEADER 60U
@@ -27,6 +28,9 @@ typedef struct {
     size_t committed_bytes;
     zj_result_t last_result;
     bool running;
+    /* Successful complete operations only. Failures/timeouts above remain
+     * separate evidence, including a packet with only some fragments stored. */
+    zj_capture_latency_t packet_commit_latency, fragment_commit_latency;
 } zj_capture_health_t;
 typedef struct {
     zj_capture_port_t port;

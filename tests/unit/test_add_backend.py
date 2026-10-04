@@ -6462,6 +6462,23 @@ def test_worker_recovery_requires_fresh_workers_for_the_device_family(db, family
     assert alert().state == "RESOLVED"
 
 
+def test_capture_latency_survives_heartbeat_storage_without_claiming_live_latency(db):
+    from zk_add.service import apply_firmware_diagnostics
+    connector = connector_fixture(db)
+    timing = {"schema_version": 1, "samples": 100, "max_ms": 900, "saturated": False,
+              "buckets": [0, 0, 0, 95, 0, 0, 0, 0, 4, 1, 0, 0, 0]}
+    apply_firmware_diagnostics(db, connector=connector, payload=HeartbeatPayload(uptime_seconds=100,
+        diagnostics={"schema_version": 2, "workers": [{"name": "capture", "state": "RUNNING",
+            "last_activity_uptime_ms": 99000, "completed_operations": 100, "failures": 3,
+            "packet_commit_latency_ms": timing}]}))
+    db.flush()
+    db.expire(connector, ["firmware_diagnostics"])
+    stored = connector.firmware_diagnostics
+    assert stored["workers"][0]["packet_commit_latency_ms"] == timing
+    assert stored["workers"][0]["failures"] == 3
+    assert not stored.get("storage") or stored["storage"].get("live_commit_p99_ms") is None
+
+
 def test_unknown_journal_authority_is_preserved_without_clearing_faults(db):
     from zk_add.service import apply_firmware_diagnostics
     connector = connector_fixture(db)

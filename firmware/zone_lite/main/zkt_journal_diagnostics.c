@@ -90,6 +90,22 @@ static bool queue(cJSON *queues, const char *name, bool empty, const char *reaso
         (!empty || cJSON_AddNumberToObject(entry, "records", 0)) &&
         (!bytes_known || cJSON_AddNumberToObject(entry, "bytes", (double)bytes));
 }
+static bool latency(cJSON *entry, const char *name, const zj_capture_latency_t *value)
+{
+    cJSON *object = cJSON_AddObjectToObject(entry, name);
+    if (!object || !cJSON_AddNumberToObject(object, "schema_version", 1) ||
+        !cJSON_AddNumberToObject(object, "samples", value->samples) ||
+        !cJSON_AddNumberToObject(object, "max_ms", value->max_ms) ||
+        !cJSON_AddBoolToObject(object, "saturated", value->saturated)) return false;
+    cJSON *buckets = cJSON_AddArrayToObject(object, "buckets");
+    if (!buckets) return false;
+    for (unsigned i = 0; i < ZJ_LATENCY_BUCKETS; ++i) {
+        cJSON *count = cJSON_CreateNumber(value->buckets[i]);
+        if (!count) return false;
+        if (!cJSON_AddItemToArray(buckets, count)) { cJSON_Delete(count); return false; }
+    }
+    return true;
+}
 bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
                            bool recent, bool legacy, const zj_diagnostics_snapshot_t *sample,
                            uint64_t now)
@@ -151,6 +167,9 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
         (capture_started && !add_time(entry, "last_activity_uptime_ms", now, capture->sampled_ms)) ||
         ((capture->packets || capture->fragments) && !add_time(entry, "last_progress_uptime_ms", now, capture->progress_ms)) ||
         (capture->running && !add_time(entry, "operation_started_uptime_ms", now, capture->started_ms))) return false;
+    if (capture_started && recent32(now, capture->sampled_ms) &&
+        (!latency(entry, "packet_commit_latency_ms", &capture->packet_commit_latency) ||
+         !latency(entry, "fragment_commit_latency_ms", &capture->fragment_commit_latency))) return false;
     }
 
     bool transport_fresh = recent && sample->transport_observed && recent32(now, transport->sampled_ms);
