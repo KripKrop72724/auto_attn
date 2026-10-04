@@ -162,6 +162,15 @@ int main(void)
     assert(commit(&proposed, &confirmed, &error) == ZJ_OK);
     zl_lease_record_t good = durable;
     ++proposed.generation; proposed.expires_epoch += 1; zl_lease_checksum(&proposed);
+    prior = writes;
+    uint64_t good_root = root_value;
+    root_value ^= 1;
+    assert(commit(&proposed, &confirmed, &error) == ZJ_CORRUPT && writes == prior);
+    assert(!memcmp(&durable, &good, sizeof(good)) && root_value == (good_root ^ 1));
+    root_value = good_root; fault = ROOT_READ;
+    assert(commit(&proposed, &confirmed, &error) == ZJ_IO && error == 908 && writes == prior);
+    assert(!memcmp(&durable, &good, sizeof(good)) && !zl_lease_valid(&confirmed));
+    fault = NONE;
     prior = writes; durable.crc ^= 1;
     assert(zl_lease_load_boot(&confirmed, &error) == ZJ_CORRUPT && !zl_lease_valid(&confirmed));
     assert(commit(&proposed, &confirmed, &error) == ZJ_CORRUPT && writes == prior);
