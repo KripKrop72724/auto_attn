@@ -27,8 +27,9 @@ static bool send_custody(void *context, const char *payload, uint32_t timeout, u
 static bool digest(void *context, const uint8_t *bytes, size_t length, uint8_t out[32])
 { (void)context; return mbedtls_sha256(bytes, length, out, 0) == 0; }
 
-static void publish_snapshot(zj_delivery_t *state)
+static void publish_snapshot(const zj_delivery_t *state, void *context)
 {
+    (void)context;
     if (xSemaphoreTake(health_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
     snapshot.started = true;
     snapshot.sampled_ms = now_ms(NULL);
@@ -39,12 +40,11 @@ static void task(void *context)
 {
     zj_delivery_t *state = context;
     for (;;) {
-        publish_snapshot(state);
         /* The snapshot mutex is released before an owner/network request.
          * Telemetry can distinguish a blocked SEND from healthy idle state. */
-        zj_delivery_step(state);
-        publish_snapshot(state);
-        vTaskDelay(pdMS_TO_TICKS(20));
+        uint32_t delay = zj_delivery_pump(state, publish_snapshot, NULL);
+        TickType_t ticks = pdMS_TO_TICKS(delay);
+        vTaskDelay(ticks ? ticks : 1);
     }
 }
 bool zj_transport_start(void)

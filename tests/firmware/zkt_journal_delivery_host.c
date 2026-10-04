@@ -11,11 +11,14 @@ typedef struct {
     zj_request_t running;
     uint64_t running_ticket;
     uint32_t clock;
-    bool online, stall, uncertain_checkpoint, reject_proof;
+    bool online, stall, uncertain_checkpoint, reject_proof, immediate_owner;
+    unsigned send_delay_ms, polls, observations, observation_delay_ms;
+    zj_delivery_phase_t observed_phase;
     unsigned sends, lost_acks, abandon_failures, abandons, submissions, canonical_count;
     char canonical[4][ZJ_CUSTODY_PAYLOAD_MAX];
 } scenario_t;
 static scenario_t scenario;
+static void owner_step(scenario_t *s);
 
 static uint32_t delivery_now(void *context) { return ((scenario_t *)context)->clock; }
 static uint32_t delivery_random(void *context) { (void)context; return 123; }
@@ -24,11 +27,15 @@ static bool delivery_submit(void *context, const zj_request_t *request, uint64_t
 {
     scenario_t *s = context;
     ++s->submissions;
-    return zj_mailbox_submit(&s->mailbox, request, ticket);
+    bool accepted = zj_mailbox_submit(&s->mailbox, request, ticket);
+    if (accepted && s->immediate_owner) owner_step(s);
+    return accepted;
 }
 static bool delivery_poll(void *context, uint64_t ticket, zj_reply_t *reply, bool *complete)
 {
-    return zj_mailbox_poll(&((scenario_t *)context)->mailbox, ticket, reply, complete);
+    scenario_t *s = context;
+    ++s->polls;
+    return zj_mailbox_poll(&s->mailbox, ticket, reply, complete);
 }
 static bool delivery_abandon(void *context, uint64_t ticket)
 {
@@ -42,6 +49,7 @@ static bool delivery_send(void *context, const char *payload, uint32_t timeout, 
     scenario_t *s = context;
     assert(s->online && timeout == 15000);
     assert(!s->running_ticket && !s->mailbox.running_ticket);
+    if (s->observations) assert(s->observed_phase == ZJ_DELIVERY_SEND);
     ++s->sends;
     unsigned index = 0;
     for (; index < s->canonical_count; ++index) if (!strcmp(payload, s->canonical[index])) break;
@@ -52,7 +60,7 @@ static bool delivery_send(void *context, const char *payload, uint32_t timeout, 
     }
     /* The simulated server commits before dropping its response. Replay
      * identity and payload must remain byte-for-byte unchanged. */
-    s->clock += 15000;
+    s->clock += s->send_delay_ms;
     if (s->lost_acks) { --s->lost_acks; return false; }
     if (!s->reject_proof) receipt[0] = (uint8_t)(index + 1);
     return true;
@@ -114,6 +122,7 @@ static void initialize(scenario_t *s)
     reset(&s->store);
     s->store.port.commit = uncertain_save;
     s->online = true;
+    s->send_delay_ms = 15000;
     zj_mailbox_init(&s->mailbox);
     zj_delivery_port_t p = {delivery_now, delivery_random, delivery_connected,
         delivery_submit, delivery_poll, delivery_abandon, delivery_send, s,
@@ -143,6 +152,71 @@ static void drained(scenario_t *s)
         step(s);
     }
     assert(!"drain deadline");
+}
+static void observe(const zj_delivery_t *delivery, void *context)
+{
+    scenario_t *s = context;
+    ++s->observations;
+    s->observed_phase = delivery->health.phase;
+    s->clock += s->observation_delay_ms;
+}
+static void cadence(void)
+{
+    scenario_t *s = &scenario;
+    initialize(s);
+    assert(append(&s->store, 'J', 40) == ZJ_OK);
+    assert(append(&s->store, 'K', 40) == ZJ_OK);
+    assert(append(&s->store, 'L', 40) == ZJ_OK);
+    s->send_delay_ms = 0;
+    s->immediate_owner = true;
+    for (unsigned i = 0; i < 30 && s->delivery.health.settled < 3; ++i) {
+        unsigned sent = s->sends, observed = s->observations;
+        uint32_t delay = zj_delivery_pump(&s->delivery, observe, s);
+        assert(s->sends <= sent + 1); /* Even a fast sender yields every exchange. */
+        assert(s->observations <= observed + 9); /* Eight transitions plus final sample. */
+        assert(delay >= 1 && delay <= 100);
+        s->clock += delay < 10 ? 10 : delay; /* Model a 100-Hz task scheduler. */
+    }
+    assert(s->delivery.health.settled == 3 && s->canonical_count == 3);
+    /* Multiple pending records in one segment must not incur a 250-ms empty
+     * delay after each receipt merely because the segment cannot be deleted. */
+    assert(s->clock < 250);
+    for (unsigned i = 0; i < 20; ++i)
+        s->clock += zj_delivery_pump(&s->delivery, observe, s);
+    unsigned io_before = calls, sends_before = s->sends;
+    for (unsigned i = 0; i < 20; ++i)
+        s->clock += zj_delivery_pump(&s->delivery, observe, s);
+    assert(calls == io_before && s->sends == sends_before);
+
+    initialize(s);
+    assert(append(&s->store, 'M', 40) == ZJ_OK);
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 1);
+    assert(s->polls == 1 && !s->sends && s->mailbox.occupied == 1);
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 1);
+    assert(s->polls == 2); /* Waiting owner is polled once per activation. */
+    owner_step(s);
+    s->send_delay_ms = 5;
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 1);
+    assert(s->sends == 1 && s->delivery.health.phase == ZJ_DELIVERY_SUBMIT_SETTLE);
+    assert(s->observed_phase == ZJ_DELIVERY_SUBMIT_SETTLE);
+
+    initialize(s);
+    s->clock = UINT32_MAX;
+    s->delivery.health.wait_ms = 0;
+    s->observation_delay_ms = 2;
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 1);
+    assert(s->delivery.health.phase == ZJ_DELIVERY_SUBMIT_READ && !s->submissions);
+    assert(s->observations == 2); /* Budget holds across monotonic wrap. */
+    s->observation_delay_ms = 0;
+    s->delivery.health.phase = ZJ_DELIVERY_IDLE;
+    s->delivery.health.wait_started_ms = UINT32_MAX - 99;
+    s->delivery.health.wait_ms = 600;
+    s->clock = 100;
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 100);
+    assert(!s->submissions && !s->sends); /* Backoff is not shortened. */
+    s->delivery.health.wait_ms = 220;
+    assert(zj_delivery_pump(&s->delivery, observe, s) == 20);
+    assert(zj_delivery_pump(NULL, NULL, NULL) == 100);
 }
 int main(void)
 {
@@ -233,6 +307,7 @@ int main(void)
     s->stall = false;
     drained(s);
     assert(s->canonical_count == 2 && s->sends == 2 && s->delivery.health.settled == 2);
+    cadence();
     clean();
     puts("journal delivery replay, checkpoint recovery, bounded timeouts and wrap: ok");
     return 0;
