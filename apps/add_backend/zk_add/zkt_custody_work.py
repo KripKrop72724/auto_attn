@@ -430,23 +430,28 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
         prior_processed = processed
         selected = set()
         recent_index = oldest_index = 0
-        while len(selected) < quota:
-            while recent_index < len(recent) and recent[recent_index].id in selected:
-                recent_index += 1
-            while oldest_index < len(oldest) and oldest[oldest_index].id in selected:
-                oldest_index += 1
-            has_recent, has_oldest = recent_index < len(recent), oldest_index < len(oldest)
-            if not has_recent and not has_oldest:
-                break
-            if processed and deadline is not None and clock() >= deadline:
-                break
-            priority = has_recent and (schedule.priority_burst < PRIORITY_BURST or not has_oldest)
-            row = recent[recent_index] if priority else oldest[oldest_index]
-            inspect_work(session, row)
-            schedule.priority_burst = min(PRIORITY_BURST, schedule.priority_burst + 1) if priority else 0
-            schedule.updated_at = utc_now()
-            selected.add(row.id)
-            processed += 1
+        candidates = list({row.id: row for row in [*recent, *oldest]}.values())
+        # The existing connector/work locks make this short-lived empty-history
+        # proof stable. Avoid two metadata round trips for each brand-new packet.
+        # Retried and corrected histories still execute their full chain checks.
+        with derived.initial_evidence_batch(session, candidates):
+            while len(selected) < quota:
+                while recent_index < len(recent) and recent[recent_index].id in selected:
+                    recent_index += 1
+                while oldest_index < len(oldest) and oldest[oldest_index].id in selected:
+                    oldest_index += 1
+                has_recent, has_oldest = recent_index < len(recent), oldest_index < len(oldest)
+                if not has_recent and not has_oldest:
+                    break
+                if processed and deadline is not None and clock() >= deadline:
+                    break
+                priority = has_recent and (schedule.priority_burst < PRIORITY_BURST or not has_oldest)
+                row = recent[recent_index] if priority else oldest[oldest_index]
+                inspect_work(session, row)
+                schedule.priority_burst = min(PRIORITY_BURST, schedule.priority_burst + 1) if priority else 0
+                schedule.updated_at = utc_now()
+                selected.add(row.id)
+                processed += 1
         if (recent or oldest) and processed == prior_processed:
             # Its lock/query used the remaining budget, but no group was
             # inspected. Keep it first next time rather than skipping it on

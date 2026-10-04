@@ -31,6 +31,15 @@ earlier within the same transaction; nothing reports progress before the outer
 commit. A failed batched write rolls back all proposed steps and work changes,
 while the original custody receipts remain intact.
 
+For new work, the inspector also checks for existing interpretation history once
+per bounded candidate batch while holding the connector and work locks. An empty
+history proof avoids the two per-record metadata reads on the first step. It
+is tied to that transaction and exact input fingerprint, consumed once, and
+discarded on context exit or failure. A changed revision, reopened transaction,
+pending interpretation or any retained history takes the normal chain and
+correction-provenance path. Ciphertext, source binding and raw-digest validation
+remain mandatory for every record. The proof never grants decoding authority.
+
 Every size-compatible live layout is an explicit hypothesis. Layout errors retain
 their byte offset, length, digest and fixed error category. Later valid records
 within the same packet remain inspectable. Identical same-second records retain

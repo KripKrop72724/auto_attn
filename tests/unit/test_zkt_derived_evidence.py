@@ -50,6 +50,84 @@ def source_observation(size, **updates):
                        raw_digest=hashlib.sha256(raw).hexdigest(), **updates)
 
 
+def test_new_packet_history_is_read_once_per_locked_batch(custody):
+    db, connector = custody
+    db.autoflush = False
+    raw = packet(live(32))
+    for sequence in range(1, 17):
+        settle_observations(db, connector, batch(packet_observation(sequence, raw)))
+    db.commit()
+    receipts = list(db.scalars(select(ZktObservationReceipt.protected_observation)))
+    queries = []
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT") and "FROM add_zkt_derived_evidence" in statement:
+            queries.append(statement)
+    connection = db.connection()
+    event.listen(connection, "before_cursor_execute", capture)
+    try:
+        assert work.advance_work(db, limit=16) == 16
+    finally:
+        event.remove(connection, "before_cursor_execute", capture)
+    assert len(queries) == 1  # One bounded absence proof instead of 32 per-work queries.
+    db.commit()
+    assert count(db, ZktDerivedEvidence) == 16
+    for obligation in db.scalars(select(ZktCustodyWork)):
+        evidence = list(derived.verified_steps(db, obligation, raw))
+        assert len(evidence) == 1 and evidence[0]["result"] == "UNQUALIFIED_FACTS"
+        assert evidence[0]["records"][0]["facts"]["user_id"] == "123"
+    assert list(db.scalars(select(ZktObservationReceipt.protected_observation))) == receipts
+    assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
+
+
+@pytest.mark.parametrize("invalidate", ["revision", "transaction", "context_exit"])
+def test_empty_history_proof_cannot_outlive_its_input_or_transaction(custody, invalidate):
+    db, connector = custody
+    raw = packet(live(32))
+    settle_observations(db, connector, batch(packet_observation(1, raw)))
+    db.commit()
+    obligation = db.scalar(select(ZktCustodyWork))
+    queries = []
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT") and "FROM add_zkt_derived_evidence" in statement:
+            queries.append(statement)
+    event.listen(db.get_bind(), "before_cursor_execute", capture)
+    try:
+        with derived.initial_evidence_batch(db, [obligation]):
+            if invalidate == "revision":
+                obligation.evidence_revision += 1
+            elif invalidate == "transaction":
+                db.rollback()
+            if invalidate != "context_exit":
+                derived.derive_step(db, obligation, raw)
+        if invalidate == "context_exit":
+            derived.derive_step(db, obligation, raw)
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture)
+    # The initial proof is stale, so both normal chain/provenance reads run.
+    assert len(queries) == 3
+    assert count(db, ZktDerivedEvidence) == 1
+
+
+def test_empty_history_context_cleans_up_after_failure_and_rejects_nesting(custody):
+    db, connector = custody
+    raw = packet(live(32))
+    settle_observations(db, connector, batch(packet_observation(1, raw)))
+    db.commit()
+    obligation = db.scalar(select(ZktCustodyWork))
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with derived.initial_evidence_batch(db, [obligation]):
+            with pytest.raises(ValueError, match="PREFETCH_NESTING"):
+                with derived.initial_evidence_batch(db, [obligation]):
+                    pass
+            raise RuntimeError("synthetic interrupted batch")
+    with derived.initial_evidence_batch(db, [obligation]):
+        row = derived.derive_step(db, obligation, raw)
+    assert row.result == "UNQUALIFIED_FACTS" and count(db, ZktDerivedEvidence) == 1
+    with pytest.raises(ValueError, match="PREFETCH_BOUNDS"):
+        with derived.initial_evidence_batch(db, [obligation] * 1001):
+            pass
+
+
 @pytest.mark.parametrize("fail_write", [False, True])
 def test_independent_steps_batch_writes_and_rollback_together(store, monkeypatch, fail_write):
     if store.kw["bind"].dialect.name != "postgresql":
