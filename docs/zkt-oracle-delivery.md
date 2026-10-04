@@ -108,8 +108,20 @@ The read-only `zkt_delivery_projection_v2_preflight.sql` check on 19c parsed the
 the synthetic timestamp's microseconds through the UTC-to-Pakistan conversion.
 It did not call a user package or install/compile a stored object.
 
+The complete reader body also passed anonymous PL/SQL compilation on Oracle
+19c 19.26 through authenticated APEX SQL Commands on 4 October 2026. Only the
+package wrapper was replaced: the exact helper, verification and HTTP procedure
+declarations were enclosed in `DECLARE ... BEGIN NULL; END;`. The outer body
+called none of those subprograms. APEX returned `Statement processed` in 0.05
+seconds. This checks the full PL/SQL and static SQL against the existing column
+types without executing an attendance query, creating a stored object or
+changing production data. The reviewed source SHA-256 was
+`9addda02f3ac0e7d3c69e6669f66810640ba6a9e4897b4997c63698ab730dd0f`.
+The generated anonymous block and observed result are retained as protected
+local evidence. This is anonymous compilation evidence only.
+
 Production's inspected Oracle engine is 19c. The newer local engine does **not**
-qualify 19c compilation/execution, the production schema's business rules, ORDS
+qualify stored-package installation/execution on 19c, the production schema's business rules, ORDS
 authentication, downstream writer behavior or concurrent real delivery. Those
 checks need an isolated matching Oracle environment before field activation.
 No production Oracle data or schema was changed during this work.

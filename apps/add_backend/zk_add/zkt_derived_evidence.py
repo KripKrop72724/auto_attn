@@ -8,6 +8,7 @@ hold connector then work locks and commit the step with its scheduling state.
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import contextmanager
 import hashlib
 import json
 import struct
@@ -29,6 +30,7 @@ MAX_STEPS = 2 + sum((PACKET_MAX - 8) // size for size in LIVE_SIZES) // RECORDS_
 MAX_PLAINTEXT = 128 * 1024
 MAX_CIPHERTEXT = 180 * 1024
 SUPPORTED_KINDS = frozenset({"SOURCE_LEDGER", "SOURCE_RECORD", "LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"})
+_INITIAL_EVIDENCE = object()
 
 
 class DerivedEvidenceInvalid(ValueError):
@@ -45,6 +47,41 @@ def input_fingerprint(work: ZktCustodyWork) -> str:
         work.kind, work.source_manifest_id, work.terminal_serial, work.capture_epoch,
         work.decoder_profile, work.decoder_version, work.expected_bytes, work.expected_digest,
         work.evidence_revision])
+
+
+@contextmanager
+def initial_evidence_batch(session: Session, works: list[ZktCustodyWork]):
+    """Prove empty interpretation history once for a bounded locked batch.
+
+    The caller holds each group's connector/work locks and visits it once.
+    This is only a read optimization, never decoding or qualification evidence.
+    Existing histories keep all chain/provenance checks. The proof expires on
+    context exit, a transaction change, input revision change or first use.
+    """
+    # Recent and oldest candidate pages can each contain at most 500 groups.
+    if len(works) > 1000 or any(row.id is None for row in works):
+        raise ValueError("DERIVED_PREFETCH_BOUNDS")
+    if _INITIAL_EVIDENCE in session.info:
+        raise ValueError("DERIVED_PREFETCH_NESTING")
+    ids = {row.id for row in works}
+    existing = set(session.scalars(select(ZktDerivedEvidence.work_id).where(
+        ZktDerivedEvidence.work_id.in_(ids)).distinct())) if ids else set()
+    existing.update(row.work_id for row in session.new if isinstance(row, ZktDerivedEvidence))
+    session.info[_INITIAL_EVIDENCE] = (session.get_transaction(), {
+        row.id: input_fingerprint(row) for row in works if row.id not in existing})
+    try:
+        yield
+    finally:
+        session.info.pop(_INITIAL_EVIDENCE, None)
+
+
+def _initial_history_proved(session: Session, work: ZktCustodyWork, fingerprint: str) -> bool:
+    cached = session.info.get(_INITIAL_EVIDENCE)
+    if cached is None:
+        return False
+    transaction, inputs = cached
+    prior = inputs.pop(work.id, None)
+    return transaction is session.get_transaction() and prior == fingerprint
 
 
 def _plan(raw: bytes, kind: str) -> dict:
@@ -145,7 +182,8 @@ def derive_step(session: Session, work: ZktCustodyWork, raw: bytes, *, flush: bo
         raise DerivedEvidenceInvalid("DERIVED_INPUT_CHANGED")
     fingerprint = input_fingerprint(work)
     plan = _plan(raw, work.kind)
-    rows = _chain_rows(session, work, fingerprint, INTERPRETATION_VERSION)
+    first = _initial_history_proved(session, work, fingerprint)
+    rows = [] if first else _chain_rows(session, work, fingerprint, INTERPRETATION_VERSION)
     prior_interpretation = None
     if rows:
         prior = _unseal(rows[-1], work, plan)
@@ -153,7 +191,7 @@ def derive_step(session: Session, work: ZktCustodyWork, raw: bytes, *, flush: bo
             return rows[-1]
         plan = prior["plan"]
         prior_interpretation = prior["prior_interpretation"]
-    else:
+    elif not first:
         earlier = session.execute(select(ZktDerivedEvidence.id, ZktDerivedEvidence.interpretation_version,
             ZktDerivedEvidence.evidence_digest).where(ZktDerivedEvidence.work_id == work.id,
                 ZktDerivedEvidence.input_fingerprint == fingerprint,
