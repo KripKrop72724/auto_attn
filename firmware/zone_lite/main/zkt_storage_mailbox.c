@@ -28,7 +28,8 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_RUNTIME_CHECKPOINT) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_CATALOG) return false;
+    if (request->operation == ZJ_CATALOG && !zc_request_valid(&request->input.catalog)) return false;
     if (request->operation == ZJ_RUNTIME_CHECKPOINT &&
         (!request->input.runtime_checkpoint.deadline_us ||
          !runtime_checkpoint_valid(&request->input.runtime_checkpoint.state))) return false;
@@ -61,18 +62,28 @@ bool zj_mailbox_begin(zj_mailbox_t *mailbox, zj_request_t *request, uint64_t *ti
 {
     if (ticket) *ticket = 0;
     if (!mailbox || !request || !ticket || mailbox->running_ticket) return false;
-    zj_request_slot_t *high = NULL, *low = NULL;
+    zj_request_slot_t *high = NULL, *low = NULL, *resume = NULL;
     for (unsigned i = 0; i < ZJ_REQUEST_SLOTS; ++i) {
         zj_request_slot_t *slot = &mailbox->slots[i];
         if (slot->state != ZJ_SLOT_QUEUED) continue;
+        if (slot->ticket == mailbox->resume_ticket) { resume = slot; continue; }
+        /* A retained catalog transaction reserves its file namespace only.
+         * Delivery reads/runtime checkpoints may run between its steps; a
+         * different catalog mutation cannot overtake the recovery intent. */
+        if (mailbox->resume_ticket && slot->request.operation == ZJ_CATALOG) continue;
         zj_request_slot_t **candidate = priority(slot->request.operation) ? &high : &low;
         if (!*candidate || slot->ticket < (*candidate)->ticket) *candidate = slot;
     }
+    bool other_low = low != NULL;
+    if (resume && (!low || !mailbox->yield_to_other)) low = resume;
     zj_request_slot_t *chosen = high && (!low || mailbox->priority_burst < ZJ_PRIORITY_BURST) ? high : low;
     if (!chosen) return false;
     if (chosen == high) {
         if (mailbox->priority_burst < ZJ_PRIORITY_BURST) ++mailbox->priority_burst;
-    } else mailbox->priority_burst = 0;
+    } else {
+        mailbox->priority_burst = 0;
+        if (resume && other_low && chosen != resume) mailbox->yield_to_other = false;
+    }
     chosen->state = ZJ_SLOT_RUNNING;
     mailbox->running_ticket = chosen->ticket;
     *ticket = chosen->ticket;
@@ -84,12 +95,24 @@ bool zj_mailbox_finish(zj_mailbox_t *mailbox, uint64_t ticket, const zj_reply_t 
     zj_request_slot_t *slot = find(mailbox, ticket);
     if (!slot || !reply || slot->state != ZJ_SLOT_RUNNING || mailbox->running_ticket != ticket) return false;
     mailbox->running_ticket = 0;
+    if (mailbox->resume_ticket == ticket) mailbox->resume_ticket = 0;
     ++mailbox->completed;
     if (slot->abandoned) release(mailbox, slot);
     else {
         slot->reply = *reply;
         slot->state = ZJ_SLOT_DONE;
     }
+    return true;
+}
+bool zj_mailbox_yield(zj_mailbox_t *mailbox, uint64_t ticket)
+{
+    zj_request_slot_t *slot = find(mailbox, ticket);
+    if (!slot || slot->state != ZJ_SLOT_RUNNING || mailbox->running_ticket != ticket ||
+        slot->request.operation != ZJ_CATALOG) return false;
+    slot->state = ZJ_SLOT_QUEUED;
+    mailbox->running_ticket = 0;
+    mailbox->resume_ticket = ticket;
+    mailbox->yield_to_other = true;
     return true;
 }
 bool zj_mailbox_poll(zj_mailbox_t *mailbox, uint64_t ticket, zj_reply_t *reply, bool *complete)

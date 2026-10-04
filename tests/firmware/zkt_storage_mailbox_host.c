@@ -76,6 +76,34 @@ int main(void)
         assert(!zj_mailbox_poll(&mailbox, running, &obtained, &complete));
     }
     assert(peek_seen);
+    /* A long optional transaction yields without losing its copied request,
+     * reply ownership or position ahead of later optional catalog mutations. */
+    zj_mailbox_init(&mailbox);
+    request = (zj_request_t){.operation = ZJ_CATALOG,
+        .input.catalog = {.operation = ZC_RECOVER, .deadline_us = 10000000}};
+    uint64_t catalog_ticket, live_ticket, later_ticket, peek_ticket;
+    assert(zj_mailbox_submit(&mailbox, &request, &catalog_ticket));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == catalog_ticket);
+    assert(zj_mailbox_submit(&mailbox, &request, &later_ticket));
+    request.operation = ZJ_APPEND;
+    assert(zj_mailbox_submit(&mailbox, &request, &live_ticket));
+    request.operation = ZJ_PEEK;
+    assert(zj_mailbox_submit(&mailbox, &request, &peek_ticket));
+    assert(zj_mailbox_yield(&mailbox, catalog_ticket) && mailbox.completed == 0);
+    assert(zj_mailbox_abandon(&mailbox, catalog_ticket));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == live_ticket);
+    assert(!zj_mailbox_yield(&mailbox, live_ticket));
+    assert(zj_mailbox_finish(&mailbox, live_ticket, &reply));
+    assert(zj_mailbox_poll(&mailbox, live_ticket, &obtained, &complete) && complete);
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == peek_ticket);
+    assert(zj_mailbox_finish(&mailbox, peek_ticket, &reply));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == catalog_ticket);
+    assert(zj_mailbox_finish(&mailbox, catalog_ticket, &reply));
+    assert(zj_mailbox_begin(&mailbox, &work, &running) && running == later_ticket);
+    assert(zj_mailbox_finish(&mailbox, later_ticket, &reply));
+    request = (zj_request_t){.operation = ZJ_CATALOG};
+    assert(!zj_mailbox_submit(&mailbox, &request, &ticket));
+    request = (zj_request_t){.operation = ZJ_APPEND};
     zj_mailbox_init(&mailbox);
     mailbox.next_ticket = UINT64_MAX;
     assert(zj_mailbox_submit(&mailbox, &request, &ticket) && ticket == UINT64_MAX);

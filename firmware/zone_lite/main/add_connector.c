@@ -6,6 +6,7 @@
 #else
 #include "zkt_custody_wire.h"
 #include "zkt_journal_runtime.h"
+#include "zkt_catalog_client.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -737,6 +738,14 @@ static const char *storage_key_material(void)
     return runtime->bootstrap_secret[0] ? runtime->bootstrap_secret : runtime->device_token;
 }
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static bool catalog_owner_required(void);
+static bool catalog_owner_idle(void);
+static bool catalog_owner_recover(void);
+static bool catalog_owner_activate(const char *path);
+#endif
+static void remove_catalog_stage(const char *path);
+
 static char *encrypt_storage_json(const char *plain)
 {
     const char *material = storage_key_material();
@@ -871,6 +880,9 @@ static const ft_port_t catalog_transaction_port = {catalog_transaction_load, cat
 
 static bool recover_catalog_transaction_locked(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return catalog_owner_recover();
+#endif
     bool ok = ft_recover(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
         ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
     // Only a fully written producer stage is renamed to the canonical commit
@@ -919,7 +931,7 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     if (bounded && !admitted) {
         s_catalog_writer_failure_reason = errno == EBUSY ? "admission_lock_busy" : "admission_rejected";
     }
-    bool ok = admitted && fprintf(file, "%s\n", encrypted) > 0 &&
+    bool ok = admitted && fprintf(file, "%s\n", encrypted) == (int)bytes &&
         fflush(file) == 0 && fsync(fileno(file)) == 0;
     if (admitted && !ok) s_catalog_writer_failure_reason = "stage_write_failed";
     if (admitted) qs_local_end(ok, ok ? 0 : errno);
@@ -930,8 +942,152 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     return ok;
 }
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static zc_client_t s_catalog_client;
+static atomic_bool s_catalog_restore_pending;
+static uint64_t s_catalog_producer_ids[2];
+static uint32_t s_catalog_producer_offsets[2];
+static bool catalog_owner_required(void)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    return app && !strcmp(app->project_name, "zone_lite") &&
+        (!strcmp(app->version, ZJ_BRIDGE_VERSION) || !strcmp(app->version, ZJ_WRITER_VERSION));
+}
+static uint64_t catalog_now(void *context) { (void)context; return (uint64_t)esp_timer_get_time(); }
+static void catalog_wait(void *context) { (void)context; vTaskDelay(pdMS_TO_TICKS(10)); }
+static bool catalog_submit(void *context, const zj_request_t *request, uint64_t *ticket)
+{ (void)context; return zj_owner_submit(request, ticket); }
+static bool catalog_poll(void *context, uint64_t ticket, zj_reply_t *reply, bool *complete)
+{ (void)context; return zj_owner_poll(ticket, reply, complete); }
+static const zc_client_port_t catalog_client_port = {catalog_now, catalog_wait, catalog_submit, catalog_poll, NULL};
+static void catalog_owner_invalidate_memory(void)
+{
+    if (s_catalog_client.active_may_have_changed) {
+        /* A late or uncertain activation may have replaced the file. A
+         * previously cached alias generation cannot override that result. */
+        s_identity_catalog_active_memory_valid = false;
+        s_catalog_client.active_may_have_changed = false;
+    }
+}
+static bool catalog_owner_idle(void)
+{
+    bool idle = zc_client_drain(&s_catalog_client, catalog_client_port);
+    catalog_owner_invalidate_memory();
+    return idle;
+}
+static bool catalog_owner_call(zc_request_t request, zc_reply_t *reply)
+{
+    if (!catalog_owner_idle()) {
+        s_catalog_writer_failure_reason = "catalog_previous_operation";
+        return false;
+    }
+    uint64_t timeout = request.operation == ZC_ACTIVATE || request.operation == ZC_RECOVER ? 30000000U : 5000000U;
+    request.deadline_us = (uint64_t)esp_timer_get_time() + timeout;
+    zj_result_t result = zc_client_call(&s_catalog_client, catalog_client_port, &request, reply);
+    catalog_owner_invalidate_memory();
+    if (result != ZJ_OK) s_catalog_writer_failure_reason = reply->operation ? reply->operation : "catalog_owner_rejected";
+    return result == ZJ_OK;
+}
+static int catalog_file_selector(const char *path)
+{
+    return path && !strcmp(path, ADD_IDENTITY_CATALOG_TMP_PATH) ? 0 :
+        path && !strcmp(path, ADD_IDENTITY_CATALOG_STAGE_PATH) ? 1 : -1;
+}
+static bool catalog_owner_reset(const char *path)
+{
+    int file = catalog_file_selector(path);
+    if (file < 0) return false;
+    zc_reply_t reply;
+    if (!catalog_owner_call((zc_request_t){.operation = ZC_RESET, .file = (uint8_t)file}, &reply)) return false;
+    s_catalog_producer_ids[file] = reply.id;
+    s_catalog_producer_offsets[file] = 0;
+    return true;
+}
+static bool catalog_owner_json(const char *path, cJSON *value)
+{
+    int file = catalog_file_selector(path);
+    if (file < 0 || !s_catalog_producer_ids[file]) return false;
+    char *plain = value ? cJSON_PrintUnformatted(value) : NULL;
+    char *encrypted = encrypt_storage_json(plain);
+    size_t length = encrypted ? strlen(encrypted) + 1U : 0;
+    bool ok = length && length <= DQ_MAX_RECORD_BYTES;
+    if (!ok) s_catalog_writer_failure_reason = !plain ? "json_allocation_failed" :
+        !encrypted ? "encryption_failed" : "record_too_large";
+    free(plain);
+    for (size_t offset = 0; ok && offset < length;) {
+        zc_request_t request = {.operation = ZC_APPEND, .file = (uint8_t)file,
+            .id = s_catalog_producer_ids[file], .offset = s_catalog_producer_offsets[file]};
+        size_t bytes = length - offset;
+        if (bytes > ZC_CHUNK_BYTES) bytes = ZC_CHUNK_BYTES;
+        request.length = (uint16_t)bytes;
+        for (size_t i = 0; i < bytes; ++i)
+            request.bytes[i] = offset + i == length - 1U ? '\n' : (uint8_t)encrypted[offset + i];
+        zc_reply_t reply;
+        ok = catalog_owner_call(request, &reply);
+        if (ok) s_catalog_producer_offsets[file] = reply.offset;
+        offset += bytes;
+    }
+    free(encrypted);
+    return ok;
+}
+static bool catalog_owner_recover(void)
+{
+    zc_reply_t reply;
+    return catalog_owner_call((zc_request_t){.operation = ZC_RECOVER}, &reply);
+}
+static bool catalog_owner_activate(const char *path)
+{
+    int file = catalog_file_selector(path);
+    if (file < 0 || !s_catalog_producer_ids[file]) return false;
+    zc_reply_t reply;
+    return catalog_owner_call((zc_request_t){.operation = ZC_ACTIVATE, .file = (uint8_t)file,
+        .id = s_catalog_producer_ids[file], .offset = s_catalog_producer_offsets[file]}, &reply);
+}
+static bool catalog_owner_persist(cJSON *root, size_t *row_count_out)
+{
+    cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
+    int count = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
+    if (count < 0 || count > ADD_IDENTITY_CATALOG_MAX_ROWS || !catalog_owner_reset(ADD_IDENTITY_CATALOG_TMP_PATH)) return false;
+    cJSON *metadata = cJSON_CreateObject();
+    bool ok = metadata && cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+        cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+        cJSON_AddNumberToObject(metadata, "rows_count", count) && catalog_owner_json(ADD_IDENTITY_CATALOG_TMP_PATH, metadata);
+    cJSON_Delete(metadata);
+    cJSON *row;
+    cJSON_ArrayForEach(row, rows) {
+        if (!cJSON_IsObject(row) || (ok && !catalog_owner_json(ADD_IDENTITY_CATALOG_TMP_PATH, row))) ok = false;
+    }
+    if (ok) ok = catalog_owner_activate(ADD_IDENTITY_CATALOG_TMP_PATH);
+    if (ok && row_count_out) *row_count_out = (size_t)count;
+    if (!ok) remove_catalog_stage(ADD_IDENTITY_CATALOG_TMP_PATH);
+    return ok;
+}
+#endif
+static void remove_catalog_stage(const char *path)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        const char *original_failure = s_catalog_writer_failure_reason;
+        int file = catalog_file_selector(path);
+        if (file >= 0 && s_catalog_producer_ids[file]) {
+            zc_reply_t reply;
+            (void)catalog_owner_call((zc_request_t){.operation = ZC_REMOVE, .file = (uint8_t)file,
+                .id = s_catalog_producer_ids[file]}, &reply);
+        }
+        s_catalog_writer_failure_reason = original_failure;
+        return;
+    }
+#endif
+    (void)remove(path);
+}
+
 static void recover_identity_catalog_backup_if_active_missing(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    /* No second writer before the owner starts. Its later bounded recovery
+     * owns both transaction files and the existing catalog NVS checkpoint. */
+    if (catalog_owner_required()) return;
+#endif
     if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         led_status_fault(LED_STATUS_LOCAL_FAILURE); return;
     }
@@ -1026,14 +1182,42 @@ static bool restore_valid_identity_catalog_locked(void)
 
 static bool restore_valid_identity_catalog(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        zj_owner_health_t health;
+        if (!zj_owner_health(&health) || !health.started) {
+            atomic_store(&s_catalog_restore_pending, true);
+            return false;
+        }
+    }
+#endif
     if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     bool ok = restore_valid_identity_catalog_locked();
     xSemaphoreGive(s_catalog_lock);
     return ok;
 }
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static void catalog_owner_maintenance(void)
+{
+    if (!catalog_owner_required() || !s_catalog_lock ||
+        xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1)) != pdTRUE) return;
+    if (catalog_owner_idle() && atomic_load(&s_catalog_restore_pending)) {
+        zj_owner_health_t health;
+        if (zj_owner_health(&health) && health.started) {
+            atomic_store(&s_catalog_restore_pending, false);
+            if (!s_identity_catalog_generation) (void)restore_valid_identity_catalog_locked();
+        }
+    }
+    xSemaphoreGive(s_catalog_lock);
+}
+#endif
+
 static bool activate_identity_catalog(const char *staged_path)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return catalog_owner_activate(staged_path);
+#endif
     if (!staged_path || !recover_catalog_transaction_locked()) return false;
     // The checked transaction is idle. A leftover canonical stage is an
     // uncommitted producer result; the active/backup generations were verified.
@@ -1048,6 +1232,9 @@ static bool activate_identity_catalog(const char *staged_path)
 
 static bool persist_identity_catalog_locked(cJSON *root, size_t *row_count_out)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return catalog_owner_persist(root, row_count_out);
+#endif
     cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
     int row_count = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : -1;
     if (row_count < 0 || row_count > ADD_IDENTITY_CATALOG_MAX_ROWS) {
@@ -1070,7 +1257,7 @@ static bool persist_identity_catalog_locked(cJSON *root, size_t *row_count_out)
     cJSON_Delete(metadata);
     cJSON *row = NULL;
     cJSON_ArrayForEach(row, rows) {
-        if (ok && !write_encrypted_json_line(file, row)) {
+        if (!cJSON_IsObject(row) || (ok && !write_encrypted_json_line(file, row))) {
             ok = false;
         }
     }
@@ -1102,7 +1289,7 @@ static bool persist_identity_catalog(cJSON *root, size_t *row_count_out)
 static void reset_identity_catalog_stage(bool remove_file)
 {
     if (remove_file) {
-        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+        remove_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     }
     free(s_identity_catalog_stage_aliases);
     s_identity_catalog_stage_aliases = NULL;
@@ -1156,7 +1343,7 @@ static bool identity_alias_from_json(
     return true;
 }
 
-static bool identity_catalog_stage_begin(cJSON *root)
+static bool identity_catalog_stage_begin_locked(cJSON *root)
 {
     cJSON *catalog_id = root
         ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
@@ -1187,21 +1374,26 @@ static bool identity_catalog_stage_begin(cJSON *root)
             s_identity_catalog_stage_alias_capacity = (size_t)expected;
         }
     }
-    FILE *file = create_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     cJSON *metadata = cJSON_CreateObject();
-    bool ok = file && metadata;
-    if (ok) {
-        ok = cJSON_AddStringToObject(metadata, "schema_version", "3") &&
-            cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
-            cJSON_AddNumberToObject(metadata, "rows_count", expected) &&
-            write_encrypted_json_line(file, metadata) &&
+    bool ok = metadata && cJSON_AddStringToObject(metadata, "schema_version", "3") &&
+        cJSON_AddStringToObject(metadata, "type", "identity_catalog") &&
+        cJSON_AddNumberToObject(metadata, "rows_count", expected);
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        ok = ok && catalog_owner_reset(ADD_IDENTITY_CATALOG_STAGE_PATH) &&
+            catalog_owner_json(ADD_IDENTITY_CATALOG_STAGE_PATH, metadata);
+    } else
+#endif
+    {
+        FILE *file = ok ? create_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH) : NULL;
+        ok = ok && file && write_encrypted_json_line(file, metadata) &&
             fflush(file) == 0 && fsync(fileno(file)) == 0;
+        if (file && fclose(file) != 0) ok = false;
     }
     cJSON_Delete(metadata);
-    if (file && fclose(file) != 0) ok = false;
     s_identity_catalog_stage_file_ok = ok;
     if (!ok) {
-        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+        remove_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     }
     if (!ok && !memory_ok) {
         reset_identity_catalog_stage(true);
@@ -1216,7 +1408,15 @@ static bool identity_catalog_stage_begin(cJSON *root)
     return true;
 }
 
-static bool identity_catalog_stage_chunk(cJSON *root)
+static bool identity_catalog_stage_begin(cJSON *root)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = identity_catalog_stage_begin_locked(root);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
+}
+
+static bool identity_catalog_stage_chunk_locked(cJSON *root)
 {
     cJSON *catalog_id = root
         ? cJSON_GetObjectItemCaseSensitive(root, "catalog_id")
@@ -1257,25 +1457,33 @@ static bool identity_catalog_stage_chunk(cJSON *root)
     if (!rows_ok) return false;
 
     if (s_identity_catalog_stage_file_ok) {
-        FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
-        bool file_ok = file != NULL;
-        if (!file_ok) s_catalog_writer_failure_reason = "stage_append_open_failed";
-        cJSON_ArrayForEach(row, rows) {
-            if (file_ok && !write_encrypted_json_line(file, row)) {
+        bool file_ok = true;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (catalog_owner_required()) {
+            cJSON_ArrayForEach(row, rows) {
+                if (file_ok && !catalog_owner_json(ADD_IDENTITY_CATALOG_STAGE_PATH, row)) file_ok = false;
+            }
+        } else
+#endif
+        {
+            FILE *file = rel_open_append(ADD_IDENTITY_CATALOG_STAGE_PATH);
+            file_ok = file != NULL;
+            if (!file_ok) s_catalog_writer_failure_reason = "stage_append_open_failed";
+            cJSON_ArrayForEach(row, rows) {
+                if (file_ok && !write_encrypted_json_line(file, row)) file_ok = false;
+            }
+            if (file_ok && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
+                s_catalog_writer_failure_reason = "stage_sync_failed";
+                file_ok = false;
+            }
+            if (file && fclose(file) != 0) {
+                if (file_ok) s_catalog_writer_failure_reason = "stage_close_failed";
                 file_ok = false;
             }
         }
-        if (file_ok && (fflush(file) != 0 || fsync(fileno(file)) != 0)) {
-            s_catalog_writer_failure_reason = "stage_sync_failed";
-            file_ok = false;
-        }
-        if (file && fclose(file) != 0) {
-            if (file_ok) s_catalog_writer_failure_reason = "stage_close_failed";
-            file_ok = false;
-        }
         if (!file_ok) {
             s_identity_catalog_stage_file_ok = false;
-            (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+            remove_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
         }
     }
     if (memory_ok || s_identity_catalog_stage_file_ok) {
@@ -1283,6 +1491,14 @@ static bool identity_catalog_stage_chunk(cJSON *root)
         return true;
     }
     return false;
+}
+
+static bool identity_catalog_stage_chunk(cJSON *root)
+{
+    if (!s_catalog_lock || xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool ok = identity_catalog_stage_chunk_locked(root);
+    xSemaphoreGive(s_catalog_lock);
+    return ok;
 }
 
 static bool identity_catalog_stage_commit_locked(
@@ -1337,7 +1553,7 @@ static bool identity_catalog_stage_commit_locked(
         *volatile_fallback_out = !persisted && memory_ready;
     }
     if (!persisted) {
-        (void)remove(ADD_IDENTITY_CATALOG_STAGE_PATH);
+        remove_catalog_stage(ADD_IDENTITY_CATALOG_STAGE_PATH);
     }
     reset_identity_catalog_stage(false);
     return ok;
@@ -2041,7 +2257,10 @@ static void parse_inbound(const char *data, size_t len)
     if (cJSON_IsString(type) &&
         strcmp(type->valuestring, "identity_catalog_chunk") == 0) {
         if (!identity_catalog_stage_chunk(root)) {
-            reset_identity_catalog_stage(true);
+            if (s_catalog_lock && xSemaphoreTake(s_catalog_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                reset_identity_catalog_stage(true);
+                xSemaphoreGive(s_catalog_lock);
+            }
             add_connector_log(
                 "ERROR",
                 "identity",
@@ -3732,6 +3951,9 @@ static void delivery_supervisor_task(void *arg)
             (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) > 90000U))
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
         restore_command_inbox();
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        catalog_owner_maintenance();
+#endif
         // Do not asynchronously delete a task which might own a mutex.
         // Buffer failures self-retry; stalled operations are independently visible.
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -4441,11 +4663,14 @@ static bool add_connector_lookup_identity_locked(
     bool *shift_worker)
 {
     if ((!user_id || !user_id[0]) && (!uid || !uid[0])) return false;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required() && !catalog_owner_idle()) return false;
+#endif
     bool found = false;
     bool memory_catalog_valid = false;
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         memory_catalog_valid = s_identity_catalog_active_memory_valid;
-        for (size_t i = 0; i < s_identity_catalog_active_alias_rows; i++) {
+        for (size_t i = 0; memory_catalog_valid && i < s_identity_catalog_active_alias_rows; i++) {
             const add_identity_alias_t *alias =
                 &s_identity_catalog_active_aliases[i];
             bool user_matches = !user_id || !user_id[0] ||

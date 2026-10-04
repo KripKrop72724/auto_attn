@@ -28,6 +28,7 @@ static size_t root_length, checkpoint_length;
 static runtime_checkpoint_t runtime_blob;
 static bool runtime_present;
 static unsigned runtime_writes;
+static ft_checkpoint_t catalog_checkpoint;
 const esp_app_desc_t *esp_app_get_description(void)
 {
     static const esp_app_desc_t app = {.project_name = "zone_lite", .version = "2.7.0"};
@@ -92,7 +93,12 @@ void xTaskNotifyGive(TaskHandle_t handle) { (void)handle; }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 {
     (void)mode;
-    assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite"));
+    assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite") || !strcmp(name, "file_tx"));
+    if (!strcmp(name, "file_tx")) {
+        assert(pthread_equal(pthread_self(), thread));
+        assert(pthread_mutex_trylock(&budget) == EBUSY);
+        *handle = 3; return ESP_OK;
+    }
     if (!strcmp(name, "zone_lite")) {
         assert(pthread_equal(pthread_self(), thread));
         assert(pthread_mutex_trylock(&budget) == EBUSY);
@@ -100,9 +106,14 @@ esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
     } else *handle = 1;
     return ESP_OK;
 }
-void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2); }
+void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handle == 3); }
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t *length)
 {
+    if (handle == 3) {
+        assert(!strcmp(name, "catalog") && *length == sizeof(catalog_checkpoint));
+        if (!catalog_checkpoint.version) return ESP_ERR_NVS_NOT_FOUND;
+        memcpy(out, &catalog_checkpoint, sizeof(catalog_checkpoint)); return ESP_OK;
+    }
     if (handle == 2) {
         assert(!strcmp(name, "runtime_v1") && *length == sizeof(runtime_blob));
         if (!runtime_present) return ESP_ERR_NVS_NOT_FOUND;
@@ -122,6 +133,10 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
 }
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes, size_t length)
 {
+    if (handle == 3) {
+        assert(!strcmp(name, "catalog") && length == sizeof(catalog_checkpoint));
+        memcpy(&catalog_checkpoint, bytes, length); return ESP_OK;
+    }
     if (handle == 2) {
         assert(!strcmp(name, "runtime_v1") && length == sizeof(runtime_blob));
         runtime_blob = *(const runtime_checkpoint_t *)bytes;
@@ -146,10 +161,11 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
     }
     return ESP_OK;
 }
-esp_err_t nvs_commit(nvs_handle_t handle) { assert(handle == 1 || handle == 2); return ESP_OK; }
+esp_err_t nvs_commit(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handle == 3); return ESP_OK; }
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 {
-    assert(policy == QS_ADMIT_LIVE && bytes >= ZJ_RECORD_MAX);
+    assert((policy == QS_ADMIT_LIVE && bytes >= ZJ_RECORD_MAX) ||
+        (policy == QS_ADMIT_OPTIONAL_HISTORICAL && bytes <= ZC_CHUNK_BYTES + 512U));
     if (atomic_load(&full)) { errno = ENOSPC; return false; }
     assert(!pthread_mutex_lock(&budget));
     while (atomic_load(&pause_write)) {
@@ -161,7 +177,8 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
 bool qs_local_read_begin(void) { assert(!pthread_mutex_lock(&budget)); return true; }
 bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
 {
-    assert(policy == QS_ADMIT_RECOVERY && bytes == 8U + ZJ_CHECKPOINT_BYTES);
+    assert((policy == QS_ADMIT_RECOVERY && bytes == 8U + ZJ_CHECKPOINT_BYTES) ||
+        (policy == QS_ADMIT_OPTIONAL_HISTORICAL && bytes <= ZC_CHUNK_BYTES + 512U));
     if (atomic_load(&full)) { errno = ENOSPC; return false; }
     return true;
 }
@@ -505,6 +522,40 @@ int main(int argc, char **argv)
     assert(zj_runtime_checkpoint_save(&runtime, &confirmed));
     assert(runtime_writes == 1 && confirmed.source_cursor == 99 && confirmed.generation == 1);
     assert(zj_owner_health(&health));
+    /* Real owner integration: optional refusal leaves attendance storage
+     * usable; abandoned activation yields to live capture, then finishes
+     * before any later catalog mutation or read can use the same paths. */
+    zj_request_t catalog = {.operation = ZJ_CATALOG, .input.catalog = {
+        .operation = ZC_RESET, .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U}};
+    assert(zj_owner_submit(&catalog, &ticket));
+    assert(wait_reply(ticket).result == ZJ_FULL);
+    atomic_store(&full, false);
+    assert(zj_owner_submit(&catalog, &ticket));
+    reply = wait_reply(ticket); assert(reply.result == ZJ_OK);
+    assert(zj_owner_health(&health) && health.append_observed && health.last_append_result == ZJ_FULL && health.ready);
+    catalog.input.catalog.id = reply.catalog.id;
+    catalog.input.catalog.operation = ZC_APPEND;
+    catalog.input.catalog.length = ZC_CHUNK_BYTES;
+    memset(catalog.input.catalog.bytes, 'C', ZC_CHUNK_BYTES);
+    for (unsigned i = 0; i < 40; ++i) {
+        assert(zj_owner_submit(&catalog, &ticket)); reply = wait_reply(ticket);
+        assert(reply.result == ZJ_OK); catalog.input.catalog.offset = reply.catalog.offset;
+    }
+    catalog.input.catalog.operation = ZC_ACTIVATE;
+    uint64_t catalog_ticket;
+    assert(zj_owner_submit(&catalog, &catalog_ticket));
+    assert(zj_owner_abandon(catalog_ticket));
+    zj_request_t concurrent_capture = {.operation = ZJ_APPEND, .input.observation = {
+        .raw_format = ZJ_LIVE_FRAME, .time_quality = ZJ_TIME_UNKNOWN,
+        .source_ordinal = UINT32_MAX, .raw_length = 40, .raw = {'C'}}};
+    assert(zj_owner_submit(&concurrent_capture, &ticket));
+    assert(wait_reply(ticket).result == ZJ_OK);
+    catalog.input.catalog = (zc_request_t){.operation = ZC_READ,
+        .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U};
+    assert(zj_owner_submit(&catalog, &ticket)); reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK && reply.catalog.length == ZC_CHUNK_BYTES &&
+        reply.catalog.total == 40 * ZC_CHUNK_BYTES && reply.catalog.bytes[0] == 'C');
+    assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
      * acknowledging; a new producer cannot race the completed barrier. */

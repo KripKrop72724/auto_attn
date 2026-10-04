@@ -8,7 +8,10 @@ ROOT = Path(__file__).resolve().parents[3]
 source = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
 functions = source[source.index("static cJSON *load_catalog_for_tombstone("):
                    source.index("static bool append_cancelled_command(")]
+functions += source[source.index("static bool add_connector_lookup_identity_locked("):
+                    source.index("uint32_t add_connector_identity_catalog_generation(")]
 program = r'''
+#define ZONE_LITE_HIKVISION 1
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,6 +48,14 @@ static int *s_catalog_lock=&catalog_lock;
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
 static void xSemaphoreGive(int *lock){assert(*lock);*lock=0;}
 static bool recover_catalog_transaction_locked(void){assert(catalog_lock);return true;}
+static int identity_lock;
+static int *s_lock=&identity_lock;
+static bool s_identity_catalog_active_memory_valid;
+typedef struct {char user_id[32],uid[32],display_name[32],cnic[32];bool shift_worker;} add_identity_alias_t;
+static add_identity_alias_t s_identity_catalog_active_aliases[1]={{.user_id="removed",.uid="old",.display_name="Stale alias"}};
+static size_t s_identity_catalog_active_alias_rows=1;
+static size_t copy_text(char *out,const char *in,size_t capacity){size_t n=strlen(in);if(capacity){size_t k=n<capacity-1?n:capacity-1;memcpy(out,in,k);out[k]=0;}return n;}
+#define strlcpy copy_text
 ''' + functions + r'''
 static void seed(const char *data){FILE *f=fopen("catalog","w");assert(f && fputs(data,f)>=0);assert(!fclose(f));}
 int main(void){
@@ -58,7 +69,16 @@ int main(void){
  fail_at=0;fail_close=true;persists=0;assert(!add_connector_persist_command_tombstone(&command) && !persists);fail_close=false;
  const char *bad[]={"", "{\"rows_count\":2}\n{\"uid\":\"old\"}\n", "{\"rows_count\":0}\n{}\n", "{\"rows_count\":1}\n{\"uid\":\"old\"}", "{\"rows\":[]}\n{}\n"};
  for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){seed(bad[i]);persists=0;assert(!add_connector_persist_command_tombstone(&command) && !persists);}
- puts("catalog tombstone allocation regressions passed");
+ seed("{\"rows_count\":0}\n");
+ char display[32]={0};
+ s_identity_catalog_active_memory_valid=false;
+ assert(!add_connector_lookup_identity("removed",NULL,display,sizeof(display),NULL,0,NULL) && !display[0]);
+ unlink("catalog");
+ assert(!add_connector_lookup_identity("removed",NULL,display,sizeof(display),NULL,0,NULL) && !display[0]);
+ s_identity_catalog_active_memory_valid=true;
+ assert(add_connector_lookup_identity("removed",NULL,display,sizeof(display),NULL,0,NULL));
+ assert(!strcmp(display,"Stale alias"));
+ puts("catalog tombstone allocation and invalidated alias regressions passed");
 }
 '''
 cjson = Path(os.environ["IDF_PATH"]) / "components/json/cJSON"

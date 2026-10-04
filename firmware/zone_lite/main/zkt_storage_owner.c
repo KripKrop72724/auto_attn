@@ -24,6 +24,7 @@ typedef struct {
     zj_state_t state;
     zj_crypto_key_t key;
     zj_metadata_t metadata;
+    zc_store_t catalog;
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
@@ -57,6 +58,68 @@ static int state_read(void *context, const char *name, uint8_t *out, size_t leng
         return -1;
     }
     return 1;
+}
+static int catalog_load(void *context, ft_checkpoint_t *checkpoint)
+{
+    owner_t *o = context;
+    nvs_handle_t handle;
+    esp_err_t status = nvs_open("file_tx", NVS_READONLY, &handle);
+    if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (status != ESP_OK) { o->nvs_error = status; return -1; }
+    size_t length = sizeof(*checkpoint);
+    status = nvs_get_blob(handle, "catalog", checkpoint, &length);
+    nvs_close(handle);
+    if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (status != ESP_OK || length != sizeof(*checkpoint)) {
+        o->nvs_error = status == ESP_OK ? ESP_ERR_INVALID_SIZE : status;
+        return -1;
+    }
+    return 1;
+}
+static bool catalog_commit(void *context, const ft_checkpoint_t *checkpoint)
+{
+    owner_t *o = context;
+    nvs_handle_t handle;
+    esp_err_t status = nvs_open("file_tx", NVS_READWRITE, &handle);
+    if (status == ESP_OK) {
+        status = nvs_set_blob(handle, "catalog", checkpoint, sizeof(*checkpoint));
+        if (status == ESP_OK) status = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (status != ESP_OK) o->nvs_error = status;
+    return status == ESP_OK;
+}
+static bool execute_catalog(owner_t *o, uint64_t ticket, const zj_request_t *request, zj_reply_t *reply)
+{
+    const zc_request_t *catalog = &request->input.catalog;
+    memset(reply, 0, sizeof(*reply));
+    o->nvs_error = 0;
+    o->store.last_errno = 0;
+    o->store.last_operation = NULL;
+    /* Do not inherit the legacy optional producer's ten-second lock wait on
+     * the attendance owner. Take its short local lock, then check capacity. */
+    bool locked = qs_local_read_begin();
+    size_t bytes = locked ? zc_store_admission_bytes(&o->catalog, catalog) : 0;
+    bool admitted = locked && (!bytes || qs_local_admit_locked(QS_ADMIT_OPTIONAL_HISTORICAL, bytes));
+    if (!admitted) {
+        reply->catalog.error = errno;
+        reply->catalog.operation = errno == EBUSY ? "catalog_lock" : "catalog_admission";
+        reply->result = errno == ENOSPC ? ZJ_FULL : ZJ_IO;
+        if (locked) qs_local_end(true, 0);
+        o->store.last_errno = reply->catalog.error;
+        o->store.last_operation = reply->catalog.operation;
+        /* A yielded activation must retain its transaction and ticket if
+         * a later lock acquisition fails. No admitted intent is discarded. */
+        return o->catalog.work_ticket == ticket;
+    }
+    bool pending = zc_store_step(&o->catalog, ticket, (uint64_t)esp_timer_get_time(), catalog,
+        &reply->catalog, &reply->result);
+    /* Optional catalog failure cannot become an attendance write failure.
+     * Its captured filesystem/NVS error remains in this request's reply. */
+    qs_local_end(true, 0);
+    o->store.last_errno = reply->catalog.error;
+    o->store.last_operation = reply->catalog.operation;
+    return pending;
 }
 static bool state_write(void *context, const char *name, const uint8_t *bytes, size_t length)
 {
@@ -294,14 +357,19 @@ static void task(void *context)
         }
         xSemaphoreGive(mailbox_lock);
         if (!work && !repair) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)); continue; }
-        if (work) execute(o, &request, &reply);
+        bool pending = false;
+        if (work && request.operation == ZJ_CATALOG) pending = execute_catalog(o, ticket, &request, &reply);
+        else if (work) execute(o, &request, &reply);
         else {
             memset(&reply, 0, sizeof(reply));
             reply.result = recover(o);
         }
         uint64_t finished = (uint64_t)esp_timer_get_time();
         while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
-        if (work) (void)zj_mailbox_finish(&o->mailbox, ticket, &reply);
+        if (work) {
+            if (pending) (void)zj_mailbox_yield(&o->mailbox, ticket);
+            else (void)zj_mailbox_finish(&o->mailbox, ticket, &reply);
+        }
         o->health.progress_uptime_us = finished;
         o->health.sampled_uptime_us = finished;
         uint64_t elapsed = finished - o->health.operation_started_us;
@@ -326,7 +394,7 @@ static void task(void *context)
             o->health.last_append_result = reply.result;
             o->health.last_append_uptime_us = finished;
         }
-        if (reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
+        if (!pending && reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
             ++o->health.failures;
             o->health.filesystem_error = o->store.last_errno;
             o->health.nvs_error = o->nvs_error;
@@ -335,6 +403,7 @@ static void task(void *context)
         xSemaphoreGive(mailbox_lock);
         mbedtls_platform_zeroize(&request, sizeof(request));
         mbedtls_platform_zeroize(&reply, sizeof(reply));
+        if (pending) vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -353,6 +422,15 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     }
     strcpy(owner->prefix, prefix);
     owner->metadata = *metadata;
+    ft_port_t catalog_port = {catalog_load, catalog_commit, owner};
+    if (!zc_store_init(&owner->catalog, ZC_ACTIVE_PATH, ZC_COMMIT_PATH, ZC_BACKUP_PATH,
+                      ZC_TEMP_PATH, ZC_STAGE_PATH, catalog_port)) {
+        heap_caps_free(owner);
+        owner = NULL;
+        vSemaphoreDelete(mailbox_lock);
+        mailbox_lock = NULL;
+        return false;
+    }
     zj_mailbox_init(&owner->mailbox);
     owner->health.started = true;
     owner->compatibility = owner->health.compatibility = ZJ_COMPAT_NOT_READY;
