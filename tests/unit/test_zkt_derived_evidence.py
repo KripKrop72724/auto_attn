@@ -12,7 +12,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from cryptography.fernet import Fernet
 import pytest
-from sqlalchemy import insert, select, text
+from sqlalchemy import event, insert, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from test_zkt_custody import custody as custody, observation, batch, count
@@ -25,7 +25,7 @@ from zk_add.crypto import decrypt_json
 from zk_add.db import Base
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, TerminalRecordManifest,
     ZktCustodyWork, ZktDerivedEvidence, ZktObservationReceipt)
-from zk_add.zkt_custody import settle_observations
+from zk_add.zkt_custody import observation_id, settle_observations
 from zk_add.settings import settings
 
 
@@ -48,6 +48,53 @@ def source_observation(size, **updates):
         raw[31] = 2
     return observation(raw_format="SOURCE_RECORD", raw_b64=base64.b64encode(raw).decode(),
                        raw_digest=hashlib.sha256(raw).hexdigest(), **updates)
+
+
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_independent_steps_batch_writes_and_rollback_together(store, monkeypatch, fail_write):
+    if store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL write batching")
+    monkeypatch.setattr(settings, "pii_fernet_key", Fernet.generate_key().decode())
+    with store() as db:
+        db.autoflush = False  # Match the actual worker's session policy.
+        connector = db.scalar(select(Connector))
+        connector.zkt_custody_enabled = True
+        for sequence in range(1, 17):
+            value = packet_observation(sequence, packet(live(32)), terminal_serial="TEST-LOAD")
+            value["observation_id"] = observation_id("TEST-LOAD", value["capture_epoch"], sequence)
+            settle_observations(db, connector, batch(value))
+        db.commit()
+        receipts = list(db.scalars(select(ZktObservationReceipt.protected_observation)))
+        writes = []
+        def capture(connection, cursor, statement, parameters, context, executemany):
+            if statement.startswith("INSERT INTO add_zkt_derived_evidence"):
+                writes.append(statement)
+                if fail_write:
+                    raise SQLAlchemyError("synthetic interrupted batched evidence write")
+        connection = db.connection()
+        event.listen(connection, "after_cursor_execute", capture)
+        try:
+            if fail_write:
+                with pytest.raises(SQLAlchemyError, match="interrupted batched"):
+                    work.advance_work(db, limit=16)
+            else:
+                assert work.advance_work(db, limit=16) == 16
+        finally:
+            event.remove(connection, "after_cursor_execute", capture)
+        assert len(writes) == 1
+        if fail_write:
+            db.rollback()
+            assert count(db, ZktDerivedEvidence) == 0
+            assert all(row.attempt_count == 0 and row.state == "PENDING"
+                       for row in db.scalars(select(ZktCustodyWork)))
+            assert work.advance_work(db, limit=16) == 16
+        db.commit()
+        assert count(db, ZktDerivedEvidence) == 16
+        assert all(row.attempt_count == 1 and row.state == "WAIT_PROFILE"
+                   for row in db.scalars(select(ZktCustodyWork)))
+        assert list(db.scalars(select(ZktObservationReceipt.protected_observation))) == receipts
+        assert work.advance_work(db) == 0
+        assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
 
 
 @pytest.mark.parametrize("size", [8, 16, 40])
@@ -201,8 +248,9 @@ def test_transaction_failure_restarts_at_last_committed_step(custody, monkeypatc
     db.commit()
     old = steps(db)[0].protected_evidence
     original = derived.derive_step
-    def fail(*args):
-        original(*args)
+    def fail(*args, **kwargs):
+        original(*args, **kwargs)
+        args[0].flush()
         raise SQLAlchemyError("synthetic post-insert failure")
     monkeypatch.setattr(derived, "derive_step", fail)
     with pytest.raises(SQLAlchemyError):

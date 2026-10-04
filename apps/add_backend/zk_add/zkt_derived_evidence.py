@@ -130,13 +130,15 @@ def _unseal(row: ZktDerivedEvidence, work: ZktCustodyWork, plan: dict) -> dict:
     return value
 
 
-def derive_step(session: Session, work: ZktCustodyWork, raw: bytes) -> ZktDerivedEvidence:
+def derive_step(session: Session, work: ZktCustodyWork, raw: bytes, *, flush: bool = True) -> ZktDerivedEvidence:
     """Interpret at most 128 records across explicit hypothetical layouts.
 
     The caller has checked original ciphertext, framing and custody bindings.
     All size-compatible layouts are tried independently; a plausible layout is
     still unqualified and two plausible layouts remain ambiguous. A bad record
     retains its offset and byte digest without discarding later valid records.
+    A batch owner may defer the flush only when it visits each work group once
+    and flushes the evidence and work states together before reporting progress.
     """
     if (work.kind not in SUPPORTED_KINDS or len(raw) != work.expected_bytes or len(raw) > PACKET_MAX
             or hashlib.sha256(raw).hexdigest() != work.expected_digest):
@@ -206,7 +208,8 @@ def derive_step(session: Session, work: ZktCustodyWork, raw: bytes) -> ZktDerive
         previous_digest=value["previous_digest"], evidence_digest=_digest(value),
         protected_evidence=encrypt_json(value))
     session.add(row)
-    session.flush()
+    if flush:
+        session.flush()
     return row
 
 

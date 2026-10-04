@@ -301,7 +301,11 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
             work.assembled_digest = hashlib.sha256(raw).hexdigest()
             work.assembled_at = work.assembled_at or utc_now()
             work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
-        step = derived.derive_step(session, work, raw)
+        # The batch visits each group at most once and flushes before returning.
+        # Defer independent inserts/updates so the driver can batch them without
+        # a write round trip for every proposed interpretation. Nothing is
+        # published or counted as useful progress before the outer commit.
+        step = derived.derive_step(session, work, raw, flush=False)
         if step.result == "PENDING":
             work.state, work.reason_code, work.owner = "INTERPRETING", "DERIVED_EVIDENCE_INCOMPLETE", "ADD_PROTOCOL"
             work.next_attempt_at = utc_now()
