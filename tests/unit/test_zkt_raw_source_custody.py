@@ -26,7 +26,7 @@ from zk_add.db import Base
 from zk_add.models import (
     AttendanceEvent, Connector, OrdsOutbox, ReconciliationChunk, ReconciliationCoverage,
     ReconciliationJob, ReconciliationDivergence, SourceTailChunk, TerminalRecordManifest,
-    TerminalRecordReview, TerminalSourceEpoch, ZktCustodyWork,
+    TerminalRecordReview, TerminalSourceEpoch, ZktCustodyWork, ZktOccurrenceAlias,
 )
 from zk_add.schemas import (
     Envelope, ReconciliationAnchorRequest, ReconciliationChunkRequest,
@@ -114,6 +114,11 @@ def test_atomic_custody_replays_without_attendance_or_polling_unchanged_holds(so
         result = apply(db, connector, path, request)
         assert result[2] and result[1].id == chunk_id
         assert count(db, TerminalRecordManifest) == count(db, ZktCustodyWork) == 2
+        assert count(db, ZktOccurrenceAlias) == 2
+        aliases = db.scalars(select(ZktOccurrenceAlias).order_by(ZktOccurrenceAlias.ordinal)).all()
+        assert len({row.occurrence_id for row in aliases}) == 2
+        assert [row.ordinal for row in aliases] == [0, 1]
+        assert all(row.attendance_event_id is None for row in aliases)
         assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
         manifests = db.scalars(select(TerminalRecordManifest).order_by(TerminalRecordManifest.ordinal)).all()
         assert [row.ordinal for row in manifests] == [0, 1]
@@ -158,6 +163,7 @@ def test_missing_work_commit_rolls_back_raw_rows_receipt_and_cursor(source_store
         web.persist_envelope(identifier, envelope)
     with source_store() as db:
         assert count(db, TerminalRecordManifest) == count(db, ZktCustodyWork) == 0
+        assert count(db, ZktOccurrenceAlias) == 0
         assert count(db, ReconciliationChunk) == count(db, SourceTailChunk) == 0
         assert db.scalar(select(ReconciliationJob)).committed_next_ordinal == 0
         assert db.scalar(select(ReconciliationCoverage)).source_committed_cursor == 0
@@ -382,6 +388,7 @@ def test_concurrent_tail_replay_commits_one_range_and_each_occurrence_once(sourc
     with source_store() as db:
         assert count(db, SourceTailChunk) == 1
         assert count(db, ZktCustodyWork) == count(db, TerminalRecordManifest) == 2
+        assert count(db, ZktOccurrenceAlias) == 2
         assert db.scalar(select(ReconciliationCoverage)).raw_preserved_count == 2
 
 
@@ -416,6 +423,8 @@ def test_migration_upgrades_existing_install_and_retains_custody_on_downgrade(so
         protected = db.scalar(select(TerminalRecordManifest)).protected_raw_record
         receipt = db.scalar(select(SourceTailChunk)).id
         obligation = db.scalar(select(ZktCustodyWork)).work_key
+        alias = db.scalar(select(ZktOccurrenceAlias))
+        original_occurrence = (alias.id, alias.occurrence_id, alias.manifest_id, alias.raw_digest)
     with engine.begin() as connection:
         monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
         migration.downgrade()
@@ -424,4 +433,6 @@ def test_migration_upgrades_existing_install_and_retains_custody_on_downgrade(so
         assert db.scalar(select(TerminalRecordManifest)).protected_raw_record == protected
         assert db.scalar(select(SourceTailChunk)).id == receipt
         assert db.scalar(select(ZktCustodyWork)).work_key == obligation
+        alias = db.scalar(select(ZktOccurrenceAlias))
+        assert (alias.id, alias.occurrence_id, alias.manifest_id, alias.raw_digest) == original_occurrence
         assert db.scalar(select(ReconciliationCoverage)).raw_preserved_count == 1

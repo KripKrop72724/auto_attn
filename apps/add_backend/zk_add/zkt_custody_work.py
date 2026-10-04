@@ -53,11 +53,16 @@ def attach_source_work(session: Session, connector: Connector,
     manufacture a second journal observation or claim a decoded attendance.
     The connector lock held by source ingestion serializes these associations.
     """
+    from zk_add.zkt_custody import bind_manifest_occurrences
+
     if len(manifests) > 100:
         raise ValueError("SOURCE_WORK_BATCH_BOUNDS")
     if not manifests:
         return
     session.flush()
+    # Raw ledger ranges need the same occurrence identities as later journal
+    # observations. The range receipt, aliases, work and cursor commit together.
+    bind_manifest_occurrences(session, connector, manifests)
     existing = {row.source_manifest_id: row for row in session.scalars(select(ZktCustodyWork).where(
         ZktCustodyWork.source_manifest_id.in_([row.id for row in manifests])))}
     for manifest in manifests:
@@ -90,6 +95,8 @@ def attach_source_work(session: Session, connector: Connector,
 
 def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> bytes:
     """Authenticate original source bytes before deriving any interpretation."""
+    from zk_add.zkt_custody import (SourceAssociationError, bind_manifest_occurrences,
+                                   source_occurrence_delivery_hold)
     if not settings.pii_fernet_key:
         raise RuntimeError("CUSTODY_KEY_UNAVAILABLE")
     manifest = session.get(TerminalRecordManifest, work.source_manifest_id) if work.source_manifest_id else None
@@ -113,6 +120,14 @@ def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> bytes:
         raise EvidenceInvalid("SOURCE_WORK_BYTES_CHANGED") from exc
     if len(raw) != work.expected_bytes or hashlib.sha256(raw).hexdigest() != work.expected_digest:
         raise EvidenceInvalid("SOURCE_WORK_BYTES_CHANGED")
+    try:
+        alias = bind_manifest_occurrences(session, connector, [manifest])[manifest.id]
+    except SourceAssociationError as exc:
+        raise EvidenceInvalid(str(exc)) from exc
+    hold = source_occurrence_delivery_hold(session, connector, alias.occurrence_id)
+    if hold:
+        work.state, work.reason_code, work.owner = "HELD_OCCURRENCE", hold, "ADD_RECONCILIATION"
+        return raw
     work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
     return raw
 

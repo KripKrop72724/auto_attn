@@ -11,15 +11,32 @@ user reference or source error. Existing 8/16/40-byte transport layouts remain
 bounded; accepting those bytes does not establish their semantic layout.
 
 The surrounding ADD transaction commits the encrypted canonical source row,
-range receipt, chain checkpoint and a `SOURCE_LEDGER` processing obligation.
+range receipt, occurrence alias, chain checkpoint and a `SOURCE_LEDGER` processing obligation.
 Failure of any of those writes prevents an acknowledgement and rolls back the
 cursor. An identical retry returns the original committed range, including
 after new intake is disabled or the job is paused or ended. Its receipt retains
 the original range cursor and matching chain, even when later ranges have
 committed; it does not grant new scan credit through a hold.
 Equal bytes at two ordinals retain separate rows
-and work identities. Original legacy interpretations and attendance keys are
+and occurrence/work identities. A later exact-source journal observation reuses
+the range's occurrence alias; it cannot allocate another logical occurrence.
+Original legacy interpretations and attendance keys are
 not overwritten by this path.
+
+One bounded helper verifies the source's connector, confirmed terminal, epoch,
+generation, ordinal and digest before creating aliases for at most 100 rows.
+It checks existing identities through all three unique keys: source coordinates,
+manifest and occurrence identity. A conflicting retained alias remains intact
+and prevents acknowledgement of the new range. A failed alias insert rolls back
+the receipt, source rows, obligations and cursor together. The helper uses two
+set-based reads per batch; it does not scan a complete source ledger.
+
+Inspection of a previously stored raw work item authenticates its original
+bytes, reconstructs a missing alias and detects a changed alias. This is a
+bounded repair when the item is inspected, not a retrospective qualification
+or an automatic sweep of unchanged holds. No background attendance repair or
+profile activation is added. Recovery epochs retain separate occurrence
+identities and their original raw custody.
 
 The obligation starts in `PENDING`, owned by `ADD_PROTOCOL`. The bounded worker
 retains a versioned decoder proposal before leaving it in `WAIT_PROFILE`.
@@ -54,7 +71,7 @@ and work remain retained on downgrade. This data-preserving migration does not
 establish semantic compatibility with an older backend: operational rollback
 to a reader that does not understand raw holds remains unqualified.
 
-`test_zkt_raw_source_custody.py` exercises SQLite and PostgreSQL transactions,
+`test_zkt_raw_source_custody.py` and `test_zkt_source_occurrence_custody.py` exercise SQLite and PostgreSQL transactions,
 lost acknowledgement replay, concurrent PostgreSQL submissions, epoch and
 capability rejection, immutable byte/identity checks, source versus Oracle
 assurance, migration idempotence and retained evidence. The reconciliation UI

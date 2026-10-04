@@ -9,10 +9,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import select
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.orm import Session
 
 from zk_add.crypto import encrypt_json
@@ -41,6 +42,78 @@ def journal_exception_id(serial: str, epoch: str, segment: int,
 
 class SourceAssociationError(ValueError):
     """A derived source conflict must not roll back custody of unrelated items."""
+
+
+def bind_manifest_occurrences(session: Session, connector: Connector,
+                              manifests: list[TerminalRecordManifest]) -> dict[int, ZktOccurrenceAlias]:
+    """Bind a bounded canonical source batch inside its custody transaction.
+
+    The caller owns the connector lock and has authenticated the source bytes.
+    Coordinates identify an occurrence before interpretation. An existing
+    attendance link is retained, never inferred, replaced or released here.
+    Validate the entire batch before inserting any new aliases; one corrupt
+    retained alias must prevent a successful source-custody acknowledgement.
+    """
+    if len(manifests) > 100 or len({row.id for row in manifests}) != len(manifests):
+        raise SourceAssociationError("SOURCE_OCCURRENCE_BATCH_BOUNDS")
+    if not manifests:
+        return {}
+    terminal = connector.zkt_device
+    epochs = {row.id: row for row in session.scalars(select(TerminalSourceEpoch).where(
+        TerminalSourceEpoch.id.in_({row.source_epoch_id for row in manifests})))}
+    identities = {}
+    coordinates = []
+    for row in manifests:
+        epoch = epochs.get(row.source_epoch_id)
+        if (connector.firmware_family != "zkt" or terminal is None or row.id is None
+                or row.connector_id != connector.id or row.zkt_device_id != terminal.id
+                or not row.canonical_source or not row.terminal_serial
+                or row.terminal_serial != terminal.serial or row.terminal_serial != terminal.confirmed_serial
+                or epoch is None or epoch.zkt_device_id != terminal.id
+                or epoch.terminal_generation != row.generation
+                or not isinstance(epoch.epoch_id, str)
+                or not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", epoch.epoch_id)
+                or type(row.ordinal) is not int or not 0 <= row.ordinal < 2**31
+                or not isinstance(row.raw_record_digest, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", row.raw_record_digest)):
+            raise SourceAssociationError("SOURCE_OCCURRENCE_BINDING")
+        identities[row.id] = occurrence_id(row.terminal_serial, epoch.epoch_id, row.ordinal, row.raw_record_digest)
+        coordinates.append((row.zkt_device_id, row.source_epoch_id, row.ordinal))
+    if len(set(coordinates)) != len(coordinates) or len(set(identities.values())) != len(identities):
+        raise SourceAssociationError("SOURCE_OCCURRENCE_CONFLICT")
+    aliases = list(session.scalars(select(ZktOccurrenceAlias).where(or_(
+        ZktOccurrenceAlias.manifest_id.in_(identities),
+        ZktOccurrenceAlias.occurrence_id.in_(identities.values()),
+        tuple_(ZktOccurrenceAlias.zkt_device_id, ZktOccurrenceAlias.source_epoch_id,
+               ZktOccurrenceAlias.ordinal).in_(coordinates),
+    ))))
+    by_manifest = {row.manifest_id: row for row in aliases}
+    by_identity = {row.occurrence_id: row for row in aliases}
+    by_coordinate = {(row.zkt_device_id, row.source_epoch_id, row.ordinal): row for row in aliases}
+    result = {}
+    pending = []
+    for manifest, coordinate in zip(manifests, coordinates):
+        identity = identities[manifest.id]
+        candidates = [row for row in (by_manifest.get(manifest.id), by_identity.get(identity),
+                                       by_coordinate.get(coordinate)) if row is not None]
+        alias = candidates[0] if candidates else None
+        if alias is not None:
+            if (any(row.id != alias.id for row in candidates)
+                    or (alias.manifest_id, alias.occurrence_id, alias.raw_digest,
+                        alias.zkt_device_id, alias.source_epoch_id, alias.ordinal) !=
+                       (manifest.id, identity, manifest.raw_record_digest, *coordinate)):
+                raise SourceAssociationError("SOURCE_OCCURRENCE_CONFLICT")
+        else:
+            alias = ZktOccurrenceAlias(occurrence_id=identity, zkt_device_id=manifest.zkt_device_id,
+                source_epoch_id=manifest.source_epoch_id, ordinal=manifest.ordinal,
+                manifest_id=manifest.id, raw_digest=manifest.raw_record_digest,
+                attendance_event_id=manifest.attendance_event_id)
+            pending.append(alias)
+        result[manifest.id] = alias
+    session.add_all(pending)
+    if pending:
+        session.flush()
+    return result
 
 
 class OccurrenceReference(BaseModel):
@@ -153,29 +226,14 @@ def bind_source_occurrence(session: Session, connector: Connector,
         return None
     if manifest.raw_record_digest != value.raw_digest:
         raise SourceAssociationError("SOURCE_RAW_DIGEST_MISMATCH")
-    identity = occurrence_id(value.terminal_serial, value.occurrence.source_epoch,
-                             value.occurrence.ordinal, value.raw_digest)
-    alias = session.scalar(select(ZktOccurrenceAlias).where(
-        ZktOccurrenceAlias.zkt_device_id == zkt.id,
-        ZktOccurrenceAlias.source_epoch_id == manifest.source_epoch_id,
-        ZktOccurrenceAlias.ordinal == manifest.ordinal,
-    ))
-    if alias is None:
-        alias = ZktOccurrenceAlias(occurrence_id=identity, zkt_device_id=zkt.id,
-                                  source_epoch_id=manifest.source_epoch_id, ordinal=manifest.ordinal,
-                                  manifest_id=manifest.id, raw_digest=value.raw_digest,
-                                  attendance_event_id=manifest.attendance_event_id)
-        session.add(alias)
-        session.flush()
-    elif alias.occurrence_id != identity or alias.manifest_id != manifest.id:
-        raise SourceAssociationError("SOURCE_OCCURRENCE_CONFLICT")
+    alias = bind_manifest_occurrences(session, connector, [manifest])[manifest.id]
     prior = session.scalar(select(ZktObservationLink).where(ZktObservationLink.receipt_id == receipt.id))
     if prior is None:
         session.add(ZktObservationLink(receipt_id=receipt.id, occurrence_alias_id=alias.id,
                                        proof_kind="EXACT_CANONICAL_SOURCE_BYTES"))
     elif prior.occurrence_alias_id != alias.id:
         raise SourceAssociationError("OBSERVATION_ALREADY_BOUND")
-    return identity
+    return alias.occurrence_id
 
 
 def source_occurrence_delivery_hold(session: Session, connector: Connector, identity: str) -> str | None:
