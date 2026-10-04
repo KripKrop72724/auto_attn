@@ -353,19 +353,26 @@ zj_compat_result_t zj_reader_platform_update(const char *serial, const uint8_t e
     assert(address == 0x2a0000 && size == 0x280000 && !strcmp(version, ZJ_WRITER_VERSION));
     return delivery && !recovering ? ZJ_COMPAT_PROTECTED_SLOT : ZJ_COMPAT_NOT_READY;
 }
-static bool uncertain_selection;
+static bool uncertain_selection, failed_rollback_test;
 zj_compat_result_t zj_reader_platform_select(const char *serial, const uint8_t epoch[16],
     bool ready, bool delivery, bool persistence, bool recovering, const uint8_t expected[32], uint64_t deadline)
 {
     assert(pthread_mutex_trylock(&budget) == EBUSY);
     assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0] && ready && persistence && expected[0] == 17);
-    assert(ota_checkpoint_valid(&ota_blob) && !strcmp(ota_blob.journal.state, "READER_INTENT"));
+    assert(ota_checkpoint_valid(&ota_blob) && !strcmp(ota_blob.journal.state,
+        failed_rollback_test ? "FAILED_BOOT_INTENT" : "READER_INTENT"));
     zj_owner_health_t health;
     assert(zj_owner_health(&health) && health.quiescing && !health.pending_appends);
     ++selection_calls;
     if (deadline <= (uint64_t)esp_timer_get_time()) return ZJ_COMPAT_SELECTION_EXPIRED;
     if (!delivery || recovering) return ZJ_COMPAT_NOT_READY;
     return uncertain_selection ? ZJ_COMPAT_SELECTION_UNCERTAIN : ZJ_COMPAT_OK;
+}
+zj_compat_result_t zj_reader_platform_failed_boot(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, const uint8_t expected[32], uint64_t deadline)
+{
+    assert(failed_rollback_test);
+    return zj_reader_platform_select(serial, epoch, ready, delivery, persistence, recovering, expected, deadline);
 }
 /* The genuine mbedTLS adapter is independently tested. This port exercises
  * owner/thread/file/NVS interactions, not cryptographic authentication. */
@@ -418,6 +425,11 @@ static void rollback_with_full_mailbox(void)
     memset(expected.journal.image_sha256, '1', 64);
     strcpy(expected.journal.download_url, "https://example.invalid/unused");
     strcpy(expected.journal.state, "DOWNLOADING"); expected.journal.image_size = 131072;
+    if (failed_rollback_test) {
+        strcpy(expected.journal.target_version, ZJ_WRITER_VERSION);
+        strcpy(expected.journal.state, "READY_TO_BOOT");
+        expected.journal.bytes_written = expected.journal.image_size;
+    }
     expected.crc = dq_crc32(&expected, offsetof(ota_checkpoint_t, crc));
     ota_blob = expected;
     uint64_t ticket, retained[ZJ_REQUEST_SLOTS];
@@ -454,7 +466,7 @@ static void rollback_with_full_mailbox(void)
     assert(zj_owner_select_quiesced_reader(&expected, &ticket));
     reply = wait_reply(ticket);
     assert(reply.result == ZJ_UNCERTAIN && !selection_calls && ota_blob.generation == 8);
-    assert(!strcmp(ota_blob.journal.state, "READER_INTENT"));
+    assert(!strcmp(ota_blob.journal.state, failed_rollback_test ? "FAILED_BOOT_INTENT" : "READER_INTENT"));
     uncertain_selection = true;
     assert(zj_owner_select_quiesced_reader(&expected, &ticket));
     reply = wait_reply(ticket);
@@ -486,7 +498,8 @@ int main(int argc, char **argv)
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
     bool corrupt_journal = argc == 2 && !strcmp(argv[1], "--runtime-corrupt-journal");
     bool authority_test = argc == 2 && !strncmp(argv[1], "--authority-", 12);
-    bool rollback_test = argc == 2 && !strcmp(argv[1], "--rollback-full");
+    failed_rollback_test = argc == 2 && !strcmp(argv[1], "--failed-boot-full");
+    bool rollback_test = failed_rollback_test || (argc == 2 && !strcmp(argv[1], "--rollback-full"));
     bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {

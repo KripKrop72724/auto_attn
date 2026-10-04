@@ -21,7 +21,8 @@ def run(tmp_path, program, sources=(), family=0):
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
-def test_intent_is_committed_and_read_back_before_selection(tmp_path):
+@pytest.mark.parametrize("failed_boot", [False, True])
+def test_intent_is_committed_and_read_back_before_selection(tmp_path, failed_boot):
     (tmp_path / "nvs.h").write_text('''#pragma once
 #include <stddef.h>
 typedef int nvs_handle_t;
@@ -114,6 +115,18 @@ int main(void)
     puts("Rollback intent replay, corruption, stale operation and interrupted commit checks passed");
 }
 '''
+    if failed_boot:
+        program = program.replace('strcpy(c.journal.target_version,"2.6.16")',
+                                  'strcpy(c.journal.target_version,"2.7.0")')
+        program = program.replace('strcpy(c.journal.state,"DOWNLOADING")',
+                                  'strcpy(c.journal.state,"READY_TO_BOOT")')
+        program = program.replace('c.journal.image_size=131072;',
+                                  'c.journal.image_size=c.journal.bytes_written=131072;')
+        program = program.replace('"READER_INTENT"', '"FAILED_BOOT_INTENT"')
+        program = program.replace('!out.journal.bytes_written',
+                                  'out.journal.bytes_written==out.journal.image_size')
+        program = program.replace('assert(zj_rollback_request_valid(&expected));strcpy(expected.journal.target_version,"2.7.0");',
+                                  'assert(zj_rollback_request_valid(&expected));strcpy(expected.journal.target_version,"2.6.16");')
     run(tmp_path, program, ["zkt_rollback.c"])
 
 

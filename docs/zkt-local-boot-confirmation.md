@@ -34,12 +34,40 @@ report. Only `RECONCILING` may accept the same deployment's already committed
 Missing fields, malformed replies and allocation failure leave progress pending.
 Legacy firmware and capability registration keep their existing HTTP contract.
 
-The checkpoint layout/version is unchanged, with two additional state strings.
+The checkpoint layout/version is unchanged, with additional state strings.
 Both the paired reader bridge and writer must contain these readers before
 release. Old images are not authorized rollback targets once the new writer is
-active. The existing bootloader failure path remains for an image that cannot
-establish local health inside the configured deadline; exact compatible reader
-qualification and the separate operator rollback coordinator remain required.
+active. A 2.7.0 local-health timeout now enters the bounded failed-boot
+coordinator. It blocks new terminal sessions, waits for the current session's
+cleanup, drains accepted owner work and commits/read-backs `FAILED_BOOT_INTENT`
+through the reserved owner control slot. Full ordinary reply slots and caller
+timeouts cannot cancel accepted work or manufacture a successful handoff.
+
+Before invalidating the failed writer, the ESP adapter verifies its actual
+digest, two-slot partition layout, secure boot, encrypted NVS, current reader
+proof and the exact retained, VALID 2.6.16 bridge. It uses ESP-IDF's non-rebooting
+rollback operation and reads back the selected bridge before allowing restart.
+An uncertain result retains the intent; retry checks actual boot selection
+again. The bridge stays VALID instead of becoming another trial boot merely
+because the terminal is unavailable. These checks use the pinned ESP-IDF 5.5.3
+implementation; signed-device and physical interruption qualification remain
+required. An unqualified bridge-to-legacy/factory predecessor remains an
+explicit recovery hold. Legacy images and Hikvision retain their existing path.
+
+After returning to the bridge, journal startup/recovery must complete before
+the original writer deployment is reported as `ROLLED_BACK`. ADD verifies the
+immediately preceding successful bridge deployment, its image/slot evidence,
+and any received writer failure evidence. Only a `BOOT_HEALTH_TIMEOUT` failure
+of the same latest 2.7.0 attempt may refine `FAILED` to `ROLLED_BACK`; other
+terminal outcomes remain immutable. The original failure event is retained and
+the campaign stays paused. Concurrent reports share one committed recovery
+event. ADD's receipt binds the stored bridge digest, separately from the failed
+writer artifact. Commit failures, lost responses and failed local cleanup retain
+the intent for retry; neither HTTP success nor a requested state clears it.
+If the bridge returns before a failure intent commits, the same recovered-reader
+and previous-image checks apply. It reports `PREVIOUS_FIRMWARE_OBSERVED` without
+claiming a bootloader, watchdog or physical reset cause. Missing accepted bridge
+or complete deployment evidence keeps the report pending for investigation.
 
 Diagnostics retain the failed local step: unsupported image/family, storage
 upgrade, journal recovery, unverified storage, telemetry lock, terminal session,
@@ -51,6 +79,11 @@ Tests execute production C control flow and NVS adapters under sanitizers. They
 cover an ADD outage beyond the boot deadline after local confirmation, lost
 replies, each new checkpoint boundary, repeat mark-valid failure/recovery,
 coherent checkpoint reload, worker/storage refusal and both firmware families.
+Failed-boot tests cover a stopped terminal session, occupied ordinary reply
+slots, NVS uncertainty, unqualified rollback evidence, changed boot selection,
+bounded deadlines, recovered-reader startup and lost recovery acknowledgements.
+SQLite and PostgreSQL endpoint tests cover changed image/slot/attempt evidence,
+concurrent replies and commit failure without acknowledging recovery.
 The real HTTP acceptance path is tested with pinned cJSON under allocation
 faults and sanitizers. Backend tests exercise the actual endpoint after both
 failed and successful terminal states and verify that receipt image evidence

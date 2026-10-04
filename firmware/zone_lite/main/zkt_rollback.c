@@ -4,14 +4,24 @@
 #include "nvs.h"
 #include <string.h>
 
-bool zj_rollback_request_valid(const ota_checkpoint_t *request)
+bool zj_rollback_failed_boot(const ota_checkpoint_t *request)
 {
     return ota_checkpoint_valid(request) &&
+        !strcmp(request->journal.target_version, ZJ_WRITER_VERSION) &&
+        (!strcmp(request->journal.state, "READY_TO_BOOT") ||
+         !strcmp(request->journal.state, "FAILED_BOOT_INTENT")) &&
+        request->journal.bytes_written == request->journal.image_size &&
+        strspn(request->journal.image_sha256, "0") != 64;
+}
+
+bool zj_rollback_request_valid(const ota_checkpoint_t *request)
+{
+    return zj_rollback_failed_boot(request) || (ota_checkpoint_valid(request) &&
         !strcmp(request->journal.target_version, ZJ_BRIDGE_VERSION) &&
         (!strcmp(request->journal.state, "DOWNLOADING") ||
          !strcmp(request->journal.state, "READER_INTENT")) &&
         !request->journal.bytes_written &&
-        strspn(request->journal.image_sha256, "0") != 64;
+        strspn(request->journal.image_sha256, "0") != 64);
 }
 
 bool zj_rollback_same_target(const ota_checkpoint_t *left, const ota_checkpoint_t *right)
@@ -44,7 +54,8 @@ zj_result_t zj_rollback_commit_intent(const ota_checkpoint_t *expected,
         result = ZJ_CORRUPT; goto done;
     }
     if (!zj_rollback_same_target(expected, &current)) { result = ZJ_STALE; goto done; }
-    if (!strcmp(current.journal.state, "READER_INTENT")) {
+    const char *intent = zj_rollback_failed_boot(expected) ? "FAILED_BOOT_INTENT" : "READER_INTENT";
+    if (!strcmp(current.journal.state, intent)) {
         /* A lost commit response must recover the same approved operation,
          * without rewriting NVS or trusting the caller's old generation. */
         if (current.generation < expected->generation) { result = ZJ_STALE; goto done; }
@@ -56,7 +67,7 @@ zj_result_t zj_rollback_commit_intent(const ota_checkpoint_t *expected,
     ota_checkpoint_t next = current;
     ++next.generation;
     memset(next.journal.state, 0, sizeof(next.journal.state));
-    memcpy(next.journal.state, "READER_INTENT", sizeof("READER_INTENT"));
+    memcpy(next.journal.state, intent, strlen(intent) + 1);
     next.crc = dq_crc32(&next, offsetof(ota_checkpoint_t, crc));
     status = nvs_set_blob(handle, "journal_v1", &next, sizeof(next));
     if (status == ESP_OK) status = nvs_commit(handle);

@@ -238,3 +238,51 @@ zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
     return boot && boot->address == previous->address && boot->size == previous->size
         ? ZJ_COMPAT_OK : ZJ_COMPAT_SELECTION_UNCERTAIN;
 }
+
+zj_compat_result_t zj_reader_platform_failed_boot(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending,
+    const uint8_t expected_writer_digest[32], uint64_t deadline_us)
+{
+    if (!expected_writer_digest) return ZJ_COMPAT_INVALID;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+#if defined(CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK) && CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
+    return ZJ_COMPAT_ANTI_ROLLBACK;
+#endif
+    if (esp_ota_get_app_partition_count() != 2) return ZJ_COMPAT_SECURITY;
+    zj_reader_environment_t env;
+    zj_reader_identity_t current_id, previous_id;
+    zj_compat_result_t result = current_reader(terminal_serial, capture_epoch, reader_ready,
+        delivery_ready, persistence_verified, recovery_pending, &env, &current_id);
+    if (result != ZJ_COMPAT_OK) return result;
+    if (strcmp(env.version, ZJ_WRITER_VERSION)) return ZJ_COMPAT_VERSION;
+    if (memcmp(expected_writer_digest, current_id.image_digest, 32)) return ZJ_COMPAT_ROLLBACK;
+    const esp_partition_t *previous = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t previous_app;
+    if (!ota(previous) || !validated(previous)) return ZJ_COMPAT_SECURITY;
+    if (esp_ota_get_partition_description(previous, &previous_app) != ESP_OK || !descriptor_valid(&previous_app) ||
+        !identity(previous, &current_id, &previous_id)) return ZJ_COMPAT_IO;
+    zj_reader_environment_t rollback = {.application = previous_app.project_name, .version = previous_app.version,
+        .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
+        .ota_slot = true, .image_validated = true};
+    zj_reader_proof_port_t port = {read_proof, NULL, NULL};
+    result = zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
+    if (result != ZJ_COMPAT_OK) return result;
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    if (!boot) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    if (boot->address == previous_id.slot_address && boot->size == previous_id.slot_size)
+        return ZJ_COMPAT_OK;
+    if (boot->address != current_id.slot_address || boot->size != current_id.slot_size)
+        return ZJ_COMPAT_ROLLBACK;
+    if (!esp_ota_check_rollback_is_possible()) return ZJ_COMPAT_ROLLBACK;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    /* The application intent and accepted writes are durable before IDF can
+     * mark this image invalid. Its existing VALID bridge remains VALID, so a
+     * terminal outage does not turn the recovery image into another trial. */
+    if (esp_ota_mark_app_invalid_rollback() != ESP_OK) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    boot = esp_ota_get_boot_partition();
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    return boot && boot->address == previous_id.slot_address && boot->size == previous_id.slot_size && validated(previous)
+        ? ZJ_COMPAT_OK : ZJ_COMPAT_SELECTION_UNCERTAIN;
+}

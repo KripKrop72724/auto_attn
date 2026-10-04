@@ -25,3 +25,12 @@ zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending,
     const uint8_t expected_digest[32], uint64_t deadline_us);
+
+/* Drained owner only, after FAILED_BOOT_INTENT commits. Verify the exact
+ * failed writer and the retained VALID, attested bridge before invoking IDF's
+ * failed-boot rollback without rebooting. Check the selected bridge again
+ * before returning OK to the coordinator for its separate restart. */
+zj_compat_result_t zj_reader_platform_failed_boot(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending,
+    const uint8_t expected_writer_digest[32], uint64_t deadline_us);

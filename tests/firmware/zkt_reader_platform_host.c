@@ -17,6 +17,9 @@ static unsigned running = 3, other = 2, fault, reads, writes, opens, closes, com
 static bool secure = true, exists, current_valid = true, previous_valid = true, reverse;
 static bool writer_allowed;
 static unsigned boot_slot = 2, selections;
+static unsigned invalidations;
+static unsigned ota_count = 2;
+static bool rollback_possible = true;
 static int state_override = -1;
 static int64_t clock_us = 1000000;
 static uint8_t durable[ZJ_READER_PROOF_BYTES], pending[ZJ_READER_PROOF_BYTES], epoch[16] = {77};
@@ -52,6 +55,15 @@ int esp_ota_set_boot_partition(const esp_partition_t *p)
     boot_slot = other;
     state_override = ESP_OTA_IMG_NEW;
     return fault == 22 ? -1 : 0;
+}
+bool esp_ota_check_rollback_is_possible(void) { return rollback_possible; }
+unsigned esp_ota_get_app_partition_count(void) { return ota_count; }
+int esp_ota_mark_app_invalid_rollback(void)
+{
+    assert(previous_valid && (state_override == -1 || state_override == ESP_OTA_IMG_VALID));
+    ++invalidations;
+    if (fault != 31) boot_slot = other;
+    return fault == 31 || fault == 32 ? -1 : ESP_OK;
 }
 esp_partition_iterator_t esp_partition_find(int type, int subtype, const char *label)
 { assert(type == 255 && subtype == 255 && !label); iterator.index = 0; return fault == 8 ? NULL : &iterator; }
@@ -123,17 +135,28 @@ static zj_compat_result_t select_reader(void)
     assert(writes == initial && opens == closes);
     return result;
 }
+static zj_compat_result_t failed_boot(void)
+{
+    uint8_t expected[32]; memset(expected, 16, sizeof(expected));
+    unsigned initial = writes;
+    zj_compat_result_t result = zj_reader_platform_failed_boot("TEST-TERMINAL", epoch, true, true, true, false,
+        expected, (uint64_t)clock_us + 5000000U);
+    assert(writes == initial && opens == closes);
+    return result;
+}
 int main(void)
 {
 #if !CONFIG_NVS_ENCRYPTION
     assert(check() == ZJ_COMPAT_SECURITY && !writes);
     assert(update() == ZJ_COMPAT_SECURITY && !writes);
     assert(select_reader() == ZJ_COMPAT_SECURITY && !selections);
+    assert(failed_boot() == ZJ_COMPAT_SECURITY && !invalidations);
     return 0;
 #elif !ZONE_LITE_JOURNAL_WRITES
     assert(check() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
     assert(update() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
     assert(select_reader() == ZJ_COMPAT_CAPTURE_DISABLED && !selections);
+    assert(failed_boot() == ZJ_COMPAT_CAPTURE_DISABLED && !invalidations);
     return 0;
 #else
     current_valid = false;
@@ -163,6 +186,7 @@ int main(void)
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
 #if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
     assert(select_reader() == ZJ_COMPAT_ANTI_ROLLBACK && !selections);
+    assert(failed_boot() == ZJ_COMPAT_ANTI_ROLLBACK && !invalidations);
 #else
     for (unsigned f = 1; f <= 13; ++f) {
         fault = f;
@@ -235,6 +259,38 @@ int main(void)
         assert(selections == (f == 21 ? 2U : 1U));
     }
     selections = 0; boot_slot = running; state_override = -1;
+    for (unsigned f = 1; f <= 13; ++f) {
+        fault = f; assert(failed_boot() != ZJ_COMPAT_OK && !invalidations);
+    }
+    fault = 0; rollback_possible = false;
+    assert(failed_boot() == ZJ_COMPAT_ROLLBACK && !invalidations);
+    rollback_possible = true;
+    ota_count = 3; assert(failed_boot() == ZJ_COMPAT_SECURITY && !invalidations); ota_count = 2;
+    state_override = ESP_OTA_IMG_NEW;
+    assert(failed_boot() == ZJ_COMPAT_SECURITY && !invalidations); state_override = -1;
+    uint8_t writer_digest[32]; memset(writer_digest, 16, sizeof(writer_digest));
+    writer_digest[0] ^= 1;
+    assert(zj_reader_platform_failed_boot("TEST-TERMINAL", epoch, true, true, true, false,
+        writer_digest, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_ROLLBACK && !invalidations);
+    writer_digest[0] ^= 1;
+    assert(zj_reader_platform_failed_boot("TEST-TERMINAL", epoch, true, true, false, false,
+        writer_digest, (uint64_t)clock_us + 5000000U) == ZJ_COMPAT_NOT_READY && !invalidations);
+    assert(zj_reader_platform_failed_boot("TEST-TERMINAL", epoch, true, true, true, false,
+        writer_digest, (uint64_t)clock_us) == ZJ_COMPAT_SELECTION_EXPIRED && !invalidations);
+    fault = 25; assert(failed_boot() == ZJ_COMPAT_SELECTION_EXPIRED && !invalidations);
+    fault = 0; epoch[0] ^= 1;
+    assert(failed_boot() == ZJ_COMPAT_BINDING && !invalidations); epoch[0] ^= 1;
+    fault = 31;
+    assert(failed_boot() == ZJ_COMPAT_SELECTION_UNCERTAIN && invalidations == 1 && boot_slot == running);
+    fault = 32;
+    assert(failed_boot() == ZJ_COMPAT_SELECTION_UNCERTAIN && invalidations == 2 && boot_slot == other);
+    fault = 0;
+    assert(failed_boot() == ZJ_COMPAT_OK && invalidations == 2);
+    durable[80] ^= 1; assert(failed_boot() == ZJ_COMPAT_CORRUPT && invalidations == 2);
+    memcpy(durable, saved_proof, sizeof(durable));
+    boot_slot = running;
+    assert(failed_boot() == ZJ_COMPAT_OK && invalidations == 3 && boot_slot == other);
+    boot_slot = running;
 #endif
     for (unsigned f = 1; f <= 13; ++f) {
         fault = f;

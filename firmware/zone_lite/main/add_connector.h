@@ -153,6 +153,10 @@ bool add_connector_terminal_session_begin(void);
 bool add_connector_terminal_session_end(void);
 bool add_connector_terminal_restart_pending(void);
 bool add_connector_claim_ota_restart(void);
+/* Failed writer boot: block new sessions even if the terminal is offline,
+ * then wait for the current session's normal bounded cleanup. This grants no
+ * storage or rollback authority; the drained owner verifies the reader. */
+bool add_connector_claim_failed_boot_restart(void);
 bool add_connector_begin_pending_command_activity(void);
 bool add_connector_begin_pending_config_activity(void);
 bool add_connector_take_config_command(add_command_t *out);
