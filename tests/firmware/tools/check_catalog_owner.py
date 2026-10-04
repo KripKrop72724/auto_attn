@@ -10,7 +10,7 @@ source = (main / "add_connector.c").read_text()
 helper_start = source.index("static zc_client_t s_catalog_client;")
 helpers = source[helper_start:source.index("#endif\nstatic void remove_catalog_stage(", helper_start)]
 helpers += source[source.index("static void remove_catalog_stage(const char *path)\n{"):
-                  source.index("static void recover_identity_catalog_backup_if_active_missing(")]
+                  source.index("/* Catalog stream adapter:")]
 program = r'''
 #include "zkt_catalog_client.h"
 #include "cJSON.h"

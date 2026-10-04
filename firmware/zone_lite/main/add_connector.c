@@ -1082,6 +1082,96 @@ static void remove_catalog_stage(const char *path)
     (void)remove(path);
 }
 
+/* Catalog stream adapter: new images never open a catalog in the caller.
+ * Callers hold s_catalog_lock and recover the transaction before opening. */
+typedef struct {
+    FILE *file;
+    bool managed, absent, error;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    zc_reply_t chunk;
+    size_t position;
+    uint64_t deadline_us;
+#endif
+} catalog_stream_t;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static bool catalog_stream_pull(catalog_stream_t *stream)
+{
+    zc_request_t request = {.operation = ZC_READ, .offset = stream->chunk.offset,
+        .revision = stream->chunk.revision, .deadline_us = stream->deadline_us};
+    zj_result_t result = zc_client_call(&s_catalog_client, catalog_client_port, &request, &stream->chunk);
+    catalog_owner_invalidate_memory();
+    stream->position = 0;
+    if (result == ZJ_EMPTY && !request.offset) {
+        stream->absent = true; stream->chunk.eof = true; return true;
+    }
+    if (result != ZJ_OK || stream->chunk.total > ADD_IDENTITY_CATALOG_MAX_BYTES ||
+        (!stream->chunk.length && !stream->chunk.eof)) {
+        stream->error = true;
+        s_catalog_writer_failure_reason = stream->chunk.operation ? stream->chunk.operation : "catalog_read_rejected";
+        return false;
+    }
+    return true;
+}
+#endif
+static bool catalog_stream_open(catalog_stream_t *stream)
+{
+    memset(stream, 0, sizeof(*stream));
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) {
+        stream->managed = true;
+        uint64_t now = (uint64_t)esp_timer_get_time();
+        if (!catalog_owner_idle() || now > UINT64_MAX - 30000000ULL) { stream->error = true; return false; }
+        stream->deadline_us = now + 30000000ULL;
+        return catalog_stream_pull(stream);
+    }
+#endif
+    stream->file = fopen(ADD_IDENTITY_CATALOG_PATH, "rb");
+    if (!stream->file) { stream->absent = errno == ENOENT; stream->error = !stream->absent; return !stream->error; }
+    struct stat st;
+    stream->error = fstat(fileno(stream->file), &st) != 0 || st.st_size < 0 ||
+        st.st_size > ADD_IDENTITY_CATALOG_MAX_BYTES;
+    if (stream->error) { (void)fclose(stream->file); stream->file = NULL; }
+    return !stream->error;
+}
+/* 1 = complete encrypted line, 0 = EOF/absence, -1 = unresolved evidence. */
+static int catalog_stream_next(catalog_stream_t *stream, char *line, size_t capacity)
+{
+    if (!line || capacity < 2 || stream->error) { stream->error = true; return -1; }
+    if (stream->absent) return 0;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (stream->managed) {
+        size_t used = 0;
+        for (;;) {
+            if (stream->position == stream->chunk.length) {
+                if (stream->chunk.eof) { if (used) stream->error = true; return used ? -1 : 0; }
+                if (!catalog_stream_pull(stream)) return -1;
+                if (!stream->chunk.length) { if (used) stream->error = true; return used ? -1 : 0; }
+            }
+            uint8_t byte = stream->chunk.bytes[stream->position++];
+            if (!byte || used == capacity - 1) { stream->error = true; return -1; }
+            line[used++] = (char)byte;
+            if (byte == '\n') { line[used] = 0; return 1; }
+        }
+    }
+#endif
+    if (!stream->file || !fgets(line, (int)capacity, stream->file)) {
+        if (!stream->file || ferror(stream->file)) { stream->error = true; return -1; }
+        return 0;
+    }
+    size_t length = strlen(line);
+    if (!length || line[length - 1] != '\n') { stream->error = true; return -1; }
+    return 1;
+}
+static bool catalog_stream_close(catalog_stream_t *stream)
+{
+    if (stream->file) {
+        if (ferror(stream->file)) stream->error = true;
+        if (fclose(stream->file) != 0) stream->error = true;
+        stream->file = NULL;
+    }
+    return !stream->error;
+}
+
 static void recover_identity_catalog_backup_if_active_missing(void)
 {
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -1107,9 +1197,10 @@ static void recover_identity_catalog_backup_if_active_missing(void)
 static bool restore_valid_identity_catalog_locked(void)
 {
     if (!recover_catalog_transaction_locked()) return false;
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    catalog_stream_t stream;
+    bool opened = catalog_stream_open(&stream);
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    bool ok = file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file);
+    bool ok = opened && line && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1;
     size_t row_count = 0;
     int expected_rows = -1;
     bool legacy_catalog = false;
@@ -1148,7 +1239,7 @@ static bool restore_valid_identity_catalog_locked(void)
                expected_rows > ADD_IDENTITY_CATALOG_MAX_ROWS)) {
         ok = false;
     }
-    while (ok && !legacy_catalog && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    while (ok && !legacy_catalog && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1) {
         char *plain = decrypt_storage_line(line);
         cJSON *row = plain ? cJSON_Parse(plain) : NULL;
         free(plain);
@@ -1160,9 +1251,9 @@ static bool restore_valid_identity_catalog_locked(void)
         }
         cJSON_Delete(row);
     }
-    if (file && ferror(file)) ok = false;
+    if (ok && legacy_catalog && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) != 0) ok = false;
     if (ok && row_count != (size_t)expected_rows) ok = false;
-    if (file && fclose(file) != 0) ok = false;
+    if (!catalog_stream_close(&stream)) ok = false;
     free(line);
     if (!ok) {
         ESP_LOGW(TAG, "No complete encrypted ADD identity catalog was restored");
@@ -1570,27 +1661,24 @@ static bool identity_catalog_stage_commit(cJSON *root, size_t *row_count_out, bo
 
 static cJSON *load_catalog_for_tombstone(void)
 {
-    errno = 0;
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
-    if (!file) {
-        if (errno != ENOENT) return NULL;
+    catalog_stream_t stream;
+    if (!catalog_stream_open(&stream)) { (void)catalog_stream_close(&stream); return NULL; }
+    if (stream.absent) {
+        if (!catalog_stream_close(&stream)) return NULL;
         cJSON *empty = cJSON_CreateObject();
         if (!empty || !cJSON_AddArrayToObject(empty, "rows")) {
             cJSON_Delete(empty); return NULL;
         }
         return empty;
     }
-    struct stat st;
-    bool ok = fstat(fileno(file), &st) == 0 && st.st_size > 0 &&
-        st.st_size <= ADD_IDENTITY_CATALOG_MAX_BYTES;
-    char *line = ok ? malloc(ADD_COMMAND_LINE_BYTES) : NULL;
+    char *line = malloc(ADD_COMMAND_LINE_BYTES);
     cJSON *root = NULL;
-    if (line && fgets(line, ADD_COMMAND_LINE_BYTES, file) && strchr(line, '\n')) {
+    if (line && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1) {
         char *plain = decrypt_storage_line(line);
         root = plain ? cJSON_Parse(plain) : NULL;
         free(plain);
     }
-    ok = ok && cJSON_IsObject(root);
+    bool ok = cJSON_IsObject(root);
     cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
     if (ok && !cJSON_IsArray(rows)) {
         cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "rows_count");
@@ -1599,8 +1687,8 @@ static cJSON *load_catalog_for_tombstone(void)
         rows = ok ? cJSON_AddArrayToObject(root, "rows") : NULL;
         ok = ok && rows;
         int seen = 0;
-        while (ok && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
-            if (!strchr(line, '\n') || seen >= expected) { ok = false; break; }
+        while (ok && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1) {
+            if (seen >= expected) { ok = false; break; }
             char *plain = decrypt_storage_line(line);
             cJSON *row = plain ? cJSON_Parse(plain) : NULL;
             free(plain);
@@ -1612,10 +1700,10 @@ static cJSON *load_catalog_for_tombstone(void)
         ok = ok && seen == expected;
     } else if (ok) {
         // Legacy single-object catalogs cannot hide extra or truncated rows.
-        ok = fgetc(file) == EOF && cJSON_GetArraySize(rows) <= ADD_IDENTITY_CATALOG_MAX_ROWS;
+        ok = catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 0 &&
+            cJSON_GetArraySize(rows) <= ADD_IDENTITY_CATALOG_MAX_ROWS;
     }
-    if (ferror(file)) ok = false;
-    if (fclose(file) != 0) ok = false;
+    if (!catalog_stream_close(&stream)) ok = false;
     free(line);
     if (!ok) { cJSON_Delete(root); return NULL; }
     return root;
@@ -4854,6 +4942,9 @@ static bool add_connector_lookup_identity_locked(
     size_t cnic_size,
     bool *shift_worker)
 {
+    if (display_name && display_name_size) display_name[0] = '\0';
+    if (cnic && cnic_size) cnic[0] = '\0';
+    if (shift_worker) *shift_worker = false;
     if ((!user_id || !user_id[0]) && (!uid || !uid[0])) return false;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     if (catalog_owner_required() && !catalog_owner_idle()) return false;
@@ -4891,15 +4982,25 @@ static bool add_connector_lookup_identity_locked(
     if (memory_catalog_valid) return found;
 
     if (!recover_catalog_transaction_locked()) return false;
-    FILE *file = fopen(ADD_IDENTITY_CATALOG_PATH, "r");
+    catalog_stream_t stream;
+    bool opened = catalog_stream_open(&stream);
     char *line = malloc(ADD_COMMAND_LINE_BYTES);
-    if (file && line && fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+    if (opened && line && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1) {
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
         cJSON *rows = root ? cJSON_GetObjectItemCaseSensitive(root, "rows") : NULL;
         bool legacy_catalog = cJSON_IsArray(rows);
+        cJSON *count = root ? cJSON_GetObjectItemCaseSensitive(root, "rows_count") : NULL;
+        bool valid_header = cJSON_IsObject(root) && (legacy_catalog ?
+            cJSON_GetArraySize(rows) <= ADD_IDENTITY_CATALOG_MAX_ROWS :
+            cJSON_IsNumber(count) && count->valueint >= 0 && count->valueint <= ADD_IDENTITY_CATALOG_MAX_ROWS &&
+                count->valuedouble == count->valueint);
+        if (!valid_header) stream.error = true;
+        int expected_rows = cJSON_IsNumber(count) ? count->valueint : -1;
         cJSON *row = NULL;
         cJSON_ArrayForEach(row, rows) {
+            if (!cJSON_IsObject(row)) { stream.error = true; break; }
+            if (found) continue;
             cJSON *candidate = cJSON_GetObjectItemCaseSensitive(row, "user_id");
             cJSON *candidate_uid = cJSON_GetObjectItemCaseSensitive(row, "uid");
             bool user_matches = !user_id || !user_id[0] ||
@@ -4918,18 +5019,19 @@ static bool add_connector_lookup_identity_locked(
             }
             if (shift_worker) *shift_worker = cJSON_IsTrue(shift);
             found = true;
-            break;
         }
         cJSON_Delete(root);
         free(plain);
         // Schema v3 stores one encrypted JSON row per line.  This keeps
         // lookups and catalog replacement bounded independently of fleet size
         // while retaining support for the legacy single-object catalog.
-        if (!found && !legacy_catalog) {
-            while (fgets(line, ADD_COMMAND_LINE_BYTES, file)) {
+        if (!legacy_catalog && !stream.error) {
+            int seen = 0;
+            while (catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) == 1) {
                 char *row_plain = decrypt_storage_line(line);
                 row = row_plain ? cJSON_Parse(row_plain) : NULL;
                 free(row_plain);
+                if (!cJSON_IsObject(row) || ++seen > expected_rows) { cJSON_Delete(row); stream.error = true; break; }
                 cJSON *candidate = row
                     ? cJSON_GetObjectItemCaseSensitive(row, "user_id")
                     : NULL;
@@ -4942,7 +5044,7 @@ static bool add_connector_lookup_identity_locked(
                 bool uid_matches = !uid || !uid[0] ||
                     (cJSON_IsString(candidate_uid) &&
                      strcmp(candidate_uid->valuestring, uid) == 0);
-                if (user_matches && uid_matches) {
+                if (!found && user_matches && uid_matches) {
                     cJSON *name =
                         cJSON_GetObjectItemCaseSensitive(row, "display_name");
                     cJSON *identity =
@@ -4963,12 +5065,18 @@ static bool add_connector_lookup_identity_locked(
                     found = true;
                 }
                 cJSON_Delete(row);
-                if (found) break;
             }
+            if (seen != expected_rows) stream.error = true;
         }
+        if (legacy_catalog && catalog_stream_next(&stream, line, ADD_COMMAND_LINE_BYTES) != 0) stream.error = true;
     }
-    if (file) fclose(file);
+    if (!catalog_stream_close(&stream)) found = false;
     free(line);
+    if (!found) {
+        if (display_name && display_name_size) display_name[0] = '\0';
+        if (cnic && cnic_size) cnic[0] = '\0';
+        if (shift_worker) *shift_worker = false;
+    }
     return found;
 }
 
