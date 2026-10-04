@@ -1,7 +1,7 @@
 """Durable processing obligations attached in the custody transaction.
 
-No employee attribution or Oracle completion is inferred here. Reassembly is
-bounded; decoding waits for separately qualified profile evidence. Callers
+No employee attribution or Oracle completion is inferred here. Reassembly and
+derived interpretation are bounded; authority waits for qualified profiles. Callers
 serialize mutations using the connector row before the work row, including
 when a new fragment arrives while a worker inspects its group.
 """
@@ -16,11 +16,12 @@ import time
 
 from cryptography.fernet import InvalidToken
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.crypto import decrypt_json, decrypt_text
-from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktObservationReceipt
+from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktDerivedEvidence, ZktObservationReceipt
+from zk_add import zkt_derived_evidence as derived
 from zk_add.time_utils import utc_now
 from zk_add.settings import settings
 from zk_add.zkt_packet import FRAGMENT_DATA, PACKET_MAX, parse_fragment, reassemble
@@ -76,15 +77,15 @@ def attach_source_work(session: Session, connector: Connector,
             work_key=source_work_key(connector, manifest),
             connector_id=connector.id, source_manifest_id=manifest.id, kind="SOURCE_LEDGER",
             terminal_serial=manifest.terminal_serial, expected_bytes=manifest.record_size,
-            expected_digest=manifest.raw_record_digest, state="WAIT_PROFILE",
-            reason_code="PROFILE_QUALIFICATION_REQUIRED", owner="ADD_PROTOCOL",
-            evidence_revision=1, processed_revision=1, next_attempt_at=None,
+            expected_digest=manifest.raw_record_digest, state="PENDING",
+            reason_code="AWAITING_INTERPRETATION", owner="ADD_PROTOCOL",
+            evidence_revision=1, processed_revision=0, next_attempt_at=utc_now(),
         ))
     session.flush()
 
 
-def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> None:
-    """Keep interpretation pending until qualified decoding owns this work."""
+def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> bytes:
+    """Authenticate original source bytes before deriving any interpretation."""
     if not settings.pii_fernet_key:
         raise RuntimeError("CUSTODY_KEY_UNAVAILABLE")
     manifest = session.get(TerminalRecordManifest, work.source_manifest_id) if work.source_manifest_id else None
@@ -109,6 +110,7 @@ def inspect_source_ledger(session: Session, work: ZktCustodyWork) -> None:
     if len(raw) != work.expected_bytes or hashlib.sha256(raw).hexdigest() != work.expected_digest:
         raise EvidenceInvalid("SOURCE_WORK_BYTES_CHANGED")
     work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
+    return raw
 
 
 def attach_work(session: Session, connector: Connector, receipt: ZktObservationReceipt,
@@ -209,7 +211,7 @@ def materialize_packet(session: Session, work: ZktCustodyWork) -> bytes | None:
     return packet
 
 
-def inspect_source(session: Session, work: ZktCustodyWork) -> None:
+def inspect_source(session: Session, work: ZktCustodyWork) -> bytes:
     """Associate late source evidence without manufacturing an attendance row."""
     from zk_add.zkt_custody import (Observation, SourceAssociationError, bind_source_occurrence,
                                    digest, source_occurrence_delivery_hold)
@@ -228,11 +230,12 @@ def inspect_source(session: Session, work: ZktCustodyWork) -> None:
         parsed = Observation.model_validate(value)
     except ValidationError as exc:
         raise EvidenceInvalid("SOURCE_SCHEMA_INVALID") from exc
+    raw = base64.b64decode(parsed.raw_b64, validate=True)
     if (receipt.error_code or receipt.connector_id != work.connector_id
             or parsed.raw_format != "SOURCE_RECORD" or parsed.terminal_serial != work.terminal_serial
             or parsed.capture_epoch != work.capture_epoch
             or (parsed.decoder_profile, parsed.decoder_version) != (work.decoder_profile, work.decoder_version)
-            or len(base64.b64decode(parsed.raw_b64)) != work.expected_bytes
+            or len(raw) != work.expected_bytes
             or parsed.raw_digest != work.expected_digest):
         raise EvidenceInvalid("SOURCE_EVIDENCE_BINDING")
     connector = session.get(Connector, work.connector_id)
@@ -241,10 +244,10 @@ def inspect_source(session: Session, work: ZktCustodyWork) -> None:
     if (terminal is None or terminal.serial != parsed.terminal_serial
             or terminal.confirmed_serial != parsed.terminal_serial):
         work.state, work.reason_code = "WAIT_SOURCE", "TERMINAL_BINDING_CHANGED"
-        return
+        return raw
     if parsed.occurrence is None:
         work.state, work.reason_code = "WAIT_SOURCE", "SOURCE_REFERENCE_REQUIRED"
-        return
+        return raw
     try:
         # Any failed derived association rolls back locally. The committed
         # custody receipt and unrelated work remain available for recovery.
@@ -258,14 +261,15 @@ def inspect_source(session: Session, work: ZktCustodyWork) -> None:
         # corruption. The bounded fair worker retries; unchanged profile holds
         # and unreferenced records are not continuously rescanned.
         work.next_attempt_at = utc_now() + timedelta(seconds=30)
-        return
+        return raw
     hold = source_occurrence_delivery_hold(session, connector, identity)
     if hold:
         work.state, work.reason_code = "HELD_OCCURRENCE", hold
-        return
+        return raw
     work.state, work.reason_code = "SOURCE_ASSOCIATED", "EXACT_CANONICAL_SOURCE_BYTES"
     # Identity and downstream receipt verification are separate obligations.
     # An association alone cannot create attendance or mark Oracle complete.
+    return raw
 
 
 def inspect_work(session: Session, work: ZktCustodyWork) -> None:
@@ -275,19 +279,29 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
     work.next_attempt_at = None
     work.processed_revision = work.evidence_revision
     work.attempt_count += 1
+    work.interpretation_version = derived.INTERPRETATION_VERSION
     work.updated_at = utc_now()
     if work.kind not in {"SOURCE_LEDGER", "SOURCE_RECORD", "LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"}:
         work.state, work.reason_code, work.owner = "WAIT_PROFILE", "UNKNOWN_RAW_FORMAT", "ADD_PROTOCOL"
         return
     try:
         if work.kind == "SOURCE_LEDGER":
-            inspect_source_ledger(session, work)
-            return
-        if work.kind == "SOURCE_RECORD":
-            inspect_source(session, work)
-            return
-        packet = materialize_packet(session, work)
-    except EvidenceInvalid as exc:
+            raw = inspect_source_ledger(session, work)
+        elif work.kind == "SOURCE_RECORD":
+            raw = inspect_source(session, work)
+        else:
+            raw = materialize_packet(session, work)
+            if raw is None:
+                work.state, work.reason_code, work.owner = "WAIT_FRAGMENTS", "INCOMPLETE_PACKET", "ADD_PROTOCOL"
+                return
+            work.assembled_digest = hashlib.sha256(raw).hexdigest()
+            work.assembled_at = work.assembled_at or utc_now()
+            work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
+        step = derived.derive_step(session, work, raw)
+        if step.result == "PENDING":
+            work.state, work.reason_code, work.owner = "INTERPRETING", "DERIVED_EVIDENCE_INCOMPLETE", "ADD_PROTOCOL"
+            work.next_attempt_at = utc_now()
+    except (EvidenceInvalid, derived.DerivedEvidenceInvalid) as exc:
         work.state, work.reason_code, work.owner = "HELD_EXCEPTION", str(exc), "ADD_EVIDENCE_REVIEW"
         return
     except (InvalidToken, ValueError, RuntimeError):
@@ -297,12 +311,6 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
         work.state, work.reason_code, work.owner = "RETRY_SYSTEM", "CUSTODY_DECRYPT_UNAVAILABLE", "ADD_OPERATIONS"
         work.next_attempt_at = utc_now() + timedelta(seconds=60)
         return
-    if packet is None:
-        work.state, work.reason_code, work.owner = "WAIT_FRAGMENTS", "INCOMPLETE_PACKET", "ADD_PROTOCOL"
-        return
-    work.assembled_digest = hashlib.sha256(packet).hexdigest()
-    work.assembled_at = utc_now()
-    work.state, work.reason_code, work.owner = "WAIT_PROFILE", "PROFILE_QUALIFICATION_REQUIRED", "ADD_PROTOCOL"
 
 
 @dataclass(frozen=True)
@@ -324,8 +332,15 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
     clock = clock or time.monotonic
     deadline = None if time_budget_ms is None else clock() + max(1, min(time_budget_ms, 1000)) / 1000
     now = utc_now()
+    # A decoder revision wakes each supported hold once. Unchanged holds do
+    # not repeatedly decrypt/scan receipts, and disabled connectors stay idle.
+    eligible = or_(ZktCustodyWork.next_attempt_at <= now, and_(
+        ZktCustodyWork.kind.in_(derived.SUPPORTED_KINDS),
+        ZktCustodyWork.state != "HELD_EXCEPTION",
+        or_(ZktCustodyWork.interpretation_version.is_(None),
+            ZktCustodyWork.interpretation_version != derived.INTERPRETATION_VERSION)))
     due = select(ZktCustodyWork.id).where(ZktCustodyWork.connector_id == Connector.id,
-        ZktCustodyWork.next_attempt_at <= now).exists()
+        eligible).exists()
     connectors = session.scalars(select(Connector.id).where(Connector.zkt_custody_enabled.is_(True), due)
         .order_by(Connector.id <= after_connector, Connector.id).limit(maximum)).all()
     quota = max(1, maximum // max(1, len(connectors)))
@@ -347,7 +362,7 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
             cursor = connector_id
             continue
         work = session.scalars(select(ZktCustodyWork).where(ZktCustodyWork.connector_id == connector_id,
-            ZktCustodyWork.next_attempt_at <= now).order_by(ZktCustodyWork.next_attempt_at, ZktCustodyWork.id)
+            eligible).order_by(ZktCustodyWork.next_attempt_at.asc().nulls_last(), ZktCustodyWork.id)
             .limit(quota).with_for_update(skip_locked=True)).all()
         prior_processed = processed
         for row in work:
@@ -419,6 +434,19 @@ def work_status(session: Session, connector: Connector, *, before: int | None = 
         ~select(ZktCustodyWork.id).where(ZktCustodyWork.source_manifest_id == TerminalRecordManifest.id).exists())
         .limit(1))
     page = rows[:maximum]
+    fingerprints = {row.id: derived.input_fingerprint(row) for row in page}
+    latest = select(func.max(ZktDerivedEvidence.id).label("id")).where(
+        ZktDerivedEvidence.work_id.in_([row.id for row in page])).group_by(ZktDerivedEvidence.work_id).subquery()
+    # Metadata only: no ciphertext, user reference or punch time is loaded by
+    # the ordinary device-status projection. It never constitutes assurance.
+    evidence = {row.work_id: dict(version=row.interpretation_version, result=row.result,
+        step_index=row.step_index, sampled_at=row.created_at, authority="UNQUALIFIED",
+        current_input=row.input_fingerprint == fingerprints[row.work_id],
+        current_decoder=row.interpretation_version == derived.INTERPRETATION_VERSION)
+        for row in session.execute(select(ZktDerivedEvidence.work_id, ZktDerivedEvidence.interpretation_version,
+            ZktDerivedEvidence.input_fingerprint, ZktDerivedEvidence.result,
+            ZktDerivedEvidence.step_index, ZktDerivedEvidence.created_at)
+            .join(latest, latest.c.id == ZktDerivedEvidence.id))}
     return {"connector_id": connector.connector_id, "enabled": connector.zkt_custody_enabled, "sampled_at": utc_now(),
         "oracle_completion": "NOT_ASSERTED", "missing_processing_obligation": missing is not None or source_missing is not None,
         "counts": [{"state": state, "owner": owner, "count": count} for state, owner, count in counts],
@@ -426,6 +454,7 @@ def work_status(session: Session, connector: Connector, *, before: int | None = 
                   "source_manifest_id": row.source_manifest_id,
                   "owner": row.owner, "evidence_revision": row.evidence_revision,
                   "processed_revision": row.processed_revision, "attempt_count": row.attempt_count,
+                  "decoding": evidence.get(row.id),
                   "expected_bytes": row.expected_bytes, "assembled_at": row.assembled_at,
                   "created_at": row.created_at, "updated_at": row.updated_at,
                   "next_attempt_at": row.next_attempt_at} for row in page],

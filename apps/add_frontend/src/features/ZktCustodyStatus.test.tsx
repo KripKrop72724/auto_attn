@@ -23,6 +23,36 @@ beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => response(fixture()))
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('ZKT custody evidence', () => {
+  it.each([
+    ['UNQUALIFIED_FACTS', true, true, 'Proposed facts · qualification required'],
+    ['AMBIGUOUS_LAYOUT', true, true, 'Ambiguous record layout'],
+    ['DECODE_REJECTED', true, true, 'No valid interpretation'],
+    ['PENDING', true, true, 'Interpretation in progress'],
+    ['UNQUALIFIED_FACTS', false, true, 'Earlier capture evidence · inspection required'],
+    ['UNQUALIFIED_FACTS', true, false, 'Earlier decoder version · inspection required'],
+  ])('keeps derived %s evidence distinct from qualification (%s, %s)', async (result, current_input, current_decoder, expected) => {
+    const value = fixture()
+    value.rows[0].decoding = { version: 'synthetic-v1', result: result as string,
+      current_input: current_input as boolean, current_decoder: current_decoder as boolean,
+      authority: 'UNQUALIFIED', step_index: 0, sampled_at: value.sampled_at }
+    vi.mocked(fetch).mockResolvedValue(response(value))
+    mount()
+    expect(await screen.findByText(expected as string)).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+    expect(screen.queryByText(/Healthy|All delivered/i)).toBeNull()
+  })
+  it.each(['future', 'authority', 'unknown-result', 'missing-binding'])('rejects invalid decoder metadata: %s', async kind => {
+    const value = fixture()
+    const decoding = { version: 'synthetic-v1', result: 'UNQUALIFIED_FACTS', current_input: true,
+      current_decoder: true, authority: 'UNQUALIFIED', step_index: 0, sampled_at: value.sampled_at }
+    const change = kind === 'future' ? { sampled_at: new Date(Date.now() + 60_000).toISOString() }
+      : kind === 'authority' ? { authority: 'QUALIFIED' } : kind === 'unknown-result' ? { result: 'SUCCESS' }
+        : { current_input: undefined }
+    vi.mocked(fetch).mockResolvedValue(response({ ...value, rows: [{ ...value.rows[0], decoding: { ...decoding, ...change } }] }))
+    mount()
+    expect(await screen.findByText('Decoding evidence unavailable')).toBeTruthy()
+    expect(screen.getByText('12')).toBeTruthy()
+  })
   it('keeps ambiguous legacy occurrence links on hold independently of custody and Oracle', async () => {
     vi.mocked(fetch).mockResolvedValue(response(fixture({
       counts: [{ state: 'HELD_OCCURRENCE', owner: 'ADD_RECONCILIATION', count: 2 }],

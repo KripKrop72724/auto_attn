@@ -21,13 +21,18 @@ Equal bytes at two ordinals retain separate rows
 and work identities. Original legacy interpretations and attendance keys are
 not overwritten by this path.
 
-The obligation starts in `WAIT_PROFILE`, owned by `ADD_PROTOCOL`, with no timed
-retry. Unchanged raw evidence does not need repeated semantic inspection. Its
+The obligation starts in `PENDING`, owned by `ADD_PROTOCOL`. The bounded worker
+retains a versioned decoder proposal before leaving it in `WAIT_PROFILE`.
+Unchanged raw evidence does not need repeated semantic inspection. Its
 immutable key binds the connector, manifest, terminal, source epoch, generation,
 ordinal, layout size and source digests. A later inspection checks that binding
 and the decrypted bytes. Evidence mutation and unavailable cryptographic
 material are different holds. The custody status endpoint identifies a missing
 source obligation without returning protected content.
+
+The [derived-evidence contract](zkt-derived-evidence.md) retains interpretation
+history separately. A plausible proposal, failed decode or changed decoder does
+not rewrite the source's original classification or create attendance.
 
 Recovery-epoch prefix copying reads at most 100 manifests per page and creates
 replacement obligations in the same transaction. Failure on a later page leaves

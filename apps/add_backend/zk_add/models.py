@@ -498,6 +498,7 @@ class ZktCustodyWork(Base):
     owner: Mapped[str] = mapped_column(String(60))
     evidence_revision: Mapped[int] = mapped_column(Integer, default=1)
     processed_revision: Mapped[int] = mapped_column(Integer, default=0)
+    interpretation_version: Mapped[str | None] = mapped_column(String(80))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     assembled_digest: Mapped[str | None] = mapped_column(String(64))
@@ -509,6 +510,29 @@ class ZktCustodyWork(Base):
 Index("ix_add_zkt_work_due", ZktCustodyWork.connector_id, ZktCustodyWork.next_attempt_at,
       ZktCustodyWork.id, postgresql_where=text("next_attempt_at is not null"),
       sqlite_where=text("next_attempt_at is not null"))
+Index("ix_add_zkt_work_interpretation", ZktCustodyWork.connector_id,
+      ZktCustodyWork.interpretation_version, ZktCustodyWork.id)
+
+
+class ZktDerivedEvidence(Base):
+    """Append-only decoder steps. No step constitutes profile or identity proof."""
+    __tablename__ = "add_zkt_derived_evidence"
+    __table_args__ = (
+        UniqueConstraint("work_id", "interpretation_version", "input_fingerprint", "step_index",
+                         name="uq_add_zkt_derived_step"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    work_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_custody_work.id"))
+    interpretation_version: Mapped[str] = mapped_column(String(80))
+    input_fingerprint: Mapped[str] = mapped_column(String(64))
+    step_index: Mapped[int] = mapped_column(Integer)
+    result: Mapped[str] = mapped_column(String(40))
+    record_count: Mapped[int] = mapped_column(Integer)
+    error_count: Mapped[int] = mapped_column(Integer)
+    previous_digest: Mapped[str | None] = mapped_column(String(64))
+    evidence_digest: Mapped[str] = mapped_column(String(64))
+    protected_evidence: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
 
 
 class ZktCustodyWorkReceipt(Base):
