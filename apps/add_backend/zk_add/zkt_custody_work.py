@@ -20,11 +20,15 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.crypto import decrypt_json, decrypt_text
-from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktDerivedEvidence, ZktObservationReceipt
+from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktCustodySchedule, ZktDerivedEvidence, ZktObservationReceipt
 from zk_add import zkt_derived_evidence as derived
 from zk_add.time_utils import utc_now
 from zk_add.settings import settings
 from zk_add.zkt_packet import FRAGMENT_DATA, PACKET_MAX, parse_fragment, reassemble
+
+PRIORITY_BURST = 8
+RECENT_LIVE_SECONDS = 60
+LIVE_KINDS = frozenset({"LIVE_PACKET", "LIVE_FRAME", "PACKET_FRAGMENT"})
 
 
 def key(parts: list) -> str:
@@ -361,16 +365,47 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
             locked += 1
             cursor = connector_id
             continue
-        work = session.scalars(select(ZktCustodyWork).where(ZktCustodyWork.connector_id == connector_id,
-            eligible).order_by(ZktCustodyWork.next_attempt_at.asc().nulls_last(), ZktCustodyWork.id)
+        # Both reads and scheduling state are under the connector lock. Recent
+        # intake is a scheduling hint only, never terminal clock/profile proof.
+        # Select bounded candidate pages, not all of a site's retained history.
+        recent = session.scalars(select(ZktCustodyWork).where(
+            ZktCustodyWork.connector_id == connector_id, eligible,
+            ZktCustodyWork.kind.in_(LIVE_KINDS),
+            ZktCustodyWork.created_at >= now - timedelta(seconds=RECENT_LIVE_SECONDS),
+            ZktCustodyWork.created_at <= now)
+            .order_by(ZktCustodyWork.created_at.desc(), ZktCustodyWork.id.desc())
             .limit(quota).with_for_update(skip_locked=True)).all()
+        oldest = session.scalars(select(ZktCustodyWork).where(
+            ZktCustodyWork.connector_id == connector_id, eligible)
+            .order_by(func.coalesce(ZktCustodyWork.next_attempt_at, ZktCustodyWork.created_at), ZktCustodyWork.id)
+            .limit(quota).with_for_update(skip_locked=True)).all()
+        schedule = session.scalar(select(ZktCustodySchedule).where(ZktCustodySchedule.connector_id == connector_id))
+        if schedule is None:
+            schedule = ZktCustodySchedule(connector_id=connector_id, priority_burst=0)
+            session.add(schedule)
+        if not 0 <= schedule.priority_burst <= PRIORITY_BURST:
+            raise RuntimeError("CUSTODY_SCHEDULE_INVALID")
         prior_processed = processed
-        for row in work:
+        selected = set()
+        recent_index = oldest_index = 0
+        while len(selected) < quota:
+            while recent_index < len(recent) and recent[recent_index].id in selected:
+                recent_index += 1
+            while oldest_index < len(oldest) and oldest[oldest_index].id in selected:
+                oldest_index += 1
+            has_recent, has_oldest = recent_index < len(recent), oldest_index < len(oldest)
+            if not has_recent and not has_oldest:
+                break
             if processed and deadline is not None and clock() >= deadline:
                 break
+            priority = has_recent and (schedule.priority_burst < PRIORITY_BURST or not has_oldest)
+            row = recent[recent_index] if priority else oldest[oldest_index]
             inspect_work(session, row)
+            schedule.priority_burst = min(PRIORITY_BURST, schedule.priority_burst + 1) if priority else 0
+            schedule.updated_at = utc_now()
+            selected.add(row.id)
             processed += 1
-        if work and processed == prior_processed:
+        if (recent or oldest) and processed == prior_processed:
             # Its lock/query used the remaining budget, but no group was
             # inspected. Keep it first next time rather than skipping it on
             # every full rotation through an even-sized saturated fleet.

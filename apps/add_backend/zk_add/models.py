@@ -512,6 +512,21 @@ Index("ix_add_zkt_work_due", ZktCustodyWork.connector_id, ZktCustodyWork.next_at
       sqlite_where=text("next_attempt_at is not null"))
 Index("ix_add_zkt_work_interpretation", ZktCustodyWork.connector_id,
       ZktCustodyWork.interpretation_version, ZktCustodyWork.id)
+Index("ix_add_zkt_work_recent_live", ZktCustodyWork.connector_id,
+      ZktCustodyWork.created_at, ZktCustodyWork.id,
+      postgresql_where=text("kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"),
+      sqlite_where=text("kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"))
+
+
+class ZktCustodySchedule(Base):
+    """Committed fairness state, serialized by the connector row lock."""
+    __tablename__ = "add_zkt_custody_schedule"
+    __table_args__ = (CheckConstraint("priority_burst >= 0 and priority_burst <= 8",
+                                     name="ck_add_zkt_custody_priority_burst"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), unique=True)
+    priority_burst: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = utc_column()
 
 
 class ZktDerivedEvidence(Base):

@@ -46,6 +46,24 @@ Database statement/time budgets and connector rotation still apply. A large
 packet can span several ticks without retaining a transaction or lock between
 them. Database workload qualification remains distinct from field latency.
 
+Migration `0049` adds committed per-connector scheduling state and an index for
+recent live intake. The worker prefers live packet/fragment groups received by
+ADD in the preceding 60 seconds, newest first. After at most eight such steps,
+it services the oldest eligible group before starting another burst. Old decoder
+holds with no retry timestamp retain their original intake age for this turn.
+This uses ADD's intake time only; it does not trust a terminal timestamp or treat
+an uploaded offline packet as independently verified real-time evidence.
+
+The burst counter commits with the interpretation step under the existing
+connector-first lock. Failed transactions cannot consume a historical turn;
+restarted and concurrent workers inherit committed fairness. Each of the two
+candidate queries is limited to the connector's batch quota, their union is
+deduplicated, and at most that quota is inspected. A partially interpreted packet
+receives at most one step in a batch. Rotation, lock skipping, statement deadlines
+and the overall tick budget continue to apply. Downgrade retains the counter.
+This scheduler does not establish ESP backlog catch-up, Oracle latency or fleet
+capacity; those require their own integrated qualification.
+
 The ordinary custody API returns only interpretation status, version, sampling
 time and current-input/current-decoder flags. It never returns protected facts.
 The UI distinguishes proposed facts, ambiguity, rejection, work in progress and
