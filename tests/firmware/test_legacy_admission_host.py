@@ -11,7 +11,7 @@ def test_legacy_append_shares_reserves_and_releases_budget_on_every_failure(tmp_
     adapter = (firmware / "queue_store.c").read_text()
     runtime = (firmware / "zone_lite.c").read_text()
     measure = adapter[adapter.index("static bool measure("):adapter.index("static bool admit(")]
-    admission = adapter[adapter.index("bool qs_local_begin("):adapter.index("static bool lock(")]
+    admission = adapter[adapter.index("bool qs_local_begin("):adapter.index("void qs_local_end_legacy(")]
     append = runtime[runtime.index("static bool append_line_policy("):runtime.index("static bool extract_event_uid(")]
     harness = r'''
 #include "queue_store.h"
@@ -70,6 +70,10 @@ int main(void)
     }
     assert(health.write_failures==operations);
     fail_operation=0;operation=0;
+    used=(total*60+99)/100;
+    assert(!qs_local_begin(QS_ADMIT_OPTIONAL_HISTORICAL,4096));
+    assert(!locked && health.last_error==EIO && !strcmp(health.last_operation,"local_write_commit"));
+    health.admission_rejections=0; /* Start the independent reserve-boundary case below. */
     health.last_error=0; // A separate clean boot under policy pressure.
     used=(total*60+99)/100;
     unsigned before=opens;

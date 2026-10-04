@@ -46,6 +46,7 @@ counts are kept outside this public repository.
 | A failed Oracle backlog restore can be mistaken for an empty queue | Require successful generation restoration before scanning or caching empty; propagate retirement/restore errors and keep failed boot restoration visible | Actual Oracle read/send/commit orchestration with failed rename/stat, preserved backup/temp files, retry and lock release; production boot failure checks | Recovery defect corrected; complete migration and field qualification remain open |
 | Retained corrupt-file evidence bypasses the storage task | New-image quarantine reads and exact-receipt retirement use copied owner requests, existing NVS checkpoints and bounded prefix recovery | Actual production adapters and delivery slice, raw/binary/oversized tails, lost receipts/replies, NVS/read/close/stat/remove faults, empty cache and both family paths | Implemented evidence component; raw custody does not resolve identity or deliver attendance to Oracle |
 | Legacy Oracle and identity-blocked files still compete with capture | New-image producers, readers, identity recovery and retirement use the storage task; initial recovery is deferred from boot and yields between prefix slices | Actual adapter and gateway/Oracle/blocked consumers, unchanged checkpoint reader, surviving generations, failed writes/restores/checkpoints, exact receipt ordering, allocation faults and family isolation | Storage-owner component; complete migration records, incident recovery and measured ESP/catch-up qualification remain open |
+| Legacy read and retirement failures can be missing from shared health | Fixed per-queue read/append/retirement incidents, captured I/O errors, active versus recovered counts in ADD, and a HIL precondition | Actual queue adapters, shared health/probe/recovery functions, short reads and failed close/NVS/reclamation, partial retry, unrelated progress, ingestion and UI tests | Read faults recover only after a complete affected-queue retry; write/retirement proof and durable incident history remain open |
 | Development journal and OTA scan use an unmounted directory | Journal runtime and OTA evidence scans share the actual `/storage` boot mount constant | Production boot initialization and runtime adapter compare journal/OTA/catalog/command paths to the captured VFS mount | Integration defect corrected; signed-device boot and physical qualification remain open |
 | Identity lookup can expose a row before a later read or close fails | New-image catalog restoration, lookup and tombstone loading read copied owner chunks; lookup validates complete row counts and clears unresolved outputs | Actual consumer functions, every allocation site, late reads, changed revisions, extra/missing rows, truncated tails and legacy close failure | Implemented read component; ESP catalog latency and legacy custody migration stay open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
@@ -571,6 +572,26 @@ identity-fingerprint checks, preserves the original event UID, and cannot retire
 before the destination append succeeds. Historical, changed, rejected and
 unresolved identities remain held or transferred as raw evidence. These
 components do not complete per-item migration evidence or authorize a release.
+
+The seven retained flat-file queues report separate read, append and retirement
+incidents while the storage owner holds its local lock. A successful complete
+peek, including required generation restoration and checkpoint validation,
+resolves only that queue's read incident. Partial prefix verification,
+contention, capacity refusal and another queue's progress cannot resolve it.
+The full segmented recovery and persistence checks must still run again before
+the device claims verified storage. Failed reads during retirement are reported
+as I/O failures; they no longer masquerade as a stale receipt token. The first
+captured read/seek error survives cleanup errors.
+
+Active read, append and retirement counts are distinct from read recoveries
+since boot. ADD retains these optional fields, displays the affected queue and
+operation, and prevents an active incident from producing a healthy UI or HIL
+verdict. An optional catalog refusal cannot replace an existing error's
+operation label. Legacy firmware and Hikvision do not enter the new reporting
+path. This incident inventory is bounded and boot-local. Append and retirement
+incidents deliberately remain latched: a later successful operation is not
+proof of the earlier record's custody. Per-item recovery evidence, persisted
+incident history and release qualification are still required.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain

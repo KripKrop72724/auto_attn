@@ -23,7 +23,11 @@ typedef int esp_err_t;
 typedef unsigned nvs_handle_t;
 static SemaphoreHandle_t g_storage_lock=1;
 static bool required=true, owner_task, reject, grant_custody;
-static unsigned held,budget,peeks,reclaims,faults,receipts,checkpoint_writes,failed_writes;
+static lf_state_t legacy_health;
+static qs_health_t health;
+#define failed_writes health.write_failures
+#include "legacy_health_actual.inc"
+static unsigned held,budget,peeks,reclaims,faults,receipts,checkpoint_writes;
 static unsigned nvs_fault;
 static bool peek_fault;
 static lq_checkpoint_t committed[3],pending_checkpoint;
@@ -193,7 +197,10 @@ int main(void)
     unsigned before=peeks,before_reclaim=reclaims,before_receipts=receipts;
     for(unsigned i=0;i<100;++i)slice(0);
     assert(peeks==before && reclaims==before_reclaim && receipts==before_receipts);
-    peek_fault=true;slice(1);assert(!peek_fault && exists(1));slice(1);assert(!exists(1));
+    peek_fault=true;slice(1);assert(!peek_fault && exists(1));
+    if(ZONE_LITE_QUEUE_OWNER)assert(health.legacy.read_faults==1 && health.legacy.retire_faults==1);
+    slice(1);assert(!exists(1));
+    if(ZONE_LITE_QUEUE_OWNER)assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && health.legacy.retire_faults==1);
     seed(1,"repeat\nrepeat\n",14);nvs_fault=3;slice(1);
     assert(!nvs_fault && committed[1].offset==7 && exists(1));
     slice(1);assert(!exists(1)); /* Uncertain checkpoint is recovered, never a fabricated receipt. */
@@ -257,6 +264,7 @@ int main(void)
     assert(!exists(2));
     /* Legacy/Hikvision compilation and older ZKT retain their direct path. */
     required=false;seed(0,"old\n",4);slice(0);assert(!exists(0));
+    if(!ZONE_LITE_QUEUE_OWNER)assert(!health.legacy.observed && !health.read_failures && !health.write_failures);
     assert(checkpoint_writes && faults && !held && !budget && !ticket);
     puts("actual quarantine custody, owner routing, faults, empty cache and family paths passed");
 }

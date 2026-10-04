@@ -19,7 +19,8 @@ static bool persist(legacy_queue_t *q, lq_checkpoint_t next)
     if (!next.version) next.version = 1;
     next.generation++;
     next.crc = dq_crc32(&next, offsetof(lq_checkpoint_t, crc));
-    if (!q->port.commit(q->port.context, &next)) { q->ready=false; return false; }
+    errno=0;
+    if (!q->port.commit(q->port.context, &next)) { q->ready=false; if(!errno)errno=EIO; return false; }
     q->checkpoint=next;
     return true;
 }
@@ -29,9 +30,10 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
     if (!q->recovering || strcmp(q->path,path) || q->port.context!=port.context ||
         q->port.load!=port.load || q->port.commit!=port.commit) {
         memset(q,0,sizeof(*q)); strcpy(q->path,path); q->port=port;
+        errno=0;
         int loaded=port.load(port.context,&q->checkpoint);
         lq_checkpoint_t *cp=&q->checkpoint;
-        if (loaded<0) return DQ_IO;
+        if (loaded<0) { if(!errno)errno=EIO; return DQ_IO; }
         if (loaded && ((cp->version!=1 && cp->version!=2) || !cp->generation ||
             cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc)))) return DQ_CORRUPT;
         q->recovering=true;
@@ -44,17 +46,19 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
         uint32_t position=q->recovery_offset, crc=q->recovery_crc;
         uint32_t remaining=cp->offset-position;
         if (remaining>LQ_RECOVERY_SLICE_BYTES) remaining=LQ_RECOVERY_SLICE_BYTES;
+        errno=0;
         bool ok=fseek(file,(long)position,SEEK_SET)==0, boundary=true;
+        int error=ok?0:(errno?errno:EIO);
         while (ok && remaining) {
             size_t n=remaining<sizeof(bytes)?remaining:sizeof(bytes);
-            if (fread(bytes,1,n,file)!=n) { ok=false; break; }
+            if (fread(bytes,1,n,file)!=n) { ok=false; error=errno?errno:EIO; break; }
             crc=extend(crc,bytes,n); remaining-=(uint32_t)n; position+=(uint32_t)n;
             if (position==cp->offset && cp->version==1 && bytes[n-1]!='\n') boundary=false;
         }
-        if (ferror(file)) ok=false;
-        if (fclose(file)!=0) ok=false;
+        if (ferror(file)) { ok=false; if(!error)error=errno?errno:EIO; }
+        if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
         // Failed I/O retries exactly this slice, including a failed close.
-        if (!ok) return DQ_IO;
+        if (!ok) { errno=error; return DQ_IO; }
         if (!boundary) { q->recovering=false; return DQ_CORRUPT; }
         q->recovery_offset=position; q->recovery_crc=crc;
         if (position<cp->offset) return DQ_PENDING;
@@ -77,15 +81,19 @@ dq_result_t lq_peek(legacy_queue_t *q, char *data, size_t capacity, lq_token_t *
     if (!q || !q->ready || !data || capacity<2 || capacity>DQ_MAX_RECORD_BYTES+1 || !token) return DQ_IO;
     FILE *file=fopen(q->path,"rb");
     if (!file) return errno==ENOENT && !q->checkpoint.offset ? DQ_EMPTY : DQ_IO;
-    if (fseek(file,(long)q->checkpoint.offset,SEEK_SET)!=0) { fclose(file); return DQ_IO; }
+    if (fseek(file,(long)q->checkpoint.offset,SEEK_SET)!=0) {
+        int error=errno?errno:EIO; fclose(file); errno=error; return DQ_IO;
+    }
+    errno=0;
     size_t n=0; int ch=EOF;
     while (n<capacity-1 && (ch=fgetc(file))!=EOF) {
         data[n++]=(char)ch;
         if (ch=='\n') break;
     }
     bool ok=!ferror(file);
-    if (fclose(file)!=0) ok=false;
-    if (!ok) return DQ_IO;
+    int error=ok?0:(errno?errno:EIO);
+    if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
+    if (!ok) { errno=error; return DQ_IO; }
     if (!n && ch==EOF) return DQ_EMPTY;
     if (n>UINT32_MAX-q->checkpoint.offset) return DQ_CORRUPT;
     data[n]=0;
@@ -102,18 +110,21 @@ static dq_result_t settle(legacy_queue_t *q, const lq_token_t *token, bool custo
         token->end<=token->offset || token->end-token->offset>DQ_MAX_RECORD_BYTES) return DQ_STALE;
     FILE *file=fopen(q->path,"rb");
     if (!file) return DQ_IO;
+    errno=0;
     bool ok=fseek(file,(long)token->offset,SEEK_SET)==0;
+    int error=ok?0:(errno?errno:EIO);
     uint32_t remaining=token->end-token->offset, crc=0, prefix=q->checkpoint.prefix_crc;
     unsigned char bytes[512]; bool newline=false;
     while (ok && remaining) {
         size_t n=remaining<sizeof(bytes)?remaining:sizeof(bytes);
-        if (fread(bytes,1,n,file)!=n) { ok=false; break; }
+        if (fread(bytes,1,n,file)!=n) { ok=false; error=errno?errno:EIO; break; }
         crc=extend(crc,bytes,n); prefix=extend(prefix,bytes,n); remaining-=(uint32_t)n;
-        if (!remaining) { newline=bytes[n-1]=='\n'; if (!custody && !newline) ok=false; }
+        if (!remaining) newline=bytes[n-1]=='\n';
     }
-    if (ferror(file)) ok=false;
-    if (fclose(file)!=0) ok=false;
-    if (!ok || crc!=token->crc) return DQ_STALE;
+    if (ferror(file)) { ok=false; if(!error)error=errno?errno:EIO; }
+    if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
+    if (!ok) { errno=error; return DQ_IO; }
+    if ((!custody && !newline) || crc!=token->crc) return DQ_STALE;
     lq_checkpoint_t next=q->checkpoint;
     next.offset=token->end; next.prefix_crc=prefix; next.version=newline?1:2;
     return persist(q,next)?DQ_OK:DQ_IO;

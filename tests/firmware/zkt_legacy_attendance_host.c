@@ -16,7 +16,11 @@
 #include <unistd.h>
 
 static bool owner_task,required=true,full,reject;
-static unsigned budget,failed_writes,nvs_fault,io_fault,peeks,stats;
+static lf_state_t legacy_health;
+static qs_health_t health;
+#define failed_writes health.write_failures
+#include "legacy_health_actual.inc"
+static unsigned budget,nvs_fault,io_fault,peeks,stats;
 static size_t read_bytes;
 enum { SHORT_WRITE=1,FLUSH,SYNC,CLOSE,RENAME,STAT,REMOVE,READ };
 static lq_checkpoint_t saved[2],pending_cp;
@@ -231,13 +235,18 @@ int main(void)
     saved[0]=(lq_checkpoint_t){.version=1,.generation=4,.offset=LQ_RECOVERY_SLICE_BYTES*3,.prefix_crc=dq_crc32(large,LQ_RECOVERY_SLICE_BYTES*3)};
     saved[0].crc=dq_crc32(&saved[0],offsetof(lq_checkpoint_t,crc));
     io_fault=READ;assert(peek_lane(0,bytes,&length,&token)==DQ_IO && !io_fault && !length);
+    assert(health.legacy.read_faults==1 && legacy_health.errors[LF_ORDS_PENDING][LF_READ]==EIO);
+    unsigned recovered=health.legacy.read_recoveries;
     for(unsigned i=0;i<2;++i){
         size_t read_before=read_bytes;
         assert(peek_lane(0,bytes,&length,&token)==DQ_PENDING && !length && !token.end);
         assert(read_bytes-read_before==LQ_RECOVERY_SLICE_BYTES);
         assert(zol_append(1,"independent",11,QS_ADMIT_LIVE)==DQ_OK);
+        assert(health.legacy.read_faults==1 && health.legacy.read_recoveries==recovered);
     }
     assert(peek_lane(0,bytes,&length,&token)==DQ_OK && length==5 && !memcmp(bytes,"tail\n",5));
+    assert(!health.legacy.read_faults && health.legacy.read_recoveries==recovered+1);
+    assert(health.legacy.append_faults==1 && health.legacy.retire_faults==2); /* Distinct unresolved writes survive. */
     assert(zq_attendance_legacy_settle(0,&token,false)==DQ_OK);
     /* Execute the actual gateway adapter and Oracle delivery slice. A good
      * Oracle response alone cannot retire before its durable ADD receipt. */

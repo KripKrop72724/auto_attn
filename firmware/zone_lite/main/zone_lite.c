@@ -7646,8 +7646,9 @@ static void blocked_evidence_slice(void)
 static legacy_queue_t g_legacy_quarantine[3];
 static unsigned g_quarantine_lane;
 static dq_result_t read_quarantine_locked(unsigned lane, void *bytes, size_t capacity,
-                                          size_t *length, lq_token_t *token)
+                                          size_t *length, lq_token_t *token, lf_operation_t *operation)
 {
+    if (operation) *operation = LF_READ;
     static const char *paths[] = {CORRUPT_ORDS_PATH, STORAGE_BASE "/add_corrupt.jsonl", STORAGE_BASE "/add_corrupt.bak"};
     static const char *keys[] = {"old_qo", "old_qa", "old_qb"};
     if (length) *length = 0;
@@ -7666,7 +7667,10 @@ static dq_result_t read_quarantine_locked(unsigned lane, void *bytes, size_t cap
     if (read == DQ_OK) *length = token->end - token->offset;
     if (read == DQ_EMPTY) {
         dq_result_t reclaimed = lq_reclaim(queue);
-        if (reclaimed != DQ_OK && reclaimed != DQ_EMPTY) read = reclaimed;
+        if (reclaimed != DQ_OK && reclaimed != DQ_EMPTY) {
+            read = reclaimed;
+            if (operation) *operation = LF_RETIRE;
+        }
         else queue->empty_cached = true;
     }
     return read;
@@ -7695,8 +7699,10 @@ dq_result_t zkt_quarantine_owner_peek(unsigned lane, void *bytes, size_t capacit
     if (length) *length = 0;
     if (token) memset(token, 0, sizeof(*token));
     if (!quarantine_owner_lock(lane)) return DQ_PENDING;
-    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token);
-    qs_local_end(true, 0);
+    errno = 0;
+    lf_operation_t operation;
+    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token, &operation);
+    qs_local_end_legacy((lf_lane_t)(LF_ORDS_QUARANTINE + lane), operation, result, errno);
     xSemaphoreGive(g_storage_lock);
     return result;
 }
@@ -7707,7 +7713,7 @@ dq_result_t zkt_quarantine_owner_settle(unsigned lane, const lq_token_t *token, 
     errno = 0;
     dq_result_t result = settle_quarantine_locked(lane, token);
     int error = errno;
-    qs_local_end(result != DQ_IO, result == DQ_IO ? (error ? error : EIO) : 0);
+    qs_local_end_legacy((lf_lane_t)(LF_ORDS_QUARANTINE + lane), LF_RETIRE, result, error);
     xSemaphoreGive(g_storage_lock);
     return result;
 }
@@ -7721,7 +7727,7 @@ static dq_result_t read_quarantine_delivery(unsigned lane, void *bytes, size_t c
     if (zj_runtime_checkpoint_required()) return zq_evidence_peek(lane, bytes, capacity, length, token);
 #endif
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return DQ_PENDING;
-    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token);
+    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token, NULL);
     xSemaphoreGive(g_storage_lock);
     return result;
 }

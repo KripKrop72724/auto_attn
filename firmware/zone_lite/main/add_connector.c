@@ -2901,6 +2901,15 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
             !cJSON_AddNumberToObject(storage, "persistence_probe_failures", measured_health.persistence_probe_failures) ||
             !cJSON_AddNumberToObject(storage, "persistence_probe_total_failures", measured_health.persistence_probe_total_failures) ||
             !cJSON_AddNumberToObject(storage, "admission_reserve_bytes", (double)measured_health.admission_reserve_bytes)) goto failed;
+        if (measured_health.legacy.observed &&
+            (!cJSON_AddNumberToObject(storage, "legacy_read_faults", measured_health.legacy.read_faults) ||
+             !cJSON_AddNumberToObject(storage, "legacy_append_faults", measured_health.legacy.append_faults) ||
+             !cJSON_AddNumberToObject(storage, "legacy_retire_faults", measured_health.legacy.retire_faults) ||
+             !cJSON_AddNumberToObject(storage, "legacy_read_recoveries", measured_health.legacy.read_recoveries))) goto failed;
+        if (measured_health.legacy.error &&
+            (!cJSON_AddStringToObject(storage, "legacy_error_queue", measured_health.legacy.queue) ||
+             !cJSON_AddStringToObject(storage, "legacy_error_operation", measured_health.legacy.operation) ||
+             !cJSON_AddNumberToObject(storage, "legacy_error_code", measured_health.legacy.error))) goto failed;
         if (measured_health.persistence_probe_error &&
             (!cJSON_AddStringToObject(storage, "persistence_probe_operation", measured_health.persistence_probe_operation) ||
              !cJSON_AddNumberToObject(storage, "persistence_probe_error", measured_health.persistence_probe_error))) goto failed;
@@ -3325,7 +3334,7 @@ static dq_result_t add_legacy_owner_prepare(add_outbox_t *outbox)
     return result;
 }
 static dq_result_t add_legacy_owner_done(add_outbox_t *outbox, dq_result_t result,
-                                         bool write_attempted, int captured_error)
+                                         lf_operation_t operation, int captured_error)
 {
     if (!(result == DQ_EMPTY && outbox->legacy.empty_cached &&
           outbox->owner_bytes_known && !outbox->owner_bytes)) {
@@ -3342,9 +3351,8 @@ static dq_result_t add_legacy_owner_done(add_outbox_t *outbox, dq_result_t resul
     }
     if (result != DQ_OK && result != DQ_EMPTY && result != DQ_PENDING && result != DQ_FULL)
         outbox->depth_known = false;
-    /* Refused admission and reads are not failed attendance writes. The
-     * actual write result, including close failure, remains latched by QS. */
-    qs_local_end(!write_attempted || result == DQ_OK, captured_error);
+    qs_local_end_legacy(outbox == &s_live_outbox ? LF_ADD_LIVE : LF_ADD_BULK,
+        operation, result, captured_error);
     xSemaphoreGive(outbox->lock);
     return result;
 }
@@ -3354,6 +3362,7 @@ dq_result_t add_legacy_owner_append(unsigned lane, const void *bytes, size_t len
         memchr(bytes, 0, length) || memchr(bytes, '\n', length)) return DQ_IO;
     add_outbox_t *outbox = add_legacy_owner_lock(lane);
     if (!outbox) return DQ_PENDING;
+    errno = 0;
     dq_result_t result = add_legacy_owner_prepare(outbox);
     bool attempted = false; int error = 0;
     if (result != DQ_OK) goto done;
@@ -3382,7 +3391,7 @@ dq_result_t add_legacy_owner_append(unsigned lane, const void *bytes, size_t len
     if (ok && counted && outbox->depth < UINT32_MAX) { ++outbox->depth; outbox->depth_known = true; }
     result = ok ? DQ_OK : DQ_IO;
 done:
-    return add_legacy_owner_done(outbox, result, attempted, error);
+    return add_legacy_owner_done(outbox, result, attempted ? LF_APPEND : LF_READ, error ? error : errno);
 }
 dq_result_t add_legacy_owner_peek(unsigned lane, void *bytes, size_t capacity, size_t *length, lq_token_t *token)
 {
@@ -3391,26 +3400,31 @@ dq_result_t add_legacy_owner_peek(unsigned lane, void *bytes, size_t capacity, s
     if (!bytes || capacity < 2 || capacity > ADD_OUTBOX_LINE_BYTES || !length || !token) return DQ_IO;
     add_outbox_t *outbox = add_legacy_owner_lock(lane);
     if (!outbox) return DQ_PENDING;
+    errno = 0;
+    lf_operation_t operation = LF_READ;
     dq_result_t result = add_legacy_owner_prepare(outbox);
     if (result != DQ_OK) goto done;
     if (outbox->legacy.empty_cached) { result = DQ_EMPTY; goto done; }
     result = lq_peek(&outbox->legacy, bytes, capacity, token);
     if (result == DQ_OK) *length = token->end - token->offset;
     else if (result == DQ_EMPTY) {
-        if (!compact_outbox_locked(outbox, true)) result = DQ_IO;
+        if (!compact_outbox_locked(outbox, true)) { result = DQ_IO; operation = LF_RETIRE; }
         else if (!outbox->depth_known || outbox->depth) result = DQ_PENDING; /* Restored generation. */
         else outbox->legacy.empty_cached = true;
     }
 done:
-    return add_legacy_owner_done(outbox, result, false, 0);
+    return add_legacy_owner_done(outbox, result, operation, errno);
 }
 dq_result_t add_legacy_owner_settle(unsigned lane, const lq_token_t *token, bool custody)
 {
     if (!token || token->end <= token->offset) return DQ_IO;
     add_outbox_t *outbox = add_legacy_owner_lock(lane);
     if (!outbox) return DQ_PENDING;
+    errno = 0;
+    lf_operation_t operation = LF_READ;
     dq_result_t result = add_legacy_owner_prepare(outbox);
     if (result == DQ_OK) {
+        operation = LF_RETIRE;
         result = custody ? lq_settle_evidence(&outbox->legacy, token) : lq_settle(&outbox->legacy, token);
         if (result == DQ_OK) {
             outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
@@ -3418,7 +3432,7 @@ dq_result_t add_legacy_owner_settle(unsigned lane, const lq_token_t *token, bool
             if (!compact_outbox_locked(outbox, false)) result = DQ_IO;
         }
     }
-    return add_legacy_owner_done(outbox, result, false, 0);
+    return add_legacy_owner_done(outbox, result, operation, errno);
 }
 #endif
 

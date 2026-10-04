@@ -80,7 +80,10 @@ static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_work
 static bool legacy_healthy;
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,
  .recovery_complete=legacy_healthy,.persistence_verified=legacy_healthy,
- .admission_reserve_bytes=1048576,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit"};}
+ .admission_reserve_bytes=1048576,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit",
+ .legacy={.observed=true,.read_faults=legacy_healthy?0:1,.append_faults=legacy_healthy?0:2,
+ .retire_faults=legacy_healthy?0:3,.read_recoveries=7,.error=legacy_healthy?0:EIO,
+ .queue="ords_pending",.operation="legacy_read"}};}
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
 ''' + runtime_function + functions + r'''
 static cJSON *named(cJSON *array,const char *name){
@@ -129,6 +132,11 @@ int main(void){
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_read_faults")->valueint==1);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_append_faults")->valueint==2);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_retire_faults")->valueint==3);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_read_recoveries")->valueint==7);
+ assert(!strcmp(string(storage,"legacy_error_queue"),"ords_pending"));
  cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==11);
  assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(queues,0),"bytes")->valueint==123);
  assert(!cJSON_HasObjectItem(cJSON_GetArrayItem(queues,1),"bytes"));

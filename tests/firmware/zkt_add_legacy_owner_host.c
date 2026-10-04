@@ -21,7 +21,11 @@ typedef int SemaphoreHandle_t;
 typedef int esp_err_t;
 typedef unsigned nvs_handle_t;
 static bool required = true, owner_task, admission_full, reject;
-static unsigned held, budget, failed_writes, peeks, stats, faults;
+static lf_state_t legacy_health;
+static qs_health_t health;
+#define failed_writes health.write_failures
+#include "legacy_health_actual.inc"
+static unsigned held, budget, peeks, stats, faults;
 static int io_fault, nvs_fault;
 enum { SHORT_WRITE = 1, FLUSH, SYNC, CLOSE, RENAME, STAT, RESTORE };
 static lq_checkpoint_t committed[2], pending_checkpoint;
@@ -153,6 +157,7 @@ int main(void)
     lq_token_t first=token, wrong=token;wrong.crc^=1;
     assert(zq_legacy_settle(0,&wrong,false)==DQ_STALE);
     nvs_fault=2;assert(zq_legacy_settle(0,&token,false)==DQ_IO);
+    assert(health.legacy.retire_faults==1 && !health.legacy.read_faults && health.write_failures==1);
     expect(0,"same\n");settle(0,false);
     assert(zq_legacy_settle(0,&first,false)==DQ_STALE);
     expect(0,"same\n");assert(token.offset==5);settle(0,false);
@@ -194,9 +199,12 @@ int main(void)
      * storage or authorize append/create. */
     io_fault=STAT;assert(zq_legacy_append(0,"stat",4,QS_ADMIT_LIVE)==DQ_IO && !io_fault);
     assert(stat("live.jsonl",&st)!=0 && errno==ENOENT);
+    assert(health.legacy.read_faults==1 && legacy_health.errors[LF_ADD_LIVE][LF_READ]==EIO);
     char maximum[8190];memset(maximum,'m',sizeof(maximum));
     assert(zq_legacy_append(0,maximum,sizeof(maximum),QS_ADMIT_LIVE)==DQ_OK);
+    assert(health.legacy.read_faults==1); /* A producer is not a complete read proof. */
     assert(peek(0)==DQ_OK && copied_length==8191 && copied[8190]=='\n' && !memcmp(copied,maximum,sizeof(maximum)));
+    assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && health.legacy.append_faults==1 && health.legacy.retire_faults==1);
     settle(0,false);
     /* Lost append and retirement replies never authorize a different item. */
     lose_operation=ZQ_APPEND_COMMIT;
@@ -221,6 +229,9 @@ int main(void)
     expect(0,"during\n");settle(0,false);
     /* A reboot reloads the checkpoint; no old text cursor can skip bytes. */
     s_bulk_outbox.owner_initialized=false;memset(&s_bulk_outbox.legacy,0,sizeof(s_bulk_outbox.legacy));
-    nvs_fault=1;assert(peek(1)==DQ_IO);nvs_fault=0;assert(peek(1)==DQ_EMPTY);
+    nvs_fault=1;assert(peek(1)==DQ_IO);
+    assert(health.legacy.read_faults==1 && legacy_health.errors[LF_ADD_BULK][LF_READ]==EIO);
+    nvs_fault=0;assert(peek(1)==DQ_EMPTY);
+    assert(!health.legacy.read_faults && health.legacy.read_recoveries==2 && health.legacy.retire_faults==1);
     puts("actual ADD legacy owner: generations, faults, copied replies, prefix recovery and custody passed");
 }

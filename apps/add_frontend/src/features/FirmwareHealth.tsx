@@ -9,6 +9,14 @@ const labels: Record<string, string> = {
   capture: 'Terminal capture', storage_owner: 'Journal storage', journal: 'Preserved journal',
   journal_add_delivery: 'Journal ADD delivery', legacy_add_delivery: 'Retained ADD delivery',
   legacy_ords_delivery: 'Retained Oracle delivery', legacy_migration: 'Legacy custody transfer',
+  add_live: 'Retained live attendance', add_bulk: 'Retained historical attendance',
+  ords_pending: 'Retained Oracle pending', identity_blocked: 'Retained identity exceptions',
+  ords_quarantine: 'Oracle preserved evidence', add_quarantine: 'ADD preserved evidence',
+  add_quarantine_backup: 'ADD preserved evidence backup',
+}
+const legacyOperations: Record<string, string> = {
+  legacy_read: 'reading preserved records', legacy_append: 'preserving a record',
+  legacy_retire: 'checkpointing preserved custody',
 }
 const countReasons: Record<string, string> = {
   VERIFIED_EMPTY: 'Empty queue verified', NONEMPTY_OR_UNVERIFIED: 'Pending inventory not yet verified',
@@ -63,7 +71,9 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
     Math.max(0, ownerAge) + Math.max(0, now - observed) <= 45_000
   const journalStorageVerified = ownerFresh && journalStorage?.ready && journalStorage.durability === 'HEALTHY' &&
     !journalStorage.checkpoint_recovery_pending && (!journalStorage.last_append_result || journalStorage.last_append_result === 'OK')
-  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error &&
+  const legacyNeedsAttention = Boolean(storage?.legacy_read_faults || storage?.legacy_append_faults ||
+    storage?.legacy_retire_faults || storage?.legacy_error_code)
+  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error && !legacyNeedsAttention &&
     (diagnostics?.runtime_profile !== 'ZKT_JOURNAL_V1' || journalStorageVerified)
   const journalNeedsAttention = ownerFresh && journalStorage &&
     (['DEGRADED', 'FULL'].includes(journalStorage.durability) || !journalStorage.ready ||
@@ -72,7 +82,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
     : !sameBoot ? 'Durability boot identity is unverified'
       : !fresh ? 'Durability telemetry is stale'
       : verified ? 'Local storage verified'
-        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || journalNeedsAttention ? 'Local storage needs attention'
+        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Local storage needs attention'
           : 'Local recovery checks pending'
   return <article className="detail-card wide" aria-label="Firmware preservation health">
     <p className="eyebrow">ATTENDANCE PRESERVATION</p>
@@ -91,6 +101,11 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Reserved admission space</dt><dd>{bytes(storage?.admission_reserve_bytes)}</dd></div>
         <div><dt>Write failures</dt><dd>{storage?.write_failures ?? 'Not reported'}</dd></div>
         <div><dt>Read failures</dt><dd>{storage?.read_failures ?? 'Not reported'}</dd></div>
+        <div><dt>Active legacy read faults</dt><dd>{storage?.legacy_read_faults ?? 'Not reported'}</dd></div>
+        <div><dt>Legacy writes awaiting recovery proof</dt><dd>{storage?.legacy_append_faults ?? 'Not reported'}</dd></div>
+        <div><dt>Legacy retirement faults awaiting recovery proof</dt><dd>{storage?.legacy_retire_faults ?? 'Not reported'}</dd></div>
+        <div><dt>Legacy read faults recovered since boot</dt><dd>{storage?.legacy_read_recoveries ?? 'Not reported'}</dd></div>
+        {!!storage?.legacy_error_code && <div><dt>Active legacy storage error</dt><dd>{labels[storage.legacy_error_queue || ''] || 'Queue not reported'} · {legacyOperations[storage.legacy_error_operation || ''] || 'Operation not reported'} · {storage.legacy_error_code}</dd></div>}
         <div><dt>Persistence probe failures</dt><dd>{storage?.persistence_probe_failures ?? 'Not reported'}</dd></div>
         <div><dt>Probe failures since boot</dt><dd>{storage?.persistence_probe_total_failures ?? 'Not reported'}</dd></div>
         {!!storage?.persistence_probe_error && <div><dt>Active persistence probe error</dt><dd>{storage.persistence_probe_operation || 'Operation not reported'} · {storage.persistence_probe_error}</dd></div>}

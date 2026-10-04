@@ -13,6 +13,7 @@ def test_legacy_quarantine_requires_exact_durable_custody(tmp_path):
                    source.index("static void ords_uploader_task(void *arg)")]
     program = r'''
 #include "legacy_queue.h"
+#include "legacy_storage_health.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
