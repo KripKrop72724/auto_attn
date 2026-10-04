@@ -69,8 +69,9 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             memset(&s->read_token, 0, sizeof(s->read_token));
             memset(&s->legacy_read_token, 0, sizeof(s->legacy_read_token));
             size_t length = 0;
-            if (r->domain == ZQ_ADD_LEGACY) {
-                out->result = s->legacy.peek ? s->legacy.peek(r->lane, s->read_bytes,
+            if (r->domain != ZQ_SEGMENTED) {
+                zq_legacy_port_t *port = r->domain == ZQ_ADD_LEGACY ? &s->legacy : &s->quarantine;
+                out->result = port->peek ? port->peek(r->lane, s->read_bytes,
                     sizeof(s->read_bytes), &length, &s->legacy_read_token) : DQ_IO;
             } else out->result = qs_peek((qs_lane_t)r->lane, s->read_bytes,
                                   sizeof(s->read_bytes), &length, &s->read_token);
@@ -97,8 +98,10 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             out->legacy_token = s->legacy_read_token;
             break;
         case ZQ_SETTLE:
-            if (r->domain == ZQ_ADD_LEGACY) out->result = s->legacy.settle ?
-                s->legacy.settle(r->lane, &r->legacy_token, r->custody) : DQ_IO;
+            if (r->domain != ZQ_SEGMENTED) {
+                zq_legacy_port_t *port = r->domain == ZQ_ADD_LEGACY ? &s->legacy : &s->quarantine;
+                out->result = port->settle ? port->settle(r->lane, &r->legacy_token, r->custody) : DQ_IO;
+            }
             else out->result = qs_settle((qs_lane_t)r->lane, &r->token);
             break;
         case ZQ_SNAPSHOT:

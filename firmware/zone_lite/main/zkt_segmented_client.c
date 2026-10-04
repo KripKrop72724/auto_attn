@@ -47,7 +47,7 @@ static void end(client_t *client)
 { atomic_flag_clear_explicit(&client->busy, memory_order_release); }
 static dq_result_t append(zq_domain_t domain, unsigned lane, const void *data, size_t length, qs_admission_t policy)
 {
-    if (lane >= (domain == ZQ_ADD_LEGACY ? 2U : QS_COUNT) || (unsigned)policy > QS_ADMIT_RECOVERY ||
+    if (lane >= zq_domain_lanes(domain) || (unsigned)policy > QS_ADMIT_RECOVERY ||
         !data || !length || length > DQ_MAX_RECORD_BYTES) return DQ_IO;
     client_t *client = &clients[0]; uint64_t deadline;
     if (!begin(client, &deadline)) return DQ_PENDING;
@@ -82,8 +82,8 @@ static dq_result_t peek(zq_domain_t domain, unsigned lane, void *data, size_t ca
     if (length) *length = 0;
     if (token) memset(token, 0, sizeof(*token));
     if (legacy_token) memset(legacy_token, 0, sizeof(*legacy_token));
-    if (lane >= (domain == ZQ_ADD_LEGACY ? 2U : QS_COUNT) || !data || !capacity || !length ||
-        (domain == ZQ_ADD_LEGACY ? !legacy_token : !token)) return DQ_IO;
+    if (lane >= zq_domain_lanes(domain) || !data || !capacity || !length ||
+        (domain != ZQ_SEGMENTED ? !legacy_token : !token)) return DQ_IO;
     client_t *client = &clients[1]; uint64_t deadline;
     if (!begin(client, &deadline)) return DQ_PENDING;
     zq_request_t in = {.operation = ZQ_PEEK_BEGIN, .lane = (uint8_t)lane,
@@ -100,7 +100,7 @@ static dq_result_t peek(zq_domain_t domain, unsigned lane, void *data, size_t ca
         result = call(client, &in, &out);
         if (result != DQ_OK) goto done;
         size_t expected = total - in.offset > ZQ_CHUNK_BYTES ? ZQ_CHUNK_BYTES : total - in.offset;
-        bool token_matches = domain == ZQ_ADD_LEGACY ? same_legacy_token(&out.legacy_token, &legacy_copied) :
+        bool token_matches = domain != ZQ_SEGMENTED ? same_legacy_token(&out.legacy_token, &legacy_copied) :
             !memcmp(&out.token, &copied, sizeof(copied));
         if (out.transfer != in.transfer || out.total != total || out.length != expected || !token_matches) {
             result = DQ_CORRUPT; goto done;
@@ -109,7 +109,7 @@ static dq_result_t peek(zq_domain_t domain, unsigned lane, void *data, size_t ca
         in.offset += out.length;
     }
     *length = total;
-    if (domain == ZQ_ADD_LEGACY) *legacy_token = legacy_copied;
+    if (domain != ZQ_SEGMENTED) *legacy_token = legacy_copied;
     else *token = copied;
 done:
     if (result != DQ_OK && in.offset) memset(data, 0, in.offset);
@@ -123,6 +123,8 @@ dq_result_t zq_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length,
 { return peek(ZQ_SEGMENTED, (unsigned)lane, data, capacity, length, token, NULL); }
 dq_result_t zq_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token)
 { return peek(ZQ_ADD_LEGACY, lane, data, capacity, length, NULL, token); }
+dq_result_t zq_evidence_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token)
+{ return peek(ZQ_QUARANTINE, lane, data, capacity, length, NULL, token); }
 static dq_result_t simple(zq_request_t *in, zq_reply_t *out)
 {
     client_t *client = &clients[2];
@@ -142,6 +144,14 @@ dq_result_t zq_legacy_settle(unsigned lane, const lq_token_t *token, bool custod
     if (lane >= 2 || !token || token->end <= token->offset) return DQ_IO;
     zq_request_t in = {.operation = ZQ_SETTLE, .lane = (uint8_t)lane, .domain = ZQ_ADD_LEGACY,
         .legacy_token = *token, .custody = custody};
+    zq_reply_t out;
+    return simple(&in, &out);
+}
+dq_result_t zq_evidence_settle(unsigned lane, const lq_token_t *token)
+{
+    if (lane >= 3 || !token || token->end <= token->offset) return DQ_IO;
+    zq_request_t in = {.operation = ZQ_SETTLE, .lane = (uint8_t)lane, .domain = ZQ_QUARANTINE,
+        .legacy_token = *token, .custody = true};
     zq_reply_t out;
     return simple(&in, &out);
 }
