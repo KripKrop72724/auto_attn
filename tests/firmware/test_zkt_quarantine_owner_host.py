@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_quarantine_custody_storage_owner_and_family_paths(tmp_path):
     main = ROOT / "firmware/zone_lite/main"
     source = (main / "zone_lite.c").read_text()
-    actual = source[source.index("static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)\n{"):
-                    source.index("static void oracle_drain_pending(bool live_first)")]
+    checkpoint_start = source.index("static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint)\n{")
+    actual = source[checkpoint_start:source.index("\n#if defined(ZONE_LITE_QUEUE_OWNER)", checkpoint_start)]
     actual += source[source.index("static legacy_queue_t g_legacy_quarantine[3];"):
                      source.index("static void ords_uploader_task(void *arg)")]
     (tmp_path / "quarantine_actual.inc").write_text(actual)

@@ -5,7 +5,7 @@
 
 #define ZQ_CHUNK_BYTES 512U
 #define ZQ_DEADLINE_US 10000000ULL
-typedef enum { ZQ_SEGMENTED, ZQ_ADD_LEGACY, ZQ_QUARANTINE } zq_domain_t;
+typedef enum { ZQ_SEGMENTED, ZQ_ADD_LEGACY, ZQ_QUARANTINE, ZQ_ATTENDANCE_LEGACY } zq_domain_t;
 typedef enum { ZQ_APPEND_BEGIN, ZQ_APPEND_CHUNK, ZQ_APPEND_COMMIT,
     ZQ_PEEK_BEGIN, ZQ_PEEK_CHUNK, ZQ_SETTLE, ZQ_SNAPSHOT, ZQ_GENERATION,
     ZQ_RECOVER, ZQ_PROBE } zq_operation_t;
@@ -42,7 +42,7 @@ typedef struct {
     uint8_t append_lane, append_policy, read_lane, append_domain, read_domain;
     dq_token_t read_token;
     lq_token_t legacy_read_token;
-    zq_legacy_port_t legacy, quarantine;
+    zq_legacy_port_t legacy, quarantine, attendance;
     /* Allocated with the owner in PSRAM, never on a caller/task stack. */
     uint8_t append_bytes[DQ_MAX_RECORD_BYTES], read_bytes[DQ_MAX_RECORD_BYTES];
 } zq_store_t;
@@ -50,7 +50,7 @@ typedef struct {
 static inline unsigned zq_domain_lanes(unsigned domain)
 {
     return domain == ZQ_SEGMENTED ? QS_COUNT : domain == ZQ_ADD_LEGACY ? 2U :
-        domain == ZQ_QUARANTINE ? 3U : 0U;
+        domain == ZQ_QUARANTINE ? 3U : domain == ZQ_ATTENDANCE_LEGACY ? 2U : 0U;
 }
 static inline bool zq_request_valid(const zq_request_t *r)
 {
@@ -95,3 +95,6 @@ dq_result_t zq_legacy_settle(unsigned lane, const lq_token_t *token, bool custod
 /* Retained corrupt-file evidence is read-only except exact custody retirement. */
 dq_result_t zq_evidence_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token);
 dq_result_t zq_evidence_settle(unsigned lane, const lq_token_t *token);
+dq_result_t zq_attendance_legacy_append(unsigned lane, const void *data, size_t length, qs_admission_t policy);
+dq_result_t zq_attendance_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token);
+dq_result_t zq_attendance_legacy_settle(unsigned lane, const lq_token_t *token, bool custody);

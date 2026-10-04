@@ -11,7 +11,8 @@ def test_boot_mount_journal_start_and_downgrade_scan_share_namespace(tmp_path):
     gateway = (main / "zone_lite.c").read_text()
     runtime = (main / "zkt_journal_runtime.c").read_text()
     constants = "\n".join(line for line in gateway.splitlines() if line.startswith(tuple(
-        f"#define {name} " for name in ("STORAGE_BASE", "PENDING_PATH", "BLOCKED_PATH", "ACKED_PATH"))))
+        f"#define {name} " for name in ("STORAGE_BASE", "PENDING_PATH", "PENDING_BACKUP_PATH", "PENDING_TMP_PATH",
+                                       "BLOCKED_PATH", "BLOCKED_RECOVERY_BACKUP_PATH", "BLOCKED_RECOVERY_TMP_PATH", "ACKED_PATH"))))
     actual = constants + "\n" + gateway[gateway.index("static bool g_queue_store_ready;"):
                                         gateway.index("static const char *oracle_capture_type(")]
     actual += runtime[runtime.index("static bool start_owner("):runtime.index("static bool owner_health(")]
