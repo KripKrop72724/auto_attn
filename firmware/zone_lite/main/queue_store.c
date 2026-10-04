@@ -244,14 +244,25 @@ bool qs_recover_step(void)
     return false; /* Hikvision retains its existing independent recovery path. */
 #else
     bool complete = true;
-    for (unsigned i = 0; i < QS_COUNT; ++i) {
+    unsigned first = 0, count = QS_COUNT;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    bool owned = zj_runtime_checkpoint_required() && zj_owner_is_current_task();
+    if (owned) {
+        static unsigned next_lane;
+        first = next_lane; next_lane = (next_lane + 1U) % QS_COUNT;
+        count = 1; /* Yield to live work between retained queue records. */
+    }
+#endif
+    for (unsigned at = 0; at < count; ++at) {
+        unsigned i = first + at;
         if (!lock((qs_lane_t)i)) return false;
         if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
             xSemaphoreGive(lanes[i].mutex); return false;
         }
         errno = 0;
         dq_result_t result = reopen(&lanes[i]);
-        if (result == DQ_OK && !recovery_audits[i].complete)
+        if (result == DQ_OK && (!recovery_audits[i].complete ||
+            recovery_audits[i].generation != lanes[i].queue.checkpoint.generation))
             result = dq_audit_step(&lanes[i].queue, &recovery_audits[i],
                 recovery_buffer, sizeof(recovery_buffer));
         if (result != DQ_OK) complete = false;
@@ -259,6 +270,15 @@ bool qs_recover_step(void)
         xSemaphoreGive(budget_lock);
         xSemaphoreGive(lanes[i].mutex);
     }
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (owned) {
+        /* This task is the only segmented writer after handoff. A completed
+         * audit of an older checkpoint is never current recovery evidence. */
+        for (unsigned i = 0; i < QS_COUNT; ++i)
+            if (!lanes[i].queue.ready || !recovery_audits[i].complete ||
+                recovery_audits[i].generation != lanes[i].queue.checkpoint.generation) complete = false;
+    }
+#endif
     if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         health.recovery_complete = complete && !health.last_error;
         complete = health.recovery_complete;

@@ -13,6 +13,12 @@ also run there. Shared admission, queue tokens, encrypted-NVS checkpoints and
 the existing segmented file format are unchanged. Old flat-file attendance
 queues still require a separate handoff.
 
+An owner recovery request audits at most one retained record from one lane.
+Lanes rotate even when one fails; live requests can run between these steps.
+Unchanged completed audits reuse their verified result. A changed checkpoint
+generation invalidates that evidence and requires another audit. Bootstrap
+retains its existing bounded pass across the lanes.
+
 An eight-kilobyte record uses two fixed owner buffers allocated in PSRAM, one
 for append assembly and one for read snapshots. Each mailbox request or reply
 copies at most 512 payload bytes. Buffers never reference caller memory. A

@@ -35,3 +35,16 @@ def test_actual_queue_entrypoints_route_without_storage_fallback(tmp_path):
                     "-I", str(tmp_path), "-I", str(main),
                     str(ROOT / "tests/firmware/zkt_segmented_routing_host.c"), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
+
+
+def test_actual_recovery_yields_between_lanes_and_checks_current_generation(tmp_path):
+    main = ROOT / "firmware/zone_lite/main"
+    source = (main / "queue_store.c").read_text()
+    actual = source[source.index("bool qs_recover_step("):source.index("bool qs_verify_persistence(")]
+    (tmp_path / "segmented_recovery_actual.inc").write_text(actual)
+    binary = tmp_path / "segmented-recovery"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                    "-I", str(tmp_path), "-I", str(main),
+                    str(ROOT / "tests/firmware/zkt_segmented_recovery_host.c"), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
