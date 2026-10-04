@@ -915,7 +915,7 @@ def test_identity_catalog_has_bounded_memory_fallback_under_storage_pressure():
     assert "s_identity_catalog_active_aliases" in lookup
     assert "if (memory_catalog_valid) return found;" in lookup
     assert lookup.index("s_identity_catalog_active_aliases") < lookup.index(
-        "fopen(ADD_IDENTITY_CATALOG_PATH"
+        "catalog_stream_open("
     )
 
 

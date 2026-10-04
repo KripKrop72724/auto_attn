@@ -6,7 +6,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
 source = (ROOT / "firmware/zone_lite/main/add_connector.c").read_text()
-functions = source[source.index("static cJSON *load_catalog_for_tombstone("):
+functions = source[source.index("/* Catalog stream adapter:"):
+                   source.index("static void recover_identity_catalog_backup_if_active_missing(")]
+functions += source[source.index("static cJSON *load_catalog_for_tombstone("):
                    source.index("static bool append_cancelled_command(")]
 functions += source[source.index("static bool add_connector_lookup_identity_locked("):
                     source.index("uint32_t add_connector_identity_catalog_generation(")]
@@ -78,6 +80,20 @@ int main(void){
  s_identity_catalog_active_memory_valid=true;
  assert(add_connector_lookup_identity("removed",NULL,display,sizeof(display),NULL,0,NULL));
  assert(!strcmp(display,"Stale alias"));
+ s_identity_catalog_active_memory_valid=false;
+ seed("{\"rows_count\":1}\n{\"user_id\":\"test\",\"display_name\":\"Name\",\"cnic\":\"synthetic\"}\n");
+ char identity[32]={0};bool shift=true;fail_close=true;
+ assert(!add_connector_lookup_identity("test",NULL,display,sizeof(display),identity,sizeof(identity),&shift));
+ assert(!display[0]&&!identity[0]&&!shift);fail_close=false;
+ assert(add_connector_lookup_identity("test",NULL,display,sizeof(display),identity,sizeof(identity),&shift));
+ assert(!strcmp(display,"Name")&&!strcmp(identity,"synthetic"));
+ const char *incomplete[]={"{\"rows_count\":2}\n{\"user_id\":\"test\",\"display_name\":\"Name\"}\n",
+ "{\"rows_count\":1}\n{\"user_id\":\"test\",\"display_name\":\"Name\"}\n{}\n",
+ "{\"rows\":[{\"user_id\":\"test\",\"display_name\":\"Name\"}]}\ntruncated"};
+ for(unsigned i=0;i<sizeof(incomplete)/sizeof(incomplete[0]);++i){
+  seed(incomplete[i]);assert(!add_connector_lookup_identity("test",NULL,display,sizeof(display),identity,sizeof(identity),&shift));
+  assert(!display[0]&&!identity[0]&&!shift);
+ }
  puts("catalog tombstone allocation and invalidated alias regressions passed");
 }
 '''

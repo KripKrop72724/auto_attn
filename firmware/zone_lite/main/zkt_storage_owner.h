@@ -33,7 +33,7 @@ typedef struct {
  * Wi-Fi entropy source are initialized. Only a qualified reader/writer gate
  * may enable this task. Starting it is NOT a compatibility certificate.
  * This module exclusively owns journal files, its NVS namespace and new-image
- * runtime_v1 checkpoint writes in zone_lite, plus new-image catalog mutations
+ * runtime_v1 checkpoint writes in zone_lite, plus new-image catalog reads/mutations
  * and the existing catalog NVS checkpoint. New-image command inbox reads,
  * replacements and their existing NVS checkpoint also run here, along with
  * processed/cancelled command-ID cache operations. Legacy attendance still
