@@ -514,8 +514,14 @@ Index("ix_add_zkt_work_interpretation", ZktCustodyWork.connector_id,
       ZktCustodyWork.interpretation_version, ZktCustodyWork.id)
 Index("ix_add_zkt_work_recent_live", ZktCustodyWork.connector_id,
       ZktCustodyWork.created_at, ZktCustodyWork.id,
-      postgresql_where=text("kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"),
-      sqlite_where=text("kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"))
+      postgresql_where=text("next_attempt_at is not null and kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"),
+      sqlite_where=text("next_attempt_at is not null and kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT')"))
+Index("ix_add_zkt_work_revision_hold", ZktCustodyWork.connector_id,
+      ZktCustodyWork.interpretation_version, ZktCustodyWork.created_at, ZktCustodyWork.id,
+      postgresql_where=text("next_attempt_at is null and state != 'HELD_EXCEPTION' and "
+                            "kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT','SOURCE_LEDGER','SOURCE_RECORD')"),
+      sqlite_where=text("next_attempt_at is null and state != 'HELD_EXCEPTION' and "
+                        "kind in ('LIVE_PACKET','LIVE_FRAME','PACKET_FRAGMENT','SOURCE_LEDGER','SOURCE_RECORD')"))
 
 
 class ZktCustodySchedule(Base):

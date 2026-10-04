@@ -2,14 +2,16 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import json
 from pathlib import Path
+import re
 from threading import Event
 
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import pytest
-from sqlalchemy import insert, select, text
+from sqlalchemy import event, insert, select, text
 
 from test_zkt_source_load import store as store
 from zk_add import zkt_custody_work as work, zkt_derived_evidence as derived
@@ -95,6 +97,39 @@ def test_old_decoder_hold_gets_a_turn_despite_null_retry_time(priority_store, mo
         db.commit()
         assert work.advance_work(db, limit=1) == 1
         assert seen == [old]
+
+
+def test_decoder_revision_preserves_explicit_backoff_and_excludes_invalid_holds(priority_store, monkeypatch):
+    seen = []
+    inspector(monkeypatch, seen)
+    with priority_store() as db:
+        delayed = db.get(ZktCustodyWork, add_work(db, 1, kind="LIVE_PACKET", age=-30))
+        delayed.created_at = NOW - timedelta(seconds=1)
+        invalid = db.get(ZktCustodyWork, add_work(db, 2, due=False))
+        invalid.state = "HELD_EXCEPTION"
+        add_work(db, 3, kind="UNKNOWN", due=False)
+        add_work(db, 4, due=False, version=derived.INTERPRETATION_VERSION)
+        db.commit()
+        assert work.advance_work(db) == 0
+        delayed.next_attempt_at = NOW
+        db.commit()
+        assert work.advance_work(db) == 1
+        assert seen == [delayed.id]
+
+
+def test_revision_ranges_make_progress_once_without_reading_current_holds(priority_store, monkeypatch):
+    seen = []
+    inspector(monkeypatch, seen)
+    with priority_store() as db:
+        expected = [add_work(db, i, due=False, version=version)
+                    for i, version in enumerate((None, "a", "b", "zz", "zzz"))]
+        add_work(db, 100, due=False, version=derived.INTERPRETATION_VERSION)
+        db.commit()
+        for _ in expected:
+            assert work.advance_work(db, limit=1) == 1
+            db.commit()
+        assert set(seen) == set(expected)
+        assert work.advance_work(db) == 0
 
 
 def test_priority_uses_bounded_server_intake_window(priority_store, monkeypatch):
@@ -205,6 +240,61 @@ def test_large_due_history_does_not_hide_recent_intake(priority_store, monkeypat
         assert seen == [recent]
 
 
+def test_generic_plans_skip_retained_holds_without_full_scan_or_sort(priority_store, monkeypatch):
+    if priority_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL prepared-plan workload")
+    from psycopg import sql
+    inspector(monkeypatch, [])
+    statements = []
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT") and "add_zkt_custody_work" in statement:
+            statements.append((statement, parameters))
+    with priority_store() as db:
+        connector_id = db.scalar(select(Connector.id))
+        for start in range(0, 200000, 5000):
+            db.execute(insert(ZktCustodyWork), [dict(work_key=f"{index:064x}", connector_id=connector_id,
+                kind="LIVE_PACKET", terminal_serial="TEST-LOAD", state="WAIT_PROFILE", reason_code="PENDING",
+                owner="ADD_PROTOCOL", created_at=NOW-timedelta(seconds=5),
+                interpretation_version=derived.INTERPRETATION_VERSION) for index in range(start, start + 5000)])
+        for index, version in enumerate((None, "a", "zz"), 200000):
+            add_work(db, index, due=False, version=version)
+        add_work(db, 200003, kind="LIVE_PACKET", age=0)
+        db.commit()
+        db.execute(text("ANALYZE add_zkt_custody_work"))
+        connection = db.connection()
+        event.listen(connection, "before_cursor_execute", capture)
+        try:
+            assert work.advance_work(db, limit=1) == 1
+        finally:
+            event.remove(connection, "before_cursor_execute", capture)
+        # EXPLAIN the actual emitted statements with server-side generic plans,
+        # including safely rendered fixed predicates, rather than a toy query.
+        cursor = connection.connection.driver_connection.cursor()
+        cursor.execute("SET LOCAL plan_cache_mode = force_generic_plan")
+        cursor.execute("SET LOCAL statement_timeout = '2000ms'")
+        indexes = set()
+        def visit(node):
+            if node.get("Relation Name") == "add_zkt_custody_work" and node.get("Actual Loops", 0):
+                assert node["Node Type"] != "Seq Scan", json.dumps(node)
+                assert node.get("Actual Rows", 0) + node.get("Rows Removed by Filter", 0) <= 20, json.dumps(node)
+                assert node.get("Rows Removed by Index Recheck", 0) <= 20
+            if "Index Name" in node:
+                indexes.add(node["Index Name"])
+            for child in node.get("Plans", []):
+                visit(child)
+        for number, (statement, parameters) in enumerate(statements):
+            keys = list(dict.fromkeys(re.findall(r"%\((\w+)\)s", statement)))
+            prepared = re.sub(r"%\((\w+)\)s", lambda match: "$" + str(keys.index(match[1]) + 1), statement)
+            name = sql.Identifier(f"custody_plan_{number}")
+            cursor.execute(sql.SQL("PREPARE {} AS {}").format(name, sql.SQL(prepared)))
+            values = sql.SQL(",").join(sql.Literal(parameters[key]) for key in keys)
+            cursor.execute(sql.SQL("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE {} ({})").format(name, values))
+            visit(cursor.fetchone()[0][0]["Plan"])
+            cursor.execute(sql.SQL("DEALLOCATE {}").format(name))
+        cursor.close()
+        assert {"ix_add_zkt_work_due", "ix_add_zkt_work_revision_hold", "ix_add_zkt_work_recent_live"} <= indexes
+
+
 def test_additive_migration_retains_counter_on_backend_rollback(priority_store, monkeypatch):
     path = Path(__file__).resolve().parents[2] / "apps/add_backend/migrations/versions/20261004_0049_zkt_custody_priority.py"
     spec = importlib.util.spec_from_file_location("priority_migration", path)
@@ -215,6 +305,7 @@ def test_additive_migration_retains_counter_on_backend_rollback(priority_store, 
         ops = Operations(MigrationContext.configure(connection))
         ZktCustodySchedule.__table__.drop(connection)
         ops.drop_index("ix_add_zkt_work_recent_live", table_name="add_zkt_custody_work")
+        ops.drop_index("ix_add_zkt_work_revision_hold", table_name="add_zkt_custody_work")
         monkeypatch.setattr(migration, "op", ops)
         migration.upgrade()
         migration.upgrade()

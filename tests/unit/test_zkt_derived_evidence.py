@@ -368,10 +368,16 @@ def test_additive_migration_is_idempotent_and_downgrade_keeps_evidence(source_st
         ops = Operations(MigrationContext.configure(connection))
         ZktDerivedEvidence.__table__.drop(connection)
         ops.drop_index("ix_add_zkt_work_interpretation", table_name="add_zkt_custody_work")
+        # The fixture starts at current metadata. Remove the later 0049
+        # dependency before recreating the column introduced by 0048.
+        future_index = next(index for index in ZktCustodyWork.__table__.indexes
+                            if index.name == "ix_add_zkt_work_revision_hold")
+        future_index.drop(connection)
         ops.drop_column("add_zkt_custody_work", "interpretation_version")
         monkeypatch.setattr(migration, "op", ops)
         migration.upgrade()
         migration.upgrade()
+        future_index.create(connection)
         tables = {"add_zkt_custody_work", "add_zkt_derived_evidence"}
         context = MigrationContext.configure(connection, opts={
             "include_object": lambda obj, name, kind, reflected, compare_to: kind != "table" or name in tables})

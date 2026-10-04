@@ -46,23 +46,60 @@ Database statement/time budgets and connector rotation still apply. A large
 packet can span several ticks without retaining a transaction or lock between
 them. Database workload qualification remains distinct from field latency.
 
-Migration `0049` adds committed per-connector scheduling state and an index for
-recent live intake. The worker prefers live packet/fragment groups received by
+Migration `0049` adds committed per-connector scheduling state and partial indexes
+for pending live intake and revision-held work. The worker prefers due live packet/fragment groups received by
 ADD in the preceding 60 seconds, newest first. After at most eight such steps,
-it services the oldest eligible group before starting another burst. Old decoder
-holds with no retry timestamp retain their original intake age for this turn.
+it services an older candidate before starting another burst. Explicit retry
+deadlines take precedence over decoder changes. Revision-only holds drain in
+index order through three disjoint version ranges (null, below and above the
+current version); these comparisons schedule work and do not rank decoder trust.
+Each range supplies a bounded page ordered by version, intake time and ID.
+The merge of those pages and the oldest due page uses the original intake time
+for holds without a retry timestamp. Current-version holds are skipped by the
+index, and settled live records are excluded from the recent-intake index.
 This uses ADD's intake time only; it does not trust a terminal timestamp or treat
 an uploaded offline packet as independently verified real-time evidence.
 
 The burst counter commits with the interpretation step under the existing
 connector-first lock. Failed transactions cannot consume a historical turn;
-restarted and concurrent workers inherit committed fairness. Each of the two
+restarted and concurrent workers inherit committed fairness. Each of the five
 candidate queries is limited to the connector's batch quota, their union is
 deduplicated, and at most that quota is inspected. A partially interpreted packet
 receives at most one step in a batch. Rotation, lock skipping, statement deadlines
 and the overall tick budget continue to apply. Downgrade retains the counter.
 This scheduler does not establish ESP backlog catch-up, Oracle latency or fleet
 capacity; those require their own integrated qualification.
+
+The queries preserve index ordering instead of sorting all retained work by a
+coalesced retry/intake expression. Connector discovery uses independent indexed
+ordered one-row probes. Fixed index predicates remain visible in prepared generic
+plans. PostgreSQL qualification checks the actual emitted plans against 200,000
+current-version holds as well as a large due backlog.
+
+`scripts/run_zkt_custody_load.py` drives the real receipt handler and inspector
+against a fresh database in an explicitly named local PostgreSQL container. Its
+default load is 17 synthetic connectors, ten single-item envelopes per second
+each, for 900 seconds. It uses 2,048 synthetic user references per connector,
+replays a committed response every 97 observations, and restarts the inspector
+object every five minutes. The runner has a hard intake interval and separate
+bounded drain interval; unsent observations fail the offered-load gate. It saves
+progress atomically, including failures, handler latency, scheduled-input-to-commit
+latency, database counts and replay counts. Its database is removed after the
+final report; a still-running worker prevents removal. Use a new output path for
+each run:
+
+```sh
+python scripts/run_zkt_custody_load.py --postgres-container local-test-postgres \
+  --postgres-user add_service --output /protected/evidence/custody-load.json
+```
+
+The container must expose PostgreSQL only on loopback and use a local Docker
+daemon. The runner ignores deployment settings, generates a fresh encryption
+key and never starts external delivery. A pass only establishes this backend
+component's behavior on the measured host. Socket/TLS latency, the ESP journal,
+Oracle completion, terminal models, seven-day capacity and field HIL require
+separate evidence. Record the host's resources and competing workloads with
+the report; a ten-second smoke run cannot replace the full burst.
 
 The ordinary custody API returns only interpretation status, version, sampling
 time and current-input/current-decoder flags. It never returns protected facts.

@@ -11,8 +11,9 @@ def upgrade() -> None:
     from zk_add.models import ZktCustodySchedule, ZktCustodyWork
     bind = op.get_bind()
     ZktCustodySchedule.__table__.create(bind, checkfirst=True)
-    next(index for index in ZktCustodyWork.__table__.indexes
-         if index.name == "ix_add_zkt_work_recent_live").create(bind, checkfirst=True)
+    for name in ("ix_add_zkt_work_recent_live", "ix_add_zkt_work_revision_hold"):
+        next(index for index in ZktCustodyWork.__table__.indexes
+             if index.name == name).create(bind, checkfirst=True)
 
 
 def downgrade() -> None:

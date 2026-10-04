@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, timezone
 import hashlib
 import json
 import time
 
 from cryptography.fernet import InvalidToken
 from pydantic import ValidationError
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.crypto import decrypt_json, decrypt_text
@@ -325,6 +325,44 @@ class InspectionBatch:
     locked_connectors: int = 0
 
 
+def _revision_ranges():
+    """Disjoint index ranges skip unchanged holds, even with a generic plan."""
+    version = ZktCustodyWork.interpretation_version
+    return (version.is_(None), version < derived.INTERPRETATION_VERSION,
+            version > derived.INTERPRETATION_VERSION)
+
+
+def _revision_hold():
+    # These are fixed implementation constants, rendered safely by SQLAlchemy.
+    # A prepared statement's generic plan must be able to prove the partial
+    # index predicate; bound kind/state parameters cannot provide that proof.
+    return and_(ZktCustodyWork.next_attempt_at.is_(None),
+        ZktCustodyWork.kind.in_([literal(kind, literal_execute=True)
+                                for kind in sorted(derived.SUPPORTED_KINDS)]),
+        ZktCustodyWork.state != literal("HELD_EXCEPTION", literal_execute=True))
+
+
+def _oldest_candidates(session: Session, connector_id: int, now, quota: int):
+    """Bounded pages avoid sorting a connector's entire retained history.
+
+    Explicit retries retain their deadlines. Revision-only holds drain in
+    version/index order within each range; unchanged versions are never read.
+    """
+    base = select(ZktCustodyWork).where(ZktCustodyWork.connector_id == connector_id)
+    candidates = list(session.scalars(base.where(ZktCustodyWork.next_attempt_at <= now)
+        .order_by(ZktCustodyWork.next_attempt_at, ZktCustodyWork.id)
+        .limit(quota).with_for_update(skip_locked=True)))
+    for version_range in _revision_ranges():
+        candidates.extend(session.scalars(base.where(_revision_hold(), version_range)
+            .order_by(ZktCustodyWork.interpretation_version, ZktCustodyWork.created_at, ZktCustodyWork.id)
+            .limit(quota).with_for_update(skip_locked=True)))
+    # SQLite returns naive stored UTC, while PostgreSQL returns aware values.
+    def age(row):
+        stamp = row.next_attempt_at or row.created_at
+        return (stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp, row.id)
+    return sorted(candidates, key=age)[:quota]
+
+
 def advance_work_batch(session: Session, *, limit: int = 100, after_connector: int = 0,
                        time_budget_ms: int | None = 250, clock=None) -> InspectionBatch:
     """Fair bounded inspection; connector-first locks match custody ingestion.
@@ -338,13 +376,16 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
     now = utc_now()
     # A decoder revision wakes each supported hold once. Unchanged holds do
     # not repeatedly decrypt/scan receipts, and disabled connectors stay idle.
-    eligible = or_(ZktCustodyWork.next_attempt_at <= now, and_(
-        ZktCustodyWork.kind.in_(derived.SUPPORTED_KINDS),
-        ZktCustodyWork.state != "HELD_EXCEPTION",
-        or_(ZktCustodyWork.interpretation_version.is_(None),
-            ZktCustodyWork.interpretation_version != derived.INTERPRETATION_VERSION)))
-    due = select(ZktCustodyWork.id).where(ZktCustodyWork.connector_id == Connector.id,
-        eligible).exists()
+    base = select(ZktCustodyWork.id).where(ZktCustodyWork.connector_id == Connector.id)
+    # EXISTS can pick a sequential scan for a generic plan's estimated first
+    # match. Ordered one-row probes retain index ordering even when a site's
+    # only pending row has just settled and most retained rows are holds.
+    due = or_(base.where(ZktCustodyWork.next_attempt_at <= now)
+        .order_by(ZktCustodyWork.next_attempt_at, ZktCustodyWork.id)
+        .limit(1).scalar_subquery().is_not(None), *(
+            base.where(_revision_hold(), version_range)
+            .order_by(ZktCustodyWork.interpretation_version, ZktCustodyWork.created_at, ZktCustodyWork.id)
+            .limit(1).scalar_subquery().is_not(None) for version_range in _revision_ranges()))
     connectors = session.scalars(select(Connector.id).where(Connector.zkt_custody_enabled.is_(True), due)
         .order_by(Connector.id <= after_connector, Connector.id).limit(maximum)).all()
     quota = max(1, maximum // max(1, len(connectors)))
@@ -369,16 +410,13 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
         # intake is a scheduling hint only, never terminal clock/profile proof.
         # Select bounded candidate pages, not all of a site's retained history.
         recent = session.scalars(select(ZktCustodyWork).where(
-            ZktCustodyWork.connector_id == connector_id, eligible,
-            ZktCustodyWork.kind.in_(LIVE_KINDS),
+            ZktCustodyWork.connector_id == connector_id, ZktCustodyWork.next_attempt_at <= now,
+            ZktCustodyWork.kind.in_([literal(kind, literal_execute=True) for kind in sorted(LIVE_KINDS)]),
             ZktCustodyWork.created_at >= now - timedelta(seconds=RECENT_LIVE_SECONDS),
             ZktCustodyWork.created_at <= now)
             .order_by(ZktCustodyWork.created_at.desc(), ZktCustodyWork.id.desc())
             .limit(quota).with_for_update(skip_locked=True)).all()
-        oldest = session.scalars(select(ZktCustodyWork).where(
-            ZktCustodyWork.connector_id == connector_id, eligible)
-            .order_by(func.coalesce(ZktCustodyWork.next_attempt_at, ZktCustodyWork.created_at), ZktCustodyWork.id)
-            .limit(quota).with_for_update(skip_locked=True)).all()
+        oldest = _oldest_candidates(session, connector_id, now, quota)
         schedule = session.scalar(select(ZktCustodySchedule).where(ZktCustodySchedule.connector_id == connector_id))
         if schedule is None:
             schedule = ZktCustodySchedule(connector_id=connector_id, priority_burst=0)
