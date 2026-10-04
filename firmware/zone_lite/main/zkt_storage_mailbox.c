@@ -28,8 +28,9 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_LEASE) return false;
-    if (request->operation == ZJ_CATALOG && !zc_request_valid(&request->input.catalog)) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_COMMANDS) return false;
+    if ((request->operation == ZJ_CATALOG || request->operation == ZJ_COMMANDS) &&
+        !zc_request_valid(&request->input.catalog)) return false;
     if (request->operation == ZJ_RUNTIME_CHECKPOINT &&
         (!request->input.runtime_checkpoint.deadline_us ||
          !runtime_checkpoint_valid(&request->input.runtime_checkpoint.state))) return false;
@@ -69,10 +70,11 @@ bool zj_mailbox_begin(zj_mailbox_t *mailbox, zj_request_t *request, uint64_t *ti
         zj_request_slot_t *slot = &mailbox->slots[i];
         if (slot->state != ZJ_SLOT_QUEUED) continue;
         if (slot->ticket == mailbox->resume_ticket) { resume = slot; continue; }
-        /* A retained catalog transaction reserves its file namespace only.
-         * Delivery reads/runtime checkpoints may run between its steps; a
-         * different catalog mutation cannot overtake the recovery intent. */
-        if (mailbox->resume_ticket && slot->request.operation == ZJ_CATALOG) continue;
+        /* One retained file transaction uses the shared resume slot.
+         * Delivery reads/runtime checkpoints may run between its steps;
+         * catalog/command file operations wait for the recovery intent. */
+        if (mailbox->resume_ticket && (slot->request.operation == ZJ_CATALOG ||
+            slot->request.operation == ZJ_COMMANDS)) continue;
         zj_request_slot_t **candidate = priority(slot->request.operation) ? &high : &low;
         if (!*candidate || slot->ticket < (*candidate)->ticket) *candidate = slot;
     }
@@ -110,7 +112,7 @@ bool zj_mailbox_yield(zj_mailbox_t *mailbox, uint64_t ticket)
 {
     zj_request_slot_t *slot = find(mailbox, ticket);
     if (!slot || slot->state != ZJ_SLOT_RUNNING || mailbox->running_ticket != ticket ||
-        slot->request.operation != ZJ_CATALOG) return false;
+        (slot->request.operation != ZJ_CATALOG && slot->request.operation != ZJ_COMMANDS)) return false;
     slot->state = ZJ_SLOT_QUEUED;
     mailbox->running_ticket = 0;
     mailbox->resume_ticket = ticket;

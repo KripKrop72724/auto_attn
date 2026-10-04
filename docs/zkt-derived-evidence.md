@@ -131,6 +131,27 @@ Oracle completion, terminal models, seven-day capacity and field HIL require
 separate evidence. Record the host's resources and competing workloads with
 the report; a ten-second smoke run cannot replace the full burst.
 
+On 2026-10-04, the complete isolated PostgreSQL 16.14 run on source
+`58beaee8e93ded50010d6e7d6260ebc9a76b5590` passed with no backend source diff:
+17 sources × 10 observations/second × 900 seconds produced 153,000 committed
+receipts and 153,000 inspected obligations, including 1,564 stable receipt
+replays. There were zero errors, input refusals, missed inputs or pending
+obligations after drain. Scheduled-input-to-commit p95 was 117.697 ms and p99
+177.466 ms; maximum emitter delay was 8.737 ms against the unchanged 100 ms
+limit. Delivery completed at 900.061 seconds; final accounting at 902.431
+seconds. The inspector restarted every five minutes. The host had 8 CPUs and
+16 GiB RAM; local Docker had 8 CPUs and approximately 8 GiB, with this PostgreSQL
+container limited to 1 GiB (128 MiB shared buffers, 4 MiB work memory). Heavy
+builds and other local test suites were excluded during the run.
+
+All 153,000 inputs remained explicitly `WAIT_PROFILE / UNQUALIFIED_FACTS`.
+The run created no attendance events or Oracle outboxes and made no external
+delivery calls. It qualifies this custody/inspection component only. Earlier
+failed runs remain retained: one left 5,660 pending inspections after its
+120-second drain, while its source thread also exceeded the 100 ms emission
+limit. The passing run separates source generation into a process and batches
+empty interpretation-history checks without changing the workload or gates.
+
 The ordinary custody API returns only interpretation status, version, sampling
 time and current-input/current-decoder flags. It never returns protected facts.
 The UI distinguishes proposed facts, ambiguity, rejection, work in progress and

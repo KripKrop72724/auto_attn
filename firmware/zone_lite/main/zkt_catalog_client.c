@@ -26,14 +26,20 @@ zj_result_t zc_client_call(zc_client_t *client, zc_client_port_t port,
     if (!client || !port.now_us || !port.wait || !port.submit || !port.poll || !zc_request_valid(request))
         return ZJ_INVALID;
     if (!zc_client_drain(client, port)) {
-        reply->error = EBUSY; reply->operation = "catalog_previous_operation"; return ZJ_IO;
+        reply->error = EBUSY;
+        reply->operation = client->commands ? "commands_previous_operation" : "catalog_previous_operation";
+        return ZJ_IO;
     }
     if (port.now_us(port.context) >= request->deadline_us) {
-        reply->error = ETIMEDOUT; reply->operation = "catalog_deadline"; return ZJ_STALE;
+        reply->error = ETIMEDOUT;
+        reply->operation = client->commands ? "commands_deadline" : "catalog_deadline";
+        return ZJ_STALE;
     }
-    zj_request_t message = {.operation = ZJ_CATALOG, .input.catalog = *request};
+    zj_request_t message = {.operation = client->commands ? ZJ_COMMANDS : ZJ_CATALOG, .input.catalog = *request};
     if (!port.submit(port.context, &message, &client->pending_ticket)) {
-        reply->error = EBUSY; reply->operation = "catalog_owner_admission"; return ZJ_IO;
+        reply->error = EBUSY;
+        reply->operation = client->commands ? "commands_owner_admission" : "catalog_owner_admission";
+        return ZJ_IO;
     }
     client->pending_operation = request->operation;
     for (;;) {
@@ -45,7 +51,9 @@ zj_result_t zc_client_call(zc_client_t *client, zc_client_port_t port,
             return response.result;
         }
         if (port.now_us(port.context) >= request->deadline_us) {
-            reply->error = ETIMEDOUT; reply->operation = "catalog_owner_wait"; return ZJ_UNCERTAIN;
+            reply->error = ETIMEDOUT;
+            reply->operation = client->commands ? "commands_owner_wait" : "catalog_owner_wait";
+            return ZJ_UNCERTAIN;
         }
         port.wait(port.context);
     }

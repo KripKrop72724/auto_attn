@@ -31,7 +31,7 @@ static unsigned runtime_writes;
 static zl_lease_record_t lease_blob;
 static unsigned lease_writes;
 static uint64_t lease_root;
-static ft_checkpoint_t catalog_checkpoint;
+static ft_checkpoint_t catalog_checkpoint, command_checkpoint;
 const esp_app_desc_t *esp_app_get_description(void)
 {
     static const esp_app_desc_t app = {.project_name = "zone_lite", .version = "2.7.0"};
@@ -113,9 +113,10 @@ void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handl
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t *length)
 {
     if (handle == 3) {
-        assert(!strcmp(name, "catalog") && *length == sizeof(catalog_checkpoint));
-        if (!catalog_checkpoint.version) return ESP_ERR_NVS_NOT_FOUND;
-        memcpy(out, &catalog_checkpoint, sizeof(catalog_checkpoint)); return ESP_OK;
+        assert((!strcmp(name, "catalog") || !strcmp(name, "commands")) && *length == sizeof(catalog_checkpoint));
+        ft_checkpoint_t *checkpoint = !strcmp(name, "catalog") ? &catalog_checkpoint : &command_checkpoint;
+        if (!checkpoint->version) return ESP_ERR_NVS_NOT_FOUND;
+        memcpy(out, checkpoint, sizeof(*checkpoint)); return ESP_OK;
     }
     if (handle == 2) {
         if (!strcmp(name, "lease_v2_root")) {
@@ -148,8 +149,8 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes, size_t length)
 {
     if (handle == 3) {
-        assert(!strcmp(name, "catalog") && length == sizeof(catalog_checkpoint));
-        memcpy(&catalog_checkpoint, bytes, length); return ESP_OK;
+        assert((!strcmp(name, "catalog") || !strcmp(name, "commands")) && length == sizeof(catalog_checkpoint));
+        memcpy(!strcmp(name, "catalog") ? &catalog_checkpoint : &command_checkpoint, bytes, length); return ESP_OK;
     }
     if (handle == 2) {
         if (!strcmp(name, "lease_v2_root")) {
@@ -201,7 +202,7 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
 bool qs_local_read_begin(void) { assert(!pthread_mutex_lock(&budget)); return true; }
 bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
 {
-    assert((policy == QS_ADMIT_RECOVERY && bytes == 8U + ZJ_CHECKPOINT_BYTES) ||
+    assert((policy == QS_ADMIT_RECOVERY && (bytes == 8U + ZJ_CHECKPOINT_BYTES || bytes <= ZC_CHUNK_BYTES + 512U)) ||
         (policy == QS_ADMIT_OPTIONAL_HISTORICAL && bytes <= ZC_CHUNK_BYTES + 512U));
     if (atomic_load(&full)) { errno = ENOSPC; return false; }
     return true;
@@ -606,6 +607,33 @@ int main(int argc, char **argv)
     assert(zj_owner_submit(&catalog, &ticket)); reply = wait_reply(ticket);
     assert(reply.result == ZJ_OK && reply.catalog.length == ZC_CHUNK_BYTES &&
         reply.catalog.total == 40 * ZC_CHUNK_BYTES && reply.catalog.bytes[0] == 'C');
+    /* Command replacement uses a separate bounded namespace and checkpoint.
+     * Its yielded activation also lets a live observation commit first. */
+    zj_request_t commands = {.operation = ZJ_COMMANDS, .input.catalog = {
+        .operation = ZC_RECOVER, .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U}};
+    assert(zj_owner_submit(&commands, &ticket)); assert(wait_reply(ticket).result == ZJ_OK);
+    commands.input.catalog.operation = ZC_RESET;
+    assert(zj_owner_submit(&commands, &ticket)); reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK);
+    commands.input.catalog.id = reply.catalog.id;
+    commands.input.catalog.operation = ZC_APPEND;
+    commands.input.catalog.length = ZC_CHUNK_BYTES;
+    memset(commands.input.catalog.bytes, 'D', ZC_CHUNK_BYTES);
+    for (unsigned i = 0; i < 40; ++i) {
+        assert(zj_owner_submit(&commands, &ticket)); reply = wait_reply(ticket);
+        assert(reply.result == ZJ_OK); commands.input.catalog.offset = reply.catalog.offset;
+    }
+    commands.input.catalog.operation = ZC_ACTIVATE;
+    uint64_t command_ticket;
+    assert(zj_owner_submit(&commands, &command_ticket)); assert(zj_owner_abandon(command_ticket));
+    assert(zj_owner_submit(&concurrent_capture, &ticket)); assert(wait_reply(ticket).result == ZJ_OK);
+    commands.input.catalog = (zc_request_t){.operation = ZC_READ,
+        .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U};
+    assert(zj_owner_submit(&commands, &ticket)); reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK && reply.catalog.total == 40 * ZC_CHUNK_BYTES && reply.catalog.bytes[0] == 'D');
+    assert(command_checkpoint.version && catalog_checkpoint.version);
+    assert(zj_owner_submit(&catalog, &ticket)); reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK && reply.catalog.bytes[0] == 'C');
     assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before

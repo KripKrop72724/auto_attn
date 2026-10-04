@@ -41,6 +41,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     "-I", str(tmp_path), "-I", str(fixture), "-I", str(main),
                     *(f'-DZC_{key}_PATH="catalog.{key.lower()}"' for key in ("ACTIVE", "COMMIT", "BACKUP", "TEMP", "STAGE")),
+                    *(f'-DZC_COMMAND_{key}_PATH="commands.{key.lower()}"' for key in ("ACTIVE", "COMMIT", "BACKUP", "TEMP", "STAGE")),
                     str(fixture / "zkt_storage_owner_host.c"),
                     *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c", "zkt_runtime_checkpoint.c", "zkt_lease_store.c",
                         "zkt_journal_state.c", "zkt_journal_store.c", "zkt_journal_codec.c", "durable_queue.c",

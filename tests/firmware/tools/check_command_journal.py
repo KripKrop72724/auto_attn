@@ -22,6 +22,7 @@ program = r'''
 #include "cJSON.h"
 #include "file_transaction.h"
 #include "reliability.h"
+#define ZONE_LITE_HIKVISION 1 /* Preserve the legacy path; owner has separate tests. */
 #define ESP_OK 0
 #define ESP_ERR_NVS_NOT_FOUND 1
 #define NVS_READONLY 0

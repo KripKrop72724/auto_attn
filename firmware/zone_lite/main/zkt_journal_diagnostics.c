@@ -28,6 +28,7 @@ static const char *owner_operation(zj_operation_t operation)
         case ZJ_RUNTIME_CHECKPOINT: return "committing runtime checkpoint";
         case ZJ_CATALOG: return "updating optional identity catalog";
         case ZJ_LEASE: return "committing administrator lease";
+        case ZJ_COMMANDS: return "updating durable command inbox";
         default: return "unknown operation";
     }
 }
