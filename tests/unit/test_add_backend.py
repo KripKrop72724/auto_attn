@@ -6462,6 +6462,35 @@ def test_worker_recovery_requires_fresh_workers_for_the_device_family(db, family
     assert alert().state == "RESOLVED"
 
 
+def test_unknown_journal_authority_is_preserved_without_clearing_faults(db):
+    from zk_add.service import apply_firmware_diagnostics
+    connector = connector_fixture(db)
+    def report(authority, owner, workers):
+        apply_firmware_diagnostics(db, connector=connector, payload=HeartbeatPayload(uptime_seconds=100,
+            diagnostics={"schema_version": 2, "runtime_profile": "ZKT_JOURNAL_V1", "journal_format": 1,
+                "delivery_authority": authority, "journal_storage": owner,
+                "storage": {"durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True},
+                "workers": workers}))
+        db.flush()
+    owner = {"observed": True, "fresh": True, "ready": True, "durability": "HEALTHY",
+        "checkpoint_recovery_pending": False, "mailbox_capacity": 8, "mailbox_high_watermark": 4,
+        "pending_appends": 0, "sampled_uptime_ms": 99000, "last_append_result": "FULL"}
+    workers = [{"name": name, "state": "RUNNING", "last_activity_uptime_ms": 99000}
+               for name in ("storage_owner", "add_delivery", "legacy_add_delivery", "legacy_ords_delivery")]
+    workers.append({"name": "capture", "state": "STOPPED", "execution_model": "ON_DEMAND",
+                    "sampled_uptime_ms": 99000, "last_activity_uptime_ms": 0, "pending_requests": 0})
+    report("ADD", owner, workers)
+    def state(code):
+        return db.scalar(select(DeviceAlert).where(DeviceAlert.connector_id == connector.id, DeviceAlert.code == code)).state
+    assert state("ESP_DURABILITY_FAULT") == state("ESP_DELIVERY_WORKER_FAULT") == "OPEN"
+    report("UNKNOWN", {**owner, "fresh": False}, workers)
+    assert connector.firmware_diagnostics["delivery_authority"] == "UNKNOWN"
+    assert state("ESP_DURABILITY_FAULT") == state("ESP_DELIVERY_WORKER_FAULT") == "OPEN"
+    workers[-1]["state"] = "RUNNING"
+    report("ADD", {**owner, "last_append_result": "OK", "last_filesystem_error": 5}, workers)
+    assert state("ESP_DURABILITY_FAULT") == state("ESP_DELIVERY_WORKER_FAULT") == "RESOLVED"
+
+
 def _make_recovery_event(
     db: Session,
     connector: Connector,

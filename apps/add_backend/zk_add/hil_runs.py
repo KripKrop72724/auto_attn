@@ -124,23 +124,22 @@ def start_run(
         or storage.get("upgrade_ready") is not True
     ):
         raise ValueError("Local persistence and queue recovery must be verified before observation")
-    from zk_add.runtime_contract import runtime_contract
+    from zk_add.runtime_contract import journal_storage_status, runtime_contract, worker_snapshot_fresh
 
     runtime = runtime_contract(diagnostics, connector.firmware_family or "zkt")
+    if journal_storage_status(diagnostics, telemetry.uptime_seconds) not in {None, "HEALTHY"}:
+        raise ValueError("Current journal persistence and recovery evidence is required")
     manifest_runtime = release.manifest.get("runtime_profile")
     if manifest_runtime and diagnostics.get("runtime_profile") != manifest_runtime:
         raise ValueError("Signed runtime profile does not match telemetry")
     workers = diagnostics.get("workers") or []
-    if {row.get("name") for row in workers} != runtime.workers or len(workers) != len(runtime.workers):
+    names = {row.get("name") for row in workers}
+    if not runtime.workers <= names <= runtime.workers | runtime.auxiliary_workers or len(names) != len(workers):
         raise ValueError("All required runtime workers must report their current health")
     for worker in workers:
-        tick = worker.get("last_activity_uptime_ms")
         if (
             worker.get("state") not in {"RUNNING", "WAITING_NETWORK"}
-            or tick is None
-            or telemetry.uptime_seconds is None
-            # Uptime is sampled before the diagnostics and rounded to seconds.
-            or not -5_000 <= telemetry.uptime_seconds * 1000 - tick <= 90_000
+            or not worker_snapshot_fresh(worker, telemetry.uptime_seconds, runtime)
         ):
             raise ValueError("Delivery workers are not healthy and fresh")
     queues = diagnostics.get("queues") or []

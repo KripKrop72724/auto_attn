@@ -18,6 +18,33 @@ const journal: NonNullable<FirmwareDiagnostics['journal_runtime']> = {
   proof_attempts: 3, failures: 7, sampled_uptime_ms: 40000, compatibility: 'READER_OK',
 }
 describe('firmware preservation evidence', () => {
+  it.each(['missing', 'stale', 'full', 'recovering', 'append-failed'])('does not promote legacy storage proof over %s journal evidence', failure => {
+    const diagnostics: FirmwareDiagnostics = { ...healthy, runtime_profile: 'ZKT_JOURNAL_V1', sampled_uptime_ms: 100000,
+      journal_storage: { observed: true, fresh: true, ready: true, durability: 'HEALTHY', checkpoint_recovery_pending: false,
+        mailbox_capacity: 8, mailbox_high_watermark: 4, pending_appends: 0, sampled_uptime_ms: 99000 } }
+    if (failure === 'missing') diagnostics.journal_storage = undefined
+    if (failure === 'stale') diagnostics.journal_storage!.sampled_uptime_ms = 50000
+    if (failure === 'full') diagnostics.journal_storage!.durability = 'FULL'
+    if (failure === 'recovering') diagnostics.journal_storage!.checkpoint_recovery_pending = true
+    if (failure === 'append-failed') diagnostics.journal_storage!.last_append_result = 'UNCERTAIN'
+    render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
+    expect(screen.queryByText('Local storage verified')).toBeNull()
+  })
+  it('keeps historical errors and unverified migration visible without inventing a pending count', () => {
+    render(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()} diagnostics={{ ...healthy,
+      runtime_profile: 'ZKT_JOURNAL_V1', sampled_uptime_ms: 100000,
+      journal_storage: { observed: true, fresh: true, ready: true, durability: 'HEALTHY', checkpoint_recovery_pending: false,
+        mailbox_capacity: 8, mailbox_high_watermark: 4, pending_appends: 0, sampled_uptime_ms: 99000,
+        last_append_result: 'OK', last_failure_operation: 'old_sync', last_filesystem_error: 5 },
+      queues: [{ name: 'legacy_migration', count_known: false, records: 0, count_reason: 'UNVERIFIED_MIGRATION' }],
+      workers: [{ name: 'capture', state: 'RUNNING', completed_operations: 20, failures: 2, timeouts: 1 }],
+    }} />)
+    expect(screen.getByText('Local storage verified')).toBeTruthy()
+    expect(screen.getByText(/old_sync · filesystem 5/)).toBeTruthy()
+    expect(screen.getByText(/Legacy custody verification pending/)).toBeTruthy()
+    expect(screen.queryByText(/0 pending/)).toBeNull()
+    expect(screen.getByText(/2 failures since boot/)).toBeTruthy()
+  })
   it.each(['UNKNOWN', 'LEGACY', undefined] as const)('does not infer ADD ownership from writer-ready: %s', authority => {
     render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, sampled_uptime_ms: 41000,
       journal_runtime: { ...journal, writer_ready: true, delivery_authority: authority } }} observedAt={new Date().toISOString()} />)

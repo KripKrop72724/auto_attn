@@ -137,6 +137,40 @@ def test_observation_accepts_worker_tick_sampled_after_rounded_uptime(ready):
     assert start(ready).status == "OBSERVING"
 
 
+@pytest.mark.parametrize("variant", ["healthy", "idle-capture", "stalled-capture", "missing-worker",
+                                     "unknown-worker", "duplicate-worker", "unknown-migration", "stale-storage", "append-full"])
+def test_journal_hil_requires_its_workers_and_keeps_legacy_custody_obligations(ready, variant):
+    diagnostics = ready[-1].payload["diagnostics"]
+    diagnostics.update(schema_version=2, runtime_profile="ZKT_JOURNAL_V1", journal_format=1, delivery_authority="ADD")
+    diagnostics["workers"] = [{"name": name, "state": "RUNNING", "last_activity_uptime_ms": 100000}
+                              for name in ("capture", "storage_owner", "add_delivery", "legacy_add_delivery", "legacy_ords_delivery")]
+    diagnostics["journal_storage"] = {"observed": True, "fresh": True, "ready": True, "durability": "HEALTHY",
+        "checkpoint_recovery_pending": False, "sampled_uptime_ms": 99000}
+    diagnostics["queues"] = [{"name": name, "count_known": True, "records": 0} for name in ("journal", "legacy_migration")]
+    if variant in {"idle-capture", "stalled-capture"}:
+        diagnostics["workers"][0].update(execution_model="ON_DEMAND", sampled_uptime_ms=100000,
+                                         last_activity_uptime_ms=0, pending_requests=0)
+        if variant == "stalled-capture":
+            diagnostics["workers"][0]["operation_started_uptime_ms"] = 85000
+    if variant == "missing-worker":
+        diagnostics["workers"].pop(0)
+    if variant == "unknown-worker":
+        diagnostics["workers"].append({"name": "invented-worker", "state": "RUNNING", "last_activity_uptime_ms": 100000})
+    if variant == "duplicate-worker":
+        diagnostics["workers"].append(diagnostics["workers"][0])
+    if variant == "unknown-migration":
+        diagnostics["queues"][1]["count_known"] = False
+    if variant == "stale-storage":
+        diagnostics["journal_storage"]["sampled_uptime_ms"] = 55000
+    if variant == "append-full":
+        diagnostics["journal_storage"]["last_append_result"] = "FULL"
+    if variant in {"healthy", "idle-capture"}:
+        assert start(ready).status == "OBSERVING"
+    else:
+        with pytest.raises(ValueError):
+            start(ready)
+
+
 @pytest.mark.parametrize(
     "change",
     [

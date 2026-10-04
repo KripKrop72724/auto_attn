@@ -75,6 +75,8 @@ class QueueDiagnostics(BaseModel):
     bytes: int | None = Field(default=None, ge=0)
     records: int | None = Field(default=None, ge=0)
     count_known: bool = False
+    count_reason: Literal["VERIFIED_EMPTY", "NONEMPTY_OR_UNVERIFIED", "PENDING_APPEND",
+                          "STALE_OWNER", "UNVERIFIED_MIGRATION"] | None = None
     oldest_pending_age_seconds: int | None = Field(default=None, ge=0)
     last_progress_uptime_ms: int | None = Field(default=None, ge=0)
 
@@ -89,6 +91,32 @@ class WorkerDiagnostics(BaseModel):
     last_progress_uptime_ms: int | None = Field(default=None, ge=0)
     operation_started_uptime_ms: int | None = Field(default=None, ge=0)
     pending_requests: int | None = Field(default=None, ge=0)
+    execution_model: Literal["TASK", "ON_DEMAND"] = "TASK"
+    sampled_uptime_ms: int | None = Field(default=None, ge=0)
+    completed_operations: int | None = Field(default=None, ge=0)
+    failures: int | None = Field(default=None, ge=0)
+    consecutive_failures: int | None = Field(default=None, ge=0)
+    timeouts: int | None = Field(default=None, ge=0)
+    refusals: int | None = Field(default=None, ge=0)
+    max_operation_ms: int | None = Field(default=None, ge=0)
+
+
+class JournalStorageDiagnostics(BaseModel):
+    observed: bool
+    fresh: bool
+    ready: bool
+    durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"]
+    checkpoint_recovery_pending: bool
+    mailbox_capacity: int = Field(ge=1, le=32)
+    mailbox_high_watermark: int = Field(ge=0, le=32)
+    pending_appends: int = Field(ge=0, le=32)
+    sampled_uptime_ms: int | None = Field(default=None, ge=0)
+    segments: int | None = Field(default=None, ge=0, le=256)
+    last_append_result: Literal["OK", "EMPTY", "FULL", "IO", "CORRUPT", "STALE", "INVALID", "UNCERTAIN", "UNKNOWN"] | None = None
+    last_append_uptime_ms: int | None = Field(default=None, ge=0)
+    last_failure_operation: str | None = Field(default=None, max_length=80)
+    last_filesystem_error: int | None = None
+    last_nvs_error: int | None = None
 
 
 class StorageDiagnostics(BaseModel):
@@ -154,6 +182,7 @@ class FirmwareDiagnostics(BaseModel):
     storage: StorageDiagnostics | None = None
     memory: MemoryDiagnostics | None = None
     journal_runtime: JournalRuntimeDiagnostics | None = None
+    journal_storage: JournalStorageDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
     workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
     reconciliation_mode: str | None = Field(default=None, max_length=40)
@@ -233,7 +262,9 @@ class HeartbeatPayload(BaseModel):
         if self.diagnostics:
             from zk_add.runtime_contract import runtime_contract
 
-            runtime_contract(self.diagnostics.model_dump(), self.firmware_family)
+            # Recovery telemetry is evidence, not permission to capture or
+            # pass HIL. Qualification still requires known ADD authority.
+            runtime_contract(self.diagnostics.model_dump(), self.firmware_family, allow_unknown_authority=True)
         return self
 
 

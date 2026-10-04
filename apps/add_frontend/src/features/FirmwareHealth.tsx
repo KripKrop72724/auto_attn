@@ -6,6 +6,14 @@ const labels: Record<string, string> = {
   add_delivery: 'ADD delivery', ords_delivery: 'Oracle delivery',
   live: 'Live attendance', bulk: 'Historical attendance', receipts: 'Delivery receipts',
   blocked: 'Identity exceptions', evidence: 'Preserved evidence', ords: 'Oracle pending',
+  capture: 'Terminal capture', storage_owner: 'Journal storage', journal: 'Preserved journal',
+  journal_add_delivery: 'Journal ADD delivery', legacy_add_delivery: 'Retained ADD delivery',
+  legacy_ords_delivery: 'Retained Oracle delivery', legacy_migration: 'Legacy custody transfer',
+}
+const countReasons: Record<string, string> = {
+  VERIFIED_EMPTY: 'Empty queue verified', NONEMPTY_OR_UNVERIFIED: 'Pending inventory not yet verified',
+  PENDING_APPEND: 'Capture is awaiting storage', STALE_OWNER: 'Current storage evidence unavailable',
+  UNVERIFIED_MIGRATION: 'Legacy custody verification pending',
 }
 const journalPhases: Record<string, string> = {
   NOT_STARTED: 'Not started', DISABLED: 'Inactive for this image', SECURITY_HOLD: 'Security checks required',
@@ -35,6 +43,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
   const storage = diagnostics?.storage
   const journal = diagnostics?.journal_runtime
+  const journalStorage = diagnostics?.journal_storage
   const count = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
   const journalValid = journal?.observed === true && Object.hasOwn(journalPhases, journal.phase) &&
     typeof journal.reader_ready === 'boolean' && typeof journal.writer_ready === 'boolean' &&
@@ -47,12 +56,23 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const journalFresh = fresh && journalLag + Math.max(0, now - observed) <= 45_000
   const journalReader = journalFresh && journal?.reader_ready &&
     ['CHECKING_READER', 'READER_HOLD', 'CAPTURE_START', 'WRITER_DISABLED', 'BRIDGE_VALIDATION', 'READY'].includes(journal.phase)
-  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error
+  const ownerSample = journalStorage?.sampled_uptime_ms
+  const ownerAge = typeof parentUptime === 'number' && typeof ownerSample === 'number' &&
+    Number.isSafeInteger(ownerSample) && ownerSample >= 0 ? parentUptime - ownerSample : Infinity
+  const ownerFresh = fresh && journalStorage?.observed && journalStorage.fresh && ownerAge >= -5000 &&
+    Math.max(0, ownerAge) + Math.max(0, now - observed) <= 45_000
+  const journalStorageVerified = ownerFresh && journalStorage?.ready && journalStorage.durability === 'HEALTHY' &&
+    !journalStorage.checkpoint_recovery_pending && (!journalStorage.last_append_result || journalStorage.last_append_result === 'OK')
+  const verified = fresh && storage?.durability === 'HEALTHY' && storage.persistence_verified && storage.recovery_complete && !storage.persistence_probe_error &&
+    (diagnostics?.runtime_profile !== 'ZKT_JOURNAL_V1' || journalStorageVerified)
+  const journalNeedsAttention = ownerFresh && journalStorage &&
+    (['DEGRADED', 'FULL'].includes(journalStorage.durability) || !journalStorage.ready ||
+      journalStorage.checkpoint_recovery_pending || (journalStorage.last_append_result && journalStorage.last_append_result !== 'OK'))
   const heading = !diagnostics ? 'Local durability not reported'
     : !sameBoot ? 'Durability boot identity is unverified'
       : !fresh ? 'Durability telemetry is stale'
       : verified ? 'Local storage verified'
-        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error ? 'Local storage needs attention'
+        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || journalNeedsAttention ? 'Local storage needs attention'
           : 'Local recovery checks pending'
   return <article className="detail-card wide" aria-label="Firmware preservation health">
     <p className="eyebrow">ATTENDANCE PRESERVATION</p>
@@ -77,6 +97,14 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
         {storage?.error_operation && <div><dt>Last storage error</dt><dd>{storage.error_operation} · {storage.error_code ?? 'No code reported'}</dd></div>}
+        {journalStorage && <>
+          <div><dt>Journal preservation</dt><dd>{ownerFresh ? journalStorage.durability.toLowerCase() : 'Current journal storage unverified'}</dd></div>
+          <div><dt>Journal checkpoint recovery</dt><dd>{ownerFresh ? journalStorage.checkpoint_recovery_pending ? 'Recovery pending' : 'No checkpoint recovery pending' : 'Not confirmed'}</dd></div>
+          <div><dt>Last capture append</dt><dd>{journalStorage.last_append_result || 'No result reported'}</dd></div>
+          <div><dt>Storage mailbox peak / capacity</dt><dd>{journalStorage.mailbox_high_watermark} / {journalStorage.mailbox_capacity}</dd></div>
+          <div><dt>Capture appends awaiting storage</dt><dd>{ownerFresh ? journalStorage.pending_appends : 'Not confirmed'}</dd></div>
+          {journalStorage.last_failure_operation && <div><dt>Historical journal failure</dt><dd>{journalStorage.last_failure_operation} · filesystem {journalStorage.last_filesystem_error ?? 'not reported'} · NVS {journalStorage.last_nvs_error ?? 'not reported'}</dd></div>}
+        </>}
         {journal && <>
           <div><dt>Journal startup</dt><dd>{journalFresh ? journalPhases[journal.phase] : 'Current journal state unverified'}</dd></div>
           <div><dt>Journal reader</dt><dd>{journalReader ? 'Ready for recovery and receipt delivery' : 'Readiness not confirmed'}</dd></div>
@@ -93,10 +121,15 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         {worker.operation ? ` · ${worker.operation}` : ''}
         {worker.restart_count != null ? ` · ${worker.restart_count} successful restarts` : ''}
         {worker.restart_attempts != null ? ` · ${worker.restart_attempts} restart attempts` : ''}
+        {worker.pending_requests != null ? ` · ${worker.pending_requests} pending requests` : ''}
+        {worker.failures != null ? ` · ${worker.failures} failures since boot` : ''}
+        {worker.timeouts != null ? ` · ${worker.timeouts} timeouts since boot` : ''}
+        {worker.refusals != null ? ` · ${worker.refusals} admission refusals since boot` : ''}
       </p>)}
       {!diagnostics.workers.length && <p>Delivery workers: Not reported</p>}
       {diagnostics.queues.map(queue => <p key={queue.name}>
         {labels[queue.name] || queue.name}: {queue.count_known && queue.records != null ? `${queue.records.toLocaleString()} pending` : 'Pending count not reported'} · {bytes(queue.bytes)}
+        {queue.count_reason && countReasons[queue.count_reason] ? ` · ${countReasons[queue.count_reason]}` : ''}
       </p>)}
     </>}
   </article>

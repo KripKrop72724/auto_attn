@@ -1,5 +1,6 @@
 #include "zkt_journal_runtime.h"
 #include "zkt_capture_runtime.h"
+#include "zkt_journal_diagnostics.h"
 #include "queue_store.h"
 #include "zone_config.h"
 #include "esp_app_desc.h"
@@ -144,7 +145,15 @@ bool zj_runtime_append_diagnostics(cJSON *diagnostics)
         (!observed || (cJSON_AddNumberToObject(runtime, "sampled_uptime_ms", current.sampled_ms) &&
             cJSON_AddNumberToObject(runtime, "last_progress_uptime_ms", current.progress_ms) &&
             cJSON_AddStringToObject(runtime, "compatibility", zj_compat_error(current.compatibility))));
-    if (ok && cJSON_AddItemToObject(diagnostics, "journal_runtime", runtime)) return true;
+    if (ok && cJSON_AddItemToObject(diagnostics, "journal_runtime", runtime)) {
+        if (required == ZJ_BOOT_DISABLED) return true;
+        zj_diagnostics_snapshot_t workers = {0};
+        workers.owner_observed = zj_owner_health(&workers.owner);
+        workers.transport_observed = zj_transport_health(&workers.transport);
+        workers.capture_observed = zj_capture_runtime_health(&workers.capture);
+        return zj_diagnostics_append(diagnostics, &current, recent, legacy, &workers,
+            (uint64_t)(esp_timer_get_time() / 1000));
+    }
     cJSON_Delete(runtime);
     return false;
 }
