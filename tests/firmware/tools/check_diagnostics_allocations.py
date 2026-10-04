@@ -7,6 +7,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[3]
 firmware = ROOT / "firmware/zone_lite/main"
 source = (firmware / "add_connector.c").read_text()
+outbox_type = source[source.index("typedef struct {\n    const char *path;"):
+                     source.index("} add_outbox_t;") + len("} add_outbox_t;")]
 functions = source[source.index("static bool append_worker_diagnostic("):
                    source.index("static void heartbeat_task(", source.index("static bool append_worker_diagnostic("))]
 runtime_source = (firmware / "zkt_journal_runtime.c").read_text()
@@ -31,9 +33,13 @@ typedef struct {bool add_source_coverage_certified,committed_source_known; int64
 static add_zkt_telemetry_t zkt={.add_source_coverage_certified=true,.committed_source_known=true,.last_light_check_uptime_ms=2000,.last_tail_audit_uptime_ms=4000,.committed_source_generation=9,.committed_source_cursor=100};
 typedef int esp_err_t;
 typedef enum {ADD_WORKER_IDLE,ADD_WORKER_READING,ADD_WORKER_NETWORK,ADD_WORKER_COMMITTING,ADD_WORKER_RESOURCE} add_worker_operation_t;
-typedef struct {int *lock;bool depth_known;unsigned depth;const char *path;} add_outbox_t;
+typedef int *SemaphoreHandle_t;
+''' + outbox_type + r'''
+static bool owned_legacy=true;
+static bool add_legacy_owner_required(void){return owned_legacy;}
 static int held;
-static add_outbox_t s_live_outbox={&held,true,3,"absent-live"},s_bulk_outbox={&held,false,0,"absent-bulk"};
+static add_outbox_t s_live_outbox={.lock=&held,.depth_known=true,.depth=3,.path="absent-live",.owner_bytes_known=true,.owner_bytes=123};
+static add_outbox_t s_bulk_outbox={.lock=&held,.depth_known=false,.path="absent-bulk"};
 static size_t calls,fail_at;
 static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n);}
 static int xSemaphoreTake(int *lock,unsigned timeout){(void)timeout;assert(!*lock);*lock=1;return 1;}
@@ -124,13 +130,20 @@ int main(void){
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
  cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==11);
+ assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(queues,0),"bytes")->valueint==123);
+ assert(!cJSON_HasObjectItem(cJSON_GetArrayItem(queues,1),"bytes"));
  cJSON *unknown=cJSON_GetArrayItem(queues,2+QS_BLOCKED);assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(unknown,"count_known")));
  assert(!cJSON_HasObjectItem(unknown,"records"));cJSON_Delete(payload);
  for(size_t i=1;i<=total;i++){
   fail_at=0;payload=cJSON_CreateObject();assert(payload);calls=0;fail_at=i;
   append_firmware_diagnostics(payload, &zkt, "LIVE_CAPTURE");assert(!cJSON_HasObjectItem(payload,"diagnostics") && !held);cJSON_Delete(payload);
  }
- fail_at=0;memset(&zkt,0,sizeof(zkt));
+ fail_at=0;owned_legacy=false;
+ payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
+ diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+ queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");
+ assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(queues,0),"bytes")->valueint==0);
+ cJSON_Delete(payload);owned_legacy=true;memset(&zkt,0,sizeof(zkt));
  payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
  diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(diagnostics,"reconciliation_mode")->valuestring,"IDLE"));

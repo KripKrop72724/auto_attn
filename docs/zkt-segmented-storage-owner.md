@@ -18,8 +18,8 @@ firmware versions and Hikvision retain their previous execution path.
 The boot/app task initializes and verifies the existing queues before journal
 startup. After the owner starts, periodic queue recovery and persistence probes
 also run there. Shared admission, queue tokens, encrypted-NVS checkpoints and
-the existing segmented file format are unchanged. Old flat-file attendance
-queues still require a separate handoff.
+the existing segmented file format are unchanged. The [ADD flat-file handoff](zkt-add-legacy-storage-owner.md)
+uses the same copied transport. Oracle/blocked flat files still require handoff.
 
 An owner recovery request audits at most one retained record from one lane.
 Lanes rotate even when one fails; live requests can run between these steps.
@@ -63,7 +63,7 @@ fault tests continue covering file and NVS failures. These results do not
 qualify ESP flash latency, stack/PSRAM headroom or physical interruption.
 
 This is an ownership component, not a completed legacy migration. The
-flat-file ADD/Oracle queues, per-item migration evidence, qualified source
+flat-file Oracle queues, per-item migration evidence, qualified source
 interpretation, signed bridge/candidate and release gates remain open. No
 connector is activated or upgraded by this change. Physical qualification is
 **NOT_PERFORMED**.

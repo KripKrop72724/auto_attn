@@ -1,24 +1,29 @@
 #pragma once
 #include "queue_store.h"
+#include "legacy_queue.h"
 #include "zkt_journal_store.h"
 
 #define ZQ_CHUNK_BYTES 512U
 #define ZQ_DEADLINE_US 10000000ULL
+typedef enum { ZQ_SEGMENTED, ZQ_ADD_LEGACY } zq_domain_t;
 typedef enum { ZQ_APPEND_BEGIN, ZQ_APPEND_CHUNK, ZQ_APPEND_COMMIT,
     ZQ_PEEK_BEGIN, ZQ_PEEK_CHUNK, ZQ_SETTLE, ZQ_SNAPSHOT, ZQ_GENERATION,
     ZQ_RECOVER, ZQ_PROBE } zq_operation_t;
 typedef struct {
     uint64_t deadline_us, transfer;
     dq_token_t token;
+    lq_token_t legacy_token;
     uint32_t offset, total;
     uint16_t length;
-    uint8_t operation, lane, policy;
+    uint8_t operation, lane, policy, domain;
+    bool custody;
     uint8_t bytes[ZQ_CHUNK_BYTES];
 } zq_request_t;
 typedef struct {
     dq_result_t result;
     uint64_t transfer;
     dq_token_t token;
+    lq_token_t legacy_token;
     uint32_t total, depth;
     uint16_t length;
     bool verified;
@@ -26,20 +31,29 @@ typedef struct {
     uint8_t bytes[ZQ_CHUNK_BYTES];
 } zq_reply_t;
 typedef struct {
+    dq_result_t (*append)(unsigned lane, const void *bytes, size_t length, qs_admission_t policy);
+    dq_result_t (*peek)(unsigned lane, void *bytes, size_t capacity, size_t *length, lq_token_t *token);
+    dq_result_t (*settle)(unsigned lane, const lq_token_t *token, bool custody);
+} zq_legacy_port_t;
+typedef struct {
     uint64_t next_transfer, append_transfer, read_transfer;
     uint64_t append_deadline, read_deadline;
     uint32_t append_used, append_total, read_length;
-    uint8_t append_lane, append_policy, read_lane;
+    uint8_t append_lane, append_policy, read_lane, append_domain, read_domain;
     dq_token_t read_token;
+    lq_token_t legacy_read_token;
+    zq_legacy_port_t legacy;
     /* Allocated with the owner in PSRAM, never on a caller/task stack. */
     uint8_t append_bytes[DQ_MAX_RECORD_BYTES], read_bytes[DQ_MAX_RECORD_BYTES];
 } zq_store_t;
 
 static inline bool zq_request_valid(const zq_request_t *r)
 {
-    if (!r || !r->deadline_us || r->operation > ZQ_PROBE || r->lane >= QS_COUNT ||
+    if (!r || !r->deadline_us || r->operation > ZQ_PROBE || r->domain > ZQ_ADD_LEGACY ||
+        r->lane >= (r->domain == ZQ_ADD_LEGACY ? 2U : QS_COUNT) ||
         r->policy > QS_ADMIT_RECOVERY || r->length > ZQ_CHUNK_BYTES)
         return false;
+    if (r->domain == ZQ_ADD_LEGACY && r->operation > ZQ_SETTLE) return false;
     switch (r->operation) {
         case ZQ_APPEND_BEGIN: return !r->transfer && !r->length && !r->offset &&
             r->total && r->total <= DQ_MAX_RECORD_BYTES;
@@ -48,7 +62,8 @@ static inline bool zq_request_valid(const zq_request_t *r)
         case ZQ_APPEND_COMMIT: return r->transfer && !r->length;
         case ZQ_PEEK_BEGIN: return !r->transfer && !r->length;
         case ZQ_PEEK_CHUNK: return r->transfer && !r->length && r->offset < DQ_MAX_RECORD_BYTES;
-        case ZQ_SETTLE: return !r->length && r->token.end > r->token.offset;
+        case ZQ_SETTLE: return !r->length && (r->domain == ZQ_ADD_LEGACY ?
+            r->legacy_token.end > r->legacy_token.offset : r->token.end > r->token.offset);
         default: return !r->length && !r->transfer;
     }
 }
@@ -65,3 +80,8 @@ bool zq_snapshot(qs_lane_t lane, uint32_t *depth);
 bool zq_generation(char output[33]);
 bool zq_recover(void);
 bool zq_probe(void);
+/* ADD flat files: lane 0 is live, lane 1 is historical. Copies and retained
+ * replies share the same bounded client classes as segmented queues. */
+dq_result_t zq_legacy_append(unsigned lane, const void *data, size_t length, qs_admission_t policy);
+dq_result_t zq_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token);
+dq_result_t zq_legacy_settle(unsigned lane, const lq_token_t *token, bool custody);

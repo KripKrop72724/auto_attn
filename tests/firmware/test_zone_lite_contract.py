@@ -1503,11 +1503,14 @@ def test_attendance_poison_rows_settle_without_head_of_line_blocking():
     assert "esp_random()" in connector
 
     worker = connector[
-        connector.index("static void outbox_task(") :
+        connector.index("static void outbox_task(void *arg)\n{") :
         connector.index("void add_connector_init(")
     ]
     assert worker.index("add_connector_transfer_queue_evidence(") < worker.index(
-        "advance_outbox_locked(outbox, row_end, true)"
+        "settle_legacy_delivery(outbox, &legacy_token, true)"
+    )
+    assert worker.index("attendance_settlement_matches_payload(") < worker.index(
+        "settle_legacy_delivery(outbox, &legacy_token, false)"
     )
     assert "if (preserved)" in worker
     assert "!memchr(line, 0, raw_length)" in worker

@@ -31,7 +31,7 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             s->append_transfer = transfer(s);
             memset(s->append_bytes, 0, sizeof(s->append_bytes));
             s->append_used = 0; s->append_total = r->total;
-            s->append_lane = r->lane; s->append_policy = r->policy;
+            s->append_lane = r->lane; s->append_policy = r->policy; s->append_domain = r->domain;
             s->append_deadline = r->deadline_us;
             out->transfer = s->append_transfer;
             out->result = out->transfer ? DQ_OK : DQ_FULL;
@@ -39,7 +39,7 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
         case ZQ_APPEND_CHUNK:
         case ZQ_APPEND_COMMIT:
             if (s->append_transfer != r->transfer || s->append_lane != r->lane ||
-                s->append_policy != r->policy || s->append_deadline != r->deadline_us) {
+                s->append_policy != r->policy || s->append_domain != r->domain || s->append_deadline != r->deadline_us) {
                 out->result = DQ_STALE; break;
             }
             if (r->operation == ZQ_APPEND_CHUNK) {
@@ -55,7 +55,10 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
                  * Retrying complete caller bytes can replay an event, but
                  * cannot commit this transfer twice after a lost result. */
                 s->append_transfer = 0;
-                out->result = qs_append_with_policy((qs_lane_t)r->lane,
+                if (r->domain == ZQ_ADD_LEGACY) {
+                    out->result = s->legacy.append ? s->legacy.append(r->lane,
+                        s->append_bytes, s->append_total, (qs_admission_t)r->policy) : DQ_IO;
+                } else out->result = qs_append_with_policy((qs_lane_t)r->lane,
                     s->append_bytes, s->append_total, (qs_admission_t)r->policy);
                 memset(s->append_bytes, 0, sizeof(s->append_bytes));
             }
@@ -63,20 +66,27 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
         case ZQ_PEEK_BEGIN: {
             s->read_transfer = 0; s->read_length = 0;
             memset(s->read_bytes, 0, sizeof(s->read_bytes));
+            memset(&s->read_token, 0, sizeof(s->read_token));
+            memset(&s->legacy_read_token, 0, sizeof(s->legacy_read_token));
             size_t length = 0;
-            out->result = qs_peek((qs_lane_t)r->lane, s->read_bytes,
+            if (r->domain == ZQ_ADD_LEGACY) {
+                out->result = s->legacy.peek ? s->legacy.peek(r->lane, s->read_bytes,
+                    sizeof(s->read_bytes), &length, &s->legacy_read_token) : DQ_IO;
+            } else out->result = qs_peek((qs_lane_t)r->lane, s->read_bytes,
                                   sizeof(s->read_bytes), &length, &s->read_token);
             if (out->result != DQ_OK) break;
             if (!length || length > sizeof(s->read_bytes)) { out->result = DQ_CORRUPT; break; }
             s->read_transfer = transfer(s);
             if (!s->read_transfer) { out->result = DQ_FULL; break; }
             s->read_length = (uint32_t)length; s->read_lane = r->lane; s->read_deadline = r->deadline_us;
+            s->read_domain = r->domain;
             out->transfer = s->read_transfer; out->total = s->read_length; out->token = s->read_token;
+            out->legacy_token = s->legacy_read_token;
             break;
         }
         case ZQ_PEEK_CHUNK:
             if (s->read_transfer != r->transfer || s->read_lane != r->lane ||
-                s->read_deadline != r->deadline_us || r->offset >= s->read_length) {
+                s->read_domain != r->domain || s->read_deadline != r->deadline_us || r->offset >= s->read_length) {
                 out->result = DQ_STALE; break;
             }
             out->length = (uint16_t)(s->read_length - r->offset > ZQ_CHUNK_BYTES ?
@@ -84,8 +94,13 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             memcpy(out->bytes, s->read_bytes + r->offset, out->length);
             out->transfer = s->read_transfer; out->total = s->read_length;
             out->token = s->read_token; out->result = DQ_OK;
+            out->legacy_token = s->legacy_read_token;
             break;
-        case ZQ_SETTLE: out->result = qs_settle((qs_lane_t)r->lane, &r->token); break;
+        case ZQ_SETTLE:
+            if (r->domain == ZQ_ADD_LEGACY) out->result = s->legacy.settle ?
+                s->legacy.settle(r->lane, &r->legacy_token, r->custody) : DQ_IO;
+            else out->result = qs_settle((qs_lane_t)r->lane, &r->token);
+            break;
         case ZQ_SNAPSHOT:
             out->verified = qs_snapshot((qs_lane_t)r->lane, &out->depth);
             out->result = out->verified ? DQ_OK : DQ_PENDING; break;

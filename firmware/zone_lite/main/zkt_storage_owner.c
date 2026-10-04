@@ -5,6 +5,7 @@
 #include "zkt_journal_transport.h"
 #include "zkt_reader_platform.h"
 #include "zkt_runtime_checkpoint.h"
+#include "zkt_add_legacy_owner.h"
 #include "queue_store.h"
 #include <dirent.h>
 #include <errno.h>
@@ -476,6 +477,8 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     }
     strcpy(owner->prefix, prefix);
     owner->metadata = *metadata;
+    owner->segmented.legacy = (zq_legacy_port_t){
+        add_legacy_owner_append, add_legacy_owner_peek, add_legacy_owner_settle};
     ft_port_t catalog_port = {catalog_load, catalog_commit, owner};
     ft_port_t command_port = {commands_load, commands_commit, owner};
     if (!zc_store_init(&owner->catalog, ZC_ACTIVE_PATH, ZC_COMMIT_PATH, ZC_BACKUP_PATH,
