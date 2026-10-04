@@ -5,11 +5,9 @@
 static bool valid_local_time(const struct tm *local)
 {
     if (!local || local->tm_year < 100 || local->tm_year > 199 ||
-        local->tm_mon < 0 || local->tm_mon > 11 ||
-        local->tm_mday < 1 || local->tm_mday > 31 ||
-        local->tm_hour < 0 || local->tm_hour > 23 ||
-        local->tm_min < 0 || local->tm_min > 59 ||
-        local->tm_sec < 0 || local->tm_sec > 59) return false;
+        !zkt_clock_fields_valid((unsigned)local->tm_year + 1900U, (unsigned)local->tm_mon + 1U,
+            (unsigned)local->tm_mday, (unsigned)local->tm_hour,
+            (unsigned)local->tm_min, (unsigned)local->tm_sec)) return false;
     struct tm copy = *local;
     copy.tm_isdst = 0;
     time_t roundtrip = mktime(&copy); /* Firmware sets TZ=UTC0 at boot. */

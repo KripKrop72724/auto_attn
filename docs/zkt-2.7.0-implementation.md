@@ -27,6 +27,7 @@ evidence still required. They are procedures, not passing qualification results.
 | Legacy probes hide journal worker and append failures | Separate owner, synchronous capture, ADD transport and retained legacy workers; bounded mailbox/catalog snapshots; append faults survive unrelated work; unknown authority is retained as recovery telemetry | Actual owner-thread recovery and capacity tests; pinned cJSON allocation faults; heartbeat, HIL and browser evidence tests | Implemented diagnostic component; migration counts, latency qualification and release acceptance remain open |
 | Rejected evidence cannot be traced safely | Bounded rejection categories and envelope request IDs without copying protected payloads | `test_browser_reliability.py` | Implemented |
 | Source timestamp/layout exceptions | Extracted 8/16/40-byte firmware and ADD fact decoders; explicit live layouts, calendar validation, strict count/layout agreement and bounded transport; six model selectors | Sanitized record/transport harnesses, 3,500 cross-language fact/clock vectors and ASan/UBSan | Partial: valid physical-model fixtures and actual exception root cause are unqualified |
+| Live firmware accepts impossible dates and control characters that ADD rejects | Shared pure Gregorian field validation for framing and clock conversion; printable ASCII text before the first NUL, with literal-space trimming | Actual C/ADD negative wire vectors, valid leap/end-of-century dates, genuinely ambiguous layouts, unchanged raw bytes and 47,190 independent calendar checks under ASan/UBSan | Decoder agreement corrected; installed-model qualification and field-exception root cause remain open |
 | History encoding performs interpretation before raw custody | Exact 2.7.0 source rows emit raw evidence only when journal runtime permits writing; no legacy interpretation fallback through a hold | Production encoder with pinned cJSON, every allocation failure, invalid/zero raw bytes, missing roster and actual runtime gates | Encoder component only; receiver activation, bridge cutover and qualified interpretation remain open |
 | Short socket reads can extend a terminal operation indefinitely | One absolute monotonic deadline for a command, prepared-buffer transfer or live frame, including interleaved preservation and ACK; per-call nonblocking I/O after readiness | Fragment trickles, repeated events, interrupted waits, readiness races, actual Unix/TCP sockets and both ESP-IDF builds | Implemented transport bound; terminal scheduling and physical-model qualification remain open |
 | Historical attendance UID mistaken for current enrollment identity | Never supply a historical UID to current-roster matching; reject empty 40-byte text identities; preserve missing-reference source rows as `IDENTITY_UNRESOLVED`. Review notes cannot remove the identity hold or certify Oracle delivery | Synthetic empty/space-only fields, C/ADD rejection agreement, actual historical parser, baseline/tail replay and review-gate tests | Implemented guard; historical correction evidence and model qualification remain open |
@@ -173,6 +174,17 @@ that an entire historical scan fits in 90 seconds. On allocation failure the
 caller abandons the session instead of draining an untrusted body. This fixes
 an operation-bound defect, not a demonstrated cause of the field's malformed
 source records.
+
+Live record validation now uses the same complete Gregorian field check as the
+firmware clock converter, including month-specific day counts and the current
+2000–2099 decoder range. Text user references reject control/non-ASCII bytes
+before their first NUL and trim only literal spaces, matching ADD. Invalid
+records cannot supply facts for legacy live attendance; that path requests
+source reconciliation. The gated journal path continues to preserve raw bytes
+before interpretation. Negative wire vectors and independently enumerated
+calendar fields establish decoder agreement, not terminal-model qualification.
+The framing tests also retain a packet valid under two different layouts and
+require it to remain ambiguous rather than selecting an employee interpretation.
 
 ## Browser event contract
 

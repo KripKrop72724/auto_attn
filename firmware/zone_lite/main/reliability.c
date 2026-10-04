@@ -1,4 +1,5 @@
 #include "reliability.h"
+#include "zkt_clock.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -218,13 +219,15 @@ bool rel_parse_live_record(const uint8_t *data, size_t length, rel_live_record_t
         base = 4;
     } else {
         size_t n = 0;
-        while (n < 24 && data[n]) { out->user_id[n] = (char)data[n]; n++; }
-        while (n && isspace((unsigned char)out->user_id[n - 1])) out->user_id[--n] = 0;
+        while (n < 24 && data[n]) {
+            if (data[n] < 32 || data[n] > 126) return false;
+            out->user_id[n] = (char)data[n]; n++;
+        }
+        while (n && out->user_id[n - 1] == ' ') out->user_id[--n] = 0;
         base = 24;
     }
     const uint8_t *t = data + base + 2;
-    if (t[1] < 1 || t[1] > 12 || t[2] < 1 || t[2] > 31 ||
-        t[3] > 23 || t[4] > 59 || t[5] > 59) return false;
+    if (!zkt_clock_fields_valid(2000U + t[0], t[1], t[2], t[3], t[4], t[5])) return false;
     uint64_t timestamp = (((((uint64_t)t[0] * 12 + t[1] - 1) * 31 + t[2] - 1)
                            * 24 + t[3]) * 60 + t[4]) * 60 + t[5];
     if (timestamp > UINT32_MAX) return false;
