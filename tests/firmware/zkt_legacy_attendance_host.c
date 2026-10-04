@@ -128,6 +128,7 @@ static bool g_legacy_owner_progress;
 static bool backlog,receipt,evidence;
 static unsigned sends,evidence_sends,delivery_faults;
 static char delivered[DQ_MAX_RECORD_BYTES+1];
+static char evidence_identity[180];
 static size_t evidence_length;
 typedef enum { ORACLE_DELIVERY_ACKED,ORACLE_DELIVERY_RETRYABLE,ORACLE_DELIVERY_CORRUPT_LOCAL_ROW,
     ORACLE_DELIVERY_IDENTITY_UNRESOLVED,ORACLE_DELIVERY_PERMANENT_REJECTION } oracle_delivery_result_t;
@@ -148,7 +149,8 @@ static bool add_connector_transfer_queue_evidence(const char *queue,const char *
     const void *bytes,size_t length,const char *serial,const char *reason)
 {
     assert(!budget && !owner_task && !strcmp(queue,"ords_legacy") && strstr(generation,"-legacy-") &&
-        strchr(id,':') && !serial && (!strcmp(reason,"MALFORMED") || !strcmp(reason,"IDENTITY_UNRESOLVED")));
+        strchr(id,':') && !serial && (!strcmp(reason,"MALFORMED") || !strcmp(reason,"IDENTITY_UNRESOLVED") || !strcmp(reason,"LEGACY_RECOVERY")));
+    snprintf(evidence_identity,sizeof(evidence_identity),"%s/%s/%s",queue,generation,id);
     ++evidence_sends;evidence_length=length;memcpy(delivered,bytes,length);return evidence;
 }
 static char *oracle_mark_permanent_rejection(const char *line)
@@ -254,7 +256,14 @@ int main(void)
     assert(append_line_policy(PENDING_PATH,"{\"event_uid\":\"retained-uid\"}",QS_ADMIT_LIVE));
     oracle_drain_owned_pending();assert(sends==1 && !saved[0].offset && exists(ZOL_PENDING_PATH) && backlog);
     assert(!strcmp(delivered,"{\"event_uid\":\"retained-uid\"}\n"));
-    receipt=true;oracle_drain_owned_pending();assert(sends==2 && !exists(ZOL_PENDING_PATH));
+    receipt=true;evidence=false;oracle_drain_owned_pending();
+    assert(sends==2 && evidence_sends==1 && exists(ZOL_PENDING_PATH) && !saved[0].offset && !g_legacy_owner_progress);
+    char first_identity[180];memcpy(first_identity,evidence_identity,sizeof(first_identity));
+    /* Lose the ADD reply, then restart the reader. The source, UID and exact
+     * custody identity survive; only a confirmed ADD receipt permits retire. */
+    memset(&lanes[0].queue,0,sizeof(lanes[0].queue));lanes[0].initialized=false;
+    oracle_drain_owned_pending();assert(sends==3 && evidence_sends==2 && !strcmp(first_identity,evidence_identity));
+    evidence=true;oracle_drain_owned_pending();assert(sends==4 && !exists(ZOL_PENDING_PATH));
     oracle_drain_owned_pending();assert(!backlog && zol_pending_verified_empty() && !file_has_nonempty_line(PENDING_PATH));
     reject=true;assert(!append_line_policy(PENDING_PATH,"rejected-admission",QS_ADMIT_LIVE));
     assert(!zol_pending_verified_empty() && file_has_nonempty_line(PENDING_PATH));reject=false;
@@ -262,10 +271,12 @@ int main(void)
     oracle_drain_owned_pending();assert(exists(ZOL_PENDING_PATH) && !saved[0].offset);
     delivery_result=ORACLE_DELIVERY_PERMANENT_REJECTION;full=true;
     oracle_drain_owned_pending();assert(exists(ZOL_PENDING_PATH) && !exists(ZOL_BLOCKED_PATH));full=false;
-    oracle_drain_owned_pending();assert(!exists(ZOL_PENDING_PATH) && exists(ZOL_BLOCKED_PATH));
+    evidence=false;oracle_drain_owned_pending();assert(exists(ZOL_PENDING_PATH) && exists(ZOL_BLOCKED_PATH));
+    evidence=true;oracle_drain_owned_pending();assert(!exists(ZOL_PENDING_PATH) && exists(ZOL_BLOCKED_PATH));
     assert(peek_lane(1,bytes,&length,&token)==DQ_OK);bytes[length]=0;assert(strstr(bytes,"retained-uid"));
     reset_lane(0);seed(ZOL_PENDING_PATH,"raw\0tail",8);before=sends;evidence=false;
-    oracle_drain_owned_pending();assert(sends==before && evidence_sends==1 && exists(ZOL_PENDING_PATH));
+    unsigned previous_evidence=evidence_sends;
+    oracle_drain_owned_pending();assert(sends==before && evidence_sends==previous_evidence+1 && exists(ZOL_PENDING_PATH));
     evidence=true;oracle_drain_owned_pending();assert(sends==before && evidence_length==8 && !memcmp(delivered,"raw\0tail",8));
     assert(!exists(ZOL_PENDING_PATH));
     reset_lane(0);assert(append_line(PENDING_PATH,"unresolved"));delivery_result=ORACLE_DELIVERY_IDENTITY_UNRESOLVED;evidence=false;

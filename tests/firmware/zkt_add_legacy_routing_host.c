@@ -24,6 +24,9 @@ static bool required=true, segmented;
 static unsigned held, writes, reads, settlements, direct_reads, direct_settlements;
 static unsigned fail_on_write;
 static bool last_custody;
+static bool generation_ok=true,evidence_ok=true;
+static unsigned evidence_sends;
+static char evidence_key[256];
 static int64_t now;
 static dq_result_t reply=DQ_OK;
 #if ZONE_LITE_QUEUE_OWNER
@@ -74,6 +77,14 @@ dq_result_t zq_legacy_peek(unsigned lane,void *bytes,size_t capacity,size_t *len
 dq_result_t zq_legacy_settle(unsigned lane,const lq_token_t *token,bool custody)
 { assert(required && !held && lane<2 && token->generation==9 && token->offset==7 && token->end==11 && token->crc==99);
   ++settlements;last_custody=custody;return reply; }
+bool qs_generation(char output[33])
+{ assert(!held);memset(output,'a',32);output[32]=0;return generation_ok; }
+static bool add_connector_transfer_queue_evidence(const char *queue,const char *generation,const char *id,
+    const void *bytes,size_t length,const char *serial,const char *reason)
+{
+    assert(!held && required && !serial && !strcmp(reason,"LEGACY_RECOVERY") && length==4 && !memcmp(bytes,"new\n",4));
+    ++evidence_sends;snprintf(evidence_key,sizeof(evidence_key),"%s/%s/%s",queue,generation,id);return evidence_ok;
+}
 #include "add_legacy_routing_actual.inc"
 int main(void)
 {
@@ -99,8 +110,23 @@ int main(void)
         assert(now-started==ADD_BULK_CAPACITY_WAIT_MS && !direct_reads && !direct_settlements && !held);
         assert(stat("live.jsonl",&st)!=0 && errno==ENOENT && stat("bulk.jsonl",&st)!=0 && errno==ENOENT);
         reply=DQ_OK;
+        dq_token_t segmented_token={.segment=3,.offset=7,.end=11,.sequence=19,.crc=99};
+        token=(lq_token_t){.generation=9,.offset=7,.end=11,.crc=99};
+        const char *names[]={"add_live_legacy/","add_live/","add_bulk_legacy/","add_bulk/","receipts/","evidence/"};
+        for(unsigned lane=0;lane<6;++lane){
+            assert(preserve_retained_outbox(lane,"new\n",4,&segmented_token,&token));
+            assert(strstr(evidence_key,names[lane])==evidence_key);
+            assert(strstr(evidence_key,lane==0 || lane==2 ? "-legacy-9/7:99" : "-segmented-v2/3:7:19"));
+        }
+        unsigned custody_before=evidence_sends;generation_ok=false;
+        assert(!preserve_retained_outbox(0,"new\n",4,&segmented_token,&token) && evidence_sends==custody_before);
+        generation_ok=true;evidence_ok=false;
+        assert(!preserve_retained_outbox(0,"new\n",4,&segmented_token,&token) && evidence_sends==custody_before+1);
+        evidence_ok=true;
     }
     required=false; /* Older ZKT and Hikvision use their existing direct path. */
+    unsigned custody_before=evidence_sends;
+    assert(preserve_retained_outbox(0,NULL,0,NULL,NULL) && evidence_sends==custody_before);
     assert(add_connector_enqueue_validated_line_with_policy("old",true,QS_ADMIT_LIVE));
     FILE *file=fopen("live.jsonl","rb");assert(file && fread(bytes,1,4,file)==4 && !memcmp(bytes,"old\n",4) && fclose(file)==0);
     assert(read_legacy_delivery(&s_live_outbox,bytes,&length,&token) && length==4 && direct_reads==1);

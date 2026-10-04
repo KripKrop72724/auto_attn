@@ -13,6 +13,8 @@ def test_attendance_legacy_owner_faults_and_checkpoint_compatibility(tmp_path):
     actual = source[source.index("static bool append_line_policy("):source.index("static bool extract_event_uid(")]
     actual += source[source.index("static bool file_has_nonempty_line("):
                      source.index("static bool restore_pending_backup_if_needed(")]
+    actual += source[source.index("static bool preserve_delivered_ords("):
+                     source.index("static bool oracle_drain_segmented_slice(")]
     actual += source[source.index("static void oracle_drain_owned_pending("):
                      source.index("\n#endif", source.index("static void oracle_drain_owned_pending("))]
     (tmp_path / "legacy_delivery_actual.inc").write_text(actual)

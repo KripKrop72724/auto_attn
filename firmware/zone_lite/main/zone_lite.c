@@ -3205,27 +3205,26 @@ static bool settle_blocked_locked(const lq_token_t *token, bool custody)
 static bool recover_blocked_events_from_snapshot(const user_table_t *users, size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
-    bool owned = legacy_attendance_owner_required();
-    if (!users || (!owned && (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE))) return false;
+    if (!users) return false;
+    if (legacy_attendance_owner_required()) {
+        /* Bridge/writer snapshots must not rewrite or retire retained source
+         * bytes. The delivery worker transfers the original blocked record to
+         * ADD before retirement; identity resolution remains an ADD obligation.
+         * This caller may own the terminal session, so it cannot await custody. */
+        return true;
+    }
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return false;
     char line[MAX_EVENT_JSON];
     lq_token_t token;
-    dq_result_t read;
-#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
-    if (owned) {
-        size_t copied = 0;
-        read = zq_attendance_legacy_peek(ZOL_BLOCKED, line, sizeof(line) - 1, &copied, &token);
-        if (read == DQ_OK) line[copied] = 0;
-    } else
-#endif
-        read = read_blocked_locked(line, sizeof(line), &token);
+    dq_result_t read = read_blocked_locked(line, sizeof(line), &token);
     if (read != DQ_OK) {
-        if (!owned) xSemaphoreGive(g_storage_lock);
+        xSemaphoreGive(g_storage_lock);
         return read == DQ_EMPTY;
     }
     size_t length = token.end - token.offset;
     bool syntax_valid = !token.evidence_required && !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
     cJSON *root = syntax_valid ? cJSON_Parse(line) : NULL;
-    if (syntax_valid && !root) { if (!owned) xSemaphoreGive(g_storage_lock); return false; }
+    if (syntax_valid && !root) { xSemaphoreGive(g_storage_lock); return false; }
     const cJSON *user_id = root ? cJSON_GetObjectItemCaseSensitive(root, "user_id") : NULL;
     const cJSON *uid = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid") : NULL;
     const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
@@ -3243,7 +3242,7 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
     if (!user || strlen(user->cnic) != 13 || strspn(user->cnic, "0123456789") != 13) {
         // Unresolved heads are independently transferred by the delivery worker;
         // no whole-file rewrite or size cutoff blocks unrelated capture.
-        cJSON_Delete(root); if (!owned) xSemaphoreGive(g_storage_lock); return true;
+        cJSON_Delete(root); xSemaphoreGive(g_storage_lock); return true;
     }
     cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
     cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
@@ -3253,17 +3252,11 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
     char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
     ok = output && append_line(PENDING_PATH, output);
-    if (ok) {
-#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
-        if (owned) ok = zq_attendance_legacy_settle(ZOL_BLOCKED, &token, false) == DQ_OK;
-        else
-#endif
-            ok = settle_blocked_locked(&token, false);
-    }
+    if (ok) ok = settle_blocked_locked(&token, false);
     free(output); cJSON_Delete(root);
     if (ok && recovered_out) *recovered_out = 1;
     if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
-    if (!owned) xSemaphoreGive(g_storage_lock);
+    xSemaphoreGive(g_storage_lock);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     return ok;
 }
@@ -7289,8 +7282,27 @@ static int64_t g_segmented_ords_retry_ms;
 static bool g_legacy_owner_progress;
 #endif
 
-/* Compatibility reader: one request per slice, with no storage mutex held
+/* Compatibility reader: one retained record per slice, with no storage mutex held
  * across transport or receipt delivery. New-format production remains gated. */
+static bool preserve_delivered_ords(const void *bytes, size_t length,
+    const dq_token_t *segmented, const lq_token_t *legacy)
+{
+    if (!legacy_attendance_owner_required()) return true;
+    if (!bytes || !length || (!segmented && !legacy) || (segmented && legacy)) return false;
+    char instance[33], generation[80], record_id[80];
+    if (!qs_generation(instance)) return false;
+    if (segmented) {
+        snprintf(generation, sizeof(generation), "%s", instance);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu:%lu", (unsigned long)segmented->segment,
+            (unsigned long)segmented->offset, (unsigned long)segmented->sequence);
+    } else {
+        snprintf(generation, sizeof(generation), "%s-legacy-%lu", instance, (unsigned long)legacy->generation);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)legacy->offset, (unsigned long)legacy->crc);
+    }
+    return add_connector_transfer_queue_evidence(segmented ? "ords" : "ords_legacy",
+        generation, record_id, bytes, length, NULL, "LEGACY_RECOVERY");
+}
+
 static bool oracle_drain_segmented_slice(void)
 {
     int64_t now = uptime_ms();
@@ -7335,6 +7347,11 @@ static bool oracle_drain_segmented_slice(void)
         }
     }
     free(quarantine);
+    if (settled && (delivery == ORACLE_DELIVERY_ACKED || delivery == ORACLE_DELIVERY_PERMANENT_REJECTION)) {
+        add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+        settled = preserve_delivered_ords(event, length, &token, NULL);
+        add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    }
     if (settled && qs_settle(QS_ORDS, &token) != DQ_OK) {
         settled = false;
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -7407,6 +7424,11 @@ static void oracle_drain_owned_pending(void)
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
     free(quarantine);
+    if (settled && !custody) {
+        add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+        settled = preserve_delivered_ords(event, length, NULL, &token);
+        add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    }
     if (!settled) return;
     dq_result_t committed = zq_attendance_legacy_settle(ZOL_PENDING, &token, custody);
     if (committed == DQ_OK) {
