@@ -345,6 +345,36 @@ async function mockDashboard(page: Page) {
 
 test.beforeEach(async ({ page }) => mockDashboard(page))
 
+test('a permanently closed event stream reconnects while fleet snapshots keep refreshing', async ({ page }) => {
+  let streamRequests = 0
+  let fleetRequests = 0
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/v1/devices') fleetRequests += 1
+  })
+  await page.route('**/events/v1/stream', async route => {
+    streamRequests += 1
+    // HTTP 204 puts the browser's real EventSource in CLOSED; its native
+    // transient-error retry cannot recover this connection.
+    await route.fulfill({ status: 204 })
+  })
+  await page.clock.install({ time: new Date('2026-10-04T09:00:00Z') })
+  // Freeze before app startup so real network scheduling cannot move an
+  // attempt a few milliseconds past the next 30-second clock boundary.
+  await page.clock.pauseAt(new Date('2026-10-04T09:00:01Z'))
+  await page.goto('/fleet')
+  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
+  await expect.poll(() => streamRequests).toBe(1)
+  await expect(page.locator('.live-sync')).toHaveText('Reconnecting')
+  const initialFleetRequests = fleetRequests
+  await page.clock.runFor(30_200)
+  await expect.poll(() => streamRequests).toBe(2)
+  await expect.poll(() => fleetRequests).toBeGreaterThan(initialFleetRequests)
+  await expect(page.getByText('Cached data', { exact: true })).toBeVisible()
+  await expect(page.getByText('Live transport', { exact: true })).toHaveCount(0)
+  await page.clock.runFor(30_000)
+  await expect.poll(() => streamRequests).toBe(3)
+})
+
 test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
   await page.goto('/fleet')
   await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()

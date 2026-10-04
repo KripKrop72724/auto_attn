@@ -826,6 +826,9 @@ describe('State Life ADD interface', () => {
   })
 
   it('starts an exact-target HIL firmware campaign with step-up confirmation', async () => {
+    // Finish the lazy module's test-time transform before timing interactions.
+    // The browser suite exercises route loading from the production bundle.
+    await import('./features/Firmware')
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
