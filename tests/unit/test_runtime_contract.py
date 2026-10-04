@@ -4,6 +4,33 @@ from zk_add.runtime_contract import journal_storage_status, runtime_contract, wo
 from zk_add.schemas import FirmwareDiagnostics, HeartbeatPayload
 
 
+@pytest.mark.parametrize("field", ["legacy_read_faults", "legacy_append_faults", "legacy_retire_faults", "legacy_error_code"])
+def test_active_legacy_incident_survives_ingress_and_overrides_a_healthy_claim(field):
+    payload = HeartbeatPayload(diagnostics={"schema_version": 2, "storage": {
+        "durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True,
+        "legacy_read_recoveries": 12, "legacy_error_queue": "ords_pending",
+        "legacy_error_operation": "legacy_read", field: 1}})
+    storage = payload.diagnostics.storage
+    assert storage.durability == "DEGRADED"
+    assert not storage.persistence_verified and not storage.recovery_complete
+    assert storage.legacy_read_recoveries == 12
+    assert storage.legacy_error_queue == "ords_pending"
+    assert storage.model_dump()[field] == 1
+
+
+def test_recovered_legacy_read_history_and_missing_diagnostics_are_not_active_faults():
+    source = {"durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True}
+    for extra in ({}, {"legacy_read_faults": 0, "legacy_append_faults": 0,
+                      "legacy_retire_faults": 0, "legacy_read_recoveries": 42}):
+        value = FirmwareDiagnostics(storage={**source, **extra}).storage
+        assert value.durability == "HEALTHY" and value.recovery_complete and value.persistence_verified
+        assert value.legacy_read_recoveries == extra.get("legacy_read_recoveries")
+    for extra in ({"legacy_read_faults": 8}, {"legacy_append_faults": -1},
+                  {"legacy_read_recoveries": 0x100000000}, {"legacy_error_queue": "unknown"}):
+        with pytest.raises(ValueError):
+            FirmwareDiagnostics(storage={**source, **extra})
+
+
 def test_legacy_requirements_are_preserved_and_journal_does_not_need_esp_oracle():
     assert runtime_contract({}).workers == {"add_delivery", "ords_delivery"}
     evidence = {"schema_version": 2, "runtime_profile": "ZKT_JOURNAL_V1",

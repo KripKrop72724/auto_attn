@@ -1,5 +1,6 @@
 #pragma once
 #include "durable_queue.h"
+#include "legacy_storage_health.h"
 
 typedef enum { QS_LIVE, QS_BULK, QS_ORDS, QS_BLOCKED, QS_RECEIPTS, QS_EVIDENCE,
     QS_HIK_SOURCE, QS_COUNT } qs_lane_t;
@@ -8,6 +9,7 @@ typedef enum { QS_ADMIT_LIVE, QS_ADMIT_HISTORICAL, QS_ADMIT_RECOVERY,
 typedef struct {
     size_t total_bytes, used_bytes, admission_reserve_bytes;
     bool observed, available, bulk_paused, recovery_complete, persistence_verified;
+    bool persistence_recheck_required; /* A recovered legacy fault needs a fresh proof. */
     uint32_t failures, write_failures, read_failures, admission_rejections;
     uint32_t persistence_probe_failures;
     uint32_t persistence_probe_total_failures;
@@ -15,6 +17,7 @@ typedef struct {
     const char *persistence_probe_operation;
     int last_error;
     const char *last_operation;
+    lf_health_t legacy;
 } qs_health_t;
 bool qs_init(void);
 /* ZKT supervisor: bounded verification of pending segmented records. */
@@ -44,3 +47,6 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes);
  * Caller must hold a successful qs_local_*_begin until qs_local_end. */
 qs_health_t qs_local_health_locked(void);
 void qs_local_end(bool persisted, int captured_error);
+/* Owner-only legacy adapters: reports the exact lane/operation before releasing
+ * the local lock. Refusals and contention are not failed persistence. */
+void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t result, int captured_error);

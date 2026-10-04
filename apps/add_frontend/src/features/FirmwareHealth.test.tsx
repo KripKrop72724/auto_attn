@@ -18,6 +18,19 @@ const journal: NonNullable<FirmwareDiagnostics['journal_runtime']> = {
   proof_attempts: 3, failures: 7, sampled_uptime_ms: 40000, compatibility: 'READER_OK',
 }
 describe('firmware preservation evidence', () => {
+  it.each(['legacy_read_faults', 'legacy_append_faults', 'legacy_retire_faults', 'legacy_error_code'] as const)('keeps an active %s separate from recovered history', field => {
+    const diagnostics = { ...healthy, storage: { ...healthy.storage!, legacy_read_recoveries: 42,
+      legacy_error_queue: 'ords_pending', legacy_error_operation: 'legacy_read', [field]: 1 } }
+    const { rerender } = render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
+    expect(screen.getByRole('heading', { name: 'Local storage needs attention' })).toBeTruthy()
+    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.getByText('42')).toBeTruthy()
+    if (field === 'legacy_error_code') expect(screen.getByText(/Retained Oracle pending · reading preserved records · 1/)).toBeTruthy()
+    rerender(<FirmwareHealth bootId="current" diagnostics={{ ...diagnostics,
+      storage: { ...diagnostics.storage, [field]: 0 } }} observedAt={new Date().toISOString()} />)
+    expect(screen.getByRole('heading', { name: 'Local storage verified' })).toBeTruthy()
+    expect(screen.getByText('42')).toBeTruthy()
+  })
   it.each(['missing', 'stale', 'full', 'recovering', 'append-failed'])('does not promote legacy storage proof over %s journal evidence', failure => {
     const diagnostics: FirmwareDiagnostics = { ...healthy, runtime_profile: 'ZKT_JOURNAL_V1', sampled_uptime_ms: 100000,
       journal_storage: { observed: true, fresh: true, ready: true, durability: 'HEALTHY', checkpoint_recovery_pending: false,

@@ -167,6 +167,13 @@ export interface FirmwareDiagnostics {
     admission_reserve_bytes?: number | null
     write_failures?: number | null
     read_failures?: number | null
+    legacy_read_faults?: number | null
+    legacy_append_faults?: number | null
+    legacy_retire_faults?: number | null
+    legacy_read_recoveries?: number | null
+    legacy_error_queue?: string | null
+    legacy_error_operation?: string | null
+    legacy_error_code?: number | null
     persistence_probe_failures?: number | null
     persistence_probe_total_failures?: number | null
     persistence_probe_error?: number | null

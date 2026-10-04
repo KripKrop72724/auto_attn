@@ -119,6 +119,8 @@ def start_run(
         storage.get("durability") != "HEALTHY"
         or storage.get("persistence_verified") is not True
         or bool(storage.get("persistence_probe_error"))
+        or any(storage.get(name) for name in (
+            "legacy_read_faults", "legacy_append_faults", "legacy_retire_faults", "legacy_error_code"))
         or storage.get("recovery_complete") is not True
         or storage.get("error_code")
         or storage.get("upgrade_ready") is not True

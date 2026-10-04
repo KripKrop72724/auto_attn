@@ -129,6 +129,14 @@ class StorageDiagnostics(BaseModel):
     admission_reserve_bytes: int | None = Field(default=None, ge=0)
     write_failures: int | None = Field(default=None, ge=0)
     read_failures: int | None = Field(default=None, ge=0)
+    legacy_read_faults: int | None = Field(default=None, ge=0, le=7)
+    legacy_append_faults: int | None = Field(default=None, ge=0, le=7)
+    legacy_retire_faults: int | None = Field(default=None, ge=0, le=7)
+    legacy_read_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    legacy_error_queue: Literal["add_live", "add_bulk", "ords_pending", "identity_blocked",
+                                "ords_quarantine", "add_quarantine", "add_quarantine_backup"] | None = None
+    legacy_error_operation: Literal["legacy_read", "legacy_append", "legacy_retire"] | None = None
+    legacy_error_code: int | None = None
     persistence_probe_failures: int | None = Field(default=None, ge=0)
     persistence_probe_total_failures: int | None = Field(default=None, ge=0)
     persistence_probe_error: int | None = None
@@ -143,6 +151,16 @@ class StorageDiagnostics(BaseModel):
     recovery_complete: bool = False
     error_operation: str | None = Field(default=None, max_length=80)
     error_code: int | None = None
+
+    @model_validator(mode="after")
+    def retain_legacy_recovery_hold(self) -> "StorageDiagnostics":
+        if (self.legacy_read_faults or self.legacy_append_faults or self.legacy_retire_faults
+                or self.legacy_error_code):
+            if self.durability != "FULL":
+                self.durability = "DEGRADED"
+            self.recovery_complete = False
+            self.persistence_verified = False
+        return self
 
 
 class MemoryDiagnostics(BaseModel):

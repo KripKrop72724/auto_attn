@@ -64,6 +64,10 @@ int main(void)
     assert(!qs_recover_step()); /* Another lane cannot certify the changed one. */
     for (unsigned pass = 0; pass < 2 * QS_COUNT; ++pass) (void)qs_recover_step();
     assert(qs_recover_step() && accesses == before + 2);
+    health.legacy.error = EIO;
+    assert(!qs_recover_step() && !health.recovery_complete);
+    health.legacy.error = 0;
+    assert(qs_recover_step()); /* Segmented checks cannot override legacy incidents. */
     memset(recovery_audits, 0, sizeof(recovery_audits));
     failed_lane = 2; before = accesses;
     for (unsigned pass = 0; pass < 2 * QS_COUNT; ++pass) assert(!qs_recover_step());

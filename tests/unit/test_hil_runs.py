@@ -182,6 +182,10 @@ def test_journal_hil_requires_its_workers_and_keeps_legacy_custody_obligations(r
         "offline",
         "recovery",
         "probe-error",
+        "legacy_read_faults",
+        "legacy_append_faults",
+        "legacy_retire_faults",
+        "legacy_error_code",
         "unknown-queue",
         "worker",
         "reconciling",
@@ -210,6 +214,8 @@ def test_observation_cannot_start_before_every_precondition(ready, change):
         telemetry.payload["diagnostics"]["storage"]["recovery_complete"] = False
     if change == "probe-error":
         telemetry.payload["diagnostics"]["storage"]["persistence_probe_error"] = 5
+    if change.startswith("legacy_"):
+        telemetry.payload["diagnostics"]["storage"][change] = 1
     if change == "unknown-queue":
         telemetry.payload["diagnostics"]["queues"][0]["count_known"] = False
     if change == "worker":

@@ -18,6 +18,9 @@ def test_quarantine_custody_storage_owner_and_family_paths(tmp_path):
         path = tmp_path / header
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('#include "zkt_storage_owner_platform.h"\n')
+    health_source = (main / "queue_store.c").read_text()
+    report = health_source[health_source.index("void qs_local_end_legacy("):health_source.index("static bool lock(")]
+    (tmp_path / "legacy_health_actual.inc").write_text(report.replace("xSemaphoreGive(budget_lock);", "qs_local_end(true, 0);"))
     for owner in (0, 1):
         executable = tmp_path / f"quarantine-{owner}"
         directory = tmp_path / f"family-{owner}"
@@ -28,6 +31,6 @@ def test_quarantine_custody_storage_owner_and_family_paths(tmp_path):
                         "-I", str(ROOT / "tests/firmware"), "-I", str(main),
                         str(ROOT / "tests/firmware/zkt_quarantine_owner_host.c"),
                         *(str(main / name) for name in ("zkt_segmented_store.c", "zkt_segmented_client.c",
-                                                       "durable_queue.c")),
+                                                       "legacy_storage_health.c", "durable_queue.c")),
                         "-o", str(executable)], check=True)
         subprocess.run([str(executable)], cwd=directory, check=True, timeout=30)

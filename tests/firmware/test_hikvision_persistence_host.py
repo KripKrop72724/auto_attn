@@ -60,6 +60,13 @@ int main(void){
  assert(!attempt_probe());assert(writes==0);
  health.recovery_complete=true;assert(attempt_probe());assert(health.persistence_verified && writes==1);
  assert(attempt_probe() && writes==1); /* no recurring flash wear */
+ health.legacy.error=EIO;
+ assert(!attempt_probe() && writes==1); /* No global probe clears a scoped legacy incident. */
+ health.legacy.error=0;
+ health.persistence_recheck_required=true;
+ assert(attempt_probe() && writes==2 && !health.persistence_recheck_required);
+ assert(attempt_probe() && writes==2); /* One fresh full proof, then no recurring writes. */
+ writes=1; /* Retain the independent fault-matrix counter baseline below. */
  health=(qs_health_t){.recovery_complete=true};fail_fs=1;
  assert(!attempt_probe() && !health.persistence_verified && !health.last_error);
  assert(health.persistence_probe_failures==1 && writes==1);

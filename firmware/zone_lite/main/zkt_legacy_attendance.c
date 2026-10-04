@@ -79,11 +79,12 @@ static dq_result_t prepare(lane_t *lane)
     /* One bounded consumed-prefix check, never a synchronous whole-file scan. */
     return lq_open_step(&lane->queue, lane->path, (lq_port_t){load, commit, lane});
 }
-static dq_result_t finish(lane_t *lane, dq_result_t result, bool failed_write, int error)
+static dq_result_t finish(lane_t *lane, dq_result_t result, lf_operation_t operation, int error)
 {
     if (lane == &lanes[ZOL_PENDING]) atomic_store_explicit(&pending_empty,
         result == DQ_EMPTY && lane->queue.ready && lane->queue.empty_cached, memory_order_release);
-    qs_local_end(!failed_write, failed_write ? (error ? error : EIO) : 0);
+    qs_local_end_legacy(lane == &lanes[ZOL_PENDING] ? LF_ORDS_PENDING : LF_IDENTITY_BLOCKED,
+        operation, result, error);
     return result;
 }
 static dq_result_t retire(lane_t *lane)
@@ -103,6 +104,7 @@ dq_result_t zol_owner_append(unsigned index, const void *bytes, size_t length, q
         memchr(bytes, 0, length) || memchr(bytes, '\n', length)) return DQ_IO;
     lane_t *lane = begin(index);
     if (!lane) return DQ_PENDING;
+    errno = 0;
     dq_result_t result = prepare(lane);
     bool attempted = false;
     int error = 0;
@@ -121,7 +123,7 @@ dq_result_t zol_owner_append(unsigned index, const void *bytes, size_t length, q
     if (file && fclose(file) != 0) { ok = false; if (!error) error = errno ? errno : EIO; }
     result = ok ? DQ_OK : DQ_IO;
 done:
-    return finish(lane, result, attempted && result != DQ_OK, error);
+    return finish(lane, result, attempted ? LF_APPEND : LF_READ, error ? error : errno);
 }
 dq_result_t zol_owner_peek(unsigned index, void *bytes, size_t capacity, size_t *length, lq_token_t *token)
 {
@@ -130,6 +132,8 @@ dq_result_t zol_owner_peek(unsigned index, void *bytes, size_t capacity, size_t 
     if (!bytes || capacity < 2 || capacity > DQ_MAX_RECORD_BYTES + 1 || !length || !token) return DQ_IO;
     lane_t *lane = begin(index);
     if (!lane) return DQ_PENDING;
+    errno = 0;
+    lf_operation_t operation = LF_READ;
     dq_result_t result = prepare(lane);
     if (result != DQ_OK) goto done;
     if (lane->queue.empty_cached) { result = DQ_EMPTY; goto done; }
@@ -138,10 +142,13 @@ dq_result_t zol_owner_peek(unsigned index, void *bytes, size_t capacity, size_t 
     else if (result == DQ_EMPTY) {
         dq_result_t reclaimed = retire(lane);
         if (reclaimed == DQ_EMPTY) lane->queue.empty_cached = true;
-        else result = reclaimed == DQ_OK ? DQ_PENDING : reclaimed;
+        else {
+            result = reclaimed == DQ_OK ? DQ_PENDING : reclaimed;
+            if (result == DQ_IO || result == DQ_CORRUPT) operation = LF_RETIRE;
+        }
     }
 done:
-    return finish(lane, result, false, 0);
+    return finish(lane, result, operation, errno);
 }
 dq_result_t zol_owner_settle(unsigned index, const lq_token_t *token, bool custody)
 {
@@ -155,5 +162,5 @@ dq_result_t zol_owner_settle(unsigned index, const lq_token_t *token, bool custo
         if (result == DQ_STALE) result = DQ_OK; /* Another retained row remains. */
     }
     int error = errno;
-    return finish(lane, result, result == DQ_IO, error);
+    return finish(lane, result, LF_RETIRE, error);
 }

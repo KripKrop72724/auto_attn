@@ -22,6 +22,7 @@ typedef struct { durable_queue_t queue; SemaphoreHandle_t mutex; qs_lane_t lane;
 static lane_t lanes[QS_COUNT];
 static SemaphoreHandle_t budget_lock;
 static qs_health_t health;
+static lf_state_t legacy_health;
 static storage_budget_t budget;
 static char storage_generation[33];
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe", "qh"};
@@ -156,11 +157,13 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
     if (!admitted) {
         health.failures++;
         health.admission_rejections++;
-        health.last_operation = measured ? "capacity_admission" : "filesystem_info";
         int error = measured ? ENOSPC : EIO;
         // Only the optional authenticated catalog may fall back to memory.
         // Refused attendance and recovery writes must still block boot proof.
-        if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) health.last_error = error;
+        if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) {
+            health.last_error = error;
+            health.last_operation = measured ? "capacity_admission" : "filesystem_info";
+        }
         errno = error;
     }
     return admitted;
@@ -173,6 +176,21 @@ void qs_local_end(bool persisted, int captured_error)
         health.write_failures++;
         health.last_operation = "local_write_commit";
         health.last_error = captured_error ? captured_error : EIO;
+    }
+    xSemaphoreGive(budget_lock);
+}
+
+void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t result, int captured_error)
+{
+    lf_record(&legacy_health, lane, operation, result, captured_error);
+    health.legacy = lf_health(&legacy_health);
+    if (result == DQ_IO || result == DQ_CORRUPT) {
+        if (health.failures < UINT32_MAX) ++health.failures;
+        uint32_t *failures = operation == LF_READ ? &health.read_failures : &health.write_failures;
+        if (*failures < UINT32_MAX) ++*failures;
+        health.recovery_complete = false;
+        health.persistence_verified = false;
+        health.persistence_recheck_required = true;
     }
     xSemaphoreGive(budget_lock);
 }
@@ -280,7 +298,7 @@ bool qs_recover_step(void)
     }
 #endif
     if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        health.recovery_complete = complete && !health.last_error;
+        health.recovery_complete = complete && !health.last_error && !health.legacy.error;
         complete = health.recovery_complete;
         xSemaphoreGive(budget_lock);
     } else complete = false;
@@ -296,10 +314,10 @@ bool qs_verify_persistence(void)
         xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     /* A probe can only resolve its own failure. Queue corruption, refused
      * attendance and failed local writes need their own recovery evidence. */
-    if (!health.recovery_complete || health.last_error) {
+    if (!health.recovery_complete || health.last_error || health.legacy.error) {
         xSemaphoreGive(budget_lock); return false;
     }
-    if (health.persistence_verified && !health.persistence_probe_error) {
+    if (health.persistence_verified && !health.persistence_probe_error && !health.persistence_recheck_required) {
         xSemaphoreGive(budget_lock); return true;
     }
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -400,6 +418,7 @@ bool qs_verify_persistence(void)
     }
     health.persistence_verified = ok;
     if (ok) {
+        health.persistence_recheck_required = false;
         health.persistence_probe_failures = 0;
         health.persistence_probe_error = 0;
         health.persistence_probe_operation = NULL;
@@ -455,7 +474,7 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
     errno = 0;
     dq_result_t result = ensure_storage_generation() ? reopen(&lanes[lane]) : DQ_IO;
     if (result == DQ_OK) result = dq_append(&lanes[lane].queue, data, length);
-    if (result == DQ_OK && !health.persistence_probe_error) health.persistence_verified = true;
+    if (result == DQ_OK && !health.persistence_probe_error && !health.persistence_recheck_required) health.persistence_verified = true;
     record_queue_result(result, "segment_append", true);
     xSemaphoreGive(budget_lock);
     xSemaphoreGive(lanes[lane].mutex);
@@ -523,6 +542,15 @@ qs_health_t qs_local_health_locked(void)
 {
     (void)measure();
     qs_health_t snapshot = health;
+    if (snapshot.persistence_recheck_required) snapshot.persistence_verified = false;
+    if (snapshot.legacy.error) {
+        snapshot.recovery_complete = false;
+        snapshot.persistence_verified = false;
+        if (!snapshot.last_error) {
+            snapshot.last_error = snapshot.legacy.error;
+            snapshot.last_operation = snapshot.legacy.operation;
+        }
+    }
     snapshot.observed = true;
     return snapshot;
 }

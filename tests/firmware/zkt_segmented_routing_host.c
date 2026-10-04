@@ -59,4 +59,8 @@ int main(void)
         assert(routed == (route ? 5U : 0U) && accesses == (route ? 0U : 3U));
         assert(!lane_lock && !budget_mutex);
     }
+    required = owner_context = true;
+    health.persistence_verified = false; health.persistence_recheck_required = true;
+    assert(qs_append_with_policy(QS_LIVE, "x", 1, QS_ADMIT_LIVE) == DQ_OK);
+    assert(!health.persistence_verified && health.persistence_recheck_required);
 }
