@@ -30,6 +30,8 @@ static bool g_ords_buffer_failed;
 static bool fail_evidence, unresolved_identity;
 static const char *expected_reason="MALFORMED";
 static unsigned evidence_requests;
+static bool owner_required;
+static char last_evidence_identity[256];
 static const char *expected_evidence="bad\0row\n";
 static size_t expected_length=8;
 static bool g_prefer_segmented_ords;
@@ -107,10 +109,11 @@ static bool add_connector_transfer_queue_evidence(
     (void)serial;
     assert(!storage_lock && queue[0] && generation[0] && record_id[0] && !strcmp(reason,expected_reason));
     assert(length==expected_length && !memcmp(data,expected_evidence,length));
+    snprintf(last_evidence_identity,sizeof(last_evidence_identity),"%s/%s/%s",queue,generation,record_id);
     ++evidence_requests;
     return !fail_evidence;
 }
-static bool legacy_attendance_owner_required(void) { return false; }
+static bool legacy_attendance_owner_required(void) { return owner_required; }
 /* INSERT_PRODUCTION_SEGMENTED */
 /* INSERT_PRODUCTION_DRAIN */
 
@@ -221,6 +224,18 @@ int main(void)
     fail_evidence=false;g_segmented_ords_retry_ms=0;
     assert(dq_open(&segmented,"segmented-",port)==DQ_OK);
     oracle_drain_pending(true);assert(segmented.checkpoint.depth==0 && requests==prior);
+    /* New-image retained segmented records also require the original bytes in
+     * ADD, even after successful Oracle delivery and local receipt enqueue. */
+    unresolved_identity=false;owner_required=true;expected_reason="LEGACY_RECOVERY";
+    expected_evidence="retained segment";expected_length=strlen(expected_evidence);
+    assert(dq_append(&segmented,expected_evidence,expected_length)==DQ_OK);
+    prior=requests;fail_evidence=true;g_segmented_ords_retry_ms=0;gate_lock=1;
+    assert(oracle_drain_segmented_slice() && requests==prior+1 && segmented.checkpoint.depth==1);
+    char original_identity[256];memcpy(original_identity,last_evidence_identity,sizeof(original_identity));
+    assert(dq_open(&segmented,"segmented-",port)==DQ_OK);
+    fail_evidence=false;g_segmented_ords_retry_ms=0;
+    assert(oracle_drain_segmented_slice() && requests==prior+2 && segmented.checkpoint.depth==0);
+    assert(!strcmp(original_identity,last_evidence_identity) && !storage_lock);gate_lock=0;
     free(g_legacy_drain_buffer);
     puts("legacy drain integration regressions passed");
 }

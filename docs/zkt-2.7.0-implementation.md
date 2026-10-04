@@ -45,8 +45,10 @@ counts are kept outside this public repository.
 | ADD flat-file producers and delivery still perform competing storage operations | New-image producers and delivery use copied owner requests; consumed-prefix recovery yields, all surviving generations drain, and verified-empty evidence is invalidated by writes | Actual adapters and family routing, real files, storage/NVS faults, lost replies, backup-restore failure, stale tokens and owner quiescence | ADD flat-file ownership implemented; migration evidence and ESP qualification remain open |
 | A failed Oracle backlog restore can be mistaken for an empty queue | Require successful generation restoration before scanning or caching empty; propagate retirement/restore errors and keep failed boot restoration visible | Actual Oracle read/send/commit orchestration with failed rename/stat, preserved backup/temp files, retry and lock release; production boot failure checks | Recovery defect corrected; complete migration and field qualification remain open |
 | Retained corrupt-file evidence bypasses the storage task | New-image quarantine reads and exact-receipt retirement use copied owner requests, existing NVS checkpoints and bounded prefix recovery | Actual production adapters and delivery slice, raw/binary/oversized tails, lost receipts/replies, NVS/read/close/stat/remove faults, empty cache and both family paths | Implemented evidence component; raw custody does not resolve identity or deliver attendance to Oracle |
-| Legacy Oracle and identity-blocked files still compete with capture | New-image producers, readers, identity recovery and retirement use the storage task; initial recovery is deferred from boot and yields between prefix slices | Actual adapter and gateway/Oracle/blocked consumers, unchanged checkpoint reader, surviving generations, failed writes/restores/checkpoints, exact receipt ordering, allocation faults and family isolation | Storage-owner component; complete migration records, incident recovery and measured ESP/catch-up qualification remain open |
+| Legacy Oracle and identity-blocked files still compete with capture | New-image producers, readers and retirement use the storage task; initial recovery is deferred from boot and yields between prefix slices | Actual adapter and gateway/Oracle/blocked consumers, unchanged checkpoint reader, surviving generations, failed writes/restores/checkpoints, exact receipt ordering, allocation faults and family isolation | Storage-owner component; complete migration records, incident recovery and measured ESP/catch-up qualification remain open |
 | Legacy read and retirement failures can be missing from shared health | Fixed per-queue read/append/retirement incidents, captured I/O errors, active versus recovered counts in ADD, and a HIL precondition | Actual queue adapters, shared health/probe/recovery functions, short reads and failed close/NVS/reclamation, partial retry, unrelated progress, ingestion and UI tests | Read faults recover only after a complete affected-queue retry; write/retirement proof and durable incident history remain open |
+| Valid retained delivery can retire the original queue bytes without ADD custody | Bridge/writer ADD and Oracle drains require an exact raw-evidence receipt after the existing delivery or quarantine obligation, before checkpoint retirement | Actual ADD worker and Oracle consumers, real files/checkpoints, lost ADD replies, restart, generation failure, allocation faults and family isolation | Retained delivery component; a complete migration inventory, receipt-linked checkpoint certificate and ADD interpretation of retained blocked records remain open |
+| Snapshot recovery can rewrite a retained identity-blocked original before custody | Bridge/writer snapshot callers defer to the existing raw-evidence delivery worker; only a committed ADD custody acknowledgement permits source retirement | Actual snapshot and delivery functions, a matching roster, terminal-session isolation, lost acknowledgements, failed checkpoints, stable replay identity, generation failure and legacy-family regression | Original-byte handoff component; ADD identity resolution and Oracle delivery remain separate, incomplete obligations |
 | Maximum storage-task duration cannot establish capture p99 | Fixed-size capture-session histograms measure complete packet preservation and individual fragment submission-to-commit; ADD retains their counts and shows conservative p99 bounds separately from failures | Actual file-backed capture and queue waits, clock wrap, partial packets, counter exhaustion, allocation failures, heartbeat storage and stale/invalid UI evidence | Measurement component; per-occurrence latency, ESP performance, qualified windows and release acceptance remain open |
 | Development journal and OTA scan use an unmounted directory | Journal runtime and OTA evidence scans share the actual `/storage` boot mount constant | Production boot initialization and runtime adapter compare journal/OTA/catalog/command paths to the captured VFS mount | Integration defect corrected; signed-device boot and physical qualification remain open |
 | Identity lookup can expose a row before a later read or close fails | New-image catalog restoration, lookup and tombstone loading read copied owner chunks; lookup validates complete row counts and clears unresolved outputs | Actual consumer functions, every allocation site, late reads, changed revisions, extra/missing rows, truncated tails and legacy close failure | Implemented read component; ESP catalog latency and legacy custody migration stay open |
@@ -477,6 +479,27 @@ Physical power-loss qualification remains a separate release requirement.
 No connector has been upgraded or accepted by this implementation work.
 
 ## Journal component implementation
+
+The exact bridge/writer's retained ADD and Oracle drains now preserve original
+queue bytes in ADD before retiring a successfully delivered row. Queue names,
+generation and extent identities use the existing evidence protocol; a lost
+reply or failed local checkpoint replays the same object. Accepted attendance
+batches and verified Oracle responses remain separate obligations, so raw custody
+alone cannot claim delivery or resolve identity. No filesystem or terminal lock
+crosses the additional custody exchange. Older ZKT and Hikvision images retain
+their existing behavior. This adds one custody exchange for successfully delivered
+retained rows and needs catch-up qualification. It does not reconstruct already
+retired predecessor rows or certify complete migration. These evidence records retain the existing
+`PRESERVED_UNRESOLVED` disposition; downstream status is checked independently.
+
+Bridge/writer snapshot processing leaves retained identity-blocked originals
+untouched, even when the current roster matches. The existing delivery worker
+transfers those exact bytes to ADD before committing their retirement. A lost
+acknowledgement or failed retirement checkpoint retries the same evidence identity.
+The terminal-session caller performs no additional storage or network work and
+reports zero local identity repairs. ADD identity resolution and downstream
+delivery for these preserved blocked records still require implementation and
+qualification; this change does not turn raw custody into an identity decision.
 
 ADD-owned Oracle delivery now has a separate inactive component described in
 [`zkt-oracle-delivery.md`](zkt-oracle-delivery.md). It freezes encrypted payloads,
