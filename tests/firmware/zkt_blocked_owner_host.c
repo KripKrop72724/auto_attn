@@ -20,10 +20,12 @@
 #define MALLOC_CAP_8BIT 2
 static int g_storage_lock=1,held;
 static bool required=ZONE_LITE_QUEUE_OWNER,append_ok=true,settle_ok=true,custody_ok,with_fingerprint=true;
+static bool session_active,generation_ok=true;
 static dq_result_t read_result=DQ_OK;
 static unsigned appends,settles,owner_reads,direct_reads,evidence_calls;
 static bool last_custody;
 static char source_line[MAX_EVENT_JSON],preserved[MAX_EVENT_JSON];
+static char evidence_generation[80],evidence_id[80];
 static char g_device_serial[80]="TEST-TERMINAL";
 static char saved_fingerprint[65],enrollment_uid[16]="17",capture[32]="LIVE",terminal[80]="TEST-TERMINAL";
 static const char *reason="";
@@ -62,21 +64,26 @@ dq_result_t zq_attendance_legacy_settle(unsigned lane,const lq_token_t *token,bo
 dq_result_t qs_peek(qs_lane_t lane,void *bytes,size_t capacity,size_t *length,dq_token_t *token)
 { (void)bytes;(void)capacity;(void)token;assert(lane==QS_BLOCKED && !held);*length=0;return DQ_EMPTY; }
 dq_result_t qs_settle(qs_lane_t lane,const dq_token_t *token) { (void)lane;(void)token;assert(false);return DQ_IO; }
-bool qs_generation(char output[33]) { assert(!held);memset(output,'a',32);output[32]=0;return true; }
+bool qs_generation(char output[33]) { assert(!held && !session_active);memset(output,'a',32);output[32]=0;return generation_ok; }
 static bool add_connector_is_connected(void) { return true; }
 static void *heap_caps_malloc(size_t size,unsigned flags) { assert(flags==3);return malloc(size); }
 static void add_connector_report_ords_worker(int state) { assert(!held && state>=2 && state<=4); }
 static bool add_connector_transfer_queue_evidence(const char *queue,const char *generation,const char *id,
     const void *bytes,size_t length,const char *serial,const char *classification)
 {
-    (void)serial;assert(!held && !strcmp(queue,"blocked_legacy") && strstr(generation,"-legacy-7") &&
+    (void)serial;assert(!held && !session_active && !strcmp(queue,"blocked_legacy") && strstr(generation,"-legacy-7") &&
         strchr(id,':') && (!strcmp(classification,"LEGACY_RECOVERY") || !strcmp(classification,"MALFORMED")));
-    assert(length==strlen(source_line) && !memcmp(bytes,source_line,length));++evidence_calls;return custody_ok;
+    assert(length==strlen(source_line) && !memcmp(bytes,source_line,length));
+    if(evidence_calls) assert(!strcmp(evidence_generation,generation) && !strcmp(evidence_id,id));
+    snprintf(evidence_generation,sizeof(evidence_generation),"%s",generation);
+    snprintf(evidence_id,sizeof(evidence_id),"%s",id);
+    ++evidence_calls;return custody_ok;
 }
 #include "blocked_consumers_actual.inc"
 static void reset(void)
 {
-    allocations=fail_at=0;appends=settles=0;append_ok=settle_ok=true;last_custody=false;read_result=DQ_OK;
+    allocations=fail_at=0;appends=settles=owner_reads=direct_reads=evidence_calls=0;
+    append_ok=settle_ok=generation_ok=true;session_active=custody_ok=last_custody=false;read_result=DQ_OK;
     snprintf(source_line,sizeof(source_line),"{\"event_uid\":\"retained-uid\",\"user_id\":\"TEST-USER\","
         "\"_terminal_uid\":\"%s\",\"device_serial\":\"%s\",\"capturetype\":\"%s\"%s%s%s%s}\n",
         enrollment_uid,terminal,capture,with_fingerprint?",\"_terminal_identity_fingerprint\":\"":"",
@@ -93,8 +100,22 @@ int main(void)
     strcpy(user->employee_name,"SYNTHETIC TEST");user->raw_punch=true;
     memset(saved_fingerprint,'b',64);saved_fingerprint[64]=0;strcpy(user->terminal_identity_fingerprint,saved_fingerprint);
     reset();size_t recovered=999;
+    if(required) {
+        /* Even an exactly matching roster cannot rewrite/retire original bytes
+         * in the terminal session. This path must not wait on ADD or storage. */
+        for(unsigned unavailable=0;unavailable<2;++unavailable) {
+            reset();session_active=true;fail_at=unavailable?1:0;
+            assert(recover_blocked_events_from_snapshot(&users,&recovered));
+            assert(!recovered && !allocations && !appends && !settles &&
+                !owner_reads && !direct_reads && !evidence_calls && !held);
+        }
+        session_active=false;
+    }
+    /* Existing firmware/Hikvision recovery still requires provenance and a
+     * durable local destination. Its allocation and persistence checks remain. */
+    required=false;reset();
     assert(recover_blocked_events_from_snapshot(&users,&recovered) && recovered==1 && appends==1 && settles==1 && !last_custody && !held);
-    assert(required ? owner_reads==1 && !direct_reads : direct_reads==1 && !owner_reads);
+    assert(direct_reads==1 && !owner_reads);
     size_t total=allocations;
     cJSON *json=cJSON_Parse(preserved);assert(json);
     assert(!strcmp(cJSON_GetObjectItemCaseSensitive(json,"event_uid")->valuestring,"retained-uid"));
@@ -118,8 +139,12 @@ int main(void)
     /* Raw custody retirement is independent of identity repair. No receipt,
      * including a lost response, means no retirement; it holds no file lock. */
     static char raw_buffer[DQ_MAX_RECORD_BYTES+1];g_blocked_drain_buffer=raw_buffer;
+    required=ZONE_LITE_QUEUE_OWNER;
     reset();custody_ok=false;blocked_evidence_slice();assert(evidence_calls==1 && !settles && !held);
-    custody_ok=true;blocked_evidence_slice();assert(evidence_calls==2 && settles==1 && last_custody && !held);
+    custody_ok=true;settle_ok=false;blocked_evidence_slice();assert(evidence_calls==2 && settles==1 && last_custody && !held);
+    settle_ok=true;blocked_evidence_slice();assert(evidence_calls==3 && settles==2 && last_custody && !held && !appends);
+    assert(required ? owner_reads==3 && !direct_reads : direct_reads==3 && !owner_reads);
+    reset();generation_ok=false;blocked_evidence_slice();assert(!evidence_calls && !settles && !appends && !held);
     required=false;reset();assert(recover_blocked_events_from_snapshot(&users,&recovered) && recovered==1 && !held);
     puts("actual blocked identity, exact custody, owner/family routing and allocation faults passed");
 }

@@ -3205,27 +3205,26 @@ static bool settle_blocked_locked(const lq_token_t *token, bool custody)
 static bool recover_blocked_events_from_snapshot(const user_table_t *users, size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
-    bool owned = legacy_attendance_owner_required();
-    if (!users || (!owned && (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE))) return false;
+    if (!users) return false;
+    if (legacy_attendance_owner_required()) {
+        /* Bridge/writer snapshots must not rewrite or retire retained source
+         * bytes. The delivery worker transfers the original blocked record to
+         * ADD before retirement; identity resolution remains an ADD obligation.
+         * This caller may own the terminal session, so it cannot await custody. */
+        return true;
+    }
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return false;
     char line[MAX_EVENT_JSON];
     lq_token_t token;
-    dq_result_t read;
-#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
-    if (owned) {
-        size_t copied = 0;
-        read = zq_attendance_legacy_peek(ZOL_BLOCKED, line, sizeof(line) - 1, &copied, &token);
-        if (read == DQ_OK) line[copied] = 0;
-    } else
-#endif
-        read = read_blocked_locked(line, sizeof(line), &token);
+    dq_result_t read = read_blocked_locked(line, sizeof(line), &token);
     if (read != DQ_OK) {
-        if (!owned) xSemaphoreGive(g_storage_lock);
+        xSemaphoreGive(g_storage_lock);
         return read == DQ_EMPTY;
     }
     size_t length = token.end - token.offset;
     bool syntax_valid = !token.evidence_required && !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
     cJSON *root = syntax_valid ? cJSON_Parse(line) : NULL;
-    if (syntax_valid && !root) { if (!owned) xSemaphoreGive(g_storage_lock); return false; }
+    if (syntax_valid && !root) { xSemaphoreGive(g_storage_lock); return false; }
     const cJSON *user_id = root ? cJSON_GetObjectItemCaseSensitive(root, "user_id") : NULL;
     const cJSON *uid = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid") : NULL;
     const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
@@ -3243,7 +3242,7 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
     if (!user || strlen(user->cnic) != 13 || strspn(user->cnic, "0123456789") != 13) {
         // Unresolved heads are independently transferred by the delivery worker;
         // no whole-file rewrite or size cutoff blocks unrelated capture.
-        cJSON_Delete(root); if (!owned) xSemaphoreGive(g_storage_lock); return true;
+        cJSON_Delete(root); xSemaphoreGive(g_storage_lock); return true;
     }
     cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
     cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
@@ -3253,17 +3252,11 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
     char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
     ok = output && append_line(PENDING_PATH, output);
-    if (ok) {
-#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
-        if (owned) ok = zq_attendance_legacy_settle(ZOL_BLOCKED, &token, false) == DQ_OK;
-        else
-#endif
-            ok = settle_blocked_locked(&token, false);
-    }
+    if (ok) ok = settle_blocked_locked(&token, false);
     free(output); cJSON_Delete(root);
     if (ok && recovered_out) *recovered_out = 1;
     if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
-    if (!owned) xSemaphoreGive(g_storage_lock);
+    xSemaphoreGive(g_storage_lock);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     return ok;
 }
