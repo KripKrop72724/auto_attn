@@ -31,13 +31,15 @@ static inline bool ota_journal_valid(const ota_journal_t *j)
     if (!strcmp(j->state, "IDLE")) return !j->deployment_id[0] && !j->image_size && !j->bytes_written;
     if (strcmp(j->state, "DOWNLOADING") && strcmp(j->state, "READY_TO_BOOT") &&
         strcmp(j->state, "LOCAL_VALIDATED") && strcmp(j->state, "BOOT_REPORTED") &&
-        strcmp(j->state, "RECONCILING")) return false;
+        strcmp(j->state, "RECONCILING") && strcmp(j->state, "READER_INTENT")) return false;
+    bool reader_intent = !strcmp(j->state, "READER_INTENT");
+    if (reader_intent && (strcmp(j->target_version, "2.6.16") || j->bytes_written)) return false;
     return j->deployment_id[0] && j->release_id[0] && j->target_version[0] &&
         strlen(j->image_sha256) == 64 && strspn(j->image_sha256, "0123456789abcdef") == 64 &&
         !strncmp(j->download_url, "https://", 8) && j->download_url[8] &&
         j->image_size && j->image_size <= OTA_APPLICATION_MAX_BYTES &&
         j->bytes_written <= j->image_size &&
-        (!strcmp(j->state, "DOWNLOADING") || j->bytes_written == j->image_size);
+        (reader_intent || !strcmp(j->state, "DOWNLOADING") || j->bytes_written == j->image_size);
 }
 static inline bool ota_checkpoint_valid(const ota_checkpoint_t *c)
 {

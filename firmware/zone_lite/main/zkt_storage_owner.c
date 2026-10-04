@@ -5,6 +5,7 @@
 #include "zkt_journal_transport.h"
 #include "zkt_reader_platform.h"
 #include "zkt_runtime_checkpoint.h"
+#include "zkt_rollback.h"
 #include "zkt_add_legacy_owner.h"
 #include "zkt_quarantine_owner.h"
 #include "zkt_legacy_attendance.h"
@@ -13,6 +14,7 @@
 #include <errno.h>
 #include <string.h>
 #include "esp_heap_caps.h"
+#include "esp_app_desc.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -39,6 +41,13 @@ typedef struct {
     zj_compat_result_t compatibility;
     uint64_t retry_at_us;
     char wire_scratch[ZJ_CUSTODY_PAYLOAD_MAX];
+    /* One reserved shutdown control, independent of retained DONE replies.
+     * Its immutable target and uncertain result survive caller timeouts. */
+    uint64_t reader_ticket;
+    bool reader_bound, reader_completed;
+    ota_checkpoint_t reader_expected, reader_committed;
+    zj_result_t reader_result;
+    zj_compat_result_t reader_compatibility;
 } owner_t;
 static owner_t *owner;
 static SemaphoreHandle_t mailbox_lock;
@@ -373,6 +382,42 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
     bool write_failed = writing && (reply->result == ZJ_IO || reply->result == ZJ_UNCERTAIN);
     qs_local_end(!write_failed, o->store.last_errno);
 }
+static void execute_reader_shutdown(owner_t *o, zj_request_t *request, zj_reply_t *reply)
+{
+    memset(reply, 0, sizeof(*reply));
+    reply->compatibility = ZJ_COMPAT_NOT_READY;
+    o->store.last_operation = "rollback_intent";
+    o->store.last_errno = o->nvs_error = 0;
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (!app || strcmp(app->project_name, "zone_lite") || strcmp(app->version, ZJ_WRITER_VERSION) ||
+        !o->store.ready || !o->state.ready || o->store.checkpoint_recovery_pending) {
+        reply->result = ZJ_INVALID;
+        return;
+    }
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    if (now > UINT64_MAX - 5000000U) { reply->result = ZJ_STALE; return; }
+    request->input.reader_selection.deadline_us = now + 5000000U;
+    if (!qs_local_read_begin()) {
+        o->store.last_errno = errno;
+        reply->result = ZJ_IO;
+        return;
+    }
+    reply->result = zj_rollback_commit_intent(&o->reader_expected,
+        request->input.reader_selection.deadline_us, &o->reader_committed, &o->nvs_error);
+    qs_local_end(true, 0);
+    if (reply->result != ZJ_OK) return;
+    const char *hex = o->reader_committed.journal.image_sha256;
+    for (unsigned i = 0; i < 32; ++i) {
+        unsigned a = hex[i * 2] <= '9' ? (unsigned)(hex[i * 2] - '0') : (unsigned)(hex[i * 2] - 'a' + 10);
+        unsigned b = hex[i * 2 + 1] <= '9' ? (unsigned)(hex[i * 2 + 1] - '0') : (unsigned)(hex[i * 2 + 1] - 'a' + 10);
+        request->input.reader_selection.image_digest[i] = (uint8_t)((a << 4) | b);
+    }
+    /* All regular work was drained before this control was admitted. No
+     * producer can race between the committed intent and checked selection. */
+    execute(o, request, reply);
+    o->store.last_operation = "rollback_selection";
+}
+
 static void task(void *context)
 {
     owner_t *o = context;
@@ -383,6 +428,13 @@ static void task(void *context)
         while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
         o->health.sampled_uptime_us = (uint64_t)esp_timer_get_time();
         bool work = zj_mailbox_begin(&o->mailbox, &request, &ticket);
+        bool reader_control = !work && o->reader_ticket && !o->reader_completed;
+        if (reader_control) {
+            memset(&request, 0, sizeof(request));
+            request.operation = ZJ_SELECT_READER;
+            ticket = o->reader_ticket;
+            work = true;
+        }
         bool repair = !o->health.quiescing && !work && (!o->store.ready || !o->state.ready) &&
             o->health.sampled_uptime_us >= o->retry_at_us;
         if (o->health.quiescing && !work) {
@@ -404,7 +456,8 @@ static void task(void *context)
         xSemaphoreGive(mailbox_lock);
         if (!work && !repair) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)); continue; }
         bool pending = false;
-        if (work && (request.operation == ZJ_CATALOG || request.operation == ZJ_COMMANDS))
+        if (reader_control) execute_reader_shutdown(o, &request, &reply);
+        else if (work && (request.operation == ZJ_CATALOG || request.operation == ZJ_COMMANDS))
             pending = execute_catalog(o, ticket, &request, &reply);
         else if (work && request.operation == ZJ_COMMAND_IDS) pending = execute_command_ids(o, ticket, &request, &reply);
         else if (work && request.operation == ZJ_SEGMENTED_QUEUE) {
@@ -424,7 +477,13 @@ static void task(void *context)
         uint64_t finished = (uint64_t)esp_timer_get_time();
         while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
         if (work) {
-            if (pending) (void)zj_mailbox_yield(&o->mailbox, ticket);
+            if (reader_control) {
+                o->reader_result = reply.result;
+                o->reader_compatibility = reply.compatibility;
+                o->reader_completed = true;
+                o->health.quiesced = true;
+                ++o->mailbox.completed;
+            } else if (pending) (void)zj_mailbox_yield(&o->mailbox, ticket);
             else (void)zj_mailbox_finish(&o->mailbox, ticket, &reply);
         }
         o->health.progress_uptime_us = finished;
@@ -517,6 +576,8 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
+    /* Boot selection is a shutdown control, never ordinary competing work. */
+    if (!request || request->operation == ZJ_SELECT_READER) return false;
     if (!owner || !enter()) return false;
     bool ok = !owner->health.quiescing && zj_mailbox_submit(&owner->mailbox, request, ticket);
     if (ok && request->operation == ZJ_APPEND) owner->health.verified_empty = false;
@@ -528,7 +589,19 @@ bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete)
 {
     if (complete) *complete = false;
-    if (!owner || !enter()) return false;
+    if (!owner || !ticket || !reply || !complete || !enter()) return false;
+    if (ticket == owner->reader_ticket) {
+        if (owner->reader_completed) {
+            memset(reply, 0, sizeof(*reply));
+            reply->result = owner->reader_result;
+            reply->compatibility = owner->reader_compatibility;
+            reply->rollback_intent = owner->reader_committed;
+            *complete = true;
+            owner->reader_ticket = 0;
+        }
+        xSemaphoreGive(mailbox_lock);
+        return true;
+    }
     bool ok = zj_mailbox_poll(&owner->mailbox, ticket, reply, complete);
     xSemaphoreGive(mailbox_lock);
     return ok;
@@ -536,7 +609,7 @@ bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete)
 bool zj_owner_abandon(uint64_t ticket)
 {
     if (!owner || !enter()) return false;
-    bool ok = zj_mailbox_abandon(&owner->mailbox, ticket);
+    bool ok = ticket != owner->reader_ticket && zj_mailbox_abandon(&owner->mailbox, ticket);
     xSemaphoreGive(mailbox_lock);
     return ok;
 }
@@ -548,6 +621,26 @@ bool zj_owner_quiesce(void)
     xSemaphoreGive(mailbox_lock);
     xTaskNotifyGive(owner_task);
     return complete;
+}
+bool zj_owner_select_quiesced_reader(const ota_checkpoint_t *expected, uint64_t *ticket)
+{
+    if (ticket) *ticket = 0;
+    if (!owner || !ticket || !zj_rollback_request_valid(expected) || !enter()) return false;
+    bool allowed = owner->health.quiesced && !owner->health.operation_running &&
+        !owner->mailbox.running_ticket && !owner->reader_ticket && owner->mailbox.next_ticket &&
+        (!owner->reader_bound || zj_rollback_same_target(&owner->reader_expected, expected));
+    if (allowed) {
+        owner->reader_expected = *expected;
+        memset(&owner->reader_committed, 0, sizeof(owner->reader_committed));
+        owner->reader_bound = true;
+        owner->reader_completed = false;
+        owner->reader_ticket = owner->mailbox.next_ticket++;
+        owner->health.quiesced = false;
+        *ticket = owner->reader_ticket;
+    }
+    xSemaphoreGive(mailbox_lock);
+    if (allowed) xTaskNotifyGive(owner_task);
+    return allowed;
 }
 bool zj_owner_health(zj_owner_health_t *health)
 {

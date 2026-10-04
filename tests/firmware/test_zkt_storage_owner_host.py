@@ -44,14 +44,15 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                     *(f'-DZC_COMMAND_{key}_PATH="commands.{key.lower()}"' for key in ("ACTIVE", "COMMIT", "BACKUP", "TEMP", "STAGE")),
                     '-DZI_PROCESSED_PATH="processed.txt"', '-DZI_CANCELLED_PATH="cancelled.txt"',
                     str(fixture / "zkt_storage_owner_host.c"),
-                    *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c", "zkt_runtime_checkpoint.c", "zkt_lease_store.c",
+                    *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c", "zkt_runtime_checkpoint.c", "zkt_rollback.c", "zkt_lease_store.c",
                         "zkt_journal_state.c", "zkt_journal_store.c", "zkt_journal_codec.c", "durable_queue.c",
                         "zkt_custody_wire.c", "zkt_catalog_store.c", "file_transaction.c", "zkt_command_id_store.c",
                         "zkt_command_id_client.c", "zkt_segmented_store.c", "zkt_segmented_client.c", "legacy_queue.c"]),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
     for scenario in ["--checkpoint", "--recovery-full", "--runtime-corrupt-journal",
-                     "--authority-before", "--authority-after", "--authority-readback", "--authority-bridge"]:
+                     "--authority-before", "--authority-after", "--authority-readback", "--authority-bridge",
+                     "--rollback-full"]:
         directory = tmp_path / scenario.removeprefix("--")
         directory.mkdir()
         subprocess.run([str(binary), scenario], cwd=directory, check=True, timeout=30)

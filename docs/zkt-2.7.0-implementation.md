@@ -39,6 +39,7 @@ counts are kept outside this public repository.
 | Oracle core-field check can miss changed zone/device/capture/clock/trust data or unfinished daily processing | Versioned full stored-raw projection and independently verified daily punch times; weaker responses and pending daily work cannot acknowledge delivery | SQLite/PostgreSQL replay/fencing regressions, an isolated Oracle compile/execution job with a 200,001-row synthetic retained set, and nonexecuting anonymous compilation against 19c table definitions | Implemented component only; isolated 19c execution, ORDS and business-policy qualification remain open; field intents inactive |
 | Repeated unchanged identity holds | Roster-revision eligibility and six-hour bounded audit; existing manual identity gates preserved | Backlog/identity/force-release regressions; PostgreSQL concurrency and two 100,000-row repair tests | Deployed in `bd395cc`; non-roster evidence scheduling needs wider qualification |
 | Incompatible rollback | Persisted reader proof binds the validated bridge image, OTA slot, terminal, epoch and layout; gated startup separates reading from writing; pre-erase OTA check preserves the certified bridge | Native/Linux sanitizer, actual ESP adapter and OTA/owner fault harnesses | Partial: install interlock implemented; operational rollback selection, complete migration and signed bridge qualification remain open |
+| A rollback primitive can race accepted writes or leave selection intent only in RAM | Exact writer-to-bridge assignments use terminal handoff, acknowledged storage drain, a reserved owner control, committed/read-back OTA intent and exact running-image verification after reboot | Real owner with all eight ordinary replies retained, blocked writes/commits, uncertain selection, replay, corrupt/stale checkpoints and actual OTA coordinator; legacy/Hikvision flow tests | Coordinator component implemented; exact signed-device rollback, failed-boot recovery, full migration and release qualification remain open |
 | Rollback restores dual delivery for new punches | Irreversible ADD authority commits before sequence allocation; the validated bridge resumes raw journal capture after cutover; uncertain authority and disabled builds cannot fall back | Root/NVS commit/readback faults, actual owner, bridge boot/reboot, live dispatch and UI uncertainty checks | Implemented cutover component; legacy migration, full runtime telemetry and signed qualification remain open |
 | OTA boot confirmation waits for ADD or an unused ESP Oracle worker; HTTP success can conceal a rejected state | Exact bridge/writer images validate local preservation, required workers and an authenticated terminal snapshot before contacting ADD; durable stages order reports and typed receipts verify actual deployment state and running image | Local outage, lost-reply, interrupted checkpoint, stale-worker, mark-valid failure, rejected-state and receipt allocation tests; legacy/Hikvision regression builds | Implemented local boot component; remote HIL, operational rollback and signed qualification remain open |
 | OTA restart can race a live read or a timed-out caller's accepted write | A terminal-owner handoff blocks new sessions; the journal owner drains accepted work before acknowledging quiescence | Production gateway/OTA control flow, blocked threaded writes, abandoned callers, lock failures and Hikvision regression | Implemented component; migration evidence and physical qualification remain open |
@@ -63,6 +64,40 @@ counts are kept outside this public repository.
 | Backup file existence mistaken for restore proof | Restore pre-deployment dump into an isolated database; verify revision; clean up; retain backup digest and verification time | PowerShell failure/cleanup regressions and actual disposable PostgreSQL restore | Production deployment `37135387664` passed this gate on 3 October 2026 |
 
 ## Required release evidence
+
+An operational rollback from the exact writer to its attested bridge uses the
+existing approved OTA assignment and its exact application digest. It does not
+download into or erase the retained reader slot. The terminal session owner
+first completes capture cleanup; the storage owner then refuses new work and
+finishes every accepted operation, including work abandoned by a timed-out
+caller. A dedicated bounded control remains available even when all eight
+ordinary mailbox slots contain uncollected completed replies.
+
+The owner commits `READER_INTENT` in the existing OTA checkpoint ABI and reads
+it back before selecting an image. A changed assignment, missing/corrupt
+checkpoint or generation conflict cannot replace that intent. An uncertain
+commit is retried against the actual retained checkpoint; an unchanged intent
+does not incur another write. Selection still checks the actual signed image,
+reader proof, terminal/epoch binding, partition layout and local readiness.
+The five-second selection deadline starts after the accepted work has drained.
+No filesystem or terminal lock is held during a network request.
+
+An accepted control cannot be abandoned or rebound to a different target until
+reboot. A lost reply remains pending; an uncertain result retains the intent and
+keeps capture stopped while the same operation is retried. No forced task kill,
+unproved resume, arbitrary previous image or automatic journal deletion is used
+to escape a hold. The OTA state/error and storage operation age expose this
+condition. Operators must resolve the reported fault rather than treating a
+stopped owner as a successful rollback.
+
+After restart, only the exact bridge application digest can advance the intent
+into local boot validation. ADD progress, source reconciliation and HIL remain
+separate obligations. This follows the [ESP-IDF 5.5.3 OTA state
+contract](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/api-reference/system/ota.html):
+selecting an image makes it `NEW`, and the application must subsequently confirm
+its own health. The existing general failed-first-boot path requires additional
+qualification; this coordinator does not certify physical power interruption,
+flash endurance, a signed factory-to-OTA path or a complete migration.
 
 Capture latency schema 1 uses thirteen inclusive, non-cumulative millisecond
 buckets: 0, 1, 5, 10, 25, 50, 100, 250, 500, 1,000, 5,000, 15,000, and

@@ -55,4 +55,12 @@ bool zj_owner_abandon(uint64_t ticket);
  * True means the owner acknowledged completion, not merely request admission.
  * No lock remains held; callers may continue polling retained replies. */
 bool zj_owner_quiesce(void);
+/* OTA-task-only exception after acknowledged quiescence. All earlier work
+ * must have finished. A separate bounded control slot remains available when
+ * ordinary completed replies occupy the mailbox. It commits/readbacks exact
+ * intent before selecting the attested bridge; it cannot erase/download.
+ * The target is immutable until reboot. Poll the returned ticket normally;
+ * abandoning it or submitting ZJ_SELECT_READER through normal admission is
+ * prohibited. Timeout does not cancel accepted selection. */
+bool zj_owner_select_quiesced_reader(const ota_checkpoint_t *expected, uint64_t *ticket);
 bool zj_owner_health(zj_owner_health_t *health);
