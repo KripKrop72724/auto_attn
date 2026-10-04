@@ -984,7 +984,7 @@ class ZktOracleIntent(Base):
 
 
 class ZktOracleContentReceipt(Base):
-    """Retained Oracle core-field proof, separate from device UID claims."""
+    """Retained, explicitly scoped Oracle proof, separate from device UID claims."""
     __tablename__ = "add_zkt_oracle_content_receipts"
     __table_args__ = (
         UniqueConstraint("intent_id", "payload_digest", "content_token", name="uq_add_zkt_oracle_content"),
