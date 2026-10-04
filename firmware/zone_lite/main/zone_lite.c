@@ -3113,22 +3113,25 @@ static bool file_has_nonempty_line(const char *path)
     return has_line;
 }
 
-static void restore_pending_backup_if_needed(void)
+static bool restore_pending_backup_if_needed(void)
 {
     lq_invalidate_empty(&g_legacy_pending);
     struct stat st;
-    if (stat(PENDING_PATH, &st) == 0) return;
-    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+    if (stat(PENDING_PATH, &st) == 0) return true;
+    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
     const char *generations[] = {PENDING_BACKUP_PATH, PENDING_TMP_PATH};
     for (size_t i = 0; i < 2; i++) {
         if (stat(generations[i], &st) == 0) {
-            if (rename(generations[i], PENDING_PATH) != 0)
+            if (rename(generations[i], PENDING_PATH) != 0) {
                 led_status_fault(LED_STATUS_LOCAL_FAILURE);
-            return;
+                return false;
+            }
+            return true;
         }
-        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return; }
+        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
     }
     // Older and temporary files remain independent recoverable generations.
+    return true;
 }
 
 static bool restore_blocked_backup_if_needed(void)
@@ -3267,12 +3270,13 @@ static void storage_init(void)
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     if (g_queue_store_ready && !qs_verify_persistence()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #endif
-    restore_pending_backup_if_needed();
-    (void)restore_blocked_backup_if_needed();
+    bool generations_restored = restore_pending_backup_if_needed();
+    if (!restore_blocked_backup_if_needed()) generations_restored = false;
+    if (!generations_restored) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     load_seen_from_file(PENDING_PATH);
     load_seen_from_file(BLOCKED_PATH);
     load_seen_from_file(ACKED_PATH);
-    led_status_set_backlog(file_has_nonempty_line(PENDING_PATH));
+    led_status_set_backlog(!generations_restored || file_has_nonempty_line(PENDING_PATH));
     ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_cache.count);
 }
 
@@ -7353,9 +7357,9 @@ static void oracle_drain_pending(bool live_first)
     char *events[LEGACY_ORDS_SLICE_RECORDS];
     size_t count = 0;
     bool binary_head = false;
-    dq_result_t read = DQ_OK;
-    if (g_legacy_pending.ready && g_legacy_pending.empty_cached) read = DQ_EMPTY;
-    if (!g_legacy_pending.ready) {
+    dq_result_t read = g_legacy_pending.ready && g_legacy_pending.empty_cached ? DQ_EMPTY :
+        restore_pending_backup_if_needed() ? DQ_OK : DQ_IO;
+    if (read == DQ_OK && !g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
         read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
     }
@@ -7373,7 +7377,7 @@ static void oracle_drain_pending(bool live_first)
     }
     if (!count && read == DQ_EMPTY) {
         dq_result_t reclaim = g_legacy_pending.empty_cached ? DQ_EMPTY : lq_reclaim(&g_legacy_pending);
-        if (reclaim == DQ_OK) restore_pending_backup_if_needed();
+        if (reclaim == DQ_OK && !restore_pending_backup_if_needed()) read = DQ_IO;
         if (reclaim != DQ_OK && reclaim != DQ_EMPTY) read = reclaim;
         // A restored backup is checked on the next slice. A verified absent
         // source stays cached until its producer invalidates it under this lock.
@@ -7447,7 +7451,7 @@ static void oracle_drain_pending(bool live_first)
             if (!failure_stage) {
                 g_ords_drain_retry_not_before_ms = 0;
                 dq_result_t reclaimed = lq_reclaim(&g_legacy_pending);
-                if (reclaimed == DQ_OK) restore_pending_backup_if_needed();
+                if (reclaimed == DQ_OK && !restore_pending_backup_if_needed()) failure_stage = "legacy-restore";
                 if (reclaimed != DQ_OK && reclaimed != DQ_STALE) failure_stage = "legacy-retire";
             }
         }
