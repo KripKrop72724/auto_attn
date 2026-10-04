@@ -635,6 +635,11 @@ test('legacy employee repair route opens the responsive blocked-punch review', a
   await expect(page.getByRole('button', { name: 'Sync and check' })).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Review punches' })).toHaveCount(0)
 
+  // Enabling this control starts its disabled-to-enabled color transition.
+  // Inspect the final rendered colors without weakening the contrast check.
+  await page.getByRole('button', { name: 'Sync and check' }).evaluate(async (node) => {
+    await Promise.all(node.getAnimations().map(animation => animation.finished.catch(() => undefined)))
+  })
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
