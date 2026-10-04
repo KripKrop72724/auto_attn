@@ -6413,6 +6413,87 @@ def test_queue_evidence_admin_reveal_requires_csrf_and_step_up(db):
     assert db.scalar(select(AuditEvent).where(AuditEvent.action == "QUEUE_EVIDENCE_REVEALED")) is not None
 
 
+@pytest.mark.parametrize("kind", ["source", "queue", "divergence"])
+@pytest.mark.parametrize("commit_fails", [False, True])
+def test_protected_evidence_response_requires_committed_audit(db, monkeypatch, kind, commit_fails):
+    from zk_add.models import ReconciliationDivergence, ReconciliationJob
+    from zk_add.queue_evidence import QueueEvidenceRequest, preserve_queue_evidence
+
+    connector = connector_fixture(db)
+    raw = b"SYNTHETIC-PRIVATE-RAW".ljust(40, b"\0")
+    encoded = base64.b64encode(raw).decode()
+    digest = hashlib.sha256(raw).hexdigest()
+    if kind == "queue":
+        row = preserve_queue_evidence(db, connector, QueueEvidenceRequest.model_validate(
+            queue_evidence_payload(connector, raw),
+        ))
+        path = f"/api/v1/queue-evidence/{row.receipt_id}/reveal"
+        action, field = "QUEUE_EVIDENCE_REVEALED", "raw_b64"
+    elif kind == "source":
+        row = TerminalRecordManifest(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            terminal_serial=SERIAL, generation=1, ordinal=1, source_kind="TAIL", record_size=len(raw),
+            canonical_source=True, raw_record_digest=digest, terminal_record_key=digest,
+            disposition="INVALID_TIME", protected_raw_record=encrypt_text(encoded),
+            error_code="ZKT_TIMESTAMP_OUT_OF_RANGE")
+        db.add(row)
+        db.flush()
+        path = f"/api/v1/source-exceptions/{row.id}/reveal"
+        action, field = "TERMINAL_SOURCE_EXCEPTION_REVEALED", "raw_record_b64"
+    else:
+        job = ReconciliationJob(connector_id=connector.id, zkt_device_id=connector.zkt_device.id,
+            actor="test", reason="Synthetic audit test", idempotency_key="audit-test", request_digest=digest)
+        db.add(job)
+        db.flush()
+        row = ReconciliationDivergence(job_id=job.id, ordinal=1, old_raw_digest="a"*64,
+            new_raw_digest=digest, protected_new_raw_record=encrypt_text(encoded))
+        db.add(row)
+        db.flush()
+        path = f"/api/v1/reconciliation-divergences/{row.divergence_id}/reveal"
+        action, field = "RECONCILIATION_DIVERGENCE_EVIDENCE_REVEALED", "raw_record_b64"
+    raw_session, admin = create_admin_session(
+        db, username="StateHealthAdmin", ip_address=None, user_agent="test",
+    )
+    db.commit()
+    csrf = admin.csrf_token
+    state_before = (row.disposition if kind != "divergence" else row.state)
+    committed = []
+    original_commit = db.commit
+
+    def checked_commit():
+        if commit_fails:
+            raise RuntimeError("injected evidence audit commit failure")
+        original_commit()
+        committed.append(True)
+
+    def override_db():
+        try:
+            yield db
+        except Exception:
+            db.rollback()
+            raise
+
+    monkeypatch.setattr(db, "commit", checked_commit)
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app, raise_server_exceptions=False)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.post(path, headers={"X-CSRF-Token": csrf}, json={
+        "password": "correct-password", "reason": "Inspect synthetic protected evidence",
+        "idempotency_key": "audit-response-order",
+    })
+    if commit_fails:
+        assert response.status_code == 500
+        assert encoded not in response.text and raw.hex() not in response.text
+        assert committed == []
+    else:
+        assert response.status_code == 200 and committed == [True]
+        assert response.json()[field] == encoded
+        assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert db.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.action == action)) == (
+        0 if commit_fails else 1
+    )
+    assert (row.disposition if kind != "divergence" else row.state) == state_before
+
+
 def test_factory_boot_heartbeat_is_accepted_without_relaxing_partition_names(db: Session):
     connector = connector_fixture(db)
     payload = HeartbeatPayload(
