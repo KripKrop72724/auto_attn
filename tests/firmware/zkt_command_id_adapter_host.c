@@ -1,5 +1,6 @@
 #include "add_connector.h"
 #include "zkt_command_ids.h"
+#include "zone_storage_paths.h"
 #include <assert.h>
 #include <stdio.h>
 

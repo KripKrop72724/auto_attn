@@ -33,6 +33,7 @@ int xTaskCreate(void (*)(void *), const char *, unsigned, void *, unsigned, Task
 void vTaskDelay(unsigned);
 unsigned ulTaskNotifyTake(int, unsigned);
 void xTaskNotifyGive(TaskHandle_t);
+TaskHandle_t xTaskGetCurrentTaskHandle(void);
 esp_err_t nvs_open(const char *, int, nvs_handle_t *);
 void nvs_close(nvs_handle_t);
 esp_err_t nvs_get_blob(nvs_handle_t, const char *, void *, size_t *);

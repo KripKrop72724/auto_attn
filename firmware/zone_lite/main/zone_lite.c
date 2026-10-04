@@ -1,6 +1,7 @@
 #include "lease_guard.h"
 #include "uid_cache.h"
 #include "storage_upgrade.h"
+#include "zone_storage_paths.h"
 #include "zkt_clock.h"
 #include "zkt_record.h"
 #include "zkt_socket_io.h"
@@ -178,7 +179,7 @@
 #define WIFI_FAIL_BIT BIT1
 #define WIFI_MAXIMUM_RETRY 1000000
 
-#define STORAGE_BASE "/storage"
+#define STORAGE_BASE ZONE_STORAGE_BASE
 #define PENDING_PATH STORAGE_BASE "/pending.jsonl"
 #define PENDING_TMP_PATH STORAGE_BASE "/pending.tmp"
 #define PENDING_BACKUP_PATH STORAGE_BASE "/pending.bak"

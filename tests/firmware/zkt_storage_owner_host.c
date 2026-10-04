@@ -93,6 +93,8 @@ unsigned ulTaskNotifyTake(int clear, unsigned wait_ms)
     return 1;
 }
 void xTaskNotifyGive(TaskHandle_t handle) { (void)handle; }
+TaskHandle_t xTaskGetCurrentTaskHandle(void)
+{ return pthread_equal(pthread_self(), thread) ? &thread : NULL; }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 {
     (void)mode;
@@ -214,6 +216,44 @@ qs_health_t qs_local_health_locked(void)
     return (qs_health_t){.observed = true, .available = true,
         .recovery_complete = true, .persistence_verified = true};
 }
+/* Existing queue format with real files/checkpoints. Every operation invoked
+ * by the copied client must execute on the storage thread. */
+static durable_queue_t retained[QS_COUNT];
+static dq_checkpoint_t retained_checkpoints[QS_COUNT];
+static int retained_load(void *context, dq_checkpoint_t *out)
+{
+    unsigned lane = (unsigned)(uintptr_t)context;
+    if (!retained_checkpoints[lane].version) return 0;
+    *out = retained_checkpoints[lane]; return 1;
+}
+static bool retained_commit(void *context, const dq_checkpoint_t *in)
+{ retained_checkpoints[(unsigned)(uintptr_t)context] = *in; return true; }
+static bool retained_admit(void *context, size_t bytes)
+{ (void)context; (void)bytes; return !atomic_load(&full); }
+static durable_queue_t *retained_queue(qs_lane_t lane)
+{
+    assert(zj_owner_is_current_task() && (unsigned)lane < QS_COUNT);
+    assert(!pthread_mutex_trylock(&budget));
+    assert(!pthread_mutex_unlock(&budget));
+    if (!retained[lane].ready) {
+        char prefix[32]; snprintf(prefix, sizeof(prefix), "retained-%u", (unsigned)lane);
+        assert(dq_open(&retained[lane], prefix,
+            (dq_port_t){retained_load, retained_commit, retained_admit, (void *)(uintptr_t)lane}) == DQ_OK);
+    }
+    return &retained[lane];
+}
+dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy)
+{ assert((unsigned)policy <= QS_ADMIT_RECOVERY); return dq_append(retained_queue(lane), data, length); }
+dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
+{ return dq_peek(retained_queue(lane), data, capacity, length, token); }
+dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
+{ return dq_settle(retained_queue(lane), token); }
+bool qs_snapshot(qs_lane_t lane, uint32_t *depth)
+{ *depth = retained_queue(lane)->checkpoint.depth; return true; }
+bool qs_generation(char output[33])
+{ assert(zj_owner_is_current_task()); memset(output, 'a', 32); output[32] = 0; return true; }
+bool qs_recover_step(void) { assert(zj_owner_is_current_task()); return true; }
+bool qs_verify_persistence(void) { assert(zj_owner_is_current_task()); return true; }
 bool zj_transport_health(zj_transport_health_t *health)
 {
     *health = (zj_transport_health_t){.started = true,
@@ -293,6 +333,9 @@ static zj_reply_t wait_reply(uint64_t ticket)
 }
 int main(int argc, char **argv)
 {
+    assert(!zj_owner_started() && !zj_owner_is_current_task());
+    assert(zq_append(QS_LIVE, "before-owner", 12, QS_ADMIT_LIVE) == DQ_PENDING);
+    assert(!retained[QS_LIVE].ready); /* No direct storage fallback. */
     zj_metadata_t metadata = {.segment_id = 1, .capture_epoch = {1},
         .terminal_serial = "TEST-TERMINAL", .decoder_profile = "G3-v1", .decoder_version = "1"};
     bool corrupt_journal = argc == 2 && !strcmp(argv[1], "--runtime-corrupt-journal");
@@ -647,6 +690,30 @@ int main(int argc, char **argv)
     assert(zi_cache_remember(ZI_PROCESSED, "owner-receipt")); /* replay needs no new capacity */
     atomic_store(&full, false);
     assert(zi_cache_remember(ZI_CANCELLED, "owner-receipt"));
+    /* An 8 KiB legacy item never enlarges a mailbox frame or the task stack.
+     * Read a copied snapshot, append another item, then retire only its exact
+     * original token; queue and journal custody remain distinct. */
+    uint8_t retained_input[DQ_MAX_RECORD_BYTES], retained_output[DQ_MAX_RECORD_BYTES];
+    for (unsigned i = 0; i < sizeof(retained_input); ++i) retained_input[i] = (uint8_t)i;
+    uint32_t retained_depth = 999; size_t retained_length = 0; dq_token_t retained_token;
+    assert(zq_append(QS_ORDS, retained_input, sizeof(retained_input), QS_ADMIT_LIVE) == DQ_OK);
+    assert(zq_snapshot(QS_ORDS, &retained_depth) && retained_depth == 1);
+    assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_OK);
+    assert(retained_length == sizeof(retained_input) && !memcmp(retained_input, retained_output, retained_length));
+    assert(zq_append(QS_ORDS, "later", 5, QS_ADMIT_RECOVERY) == DQ_OK);
+    assert(zq_settle(QS_ORDS, &retained_token) == DQ_OK);
+    assert(zq_settle(QS_ORDS, &retained_token) == DQ_STALE);
+    assert(zq_snapshot(QS_ORDS, &retained_depth) && retained_depth == 1);
+    char retained_instance[33];
+    assert(zq_generation(retained_instance) && strlen(retained_instance) == 32);
+    assert(zq_recover() && zq_probe());
+    atomic_store(&full, true);
+    assert(zq_append(QS_LIVE, "full", 4, QS_ADMIT_LIVE) == DQ_FULL);
+    assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_OK);
+    assert(retained_length == 5 && !memcmp(retained_output, "later", 5));
+    assert(zq_settle(QS_ORDS, &retained_token) == DQ_OK);
+    assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_EMPTY);
+    atomic_store(&full, false);
     assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
@@ -683,6 +750,9 @@ int main(int argc, char **argv)
     assert(health.last_append_result == ZJ_OK && !health.verified_empty && !health.pending_appends);
     assert(!zj_owner_submit(&final_checkpoint, &refused_ticket));
     assert(!zj_owner_submit(&compatibility, &refused_ticket));
+    assert(zq_append(QS_LIVE, "after-quiescence", 16, QS_ADMIT_LIVE) == DQ_PENDING);
+    assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_PENDING);
+    assert(!retained_length && !retained_token.end && !zq_probe());
     vTaskDelay(10);
     assert(zj_owner_health(&health) && health.completed == before_quiesce + 3);
     assert(!pthread_mutex_trylock(&budget));
