@@ -121,7 +121,7 @@ def test_atomic_custody_replays_without_attendance_or_polling_unchanged_holds(so
         assert all(row.raw_timestamp is None and row.observed_user_id is None and row.error_code is None for row in manifests)
         rows = db.scalars(select(ZktCustodyWork)).all()
         assert len({row.work_key for row in rows}) == 2
-        assert all(row.state == "WAIT_PROFILE" and row.attempt_count == 0 and row.next_attempt_at is None for row in rows)
+        assert all(row.state == "PENDING" and row.attempt_count == 0 and row.next_attempt_at is not None for row in rows)
         assert work.advance_work(db) == 0
         status = work.work_status(db, connector)
         assert not status["missing_processing_obligation"]

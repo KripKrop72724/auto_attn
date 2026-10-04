@@ -5,6 +5,10 @@ import { humanizeStatus } from '../status'
 type Work = {
   id: number; state: string; reason_code: string; owner: string;
   updated_at: string; next_attempt_at: string | null;
+  decoding?: {
+    version: string; result: string; step_index: number; sampled_at: string;
+    authority: 'UNQUALIFIED'; current_input: boolean; current_decoder: boolean;
+  } | null;
 }
 type Processor = {
   schema_version: 1; instance_id: string; sampled_at: string;
@@ -21,7 +25,7 @@ export type CustodySnapshot = {
   processor?: Processor;
 }
 const states: Record<string, string> = {
-  PENDING: 'Awaiting inspection', WAIT_FRAGMENTS: 'Waiting for packet fragments',
+  PENDING: 'Awaiting inspection', INTERPRETING: 'Interpretation in progress', WAIT_FRAGMENTS: 'Waiting for packet fragments',
   WAIT_PROFILE: 'Waiting for profile qualification', WAIT_SOURCE: 'Waiting for source evidence',
   HELD_EXCEPTION: 'Preserved for review', RETRY_SYSTEM: 'System retry pending',
   SOURCE_ASSOCIATED: 'Source linked', HELD_OCCURRENCE: 'Occurrence link needs review',
@@ -35,6 +39,20 @@ const owner = (value: string) => owners[value] || humanizeStatus(value)
 const date = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Asia/Karachi' })
 const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
 const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+const interpretations: Record<string, string> = {
+  PENDING: 'Interpretation in progress', UNQUALIFIED_FACTS: 'Proposed facts · qualification required',
+  AMBIGUOUS_LAYOUT: 'Ambiguous record layout', DECODE_REJECTED: 'No valid interpretation',
+}
+function decodingStatus(value: Work['decoding'], sampledAt: string) {
+  if (!value) return 'No decoding evidence recorded'
+  if (value.authority !== 'UNQUALIFIED' || !interpretations[value.result] || !counter(value.step_index)
+    || typeof value.version !== 'string' || !value.version || value.version.length > 80
+    || typeof value.current_input !== 'boolean' || typeof value.current_decoder !== 'boolean'
+    || !timestamp(value.sampled_at) || Date.parse(value.sampled_at) > Date.parse(sampledAt) + 1000) return 'Decoding evidence unavailable'
+  if (!value.current_input) return 'Earlier capture evidence · inspection required'
+  if (!value.current_decoder) return 'Earlier decoder version · inspection required'
+  return interpretations[value.result]
+}
 function validProcessor(value: Processor | undefined): value is Processor {
   return value?.schema_version === 1 && typeof value.instance_id === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.instance_id)
     && timestamp(value.sampled_at) && Date.parse(value.sampled_at) <= Date.now() + 1000
@@ -123,7 +141,9 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
           <summary>{label(row.state)} · {humanizeStatus(row.reason_code)}</summary>
           <dl><div><dt>Responsible team</dt><dd>{owner(row.owner)}</dd></div>
             <div><dt>Last updated (Pakistan)</dt><dd>{date(row.updated_at)}</dd></div>
+            <div><dt>Decoding result</dt><dd>{decodingStatus(row.decoding, data.sampled_at)}</dd></div>
             <div><dt>Next inspection</dt><dd>{row.next_attempt_at ? date(row.next_attempt_at) : row.state === 'SOURCE_ASSOCIATED' ? 'Source association complete' : 'Waiting for relevant evidence or review'}</dd></div></dl>
+          <p>Decoding evidence does not establish terminal profile qualification or employee identity.</p>
         </details>)}</>}
     </>}
   </article>
