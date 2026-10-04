@@ -145,7 +145,8 @@ def _unseal(row: ZktDerivedEvidence, work: ZktCustodyWork, plan: dict) -> dict:
         value = decrypt_json(row.protected_evidence)
     except (InvalidToken, ValueError) as exc:
         raise DerivedEvidenceInvalid("DERIVED_CIPHERTEXT_CHANGED") from exc
-    if (_digest(value) != row.evidence_digest or value.get("schema_version") != 1
+    if (not isinstance(value, dict) or _digest(value) != row.evidence_digest
+            or type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or value.get("authority") != "UNQUALIFIED" or value.get("work_key") != work.work_key
             or value.get("input_fingerprint") != row.input_fingerprint
             or value.get("interpretation_version") != row.interpretation_version
@@ -251,17 +252,87 @@ def derive_step(session: Session, work: ZktCustodyWork, raw: bytes, *, flush: bo
     return row
 
 
+def _verify_coverage(work: ZktCustodyWork, raw: bytes, value: dict, progress: dict,
+                     decoder_version: str) -> None:
+    """Account for every raw span independently of encrypted summary counts.
+
+    This checks coverage and provenance, not the semantic correctness or trust
+    of a historical decoder. An explicit old decoder version remains readable.
+    The working plan is bounded by the seven supported record layouts.
+    """
+    for field, expected in {
+        "decoder_version": decoder_version, "reported_profile": work.decoder_profile,
+        "reported_decoder_version": work.decoder_version, "source_manifest_id": work.source_manifest_id,
+        "input_digest": work.expected_digest, "input_bytes": work.expected_bytes,
+        "evidence_revision": work.evidence_revision,
+    }.items():
+        actual = value.get(field)
+        if type(actual) is not type(expected) or actual != expected:
+            raise DerivedEvidenceInvalid("DERIVED_PROVENANCE_CHANGED")
+    records = value.get("records")
+    if (not isinstance(records, list) or len(records) > RECORDS_PER_STEP
+            or type(value.get("record_count")) is not int or len(records) != value["record_count"]
+            or type(value.get("error_count")) is not int):
+        raise DerivedEvidenceInvalid("DERIVED_RECORD_COVERAGE_CHANGED")
+    consumed = errors = 0
+    for layout in progress["layouts"]:
+        stop = min(layout["total"], layout["processed"] + RECORDS_PER_STEP - consumed)
+        for index in range(layout["processed"], stop):
+            size = layout["size"]
+            offset = index * size + (0 if progress["source"] else 8)
+            if consumed >= len(records):
+                raise DerivedEvidenceInvalid("DERIVED_RECORD_COVERAGE_CHANGED")
+            row = records[consumed]
+            if (not isinstance(row, dict) or type(row.get("offset")) is not int
+                    or type(row.get("length")) is not int or row["offset"] != offset
+                    or row["length"] != size
+                    or row.get("raw_digest") != hashlib.sha256(raw[offset:offset + size]).hexdigest()):
+                raise DerivedEvidenceInvalid("DERIVED_RECORD_COVERAGE_CHANGED")
+            error, facts = row.get("error_code"), row.get("facts")
+            if error is not None:
+                if not isinstance(error, str) or not error or len(error) > 80 or facts is not None:
+                    raise DerivedEvidenceInvalid("DERIVED_RECORD_DISPOSITION_CHANGED")
+                errors += 1
+                layout["errors"] += 1
+            elif (not isinstance(facts, dict) or type(facts.get("offset")) is not int
+                    or type(facts.get("length")) is not int
+                    or facts["offset"] != offset or facts["length"] != size):
+                raise DerivedEvidenceInvalid("DERIVED_RECORD_DISPOSITION_CHANGED")
+            layout["processed"] += 1
+            consumed += 1
+        if consumed == RECORDS_PER_STEP:
+            break
+    if consumed != len(records) or errors != value["error_count"] or progress != value["plan"]:
+        raise DerivedEvidenceInvalid("DERIVED_RECORD_COVERAGE_CHANGED")
+    complete = all(layout["processed"] == layout["total"] for layout in progress["layouts"])
+    plausible = [layout["size"] for layout in progress["layouts"] if not layout["errors"] and complete]
+    result = ("PENDING" if not complete else "AMBIGUOUS_LAYOUT" if len(plausible) > 1
+              else "UNQUALIFIED_FACTS" if plausible else "DECODE_REJECTED")
+    if value.get("plausible_layouts") != plausible or value["result"] != result:
+        raise DerivedEvidenceInvalid("DERIVED_COMPLETION_CHANGED")
+
+
 def verified_steps(session: Session, work: ZktCustodyWork, raw: bytes, *,
-                   version: str = INTERPRETATION_VERSION):
+                   version: str | None = None, decoder_version: str | None = None):
     """Stream a validated chain for an internal, authorized evidence consumer.
 
     This is not a qualification API. Each batch stays bounded and the reader
-    rechecks every protected step, not merely the metadata status projection.
-    Consumers must finish this iterator before trusting chain completeness.
+    rechecks every protected step and raw span, not merely metadata summaries.
+    Absent or in-progress histories cannot complete this iterator. Consumers
+    must finish it in their transaction before using any result as complete.
+    An old interpretation requires its explicit interpretation/decoder versions.
     """
-    if len(raw) != work.expected_bytes or hashlib.sha256(raw).hexdigest() != work.expected_digest:
+    version = INTERPRETATION_VERSION if version is None else version
+    decoder_version = DECODER_VERSION if decoder_version is None else decoder_version
+    if (work.kind not in SUPPORTED_KINDS or len(raw) > PACKET_MAX or len(raw) != work.expected_bytes
+            or hashlib.sha256(raw).hexdigest() != work.expected_digest):
         raise DerivedEvidenceInvalid("DERIVED_INPUT_CHANGED")
     plan = _plan(raw, work.kind)
     rows = _chain_rows(session, work, input_fingerprint(work), version)
+    if not rows or rows[-1].result == "PENDING":
+        raise DerivedEvidenceInvalid("DERIVED_INCOMPLETE")
+    progress = _plan(raw, work.kind)
     for row in rows:
-        yield _unseal(row, work, plan)
+        value = _unseal(row, work, plan)
+        _verify_coverage(work, raw, value, progress, decoder_version)
+        yield value

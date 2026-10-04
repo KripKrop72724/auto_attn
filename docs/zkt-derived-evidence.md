@@ -160,6 +160,23 @@ Internal evidence consumers must finish the validating chain iterator before
 using completeness; it checks every ciphertext and digest link. No attendance
 consumer is authorized by this component.
 
+The iterator rejects an absent history, an unfinished interpretation or a
+missing final step. It independently accounts for every expected raw span in
+layout order, at most 128 records per step. Record offsets, lengths, raw-byte
+digests, fact coordinates, rejection counts and cumulative layout progress
+must agree; a valid encrypted summary alone cannot prove coverage. Final
+classification and plausible-layout lists must agree with that complete
+accounting. Every returned step also binds the input digest/length, receipt
+revision, source-manifest reference and reported/actual decoder versions.
+
+Historical interpretations require explicit interpretation and decoder versions.
+They remain readable without rerunning a newer decoder over their stored facts;
+structural verification does not make those facts qualified. Consumers must
+finish the iterator in the transaction that will use its result. A later bad
+step can still reject the chain after earlier steps have streamed. No partial
+iteration or successfully decoded individual record authorizes attendance or
+Oracle completion. Original custody and historical ciphertext remain unchanged.
+
 Verification uses synthetic source/live bytes, invalid dates, two plausible
 layouts, repeated same-second records, maximum-size fragmented packets,
 transaction interruption, corrupted or missing steps, decoder revisions, original
