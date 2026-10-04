@@ -5,19 +5,22 @@
 #include "zkt_catalog_store.h"
 #include "zkt_lease_store.h"
 #include "zkt_command_ids.h"
+#include "zkt_segmented_owner.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
 typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
-    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG, ZJ_LEASE, ZJ_COMMANDS, ZJ_COMMAND_IDS } zj_operation_t;
+    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG, ZJ_LEASE, ZJ_COMMANDS, ZJ_COMMAND_IDS,
+    ZJ_SEGMENTED_QUEUE } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
         zj_observation_t observation;
         zc_request_t catalog;
         zi_request_t command_ids;
+        zq_request_t segmented;
         struct {
             zj_token_t token;
             uint8_t receipt_digest[32];
@@ -49,6 +52,7 @@ typedef struct {
         zj_item_t item;
         zc_reply_t catalog;
         zi_reply_t command_ids;
+        zq_reply_t segmented;
     };
     runtime_checkpoint_t runtime_checkpoint;
     zl_lease_record_t lease;
@@ -57,6 +61,8 @@ _Static_assert(sizeof(zc_request_t) <= sizeof(zj_observation_t), "Catalog reques
 _Static_assert(sizeof(zc_reply_t) <= sizeof(zj_item_t), "Catalog replies must fit the existing bounded reply envelope");
 _Static_assert(sizeof(zi_request_t) <= sizeof(zj_observation_t), "Command IDs must fit the bounded request envelope");
 _Static_assert(sizeof(zi_reply_t) <= sizeof(zj_item_t), "Command ID replies must fit the bounded reply envelope");
+_Static_assert(sizeof(zq_request_t) <= sizeof(zj_observation_t), "Queue copies must fit the bounded request envelope");
+_Static_assert(sizeof(zq_reply_t) <= sizeof(zj_item_t), "Queue copies must fit the bounded reply envelope");
 typedef enum { ZJ_SLOT_FREE, ZJ_SLOT_QUEUED, ZJ_SLOT_RUNNING, ZJ_SLOT_DONE } zj_slot_state_t;
 typedef struct {
     zj_slot_state_t state;

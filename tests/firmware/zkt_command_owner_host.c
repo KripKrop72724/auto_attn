@@ -15,7 +15,6 @@
 #define pdMS_TO_TICKS(value) (value)
 #define pdTRUE 1
 #define LED_STATUS_LOCAL_FAILURE 1
-#define QS_ADMIT_RECOVERY 2
 #define ESP_LOGW(...) ((void)0)
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_COMMAND_INBOX_MAX_BYTES 65536
@@ -83,9 +82,9 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
 }
 /* Any use of the former caller-owned NVS/budget path is a regression. */
 static void led_status_fault(int state) { (void)state; assert(false); }
-static bool qs_local_begin(int policy, size_t bytes)
+bool qs_local_begin(qs_admission_t policy, size_t bytes)
 { (void)policy; (void)bytes; assert(false); return false; }
-static void qs_local_end(bool ok, int error) { (void)ok; (void)error; assert(false); }
+void qs_local_end(bool ok, int error) { (void)ok; (void)error; assert(false); }
 FILE *rel_open_append(const char *path) { (void)path; assert(false); return NULL; }
 static int nvs_open(const char *name, int mode, int *handle)
 { (void)name; (void)mode; (void)handle; assert(false); return -1; }

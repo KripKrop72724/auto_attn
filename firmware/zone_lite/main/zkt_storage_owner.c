@@ -27,6 +27,7 @@ typedef struct {
     zc_store_t catalog;
     zc_store_t commands;
     zi_store_t command_ids;
+    zq_store_t segmented;
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
@@ -39,6 +40,10 @@ typedef struct {
 static owner_t *owner;
 static SemaphoreHandle_t mailbox_lock;
 static TaskHandle_t owner_task;
+
+bool zj_owner_started(void) { return owner_task != NULL; }
+bool zj_owner_is_current_task(void)
+{ return owner_task && xTaskGetCurrentTaskHandle() == owner_task; }
 
 static bool enter(void)
 {
@@ -399,6 +404,15 @@ static void task(void *context)
         if (work && (request.operation == ZJ_CATALOG || request.operation == ZJ_COMMANDS))
             pending = execute_catalog(o, ticket, &request, &reply);
         else if (work && request.operation == ZJ_COMMAND_IDS) pending = execute_command_ids(o, ticket, &request, &reply);
+        else if (work && request.operation == ZJ_SEGMENTED_QUEUE) {
+            memset(&reply, 0, sizeof(reply));
+            /* Queue operations take their existing short local locks. No
+             * owner/mailbox lock surrounds them, and public routing detects
+             * this task instead of recursively queuing another request. */
+            zq_store_execute(&o->segmented, (uint64_t)esp_timer_get_time(),
+                &request.input.segmented, &reply.segmented);
+            reply.result = ZJ_OK; /* Copied response; queue result is separate. */
+        }
         else if (work) execute(o, &request, &reply);
         else {
             memset(&reply, 0, sizeof(reply));

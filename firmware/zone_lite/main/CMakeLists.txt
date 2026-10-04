@@ -20,10 +20,12 @@ idf_component_register(
 )
 target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c" "zkt_socket_io.c" "add_source_wire.c" "ota_progress_receipt.c")
 if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_QUEUE_OWNER=1)
     target_sources(${COMPONENT_LIB} PRIVATE "zkt_journal_codec.c" "zkt_journal_crypto.c" "zkt_journal_store.c"
         "zkt_journal_state.c" "zkt_journal_compat.c" "zkt_reader_platform.c" "zkt_ota_guard.c"
         "zkt_storage_mailbox.c" "zkt_storage_owner.c" "zkt_runtime_checkpoint.c" "zkt_lease_store.c" "zkt_catalog_store.c" "zkt_catalog_client.c"
         "zkt_command_id_store.c" "zkt_command_id_client.c"
+        "zkt_segmented_store.c" "zkt_segmented_client.c"
         "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
         "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c"
         "zkt_journal_diagnostics.c")

@@ -47,7 +47,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                     *(str(main / name) for name in ["zkt_storage_owner.c", "zkt_storage_mailbox.c", "zkt_runtime_checkpoint.c", "zkt_lease_store.c",
                         "zkt_journal_state.c", "zkt_journal_store.c", "zkt_journal_codec.c", "durable_queue.c",
                         "zkt_custody_wire.c", "zkt_catalog_store.c", "file_transaction.c", "zkt_command_id_store.c",
-                        "zkt_command_id_client.c"]),
+                        "zkt_command_id_client.c", "zkt_segmented_store.c", "zkt_segmented_client.c"]),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
     for scenario in ["--checkpoint", "--recovery-full", "--runtime-corrupt-journal",

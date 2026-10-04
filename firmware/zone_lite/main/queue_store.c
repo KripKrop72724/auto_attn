@@ -12,6 +12,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+#include "zkt_segmented_owner.h"
+#include "zkt_storage_owner.h"
+#include "zkt_runtime_checkpoint.h"
+#endif
 
 typedef struct { durable_queue_t queue; SemaphoreHandle_t mutex; qs_lane_t lane; qs_admission_t admission; } lane_t;
 static lane_t lanes[QS_COUNT];
@@ -62,6 +67,9 @@ static bool ensure_storage_generation(void)
 
 bool qs_generation(char output[33])
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && !zj_owner_is_current_task()) return zq_generation(output);
+#endif
     if (!output || !budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     bool ok = ensure_storage_generation();
     if (ok) memcpy(output, storage_generation, sizeof(storage_generation));
@@ -227,6 +235,11 @@ bool qs_init(void)
 }
 bool qs_recover_step(void)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    /* The single boot/app task establishes the initial queue recovery before
+     * journal startup. Subsequent passes run on the owner. */
+    if (zj_runtime_checkpoint_required() && zj_owner_started() && !zj_owner_is_current_task()) return zq_recover();
+#endif
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     return false; /* Hikvision retains its existing independent recovery path. */
 #else
@@ -256,6 +269,9 @@ bool qs_recover_step(void)
 }
 bool qs_verify_persistence(void)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && zj_owner_started() && !zj_owner_is_current_task()) return zq_probe();
+#endif
     if (!storage_upgrade_ready() || !budget_lock ||
         xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     /* A probe can only resolve its own failure. Queue corruption, refused
@@ -403,6 +419,9 @@ dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 }
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && !zj_owner_is_current_task()) return zq_append(lane, data, length, policy);
+#endif
     bool writable = storage_upgrade_segmented_writes();
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     if (lane == QS_HIK_SOURCE) writable = storage_upgrade_ready();
@@ -424,6 +443,9 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
 }
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && !zj_owner_is_current_task()) return zq_peek(lane, data, capacity, length, token);
+#endif
     /* A catalog commit may hold the shared budget lock for longer than this
      * reader's slice. Contention preserves the queue and must be retried; only
      * a failed storage operation is evidence of lost local durability. */
@@ -443,6 +465,9 @@ dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length,
 }
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && !zj_owner_is_current_task()) return zq_settle(lane, token);
+#endif
     if (!lock(lane)) return DQ_IO;
     if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(lanes[lane].mutex); return DQ_IO;
@@ -457,6 +482,9 @@ dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
 }
 bool qs_snapshot(qs_lane_t lane, uint32_t *depth)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required() && !zj_owner_is_current_task()) return zq_snapshot(lane, depth);
+#endif
     if (!depth || !lock(lane)) return false;
     bool ready = lanes[lane].queue.ready;
     if (ready) *depth = lanes[lane].queue.checkpoint.depth;

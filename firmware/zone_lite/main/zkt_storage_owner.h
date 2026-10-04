@@ -1,5 +1,10 @@
 #pragma once
 #include "zkt_storage_mailbox.h"
+
+/* Queue-store routing uses task identity, never a caller-controlled bypass.
+ * Bootstrap queue recovery remains on the app task until this owner starts. */
+bool zj_owner_started(void);
+bool zj_owner_is_current_task(void);
 #include "zkt_journal_state.h"
 
 #define ZJ_DEVICE_DIRECTORY "/spiffs"
@@ -36,8 +41,8 @@ typedef struct {
  * runtime_v1 checkpoint writes in zone_lite, plus new-image catalog reads/mutations
  * and the existing catalog NVS checkpoint. New-image command inbox reads,
  * replacements and their existing NVS checkpoint also run here, along with
- * processed/cancelled command-ID cache operations. Legacy attendance still
- * requires handoff. */
+ * processed/cancelled command-ID cache operations and retained segmented
+ * queue work. Flat-file legacy attendance still requires handoff. */
 bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata);
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket);
 bool zj_owner_poll(uint64_t ticket, zj_reply_t *reply, bool *complete);
