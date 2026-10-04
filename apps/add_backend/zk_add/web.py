@@ -896,7 +896,7 @@ def reveal_source_correction_evidence(
     except RecoveryError as exc:
         status = 404 if exc.code == "SOURCE_MISSING" else 409
         raise HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)}) from exc
-    db.flush()
+    db.commit()  # Protected bytes cannot precede their durable access audit.
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return result
