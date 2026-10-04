@@ -5,7 +5,7 @@
 
 #define ZQ_CHUNK_BYTES 512U
 #define ZQ_DEADLINE_US 10000000ULL
-typedef enum { ZQ_SEGMENTED, ZQ_ADD_LEGACY } zq_domain_t;
+typedef enum { ZQ_SEGMENTED, ZQ_ADD_LEGACY, ZQ_QUARANTINE } zq_domain_t;
 typedef enum { ZQ_APPEND_BEGIN, ZQ_APPEND_CHUNK, ZQ_APPEND_COMMIT,
     ZQ_PEEK_BEGIN, ZQ_PEEK_CHUNK, ZQ_SETTLE, ZQ_SNAPSHOT, ZQ_GENERATION,
     ZQ_RECOVER, ZQ_PROBE } zq_operation_t;
@@ -42,18 +42,25 @@ typedef struct {
     uint8_t append_lane, append_policy, read_lane, append_domain, read_domain;
     dq_token_t read_token;
     lq_token_t legacy_read_token;
-    zq_legacy_port_t legacy;
+    zq_legacy_port_t legacy, quarantine;
     /* Allocated with the owner in PSRAM, never on a caller/task stack. */
     uint8_t append_bytes[DQ_MAX_RECORD_BYTES], read_bytes[DQ_MAX_RECORD_BYTES];
 } zq_store_t;
 
+static inline unsigned zq_domain_lanes(unsigned domain)
+{
+    return domain == ZQ_SEGMENTED ? QS_COUNT : domain == ZQ_ADD_LEGACY ? 2U :
+        domain == ZQ_QUARANTINE ? 3U : 0U;
+}
 static inline bool zq_request_valid(const zq_request_t *r)
 {
-    if (!r || !r->deadline_us || r->operation > ZQ_PROBE || r->domain > ZQ_ADD_LEGACY ||
-        r->lane >= (r->domain == ZQ_ADD_LEGACY ? 2U : QS_COUNT) ||
+    if (!r || !r->deadline_us || r->operation > ZQ_PROBE ||
+        r->lane >= zq_domain_lanes(r->domain) ||
         r->policy > QS_ADMIT_RECOVERY || r->length > ZQ_CHUNK_BYTES)
         return false;
-    if (r->domain == ZQ_ADD_LEGACY && r->operation > ZQ_SETTLE) return false;
+    if (r->domain != ZQ_SEGMENTED && r->operation > ZQ_SETTLE) return false;
+    if (r->domain == ZQ_QUARANTINE && (r->operation < ZQ_PEEK_BEGIN ||
+        (r->operation == ZQ_SETTLE && !r->custody))) return false;
     switch (r->operation) {
         case ZQ_APPEND_BEGIN: return !r->transfer && !r->length && !r->offset &&
             r->total && r->total <= DQ_MAX_RECORD_BYTES;
@@ -62,7 +69,7 @@ static inline bool zq_request_valid(const zq_request_t *r)
         case ZQ_APPEND_COMMIT: return r->transfer && !r->length;
         case ZQ_PEEK_BEGIN: return !r->transfer && !r->length;
         case ZQ_PEEK_CHUNK: return r->transfer && !r->length && r->offset < DQ_MAX_RECORD_BYTES;
-        case ZQ_SETTLE: return !r->length && (r->domain == ZQ_ADD_LEGACY ?
+        case ZQ_SETTLE: return !r->length && (r->domain != ZQ_SEGMENTED ?
             r->legacy_token.end > r->legacy_token.offset : r->token.end > r->token.offset);
         default: return !r->length && !r->transfer;
     }
@@ -85,3 +92,6 @@ bool zq_probe(void);
 dq_result_t zq_legacy_append(unsigned lane, const void *data, size_t length, qs_admission_t policy);
 dq_result_t zq_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token);
 dq_result_t zq_legacy_settle(unsigned lane, const lq_token_t *token, bool custody);
+/* Retained corrupt-file evidence is read-only except exact custody retirement. */
+dq_result_t zq_evidence_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token);
+dq_result_t zq_evidence_settle(unsigned lane, const lq_token_t *token);

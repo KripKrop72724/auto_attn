@@ -44,6 +44,7 @@ counts are kept outside this public repository.
 | Retained segmented queue readers and checkpoint writers compete with capture | New images route queue operations through the storage task with fixed PSRAM buffers, 512-byte copies, absolute deadlines and retained replies | Real queue files, actual public entry points and owner thread; full/refused/interrupted operations, lost replies, stale tokens and maximum records | Segmented ownership component; flat-file handoff, receipt-bound migration and ESP headroom remain open |
 | ADD flat-file producers and delivery still perform competing storage operations | New-image producers and delivery use copied owner requests; consumed-prefix recovery yields, all surviving generations drain, and verified-empty evidence is invalidated by writes | Actual adapters and family routing, real files, storage/NVS faults, lost replies, backup-restore failure, stale tokens and owner quiescence | ADD flat-file ownership implemented; Oracle/blocked ownership, migration evidence and ESP qualification remain open |
 | A failed Oracle backlog restore can be mistaken for an empty queue | Require successful generation restoration before scanning or caching empty; propagate retirement/restore errors and keep failed boot restoration visible | Actual Oracle read/send/commit orchestration with failed rename/stat, preserved backup/temp files, retry and lock release; production boot failure checks | Recovery defect corrected; Oracle/blocked storage ownership and field qualification remain open |
+| Retained corrupt-file evidence bypasses the storage task | New-image quarantine reads and exact-receipt retirement use copied owner requests, existing NVS checkpoints and bounded prefix recovery | Actual production adapters and delivery slice, raw/binary/oversized tails, lost receipts/replies, NVS/read/close/stat/remove faults, empty cache and both family paths | Implemented evidence component; raw custody does not resolve identity or deliver attendance to Oracle |
 | Development journal and OTA scan use an unmounted directory | Journal runtime and OTA evidence scans share the actual `/storage` boot mount constant | Production boot initialization and runtime adapter compare journal/OTA/catalog/command paths to the captured VFS mount | Integration defect corrected; signed-device boot and physical qualification remain open |
 | Identity lookup can expose a row before a later read or close fails | New-image catalog restoration, lookup and tombstone loading read copied owner chunks; lookup validates complete row counts and clears unresolved outputs | Actual consumer functions, every allocation site, late reads, changed revisions, extra/missing rows, truncated tails and legacy close failure | Implemented read component; ESP catalog latency and remaining legacy attendance handoff stay open |
 | Wall-clock changes or reused IDs can misdirect temporary administrator recovery | Boot-local monotonic expiry, identity-bound encrypted-NVS leases, a retained presence witness, exact uncertain-write replay and explicit evidence holds | Production grant/watchdog adapters and actual owner task with clock, reboot, changed identity, missing records, terminal and NVS fault injection | Implemented software component; physical fault, ESP latency, field recovery and full scheduling qualification remain open |
@@ -534,6 +535,19 @@ descriptor checks for that disabled configuration were not compatibility
 qualification. CI now builds the capture-capable bridge, while the host matrices
 continue to test refusal of capture-disabled builds. Signing, security and
 persisted-proof requirements remain unchanged.
+
+The storage task also owns the three retained corrupt-file generations for
+exact bridge/writer images. Their copied queue domain permits reads and
+custody-backed retirement only. The delivery task obtains an exact ADD
+`queue_evidence` receipt before sending a retirement token; it releases all
+filesystem locks before the network call. Existing file names, checkpoint
+keys and raw byte order are preserved. A consumed prefix is checked in at most
+8 KiB per request, so another lane can progress during recovery. Verified empty
+files are cached because these retained generations have no producer. Errors
+and uncertain results preserve the source or replay already receipted evidence.
+This transfers unresolved evidence; it does not classify it as valid attendance,
+resolve identity, or establish Oracle delivery. Oracle/blocked flat-file
+ownership and complete legacy migration remain open.
 
 Host tests use actual files and injected short writes, open/read/seek/sync/close
 failures, interrupted rotation, malformed tails, corrupted records, uncertain

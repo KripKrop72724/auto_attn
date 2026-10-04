@@ -73,6 +73,8 @@
 #include "zkt_runtime_checkpoint.h"
 #include "zkt_lease_store.h"
 #include "zkt_command_ids.h"
+#include "zkt_storage_owner.h"
+#include "zkt_quarantine_owner.h"
 #endif
 #include "legacy_queue.h"
 #include "queue_store.h"
@@ -7529,27 +7531,104 @@ static void blocked_evidence_slice(void)
  * drain independently and require exact ADD custody before source retirement. */
 static legacy_queue_t g_legacy_quarantine[3];
 static unsigned g_quarantine_lane;
-static void legacy_quarantine_slice(void)
+static dq_result_t read_quarantine_locked(unsigned lane, void *bytes, size_t capacity,
+                                          size_t *length, lq_token_t *token)
 {
-    if (!add_connector_is_connected() || !g_blocked_drain_buffer) return;
     static const char *paths[] = {CORRUPT_ORDS_PATH, STORAGE_BASE "/add_corrupt.jsonl", STORAGE_BASE "/add_corrupt.bak"};
     static const char *keys[] = {"old_qo", "old_qa", "old_qb"};
-    static const char *names[] = {"legacy_ords_quarantine", "legacy_add_quarantine", "legacy_add_quarantine_backup"};
-    unsigned lane = g_quarantine_lane++ % 3U;
+    if (length) *length = 0;
+    if (token) memset(token, 0, sizeof(*token));
+    if (lane >= 3 || !bytes || capacity < 2 || capacity > DQ_MAX_RECORD_BYTES + 1 || !length || !token) return DQ_IO;
     legacy_queue_t *queue = &g_legacy_quarantine[lane];
-    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    /* These generations have no producer. Once their verified tail is retired,
+     * the cache stays valid until reboot; no repeated empty-file scans run. */
+    if (queue->ready && queue->empty_cached) return DQ_EMPTY;
     dq_result_t read = DQ_OK;
     if (!queue->ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, (void *)keys[lane]};
         read = lq_open_step(queue, paths[lane], port);
     }
-    lq_token_t token;
-    if (read == DQ_OK) read = lq_peek(queue, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &token);
+    if (read == DQ_OK) read = lq_peek(queue, bytes, capacity, token);
+    if (read == DQ_OK) *length = token->end - token->offset;
     if (read == DQ_EMPTY) {
         dq_result_t reclaimed = lq_reclaim(queue);
         if (reclaimed != DQ_OK && reclaimed != DQ_EMPTY) read = reclaimed;
+        else queue->empty_cached = true;
     }
+    return read;
+}
+static dq_result_t settle_quarantine_locked(unsigned lane, const lq_token_t *token)
+{
+    if (lane >= 3 || !token) return DQ_IO;
+    legacy_queue_t *queue = &g_legacy_quarantine[lane];
+    dq_result_t result = lq_settle_evidence(queue, token);
+    if (result != DQ_OK) return result;
+    result = lq_reclaim(queue);
+    if (result == DQ_OK) queue->empty_cached = true;
+    return result == DQ_STALE ? DQ_OK : result;
+}
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+static bool quarantine_owner_lock(unsigned lane)
+{
+    if (lane >= 3 || !zj_runtime_checkpoint_required() || !zj_owner_is_current_task() || !g_storage_lock ||
+        xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (!qs_local_read_begin()) { xSemaphoreGive(g_storage_lock); return false; }
+    return true;
+}
+dq_result_t zkt_quarantine_owner_peek(unsigned lane, void *bytes, size_t capacity,
+                                     size_t *length, lq_token_t *token)
+{
+    if (length) *length = 0;
+    if (token) memset(token, 0, sizeof(*token));
+    if (!quarantine_owner_lock(lane)) return DQ_PENDING;
+    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token);
+    qs_local_end(true, 0);
     xSemaphoreGive(g_storage_lock);
+    return result;
+}
+dq_result_t zkt_quarantine_owner_settle(unsigned lane, const lq_token_t *token, bool custody)
+{
+    if (!custody || !token || token->end <= token->offset) return DQ_IO;
+    if (!quarantine_owner_lock(lane)) return DQ_PENDING;
+    errno = 0;
+    dq_result_t result = settle_quarantine_locked(lane, token);
+    int error = errno;
+    qs_local_end(result != DQ_IO, result == DQ_IO ? (error ? error : EIO) : 0);
+    xSemaphoreGive(g_storage_lock);
+    return result;
+}
+#endif
+static dq_result_t read_quarantine_delivery(unsigned lane, void *bytes, size_t capacity,
+                                            size_t *length, lq_token_t *token)
+{
+    if (length) *length = 0;
+    if (token) memset(token, 0, sizeof(*token));
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required()) return zq_evidence_peek(lane, bytes, capacity, length, token);
+#endif
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return DQ_PENDING;
+    dq_result_t result = read_quarantine_locked(lane, bytes, capacity, length, token);
+    xSemaphoreGive(g_storage_lock);
+    return result;
+}
+static dq_result_t settle_quarantine_delivery(unsigned lane, const lq_token_t *token)
+{
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (zj_runtime_checkpoint_required()) return zq_evidence_settle(lane, token);
+#endif
+    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return DQ_PENDING;
+    dq_result_t result = settle_quarantine_locked(lane, token);
+    xSemaphoreGive(g_storage_lock);
+    return result;
+}
+static void legacy_quarantine_slice(void)
+{
+    if (!add_connector_is_connected() || !g_blocked_drain_buffer) return;
+    static const char *names[] = {"legacy_ords_quarantine", "legacy_add_quarantine", "legacy_add_quarantine_backup"};
+    unsigned lane = g_quarantine_lane++ % 3U;
+    lq_token_t token;
+    size_t length = 0;
+    dq_result_t read = read_quarantine_delivery(lane, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &length, &token);
     if (read != DQ_OK) {
         if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
         return;
@@ -7561,17 +7640,11 @@ static void legacy_quarantine_slice(void)
     snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)token.offset, (unsigned long)token.crc);
     add_connector_report_ords_worker(ADD_WORKER_NETWORK);
     bool preserved = add_connector_transfer_queue_evidence(names[lane], generation, record_id,
-        g_blocked_drain_buffer, token.end - token.offset, NULL, "LEGACY_RECOVERY");
+        g_blocked_drain_buffer, length, NULL, "LEGACY_RECOVERY");
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (!preserved) return;
-    if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
-    bool committed = lq_settle_evidence(queue, &token) == DQ_OK;
-    if (committed) {
-        dq_result_t reclaimed = lq_reclaim(queue);
-        committed = reclaimed == DQ_OK || reclaimed == DQ_STALE;
-    }
-    xSemaphoreGive(g_storage_lock);
-    if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    dq_result_t committed = settle_quarantine_delivery(lane, &token);
+    if (committed != DQ_OK && committed != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 }
 
 static void ords_uploader_task(void *arg)

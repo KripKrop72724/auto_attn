@@ -254,17 +254,18 @@ bool qs_generation(char output[33])
 { assert(zj_owner_is_current_task()); memset(output, 'a', 32); output[32] = 0; return true; }
 bool qs_recover_step(void) { assert(zj_owner_is_current_task()); return true; }
 bool qs_verify_persistence(void) { assert(zj_owner_is_current_task()); return true; }
-static legacy_queue_t flat[2];
-static lq_checkpoint_t flat_checkpoints[2];
+static legacy_queue_t flat[5];
+static lq_checkpoint_t flat_checkpoints[5];
 static int flat_load(void *context, lq_checkpoint_t *out)
 { unsigned lane=(unsigned)(uintptr_t)context; *out=flat_checkpoints[lane]; return out->version ? 1 : 0; }
 static bool flat_commit(void *context, const lq_checkpoint_t *in)
 { flat_checkpoints[(unsigned)(uintptr_t)context]=*in; return true; }
 static legacy_queue_t *flat_queue(unsigned lane)
 {
-    assert(zj_owner_is_current_task() && lane < 2);
+    assert(zj_owner_is_current_task() && lane < 5);
     if (!flat[lane].ready) {
-        const char *path=lane ? "flat-bulk.jsonl" : "flat-live.jsonl";
+        static const char *paths[]={"flat-live.jsonl","flat-bulk.jsonl","quarantine-ords","quarantine-add","quarantine-backup"};
+        const char *path=paths[lane];
         assert(lq_open(&flat[lane],path,(lq_port_t){flat_load,flat_commit,(void *)(uintptr_t)lane})==DQ_OK);
     }
     return &flat[lane];
@@ -286,6 +287,10 @@ dq_result_t add_legacy_owner_peek(unsigned lane,void *bytes,size_t capacity,size
 }
 dq_result_t add_legacy_owner_settle(unsigned lane,const lq_token_t *token,bool custody)
 { return custody ? lq_settle_evidence(flat_queue(lane),token) : lq_settle(flat_queue(lane),token); }
+dq_result_t zkt_quarantine_owner_peek(unsigned lane,void *bytes,size_t capacity,size_t *length,lq_token_t *token)
+{ assert(lane<3);return add_legacy_owner_peek(lane+2,bytes,capacity,length,token); }
+dq_result_t zkt_quarantine_owner_settle(unsigned lane,const lq_token_t *token,bool custody)
+{ assert(lane<3 && custody);return add_legacy_owner_settle(lane+2,token,true); }
 bool zj_transport_health(zj_transport_health_t *health)
 {
     *health = (zj_transport_health_t){.started = true,
@@ -755,6 +760,13 @@ int main(int argc, char **argv)
     assert(zq_legacy_settle(0, &flat_token, false) == DQ_OK);
     assert(zq_legacy_settle(0, &flat_token, false) == DQ_STALE);
     assert(zq_legacy_peek(0, retained_output, sizeof(retained_output), &retained_length, &flat_token) == DQ_EMPTY);
+    FILE *quarantine_file=fopen("quarantine-add","wb");
+    assert(quarantine_file && fwrite("raw\0tail",1,8,quarantine_file)==8 && fclose(quarantine_file)==0);
+    assert(zq_evidence_peek(1,retained_output,sizeof(retained_output),&retained_length,&flat_token)==DQ_OK);
+    assert(retained_length==8 && !memcmp(retained_output,"raw\0tail",8) && flat_token.evidence_required);
+    assert(zq_evidence_settle(1,&flat_token)==DQ_OK);
+    assert(zq_evidence_settle(1,&flat_token)==DQ_STALE);
+    assert(zq_evidence_peek(1,retained_output,sizeof(retained_output),&retained_length,&flat_token)==DQ_EMPTY);
     assert(zj_owner_health(&health) && !health.occupied);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
@@ -793,6 +805,7 @@ int main(int argc, char **argv)
     assert(!zj_owner_submit(&compatibility, &refused_ticket));
     assert(zq_append(QS_LIVE, "after-quiescence", 16, QS_ADMIT_LIVE) == DQ_PENDING);
     assert(zq_legacy_append(0, "after-quiescence", 16, QS_ADMIT_LIVE) == DQ_PENDING);
+    assert(zq_evidence_peek(2,retained_output,sizeof(retained_output),&retained_length,&flat_token)==DQ_PENDING);
     assert(zq_peek(QS_ORDS, retained_output, sizeof(retained_output), &retained_length, &retained_token) == DQ_PENDING);
     assert(!retained_length && !retained_token.end && !zq_probe());
     vTaskDelay(10);
