@@ -23,6 +23,14 @@ scheduling state in the same transaction. A failed transaction resumes from the
 last committed step; a lost response cannot duplicate a committed step. Connector
 then work row locks serialize interpretation with newly arriving fragments.
 
+Independent groups defer their evidence flush until the bounded batch finishes,
+allowing PostgreSQL to insert multiple steps and update their work states
+together. Each group is visited at most once in that batch. The standalone
+decoder helper still flushes by default. Source-association savepoints may flush
+earlier within the same transaction; nothing reports progress before the outer
+commit. A failed batched write rolls back all proposed steps and work changes,
+while the original custody receipts remain intact.
+
 Every size-compatible live layout is an explicit hypothesis. Layout errors retain
 their byte offset, length, digest and fixed error category. Later valid records
 within the same packet remain inspectable. Identical same-second records retain
