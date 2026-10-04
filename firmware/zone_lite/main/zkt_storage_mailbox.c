@@ -28,11 +28,13 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_CATALOG) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_LEASE) return false;
     if (request->operation == ZJ_CATALOG && !zc_request_valid(&request->input.catalog)) return false;
     if (request->operation == ZJ_RUNTIME_CHECKPOINT &&
         (!request->input.runtime_checkpoint.deadline_us ||
          !runtime_checkpoint_valid(&request->input.runtime_checkpoint.state))) return false;
+    if (request->operation == ZJ_LEASE &&
+        (!request->input.lease.deadline_us || !zl_lease_valid(&request->input.lease.state))) return false;
     if (request->operation == ZJ_OTA_CHECK &&
         (!request->input.ota.version[0] || !memchr(request->input.ota.version, 0, sizeof(request->input.ota.version))))
         return false;

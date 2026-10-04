@@ -70,6 +70,7 @@
 #include "runtime_checkpoint.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_runtime_checkpoint.h"
+#include "zkt_lease_store.h"
 #endif
 #include "legacy_queue.h"
 #include "queue_store.h"
@@ -542,6 +543,10 @@ static bool g_temp_admin_active;
 static uint16_t g_temp_admin_uid;
 static int64_t g_temp_admin_expires_epoch;
 static lg_watch_t g_temp_admin_watch;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+static zl_lease_record_t g_committed_lease, g_lease_binding;
+static bool g_lease_evidence_known, g_lease_alert_sent;
+#endif
 // The legacy runtime checkpoint has no epoch UUID. New bridge/writer boots
 // require fresh ADD authority; never infer an epoch from the numeric generation.
 static char g_add_source_epoch[37];
@@ -7806,6 +7811,91 @@ static bool mark_command_processed(const char *command_id)
         PROCESSED_COMMANDS_PATH, command_id, COMMAND_RECEIPT_CACHE_BYTES, COMMAND_ID_MAX_BYTES);
 }
 
+static bool temp_admin_evidence_ready(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) return g_lease_evidence_known;
+#endif
+    return true;
+}
+
+static void temp_admin_load_lease_evidence(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (!zj_runtime_checkpoint_required()) return;
+    int error = 0;
+    zj_result_t loaded = zl_lease_load_boot(&g_committed_lease, &error);
+    if (loaded == ZJ_OK) {
+        g_lease_binding = g_committed_lease;
+        g_lease_evidence_known = true;
+        g_temp_admin_active = g_committed_lease.active;
+        g_temp_admin_uid = g_committed_lease.uid;
+        g_temp_admin_expires_epoch = g_committed_lease.expires_epoch;
+    } else {
+        /* Missing evidence is inactive only with an intact legacy checkpoint.
+         * A legacy active UID never supplies a trusted identity fingerprint. */
+        g_lease_evidence_known = loaded == ZJ_EMPTY && g_committed_runtime_valid &&
+            !g_committed_runtime.lease_active;
+    }
+#endif
+}
+
+static bool temp_admin_identity_matches(const zkt_user_t *user)
+{
+    if (!user) return false;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required())
+        return g_lease_evidence_known && zl_lease_matches(&g_lease_binding, g_device_serial,
+            (uint16_t)strtoul(user->uid, NULL, 10), user->terminal_identity_fingerprint);
+#endif
+    return true;
+}
+
+static bool temp_admin_prepare_binding(const zkt_user_t *user, uint16_t uid)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) {
+        /* A bridge can recover existing v2 leases but cannot create new ones
+         * while an older rollback slot might still be selected. */
+        if (!g_lease_evidence_known || !zj_runtime_writer_ready() || !user) return false;
+        if (g_temp_admin_active) return temp_admin_identity_matches(user);
+        if (user->privilege != 0 || !g_device_serial[0]) return false;
+        zl_lease_record_t binding = {.version = ZL_LEASE_VERSION, .generation = 1,
+            .uid = uid, .active = 1, .expires_epoch = epoch_now()};
+        strlcpy(binding.terminal_serial, g_device_serial, sizeof(binding.terminal_serial));
+        strlcpy(binding.identity_fingerprint, user->terminal_identity_fingerprint, sizeof(binding.identity_fingerprint));
+        zl_lease_checksum(&binding);
+        if (!zl_lease_valid(&binding)) return false;
+        g_lease_binding = binding;
+    }
+#else
+    (void)user; (void)uid;
+#endif
+    return true;
+}
+
+static bool temp_admin_checkpoint(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required()) {
+        if (!g_lease_evidence_known || !zl_lease_valid(&g_lease_binding) ||
+            g_committed_lease.generation == UINT32_MAX) return false;
+        zl_lease_record_t proposed = g_lease_binding, confirmed;
+        proposed.generation = g_committed_lease.generation + 1;
+        proposed.active = g_temp_admin_active;
+        proposed.expires_epoch = g_temp_admin_active ? g_temp_admin_expires_epoch : 0;
+        zl_lease_checksum(&proposed);
+        bool saved = zl_lease_save(&proposed, &confirmed);
+        if (zl_lease_valid(&confirmed)) {
+            g_committed_lease = confirmed;
+            g_lease_binding = confirmed;
+        }
+        return saved;
+    }
+#endif
+    return nvs_save_runtime_state();
+}
+
 static bool temp_admin_clear(void)
 {
     bool active = g_temp_admin_active;
@@ -7814,7 +7904,7 @@ static bool temp_admin_clear(void)
     g_temp_admin_active = false;
     g_temp_admin_uid = 0;
     g_temp_admin_expires_epoch = 0;
-    if (nvs_save_runtime_state()) {
+    if (temp_admin_checkpoint()) {
         g_temp_admin_watch = (lg_watch_t){0};
         return true;
     }
@@ -7823,6 +7913,13 @@ static bool temp_admin_clear(void)
     g_temp_admin_uid = uid;
     g_temp_admin_expires_epoch = expiry;
     return false;
+}
+
+static bool temp_admin_clear_owned(const zkt_user_t *user)
+{
+    if (!g_temp_admin_active) return temp_admin_evidence_ready();
+    return user && (uint16_t)strtoul(user->uid, NULL, 10) == g_temp_admin_uid &&
+        temp_admin_identity_matches(user) && temp_admin_clear();
 }
 
 typedef struct {
@@ -7841,14 +7938,18 @@ static bool temp_admin_persist(void *arg, uint16_t uid, int64_t deadline, bool a
     g_temp_admin_active = true;
     g_temp_admin_uid = uid;
     g_temp_admin_expires_epoch = deadline;
-    return nvs_save_runtime_state();
+    return temp_admin_checkpoint();
 }
 static bool temp_admin_write(void *arg, uint16_t uid, int privilege)
 {
     temp_admin_port_t *port = arg;
+    int32_t users = 0, records = 0;
+    if (!zk_get_counts(port->sock, port->ctx, &users, &records) ||
+        !zk_refresh_users_preserving_current(port->sock, port->ctx, port->users, users)) return false;
     char key[16]; snprintf(key, sizeof(key), "%u", (unsigned)uid);
     zkt_user_t *user = find_mutable_user_by_uid(port->users, key);
-    return user && zk_write_user(port->sock, port->ctx, user, NULL, privilege);
+    return user && temp_admin_identity_matches(user) &&
+        zk_write_user(port->sock, port->ctx, user, NULL, privilege);
 }
 static bool temp_admin_elevate(void *arg, uint16_t uid) { return temp_admin_write(arg, uid, 14); }
 static bool temp_admin_revoke(void *arg, uint16_t uid) { return temp_admin_write(arg, uid, 0); }
@@ -7859,7 +7960,7 @@ static bool temp_admin_verify(void *arg, uint16_t uid, int privilege)
     if (!zk_get_counts(port->sock, port->ctx, &users, &records) ||
         !zk_refresh_users_preserving_current(port->sock, port->ctx, port->users, users)) return false;
     const zkt_user_t *verified = find_user_by_uid(port->users, uid);
-    if (!verified || verified->privilege != privilege ||
+    if (!verified || !temp_admin_identity_matches(verified) || verified->privilege != privilege ||
         (port->command->user_id[0] && strcmp(verified->user_id, port->command->user_id)) ||
         (port->command->has_expected_terminal_identity_fingerprint &&
          strcmp(verified->terminal_identity_fingerprint, port->command->expected_terminal_identity_fingerprint))) return false;
@@ -7894,6 +7995,11 @@ static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *
         return false;
     }
     uint16_t uid = (uint16_t)parsed_uid;
+    if (!temp_admin_prepare_binding(find_user_by_uid(users, uid), uid)) {
+        *error_code = "ADMIN_LEASE_IDENTITY_REQUIRED";
+        *error_message = "A compatible writer and verified lease identity are required before elevation.";
+        return false;
+    }
     int64_t deadline = command->lease_expires_epoch;
     if (g_temp_admin_active && g_temp_admin_uid == uid && g_temp_admin_expires_epoch > 0 &&
         (deadline <= 0 || g_temp_admin_expires_epoch < deadline)) deadline = g_temp_admin_expires_epoch;
@@ -7923,6 +8029,16 @@ static bool execute_temp_admin_grant(int sock, zk_context_t *ctx, user_table_t *
 
 static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *users)
 {
+    if (!temp_admin_evidence_ready()) {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (!g_lease_alert_sent) {
+            add_connector_log("CRITICAL", "enrollment", "LEASE_EVIDENCE_REQUIRED",
+                "Lease evidence is unreadable or identity is unresolved; enrollment mutations are held while capture continues");
+            g_lease_alert_sent = true;
+        }
+#endif
+        return true;
+    }
     if (!g_temp_admin_active) return true;
     if (!lg_watch_due(&g_temp_admin_watch, g_temp_admin_uid,
             g_temp_admin_expires_epoch, epoch_now(), uptime_ms())) return true;
@@ -7934,7 +8050,21 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
     zkt_user_t *user = find_mutable_user_by_uid(users, uid);
     if (!user) {
         add_connector_log("CRITICAL", "enrollment", "LEASE_USER_MISSING", "Temporary administrator user is missing from the terminal snapshot");
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (zj_runtime_checkpoint_required()) {
+            g_lease_evidence_known = false;
+            return true;
+        }
+#endif
         return false;
+    }
+    if (!temp_admin_identity_matches(user)) {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        g_lease_evidence_known = false;
+#endif
+        add_connector_log("CRITICAL", "enrollment", "LEASE_IDENTITY_CHANGED",
+            "The retained lease does not match this terminal enrollment; no privilege write was attempted");
+        return true;
     }
     if (user->privilege == 0) {
         if (!temp_admin_clear()) return false;
@@ -7947,7 +8077,7 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
         if (zk_get_counts(sock, ctx, &verified_users, &verified_records) &&
             zk_refresh_users_preserving_current(sock, ctx, users, verified_users)) {
             zkt_user_t *verified = find_mutable_user_by_uid(users, uid);
-            if (verified && verified->privilege == 0) {
+            if (verified && temp_admin_identity_matches(verified) && verified->privilege == 0) {
                 g_add_zkt.user_count = verified_users;
                 g_add_zkt.attendance_count = verified_records;
                 add_connector_set_zkt(&g_add_zkt);
@@ -7962,6 +8092,19 @@ static bool temp_admin_revoke_if_due(int sock, zk_context_t *ctx, user_table_t *
     return false;
 }
 
+static bool temp_admin_command_held(const add_command_t *command)
+{
+    if (!strcmp(command->command_type, "REFRESH_USERS")) return false;
+    if (!temp_admin_evidence_ready()) return true;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (zj_runtime_checkpoint_required() && g_temp_admin_active &&
+        (uint16_t)strtoul(command->uid, NULL, 10) == g_temp_admin_uid &&
+        (!strcmp(command->command_type, "CREATE_USER") || !strcmp(command->command_type, "UPDATE_USER") ||
+         !strcmp(command->command_type, "DELETE_USER"))) return true;
+#endif
+    return false;
+}
+
 static bool process_add_commands(
     int sock,
     zk_context_t *ctx,
@@ -7970,6 +8113,12 @@ static bool process_add_commands(
 {
     add_command_t command;
     while (add_connector_take_command(&command)) {
+        if (temp_admin_command_held(&command)) {
+            (void)add_connector_command_update(command.command_id, "RETRYING", "LEASE_EVIDENCE_REQUIRED",
+                "Enrollment mutations are held until the retained administrator lease is verified.", "{}");
+            add_connector_command_retry(command.command_id);
+            break;
+        }
         rel_id_result_t cancelled = command_was_cancelled(command.command_id);
         if (cancelled == REL_ID_ERROR) {
             (void)add_connector_command_update(command.command_id, "RETRYING",
@@ -8176,6 +8325,11 @@ static bool process_add_commands(
                 if (!user) {
                     error_code = "USER_NOT_FOUND";
                     error_message = "The requested UID is not present on this terminal.";
+                } else if (strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0 &&
+                    g_temp_admin_active &&
+                    ((uint16_t)strtoul(user->uid, NULL, 10) != g_temp_admin_uid || !temp_admin_identity_matches(user))) {
+                    error_code = "ADMIN_LEASE_IDENTITY_REQUIRED";
+                    error_message = "This enrollment does not own the retained administrator lease.";
                 } else if (
                     strcmp(command.command_type, "UPDATE_USER") == 0 &&
                     user_matches_command(user, &command)) {
@@ -8197,7 +8351,7 @@ static bool process_add_commands(
                 } else if (
                     strcmp(command.command_type, "REVOKE_TEMP_ADMIN") == 0 &&
                     user->privilege == 0) {
-                    ok = temp_admin_clear();
+                    ok = temp_admin_clear_owned(user);
                     if (!ok) { error_code = "LEASE_CHECKPOINT_FAILED"; error_message = "Revocation was verified but its checkpoint could not be saved."; }
                     snprintf(
                         result,
@@ -8248,7 +8402,7 @@ static bool process_add_commands(
                             error_code = "ZKT_USER_POSTCONDITION_FAILED";
                             error_message = "Administrator revocation did not persist after reread.";
                         } else {
-                            ok = temp_admin_clear();
+                            ok = temp_admin_clear_owned(verified);
                             if (!ok) { error_code = "LEASE_CHECKPOINT_FAILED"; error_message = "Revocation was verified but its checkpoint could not be saved."; }
                             snprintf(
                                 result,
@@ -8439,7 +8593,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
     if (!temp_admin_revoke_if_due(sock, &ctx, users)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
-    if (!zk_enforce_credential_policy(sock, &ctx, users, user_count)) {
+    if (temp_admin_evidence_ready() && !g_temp_admin_active && !zk_enforce_credential_policy(sock, &ctx, users, user_count)) {
         zk_disconnect(sock, &ctx); close(sock); free(users); return uptime_ms() - session_started_ms;
     }
     g_add_zkt.user_record_size = users->record_size;
@@ -8547,7 +8701,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
             (void)zk_sync_terminal_time(sock, &ctx);
             add_connector_set_activity("LIVE_CAPTURE");
         }
-        if (now_ms - last_credential_policy >= ZONE_LITE_CREDENTIAL_POLICY_INTERVAL_MS) {
+        if (temp_admin_evidence_ready() && !g_temp_admin_active && now_ms - last_credential_policy >= ZONE_LITE_CREDENTIAL_POLICY_INTERVAL_MS) {
             int32_t policy_users = 0;
             int32_t policy_records = 0;
             char policy_hash[65] = {0};
@@ -9049,7 +9203,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
         }
 
         int restart_slot = -1;
-        if (daily_zkt_reboot_should_attempt(&restart_slot)) {
+        if (temp_admin_evidence_ready() && !g_temp_admin_active && daily_zkt_reboot_should_attempt(&restart_slot)) {
             if (!add_connector_begin_exclusive_activity("SCHEDULED_RESTART")) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
@@ -9759,7 +9913,7 @@ static void gateway_task(void *arg)
         g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
         add_connector_set_zkt(&g_add_zkt);
         int daily_reboot_day = -1;
-        if (daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
+        if (temp_admin_evidence_ready() && !g_temp_admin_active && daily_zkt_reboot_should_attempt(&daily_reboot_day)) {
             if (daily_zkt_reboot_try_target(daily_zkt_reboot_target_ip(), daily_reboot_day)) {
                 discovery_failures = 0;
                 continue;
@@ -9900,6 +10054,7 @@ void app_main(void)
         return;
     }
     nvs_load_runtime_state();
+    temp_admin_load_lease_evidence();
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
         if (!g_storage_lock) g_storage_lock = xSemaphoreCreateMutex();
         if (!g_ords_http_lock) g_ords_http_lock = xSemaphoreCreateMutex();

@@ -3,13 +3,14 @@
 #include "zkt_journal_compat.h"
 #include "runtime_checkpoint.h"
 #include "zkt_catalog_store.h"
+#include "zkt_lease_store.h"
 
 #define ZJ_REQUEST_SLOTS 8U
 #define ZJ_LIVE_RESERVED_SLOTS 3U
 #define ZJ_PRIORITY_BURST 8U
 
 typedef enum { ZJ_APPEND, ZJ_SETTLE, ZJ_PEEK, ZJ_RECLAIM, ZJ_READER_CHECK, ZJ_OTA_CHECK,
-    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG } zj_operation_t;
+    ZJ_SELECT_READER, ZJ_RUNTIME_CHECKPOINT, ZJ_CATALOG, ZJ_LEASE } zj_operation_t;
 typedef struct {
     zj_operation_t operation;
     union {
@@ -32,6 +33,10 @@ typedef struct {
             runtime_checkpoint_t state;
             uint64_t deadline_us;
         } runtime_checkpoint;
+        struct {
+            zl_lease_record_t state;
+            uint64_t deadline_us;
+        } lease;
     } input;
 } zj_request_t;
 typedef struct {
@@ -43,6 +48,7 @@ typedef struct {
         zc_reply_t catalog;
     };
     runtime_checkpoint_t runtime_checkpoint;
+    zl_lease_record_t lease;
 } zj_reply_t;
 _Static_assert(sizeof(zc_request_t) <= sizeof(zj_observation_t), "Catalog requests must fit the existing bounded request envelope");
 _Static_assert(sizeof(zc_reply_t) <= sizeof(zj_item_t), "Catalog replies must fit the existing bounded reply envelope");

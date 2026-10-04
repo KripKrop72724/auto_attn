@@ -28,6 +28,9 @@ static size_t root_length, checkpoint_length;
 static runtime_checkpoint_t runtime_blob;
 static bool runtime_present;
 static unsigned runtime_writes;
+static zl_lease_record_t lease_blob;
+static unsigned lease_writes;
+static uint64_t lease_root;
 static ft_checkpoint_t catalog_checkpoint;
 const esp_app_desc_t *esp_app_get_description(void)
 {
@@ -115,6 +118,17 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
         memcpy(out, &catalog_checkpoint, sizeof(catalog_checkpoint)); return ESP_OK;
     }
     if (handle == 2) {
+        if (!strcmp(name, "lease_v2_root")) {
+            assert(*length == sizeof(lease_root));
+            if (!lease_root) return ESP_ERR_NVS_NOT_FOUND;
+            memcpy(out, &lease_root, sizeof(lease_root)); return ESP_OK;
+        }
+        if (!strcmp(name, "lease_v2")) {
+            assert(*length == sizeof(lease_blob));
+            if (!lease_blob.version) return ESP_ERR_NVS_NOT_FOUND;
+            memcpy(out, &lease_blob, sizeof(lease_blob));
+            return ESP_OK;
+        }
         assert(!strcmp(name, "runtime_v1") && *length == sizeof(runtime_blob));
         if (!runtime_present) return ESP_ERR_NVS_NOT_FOUND;
         memcpy(out, &runtime_blob, sizeof(runtime_blob));
@@ -138,6 +152,16 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
         memcpy(&catalog_checkpoint, bytes, length); return ESP_OK;
     }
     if (handle == 2) {
+        if (!strcmp(name, "lease_v2_root")) {
+            assert(length == sizeof(lease_root));
+            lease_root = *(const uint64_t *)bytes; return ESP_OK;
+        }
+        if (!strcmp(name, "lease_v2")) {
+            assert(length == sizeof(lease_blob));
+            lease_blob = *(const zl_lease_record_t *)bytes;
+            ++lease_writes;
+            return ESP_OK;
+        }
         assert(!strcmp(name, "runtime_v1") && length == sizeof(runtime_blob));
         runtime_blob = *(const runtime_checkpoint_t *)bytes;
         runtime_present = true;
@@ -522,6 +546,33 @@ int main(int argc, char **argv)
     assert(zj_runtime_checkpoint_save(&runtime, &confirmed));
     assert(runtime_writes == 1 && confirmed.source_cursor == 99 && confirmed.generation == 1);
     assert(zj_owner_health(&health));
+    zl_lease_record_t lease = {.version = ZL_LEASE_VERSION, .generation = 1,
+        .uid = 42, .active = 1, .expires_epoch = 1900000100, .terminal_serial = "TEST-LEASE"};
+    memset(lease.identity_fingerprint, 'a', 64);
+    zl_lease_checksum(&lease);
+    zj_request_t lease_request = {.operation = ZJ_LEASE,
+        .input.lease = {.state = lease, .deadline_us = (uint64_t)esp_timer_get_time() + 5000000U}};
+    assert(zj_owner_submit(&lease_request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_CORRUPT && !lease_writes); /* legacy active has no fingerprint */
+    runtime_blob.lease_active = 0;
+    runtime_blob.crc = dq_crc32(&runtime_blob, offsetof(runtime_checkpoint_t, crc));
+    assert(zj_owner_submit(&lease_request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_OK && lease_writes == 1);
+    runtime_blob.crc ^= 1;
+    lease_request.input.lease.state.generation = 2;
+    lease_request.input.lease.state.active = 0;
+    lease_request.input.lease.state.expires_epoch = 0;
+    zl_lease_checksum(&lease_request.input.lease.state);
+    assert(zj_owner_submit(&lease_request, &ticket));
+    reply = wait_reply(ticket);
+    assert(reply.result == ZJ_OK && !reply.lease.active && lease_writes == 2);
+    assert(!runtime_checkpoint_valid(&runtime_blob)); /* lease clear did not overwrite damaged source evidence */
+    runtime_blob = confirmed;
+    lease_blob.crc ^= 1;
+    assert(zj_owner_submit(&lease_request, &ticket));
+    assert(wait_reply(ticket).result == ZJ_CORRUPT && lease_writes == 2);
+    assert(zj_owner_health(&health) && health.ready && !strcmp(health.failed_operation, "lease_checkpoint"));
+    lease_blob.crc ^= 1;
     /* Real owner integration: optional refusal leaves attendance storage
      * usable; abandoned activation yields to live capture, then finishes
      * before any later catalog mutation or read can use the same paths. */
