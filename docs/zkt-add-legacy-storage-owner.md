@@ -43,7 +43,8 @@ both family modes and dispatch these copied operations on the actual owner
 thread, including refusal before startup and after quiescence.
 
 This change completes ADD flat-file ownership, not the release's complete
-legacy handoff or migration proof. Oracle/blocked flat files, per-item
+legacy handoff or migration proof. Subsequent owner adapters also cover
+Oracle/blocked flat files and retained quarantine generations. Per-item
 migration records, source-profile qualification, compatible signed images,
 ESP capacity/latency qualification and field acceptance remain open. Physical
 power interruption and endurance qualification are **NOT_PERFORMED**.

@@ -42,14 +42,15 @@ typedef struct { bool add_enabled; } zone_config_t;
 typedef enum { ENQUEUE_DUPLICATE, ENQUEUE_PENDING, ENQUEUE_BLOCKED,
     ENQUEUE_ACKNOWLEDGED, ENQUEUE_STORAGE_ERROR, ENQUEUE_RESOURCE_ERROR } enqueue_result_t;
 static int storage_mutex, *g_storage_lock = &storage_mutex;
-static bool lock_available, ack_available, send_available;
+static bool lock_available, ack_available, send_available, owner_required;
+static bool legacy_attendance_owner_required(void) { return owner_required; }
 static enqueue_result_t local_result;
-static int local_faults, blocked_faults, ack_attempts, sends;
+static int local_faults, blocked_faults, ack_attempts, sends, lock_attempts;
 static char last_log_code[80];
 static zone_config_t config = {.add_enabled = true};
 static const zone_config_t *zone_config_get(void) { return &config; }
 static int xSemaphoreTake(int *lock, unsigned timeout)
-{ (void)lock; (void)timeout; return lock_available ? pdTRUE : 0; }
+{ (void)lock; (void)timeout; ++lock_attempts;return lock_available ? pdTRUE : 0; }
 static void xSemaphoreGive(int *lock) { (void)lock; }
 static void led_status_fault(int fault)
 { if (fault == LED_STATUS_LOCAL_FAILURE) ++local_faults; else ++blocked_faults; }
@@ -65,7 +66,7 @@ static bool add_send_attendance_event(const attendance_event_t *event, const cha
 /* INSERT_PRODUCTION_FUNCTIONS */
 static void reset(void)
 {
-    g_storage_lock = &storage_mutex; lock_available = false;
+    g_storage_lock = &storage_mutex; lock_available = false;owner_required=false;lock_attempts=0;
     ack_available = false; send_available = false;
     local_result = ENQUEUE_PENDING; local_faults = blocked_faults = ack_attempts = sends = 0;
     last_log_code[0] = 0;
@@ -92,6 +93,8 @@ int main(void)
     reset(); ack_available = true;
     assert(enqueue_event(&event, "FULL_HISTORY") == ENQUEUE_STORAGE_ERROR);
     assert(local_faults == 1 && ack_attempts == 0);
+    reset();owner_required=true;g_storage_lock=NULL;
+    assert(enqueue_event(&event, "LIVE")==ENQUEUE_PENDING && !lock_attempts && sends==1 && !local_faults);
     puts("live outbox recovery regressions passed");
 }
 '''

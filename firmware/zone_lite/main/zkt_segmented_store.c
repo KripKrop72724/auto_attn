@@ -1,6 +1,11 @@
 #include "zkt_segmented_owner.h"
 #include <string.h>
 
+static zq_legacy_port_t *legacy_port(zq_store_t *s, unsigned domain)
+{
+    return domain == ZQ_ADD_LEGACY ? &s->legacy :
+        domain == ZQ_QUARANTINE ? &s->quarantine : &s->attendance;
+}
 static uint64_t transfer(zq_store_t *s)
 {
     /* Refuse exhaustion; an old copied request can never acquire a new buffer. */
@@ -55,8 +60,9 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
                  * Retrying complete caller bytes can replay an event, but
                  * cannot commit this transfer twice after a lost result. */
                 s->append_transfer = 0;
-                if (r->domain == ZQ_ADD_LEGACY) {
-                    out->result = s->legacy.append ? s->legacy.append(r->lane,
+                if (r->domain != ZQ_SEGMENTED) {
+                    zq_legacy_port_t *port = legacy_port(s, r->domain);
+                    out->result = port->append ? port->append(r->lane,
                         s->append_bytes, s->append_total, (qs_admission_t)r->policy) : DQ_IO;
                 } else out->result = qs_append_with_policy((qs_lane_t)r->lane,
                     s->append_bytes, s->append_total, (qs_admission_t)r->policy);
@@ -70,7 +76,7 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             memset(&s->legacy_read_token, 0, sizeof(s->legacy_read_token));
             size_t length = 0;
             if (r->domain != ZQ_SEGMENTED) {
-                zq_legacy_port_t *port = r->domain == ZQ_ADD_LEGACY ? &s->legacy : &s->quarantine;
+                zq_legacy_port_t *port = legacy_port(s, r->domain);
                 out->result = port->peek ? port->peek(r->lane, s->read_bytes,
                     sizeof(s->read_bytes), &length, &s->legacy_read_token) : DQ_IO;
             } else out->result = qs_peek((qs_lane_t)r->lane, s->read_bytes,
@@ -99,7 +105,7 @@ void zq_store_execute(zq_store_t *s, uint64_t now, const zq_request_t *r, zq_rep
             break;
         case ZQ_SETTLE:
             if (r->domain != ZQ_SEGMENTED) {
-                zq_legacy_port_t *port = r->domain == ZQ_ADD_LEGACY ? &s->legacy : &s->quarantine;
+                zq_legacy_port_t *port = legacy_port(s, r->domain);
                 out->result = port->settle ? port->settle(r->lane, &r->legacy_token, r->custody) : DQ_IO;
             }
             else out->result = qs_settle((qs_lane_t)r->lane, &r->token);

@@ -110,6 +110,7 @@ static bool add_connector_transfer_queue_evidence(
     ++evidence_requests;
     return !fail_evidence;
 }
+static bool legacy_attendance_owner_required(void) { return false; }
 /* INSERT_PRODUCTION_SEGMENTED */
 /* INSERT_PRODUCTION_DRAIN */
 

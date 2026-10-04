@@ -75,6 +75,7 @@
 #include "zkt_command_ids.h"
 #include "zkt_storage_owner.h"
 #include "zkt_quarantine_owner.h"
+#include "zkt_legacy_attendance.h"
 #endif
 #include "legacy_queue.h"
 #include "queue_store.h"
@@ -3014,10 +3015,25 @@ static bool seen_add(const char *uid)
 }
 
 static legacy_queue_t g_legacy_pending, g_legacy_blocked;
+static bool legacy_attendance_owner_required(void)
+{
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    return zj_runtime_checkpoint_required();
+#else
+    return false;
+#endif
+}
 
 static bool append_line_policy(const char *path, const char *line, qs_admission_t policy)
 {
     if (!path || !line) return false;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (legacy_attendance_owner_required()) {
+        if (strcmp(path, PENDING_PATH) && strcmp(path, BLOCKED_PATH)) return false;
+        return zol_append(!strcmp(path, PENDING_PATH) ? ZOL_PENDING : ZOL_BLOCKED,
+            line, strlen(line), policy) == DQ_OK;
+    }
+#endif
     if (storage_upgrade_segmented_writes() && (!strcmp(path, PENDING_PATH) || !strcmp(path, BLOCKED_PATH))) {
         return qs_append_with_policy(!strcmp(path, PENDING_PATH) ? QS_ORDS : QS_BLOCKED,
             line, strlen(line), policy) == DQ_OK;
@@ -3099,6 +3115,9 @@ static void load_seen_from_file(const char *path)
 
 static bool file_has_nonempty_line(const char *path)
 {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (legacy_attendance_owner_required() && !strcmp(path, PENDING_PATH)) return !zol_pending_verified_empty();
+#endif
     FILE *f = fopen(path, "r");
     if (f == NULL) {
         return false;
@@ -3186,18 +3205,27 @@ static bool settle_blocked_locked(const lq_token_t *token, bool custody)
 static bool recover_blocked_events_from_snapshot(const user_table_t *users, size_t *recovered_out)
 {
     if (recovered_out) *recovered_out = 0;
-    if (!users || !g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return false;
+    bool owned = legacy_attendance_owner_required();
+    if (!users || (!owned && (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE))) return false;
     char line[MAX_EVENT_JSON];
     lq_token_t token;
-    dq_result_t read = read_blocked_locked(line, sizeof(line), &token);
+    dq_result_t read;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (owned) {
+        size_t copied = 0;
+        read = zq_attendance_legacy_peek(ZOL_BLOCKED, line, sizeof(line) - 1, &copied, &token);
+        if (read == DQ_OK) line[copied] = 0;
+    } else
+#endif
+        read = read_blocked_locked(line, sizeof(line), &token);
     if (read != DQ_OK) {
-        xSemaphoreGive(g_storage_lock);
+        if (!owned) xSemaphoreGive(g_storage_lock);
         return read == DQ_EMPTY;
     }
     size_t length = token.end - token.offset;
     bool syntax_valid = !token.evidence_required && !memchr(line, 0, length) && rel_json_syntax_valid(line, length);
     cJSON *root = syntax_valid ? cJSON_Parse(line) : NULL;
-    if (syntax_valid && !root) { xSemaphoreGive(g_storage_lock); return false; }
+    if (syntax_valid && !root) { if (!owned) xSemaphoreGive(g_storage_lock); return false; }
     const cJSON *user_id = root ? cJSON_GetObjectItemCaseSensitive(root, "user_id") : NULL;
     const cJSON *uid = root ? cJSON_GetObjectItemCaseSensitive(root, "_terminal_uid") : NULL;
     const cJSON *serial = root ? cJSON_GetObjectItemCaseSensitive(root, "device_serial") : NULL;
@@ -3215,7 +3243,7 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
     if (!user || strlen(user->cnic) != 13 || strspn(user->cnic, "0123456789") != 13) {
         // Unresolved heads are independently transferred by the delivery worker;
         // no whole-file rewrite or size cutoff blocks unrelated capture.
-        cJSON_Delete(root); xSemaphoreGive(g_storage_lock); return true;
+        cJSON_Delete(root); if (!owned) xSemaphoreGive(g_storage_lock); return true;
     }
     cJSON_DeleteItemFromObjectCaseSensitive(root, "cnic");
     cJSON_DeleteItemFromObjectCaseSensitive(root, "employee_name");
@@ -3225,11 +3253,17 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
     char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
     ok = output && append_line(PENDING_PATH, output);
-    if (ok) ok = settle_blocked_locked(&token, false);
+    if (ok) {
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+        if (owned) ok = zq_attendance_legacy_settle(ZOL_BLOCKED, &token, false) == DQ_OK;
+        else
+#endif
+            ok = settle_blocked_locked(&token, false);
+    }
     free(output); cJSON_Delete(root);
     if (ok && recovered_out) *recovered_out = 1;
     if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
-    xSemaphoreGive(g_storage_lock);
+    if (!owned) xSemaphoreGive(g_storage_lock);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     return ok;
 }
@@ -3272,13 +3306,18 @@ static void storage_init(void)
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     if (g_queue_store_ready && !qs_verify_persistence()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #endif
-    bool generations_restored = restore_pending_backup_if_needed();
-    if (!restore_blocked_backup_if_needed()) generations_restored = false;
+    bool owned = legacy_attendance_owner_required();
+    bool generations_restored = owned || restore_pending_backup_if_needed();
+    if (!owned && !restore_blocked_backup_if_needed()) generations_restored = false;
     if (!generations_restored) led_status_fault(LED_STATUS_LOCAL_FAILURE);
-    load_seen_from_file(PENDING_PATH);
-    load_seen_from_file(BLOCKED_PATH);
-    load_seen_from_file(ACKED_PATH);
-    led_status_set_backlog(!generations_restored || file_has_nonempty_line(PENDING_PATH));
+    if (!owned) {
+        load_seen_from_file(PENDING_PATH);
+        load_seen_from_file(BLOCKED_PATH);
+        load_seen_from_file(ACKED_PATH);
+    }
+    /* Retained new-image generations recover on the owner. A volatile dedup
+     * cache is not custody; stable event IDs still make any replay safe. */
+    led_status_set_backlog(owned || !generations_restored || file_has_nonempty_line(PENDING_PATH));
     ESP_LOGI(TAG, "Storage ready; loaded %u known event UIDs", (unsigned)g_seen_cache.count);
 }
 
@@ -3705,7 +3744,8 @@ static enqueue_result_t enqueue_event_to_files(
 
 static enqueue_result_t enqueue_event(const attendance_event_t *event, const char *capturetype)
 {
-    if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    bool owned = legacy_attendance_owner_required();
+    if (!owned && (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE)) {
         ESP_LOGE(TAG, "Could not lock durable attendance outbox");
         bool storage_fault = !g_storage_lock;
         if (recover_live_event_after_storage_error(
@@ -3720,7 +3760,7 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
         return ENQUEUE_STORAGE_ERROR;
     }
     enqueue_result_t result = enqueue_event_to_files(event, capturetype);
-    xSemaphoreGive(g_storage_lock);
+    if (!owned) xSemaphoreGive(g_storage_lock);
     // ADD capacity waits and acknowledgement recovery must never own the local
     // storage lock. Local capture has already settled or explicitly failed.
     if (result == ENQUEUE_STORAGE_ERROR && recover_live_event_after_storage_error(
@@ -7245,6 +7285,9 @@ static bool g_legacy_probe_head;
 static bool g_ords_buffer_failed;
 static bool g_prefer_segmented_ords;
 static int64_t g_segmented_ords_retry_ms;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+static bool g_legacy_owner_progress;
+#endif
 
 /* Compatibility reader: one request per slice, with no storage mutex held
  * across transport or receipt delivery. New-format production remains gated. */
@@ -7284,10 +7327,12 @@ static bool oracle_drain_segmented_slice(void)
         settled = qs_generation(instance) && add_connector_transfer_queue_evidence(
             "ords", instance, record_id, event, length, NULL,
             delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED ? "IDENTITY_UNRESOLVED" : "MALFORMED");
-    } else if (quarantine && g_storage_lock &&
-               xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        settled = append_line(BLOCKED_PATH, quarantine);
-        xSemaphoreGive(g_storage_lock);
+    } else if (quarantine) {
+        if (legacy_attendance_owner_required()) settled = append_line(BLOCKED_PATH, quarantine);
+        else if (g_storage_lock && xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            settled = append_line(BLOCKED_PATH, quarantine);
+            xSemaphoreGive(g_storage_lock);
+        }
     }
     free(quarantine);
     if (settled && qs_settle(QS_ORDS, &token) != DQ_OK) {
@@ -7324,10 +7369,61 @@ static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoi
     return result == ESP_OK;
 }
 
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+/* Caller owns only the delivery-consumer gate. All file/NVS operations run on
+ * the storage task; neither a terminal nor filesystem lock crosses transport. */
+static void oracle_drain_owned_pending(void)
+{
+    g_legacy_owner_progress = false;
+    char *event = (char *)g_legacy_drain_buffer;
+    size_t length = 0;
+    lq_token_t token;
+    dq_result_t read = zq_attendance_legacy_peek(ZOL_PENDING, event, DQ_MAX_RECORD_BYTES, &length, &token);
+    if (read != DQ_OK) {
+        if (read == DQ_EMPTY) {
+            uint32_t depth = 0;
+            if (!oracle_drain_segmented_slice() && qs_snapshot(QS_ORDS, &depth) && !depth)
+                led_status_set_backlog(false);
+        } else if (read != DQ_PENDING) ords_drain_preserved_deferred("legacy-owner-read", EIO);
+        return;
+    }
+    event[length] = 0;
+    led_status_set_backlog(true);
+    add_connector_report_ords_worker(ADD_WORKER_NETWORK);
+    oracle_delivery_result_t delivery = token.evidence_required || memchr(event, 0, length)
+        ? ORACLE_DELIVERY_CORRUPT_LOCAL_ROW : oracle_send_live(event);
+    char *events[] = {event};
+    bool settled = delivery == ORACLE_DELIVERY_ACKED && add_enqueue_json_receipts(events, 1, "FIRMWARE_LIVE");
+    bool custody = delivery == ORACLE_DELIVERY_CORRUPT_LOCAL_ROW || delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED;
+    if (custody) {
+        char instance[33], generation[80], record_id[80];
+        bool identity = qs_generation(instance);
+        snprintf(generation, sizeof(generation), "%s-legacy-%lu", identity ? instance : "", (unsigned long)token.generation);
+        snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)token.offset, (unsigned long)token.crc);
+        settled = identity && add_connector_transfer_queue_evidence("ords_legacy", generation, record_id,
+            event, length, NULL, delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED ? "IDENTITY_UNRESOLVED" : "MALFORMED");
+    }
+    char *quarantine = delivery == ORACLE_DELIVERY_PERMANENT_REJECTION ? oracle_mark_permanent_rejection(event) : NULL;
+    add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
+    if (quarantine) settled = append_line(BLOCKED_PATH, quarantine);
+    free(quarantine);
+    if (!settled) return;
+    dq_result_t committed = zq_attendance_legacy_settle(ZOL_PENDING, &token, custody);
+    if (committed == DQ_OK) {
+        g_ords_drain_retry_not_before_ms = 0;
+        g_legacy_owner_progress = true;
+    }
+    else if (committed != DQ_PENDING) ords_drain_preserved_deferred("legacy-owner-commit", EIO);
+}
+#endif
+
 static void oracle_drain_pending(bool live_first)
 {
     static int64_t last_slow_lock_log_ms;
     (void)live_first;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    g_legacy_owner_progress = false;
+#endif
     int64_t now_ms = uptime_ms();
     if (truth_ords_gate_priority_active(now_ms) ||
         g_ords_drain_retry_not_before_ms > now_ms || !ords_send_allowed()) return;
@@ -7350,6 +7446,13 @@ static void oracle_drain_pending(bool live_first)
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    if (legacy_attendance_owner_required()) {
+        oracle_drain_owned_pending();
+        xSemaphoreGive(g_ords_outbox_gate);
+        return;
+    }
+#endif
     if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         xSemaphoreGive(g_ords_outbox_gate);
         return;
@@ -7490,10 +7593,17 @@ static void blocked_evidence_slice(void)
     dq_result_t read = segmented ? qs_peek(QS_BLOCKED, line, DQ_MAX_RECORD_BYTES, &length, &segmented_token) : DQ_EMPTY;
     if (read == DQ_EMPTY) {
         segmented = false;
-        if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
-        read = read_blocked_locked(line, DQ_MAX_RECORD_BYTES + 1, &legacy_token);
-        if (read == DQ_OK) length = legacy_token.end - legacy_token.offset;
-        xSemaphoreGive(g_storage_lock);
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+        if (legacy_attendance_owner_required())
+            read = zq_attendance_legacy_peek(ZOL_BLOCKED, line, DQ_MAX_RECORD_BYTES, &length, &legacy_token);
+        else
+#endif
+        {
+            if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+            read = read_blocked_locked(line, DQ_MAX_RECORD_BYTES + 1, &legacy_token);
+            if (read == DQ_OK) length = legacy_token.end - legacy_token.offset;
+            xSemaphoreGive(g_storage_lock);
+        }
     }
     if (read != DQ_OK) {
         if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -7519,6 +7629,10 @@ static void blocked_evidence_slice(void)
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (preserved) {
         if (segmented) preserved = qs_settle(QS_BLOCKED, &segmented_token) == DQ_OK;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+        else if (legacy_attendance_owner_required())
+            preserved = zq_attendance_legacy_settle(ZOL_BLOCKED, &legacy_token, true) == DQ_OK;
+#endif
         else if (xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
             preserved = settle_blocked_locked(&legacy_token, true);
             xSemaphoreGive(g_storage_lock);
@@ -7652,12 +7766,21 @@ static void ords_uploader_task(void *arg)
     (void)arg;
     while (true) {
         add_connector_report_ords_worker(g_ords_buffer_failed ? ADD_WORKER_RESOURCE : ADD_WORKER_IDLE);
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+        g_legacy_owner_progress = false;
+#endif
         if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
             oracle_drain_pending(true);
             blocked_evidence_slice();
             legacy_quarantine_slice();
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        unsigned pause_ms = 2000;
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+        /* One completed row per owner slice. Shorten only the successful
+         * drain interval; refusals/outages retain the existing retry cadence. */
+        if (legacy_attendance_owner_required() && g_legacy_owner_progress) pause_ms = 100;
+#endif
+        vTaskDelay(pdMS_TO_TICKS(pause_ms));
     }
 }
 

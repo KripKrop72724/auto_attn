@@ -119,12 +119,16 @@ dq_result_t zq_append(qs_lane_t lane, const void *data, size_t length, qs_admiss
 { return append(ZQ_SEGMENTED, (unsigned)lane, data, length, policy); }
 dq_result_t zq_legacy_append(unsigned lane, const void *data, size_t length, qs_admission_t policy)
 { return append(ZQ_ADD_LEGACY, lane, data, length, policy); }
+dq_result_t zq_attendance_legacy_append(unsigned lane, const void *data, size_t length, qs_admission_t policy)
+{ return append(ZQ_ATTENDANCE_LEGACY, lane, data, length, policy); }
 dq_result_t zq_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token)
 { return peek(ZQ_SEGMENTED, (unsigned)lane, data, capacity, length, token, NULL); }
 dq_result_t zq_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token)
 { return peek(ZQ_ADD_LEGACY, lane, data, capacity, length, NULL, token); }
 dq_result_t zq_evidence_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token)
 { return peek(ZQ_QUARANTINE, lane, data, capacity, length, NULL, token); }
+dq_result_t zq_attendance_legacy_peek(unsigned lane, void *data, size_t capacity, size_t *length, lq_token_t *token)
+{ return peek(ZQ_ATTENDANCE_LEGACY, lane, data, capacity, length, NULL, token); }
 static dq_result_t simple(zq_request_t *in, zq_reply_t *out)
 {
     client_t *client = &clients[2];
@@ -152,6 +156,14 @@ dq_result_t zq_evidence_settle(unsigned lane, const lq_token_t *token)
     if (lane >= 3 || !token || token->end <= token->offset) return DQ_IO;
     zq_request_t in = {.operation = ZQ_SETTLE, .lane = (uint8_t)lane, .domain = ZQ_QUARANTINE,
         .legacy_token = *token, .custody = true};
+    zq_reply_t out;
+    return simple(&in, &out);
+}
+dq_result_t zq_attendance_legacy_settle(unsigned lane, const lq_token_t *token, bool custody)
+{
+    if (lane >= 2 || !token || token->end <= token->offset) return DQ_IO;
+    zq_request_t in = {.operation = ZQ_SETTLE, .lane = (uint8_t)lane, .domain = ZQ_ATTENDANCE_LEGACY,
+        .legacy_token = *token, .custody = custody};
     zq_reply_t out;
     return simple(&in, &out);
 }

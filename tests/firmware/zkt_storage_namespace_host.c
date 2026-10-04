@@ -1,5 +1,6 @@
 #include "zone_storage_paths.h"
 #include "zkt_storage_owner.h"
+#include "zkt_legacy_attendance.h"
 #include "uid_cache.h"
 #include <assert.h>
 #include <stdlib.h>
@@ -23,7 +24,8 @@ static uint8_t g_seen_occupied[SEEN_UID_CAPACITY];
 static uid_cache_t g_seen_cache;
 static char mounted[64], journal_prefix[128];
 static unsigned legacy_reads;
-static bool pending_restored = true, blocked_restored = true, backlog;
+static bool pending_restored = true, blocked_restored = true, backlog, owner_required;
+static bool legacy_attendance_owner_required(void) { return owner_required; }
 static unsigned storage_faults;
 static int xSemaphoreCreateMutex(void) { return 1; }
 static void *heap_caps_calloc(size_t count, size_t bytes, unsigned flags)
@@ -60,6 +62,9 @@ int main(void)
     const char *paths[] = {PENDING_PATH, BLOCKED_PATH, ACKED_PATH, ZC_ACTIVE_PATH,
         ZC_COMMAND_ACTIVE_PATH, ZI_PROCESSED_PATH, ZI_CANCELLED_PATH};
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) assert(in_mount(paths[i]));
+    assert(!strcmp(PENDING_PATH,ZOL_PENDING_PATH) && !strcmp(BLOCKED_PATH,ZOL_BLOCKED_PATH));
+    assert(!strcmp(PENDING_BACKUP_PATH,ZOL_PENDING_BACKUP_PATH) && !strcmp(PENDING_TMP_PATH,ZOL_PENDING_TEMP_PATH));
+    assert(!strcmp(BLOCKED_RECOVERY_BACKUP_PATH,ZOL_BLOCKED_BACKUP_PATH) && !strcmp(BLOCKED_RECOVERY_TMP_PATH,ZOL_BLOCKED_TEMP_PATH));
     free(g_seen_cache.keys);
     pending_restored = false;
     storage_init();
@@ -68,5 +73,10 @@ int main(void)
     pending_restored = true; blocked_restored = false;
     storage_init();
     assert(backlog && storage_faults == 2);
+    free(g_seen_cache.keys);
+    owner_required=true;
+    unsigned before=legacy_reads;
+    storage_init();
+    assert(backlog && storage_faults==2 && legacy_reads==before);
     free(g_seen_cache.keys);
 }
