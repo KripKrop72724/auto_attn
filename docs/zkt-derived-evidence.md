@@ -89,8 +89,15 @@ against a fresh database in an explicitly named local PostgreSQL container. Its
 default load is 17 synthetic connectors, ten single-item envelopes per second
 each, for 900 seconds. It uses 2,048 synthetic user references per connector,
 replays a committed response every 97 observations, and restarts the inspector
-object every five minutes. The runner has a hard intake interval and separate
-bounded drain interval; unsent observations fail the offered-load gate. It saves
+object every five minutes. An independent emitter generates inputs during a
+hard 900-second window, using a bounded 150-item queue per connector. Receipt
+waits and response replays cannot stop source arrivals. Queue refusal, missed
+input, emission lag exceeding one 100-ms interval, or an incomplete input set
+fails the offered-load gate. Already offered inputs have up to 15 seconds after
+the window for receipt processing; that grace never creates more inputs or
+changes their original scheduled time. Scheduled-input-to-commit latency includes
+queueing, and the existing p95/p99 limits remain unchanged. Inspection then has
+its own bounded drain interval. The runner saves
 progress atomically, including failures, handler latency, scheduled-input-to-commit
 latency, database counts and replay counts. Its database is removed after the
 final report; a still-running worker prevents removal. Use a new output path for

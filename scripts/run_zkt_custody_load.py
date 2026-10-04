@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
 import resource
 import signal
@@ -27,6 +28,55 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 SITES, RATE = 17, 10
+DELIVERY_GRACE_SECONDS = 15
+
+
+class BurstInputs:
+    """Bounded source arrivals independent of receipt/replay latency.
+
+    The grace period belongs to receipt processing, never input generation.
+    A full input queue, missed deadline or uncommitted item fails qualification.
+    These RAM queues model only a test source, not ESP durable preservation.
+    """
+
+    def __init__(self, sites: int, rate: int, seconds: int, *, capacity: int):
+        if min(sites, rate, seconds, capacity) < 1:
+            raise ValueError("Positive bounded input dimensions required")
+        self.queues = [Queue(maxsize=capacity) for _ in range(sites)]
+        self.rate, self.seconds, self.capacity = rate, seconds, capacity
+        self.done, self.lock = Event(), Lock()
+        self.offered = self.refused = 0
+        self.last_offer_elapsed_s = self.max_emitter_lag_ms = 0.0
+
+    def emit(self, start: float, stop: Event, *, now=time.monotonic, wait=None):
+        pause = wait or stop.wait
+        try:
+            for sequence in range(1, self.rate * self.seconds + 1):
+                due = start + (sequence - 1) / self.rate
+                pause(max(0, due - now()))
+                for queue in self.queues:
+                    instant = now()
+                    if stop.is_set() or instant >= start + self.seconds:
+                        return
+                    with self.lock:
+                        self.max_emitter_lag_ms = max(self.max_emitter_lag_ms, (instant - due) * 1000)
+                        try:
+                            queue.put_nowait((sequence, due))
+                        except Full:
+                            self.refused += 1
+                        else:
+                            self.offered += 1
+                            self.last_offer_elapsed_s = instant - start
+        finally:
+            self.done.set()
+
+    def snapshot(self):
+        with self.lock:
+            return dict(offered=self.offered, input_refusals=self.refused,
+                        input_generation_complete=self.done.is_set(),
+                        input_queue_capacity_per_site=self.capacity,
+                        last_offer_elapsed_s=round(self.last_offer_elapsed_s, 3),
+                        max_emitter_lag_ms=round(self.max_emitter_lag_ms, 3))
 
 
 def quantiles(values):
@@ -98,9 +148,10 @@ def main() -> int:
 
     lock, stop_intake, stop_worker = Lock(), Event(), Event()
     barrier = Barrier(SITES + 1)
-    metrics = dict(committed=0, replays=0, errors=0, interrupted=False)
+    metrics = dict(committed=0, replays=0, errors=0, interrupted=False, last_commit_elapsed_s=0.0)
     service_ms, scheduled_ms, lag_ms, errors, samples, restarts = [], [], [], [], [], []
     processor = CustodyProcessor()
+    inputs = BurstInputs(SITES, RATE, args.seconds, capacity=RATE * DELIVERY_GRACE_SECONDS)
     start = 0.0
     expected = SITES * RATE * args.seconds
     base_time = datetime.now(timezone.utc)
@@ -109,6 +160,7 @@ def main() -> int:
                    backend_diff_sha256=hashlib.sha256(diff).hexdigest() if diff else None,
                    harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                    sites=SITES, rate_per_site=RATE, requested_duration_s=args.seconds,
+                   receipt_grace_seconds=DELIVERY_GRACE_SECONDS,
                    expected=expected, database_name=name)
 
     def save(value):
@@ -124,10 +176,13 @@ def main() -> int:
 
     def snapshot(state):
         with lock:
-            return dict(state=state, elapsed_s=round(time.monotonic()-start, 3), **metrics,
-                        unsent_or_failed=expected-metrics["committed"], error_samples=list(errors),
-                        handler_latency_ms=quantiles(service_ms), scheduled_commit_latency_ms=quantiles(scheduled_ms),
-                        producer_lag_ms=quantiles(lag_ms), processor=processor.snapshot())
+            counters = dict(metrics)
+            durations, scheduled, lag = list(service_ms), list(scheduled_ms), list(lag_ms)
+            failures = list(errors)
+        return dict(state=state, elapsed_s=round(time.monotonic()-start, 3), **counters, **inputs.snapshot(),
+                    unsent_or_failed=expected-counters["committed"], error_samples=failures,
+                    handler_latency_ms=quantiles(durations), scheduled_commit_latency_ms=quantiles(scheduled),
+                    producer_lag_ms=quantiles(lag), processor=processor.snapshot())
 
     def interrupt(signum, frame):
         metrics["interrupted"] = True
@@ -139,11 +194,16 @@ def main() -> int:
     def send(site):
         pk, serial, epoch, index = site
         barrier.wait()
-        for sequence in range(1, RATE * args.seconds + 1):
-            due = start + (sequence-1)/RATE
-            stop_intake.wait(max(0, due-time.monotonic()))
-            if stop_intake.is_set() or time.monotonic() >= start + args.seconds:
+        incoming = inputs.queues[index]
+        while not stop_intake.is_set():
+            if time.monotonic() >= start + args.seconds + DELIVERY_GRACE_SECONDS:
                 break
+            try:
+                sequence, due = incoming.get(timeout=0.1)
+            except Empty:
+                if inputs.done.is_set():
+                    break
+                continue
             began = time.monotonic()
             captured = base_time + timedelta(seconds=(sequence-1)/RATE)
             local = captured + timedelta(hours=5)
@@ -165,6 +225,7 @@ def main() -> int:
                 finished = time.monotonic()
                 with lock:
                     metrics["committed"] += 1
+                    metrics["last_commit_elapsed_s"] = max(metrics["last_commit_elapsed_s"], finished-start)
                     service_ms.append((finished-began)*1000)
                     scheduled_ms.append((finished-due)*1000)
                     lag_ms.append((began-due)*1000)
@@ -178,6 +239,8 @@ def main() -> int:
                     metrics["errors"] += 1
                     if len(errors) < 20:
                         errors.append(dict(site=index, sequence=sequence, type=type(exc).__name__))
+            finally:
+                incoming.task_done()
 
     def inspect():
         nonlocal processor
@@ -194,7 +257,7 @@ def main() -> int:
         return subprocess.run(["docker", "exec", args.postgres_container, *command],
                               check=True, capture_output=True)
 
-    created, worker = False, None
+    created, worker, emitter = False, None, None
     try:
         docker("createdb", "-U", args.postgres_user, "--template=template0", name)
         created = True
@@ -219,7 +282,10 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=SITES) as executor:
             futures = [executor.submit(send, site) for site in sites]
             start = time.monotonic()
+            base_time = datetime.now(timezone.utc)
             barrier.wait()
+            emitter = Thread(target=inputs.emit, args=(start, stop_intake), daemon=True)
+            emitter.start()
             save(snapshot("RUNNING"))
             while not all(future.done() for future in futures):
                 time.sleep(min(30, max(1, start+args.seconds-time.monotonic())))
@@ -229,7 +295,10 @@ def main() -> int:
                 print(json.dumps({key: sample[key] for key in ("elapsed_s", "committed", "replays", "errors")}), flush=True)
             for future in futures:
                 future.result()
-        intake_elapsed = time.monotonic()-start
+        emitter.join(timeout=1)
+        if emitter.is_alive():
+            raise RuntimeError("INPUT_EMITTER_DID_NOT_STOP")
+        delivery_elapsed = time.monotonic()-start
         deadline = time.monotonic()+args.drain_seconds
         while time.monotonic() < deadline and not metrics["interrupted"]:
             with database.session_scope() as db:
@@ -248,7 +317,10 @@ def main() -> int:
             states = dict(db.execute(select(ZktCustodyWork.state, func.count()).group_by(ZktCustodyWork.state)).all())
             interpretations = dict(db.execute(select(ZktDerivedEvidence.result, func.count()).group_by(ZktDerivedEvidence.result)).all())
             pending = db.scalar(select(func.count()).select_from(ZktCustodyWork).where(ZktCustodyWork.next_attempt_at.is_not(None)))
-        result = {**snapshot("COMPLETE"), "intake_elapsed_s": round(intake_elapsed, 3), "totals": totals,
+        result = {**snapshot("COMPLETE"), "delivery_elapsed_s": round(delivery_elapsed, 3), "totals": totals,
+                  "unoffered_inputs": expected-inputs.offered-inputs.refused,
+                  "uncommitted_offered_inputs": inputs.offered-metrics["committed"],
+                  "pending_input_queue_depths": [queue.qsize() for queue in inputs.queues],
                   "per_synthetic_site": per_site, "work_states": states, "pending_after_drain": pending,
                   "interpretation_results": interpretations,
                   "samples": samples, "prior_processors": restarts,
@@ -256,9 +328,13 @@ def main() -> int:
         result["committed_custody_accounted"] = (
             totals["add_zkt_observation_receipts"] == totals["add_zkt_custody_work"] == metrics["committed"])
         result["offered_load_passed"] = (not metrics["interrupted"] and not metrics["errors"]
+            and inputs.offered == expected and not inputs.refused
+            and inputs.last_offer_elapsed_s < args.seconds
+            and inputs.max_emitter_lag_ms <= 1000 / RATE
             and metrics["committed"] == expected and len(per_site) == SITES
             and all(count == RATE*args.seconds for count in per_site.values()))
         result["component_passed"] = (result["committed_custody_accounted"] and result["offered_load_passed"]
+            and metrics["last_commit_elapsed_s"] <= args.seconds + DELIVERY_GRACE_SECONDS
             and not pending and not totals["add_attendance_events"] and not totals["add_ords_outbox"]
             and states == {"WAIT_PROFILE": expected} and interpretations == {"UNQUALIFIED_FACTS": expected}
             and result["scheduled_commit_latency_ms"]["p95"] <= 5000
@@ -274,6 +350,8 @@ def main() -> int:
     finally:
         stop_intake.set()
         stop_worker.set()
+        if emitter is not None:
+            emitter.join(timeout=1)
         if worker is not None:
             worker.join(timeout=45)
         database.engine.dispose()
