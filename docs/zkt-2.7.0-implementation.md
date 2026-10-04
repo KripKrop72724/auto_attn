@@ -138,7 +138,13 @@ Wire envelopes map to canonical `device`, `users`, `attendance`, `command` and
 unchanged. Cursors combine a server-generation UUID and monotonically increasing
 sequence. Every connection and subscriber overflow requests `resync`; periodic
 named keepalives measure transport liveness only. Clients also fetch snapshots
-every 30 seconds and on focus/visibility recovery. `snapshot_at` orders shared
+every 30 seconds and on focus/visibility recovery. Those checks also replace
+permanently closed browser streams after at least 30 seconds since the last
+attempt, or open/connecting streams after at least 60 seconds without activity.
+Replacement attempts stay at least 30 seconds apart, do not
+refresh the last-activity evidence, and fence callbacks from older connections.
+Polling continues if EventSource is unavailable or cannot be constructed.
+`snapshot_at` orders shared
 fleet/detail snapshots; `firmware_diagnostics_at` is telemetry receipt time,
 `sampled_at` is device sampling time, and `boot_id` binds health to a boot.
 

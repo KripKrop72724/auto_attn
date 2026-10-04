@@ -49,15 +49,16 @@ export function useRealtime(
 
   useEffect(() => {
     if (!enabled) return
+    let active = true
     let lastSuccess = Date.now()
+    let lastAttempt = lastSuccess
     let flushTimer = 0
-    let staleTimer = 0
+    let stream: EventSource | null = null
     const pending = new Set<RealtimeTopic>()
-    const stream = typeof EventSource === 'undefined' ? null : new EventSource('/events/v1/stream', { withCredentials: true })
 
     const flush = () => {
       flushTimer = 0
-      if (!pending.size) return
+      if (!active || !pending.size) return
       callbackRef.current(new Set(pending))
       pending.clear()
     }
@@ -65,41 +66,63 @@ export function useRealtime(
       pending.add(topic)
       if (!flushTimer) flushTimer = window.setTimeout(flush, 120)
     }
-    const markHealthy = () => {
-      lastSuccess = Date.now()
-      setLastSyncAt(new Date(lastSuccess))
-      setState('live')
+    const connect = () => {
+      lastAttempt = Date.now()
+      stream?.close()
+      stream = null
+      if (typeof EventSource === 'undefined') return
+      try {
+        const candidate = new EventSource('/events/v1/stream', { withCredentials: true })
+        stream = candidate
+        const markHealthy = (topic?: RealtimeTopic) => {
+          // A closed stream can still have queued callbacks. Only the current
+          // connection may update transport evidence or schedule a refresh.
+          if (!active || stream !== candidate) return
+          lastSuccess = Date.now()
+          setLastSyncAt(new Date(lastSuccess))
+          setState('live')
+          if (topic) enqueue(topic)
+        }
+        candidate.onopen = () => markHealthy('resync')
+        candidate.onmessage = () => markHealthy('resync')
+        serverEvents.forEach((eventName) => {
+          candidate.addEventListener(eventName, () => markHealthy(normalizeTopic(eventName)))
+        })
+        candidate.addEventListener('keepalive', () => markHealthy())
+        candidate.onerror = () => {
+          if (!active || stream !== candidate) return
+          setState(Date.now() - lastSuccess >= 30_000 ? 'stale' : 'reconnecting')
+        }
+      } catch {
+        // A browser that cannot construct EventSource must retain the polling
+        // fallback. Retry on the same bounded schedule as a closed connection.
+        setState('stale')
+      }
     }
-
+    const resync = () => {
+      const now = Date.now()
+      if (now - lastSuccess >= 30_000) setState('stale')
+      enqueue('resync')
+      // Native EventSource retries transient errors. Replace a permanently
+      // CLOSED connection after 30 s, or a silent OPEN/CONNECTING one after
+      // 60 s. Focus events cannot create a rapid reconnect loop.
+      if (now - lastAttempt < 30_000) return
+      if (!stream || stream.readyState === EventSource.CLOSED || now - Math.max(lastSuccess, lastAttempt) >= 60_000) connect()
+    }
     setState('connecting')
-    if (stream) stream.onopen = () => {
-      markHealthy()
-      enqueue('resync')
-    }
-    if (stream) stream.onmessage = () => {
-      markHealthy()
-      enqueue('resync')
-    }
-    serverEvents.forEach((eventName) => {
-      stream?.addEventListener(eventName, () => {
-        markHealthy()
-        enqueue(normalizeTopic(eventName))
-      })
-    })
-    stream?.addEventListener('keepalive', markHealthy)
-    if (stream) stream.onerror = () => setState(Date.now() - lastSuccess > 30_000 ? 'stale' : 'reconnecting')
-    const resync = () => enqueue('resync')
+    setLastSyncAt(null)
+    connect()
     const onVisible = () => { if (document.visibilityState === 'visible') resync() }
     window.addEventListener('focus', resync)
     document.addEventListener('visibilitychange', onVisible)
-    staleTimer = window.setInterval(() => {
+    const staleTimer = window.setInterval(() => {
       // OPEN alone cannot prove a functioning stream. Poll even when OPEN;
       // this also works with old servers that send invisible comment pings.
-      if (Date.now() - lastSuccess >= 30_000) setState('stale')
-      enqueue('resync')
+      resync()
     }, 30_000)
 
     return () => {
+      active = false
       stream?.close()
       window.removeEventListener('focus', resync)
       document.removeEventListener('visibilitychange', onVisible)
