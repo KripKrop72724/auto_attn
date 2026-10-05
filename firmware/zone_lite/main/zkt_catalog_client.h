@@ -13,6 +13,14 @@ typedef struct {
     uint8_t pending_operation;
     bool active_may_have_changed;
     bool commands;
+    /* The two production clients have static lifetime and independent caller
+     * locks. Reuse their bounded message storage instead of nesting several
+     * kilobytes of request/reply frames on the 4 KiB startup supervisor. The
+     * owner copies a request before submit returns, so polling may reuse it. */
+    union {
+        zj_request_t request;
+        zj_reply_t reply;
+    } scratch;
 } zc_client_t;
 
 /* Serialized by the catalog or command caller's lock, never the mailbox lock.
