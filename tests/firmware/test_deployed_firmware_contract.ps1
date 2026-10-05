@@ -3,6 +3,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('firmware-admission-' + [guid]::Ne
 $check = Join-Path $PSScriptRoot '../../deploy/add/check-deployed-firmware-contract.ps1'
 $global:admissionTestCalls = New-Object System.Collections.ArrayList
 $global:admissionTestScenario = ''
+$previousExitCode = $global:LASTEXITCODE
 function docker {
     $arguments = @($args)
     [void]$global:admissionTestCalls.Add($arguments)
@@ -50,4 +51,7 @@ try {
     Remove-Item -LiteralPath $root -Recurse -Force
     Remove-Item Function:docker
     Remove-Variable -Name admissionTestCalls,admissionTestScenario -Scope Global
+    # Failure scenarios deliberately set the native-command exit status. Do
+    # not leak a mocked failure into GitHub's shell wrapper after tests pass.
+    $global:LASTEXITCODE = $previousExitCode
 }
