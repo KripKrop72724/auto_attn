@@ -217,6 +217,11 @@ jobs:
 
   publish-hil:
     needs: [provenance, sign]
+    # Admission and publication must observe one deployed backend. Share the
+    # production deployment lock so a backend replacement cannot race them.
+    concurrency:
+      group: add-production
+      cancel-in-progress: false
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-production
     steps:
@@ -229,6 +234,9 @@ jobs:
         with:
           name: zone-lite-${{ inputs.version }}-hil-only
           path: firmware-release
+      - name: Verify the deployed ADD admits this signed contract
+        shell: powershell
+        run: ./deploy/add/check-deployed-firmware-contract.ps1 -SourceDirectory firmware-release
       - name: Atomically publish for the exact HIL scope
         shell: powershell
         env:
