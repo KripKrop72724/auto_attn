@@ -78,6 +78,7 @@
 #include "zkt_legacy_attendance.h"
 #endif
 #include "legacy_queue.h"
+#include "zkt_source_schedule.h"
 #include "queue_store.h"
 #include "firmware_family.h"
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
@@ -566,6 +567,8 @@ static bool zkt_source_epoch_required(void)
 }
 static bool g_add_source_coverage_certified;
 static uint32_t g_add_source_coverage_cursor;
+/* Keep source retry deadlines across terminal-session reconnects. */
+static zts_schedule_t g_journal_tail_schedule;
 static uint32_t g_add_source_coverage_generation;
 static char g_add_source_coverage_chain[65] =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -8744,6 +8747,31 @@ static bool process_add_commands(
     return false;
 }
 
+static bool process_add_source_tail_step(int sock, zk_context_t *ctx, const user_table_t *users, bool *more)
+{
+    int32_t audit_users = 0, audit_records = 0;
+    if (more) *more = false;
+    if (!zk_get_counts(sock, ctx, &audit_users, &audit_records) || audit_records < 0) return false;
+    /* A failed count request is unknown, not a source-count regression to
+     * zero. Keep the last observed count until a new valid response exists. */
+    g_add_zkt.attendance_count = audit_records;
+    return process_add_incremental_tail(sock, ctx, users, audit_records, more);
+}
+
+static bool zkt_source_tail_due(const zts_schedule_t *schedule, int64_t now, int64_t last_reconcile)
+{
+    if (now < 0 || !g_add_source_coverage_certified) return false;
+    if (zkt_legacy_capture_allowed())
+        return now - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
+            now - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS;
+#if defined(ZONE_LITE_JOURNAL_WRITES) && ZONE_LITE_JOURNAL_WRITES && !defined(ZONE_LITE_HIKVISION)
+    return zts_due(schedule, (uint64_t)now, zj_runtime_writer_ready(), add_connector_is_connected());
+#else
+    (void)schedule;
+    return false;
+#endif
+}
+
 static int64_t gateway_run_session(uint32_t host_order_ip);
 
 static int64_t gateway_run(uint32_t host_order_ip)
@@ -9083,26 +9111,17 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
 
         bool add_source_job_active = g_add_source_assignment_seen_ms > 0 &&
             now_ms - g_add_source_assignment_seen_ms < 30 * 60 * 1000;
-        if (g_add_source_coverage_certified &&
-            now_ms - last_reconcile >= ZONE_LITE_RECONCILE_INTERVAL_MS &&
-            now_ms - g_session_stable_since_ms >= ZONE_LITE_RECOVERY_STABILITY_MS) {
+        if (zkt_source_tail_due(&g_journal_tail_schedule, now_ms, last_reconcile)) {
             if (!add_connector_begin_exclusive_activity("CURRENT_TAIL_AUDIT")) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            int32_t audit_users = 0;
-            int32_t audit_records = 0;
             bool more = false;
-            bool audit_ok = zk_get_counts(sock, &ctx, &audit_users, &audit_records) &&
-                process_add_incremental_tail(
-                    sock,
-                    &ctx,
-                    users,
-                    audit_records,
-                    &more);
+            bool audit_ok = process_add_source_tail_step(sock, &ctx, users, &more);
             if (audit_ok && !more) g_add_zkt.last_tail_audit_uptime_ms = uptime_ms();
-            g_add_zkt.attendance_count = audit_records;
             add_connector_set_zkt(&g_add_zkt);
+            if (!zkt_legacy_capture_allowed())
+                zts_completed(&g_journal_tail_schedule, (uint64_t)uptime_ms(), audit_ok, esp_random());
             last_reconcile = more
                 ? uptime_ms() - ZONE_LITE_RECONCILE_INTERVAL_MS + 5000
                 : uptime_ms();
