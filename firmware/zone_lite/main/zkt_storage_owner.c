@@ -534,6 +534,7 @@ static void task(void *context)
         if (!o->health.ready || o->health.checkpoint_recovery_pending)
             zq_inventory_invalidate(&o->legacy_inventory);
         o->health.legacy_append_pending = o->segmented.append_transfer != 0;
+        o->health.legacy_read_pending = o->segmented.read_transfer != 0;
         o->health.legacy_empty_mask = o->legacy_inventory.empty_mask;
         o->health.legacy_required_mask = ZQ_INVENTORY_REQUIRED;
         o->health.legacy_inventory_generation = o->legacy_inventory.generation;

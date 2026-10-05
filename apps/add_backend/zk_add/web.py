@@ -2053,6 +2053,44 @@ def zkt_custody_status(
     result["processor"] = custody_processor.snapshot()
     from zk_add.zkt_handoff import boundary_status
     result["source_boundary"] = boundary_status(db, connector)
+    from zk_add.zkt_handoff_commit import handoff_status
+    result["legacy_handoff"] = handoff_status(db, connector)
+    return result
+
+
+from pydantic import BaseModel, Field  # noqa: E402
+
+
+class ZktHandoffIn(BaseModel):
+    release_id: str = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+@app.post("/api/v1/devices/{connector_id}/zkt-custody/enable")
+def enable_zkt_custody(connector_id: str, body: ZktHandoffIn,
+                       auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
+    from zk_add.zkt_handoff_commit import enable_custody
+    db, context = auth
+    try:
+        result = enable_custody(db, connector_id, release_id=body.release_id,
+                               actor=context.username, idempotency_key=body.idempotency_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/devices/{connector_id}/zkt-custody/handoff")
+def commit_zkt_handoff(connector_id: str, body: ZktHandoffIn,
+                       auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
+    from zk_add.zkt_handoff_commit import commit_handoff
+    db, context = auth
+    try:
+        result = commit_handoff(db, connector_id, release_id=body.release_id,
+                               actor=context.username, idempotency_key=body.idempotency_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
     return result
 
 

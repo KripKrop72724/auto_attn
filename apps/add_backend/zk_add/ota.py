@@ -302,7 +302,7 @@ def _is_2615_bld5_extension(release: FirmwareRelease, targets: list[HilTarget]) 
 
 
 def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
-    if identity[:2] == ("zone-lite-2.6.16", "2.6.16"):
+    if identity[:2] in {("zone-lite-2.6.16", "2.6.16"), ("zone-lite-2.7.0", "2.7.0")}:
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
     # The general parser retains its eight-device limit. Only the exact
@@ -316,7 +316,7 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
-    bridge = release.version == "2.6.16"
+    bridge = release.version in {"2.6.16", "2.7.0"}
     if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
     if bridge:
@@ -533,6 +533,10 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         contract = validate_storage_contract(release.manifest or {}, release.version)
     except ValueError:
         return "STORAGE_CONTRACT_INVALID"
+    if release.version == "2.7.0":
+        from zk_add.zkt_writer_contract import writer_predecessor_hold
+        return writer_predecessor_hold(session, connector, release) or (
+            None if connector.zkt_custody_enabled else "JOURNAL_ADD_CUSTODY_DISABLED")
     if release.version == "2.6.16" and release.state != "HIL_ONLY":
         return "JOURNAL_BRIDGE_HIL_ONLY"
     if contract and contract.get("allowed_bootstrap_versions") is not None:
@@ -838,6 +842,9 @@ def sync_release_store(session: Session) -> None:
         if manifest.get("version") == "2.6.16":
             from zk_add.zkt_bridge_contract import validate_bridge_image
             validate_bridge_image(image_bytes)
+        if manifest.get("version") == "2.7.0":
+            from zk_add.zkt_writer_contract import validate_writer_image
+            validate_writer_image(image_bytes)
         application_digest = str(manifest.get("application_sha256") or "")
         if application_digest and (
             len(application_digest) != 64 or application_digest != application_digest.lower() or

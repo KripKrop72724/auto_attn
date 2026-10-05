@@ -21,6 +21,8 @@ const char *storage_upgrade_contract(void)
     return "ZONE_HIKVISION_STORAGE_CONTRACT_V1:SOURCE:READ=2:LANES=7F";
 #elif defined(ZONE_LITE_JOURNAL_BRIDGE_IMAGE) && ZONE_LITE_JOURNAL_BRIDGE_IMAGE
     return "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1";
+#elif defined(ZONE_LITE_JOURNAL_WRITER_IMAGE) && ZONE_LITE_JOURNAL_WRITER_IMAGE
+    return "ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16";
 #elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
     return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14";
 #elif ZONE_LITE_SEGMENTED_WRITES
@@ -54,6 +56,13 @@ bool storage_upgrade_init(void)
     if (strcmp(running->version, "2.6.16") || ZONE_LITE_SEGMENTED_WRITES || ZONE_LITE_DIRECT_LEGACY_UPGRADE)
         return failed("STORAGE_BRIDGE_BUILD_MISMATCH");
     if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
+#endif
+#if defined(ZONE_LITE_JOURNAL_WRITER_IMAGE) && ZONE_LITE_JOURNAL_WRITER_IMAGE
+    if (strcmp(running->version, "2.7.0") || ZONE_LITE_SEGMENTED_WRITES || ZONE_LITE_DIRECT_LEGACY_UPGRADE)
+        return failed("STORAGE_WRITER_BUILD_MISMATCH");
+    if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
+    /* Reader proof and the exact retained rollback slot are checked by the
+     * journal runtime before any journal writer can start. */
 #endif
 #if ZONE_LITE_DIRECT_LEGACY_UPGRADE
     {

@@ -23,6 +23,31 @@ beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => response(fixture()))
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('ZKT custody evidence', () => {
+  it('shows a committed local receipt without asserting Oracle delivery or current health', async () => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ legacy_handoff: {
+      state: 'COMMITTED', receipt_id: '11111111-2222-4333-8444-555555555555', evidence_digest: 'a'.repeat(64),
+      created_at: new Date(Date.now() - 86400000).toISOString(), scope: 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1',
+      oracle_delivery: 'NOT_ASSERTED', historical_completeness: 'NOT_ASSERTED',
+    } })))
+    mount()
+    expect(await screen.findByText(/Local legacy handoff committed/)).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+    expect(screen.getByText(/Historical completeness, current device health and Oracle completion have separate checks/)).toBeTruthy()
+  })
+  it.each(['wrong-scope', 'future', 'false-oracle', 'bad-digest'])('holds a malformed receipt: %s', async fault => {
+    const receipt = {
+      state: 'COMMITTED', receipt_id: '11111111-2222-4333-8444-555555555555', evidence_digest: 'a'.repeat(64),
+      created_at: new Date().toISOString(), scope: 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1',
+      oracle_delivery: 'NOT_ASSERTED', historical_completeness: 'NOT_ASSERTED',
+    }
+    if (fault === 'wrong-scope') receipt.scope = 'FULL_HARDWARE_QUALIFICATION'
+    if (fault === 'future') receipt.created_at = new Date(Date.now() + 86400000).toISOString()
+    if (fault === 'false-oracle') receipt.oracle_delivery = 'COMPLETE'
+    if (fault === 'bad-digest') receipt.evidence_digest = 'short'
+    vi.mocked(fetch).mockResolvedValue(response({ ...fixture(), legacy_handoff: receipt }))
+    mount()
+    expect(await screen.findByText('Handoff receipt unavailable')).toBeTruthy()
+  })
   it('keeps derived attendance separate from Oracle completion and model qualification', async () => {
     const value = fixture()
     value.counts = [{ state: 'ATTENDANCE_CREATED', owner: 'ADD_DELIVERY', count: 1 }]
@@ -114,7 +139,7 @@ describe('ZKT custody evidence', () => {
     } })))
     mount()
     expect(await screen.findByText('Boundary matches preserved source bytes in ADD')).toBeTruthy()
-    expect(screen.getByText('Requires its own committed proof')).toBeTruthy()
+    expect(screen.getByText('No committed local handoff receipt')).toBeTruthy()
     expect(screen.getByText('Not established by custody')).toBeTruthy()
   })
   it('ages the boundary heartbeat independently of a fresh custody query', async () => {

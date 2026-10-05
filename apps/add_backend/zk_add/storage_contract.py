@@ -67,14 +67,14 @@ LOCK_MARKER = DELIVERY_MARKER + ",2.6.14"
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
-    # The bridge has an explicit experimental reader/capture contract. The
-    # writer remains unavailable until custody cutover and migration are wired.
-    # Neither release may fall through the pre-contract legacy path.
+    # Both roles require exact experimental contracts; neither may fall
+    # through the pre-contract legacy path or grant runtime authority here.
     if version == "2.6.16":
         from zk_add.zkt_bridge_contract import validate_bridge_manifest
         return validate_bridge_manifest(manifest)
     if version == "2.7.0":
-        raise ValueError("Journal bridge reader and rollback compatibility are not yet qualified.")
+        from zk_add.zkt_writer_contract import validate_writer_manifest
+        return validate_writer_manifest(manifest)
     contract = manifest.get("queue_storage")
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:

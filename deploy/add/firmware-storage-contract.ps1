@@ -4,7 +4,28 @@ function Get-FirmwareStorageContract {
     # with the wrong writer mode before opening the protected signing key.
     $bytes = [IO.File]::ReadAllBytes($ImagePath)
     $ascii = [Text.Encoding]::ASCII.GetString($bytes)
-    $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V3:[A-Z0-9:=_.,]+')
+    $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[34]:[A-Z0-9:=_.,]+')
+    if ($Version -eq '2.7.0') {
+        $expectedWriter = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16'
+        if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedWriter -or
+            [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:').Count -ne 0) {
+            throw 'Missing, ambiguous, or incorrect journal writer contract'
+        }
+        return [ordered]@{
+            allowed_bootstrap_images = [ordered]@{ '2.6.16' = '7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599' }
+            allowed_bootstrap_versions = @('2.6.16')
+            compatibility_version = '2.6.16'
+            delivery_authority = 'ADD'
+            journal_capture = $true
+            journal_read_format = 1
+            journal_reader_mask = 63
+            journal_write_format = 1
+            read_format = 2
+            reader_mask = 63
+            schema_version = 4
+            write_format = 1
+        }
+    }
     if ($Version -eq '2.6.16') {
         $expectedBridge = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
         $legacyMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:')

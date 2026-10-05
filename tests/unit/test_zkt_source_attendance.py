@@ -311,12 +311,15 @@ def test_source_binding_migration_is_additive_and_preserves_permits_on_rollback(
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
     from zk_add.db import Base
+    from zk_add.models import ZktLegacyHandoff
     path = Path(__file__).resolve().parents[2] / "apps/add_backend/migrations/versions/20261005_0051_zkt_source_attendance.py"
     spec = importlib.util.spec_from_file_location("zkt_source_attendance_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
     engine = prepared.kw["bind"]
     with engine.begin() as connection:
+        # Reconstruct the pre-0051 schema, including later dependent tables.
+        ZktLegacyHandoff.__table__.drop(connection)
         ZktSourceAttendance.__table__.drop(connection)
         ZktSourceCutover.__table__.drop(connection)
         monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
@@ -326,6 +329,7 @@ def test_source_binding_migration_is_additive_and_preserves_permits_on_rollback(
         context = MigrationContext.configure(connection, opts={
             "include_object": lambda obj, name, kind, reflected, compare_to: kind != "table" or name in tables})
         assert compare_metadata(context, Base.metadata) == []
+        ZktLegacyHandoff.__table__.create(connection)
     with prepared() as db:
         permit(db)
         intake(db, length=1)

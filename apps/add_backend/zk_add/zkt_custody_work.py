@@ -416,10 +416,13 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
     # A decoder revision wakes each supported hold once. Unchanged holds do
     # not repeatedly decrypt/scan receipts, and disabled connectors stay idle.
     base = select(ZktCustodyWork.id).where(ZktCustodyWork.connector_id == Connector.id)
+    from zk_add.models import ZktLegacyHandoff
+    handoff_pending = select(ZktLegacyHandoff.id).where(ZktLegacyHandoff.connector_id == Connector.id,
+        ZktLegacyHandoff.wake_cursor < ZktLegacyHandoff.wake_through).exists()
     # EXISTS can pick a sequential scan for a generic plan's estimated first
     # match. Ordered one-row probes retain index ordering even when a site's
     # only pending row has just settled and most retained rows are holds.
-    due = or_(base.where(ZktCustodyWork.next_attempt_at <= now)
+    due = or_(handoff_pending, base.where(ZktCustodyWork.next_attempt_at <= now)
         .order_by(ZktCustodyWork.next_attempt_at, ZktCustodyWork.id)
         .limit(1).scalar_subquery().is_not(None), *(
             base.where(_revision_hold(), version_range)
@@ -445,6 +448,8 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
             locked += 1
             cursor = connector_id
             continue
+        from zk_add.zkt_handoff_commit import wake_source_page
+        wake_source_page(session, connector_id, limit=quota)
         # Both reads and scheduling state are under the connector lock. Recent
         # intake is a scheduling hint only, never terminal clock/profile proof.
         # Select bounded candidate pages, not all of a site's retained history.

@@ -1,5 +1,6 @@
 #include "zkt_journal_diagnostics.h"
 #include "zkt_legacy_inventory.h"
+#include <stdio.h>
 #include <string.h>
 
 static const char *result_name(zj_result_t result)
@@ -251,10 +252,27 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
     }
     bool empty = owner_ready && owner->inventory_known && owner->verified_empty && !owner->operation_running && !owner->pending_appends;
     bool legacy_empty = owner_ready && owner->legacy_verified_empty && !owner->legacy_append_pending &&
-        !owner->operation_running && owner->legacy_inventory_generation && owner->legacy_required_mask == ZQ_INVENTORY_REQUIRED &&
+        !owner->legacy_read_pending && !owner->occupied && !owner->operation_running &&
+        owner->legacy_inventory_generation && owner->legacy_inventory_generation != UINT64_MAX &&
+        owner->legacy_required_mask == ZQ_INVENTORY_REQUIRED &&
         owner->legacy_empty_mask == ZQ_INVENTORY_REQUIRED &&
         cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(storage, "recovery_complete")) &&
         cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(storage, "persistence_verified"));
+    /* Decimal text retains all 64 generation bits through JSON/JavaScript.
+     * This snapshot proves local absence only. ADD persists the independently
+     * checked handoff; neither telemetry nor queue emptiness proves Oracle. */
+    char inventory_generation[24];
+    snprintf(inventory_generation, sizeof(inventory_generation), "%llu",
+        (unsigned long long)owner->legacy_inventory_generation);
+    cJSON *inventory = cJSON_AddObjectToObject(diagnostics, "legacy_inventory");
+    if (!inventory || !cJSON_AddNumberToObject(inventory, "schema_version", 1) ||
+        !cJSON_AddBoolToObject(inventory, "fresh", owner_fresh) ||
+        !cJSON_AddBoolToObject(inventory, "verified_empty", legacy_empty) ||
+        !cJSON_AddBoolToObject(inventory, "idle", owner_ready && !owner->operation_running &&
+            !owner->occupied && !owner->legacy_append_pending && !owner->legacy_read_pending) ||
+        !cJSON_AddStringToObject(inventory, "generation", inventory_generation) ||
+        !cJSON_AddNumberToObject(inventory, "required_mask", owner->legacy_required_mask) ||
+        !cJSON_AddNumberToObject(inventory, "empty_mask", owner->legacy_empty_mask)) return false;
     return queue(queues, "journal", empty, !owner_fresh ? "STALE_OWNER" : owner->pending_appends ? "PENDING_APPEND" :
             empty ? "VERIFIED_EMPTY" : "NONEMPTY_OR_UNVERIFIED", owner_fresh && owner->inventory_known, owner->journal_bytes) &&
         queue(queues, "legacy_migration", legacy_empty, !owner_fresh ? "STALE_OWNER" :
