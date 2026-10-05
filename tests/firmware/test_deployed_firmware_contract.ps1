@@ -4,12 +4,15 @@ $check = Join-Path $PSScriptRoot '../../deploy/add/check-deployed-firmware-contr
 $global:admissionTestCalls = New-Object System.Collections.ArrayList
 $global:admissionTestScenario = ''
 $previousExitCode = $global:LASTEXITCODE
+$previousEncoding = $OutputEncoding
+$OutputEncoding = New-Object System.Text.UTF8Encoding($true)
 function docker {
     $arguments = @($args)
     [void]$global:admissionTestCalls.Add($arguments)
     $global:LASTEXITCODE = 0
     if ($arguments[0] -eq 'cp') { throw 'docker cp cannot transfer into the production tmpfs mount' }
     if ($arguments[0] -eq 'exec' -and $arguments[1] -eq '-i') {
+        if ($OutputEncoding.GetPreamble().Length -ne 0) { throw 'Native transfer encoding must not inject a BOM' }
         if ($arguments[3] -ne 'python' -or $arguments[4] -ne '-c' -or $arguments[5] -notmatch 'b64decode') {
             throw 'Admission transfer must decode bounded public bytes inside the container'
         }
@@ -50,6 +53,7 @@ try {
         $caught = $false
         $failure = ''
         try { & $check -SourceDirectory $root } catch { $caught = $true; $failure = $_.Exception.Message }
+        if ($OutputEncoding.GetPreamble().Length -eq 0) { throw 'Caller encoding was not restored' }
         if ($caught -ne ($case -ne 'pass')) { throw "Incorrect deployed admission result: $case ($failure)" }
         if ($case -eq 'prepare-failure') {
             if ($global:admissionTestCalls.Count -ne 1) { throw 'Uncreated temporary files cannot be cleaned' }
@@ -67,4 +71,5 @@ try {
     # Failure scenarios deliberately set the native-command exit status. Do
     # not leak a mocked failure into GitHub's shell wrapper after tests pass.
     $global:LASTEXITCODE = $previousExitCode
+    $OutputEncoding = $previousEncoding
 }

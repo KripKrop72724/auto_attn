@@ -20,6 +20,10 @@ $digest = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerIn
 $temporary = '/tmp/add-firmware-admission-' + [guid]::NewGuid().ToString('N')
 $created = $false
 $failed = $false
+$previousEncoding = $OutputEncoding
+# Windows PowerShell may inherit a BOM-producing encoding from its runner.
+# The payload is ASCII base64; an injected BOM must not reach strict decoding.
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 try {
     & docker exec $AddContainer python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).mkdir(mode=0o700)' $temporary
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare deployed ADD admission check.' }
@@ -45,6 +49,7 @@ try {
     $failed = $true
     throw
 } finally {
+    $OutputEncoding = $previousEncoding
     if ($created) {
         & docker exec $AddContainer python -c 'import shutil,sys; shutil.rmtree(sys.argv[1])' $temporary
         if ($LASTEXITCODE -ne 0 -and -not $failed) { throw 'Could not remove temporary ADD admission files.' }
