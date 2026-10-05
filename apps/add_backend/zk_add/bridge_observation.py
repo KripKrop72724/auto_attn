@@ -12,7 +12,7 @@ from zk_add.models import Connector, DeviceTelemetry
 from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareHilRun, FirmwareRelease
 from zk_add.runtime_contract import RUNTIMES, journal_owner_status, worker_snapshot_fresh
 from zk_add.time_utils import ensure_utc, utc_now
-from zk_add.zkt_bridge_contract import REPLACEMENT_BRIDGE_VERSION, validate_bridge_manifest
+from zk_add.zkt_bridge_contract import READINESS_BRIDGE_VERSIONS, validate_bridge_manifest
 
 PROFILE = "BRIDGE_READINESS_V1"
 FULL_PROFILE = "FULL_REMOTE_HIL_V1"
@@ -93,7 +93,7 @@ def sample_evidence(row, *, target, identity, boot_id):
 
 
 def require_bridge_baseline(release, row, target, identity):
-    if release.version != REPLACEMENT_BRIDGE_VERSION:
+    if release.version not in READINESS_BRIDGE_VERSIONS:
         raise ValueError("Bridge readiness requires the replacement compatibility bridge")
     validate_bridge_manifest(release.manifest)
     evidence = sample_evidence(row, target=target, identity=identity, boot_id=row.boot_id)
@@ -121,7 +121,7 @@ def complete_bridge_run(session, run_id, *, actor):
     target = HilTarget.model_validate(run.target)
     errors = []
     if (release is None or release.state != "HIL_ONLY" or release.revoked_at is not None
-            or release.version != REPLACEMENT_BRIDGE_VERSION
+            or release.version not in READINESS_BRIDGE_VERSIONS
             or _release_identity(release).model_dump(mode="json") != run.release_identity):
         errors.append("RELEASE_CHANGED")
     campaign = session.get(FirmwareCampaign, deployment.campaign_id) if deployment else None

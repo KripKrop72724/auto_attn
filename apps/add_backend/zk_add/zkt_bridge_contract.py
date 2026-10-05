@@ -3,11 +3,13 @@ import struct
 
 from zk_add.zkt270_scope import TARGETS
 
-# Preserve the already signed 2.6.16 package for audit/recovery. New field
-# attempts use a distinct 2.6.17 image; neither version implies boot success.
+# Preserve revoked 2.6.16/2.6.17 package validation for audit and recovery.
+# Field recovery is a new immutable 2.6.18 image, with no implied boot success.
 BRIDGE_VERSION = "2.6.16"
 REPLACEMENT_BRIDGE_VERSION = "2.6.17"
-BRIDGE_VERSIONS = (BRIDGE_VERSION, REPLACEMENT_BRIDGE_VERSION)
+RECOVERY_BRIDGE_VERSION = "2.6.18"
+BRIDGE_VERSIONS = (BRIDGE_VERSION, REPLACEMENT_BRIDGE_VERSION, RECOVERY_BRIDGE_VERSION)
+READINESS_BRIDGE_VERSIONS = (REPLACEMENT_BRIDGE_VERSION, RECOVERY_BRIDGE_VERSION)
 BRIDGE_MARKER = "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
 PREDECESSOR_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -31,7 +33,7 @@ def bridge_hil_targets(raw: object) -> list:
 def bridge_marker(version: str) -> str:
     if version not in BRIDGE_VERSIONS:
         raise ValueError("Journal bridge version is unqualified.")
-    return BRIDGE_MARKER + (":VERSION=2.6.17" if version == REPLACEMENT_BRIDGE_VERSION else "")
+    return BRIDGE_MARKER + (f":VERSION={version}" if version != BRIDGE_VERSION else "")
 
 
 def bridge_contract(version: str = BRIDGE_VERSION) -> dict:

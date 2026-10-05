@@ -1,4 +1,4 @@
-param([ValidateSet("2.6.16", "2.6.17")][string]$BridgeVersion = "2.6.16")
+param([ValidateSet("2.6.16", "2.6.17", "2.6.18")][string]$BridgeVersion = "2.6.16")
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('hil-publication-' + [guid]::NewGuid().ToString('N'))
 $source = Join-Path $root 'package'
@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
 $bridgeMarker = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
-if ($BridgeVersion -eq '2.6.17') { $bridgeMarker += ':VERSION=2.6.17' }
+if ($BridgeVersion -ne '2.6.16') { $bridgeMarker += ':VERSION=' + $BridgeVersion }
 [IO.File]::WriteAllText($contractImage, $bridgeMarker + [char]0)
 $bridgeContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $BridgeVersion
 if ($bridgeContract.compatibility_version -cne $BridgeVersion -or $bridgeContract.schema_version -ne 3 -or $bridgeContract.journal_capture -ne $true -or

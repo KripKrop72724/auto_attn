@@ -90,10 +90,15 @@ bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
     /* A replacement reader may inspect the old proof only to renew it after
      * checking the unchanged terminal/epoch/layout. Writer/update admission
      * below still requires the exact current reader version and image. */
-    const char *version = !memcmp(bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))
-        ? ZJ_BRIDGE_VERSION
-        : !strcmp(ZJ_BRIDGE_VERSION, "2.6.17") && !memcmp(bytes + 168, "2.6.16", sizeof("2.6.16"))
-            ? "2.6.16" : NULL;
+    const char *version = NULL;
+    if (!memcmp(bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION)))
+        version = ZJ_BRIDGE_VERSION;
+    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.17") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.18")) &&
+             !memcmp(bytes + 168, "2.6.16", sizeof("2.6.16")))
+        version = "2.6.16";
+    else if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.18") &&
+             !memcmp(bytes + 168, "2.6.17", sizeof("2.6.17")))
+        version = "2.6.17";
     if (!version) return false;
     encode(&decoded, revision, version, canonical);
     if (!revision || !identity_valid(&decoded) || memcmp(bytes, canonical, sizeof(canonical))) return false;

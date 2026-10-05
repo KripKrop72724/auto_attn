@@ -86,9 +86,17 @@ int main(void)
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && !storage.writes);
 
-    if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.17")) {
-        memcpy(storage.bytes + 168, "2.6.16", sizeof("2.6.16"));
+    const char *historical[] = {"2.6.16", "2.6.17", "2.6.18"};
+    for (size_t i = 0; i < sizeof(historical) / sizeof(*historical); ++i) {
+        if (!strcmp(historical[i], ZJ_BRIDGE_VERSION)) continue;
+        memcpy(storage.bytes + 168, historical[i], strlen(historical[i]) + 1);
         crc();
+        if (strcmp(historical[i], ZJ_BRIDGE_VERSION) > 0) {
+            assert(!zj_reader_proof_decode(storage.bytes, &decoded, &generation));
+            assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_CORRUPT && !storage.writes);
+            memcpy(storage.bytes, original, sizeof(original));
+            continue;
+        }
         assert(zj_reader_proof_decode(storage.bytes, &decoded, &generation) && generation == 1);
         assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_VERSION);
         assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size,

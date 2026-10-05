@@ -120,6 +120,23 @@ The original 2.6.16 release is also revoked; both of its cancelled canary
 campaigns retain their `ROLLED_BACK` outcomes. Neither failed image may be
 offered again as a recovery shortcut.
 
+On 5 October at 10:23 UTC, after the user connected the 3FL ESP to the Mac,
+authenticated ADD telemetry reported a new boot on the original 2.6.15 image
+and an online bound terminal. USB identity matched the canary's MAC; a passive
+serial capture issued no host reset or flash command. This provides local
+console access for the next attempt. It does not prove journal recovery or
+storage health: the old image still reports an unqualified rollback reader.
+
+The next recovery bridge is **2.6.18**, with a distinct versioned marker,
+application descriptor and signed identity. It incorporates receipt-bound
+legacy-checkpoint recovery and is subject to the same exact predecessor,
+17-target quarantine and server-observed readiness rules. Its reader can renew
+a valid 2.6.16 or 2.6.17 proof only after checking unchanged terminal/epoch/layout;
+those old proofs cannot authorize its writer. Historical package validation
+remains available, and revoked packages stay revoked. Actual signed digests,
+USB boot logs and ADD readiness evidence are required before renewing the
+2.7.0 writer's current 2.6.17 pins. Adding this build role alone is not a release.
+
 ADD stores each heartbeat's running version, partition, application digest,
 OTA state, local boot check count and error with that diagnostic sample's
 authenticated boot ID and sequence. The preservation panel distinguishes this
