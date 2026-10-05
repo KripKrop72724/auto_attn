@@ -243,7 +243,7 @@ def cancel_run(session: Session, run_id: str, *, actor: str) -> FirmwareHilRun:
         return run
     run.status = "CANCELLED"
     run.completed_at = utc_now()
-    run.result = {"outcome": "INCOMPLETE", "reasons": ["CANCELLED"], "actor": actor}
+    run.result = {**(run.result or {}), "outcome": "INCOMPLETE", "reasons": ["CANCELLED"], "actor": actor}
     session.add(
         FirmwareEvent(
             deployment_id=run.deployment_id,
