@@ -22,7 +22,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Firmware manifest is not in ADD canonical sign
 
 $manifest = Get-Content (Join-Path $source 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $Version) { throw 'Manifest version does not match requested version' }
-$journalBridge = $Version -eq '2.6.16' -and $manifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY'
+$journalBridge = $Version -in @('2.6.16', '2.7.0')
+if ($journalBridge -and $manifest.release_channel -cne 'EXPERIMENTAL_HIL_ONLY') {
+    throw 'Journal releases require the experimental HIL channel'
+}
 if ($journalBridge) {
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete

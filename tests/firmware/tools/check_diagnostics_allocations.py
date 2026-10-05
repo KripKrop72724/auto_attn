@@ -257,11 +257,11 @@ int main(void){
  }
  /* A local legacy absence proof needs every domain, a fresh idle owner and
   * recovered storage. It does not assert downstream delivery. */
- for(unsigned fault=0;fault<9;fault++){
+ for(unsigned fault=0;fault<12;fault++){
   sample_clock=5000;owner_observed=true;legacy_healthy=true;health.sampled_ms=4000;
   owner=(zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=4000000,
    .inventory_known=true,.verified_empty=true,.legacy_verified_empty=true,
-   .legacy_inventory_generation=1,.legacy_empty_mask=ZQ_INVENTORY_REQUIRED,
+   .legacy_inventory_generation=UINT64_MAX-1,.legacy_empty_mask=ZQ_INVENTORY_REQUIRED,
    .legacy_required_mask=ZQ_INVENTORY_REQUIRED};
   if(fault==1)owner.legacy_append_pending=true;
   if(fault==2)owner.legacy_empty_mask&=~1U;
@@ -271,11 +271,20 @@ int main(void){
   if(fault==6){owner.operation_running=true;owner.operation_started_us=4000000;}
   if(fault==7)owner.legacy_verified_empty=false;
   if(fault==8)owner.legacy_inventory_generation=0;
+  if(fault==9)owner.legacy_read_pending=true;
+  if(fault==10)owner.occupied=1;
+  if(fault==11)owner.legacy_inventory_generation=UINT64_MAX;
   payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
   diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
   cJSON *migration=named(cJSON_GetObjectItemCaseSensitive(diagnostics,"queues"),"legacy_migration");
+  cJSON *inventory=cJSON_GetObjectItemCaseSensitive(diagnostics,"legacy_inventory");assert(inventory);
+  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(inventory,"verified_empty"))==(fault==0));
+  if(fault==1 || fault==6 || fault==9 || fault==10)
+   assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(inventory,"idle")));
   assert(migration && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(migration,"count_known"))==(fault==0));
   if(!fault){assert(cJSON_GetObjectItemCaseSensitive(migration,"records")->valueint==0);
+   assert(!strcmp(string(inventory,"generation"),"18446744073709551614"));
+   assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(inventory,"idle")));
    assert(!strcmp(string(migration,"count_reason"),"VERIFIED_EMPTY"));}
   else assert(!cJSON_HasObjectItem(migration,"records") && !cJSON_HasObjectItem(migration,"bytes"));
   cJSON_Delete(payload);check_ownership("ZKT_JOURNAL_V1","ADD",true);

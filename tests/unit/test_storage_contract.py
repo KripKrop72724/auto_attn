@@ -60,7 +60,7 @@ def test_signed_contract_required_for_both_storage_releases():
 @pytest.mark.parametrize("version", ["2.6.16", "2.7.0"])
 def test_future_journal_releases_cannot_bypass_bridge_qualification(version):
     for candidate in ({}, manifest("2.6.15"), manifest("2.6.0")):
-        with pytest.raises(ValueError, match="Journal bridge"):
+        with pytest.raises(ValueError, match="Journal (bridge|writer)"):
             validate_storage_contract(candidate, version)
 
 

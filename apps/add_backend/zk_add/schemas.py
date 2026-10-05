@@ -231,6 +231,32 @@ class SourceBoundaryDiagnostics(BaseModel):
         return self
 
 
+class LegacyInventoryDiagnostics(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal[1]
+    fresh: bool
+    verified_empty: bool
+    idle: bool
+    generation: str = Field(pattern=r"^(0|[1-9][0-9]{0,19})$")
+    required_mask: int = Field(ge=0, le=8191)
+    empty_mask: int = Field(ge=0, le=8191)
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_schema_type(cls, value):
+        if isinstance(value, dict) and type(value.get("schema_version")) is not int:
+            raise ValueError("LEGACY_INVENTORY_TYPES")
+        return value
+
+    @model_validator(mode="after")
+    def valid_inventory(self):
+        if (type(self.schema_version) is not int or int(self.generation) > 2**64 - 1
+                or (self.verified_empty and (not self.fresh or self.generation == "0"
+                    or self.required_mask != 8191 or self.empty_mask != 8191))):
+            raise ValueError("LEGACY_INVENTORY_INVALID")
+        return self
+
+
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1, 2] = 1
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
@@ -245,6 +271,7 @@ class FirmwareDiagnostics(BaseModel):
     journal_runtime: JournalRuntimeDiagnostics | None = None
     journal_storage: JournalStorageDiagnostics | None = None
     source_boundary: SourceBoundaryDiagnostics | None = None
+    legacy_inventory: LegacyInventoryDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
     workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
     reconciliation_mode: str | None = Field(default=None, max_length=40)

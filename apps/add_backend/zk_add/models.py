@@ -611,6 +611,22 @@ class ZktSourceCutover(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
+class ZktLegacyHandoff(Base):
+    """Receipt of a checked local legacy absence proof, separate from Oracle."""
+    __tablename__ = "add_zkt_legacy_handoffs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), unique=True)
+    cutover_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_source_cutovers.id"), unique=True)
+    receipt_id: Mapped[str] = mapped_column(String(100), unique=True)
+    evidence_digest: Mapped[str] = mapped_column(String(64))
+    protected_evidence: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(120))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    wake_cursor: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    wake_through: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = utc_column()
+
+
 class ZktSourceAttendance(Base):
     """Derived attendance binding; original custody and aliases stay immutable."""
     __tablename__ = "add_zkt_source_attendance"

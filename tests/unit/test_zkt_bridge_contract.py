@@ -60,7 +60,7 @@ def test_bridge_has_no_implicit_writer_authority():
     assert validate_storage_contract(manifest, BRIDGE_VERSION) == bridge_contract()
     assert manifest["queue_storage"]["delivery_authority"] == "LEGACY_UNTIL_PERSISTED_ADD_CUTOVER"
     validate_bridge_image(bridge_image())
-    with pytest.raises(ValueError, match="Journal bridge"):
+    with pytest.raises(ValueError, match="Journal writer"):
         validate_storage_contract(manifest, "2.7.0")
 
 

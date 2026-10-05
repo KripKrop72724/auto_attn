@@ -23,6 +23,11 @@ type SourceBoundary = {
   source_epoch?: string; next_ordinal?: number; record_size?: number;
   writer_digest?: string; capture_epoch?: string; sampled_at?: string;
 }
+type LegacyHandoff = { state: 'NOT_COMMITTED' } | { state: 'HELD'; reason: string } | {
+  state: 'COMMITTED'; receipt_id: string; evidence_digest: string; created_at: string;
+  scope: 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1';
+  oracle_delivery: 'NOT_ASSERTED'; historical_completeness: 'NOT_ASSERTED';
+}
 export type CustodySnapshot = {
   connector_id: string; enabled: boolean; sampled_at: string;
   oracle_completion: 'NOT_ASSERTED'; missing_processing_obligation: boolean;
@@ -30,6 +35,7 @@ export type CustodySnapshot = {
   rows: Work[]; next_cursor: number | null;
   processor?: Processor;
   source_boundary?: SourceBoundary;
+  legacy_handoff?: LegacyHandoff;
 }
 const states: Record<string, string> = {
   PENDING: 'Awaiting inspection', INTERPRETING: 'Interpretation in progress', WAIT_FRAGMENTS: 'Waiting for packet fragments',
@@ -48,6 +54,16 @@ const owner = (value: string) => owners[value] || humanizeStatus(value)
 const date = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Asia/Karachi' })
 const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
 const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+function handoffLabel(value: LegacyHandoff | undefined, fresh: boolean, now: number) {
+  if (!value || value.state === 'NOT_COMMITTED') return 'No committed local handoff receipt'
+  if (value.state === 'HELD') return 'Retained handoff evidence needs review'
+  if (value.state !== 'COMMITTED' || value.scope !== 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1'
+    || value.oracle_delivery !== 'NOT_ASSERTED' || value.historical_completeness !== 'NOT_ASSERTED'
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.receipt_id)
+    || !/^[a-f0-9]{64}$/.test(value.evidence_digest) || !timestamp(value.created_at)
+    || Date.parse(value.created_at) > now + 1000) return 'Handoff receipt unavailable'
+  return `${fresh ? '' : 'Previous report: '}Local legacy handoff committed · ${date(value.created_at)} (Pakistan)`
+}
 function boundaryLabel(value: SourceBoundary | undefined, fresh: boolean, now: number) {
   if (!value || value.migration_certified !== false || value.delivery_permission !== 'NOT_EVALUATED'
     || typeof value.reason !== 'string' || !/^SOURCE_BOUNDARY_[A-Z_]{1,70}$/.test(value.reason)) return 'Source boundary evidence unavailable'
@@ -143,8 +159,9 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
         <div><dt>Missing processing obligations</dt><dd>{data.missing_processing_obligation ? 'Detected — needs ADD operations review' : 'None detected in this snapshot'}</dd></div>
         <div><dt>Oracle completion</dt><dd>Not established by custody</dd></div>
         <div><dt>Source handoff boundary</dt><dd>{boundaryLabel(data.source_boundary, fresh, now)}</dd></div>
-        <div><dt>Migration certification</dt><dd>Requires its own committed proof</dd></div>
+        <div><dt>Local legacy handoff</dt><dd>{handoffLabel(data.legacy_handoff, fresh, now)}</dd></div>
       </dl>
+      <p>A local handoff receipt records the source boundary and empty legacy queues at cutover. Historical completeness, current device health and Oracle completion have separate checks.</p>
       <h4>ADD worker · all ZKT connectors</h4>
       {!processor ? <p>Worker progress evidence is unavailable.</p> : <dl>
         <div><dt>{processorFresh ? 'Worker state' : 'Last reported worker state'}</dt><dd>{humanizeStatus(processor.state)}</dd></div>

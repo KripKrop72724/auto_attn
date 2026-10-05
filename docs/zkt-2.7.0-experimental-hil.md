@@ -190,3 +190,47 @@ metadata digest with changed or unavailable raw bytes remains held. The device
 detail panel ages the boundary's own heartbeat separately from the API query.
 This check is read-only and cannot create a source cutover, enable journal
 custody, resolve identity, or assert migration or Oracle completion.
+
+## Experimental writer handoff
+
+The 2.7.0 package carries one compiled V4 writer marker and an exact signed
+journal contract. Its only packaged predecessor is the immutable 2.6.16 bridge
+application `7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599`.
+ADD requires that connector's successful bridge installation, current secure
+OTA-slot identity, recovered storage and live compatible-reader telemetry.
+A failed or rolled-back bridge cannot authorize the writer. The actual runtime
+independently checks persisted reader proof and the retained rollback slot.
+If the bridge needs different bytes, publish a new identity and update the
+explicit reader contract; do not overwrite an existing signed release.
+
+After publishing the signed writer in its exact HIL quarantine, an authenticated
+administrator may POST `{release_id, idempotency_key}` to
+`/api/v1/devices/{connector_id}/zkt-custody/enable`. This enables bounded ADD raw
+custody after the bridge checks; it grants no attendance or Oracle authority.
+The normal campaign still performs its independent scope and upgrade checks.
+
+After installation, the matching POST to `zkt-custody/handoff` verifies the signed
+release, exact active writer image, installation record, immutable source anchor
+against encrypted ADD source evidence, and two authenticated telemetry samples
+10–90 seconds apart. Both must show the same 64-bit owner generation, all 13
+legacy storage domains empty, no pending owner/read/append request, recovered
+storage, ready reader/writer, and idle retained legacy delivery workers. A newer
+sample must be at most 45 seconds old. A telemetry claim alone cannot create the
+receipt, and neither unknown counts nor a version string replaces those checks.
+
+The source cutover, encrypted evidence receipt and administrator audit commit
+in one database transaction. Retrying a lost response with the same actor/key
+returns the same receipt. Conflicting requests cannot move the boundary. ADD
+revisits existing held source work using a bounded durable cursor; original
+source bytes, identity holds and legacy Oracle keys remain retained. Migration
+0052 preserves the handoff on application/database downgrade.
+
+GET `zkt-custody` exposes `legacy_handoff` separately from `source_boundary`.
+Its scope is `LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1`: it establishes the
+recorded local transition, not historical completeness, decoder qualification,
+current hardware health or Oracle completion. Missing or changed retained proof
+stays held. Empty terminal boundaries without a known layout and eight-byte
+layouts without supported textual user identity remain held for this path.
+
+These interfaces do not automatically grant a field handoff, report HIL success,
+or replace actual post-installation source/identity/delivery evidence.
