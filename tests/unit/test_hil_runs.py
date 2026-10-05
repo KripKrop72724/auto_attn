@@ -137,6 +137,25 @@ def test_observation_accepts_worker_tick_sampled_after_rounded_uptime(ready):
     assert start(ready).status == "OBSERVING"
 
 
+def test_legacy_bridge_observation_keeps_optional_journal_counts_unknown(ready):
+    diagnostics = ready[-1].payload["diagnostics"]
+    diagnostics.update(schema_version=2, runtime_profile="ZKT_LEGACY", delivery_authority="LEGACY_DUAL")
+    diagnostics["queues"].extend([
+        {"name": "journal", "count_known": False, "count_reason": "NONEMPTY_OR_UNVERIFIED"},
+        {"name": "legacy_migration", "count_known": False, "count_reason": "UNVERIFIED_MIGRATION"},
+    ])
+    assert start(ready).status == "OBSERVING"
+    assert diagnostics["queues"][-1]["count_known"] is False
+    assert "records" not in diagnostics["queues"][-1]
+
+
+@pytest.mark.parametrize("value", [None, True, -1, "0"])
+def test_required_queue_depth_must_be_an_observed_nonnegative_integer(ready, value):
+    ready[-1].payload["diagnostics"]["queues"][0]["records"] = value
+    with pytest.raises(ValueError, match="required runtime queue"):
+        start(ready)
+
+
 @pytest.mark.parametrize("variant", ["healthy", "idle-capture", "stalled-capture", "missing-worker",
                                      "unknown-worker", "duplicate-worker", "unknown-migration", "stale-storage", "append-full"])
 def test_journal_hil_requires_its_workers_and_keeps_legacy_custody_obligations(ready, variant):
