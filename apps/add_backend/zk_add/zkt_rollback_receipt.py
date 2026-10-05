@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from zk_add.terminal_families import require_family_match
 from zk_add.time_utils import ensure_utc
+from zk_add.zkt_writer_contract import REQUIRED_BRIDGE_VERSION
 
 
 def verify_failed_boot_return(
@@ -28,8 +29,8 @@ def verify_failed_boot_return(
         connector.firmware_family != "zkt"
         or release.version != "2.7.0"
         or deployment.target_version != "2.7.0"
-        or deployment.previous_version != "2.6.16"
-        or running_version != "2.6.16"
+        or deployment.previous_version != REQUIRED_BRIDGE_VERSION
+        or running_version != REQUIRED_BRIDGE_VERSION
         or running_partition not in {"ota_0", "ota_1"}
         or bytes_written != release.image_size
         or deployment.bytes_written != release.image_size
@@ -57,14 +58,14 @@ def verify_failed_boot_return(
     if (
         bridge is None
         or bridge.status != "SUCCEEDED"
-        or bridge.target_version != "2.6.16"
+        or bridge.target_version != REQUIRED_BRIDGE_VERSION
         or ensure_utc(bridge.created_at) >= ensure_utc(deployment.created_at)
     ):
         raise ValueError(message)
     reader = session.get(FirmwareRelease, bridge.release_id)
     if (
         reader is None
-        or reader.version != "2.6.16"
+        or reader.version != REQUIRED_BRIDGE_VERSION
         or reader.state not in {"HIL_ONLY", "AVAILABLE"}
         or not _application_sha256(reader)
         or image_sha256 != _application_sha256(reader)
@@ -82,7 +83,7 @@ def verify_failed_boot_return(
         event is None
         or ensure_utc(event.created_at) >= ensure_utc(deployment.created_at)
         or details.get("image_sha256") != image_sha256
-        or details.get("running_version") != "2.6.16"
+        or details.get("running_version") != REQUIRED_BRIDGE_VERSION
         or details.get("running_partition") != running_partition
         or details.get("bytes_written") != reader.image_size
         or bridge.bytes_written != reader.image_size

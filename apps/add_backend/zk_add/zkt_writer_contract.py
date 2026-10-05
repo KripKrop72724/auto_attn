@@ -4,20 +4,21 @@ from datetime import datetime
 
 from sqlalchemy import select
 
-from zk_add.zkt_bridge_contract import signed_hil_targets
+from zk_add.zkt_bridge_contract import REPLACEMENT_BRIDGE_VERSION, signed_hil_targets
 
 WRITER_VERSION = "2.7.0"
-WRITER_MARKER = "ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16"
-BRIDGE_APPLICATION = "7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599"
-BRIDGE_ARTIFACT = "950b6fbcd6c6389d11e7beaf523a4ac3a81f24f2ce4a84ac1bc6cbd4198abc4a"
+REQUIRED_BRIDGE_VERSION = REPLACEMENT_BRIDGE_VERSION
+WRITER_MARKER = "ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17"
+BRIDGE_APPLICATION = "f803361f8c3e1ed03f57814793942ebda45bbbd10cd0c1e77239602f5e6e32a1"
+BRIDGE_ARTIFACT = "be23f88bfc8e2a6f7233ab2f8903c53ac9deaf1433ad39608e7f00f7e4f2bc71"
 
 
 def writer_contract():
     return {"schema_version": 4, "read_format": 2, "reader_mask": 63, "write_format": 1,
             "journal_read_format": 1, "journal_write_format": 1, "journal_reader_mask": 63,
-            "journal_capture": True, "delivery_authority": "ADD", "compatibility_version": "2.6.16",
-            "allowed_bootstrap_versions": ["2.6.16"],
-            "allowed_bootstrap_images": {"2.6.16": BRIDGE_APPLICATION}}
+            "journal_capture": True, "delivery_authority": "ADD", "compatibility_version": REQUIRED_BRIDGE_VERSION,
+            "allowed_bootstrap_versions": [REQUIRED_BRIDGE_VERSION],
+            "allowed_bootstrap_images": {REQUIRED_BRIDGE_VERSION: BRIDGE_APPLICATION}}
 
 
 def validate_writer_manifest(manifest):
@@ -26,7 +27,7 @@ def validate_writer_manifest(manifest):
     if (manifest.get("version") != WRITER_VERSION or manifest.get("release_id") != "zone-lite-2.7.0"
             or manifest.get("firmware_family") != "zkt" or manifest.get("project_name") != "zone_lite"
             or manifest.get("release_channel") != "EXPERIMENTAL_HIL_ONLY"
-            or manifest.get("minimum_bootstrap_version") != "2.6.16"
+            or manifest.get("minimum_bootstrap_version") != REQUIRED_BRIDGE_VERSION
             or manifest.get("runtime_profile") != "ZKT_JOURNAL_V1"
             or manifest.get("hil_targets") != signed_hil_targets()
             or not isinstance(contract, dict) or contract != expected
@@ -50,12 +51,12 @@ def writer_predecessor_hold(session, connector, release):
     from zk_add.time_utils import ensure_utc, utc_now
     if release.state != "HIL_ONLY":
         return "JOURNAL_WRITER_HIL_ONLY"
-    if (not _versions_match(connector.firmware_version, "2.6.16")
+    if (not _versions_match(connector.firmware_version, REQUIRED_BRIDGE_VERSION)
             or connector.ota_image_sha256 != BRIDGE_APPLICATION
             or connector.ota_running_partition not in {"ota_0", "ota_1"}
             or not connector.ota_secure_boot or not connector.ota_rollback_enabled):
         return "JOURNAL_EXACT_BRIDGE_REQUIRED"
-    bridge = session.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.6.16"))
+    bridge = session.scalar(select(FirmwareRelease).where(FirmwareRelease.version == REQUIRED_BRIDGE_VERSION))
     if (bridge is None or bridge.state != "HIL_ONLY" or bridge.revoked_at is not None
             or _application_sha256(bridge) != BRIDGE_APPLICATION or bridge.image_sha256 != BRIDGE_ARTIFACT):
         return "JOURNAL_BRIDGE_ARTIFACT_UNAVAILABLE"

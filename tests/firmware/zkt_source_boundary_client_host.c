@@ -66,7 +66,7 @@ int main(void)
     zsb_record_t out;
     zsb_facts_t facts = {.next_ordinal=200000, .record_size=40, .anchor_digest={8}};
     assert(zsb_runtime_required());
-    strcpy(app.version, "2.6.16");
+    strcpy(app.version, "2.6.17");
     assert(!zsb_runtime_required() && zsb_runtime_create(&facts, &out) == ZJ_INVALID && !submissions);
     strcpy(app.version, "2.7.0"); strcpy(app.project_name, "zone_lite_hikvision");
     assert(!zsb_runtime_required()); strcpy(app.project_name, "zone_lite");

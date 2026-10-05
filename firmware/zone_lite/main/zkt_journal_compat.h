@@ -5,9 +5,9 @@
 
 #define ZJ_READER_PROOF_BYTES 192U
 #ifndef ZJ_BRIDGE_VERSION
-/* The replacement bridge overrides this at compile time. The writer remains
- * pinned to its previous package until the replacement signed digest exists. */
-#define ZJ_BRIDGE_VERSION "2.6.16"
+/* The writer requires the replacement reader. Legacy bridge builds explicitly
+ * override this to retain their original proof and marker contracts. */
+#define ZJ_BRIDGE_VERSION "2.6.17"
 #endif
 #define ZJ_WRITER_VERSION "2.7.0"
 #define ZJ_READER_MASK 0x3fU /* Includes persisted ADD authority and bridge capture. */

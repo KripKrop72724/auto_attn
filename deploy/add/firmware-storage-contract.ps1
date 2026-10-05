@@ -6,15 +6,15 @@ function Get-FirmwareStorageContract {
     $ascii = [Text.Encoding]::ASCII.GetString($bytes)
     $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[34]:[A-Z0-9:=_.,]+')
     if ($Version -eq '2.7.0') {
-        $expectedWriter = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16'
+        $expectedWriter = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17'
         if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedWriter -or
             [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:').Count -ne 0) {
             throw 'Missing, ambiguous, or incorrect journal writer contract'
         }
         return [ordered]@{
-            allowed_bootstrap_images = [ordered]@{ '2.6.16' = '7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599' }
-            allowed_bootstrap_versions = @('2.6.16')
-            compatibility_version = '2.6.16'
+            allowed_bootstrap_images = [ordered]@{ '2.6.17' = 'f803361f8c3e1ed03f57814793942ebda45bbbd10cd0c1e77239602f5e6e32a1' }
+            allowed_bootstrap_versions = @('2.6.17')
+            compatibility_version = '2.6.17'
             delivery_authority = 'ADD'
             journal_capture = $true
             journal_read_format = 1

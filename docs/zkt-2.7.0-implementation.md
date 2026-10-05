@@ -5,7 +5,7 @@ connectors in the approved nationwide plan. Lahore 03 is a spare; Hikvision
 behavior remains a regression requirement, not part of this rollout.
 
 This register records implementation evidence. It is not a release certificate.
-No signed 2.6.16 bridge or 2.7.0 candidate is qualified by the existence of code.
+No signed bridge or 2.7.0 candidate is qualified by the existence of code.
 Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 
 The [5 October experimental HIL direction](zkt-2.7.0-experimental-hil.md)
@@ -535,7 +535,7 @@ Physical power-loss qualification remains a separate release requirement.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
    recovery of parser-affected history. No force-send or invented identity is allowed.
-4. Signed 2.6.16 reader bridge and signed 2.7.0 candidate with exact predecessors,
+4. Qualify the signed replacement 2.6.17 reader and sign the 2.7.0 candidate with exact predecessors,
    factory paths, compatible rollback slot and reproducible build records.
 5. Trusted qualification collector and enforcement in OTA assignment. The scope
    and capacity evaluators cannot be substituted for measured evidence.
@@ -546,7 +546,9 @@ Physical power-loss qualification remains a separate release requirement.
    other prerequisite failures remain in the denominator.
 
 **Nationwide remote HIL: INCOMPLETE. Production qualification: INCOMPLETE.**
-No connector has been upgraded or accepted by this implementation work.
+Two 2.6.16 canary installation attempts rolled back; their original evidence
+remains retained. The separately signed 2.6.17 replacement is under canary
+qualification. No 2.7.0 connector is accepted by these implementation results.
 
 ## Journal component implementation
 
