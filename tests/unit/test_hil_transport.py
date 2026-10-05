@@ -482,6 +482,21 @@ def test_invalid_stored_target_cannot_block_transport(observed, target):
     assert hil_transport.pending_stream_close(session, run.run_id, value["control_id"]) is None
 
 
+def test_cancellation_restores_admission_and_retains_durable_control(observed):
+    from zk_add.hil_runs import cancel_run
+
+    session, _, device, _, _, run, _ = observed
+    value, _ = begin(observed)
+    session.commit()
+    cancelled = cancel_run(session, run.run_id, actor="admin")
+    session.commit()
+    assert cancelled.status == "CANCELLED"
+    assert cancelled.result[KEY] == value
+    assert enforce_transport(session, device, transport="HTTP") is None
+    repeated, created = begin(observed)
+    assert repeated == value and not created
+
+
 def test_linux_clock_is_shared_across_worker_processes():
     import inspect
     import json
