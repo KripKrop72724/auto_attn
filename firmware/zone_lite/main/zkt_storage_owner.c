@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <string.h>
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_app_desc.h"
 #include "esp_random.h"
@@ -54,6 +55,14 @@ typedef struct {
 static owner_t *owner;
 static SemaphoreHandle_t mailbox_lock;
 static TaskHandle_t owner_task;
+/* Both journal workers must have their full internal stacks reserved before
+ * Wi-Fi/TLS allocation; fixing transport must not shift fragmentation failure
+ * to the storage task which starts first. Large mailbox state stays in PSRAM. */
+#define ZJ_OWNER_STACK_BYTES 12288U
+static DRAM_ATTR StackType_t owner_stack[ZJ_OWNER_STACK_BYTES / sizeof(StackType_t)]
+    __attribute__((aligned(16)));
+static DRAM_ATTR StaticTask_t owner_control;
+_Static_assert(sizeof(owner_stack) == ZJ_OWNER_STACK_BYTES, "journal owner stack size");
 
 bool zj_owner_started(void) { return owner_task != NULL; }
 bool zj_owner_is_current_task(void)
@@ -610,7 +619,9 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     zj_mailbox_init(&owner->mailbox);
     owner->health.started = true;
     owner->compatibility = owner->health.compatibility = ZJ_COMPAT_NOT_READY;
-    if (xTaskCreate(task, "zkt_storage", 12288, owner, 5, &owner_task) != pdPASS) {
+    owner_task = xTaskCreateStatic(task, "zkt_storage", ZJ_OWNER_STACK_BYTES,
+        owner, 5, owner_stack, &owner_control);
+    if (!owner_task) {
         heap_caps_free(owner);
         owner = NULL;
         vSemaphoreDelete(mailbox_lock);

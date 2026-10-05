@@ -88,11 +88,25 @@ int xTaskCreate(void (*function)(void *), const char *name, unsigned stack,
                 void *argument, unsigned priority, TaskHandle_t *handle)
 {
     (void)name; (void)stack; (void)priority;
+    /* Replay the observed internal heap shape for the other required worker. */
+    if (stack > 11776U) return 0;
     task_function = function;
     task_argument = argument;
     *handle = &thread;
     assert(!pthread_create(&thread, NULL, worker, NULL));
     return pdPASS;
+}
+TaskHandle_t xTaskCreateStatic(void (*function)(void *), const char *name, unsigned stack,
+                              void *argument, unsigned priority, StackType_t *buffer, StaticTask_t *control)
+{
+    assert(!strcmp(name, "zkt_storage") && stack == 12288U && priority == 5);
+    assert(buffer && control && !control->used);
+    memset(buffer, 0xa5, stack); /* ASan verifies the complete caller-owned allocation. */
+    control->used++;
+    task_function = function;
+    task_argument = argument;
+    assert(!pthread_create(&thread, NULL, worker, NULL));
+    return &thread;
 }
 unsigned ulTaskNotifyTake(int clear, unsigned wait_ms)
 {

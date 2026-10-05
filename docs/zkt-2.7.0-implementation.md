@@ -10,7 +10,7 @@ Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 
 The 3FL 2.6.18 canary failed journal transport startup on a fragmented internal
 heap and returned to 2.6.15 through its existing rollback slot. The immutable
-2.6.19 replacement reserves the full worker stack, permits receipt-bound
+2.6.19 replacement reserves both full journal worker stacks, permits receipt-bound
 recovery before the healthy-storage gate, and distinguishes successful worker
 restarts from failed attempts. This source repair does not certify a signed
 bridge or enable the 2.7.0 writer; installed-image and recovery evidence remain

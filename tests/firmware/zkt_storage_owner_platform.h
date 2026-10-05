@@ -10,6 +10,9 @@ typedef struct { char project_name[32], version[32]; } esp_app_desc_t;
 const esp_app_desc_t *esp_app_get_description(void);
 typedef pthread_mutex_t *SemaphoreHandle_t;
 typedef pthread_t *TaskHandle_t;
+typedef uint8_t StackType_t;
+typedef struct { unsigned used; } StaticTask_t;
+#define DRAM_ATTR
 #define ESP_OK 0
 #define ESP_ERR_NVS_NOT_FOUND 1
 #define ESP_ERR_INVALID_SIZE 2
@@ -30,6 +33,7 @@ int xSemaphoreTake(SemaphoreHandle_t, unsigned);
 void xSemaphoreGive(SemaphoreHandle_t);
 void vSemaphoreDelete(SemaphoreHandle_t);
 int xTaskCreate(void (*)(void *), const char *, unsigned, void *, unsigned, TaskHandle_t *);
+TaskHandle_t xTaskCreateStatic(void (*)(void *), const char *, unsigned, void *, unsigned, StackType_t *, StaticTask_t *);
 void vTaskDelay(unsigned);
 unsigned ulTaskNotifyTake(int, unsigned);
 void xTaskNotifyGive(TaskHandle_t);

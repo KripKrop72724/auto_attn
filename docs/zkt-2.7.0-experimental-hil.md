@@ -25,8 +25,8 @@ The controlled USB reset returned the connector to its existing 2.6.15 slot;
 ADD recorded `ROLLED_BACK` and the 2.6.18 release was revoked. No storage was
 erased and no second target received that bridge.
 
-The replacement is a separate 2.6.19 role. It reserves the full transport stack
-and control structures in internal memory before heap fragmentation, permits
+The replacement is a separate 2.6.19 role. It reserves both full journal worker
+stacks and control structures in internal memory before heap fragmentation, permits
 the storage owner and transport to recover an available but unhealthy store,
 and still requires verified health before attestation, capture or boot success.
 Legacy delivery workers publish successful restart counts separately from
