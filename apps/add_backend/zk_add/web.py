@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import (
+    BackgroundTasks,
     Body,
     Depends,
     FastAPI,
@@ -33,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
+from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
@@ -413,7 +415,16 @@ async def require_connector(
         supplied_body_hash,
         signature,
     )
+    await asyncio.to_thread(_guard_hil_http, db, connector)
     return db, connector
+
+
+def _guard_hil_http(db: Session, connector: Connector) -> None:
+    try:
+        enforce_transport(db, connector, transport="HTTP")
+    except TransportInterrupted as error:
+        raise HTTPException(status_code=503, detail="HIL_ADD_INTERRUPT_30S",
+                            headers={"Retry-After": str(error.retry_after)}) from error
 
 
 @app.get("/health/live")
@@ -3997,6 +4008,9 @@ async def device_stream(websocket: WebSocket):
         return
     try:
         connector_pk = await asyncio.to_thread(authenticate_stream, connector_id, token)
+    except TransportInterrupted:
+        await websocket.close(code=1013)
+        return
     except ValueError:
         await websocket.close(code=4401)
         return
@@ -4031,6 +4045,9 @@ async def device_stream(websocket: WebSocket):
                 break
             try:
                 await handle_envelope(connector_pk, envelope, websocket)
+            except TransportInterrupted:
+                await websocket.close(code=1013, reason="Controlled ADD interruption")
+                break
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
@@ -4062,7 +4079,9 @@ async def device_stream(websocket: WebSocket):
 
 def authenticate_stream(connector_id: str, token: str) -> int:
     with session_scope() as db:
-        return authenticate_websocket_token(db, connector_id, token).id
+        connector = authenticate_websocket_token(db, connector_id, token)
+        enforce_transport(db, connector, transport="WEBSOCKET")
+        return connector.id
 
 
 def set_stream_connected(connector_pk: int, connected: bool) -> None:
@@ -4171,6 +4190,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         )
         if connector is None:
             return
+        enforce_transport(db, connector, transport="WEBSOCKET")
         sequence_replay = connector.boot_id == envelope.boot_id and envelope.seq <= connector.last_sequence
         # Custody ACKs must carry the original durable receipt on replay. A
         # generic transport ACK cannot authorize retiring preserved bytes.
@@ -4833,7 +4853,7 @@ from pathlib import Path as _Path  # noqa: E402
 from typing import Literal as _Literal  # noqa: E402
 
 from fastapi.responses import StreamingResponse as _StreamingResponse  # noqa: E402
-from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
+from pydantic import BaseModel as _BaseModel, Field as _Field, SecretStr as _SecretStr, ConfigDict as _ConfigDict  # noqa: E402
 from sqlalchemy import select as _select  # noqa: E402
 
 from zk_add.audit import append_audit as _append_audit  # noqa: E402
@@ -4868,6 +4888,49 @@ class _HilRunIn(_BaseModel):
     target: _HilTarget
     idempotency_key: str = _Field(min_length=8, max_length=120)
     profile: _Literal["FULL_REMOTE_HIL_V1", "BRIDGE_READINESS_V1"] = "FULL_REMOTE_HIL_V1"
+
+
+class _HilInterruptionIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    password: _SecretStr
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+
+def _hil_interruption_socket_scope(run_id: str, control_id: str):
+    from zk_add.hil_transport import pending_stream_close
+    with session_scope() as db:
+        return pending_stream_close(db, run_id, control_id)
+
+
+async def _close_hil_interrupted_stream(run_id: str, control_id: str) -> None:
+    scope = await asyncio.to_thread(_hil_interruption_socket_scope, run_id, control_id)
+    if scope is not None:
+        await connector_hub.interrupt_until(*scope)
+
+
+@app.post("/api/v1/firmware/hil-runs/{run_id}/interrupt-add")
+def interrupt_hil_add_transport(
+    run_id: str, body: _HilInterruptionIn, background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hil_transport import start_interruption
+
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        control, created = start_interruption(db, run_id, actor=context.username,
+                                              idempotency_key=body.idempotency_key)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    run = db.scalar(_select(_FirmwareHilRun).where(_FirmwareHilRun.run_id == run_id))
+    if created:
+        _append_audit(db, actor=context.username, action="FIRMWARE_HIL_ADD_INTERRUPT_STARTED",
+            target_type="connector", target_id=run.target["connector_id"], outcome="REQUESTED",
+            after={"run_id": run_id, "control_id": control["control_id"], "expires_at": control["expires_at"]})
+    db.commit()
+    if created:
+        background_tasks.add_task(_close_hil_interrupted_stream, run_id, control["control_id"])
+    return {"control": control, "created": created}
 
 
 @app.post("/api/v1/firmware/hil-runs", status_code=201)
@@ -5011,6 +5074,7 @@ async def _require_ota_connector(
             connector_fp = hashlib.sha256((connector_id or "").encode()[:120]).hexdigest()[:12]
             logger.warning("OTA_AUTH_REJECTED connector_fp=%s reason=%s", connector_fp, reason)
         raise
+    await asyncio.to_thread(_guard_hil_http, db, connector)
     return db, connector
 
 

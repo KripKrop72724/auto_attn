@@ -75,6 +75,34 @@ components and remaining integration. This policy document does not sign an
 artifact, enable a writer or create a campaign. Physical power-loss and flash
 endurance qualification remain `NOT_PERFORMED`.
 
+## Controlled ADD interruption
+
+The administrator `POST /api/v1/firmware/hil-runs/{run_id}/interrupt-add`
+operation accepts a password step-up and an idempotency key. It requires the
+exact installed 2.7.0 writer, an active `FULL_REMOTE_HIL_V1` observation, fresh
+same-boot preservation and source evidence, settled known queues and no active
+command or unresolved administrator lease. It is available only during the
+fourth observation minute and has a fixed 30-second duration.
+
+ADD commits the control before closing the selected connector's stream. Its
+authenticated HTTP and WebSocket paths refuse processing during the interval,
+before acknowledging any attendance or advancing an envelope sequence. Other
+connectors remain admitted. A replay returns the original control and cannot
+extend its deadline or close a stream again. Concurrent requests are tested
+against both PostgreSQL and SQLite.
+
+Expiry uses both UTC and the shared Linux kernel boot identity and monotonic
+clock. Each request checks the persisted deadlines; no surviving timer or
+manual resume is required. A host reboot, unavailable clock or regressed clock
+restores admission early. Once restoration is recorded, later clock changes
+cannot reactivate that control. Missing or invalid state cannot block traffic.
+
+The record distinguishes the requested interruption, first authenticated
+refusal and first transport restoration. Its outcome remains `NOT_EVALUATED`:
+transport restoration alone does not prove durable capture, Oracle delivery,
+successful ESP reboot or a completed HIL run. Those require their own collected
+evidence. The component tests do not mean a field interruption was performed.
+
 ## Compatibility bridge package
 
 Two controlled 2.6.16 canary attempts on 5 October rolled back before ADD

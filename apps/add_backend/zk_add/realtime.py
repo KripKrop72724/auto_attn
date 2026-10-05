@@ -147,6 +147,20 @@ class ConnectorHub:
         async with self._lock:
             return connector_id in self._connections
 
+    async def interrupt_until(self, connector_id: str, expires_at: datetime) -> bool:
+        """Close only the selected socket, and never after the test deadline."""
+        async with self._lock:
+            websocket = self._connections.get(connector_id)
+        remaining = (expires_at - utc_now()).total_seconds()
+        if websocket is None or remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(websocket.close(code=1013, reason="Controlled ADD interruption"),
+                                   timeout=min(3, remaining))
+            return True
+        except Exception:
+            return False
+
 
 browser_events = BrowserEventHub()
 connector_hub = ConnectorHub()
