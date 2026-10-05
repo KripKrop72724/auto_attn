@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { FirmwareDiagnostics } from '../types'
 import { FirmwareHealth } from './FirmwareHealth'
@@ -18,6 +18,31 @@ const journal: NonNullable<FirmwareDiagnostics['journal_runtime']> = {
   proof_attempts: 3, failures: 7, sampled_uptime_ms: 40000, compatibility: 'READER_OK',
 }
 describe('firmware preservation evidence', () => {
+  it('separates the current boot image and failure from the older OTA capability', () => {
+    render(<FirmwareHealth bootId="current" imageDigest={'8'.repeat(64)} observedAt={new Date().toISOString()}
+      diagnostics={{ ...healthy, ota_runtime: {
+        running_version: '2.6.17', running_partition: 'ota_1', image_sha256: 'f'.repeat(64),
+        state: 'UPDATING', last_error: 'BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED',
+        boot_health_checks: 899, boot_health_last_ready: false,
+      } }} />)
+    expect(within(screen.getByText('Reported running application digest').parentElement!).getByText('f'.repeat(64))).toBeTruthy()
+    expect(within(screen.getByText('Last OTA capability digest').parentElement!).getByText('8'.repeat(64))).toBeTruthy()
+    expect(screen.getByText(/Previous image is not qualified to read the preserved data/)).toBeTruthy()
+    expect(screen.getByText('899 · Last check not ready')).toBeTruthy()
+    expect(screen.getByText('2.6.17 · ota_1')).toBeTruthy()
+  })
+  it.each(['missing', 'stale', 'wrong-boot'])('does not substitute an older capability for %s current boot evidence', reason => {
+    const diagnostics = { ...healthy, ota_runtime: reason === 'missing' ? undefined : {
+      running_version: '2.6.17', image_sha256: 'f'.repeat(64), state: 'READY_TO_BOOT',
+    }, boot_id: reason === 'wrong-boot' ? 'previous' : 'current' }
+    render(<FirmwareHealth bootId="current" imageDigest={'8'.repeat(64)} diagnostics={diagnostics}
+      observedAt={new Date(Date.now() - (reason === 'stale' ? 46000 : 0)).toISOString()} />)
+    expect(within(screen.getByText('Current boot evidence').parentElement!).getByText('Unverified')).toBeTruthy()
+    const reported = within(screen.getByText('Reported running application digest').parentElement!)
+    expect(reported.queryByText('8'.repeat(64))).toBeNull()
+    if (reason === 'missing') expect(reported.getByText('Not reported')).toBeTruthy()
+    else expect(reported.getByText('f'.repeat(64))).toBeTruthy()
+  })
   it('keeps packet timing separate from failed attempts and stale or wrong-boot reports', () => {
     const diagnostics: FirmwareDiagnostics = { ...healthy, sampled_uptime_ms: 100000, workers: [
       { name: 'capture', state: 'RUNNING', last_activity_uptime_ms: 99000, failures: 3,

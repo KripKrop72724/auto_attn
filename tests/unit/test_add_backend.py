@@ -2975,6 +2975,34 @@ def test_tombstone_lookup_fails_closed_when_exact_user_id_uid_is_ambiguous(
     assert row.ords_status == "BLOCKED_IDENTITY"
 
 
+@pytest.mark.parametrize("schema", [1, 2])
+def test_boot_diagnostics_keep_current_image_separate_from_prior_capability(db: Session, schema):
+    connector = connector_fixture(db)
+    connector.ota_image_sha256 = "8" * 64
+    sampled_at = utc_now()
+    payload = HeartbeatPayload(firmware_version="zone-lite-2.6.17", uptime_seconds=1192,
+        ota={"running_version": "2.6.17", "running_partition": "ota_1", "image_sha256": "f" * 64,
+             "state": "UPDATING", "last_error": "BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED",
+             "boot_health_checks": 899, "boot_health_last_ready": False},
+        diagnostics={"schema_version": schema, "boot_id": "current", "sampled_uptime_ms": 1192000,
+                     "ota_runtime": {"image_sha256": "9" * 64, "boot_health_last_ready": True}})
+    update_heartbeat(db, connector=connector, boot_id="current", sequence=33,
+                     payload=payload, device_sent_at=sampled_at)
+    db.flush()
+    db.expire(connector, ["firmware_diagnostics"])
+    evidence = connector.firmware_diagnostics
+    assert evidence["ota_runtime"] == payload.ota.model_dump(mode="json")
+    assert evidence["boot_id"] == "current" and evidence["sample_sequence"] == 33
+    assert evidence["sampled_at"] == sampled_at.isoformat()
+    # Diagnostic evidence is not a replacement for capability/OTA admission.
+    assert connector.ota_image_sha256 == "8" * 64
+    update_heartbeat(db, connector=connector, boot_id="next-boot", sequence=1,
+                     payload=HeartbeatPayload(diagnostics={"schema_version": 1}))
+    assert connector.firmware_diagnostics["boot_id"] == "next-boot"
+    assert connector.firmware_diagnostics["ota_runtime"]["image_sha256"] is None
+    assert connector.firmware_diagnostics["ota_runtime"]["last_error"] == ""
+
+
 def test_durability_fault_survives_connected_heartbeat_until_verified_recovery(db: Session):
     connector = connector_fixture(db)
     heartbeat = {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}}

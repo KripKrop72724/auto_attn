@@ -50,6 +50,10 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const observed = observedAt ? Date.parse(observedAt) : NaN
   const sameBoot = Boolean(diagnostics?.boot_id && bootId && diagnostics.boot_id === bootId)
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
+  const ota = diagnostics?.ota_runtime
+  const currentBootReported = fresh && Boolean(ota?.running_version &&
+    ['factory', 'ota_0', 'ota_1'].includes(ota.running_partition || '') &&
+    /^[0-9a-f]{64}$/.test(ota.image_sha256 || ''))
   const storage = diagnostics?.storage
   const journal = diagnostics?.journal_runtime
   const journalStorage = diagnostics?.journal_storage
@@ -101,7 +105,16 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Telemetry received</dt><dd>{observedAt ? new Date(observedAt).toLocaleString() : 'Not reported'}{Number.isFinite(observed) ? ` · ${Math.max(0, Math.floor((now - observed) / 1000))} seconds ago` : ''}</dd></div>
         <div><dt>Telemetry sampled</dt><dd>{diagnostics.sampled_at || 'Not reported'}</dd></div>
         <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Boot identity is unverified' : ''}</dd></div>
-        <div><dt>Application digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{imageDigest || 'Not reported'}</dd></div>
+        <div><dt>Current boot evidence</dt><dd>{currentBootReported ? 'Fresh report from this boot' : 'Unverified'}</dd></div>
+        <div><dt>Reported running image</dt><dd>{ota?.running_version || 'Not reported'}{ota?.running_partition ? ` · ${ota.running_partition}` : ''}</dd></div>
+        <div><dt>Reported running application digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{ota?.image_sha256 || 'Not reported'}</dd></div>
+        <div><dt>Last OTA capability digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{imageDigest || 'Not reported'}</dd></div>
+        <div><dt>Reported OTA state</dt><dd>{ota?.state?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
+        {!!ota?.last_error && <div><dt>Reported OTA error</dt><dd>{ota.last_error === 'BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED'
+          ? 'Previous image is not qualified to read the preserved data; connector rollback is held.'
+          : ota.last_error.replaceAll('_', ' ')}</dd></div>}
+        <div><dt>Local boot checks</dt><dd>{ota?.boot_health_checks
+          ? `${ota.boot_health_checks} · ${ota.boot_health_last_ready ? 'Last check ready' : 'Last check not ready'}` : 'No checks reported'}</dd></div>
         <div><dt>Oracle delivery owner</dt><dd>{fresh && diagnostics.delivery_authority === 'ADD' ? 'ADD'
           : fresh && diagnostics.delivery_authority === 'LEGACY_DUAL' ? 'Legacy delivery paths' : 'Current ownership unverified'}</dd></div>
         <div><dt>Storage used / total</dt><dd>{bytes(storage?.used_bytes)} / {bytes(storage?.total_bytes)}</dd></div>
