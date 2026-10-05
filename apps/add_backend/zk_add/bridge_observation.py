@@ -168,9 +168,10 @@ def complete_bridge_run(session, run_id, *, actor):
             errors.append("FAILURE_COUNTER_CHANGED")
         if before["source"]["generation"] != after["source"]["generation"]:
             errors.append("SOURCE_GENERATION_CHANGED")
-        if (all(_integer(sample["source"]["cursor"]) for sample in (before, after))
-                and before["source"]["cursor"] > after["source"]["cursor"]):
-            errors.append("SOURCE_CURSOR_REGRESSED")
+        for key in ("cursor", "count"):
+            if (all(_integer(sample["source"][key]) for sample in (before, after))
+                    and before["source"][key] > after["source"][key]):
+                errors.append("SOURCE_" + key.upper() + "_REGRESSED")
     if samples and samples[-1]["source"]["cursor"] != samples[-1]["source"]["count"]:
         errors.append("SOURCE_TAIL_PENDING")
     latest = session.scalar(select(DeviceTelemetry).where(DeviceTelemetry.connector_id == run.connector_id)
@@ -184,6 +185,12 @@ def complete_bridge_run(session, run_id, *, actor):
         if samples and (current["counters"] != samples[-1]["counters"]
                         or current["source"]["generation"] != samples[-1]["source"]["generation"]):
             errors.append("CURRENT_HEALTH_CHANGED")
+        if current["source"]["cursor"] != current["source"]["count"]:
+            errors.append("CURRENT_SOURCE_TAIL_PENDING")
+        for key in ("cursor", "count"):
+            if (samples and all(_integer(sample["source"][key]) for sample in (samples[-1], current))
+                    and current["source"][key] < samples[-1]["source"][key]):
+                errors.append("CURRENT_SOURCE_" + key.upper() + "_REGRESSED")
     run.status = "BRIDGE_INCOMPLETE" if errors else "BRIDGE_READY"
     run.completed_at = now
     run.result = {"profile": PROFILE, "outcome": "INCOMPLETE" if errors else "READY",

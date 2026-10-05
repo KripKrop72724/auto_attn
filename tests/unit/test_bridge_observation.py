@@ -188,6 +188,22 @@ def test_unbacked_event_or_full_hil_label_cannot_advance_bridge(bridge):
         assert _permitted_hil_targets(session, release)[0].model_dump() == signed_hil_targets()[0]
 
 
+def test_source_regression_after_observation_still_prevents_readiness(bridge):
+    session, release, device, _, run, rows = bridge
+    latest = deepcopy(rows[-1].payload)
+    latest["diagnostics"]["committed_source_cursor"] = 99
+    latest["zkt"]["attendance_count"] = 99
+    stamp = ensure_utc(run.ends_at) + timedelta(seconds=1)
+    latest["_trusted_envelope_sent_at"] = stamp.isoformat()
+    session.add(DeviceTelemetry(connector_id=device.id, boot_id=device.boot_id, created_at=stamp,
+        uptime_seconds=1001, sequence=9999, payload=latest))
+    session.flush()
+    complete_bridge_run(session, run.run_id, actor="admin")
+    assert run.status == "BRIDGE_INCOMPLETE"
+    assert "CURRENT_SOURCE_CURSOR_REGRESSED" in run.result["reasons"]
+    assert _permitted_hil_targets(session, release)[0].model_dump() == signed_hil_targets()[0]
+
+
 def test_bridge_readiness_is_not_general_hil_acceptance(hil_session):  # noqa: F811
     from zk_add.ota import FirmwareCampaign, FirmwareDeployment
 
