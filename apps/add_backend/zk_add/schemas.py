@@ -8,7 +8,7 @@ from typing import Any, Literal
 from zk_add.hikvision_clock import HikvisionClockSample
 from zk_add.capture_latency import CaptureLatencyHistogram
 
-from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -191,6 +191,46 @@ class JournalRuntimeDiagnostics(BaseModel):
     compatibility: str | None = Field(default=None, max_length=64)
 
 
+class SourceBoundaryDiagnostics(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal[1]
+    observed: bool
+    verified: bool
+    migration_certified: Literal[False]
+    result: Literal["OK", "EMPTY", "FULL", "IO", "CORRUPT", "STALE", "INVALID", "UNCERTAIN", "NOT_OBSERVED", "UNKNOWN"]
+    next_ordinal: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    record_size: Literal[0, 8, 16, 40] | None = None
+    capture_epoch: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    writer_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    terminal_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    anchor_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_types(cls, value):
+        if isinstance(value, dict) and (
+            type(value.get("schema_version")) is not int or value.get("migration_certified") is not False
+            or (value.get("record_size") is not None and type(value["record_size"]) is not int)
+        ):
+            raise ValueError("SOURCE_BOUNDARY_TYPES")
+        return value
+
+    @model_validator(mode="after")
+    def complete_binding(self):
+        fields = (self.next_ordinal, self.record_size, self.capture_epoch,
+                  self.writer_digest, self.terminal_digest, self.anchor_digest)
+        if self.verified:
+            if (not self.observed or self.result != "OK" or any(value is None for value in fields)
+                    or self.capture_epoch == "0" * 32 or self.writer_digest == "0" * 64
+                    or self.terminal_digest == "0" * 64
+                    or (self.next_ordinal == 0 and (self.record_size != 0 or self.anchor_digest != "0" * 64))
+                    or (self.next_ordinal != 0 and (self.record_size == 0 or self.anchor_digest == "0" * 64))):
+                raise ValueError("SOURCE_BOUNDARY_INCOMPLETE")
+        elif any(value is not None for value in fields):
+            raise ValueError("SOURCE_BOUNDARY_UNVERIFIED_FACTS")
+        return self
+
+
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1, 2] = 1
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
@@ -204,6 +244,7 @@ class FirmwareDiagnostics(BaseModel):
     memory: MemoryDiagnostics | None = None
     journal_runtime: JournalRuntimeDiagnostics | None = None
     journal_storage: JournalStorageDiagnostics | None = None
+    source_boundary: SourceBoundaryDiagnostics | None = None
     queues: list[QueueDiagnostics] = Field(default_factory=list, max_length=12)
     workers: list[WorkerDiagnostics] = Field(default_factory=list, max_length=8)
     reconciliation_mode: str | None = Field(default=None, max_length=40)
