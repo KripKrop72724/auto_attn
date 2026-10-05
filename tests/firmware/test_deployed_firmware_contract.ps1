@@ -8,7 +8,20 @@ function docker {
     $arguments = @($args)
     [void]$global:admissionTestCalls.Add($arguments)
     $global:LASTEXITCODE = 0
-    if ($arguments[0] -eq 'cp') {
+    if ($arguments[0] -eq 'cp') { throw 'docker cp cannot transfer into the production tmpfs mount' }
+    if ($arguments[0] -eq 'exec' -and $arguments[1] -eq '-i') {
+        if ($arguments[3] -ne 'python' -or $arguments[4] -ne '-c' -or $arguments[5] -notmatch 'b64decode') {
+            throw 'Admission transfer must decode bounded public bytes inside the container'
+        }
+        $encoded = @($input)
+        if ($encoded.Count -ne 1) { throw 'Admission transfer requires one bounded encoded payload' }
+        $decoded = [Convert]::FromBase64String($encoded[0])
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $actual = ([BitConverter]::ToString($hasher.ComputeHash($decoded))).Replace('-', '').ToLowerInvariant() }
+        finally { $hasher.Dispose() }
+        if ($actual -cne $arguments[-1] -or $arguments[-2] -notmatch '^/tmp/add-firmware-admission-[a-f0-9]{32}/(manifest.json|manifest.sig|check.py)$') {
+            throw 'Transferred metadata identity or destination changed'
+        }
         if ($global:admissionTestScenario -eq 'copy-failure') { $global:LASTEXITCODE = 1 }
         return
     }

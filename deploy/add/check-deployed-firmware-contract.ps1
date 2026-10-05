@@ -24,10 +24,15 @@ try {
     & docker exec $AddContainer python -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).mkdir(mode=0o700)' $temporary
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare deployed ADD admission check.' }
     $created = $true
-    # Copy bounded public metadata and an inspector, never firmware credentials
-    # or backend code. File execution avoids Windows stdin truncation issues.
+    # /tmp is tmpfs in production; docker cp does not see that mount reliably.
+    # Transfer bounded public bytes through exec, checking each digest before
+    # executing the saved inspector. Base64 is lossless through PowerShell 5.1's
+    # text pipeline; Python code is still executed from a file, not stdin.
     foreach ($item in @(@($manifest, 'manifest.json'), @($signature, 'manifest.sig'), @($script, 'check.py'))) {
-        & docker cp $item[0] "${AddContainer}:$temporary/$($item[1])"
+        $bytes = [IO.File]::ReadAllBytes($item[0])
+        if ($bytes.Length -gt 65536) { throw 'Firmware admission file exceeds its bounded format.' }
+        $fileDigest = (Get-FileHash -LiteralPath $item[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+        [Convert]::ToBase64String($bytes) | & docker exec -i $AddContainer python -c 'import base64,hashlib,os,pathlib,sys; os.umask(0o077); encoded=sys.stdin.buffer.read(131073).strip(); assert len(encoded)<=131072; data=base64.b64decode(encoded,validate=True); assert len(data)<=65536 and hashlib.sha256(data).hexdigest()==sys.argv[2]; assert pathlib.Path(sys.argv[1]).write_bytes(data)==len(data)' "$temporary/$($item[1])" $fileDigest
         if ($LASTEXITCODE -ne 0) { throw 'Could not transfer deployed ADD admission check.' }
     }
     $report = @(& docker exec $AddContainer python "$temporary/check.py" "$temporary/manifest.json" "$temporary/manifest.sig" $digest 2>$null)
