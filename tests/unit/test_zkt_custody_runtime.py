@@ -48,9 +48,9 @@ def test_saturated_sites_rotate_under_the_time_budget(custody, monkeypatch, site
     now = [0.0]
     inspected = []
     original = work.inspect_work
-    def inspect(session, row):
+    def inspect(session, row, **kwargs):
         inspected.append(row.connector_id)
-        original(session, row)
+        original(session, row, **kwargs)
         now[0] += 0.010  # One expensive group consumes this tick's budget.
     monkeypatch.setattr(work, "inspect_work", inspect)
     cursor = 0
@@ -89,8 +89,8 @@ def test_database_rollback_cannot_advance_cursor_or_progress(custody, monkeypatc
             raise
     monkeypatch.setattr("zk_add.db.session_scope", scope)
     original = work.inspect_work
-    def fail(session, row):
-        original(session, row)
+    def fail(session, row, **kwargs):
+        original(session, row, **kwargs)
         raise SQLAlchemyError("synthetic private error payload")
     monkeypatch.setattr(work, "inspect_work", fail)
     processor = runtime.CustodyProcessor()

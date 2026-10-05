@@ -23,6 +23,21 @@ beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => response(fixture()))
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('ZKT custody evidence', () => {
+  it('keeps derived attendance separate from Oracle completion and model qualification', async () => {
+    const value = fixture()
+    value.counts = [{ state: 'ATTENDANCE_CREATED', owner: 'ADD_DELIVERY', count: 1 }]
+    value.rows[0] = { ...value.rows[0], state: 'ATTENDANCE_CREATED', owner: 'ADD_DELIVERY',
+      reason_code: 'EXPERIMENTAL_SOURCE_ATTENDANCE_V1', decoding: { version: 'synthetic-v1',
+        result: 'UNQUALIFIED_FACTS', current_input: true, current_decoder: true,
+        authority: 'UNQUALIFIED', step_index: 0, sampled_at: value.sampled_at } }
+    vi.mocked(fetch).mockResolvedValue(response(value))
+    mount()
+    expect(await screen.findByText('Attendance created from source · Attendance delivery')).toBeTruthy()
+    expect(screen.getByText('Attendance created; delivery has separate evidence')).toBeTruthy()
+    expect(screen.getByText('Proposed facts · qualification required')).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+    expect(screen.queryByText(/Healthy|All delivered/i)).toBeNull()
+  })
   it.each([
     ['UNQUALIFIED_FACTS', true, true, 'Proposed facts · qualification required'],
     ['AMBIGUOUS_LAYOUT', true, true, 'Ambiguous record layout'],

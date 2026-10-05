@@ -7,9 +7,11 @@ Status: implemented component, inactive for field records. This does not release
 qualified occurrence creation. It requires a new attendance UID equal to the
 occurrence identity, a matching source epoch/ordinal/raw digest, and a consistent
 manifest, alias, attendance and outbox relationship. It refuses legacy UIDs and
-ambiguous source associations. No current ingestion path calls this helper.
-Profile qualification, correct identity evidence and canonical attendance
-creation remain the future caller's responsibility.
+ambiguous source associations. The source inspector now calls it only behind a
+persisted cutover permit. No field permit is created by deployment or heartbeat;
+the verified legacy/source handoff remains required before activation. Original
+raw manifests and aliases keep their original null attendance links, with the
+derived event recorded in a separate source-attendance binding.
 
 ## Durable route and replay
 
