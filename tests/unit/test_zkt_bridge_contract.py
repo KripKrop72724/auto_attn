@@ -329,7 +329,11 @@ def test_real_bridge_campaign_and_scope_expansion_require_exact_previous_accepta
     assert _permitted_hil_targets(session, release)[0].connector_id == connectors[0].connector_id
     deployment.status = "SUCCEEDED"
     session.flush()
-    assert _permitted_hil_targets(session, release)[0].connector_id == connectors[1].connector_id
+    # The original bridge retains its historical verdict contract. Replacement
+    # preparation requires a stored BRIDGE_READINESS_V1 run, exercised by the
+    # real server-observation tests; a generic HIL event cannot stand in for it.
+    expected = 1 if BRIDGE_VERSION == "2.6.16" else 0
+    assert _permitted_hil_targets(session, release)[0].connector_id == connectors[expected].connector_id
     event.details = {**details, "application_sha256": "f" * 64}
     session.flush()
     assert _permitted_hil_targets(session, release)[0].connector_id == connectors[0].connector_id
