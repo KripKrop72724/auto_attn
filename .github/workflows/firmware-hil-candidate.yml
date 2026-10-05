@@ -77,8 +77,14 @@ jobs:
           if mac and not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
               raise SystemExit('Invalid HIL MAC')
           targets = json.loads(raw) if raw else None
+          journal_bridge = os.environ['INPUT_VERSION'] == '2.6.16'
+          target_limit = 17 if journal_bridge else 8
+          if journal_bridge:
+              expected = json.load(open('deploy/add/hil-targets-zkt-270.json'))
+              if not isinstance(targets, list) or not targets or targets != expected[:len(targets)]:
+                  raise SystemExit('Journal bridge requires its exact ordered nationwide prefix')
           if targets is not None:
-              if not isinstance(targets, list) or not 1 <= len(targets) <= 8:
+              if not isinstance(targets, list) or not 1 <= len(targets) <= target_limit:
                   raise SystemExit('Invalid ordered target list')
               for row in targets:
                   if not isinstance(row, dict) or set(row) != {'connector_id', 'mac', 'terminal_serial'}:

@@ -630,6 +630,18 @@ if (-not $rejected) { throw 'Mislabelled Hikvision image accepted' }
 $bridgeImage = Join-Path $source 'zone-lite-2.6.16.bin'
 [IO.File]::WriteAllText($bridgeImage, 'Bridge fixture, not deployable firmware')
 $manifest = @{version='2.6.16';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.6.16';image_name='zone-lite-2.6.16.bin';image_sha256=(Get-FileHash $bridgeImage).Hash.ToLowerInvariant();image_size=(Get-Item $bridgeImage).Length;git_sha=('a'*40);application_sha256=('d'*64);release_channel='EXPERIMENTAL_HIL_ONLY';queue_storage=$bridgeContract}
+. (Join-Path $repo 'deploy/add/journal-hil-scope.ps1')
+$journalTargets = Get-JournalHilScope
+$manifest.hil_targets = $journalTargets
+$journalScope = ConvertTo-Json -InputObject @($journalTargets[0]) -Depth 5 -Compress
+foreach ($count in 1..17) {
+    Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject @($journalTargets[0..($count-1)]) -Depth 5 -Compress)
+}
+foreach ($bad in @('[]', $targets, (ConvertTo-Json -InputObject @($journalTargets[1], $journalTargets[0]) -Depth 5 -Compress))) {
+    $rejected = $false
+    try { Assert-JournalHilScope -TargetsJson $bad } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Journal scope accepted unreviewed target identities or order' }
+}
 Write-TestManifest
 foreach ($mode in @('AVAILABLE', 'HIL_ONLY')) {
     $rejected = $false
@@ -643,7 +655,7 @@ foreach ($mode in @('AVAILABLE', 'HIL_ONLY')) {
     if (-not $rejected) { throw 'Experimental publication bypassed ordered HIL quarantine' }
 }
 if (Test-Path (Join-Path $store '2.6.16')) { throw 'Rejected bridge publication left a release' }
-& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode HIL_ONLY -HilTargetsJson $targets
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode HIL_ONLY -HilTargetsJson $journalScope
 $bridgeScopePath = Join-Path $store '2.6.16/.hil-only.json'
 $bridgeScopeBefore = [IO.File]::ReadAllText($bridgeScopePath)
 $bridgeOutput = Join-Path $root 'bridge-promotion-output'
@@ -654,6 +666,20 @@ try {
 if (-not $rejected -or (Test-Path $bridgeOutput) -or
     [IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) {
     throw 'Experimental promotion changed the quarantine or produced output'
+}
+$fullJournalScope = ConvertTo-Json -InputObject $journalTargets -Depth 5 -Compress
+$bridgeArguments = @{
+    StoreDirectory=$store; Version='2.6.16'; ExpectedGitSha=('a'*40)
+    ExpectedImageSha256=[string]$manifest.image_sha256; ExpectedApplicationSha256=('d'*64)
+    ExistingTargetsJson=$journalScope; ExtendedTargetsJson=$fullJournalScope
+}
+& $extend @bridgeArguments -PreviewOnly
+if ([IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) { throw 'Journal preview changed quarantine' }
+& $extend @bridgeArguments
+$expandedBridge = Get-Content $bridgeScopePath -Raw | ConvertFrom-Json
+if ($expandedBridge.targets.Count -ne 17) { throw 'Journal scope expansion lost a nationwide target' }
+if ((Get-FileHash (Join-Path $store '2.6.16/zone-lite-2.6.16.bin')).Hash.ToLowerInvariant() -cne $manifest.image_sha256) {
+    throw 'Journal expansion changed signed image bytes'
 }
 Write-Host 'Publication regression tests passed'
 

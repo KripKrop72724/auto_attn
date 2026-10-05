@@ -95,6 +95,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release me
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
+$journalHilTargets = $null
+if ($Version -eq '2.6.16') {
+    if ($FirmwareFamily -ne 'zkt') { throw 'The journal bridge is ZKT-only' }
+    . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
+    Assert-JournalHilScope -TargetsJson $HilTargetsJson
+    $journalHilTargets = Get-JournalHilScope
+}
 if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
     # A signed candidate is necessary to exercise the five physical terminals.
     # Production publication still requires promotion of these exact HIL bytes
@@ -219,9 +226,9 @@ try {
         # Keep canonical lexical key order used by ADD signature verification.
         $sortedManifest = [ordered]@{}
         $additionalKeys = @('queue_storage')
-        if ($Version -eq '2.6.16') { $additionalKeys += 'release_channel' }
+        if ($Version -eq '2.6.16') { $additionalKeys += @('hil_targets', 'release_channel') }
         foreach ($key in @($manifest.Keys + $additionalKeys | Sort-Object)) {
-            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })
+            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'hil_targets') { $journalHilTargets } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })
         }
         $manifest = $sortedManifest
     }

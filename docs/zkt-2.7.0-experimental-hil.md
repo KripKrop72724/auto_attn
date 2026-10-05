@@ -68,7 +68,14 @@ OTA-slot predecessor with one of the pinned 2.4.12, 2.5.2 or 2.6.15 application
 digests. Factory partitions remain excluded until their exact transition is
 implemented. A version string alone cannot authorize an installation.
 
-Publication requires ordered connector/MAC/terminal identities. Both publisher
+The signed manifest declares all 17 ordered connector/MAC/terminal identities.
+The initial quarantine can expose only its leading canary; subsequent marker
+extensions must retain that exact prefix and cannot change the signed image or
+manifest. ADD advances to the next exposed target only after the preceding
+target's successful deployment and matching artifact HIL acceptance. This
+release-specific scope leaves legacy campaigns' shared configuration intact.
+An unavailable target stays pending; no acceptance is inferred from absence.
+Both publisher
 and promoter reject general production availability for this experimental
 package, and ADD rejects missing quarantine. Runtime reader attestation, storage
 recovery and persisted delivery authority remain independent of packaging.

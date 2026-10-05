@@ -1,0 +1,87 @@
+[
+  {
+    "connector_id": "2ca9a4c2-5ae4-4330-8d14-840223672897",
+    "mac": "a4:cb:8f:d4:66:64",
+    "terminal_serial": "PGB1261200074"
+  },
+  {
+    "connector_id": "ef1b6fe9-592b-4cf3-95e7-9c6b600f7812",
+    "mac": "ac:27:6e:a5:47:64",
+    "terminal_serial": "AEXH232260005"
+  },
+  {
+    "connector_id": "ab5f934a-5430-4ba2-a86d-5ac849276e0d",
+    "mac": "a4:cb:8f:d4:61:ac",
+    "terminal_serial": "CKPG221260316"
+  },
+  {
+    "connector_id": "0e991162-5ab9-467a-a952-4dc4c420691c",
+    "mac": "ac:27:6e:a3:10:0c",
+    "terminal_serial": "RKQ4245100152"
+  },
+  {
+    "connector_id": "06d8706c-8b9e-4a48-b8c7-a76d16da6ed4",
+    "mac": "ac:27:6e:a3:de:e8",
+    "terminal_serial": "AF4C211861133"
+  },
+  {
+    "connector_id": "bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e",
+    "mac": "e0:72:a1:d7:05:c4",
+    "terminal_serial": "CJH9211060009"
+  },
+  {
+    "connector_id": "510baddb-8eff-4817-bc48-549ee34bbd0f",
+    "mac": "ac:27:6e:a4:4e:d4",
+    "terminal_serial": "PGB1261300022"
+  },
+  {
+    "connector_id": "beb5f8eb-e4f3-4620-8f1a-cfa460bb1b73",
+    "mac": "ac:27:6e:a5:5a:20",
+    "terminal_serial": "CKPG221260245"
+  },
+  {
+    "connector_id": "9726fe6c-2905-447a-9041-2fa606660058",
+    "mac": "ac:27:6e:a3:16:d4",
+    "terminal_serial": "AEH2232460004"
+  },
+  {
+    "connector_id": "474fd36e-6c75-4e0d-9c1f-cc97c4a442f8",
+    "mac": "ac:27:6e:a3:07:f8",
+    "terminal_serial": "OCN6060066052700045"
+  },
+  {
+    "connector_id": "233dac02-eb1b-4598-a876-e3a7b1ecfd54",
+    "mac": "e0:72:a1:d5:08:a0",
+    "terminal_serial": "CJH9211060002"
+  },
+  {
+    "connector_id": "4567587c-29ee-4e59-92a4-6c36650a84aa",
+    "mac": "e0:72:a1:d6:3c:7c",
+    "terminal_serial": "PGB1261200077"
+  },
+  {
+    "connector_id": "8727e27a-77be-41c7-bb9e-5a7f31e4ae67",
+    "mac": "ac:27:6e:a4:54:b4",
+    "terminal_serial": "CKPG221260408"
+  },
+  {
+    "connector_id": "7d6fadcc-f93e-4c35-b4cc-852af1ffac0c",
+    "mac": "a4:cb:8f:d4:67:70",
+    "terminal_serial": "RKQ4254900154"
+  },
+  {
+    "connector_id": "a1ff7b24-4dcb-4dde-ad41-1a8401c7b006",
+    "mac": "e0:72:a1:d6:f3:28",
+    "terminal_serial": "PGB1254700027"
+  },
+  {
+    "connector_id": "2f5cedd8-e314-47b0-8074-bc4bb8a603cc",
+    "mac": "ac:27:6e:a3:0a:08",
+    "terminal_serial": "PGB1261300034"
+  },
+  {
+    "connector_id": "a886e2d9-204d-425c-bc8f-ded85fc89874",
+    "mac": "ac:27:6e:a5:4c:d8",
+    "terminal_serial": "PGB1254700036"
+  }
+]

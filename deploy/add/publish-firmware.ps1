@@ -22,6 +22,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Firmware manifest is not in ADD canonical sign
 
 $manifest = Get-Content (Join-Path $source 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $Version) { throw 'Manifest version does not match requested version' }
+$journalBridge = $Version -eq '2.6.16' -and $manifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY'
+if ($journalBridge) {
+    . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
+    Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete
+    Assert-JournalHilScope -TargetsJson $HilTargetsJson
+}
 $expectedImage = $(if ($manifest.firmware_family -eq 'hikvision') { "zone-lite-hikvision-$Version.bin" } else { "zone-lite-$Version.bin" })
 if ($manifest.image_name -ne $expectedImage) { throw 'Manifest image name is invalid' }
 $image = Join-Path $source $manifest.image_name
@@ -36,7 +42,8 @@ if (-not [string]::IsNullOrWhiteSpace($HilTargetsJson)) {
     # wrap that pipeline in @(), which creates a nested array on that runtime.
     $parsedTargets = ConvertFrom-Json -InputObject $HilTargetsJson
     $parsedTargets = @($parsedTargets)
-    if ($parsedTargets.Count -lt 1 -or $parsedTargets.Count -gt 8) { throw 'HIL requires one to eight ordered exact targets' }
+    $targetLimit = if ($journalBridge) { 17 } else { 8 }
+    if ($parsedTargets.Count -lt 1 -or $parsedTargets.Count -gt $targetLimit) { throw 'HIL requires an ordered list within the release target limit' }
     foreach ($target in $parsedTargets) {
         $keys = @($target.PSObject.Properties | ForEach-Object { [string]$_.Name })
         if ($keys.Count -ne 3 -or $keys -cnotcontains 'connector_id' -or

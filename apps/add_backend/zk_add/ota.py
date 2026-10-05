@@ -302,6 +302,9 @@ def _is_2615_bld5_extension(release: FirmwareRelease, targets: list[HilTarget]) 
 
 
 def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
+    if identity[:2] == ("zone-lite-2.6.16", "2.6.16"):
+        from zk_add.zkt_bridge_contract import bridge_hil_targets
+        return bridge_hil_targets(raw)
     # The general parser retains its eight-device limit. Only the exact
     # already signed image and reviewed fourteen-device scope can exceed it.
     if identity == HIL_2615_BLD5_IDENTITY and raw == [target.model_dump() for target in HIL_2615_CITY_TARGETS]:
@@ -313,12 +316,17 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
-    if not settings.firmware_hil_enabled or not settings.firmware_hil_targets_json:
+    bridge = release.version == "2.6.16"
+    if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
+    if bridge:
+        # Exact signed scope replaces the old shared configuration for the
+        # bridge only. Registering it cannot change an older campaign's scope.
+        validate_storage_contract(release.manifest or {}, release.version)
     identity = (release.release_id, release.version, release.git_sha,
                 release.image_sha256, _application_sha256(release))
     targets = _parse_release_hil_targets(identity, raw)
-    configured = parse_hil_targets(json.loads(settings.firmware_hil_targets_json))
+    configured = targets if bridge else parse_hil_targets(json.loads(settings.firmware_hil_targets_json))
     bld5_extension = _is_2615_bld5_extension(release, targets)
     city_extension = (release.state == "HIL_ONLY" and identity == HIL_2615_BLD5_IDENTITY
                       and tuple(targets) == HIL_2615_CITY_TARGETS)

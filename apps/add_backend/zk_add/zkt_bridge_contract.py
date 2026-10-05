@@ -1,6 +1,8 @@
 """Exact bridge packaging for experimental HIL; no writer or production grant."""
 import struct
 
+from zk_add.zkt270_scope import TARGETS
+
 BRIDGE_VERSION = "2.6.16"
 BRIDGE_MARKER = "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
 PREDECESSOR_IMAGES = {
@@ -8,6 +10,18 @@ PREDECESSOR_IMAGES = {
     "2.5.2": "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b",
     "2.6.15": "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6",
 }
+
+
+def signed_hil_targets() -> list[dict]:
+    return [target.identity.model_dump() for target in TARGETS]
+
+
+def bridge_hil_targets(raw: object) -> list:
+    """Quarantine can expose only an ordered prefix of the signed nationwide scope."""
+    if (not isinstance(raw, list) or not 1 <= len(raw) <= len(TARGETS)
+            or raw != signed_hil_targets()[:len(raw)]):
+        raise ValueError("Journal bridge HIL scope must retain the exact nationwide prefix.")
+    return [target.identity for target in TARGETS[:len(raw)]]
 
 
 def bridge_contract() -> dict:
@@ -31,10 +45,12 @@ def validate_bridge_manifest(manifest: dict) -> dict:
     contract = manifest.get("queue_storage")
     expected = bridge_contract()
     if (manifest.get("version") != BRIDGE_VERSION
+            or manifest.get("release_id") != "zone-lite-2.6.16"
             or manifest.get("firmware_family") != "zkt"
             or manifest.get("project_name") != "zone_lite"
             or manifest.get("release_channel") != "EXPERIMENTAL_HIL_ONLY"
             or manifest.get("minimum_bootstrap_version") != "2.4.12"
+            or manifest.get("hil_targets") != signed_hil_targets()
             or not isinstance(contract, dict) or contract != expected
             or any(type(contract[key]) is not type(value) for key, value in expected.items())):
         raise ValueError("Journal bridge requires its exact experimental HIL storage contract.")
