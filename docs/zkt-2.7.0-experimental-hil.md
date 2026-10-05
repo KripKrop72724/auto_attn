@@ -106,3 +106,34 @@ signatures, the signing script's manifest construction, RSA-PSS verification by
 ADD, invalid predecessor/capability packages and publication/promotion refusal.
 The hosted CI gate additionally exercises production Windows PowerShell 5.1.
 Local test keys and CI setup credentials are never field signing credentials.
+
+## Source-to-attendance integration
+
+The bounded source inspector can create a canonical attendance row and an
+ADD-owned Oracle intent in one transaction. Migration `0051` adds separate
+cutover and derived-binding tables; it never rewrites original raw manifests,
+source-chain dispositions, occurrence aliases or earlier interpretations.
+Identical bytes at separate ordinals remain distinct punches. An unchanged
+recovery-prefix ordinal reuses its ancestor's event and intent. Changed,
+missing, cyclic or unrelated ancestry stays held with a reason.
+
+Creation requires a persisted, protected source cutover binding the connector,
+terminal, model, source epoch, first new ordinal, layout, decoder, writer image,
+boot and migration evidence. Neither a firmware version nor a plausible decode
+creates that permit. The release handoff must still prove and issue it; this
+migration creates no field permits. Records before its boundary retain their
+existing legacy reconciliation obligation. This is necessary to avoid minting
+new identities for delayed legacy records.
+
+Experimental source layouts use the repository decoder for the six declared
+model profiles and retain `NOT_ASSERTED` qualification. Complete interpretation
+coverage and matching raw bytes are rechecked. Historical attendance UIDs are
+never enrollment IDs: the eight-byte layout remains an identity-reference hold.
+The ordinary identity/continuity/manual-approval rules still decide whether a
+new attendance is deliverable. A hold receives a durable outbox and owned intent
+without resolving an employee. UID membership receipts retain their narrower
+scope; attendance creation alone never becomes Oracle completion.
+
+The tests exercise the real raw-custody ingress, source worker, identity gates,
+delivery claim and membership adapter with synthetic data. They do not issue a
+field cutover, qualify a terminal model, or complete live/source matching.

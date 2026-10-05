@@ -236,6 +236,15 @@ def bind_source_occurrence(session: Session, connector: Connector,
     return alias.occurrence_id
 
 
+def occurrence_attendance_id(session: Session, connector: Connector, alias: ZktOccurrenceAlias) -> int | None:
+    """Resolve an existing link without modifying an immutable raw manifest."""
+    if alias.attendance_event_id is not None:
+        return alias.attendance_event_id
+    from zk_add.zkt_source_attendance import binding_event
+    event = binding_event(session, connector, alias)
+    return event.id if event else None
+
+
 def source_occurrence_delivery_hold(session: Session, connector: Connector, identity: str) -> str | None:
     """Reject an ambiguous legacy delivery link, never mint a replacement UID.
 
@@ -256,9 +265,14 @@ def source_occurrence_delivery_hold(session: Session, connector: Connector, iden
         return "SOURCE_OCCURRENCE_LINK_CONFLICT"
     if alias.attendance_event_id != manifest.attendance_event_id:
         return "SOURCE_ATTENDANCE_LINK_CHANGED"
-    if alias.attendance_event_id is None:
+    from zk_add.zkt_source_attendance import SourceAttendanceHold
+    try:
+        event_id = occurrence_attendance_id(session, connector, alias)
+    except (SourceAttendanceHold, ValueError, RuntimeError):
+        return "SOURCE_DERIVED_ATTENDANCE_CHANGED"
+    if event_id is None:
         return None  # Preserved exceptions have no attendance delivery claim.
-    event = session.get(AttendanceEvent, alias.attendance_event_id)
+    event = session.get(AttendanceEvent, event_id)
     if (event is None or event.connector_id != connector.id or event.zkt_device_id != zkt.id
             or event.device_serial != manifest.terminal_serial):
         return "SOURCE_ATTENDANCE_BINDING_UNVERIFIED"

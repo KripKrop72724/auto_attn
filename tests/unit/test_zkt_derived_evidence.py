@@ -491,7 +491,9 @@ def test_additive_migration_is_idempotent_and_downgrade_keeps_evidence(source_st
     spec.loader.exec_module(migration)
     engine = source_store.kw["bind"]
     with engine.begin() as connection:
+        from zk_add.models import ZktSourceAttendance
         ops = Operations(MigrationContext.configure(connection))
+        ZktSourceAttendance.__table__.drop(connection)
         ZktDerivedEvidence.__table__.drop(connection)
         ops.drop_index("ix_add_zkt_work_interpretation", table_name="add_zkt_custody_work")
         # The fixture starts at current metadata. Remove the later 0049
@@ -503,6 +505,7 @@ def test_additive_migration_is_idempotent_and_downgrade_keeps_evidence(source_st
         monkeypatch.setattr(migration, "op", ops)
         migration.upgrade()
         migration.upgrade()
+        ZktSourceAttendance.__table__.create(connection)
         future_index.create(connection)
         tables = {"add_zkt_custody_work", "add_zkt_derived_evidence"}
         context = MigrationContext.configure(connection, opts={

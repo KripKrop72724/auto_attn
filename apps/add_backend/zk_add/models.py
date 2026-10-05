@@ -596,6 +596,36 @@ class ZktObservationLink(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
+class ZktSourceCutover(Base):
+    """Committed handoff boundary; never inferred from a firmware version."""
+    __tablename__ = "add_zkt_source_cutovers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), unique=True)
+    source_epoch_id: Mapped[int] = mapped_column(ForeignKey("add_terminal_source_epochs.id"), index=True)
+    first_new_ordinal: Mapped[int] = mapped_column(Integer)
+    terminal_serial: Mapped[str] = mapped_column(String(120))
+    model: Mapped[str] = mapped_column(String(120))
+    record_size: Mapped[int] = mapped_column(Integer)
+    authority_digest: Mapped[str] = mapped_column(String(64))
+    protected_authority: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = utc_column()
+
+
+class ZktSourceAttendance(Base):
+    """Derived attendance binding; original custody and aliases stay immutable."""
+    __tablename__ = "add_zkt_source_attendance"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    occurrence_alias_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_occurrence_aliases.id"), unique=True)
+    canonical_alias_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_occurrence_aliases.id"), index=True)
+    cutover_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_source_cutovers.id"), index=True)
+    work_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_custody_work.id"), unique=True)
+    evidence_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_derived_evidence.id"), index=True)
+    evidence_digest: Mapped[str] = mapped_column(String(64))
+    attendance_event_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_events.id"), index=True)
+    facts_digest: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = utc_column()
+
+
 class AttendanceBatchReceipt(Base):
     """Durable acknowledgement boundary for one connector attendance batch.
 

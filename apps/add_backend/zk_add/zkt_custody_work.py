@@ -1,7 +1,7 @@
 """Durable processing obligations attached in the custody transaction.
 
 No employee attribution or Oracle completion is inferred here. Reassembly and
-derived interpretation are bounded; authority waits for qualified profiles. Callers
+derived interpretation are bounded; source attendance requires an explicit cutover. Callers
 serialize mutations using the connector row before the work row, including
 when a new fragment arrives while a worker inspects its group.
 """
@@ -18,6 +18,7 @@ from cryptography.fernet import InvalidToken
 from pydantic import ValidationError
 from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from zk_add.crypto import decrypt_json, decrypt_text
 from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch, ZktCustodyWork, ZktCustodyWorkReceipt, ZktCustodySchedule, ZktDerivedEvidence, ZktObservationReceipt
@@ -291,8 +292,8 @@ def inspect_source(session: Session, work: ZktCustodyWork) -> bytes:
     return raw
 
 
-def inspect_work(session: Session, work: ZktCustodyWork) -> None:
-    """Reassembly is not qualification. Unqualified profiles remain a hold."""
+def inspect_work(session: Session, work: ZktCustodyWork, *, source_permit: bool | None = None) -> None:
+    """Reassembly is not qualification; only a cutover permits source creation."""
     if work.state == "HELD_EXCEPTION":
         return
     work.next_attempt_at = None
@@ -324,6 +325,24 @@ def inspect_work(session: Session, work: ZktCustodyWork) -> None:
         if step.result == "PENDING":
             work.state, work.reason_code, work.owner = "INTERPRETING", "DERIVED_EVIDENCE_INCOMPLETE", "ADD_PROTOCOL"
             work.next_attempt_at = utc_now()
+        elif work.kind == "SOURCE_LEDGER" and work.state != "HELD_OCCURRENCE":
+            from zk_add.models import ZktSourceCutover
+            # No firmware version, plausible layout or connector flag is a
+            # migration handoff. Only an explicit persisted source permit can
+            # enter attendance creation. Existing field custody stays inactive.
+            if source_permit is None:
+                source_permit = session.scalar(select(ZktSourceCutover.id).where(
+                    ZktSourceCutover.connector_id == work.connector_id)) is not None
+            if source_permit:
+                from zk_add.zkt_source_attendance import SourceAttendanceHold, process_source
+                try:
+                    with session.begin_nested():
+                        process_source(session, session.get(Connector, work.connector_id), work, raw)
+                except SourceAttendanceHold as exc:
+                    work.state, work.reason_code, work.owner = "HELD_SOURCE", str(exc), "ADD_RECONCILIATION"
+                except (SQLAlchemyError, RuntimeError):
+                    work.state, work.reason_code, work.owner = "RETRY_SYSTEM", "SOURCE_ATTENDANCE_TRANSACTION_RETRY", "ADD_OPERATIONS"
+                    work.next_attempt_at = utc_now() + timedelta(seconds=60)
     except (EvidenceInvalid, derived.DerivedEvidenceInvalid) as exc:
         work.state, work.reason_code, work.owner = "HELD_EXCEPTION", str(exc), "ADD_EVIDENCE_REVIEW"
         return
@@ -386,8 +405,9 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
                        time_budget_ms: int | None = 250, clock=None) -> InspectionBatch:
     """Fair bounded inspection; connector-first locks match custody ingestion.
 
-    This stage deliberately stops at profile qualification. It never emits an
-    attendance event or an Oracle outbox based on an unqualified interpretation.
+    Default inspection stops at profile qualification. An explicit experimental
+    source cutover additionally permits guarded canonical attendance creation.
+    It never infers identity or delivery from the proposed decoder facts.
     """
     maximum = max(1, min(limit, 500))
     clock = clock or time.monotonic
@@ -443,6 +463,9 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
         if not 0 <= schedule.priority_burst <= PRIORITY_BURST:
             raise RuntimeError("CUSTODY_SCHEDULE_INVALID")
         prior_processed = processed
+        from zk_add.models import ZktSourceCutover
+        source_permit = session.scalar(select(ZktSourceCutover.id).where(
+            ZktSourceCutover.connector_id == connector_id)) is not None
         selected = set()
         recent_index = oldest_index = 0
         candidates = list({row.id: row for row in [*recent, *oldest]}.values())
@@ -462,7 +485,7 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
                     break
                 priority = has_recent and (schedule.priority_burst < PRIORITY_BURST or not has_oldest)
                 row = recent[recent_index] if priority else oldest[oldest_index]
-                inspect_work(session, row)
+                inspect_work(session, row, source_permit=source_permit)
                 schedule.priority_burst = min(PRIORITY_BURST, schedule.priority_burst + 1) if priority else 0
                 schedule.updated_at = utc_now()
                 selected.add(row.id)

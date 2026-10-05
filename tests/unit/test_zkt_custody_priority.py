@@ -44,7 +44,7 @@ def add_work(db, number, *, kind="SOURCE_RECORD", age=3600, due=True, version=No
 def inspector(monkeypatch, seen, *, pending=False):
     # Isolate selection from raw decoding, which has its own evidence tests.
     # Keeping pending=True simulates one bounded step of a large packet.
-    def inspect(db, row):
+    def inspect(db, row, **_kwargs):
         seen.append(row.id)
         row.attempt_count += 1
         row.state = "INTERPRETING" if pending else "WAIT_PROFILE"
@@ -166,8 +166,8 @@ def test_failed_transaction_preserves_fairness_and_work_state(priority_store, mo
         recent = add_work(db, 2, kind="LIVE_PACKET", age=0)
         db.add(ZktCustodySchedule(connector_id=db.scalar(select(Connector.id)), priority_burst=7))
         db.commit()
-        def fail(db, row):
-            inspect(db, row)
+        def fail(db, row, **kwargs):
+            inspect(db, row, **kwargs)
             if row.id == old:
                 raise RuntimeError("synthetic interrupted transaction")
         monkeypatch.setattr(work, "inspect_work", fail)
@@ -195,8 +195,8 @@ def test_concurrent_workers_share_fairness_without_waiting_under_connector_lock(
         recent = add_work(db, 2, kind="LIVE_PACKET", age=0)
         db.add(ZktCustodySchedule(connector_id=db.scalar(select(Connector.id)), priority_burst=7))
         db.commit()
-    def blocked(db, row):
-        inspect(db, row)
+    def blocked(db, row, **kwargs):
+        inspect(db, row, **kwargs)
         started.set()
         assert release.wait(5)
     monkeypatch.setattr(work, "inspect_work", blocked)

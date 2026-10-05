@@ -1,6 +1,6 @@
 """ADD-owned delivery with a frozen, explicit verification scope.
 
-Registration is internal to future qualified occurrence creation. No device
+Registration is internal to guarded canonical occurrence creation. No device
 payload, version string or connector toggle registers an intent. Existing
 event UIDs/Oracle keys are never migrated or changed by this module.
 The versioned reader checks every transmitted field stored by the Oracle raw
@@ -28,7 +28,7 @@ from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, ZktOccurrence
                            TerminalSourceEpoch, TerminalRecordManifest)
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
-from zk_add.zkt_custody import source_occurrence_delivery_hold, occurrence_id
+from zk_add.zkt_custody import source_occurrence_delivery_hold, occurrence_id, occurrence_attendance_id
 from zk_add.identity_states import VERIFIED_IDENTITY_RESOLUTION_STATUSES
 
 TOKEN = re.compile(r"^[a-f0-9]{64}$")
@@ -106,7 +106,7 @@ def _occurrence_bound(session, connector, alias):
 def register_intent(session, *, connector, event, outbox, alias, verification_scope=VERIFICATION_SCOPE):
     """Register only a new occurrence UID, inside its attendance transaction.
 
-    The caller still owns qualified source decoding and identity evidence. An
+    The caller still owns authorized source decoding and identity evidence. An
     association is not such proof. Registration alone cannot resolve identity
     or permit an Oracle send; claim-time policy is independently revalidated.
     """
@@ -114,7 +114,7 @@ def register_intent(session, *, connector, event, outbox, alias, verification_sc
         raise ValueError("ZKT_ORACLE_VERIFICATION_SCOPE_UNKNOWN")
     if (not connector.zkt_custody_enabled or connector.firmware_family != "zkt"
             or event.connector_id != connector.id or outbox.attendance_event_id != event.id
-            or alias.attendance_event_id != event.id or event.event_uid != alias.occurrence_id
+            or occurrence_attendance_id(session, connector, alias) != event.id or event.event_uid != alias.occurrence_id
             or not _occurrence_bound(session, connector, alias)):
         raise ValueError("ZKT_ORACLE_OCCURRENCE_BINDING")
     prior = session.scalar(select(ZktOracleIntent).where(ZktOracleIntent.attendance_event_id == event.id))
@@ -144,7 +144,7 @@ def _current(session, intent, row):
     alias = session.get(ZktOccurrenceAlias, intent.occurrence_alias_id)
     if (not event or not connector or not alias or connector.firmware_family != "zkt"
             or row.id != intent.outbox_id or row.attendance_event_id != event.id
-            or event.connector_id != connector.id or alias.attendance_event_id != event.id
+            or event.connector_id != connector.id or occurrence_attendance_id(session, connector, alias) != event.id
             or event.event_uid != alias.occurrence_id or not connector.zkt_device
             or not _occurrence_bound(session, connector, alias)
             or not _terminal_provenance_verified(event, connector)

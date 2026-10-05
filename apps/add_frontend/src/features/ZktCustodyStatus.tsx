@@ -29,10 +29,12 @@ const states: Record<string, string> = {
   WAIT_PROFILE: 'Waiting for profile qualification', WAIT_SOURCE: 'Waiting for source evidence',
   HELD_EXCEPTION: 'Preserved for review', RETRY_SYSTEM: 'System retry pending',
   SOURCE_ASSOCIATED: 'Source linked', HELD_OCCURRENCE: 'Occurrence link needs review',
+  ATTENDANCE_CREATED: 'Attendance created from source', HELD_SOURCE: 'Source handoff needs review',
 }
 const owners: Record<string, string> = {
   ADD_PROTOCOL: 'Protocol review', ADD_EVIDENCE_REVIEW: 'Evidence review',
   ADD_OPERATIONS: 'ADD operations', ADD_RECONCILIATION: 'Reconciliation',
+  ADD_DELIVERY: 'Attendance delivery',
 }
 const label = (state: string) => states[state] || humanizeStatus(state)
 const owner = (value: string) => owners[value] || humanizeStatus(value)
@@ -142,7 +144,7 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
           <dl><div><dt>Responsible team</dt><dd>{owner(row.owner)}</dd></div>
             <div><dt>Last updated (Pakistan)</dt><dd>{date(row.updated_at)}</dd></div>
             <div><dt>Decoding result</dt><dd>{decodingStatus(row.decoding, data.sampled_at)}</dd></div>
-            <div><dt>Next inspection</dt><dd>{row.next_attempt_at ? date(row.next_attempt_at) : row.state === 'SOURCE_ASSOCIATED' ? 'Source association complete' : 'Waiting for relevant evidence or review'}</dd></div></dl>
+            <div><dt>Next inspection</dt><dd>{row.next_attempt_at ? date(row.next_attempt_at) : row.state === 'SOURCE_ASSOCIATED' ? 'Source association complete' : row.state === 'ATTENDANCE_CREATED' ? 'Attendance created; delivery has separate evidence' : 'Waiting for relevant evidence or review'}</dd></div></dl>
           <p>Decoding evidence does not establish terminal profile qualification or employee identity.</p>
         </details>)}</>}
     </>}
