@@ -267,3 +267,22 @@ layouts without supported textual user identity remain held for this path.
 
 These interfaces do not automatically grant a field handoff, report HIL success,
 or replace actual post-installation source/identity/delivery evidence.
+
+## Retrying publication without replacing signed bytes
+
+Production ADD uses a read-only root filesystem and a tmpfs `/tmp` mount.
+Admission metadata is transferred through `docker exec -i` as bounded base64,
+with each original SHA-256 checked before the saved inspector runs. This avoids
+[Docker's documented tmpfs copy restriction](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases).
+An isolated container with the production mount configuration reproduced the
+original copy failure and accepted the same signed package after this repair;
+both paths removed their temporary files.
+
+The candidate workflow's optional `signed_candidate_run_id` reuses an existing
+artifact from its original completed provenance, build and signing jobs. The
+original workflow and repository, available bounded artifact, main ancestry,
+seven successful firmware-source checks, requested manifest identity, deployed
+signature/contract admission and exact HIL quarantine are still checked. Build
+and sign jobs are skipped in this mode. Rebuilding or resigning a published
+version is not a recovery mechanism. A publication retry is not a firmware or
+field qualification result.
