@@ -3356,7 +3356,7 @@ static dq_result_t add_legacy_owner_done(add_outbox_t *outbox, dq_result_t resul
     if (result != DQ_OK && result != DQ_EMPTY && result != DQ_PENDING && result != DQ_FULL)
         outbox->depth_known = false;
     qs_local_end_legacy(outbox == &s_live_outbox ? LF_ADD_LIVE : LF_ADD_BULK,
-        operation, result, captured_error);
+        operation, outbox->legacy.checkpoint_corrupt && result == DQ_OK ? DQ_CORRUPT : result, captured_error);
     xSemaphoreGive(outbox->lock);
     return result;
 }
@@ -3407,6 +3407,11 @@ dq_result_t add_legacy_owner_peek(unsigned lane, void *bytes, size_t capacity, s
     errno = 0;
     lf_operation_t operation = LF_READ;
     dq_result_t result = add_legacy_owner_prepare(outbox);
+    if (result == DQ_CORRUPT && outbox->legacy.checkpoint_corrupt) {
+        result = lq_checkpoint_evidence(&outbox->legacy, bytes, capacity, token);
+        if (result == DQ_OK) *length = token->end;
+        goto done;
+    }
     if (result != DQ_OK) goto done;
     if (outbox->legacy.empty_cached) { result = DQ_EMPTY; goto done; }
     result = lq_peek(&outbox->legacy, bytes, capacity, token);
@@ -3427,13 +3432,16 @@ dq_result_t add_legacy_owner_settle(unsigned lane, const lq_token_t *token, bool
     errno = 0;
     lf_operation_t operation = LF_READ;
     dq_result_t result = add_legacy_owner_prepare(outbox);
-    if (result == DQ_OK) {
+    if (result == DQ_OK || (result == DQ_CORRUPT && token->checkpoint_evidence)) {
         operation = LF_RETIRE;
         result = custody ? lq_settle_evidence(&outbox->legacy, token) : lq_settle(&outbox->legacy, token);
         if (result == DQ_OK) {
             outbox->offset = (off_t)outbox->legacy.checkpoint.offset;
-            if (outbox->depth_known && outbox->depth) --outbox->depth;
-            if (!compact_outbox_locked(outbox, false)) result = DQ_IO;
+            if (token->checkpoint_evidence) outbox->depth_known = false;
+            else {
+                if (outbox->depth_known && outbox->depth) --outbox->depth;
+                if (!compact_outbox_locked(outbox, false)) result = DQ_IO;
+            }
         }
     }
     return add_legacy_owner_done(outbox, result, operation, errno);
@@ -4387,9 +4395,11 @@ static void outbox_task(void *arg)
                     (unsigned long)legacy_token.crc);
             }
             const char *queue_names[] = {"add_live_legacy", "add_live", "add_bulk_legacy", "add_bulk", "receipts", "evidence"};
+            const char *evidence_queue = !segmented && legacy_token.checkpoint_evidence ?
+                (selected == 0 ? "add_live_legacy_checkpoint" : "add_bulk_legacy_checkpoint") : queue_names[selected];
             s_add_worker_operation = ADD_WORKER_NETWORK;
             bool preserved = have_identity && add_connector_transfer_queue_evidence(
-                queue_names[selected], generation, record_id, line, raw_length, NULL, "MALFORMED");
+                evidence_queue, generation, record_id, line, raw_length, NULL, "MALFORMED");
             s_add_worker_operation = ADD_WORKER_COMMITTING;
             if (preserved) {
                 if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
