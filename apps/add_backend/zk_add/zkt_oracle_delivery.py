@@ -1,15 +1,18 @@
-"""ADD-owned delivery with an explicit raw projection and daily time proof.
+"""ADD-owned delivery with a frozen, explicit verification scope.
 
 Registration is internal to future qualified occurrence creation. No device
 payload, version string or connector toggle registers an intent. Existing
 event UIDs/Oracle keys are never migrated or changed by this module.
 The versioned reader checks every transmitted field stored by the Oracle raw
 table, and independently accounts for the daily punch-time projection. Business
-status, leave and payroll calculations are outside this delivery proof.
+status, leave and payroll calculations are outside this delivery proof. The
+experimental membership contract uses the installed Oracle interface and
+records only UID presence in a separate receipt. It never downgrades a v2 intent.
 """
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
@@ -21,7 +24,8 @@ from zk_add.attendance_repair import _ords_request, _protected_digest
 from zk_add.crypto import decrypt_cnic, decrypt_json, encrypt_json
 from zk_add.db import session_scope
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, ZktOccurrenceAlias,
-                           ZktOracleContentReceipt, ZktOracleIntent, TerminalSourceEpoch, TerminalRecordManifest)
+                           ZktOracleContentReceipt, ZktOracleMembershipReceipt, ZktOracleIntent,
+                           TerminalSourceEpoch, TerminalRecordManifest)
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 from zk_add.zkt_custody import source_occurrence_delivery_hold, occurrence_id
@@ -31,6 +35,7 @@ TOKEN = re.compile(r"^[a-f0-9]{64}$")
 CONFLICTS = frozenset({"MISMATCH", "IMMUTABLE_MISMATCH", "CROSS_DEVICE_UID_COLLISION", "CHANGED",
                        "IDENTITY_HOLD", "DOWNSTREAM_HOLD"})
 VERIFICATION_SCOPE = "ORACLE_RAW_DAY_TIMES_V2"
+MEMBERSHIP_SCOPE = "ORACLE_UID_MEMBERSHIP_V1"
 PROJECTION_FIELDS = ("event_uid", "zone_id", "device_id", "device_serial", "user_id",
                      "employee_name", "cnic", "timestamp", "raw_punch", "capturetype", "trust_status")
 
@@ -70,6 +75,23 @@ class EvidenceChanged(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class MembershipProof:
+    event_uid: str
+    payload_digest: str
+    request_digest: str
+    response_digest: str
+
+
+def verification_check(payload, scope):
+    if scope == VERIFICATION_SCOPE:
+        return projection_check(payload)
+    if scope == MEMBERSHIP_SCOPE:
+        return {"contract_version": "1", "verification_scope": MEMBERSHIP_SCOPE,
+                "request_digest": _protected_digest(payload), "event_uids": [payload["event_uid"]]}
+    raise EvidenceChanged("ZKT_ORACLE_VERIFICATION_SCOPE_UNKNOWN")
+
+
 def _occurrence_bound(session, connector, alias):
     if source_occurrence_delivery_hold(session, connector, alias.occurrence_id):
         return False
@@ -81,13 +103,15 @@ def _occurrence_bound(session, connector, alias):
                                                 alias.ordinal, alias.raw_digest))
 
 
-def register_intent(session, *, connector, event, outbox, alias):
+def register_intent(session, *, connector, event, outbox, alias, verification_scope=VERIFICATION_SCOPE):
     """Register only a new occurrence UID, inside its attendance transaction.
 
     The caller still owns qualified source decoding and identity evidence. An
     association is not such proof. Registration alone cannot resolve identity
     or permit an Oracle send; claim-time policy is independently revalidated.
     """
+    if verification_scope not in {VERIFICATION_SCOPE, MEMBERSHIP_SCOPE}:
+        raise ValueError("ZKT_ORACLE_VERIFICATION_SCOPE_UNKNOWN")
     if (not connector.zkt_custody_enabled or connector.firmware_family != "zkt"
             or event.connector_id != connector.id or outbox.attendance_event_id != event.id
             or alias.attendance_event_id != event.id or event.event_uid != alias.occurrence_id
@@ -95,11 +119,12 @@ def register_intent(session, *, connector, event, outbox, alias):
         raise ValueError("ZKT_ORACLE_OCCURRENCE_BINDING")
     prior = session.scalar(select(ZktOracleIntent).where(ZktOracleIntent.attendance_event_id == event.id))
     if prior:
-        if (prior.outbox_id, prior.occurrence_alias_id, prior.connector_id) != (outbox.id, alias.id, connector.id):
+        if (prior.outbox_id, prior.occurrence_alias_id, prior.connector_id, prior.verification_scope) != (
+                outbox.id, alias.id, connector.id, verification_scope):
             raise ValueError("ZKT_ORACLE_INTENT_CONFLICT")
         return prior
     intent = ZktOracleIntent(outbox_id=outbox.id, attendance_event_id=event.id,
-                             occurrence_alias_id=alias.id, connector_id=connector.id)
+        occurrence_alias_id=alias.id, connector_id=connector.id, verification_scope=verification_scope)
     session.add(intent)
     session.flush()
     return intent
@@ -133,7 +158,7 @@ def _current(session, intent, row):
     if not cnic:
         raise EvidenceChanged("ZKT_ORACLE_IDENTITY_UNAVAILABLE")
     payload = oracle_payload(connector, connector.zkt_device, event, cnic)
-    check = projection_check(payload)
+    check = verification_check(payload, intent.verification_scope)
     return event, payload, check
 
 
@@ -233,6 +258,11 @@ def reserve_post(claim):
 
 
 async def verify(claim):
+    scope = claim["check"].get("verification_scope")
+    if scope == MEMBERSHIP_SCOPE:
+        return await verify_membership(claim)
+    if scope != VERIFICATION_SCOPE:
+        return "UNKNOWN", None
     response = await _ords_request("raw-captures/delivery-v2/check", payload=claim["check"])
     if not isinstance(response, dict):
         return "UNKNOWN", None
@@ -264,6 +294,48 @@ async def verify(claim):
     return classification, token
 
 
+async def _membership_request(uid):
+    # This is the installed ordinary attendance reader, not the administrator
+    # repair service. Experimental delivery requires no repair credentials.
+    if not settings.ords_base_url or not settings.ords_username or not settings.ords_password:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=settings.ords_timeout_seconds, headers={
+                "X-API-Username": settings.ords_username, "X-API-Password": settings.ords_password,
+        }) as client:
+            response = await client.post(settings.ords_base_url.rstrip("/") + "/raw-captures/check",
+                                         json={"event_uids": [uid]})
+        return response.json() if response.status_code == 200 else None
+    except (httpx.RequestError, ValueError):
+        return None
+
+
+async def verify_membership(claim):
+    """Use only the existing read-only membership route, with no content claim.
+
+    This path is chosen when the immutable intent is registered, never as a
+    response to v2 failure. A successful POST alone cannot settle the record.
+    """
+    from zk_add.worker import ords_membership_missing
+    uid = claim["payload"]["event_uid"]
+    check = claim["check"]
+    if check != verification_check(claim["payload"], MEMBERSHIP_SCOPE):
+        return "UNKNOWN", None
+    response = await _membership_request(uid)
+    if (not isinstance(response, dict) or any(type(response.get(field)) is not int
+            for field in ("received_count", "missing_count", "existing_count"))):
+        return "UNKNOWN", None
+    missing = ords_membership_missing(200, response, {uid})
+    if missing is None:
+        return "UNKNOWN", None
+    if uid in missing:
+        return "MISSING", None
+    normalized = {field: response[field] for field in (
+        "success", "received_count", "existing_count", "missing_count", "missing_event_uids")}
+    proof = MembershipProof(uid, claim["payload_digest"], check["request_digest"], _protected_digest(normalized))
+    return "UID_PRESENT", proof
+
+
 def persist_result(claim, classification, token=None):
     with session_scope() as session:
         owned = _owned(session, claim)
@@ -283,7 +355,30 @@ def persist_result(claim, classification, token=None):
             classification = "CHANGED"
         except Exception:
             classification = "UNKNOWN"
-        if classification == "MATCH" and isinstance(token, str) and TOKEN.fullmatch(token):
+        if (classification == "UID_PRESENT" and intent.verification_scope == MEMBERSHIP_SCOPE
+                and isinstance(token, MembershipProof) and token.event_uid == event.event_uid
+                and token.payload_digest == intent.payload_digest
+                and token.request_digest == claim["check"]["request_digest"]
+                and isinstance(token.response_digest, str)
+                and TOKEN.fullmatch(token.response_digest)):
+            receipt = session.scalar(select(ZktOracleMembershipReceipt).where(
+                ZktOracleMembershipReceipt.intent_id == intent.id,
+                ZktOracleMembershipReceipt.payload_digest == intent.payload_digest))
+            if receipt is None:
+                session.add(ZktOracleMembershipReceipt(intent_id=intent.id, event_uid=event.event_uid,
+                    payload_digest=intent.payload_digest, request_digest=token.request_digest,
+                    response_digest=token.response_digest, verification_scope=MEMBERSHIP_SCOPE,
+                    claim_attempt=claim["attempt"]))
+            now = utc_now()
+            row.status = event.ords_status = "ACKED_CHECK"
+            row.acknowledged_at = event.oracle_confirmed_at = now
+            event.oracle_confirmation_path = "ADD_ZKT_UID_ONLY_V1"
+            row.next_attempt_at = row.last_error = None
+            row.last_http_status = 200
+            # Content/day verification fields are deliberately untouched.
+            session.flush()
+        elif (classification == "MATCH" and intent.verification_scope == VERIFICATION_SCOPE
+                and isinstance(token, str) and TOKEN.fullmatch(token)):
             receipt = session.scalar(select(ZktOracleContentReceipt).where(
                 ZktOracleContentReceipt.intent_id == intent.id,
                 ZktOracleContentReceipt.payload_digest == intent.payload_digest,

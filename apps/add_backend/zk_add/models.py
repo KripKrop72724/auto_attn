@@ -1019,6 +1019,8 @@ class ZktOracleIntent(Base):
     attendance_event_id: Mapped[int] = mapped_column(ForeignKey("add_attendance_events.id"), unique=True)
     occurrence_alias_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_occurrence_aliases.id"), unique=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)
+    verification_scope: Mapped[str] = mapped_column(String(80), nullable=False,
+        default="ORACLE_RAW_DAY_TIMES_V2", server_default="ORACLE_RAW_DAY_TIMES_V2")
     payload_digest: Mapped[str | None] = mapped_column(String(64))
     protected_payload: Mapped[str | None] = mapped_column(Text)
     protected_check: Mapped[str | None] = mapped_column(Text)
@@ -1042,6 +1044,22 @@ class ZktOracleContentReceipt(Base):
     request_digest: Mapped[str] = mapped_column(String(64))
     verification_scope: Mapped[str] = mapped_column(String(80))
     content_token: Mapped[str] = mapped_column(String(64))
+    claim_attempt: Mapped[int] = mapped_column(Integer)
+    verified_at: Mapped[datetime] = utc_column()
+
+
+class ZktOracleMembershipReceipt(Base):
+    """Experimental UID membership only; never raw content or day-time proof."""
+    __tablename__ = "add_zkt_oracle_membership_receipts"
+    __table_args__ = (UniqueConstraint("intent_id", "payload_digest", name="uq_add_zkt_oracle_membership"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(String(36), unique=True, default=lambda: str(uuid4()))
+    intent_id: Mapped[int] = mapped_column(ForeignKey("add_zkt_oracle_intents.id"))
+    event_uid: Mapped[str] = mapped_column(String(64), index=True)
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    response_digest: Mapped[str] = mapped_column(String(64))
+    verification_scope: Mapped[str] = mapped_column(String(80))
     claim_attempt: Mapped[int] = mapped_column(Integer)
     verified_at: Mapped[datetime] = utc_column()
 

@@ -50,6 +50,24 @@ attendance continues through the authorized application delivery path. Any
 verification supported only by the existing Oracle interface must be labelled
 with its actual scope; it cannot be presented as the expanded projection proof.
 
+ADD implements this distinction with immutable delivery intents. An explicitly
+registered experimental intent uses `ORACLE_UID_MEMBERSHIP_V1` and the installed
+`raw-captures/check` interface. Before any send, ADD commits the frozen payload
+and rechecks its source/identity evidence. It checks membership before sending
+and again after a response or timeout. A successful POST alone cannot retire
+the outbox. A committed membership receipt records the request, response and
+payload digests with confirmation path `ADD_ZKT_UID_ONLY_V1`; raw-content and
+daily-time proof remain unasserted. Missing or malformed membership responses
+retain a retry obligation.
+
+The default `ORACLE_RAW_DAY_TIMES_V2` contract remains separate. Endpoint failure
+never changes an existing intent's verification scope. No existing attendance
+UID, Oracle key, frozen payload or content receipt is migrated to the weaker
+contract. Migration `0050` retains both kinds of evidence across backend
+rollback and requires no Oracle schema or data change. The caller must still
+establish a canonical source occurrence and verified identity before delivery;
+this adapter is not authority to assign an employee or activate capture.
+
 ## Current state
 
 The [implementation register](zkt-2.7.0-implementation.md) records completed
