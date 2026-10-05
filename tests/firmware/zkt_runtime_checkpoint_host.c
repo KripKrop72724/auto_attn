@@ -105,7 +105,7 @@ static zj_result_t commit(runtime_checkpoint_t *value, runtime_checkpoint_t *out
 int main(void)
 {
     assert(zj_runtime_checkpoint_required());
-    strcpy(app.version, "2.6.16"); assert(zj_runtime_checkpoint_required());
+    strcpy(app.version, "2.6.17"); assert(zj_runtime_checkpoint_required());
     strcpy(app.version, "2.6.15"); assert(!zj_runtime_checkpoint_required());
     strcpy(app.version, "2.7.0"); strcpy(app.project_name, "zone_hikvision");
     assert(!zj_runtime_checkpoint_required()); strcpy(app.project_name, "zone_lite");

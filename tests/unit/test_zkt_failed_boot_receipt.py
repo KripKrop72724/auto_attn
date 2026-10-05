@@ -63,7 +63,7 @@ def attempt(request):
             device_id="1",
             display_name="Synthetic",
             firmware_family="zkt",
-            firmware_version="2.6.16",
+            firmware_version="2.6.17",
         )
         releases = [
             FirmwareRelease(
@@ -79,7 +79,7 @@ def attempt(request):
                 manifest={"application_sha256": digest * 64, "firmware_family": "zkt"},
                 manifest_signature="synthetic-not-signed",
             )
-            for version, character, digest in (("2.6.16", "a", "c"), ("2.7.0", "b", "d"))
+            for version, character, digest in (("2.6.17", "a", "c"), ("2.7.0", "b", "d"))
         ]
         session.add_all([connector, *releases])
         session.flush()
@@ -104,7 +104,7 @@ def attempt(request):
             release_id=releases[0].id,
             connector_id=connector.id,
             previous_version="2.6.15",
-            target_version="2.6.16",
+            target_version="2.6.17",
             status="SUCCEEDED",
             bytes_written=1024,
             created_at=now - timedelta(minutes=5),
@@ -114,7 +114,7 @@ def attempt(request):
             campaign_id=campaigns[1].id,
             release_id=releases[1].id,
             connector_id=connector.id,
-            previous_version="2.6.16",
+            previous_version="2.6.17",
             target_version="2.7.0",
             status="READY_TO_BOOT",
             bytes_written=1024,
@@ -128,7 +128,7 @@ def attempt(request):
             created_at=now - timedelta(minutes=1),
             details={
                 "image_sha256": "c" * 64,
-                "running_version": "2.6.16",
+                "running_version": "2.6.17",
                 "running_partition": "ota_0",
                 "bytes_written": 1024,
             },
@@ -161,7 +161,7 @@ def recover(attempt, **changes):
     values = dict(
         state="ROLLED_BACK",
         bytes_written=1024,
-        running_version="2.6.16",
+        running_version="2.6.17",
         running_partition="ota_0",
         image_sha256="c" * 64,
         error_code="BOOT_HEALTH_TIMEOUT",

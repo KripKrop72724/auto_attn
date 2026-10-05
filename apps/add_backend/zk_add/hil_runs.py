@@ -175,11 +175,20 @@ def start_run(
             ReconciliationCoverage.active.is_(True),
         )
     )
+    capture_states = {"SOURCE_CAPTURE_CERTIFIED", "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"}
+    # Raw source custody accounts for every ordinal even while interpretation
+    # and Oracle delivery remain held. A signed ADD-owned writer may start its
+    # observation at that boundary; its eventual HIL verdict must still prove
+    # delivery separately. Legacy firmware cannot acquire this permission by
+    # merely reporting a different runtime profile.
+    if (release.version == "2.7.0" and manifest_runtime == "ZKT_JOURNAL_V1"
+            and diagnostics.get("runtime_profile") == manifest_runtime
+            and runtime.delivery_authority == "ADD"):
+        capture_states.add("SOURCE_CAPTURE_CERTIFIED_RAW_PENDING")
     if (
         coverage is None
         or coverage.terminal_serial != target.terminal_serial
-        or coverage.capture_state
-        not in {"SOURCE_CAPTURE_CERTIFIED", "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"}
+        or coverage.capture_state not in capture_states
         or diagnostics.get("source_generation") != coverage.terminal_generation
         or diagnostics.get("committed_source_cursor") != coverage.source_committed_cursor
         or terminal.get("attendance_count") != coverage.source_committed_cursor
@@ -213,6 +222,8 @@ def start_run(
             "source_generation": coverage.terminal_generation,
             "source_cursor": coverage.source_committed_cursor,
             "source_chain": coverage.source_committed_chain_digest,
+            "source_capture_state": coverage.capture_state,
+            "oracle_state": coverage.oracle_state,
             "diagnostics": diagnostics,
         },
         result={},

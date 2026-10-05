@@ -149,6 +149,47 @@ def test_legacy_bridge_observation_keeps_optional_journal_counts_unknown(ready):
     assert "records" not in diagnostics["queues"][-1]
 
 
+def test_raw_source_custody_is_not_legacy_reconciliation_acceptance(ready):
+    ready[5].capture_state = "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
+    with pytest.raises(ValueError, match="Certified source"):
+        start(ready)
+
+
+def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(ready):
+    from zk_add.zkt_bridge_contract import signed_hil_targets
+    from zk_add.zkt_writer_contract import writer_contract
+
+    session, release, device, deployment, job, coverage, telemetry = ready
+    exact = signed_hil_targets()[0]
+    device.connector_id, device.hardware_id = exact["connector_id"], exact["mac"]
+    for field in ("serial", "expected_serial", "confirmed_serial"):
+        setattr(device.zkt_device, field, exact["terminal_serial"])
+    job.terminal_serial = coverage.terminal_serial = exact["terminal_serial"]
+    release.release_id, release.version = "zone-lite-2.7.0", "2.7.0"
+    contract = writer_contract()
+    release.manifest = {**release.manifest, "release_id": release.release_id, "version": release.version,
+        "firmware_family": "zkt", "project_name": "zone_lite", "release_channel": "EXPERIMENTAL_HIL_ONLY",
+        "minimum_bootstrap_version": contract["compatibility_version"], "runtime_profile": "ZKT_JOURNAL_V1",
+        "queue_storage": contract, "hil_targets": signed_hil_targets(), "_hil_targets": [exact]}
+    deployment.target_version = release.version
+    telemetry.payload["ota"]["running_version"] = release.version
+    telemetry.payload["zkt"]["serial"] = exact["terminal_serial"]
+    diagnostics = telemetry.payload["diagnostics"]
+    diagnostics.update(schema_version=2, runtime_profile="ZKT_JOURNAL_V1", journal_format=1, delivery_authority="ADD",
+        journal_storage={"observed": True, "fresh": True, "ready": True, "durability": "HEALTHY",
+                         "checkpoint_recovery_pending": False, "sampled_uptime_ms": 99000})
+    diagnostics["workers"] = [{"name": name, "state": "RUNNING", "last_activity_uptime_ms": 100000}
+                              for name in ("capture", "storage_owner", "add_delivery")]
+    diagnostics["queues"] = [{"name": name, "count_known": True, "records": 0}
+                             for name in ("journal", "legacy_migration")]
+    coverage.capture_state, coverage.oracle_state = "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING", "PENDING"
+    run = start(ready, exact=exact)
+    assert run.status == "OBSERVING" and run.result == {}
+    assert run.baseline["source_capture_state"] == "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
+    assert run.baseline["oracle_state"] == "PENDING"
+    assert not list(session.scalars(select(FirmwareEvent)))
+
+
 @pytest.mark.parametrize("value", [None, True, -1, "0"])
 def test_required_queue_depth_must_be_an_observed_nonnegative_integer(ready, value):
     ready[-1].payload["diagnostics"]["queues"][0]["records"] = value

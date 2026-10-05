@@ -97,7 +97,7 @@ int main(void)
     assert(!add_connector_terminal_restart_pending());
     s_zkt.online=false;assert(!add_connector_claim_ota_restart()&&!s_ota_restart_claimed);s_zkt.online=true;
     strcpy(s_activity,"RECONCILING");assert(!add_connector_claim_ota_restart()&&!s_ota_restart_claimed);
-    s_zkt.online=false;strcpy(app.version,"2.6.16");
+    s_zkt.online=false;strcpy(app.version,"2.6.17");
     assert(!add_connector_claim_failed_boot_restart()&&!s_ota_restart_claimed);
     strcpy(app.version,"2.7.0");fail_locks=1;
     assert(!add_connector_claim_failed_boot_restart()&&!s_ota_restart_claimed);

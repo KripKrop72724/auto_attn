@@ -79,7 +79,7 @@ def prepared(source_store, monkeypatch):
             firmware_family="zkt",
             project_name="zone_lite",
             release_channel="EXPERIMENTAL_HIL_ONLY",
-            minimum_bootstrap_version="2.6.16",
+            minimum_bootstrap_version="2.6.17",
             runtime_profile="ZKT_JOURNAL_V1",
             hil_targets=[target.identity.model_dump()],
             queue_storage=writer_contract(),

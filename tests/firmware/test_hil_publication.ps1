@@ -41,17 +41,17 @@ foreach ($bad in @('', $bridgeMarker.Replace('CAPTURE=1', 'CAPTURE=0'),
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $BridgeVersion | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw 'Unqualified bridge storage marker accepted' }
 }
-$writerMarker = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16'
+$writerMarker = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17'
 [IO.File]::WriteAllText($contractImage, $writerMarker + [char]0)
 $writerContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.0'
 if ($writerContract.schema_version -ne 4 -or $writerContract.delivery_authority -cne 'ADD' -or
-    $writerContract.compatibility_version -cne '2.6.16' -or $writerContract.journal_reader_mask -ne 63 -or
+    $writerContract.compatibility_version -cne '2.6.17' -or $writerContract.journal_reader_mask -ne 63 -or
     $writerContract.allowed_bootstrap_versions.Count -ne 1 -or
-    $writerContract.allowed_bootstrap_images['2.6.16'] -cne '7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599') {
+    $writerContract.allowed_bootstrap_images['2.6.17'] -cne 'f803361f8c3e1ed03f57814793942ebda45bbbd10cd0c1e77239602f5e6e32a1') {
     throw 'Writer accepted a different storage or rollback reader contract'
 }
 foreach ($bad in @($bridgeMarker, $writerMarker.Replace('ADD', 'LEGACY'),
-    $writerMarker.Replace('2.6.16', '2.6.15'), ($writerMarker + [char]0 + $writerMarker),
+    $writerMarker.Replace('2.6.17', '2.6.15'), ($writerMarker + [char]0 + $writerMarker),
     ($writerMarker + [char]0 + $bridgeMarker))) {
     [IO.File]::WriteAllText($contractImage, $bad + [char]0)
     $rejected = $false
@@ -703,7 +703,7 @@ if ((Get-FileHash (Join-Path $store "$BridgeVersion/zone-lite-$BridgeVersion.bin
 # The writer remains quarantined even if its experimental tag is removed.
 $writerImage = Join-Path $source 'zone-lite-2.7.0.bin'
 [IO.File]::WriteAllText($writerImage, 'Writer fixture, not deployable firmware')
-$manifest = @{version='2.7.0';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.7.0';image_name='zone-lite-2.7.0.bin';image_sha256=(Get-FileHash $writerImage).Hash.ToLowerInvariant();image_size=(Get-Item $writerImage).Length;git_sha=('a'*40);application_sha256=('d'*64);queue_storage=$writerContract;runtime_profile='ZKT_JOURNAL_V1';minimum_bootstrap_version='2.6.16';hil_targets=$journalTargets}
+$manifest = @{version='2.7.0';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.7.0';image_name='zone-lite-2.7.0.bin';image_sha256=(Get-FileHash $writerImage).Hash.ToLowerInvariant();image_size=(Get-Item $writerImage).Length;git_sha=('a'*40);application_sha256=('d'*64);queue_storage=$writerContract;runtime_profile='ZKT_JOURNAL_V1';minimum_bootstrap_version='2.6.17';hil_targets=$journalTargets}
 foreach ($channel in @('', 'AVAILABLE', 'EXPERIMENTAL_HIL_ONLY')) {
     $manifest.release_channel = $channel
     Write-TestManifest

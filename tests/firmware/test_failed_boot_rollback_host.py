@@ -80,7 +80,7 @@ int main(void)
     complete=true;result=ZJ_OK;assert(!advance_failed_boot_rollback()&&restarts==1);
     /* Rebooted VALID bridge must recover locally before it reports rollback.
      * Lost ADD responses and failed journal cleanup retain the original intent. */
-    strcpy(app.version,"2.6.16");s_failed_boot_pending=false;
+    strcpy(app.version,"2.6.17");s_failed_boot_pending=false;
     assert(!advance_failed_boot_rollback()&&!reports&&!clears);
     runtime=true;assert(!advance_failed_boot_rollback()&&reports==1&&!clears);
     network=true;clear_ok=false;assert(!advance_failed_boot_rollback()&&clears==1);
@@ -91,8 +91,8 @@ int main(void)
     assert(!advance_failed_boot_rollback()&&!restarts&&!strcmp(s_journal.state,"READY_TO_BOOT"));
     reset();s_failed_boot_pending=true;s_running_image_digest[0]='2';
     assert(!advance_failed_boot_rollback()&&!claims&&!submits);
-    reset();s_failed_boot_pending=true;strcpy(app.version,"2.6.16");
-    strcpy(s_journal.target_version,"2.6.16");
+    reset();s_failed_boot_pending=true;strcpy(app.version,"2.6.17");
+    strcpy(s_journal.target_version,"2.6.17");
     assert(!advance_failed_boot_rollback()&&!claims&&!submits);
     assert(!strcmp(s_last_error,"BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED"));
     reset();s_failed_boot_pending=true;claimed=drained=true;admitted=false;
@@ -101,7 +101,7 @@ int main(void)
      * real bridge reader, without inventing a reset cause or reselecting it. */
     const char *states[]={"READY_TO_BOOT","LOCAL_VALIDATED","BOOT_REPORTED","RECONCILING"};
     for(unsigned i=0;i<4;++i){
-        reset();strcpy(app.version,"2.6.16");strcpy(s_journal.state,states[i]);
+        reset();strcpy(app.version,"2.6.17");strcpy(s_journal.state,states[i]);
         assert(!advance_failed_boot_rollback()&&s_busy&&!claims&&!submits&&!reports);
         runtime=network=true;assert(advance_failed_boot_rollback()&&reports==1&&clears==1&&!s_busy);
     }
