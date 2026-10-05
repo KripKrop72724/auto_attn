@@ -32,8 +32,7 @@ static inline uint32_t zq_inventory_bit(const zq_request_t *r)
 }
 static inline bool zq_inventory_mutates(const zq_request_t *r)
 {
-    return r->operation <= ZQ_APPEND_COMMIT || r->operation == ZQ_SETTLE ||
-        r->operation == ZQ_RECOVER || r->operation == ZQ_PROBE;
+    return r->operation <= ZQ_APPEND_COMMIT || r->operation == ZQ_SETTLE;
 }
 static inline void zq_inventory_admitted(zq_inventory_t *s, const zq_request_t *r)
 {
@@ -57,7 +56,13 @@ static inline void zq_inventory_begin(zq_inventory_t *s, const zq_request_t *r)
 static inline void zq_inventory_complete(zq_inventory_t *s, const zq_request_t *r, const zq_reply_t *out)
 {
     uint32_t bit = zq_inventory_bit(r);
-    if (!bit || (out->result != DQ_OK && out->result != DQ_EMPTY)) {
+    /* The periodic segmented audit and persistence probe do not add or retire
+     * attendance. Successful checks preserve existing absence evidence; they
+     * cannot establish it. A pending/failed/unverified check still revokes the
+     * whole proof, including when no queue producer has run. */
+    bool check = r->operation == ZQ_RECOVER || r->operation == ZQ_PROBE;
+    if (!bit || (out->result != DQ_OK && out->result != DQ_EMPTY) ||
+        (check && (out->result != DQ_OK || !out->verified))) {
         zq_inventory_invalidate(s); return;
     }
     if ((r->operation == ZQ_PEEK_BEGIN && out->result == DQ_EMPTY) ||

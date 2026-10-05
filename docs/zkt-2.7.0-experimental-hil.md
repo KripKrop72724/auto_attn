@@ -86,6 +86,15 @@ command scratch reduce that path to 1,984 bytes; catalog recovery measures
 to fit. This is compiler evidence, not a field crash diagnosis or measured
 stack high-watermark.
 
+The replacement also preserves the legacy-inventory generation across the
+app's successful once-per-second recovery audit and persistence probe. These
+checks cannot add attendance or establish an empty queue. Pending, failed or
+unverified checks still revoke the proof; admitted appends and retirements
+invalidate it before execution. A regression test reproduces the former
+generation churn and verifies 90 repeated checks without weakening failure
+invalidation. This allows two fresh telemetry samples to prove the same
+unchanged empty inventory before migration.
+
 The replacement is a separately versioned **2.6.17** bridge with its own
 application descriptor and versioned V3 marker. Preserve the signed 2.6.16
 package and failed deployment history; never republish repaired bytes under
