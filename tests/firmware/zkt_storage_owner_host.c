@@ -22,6 +22,7 @@ static atomic_bool bridge_image, cutover_readback_failure;
 static atomic_int cutover_failure;
 static atomic_int persistence_failure;
 static pthread_t thread;
+static atomic_bool start_waiting, owner_announced;
 static pthread_mutex_t budget = PTHREAD_MUTEX_INITIALIZER;
 static void (*task_function)(void *);
 static void *task_argument;
@@ -106,20 +107,29 @@ TaskHandle_t xTaskCreateStatic(void (*function)(void *), const char *name, unsig
     task_function = function;
     task_argument = argument;
     assert(!pthread_create(&thread, NULL, worker, NULL));
+    /* A higher-priority FreeRTOS task can run before creation returns. */
+    for (unsigned i = 0; i < 2000 && !atomic_load(&start_waiting); ++i) vTaskDelay(1);
+    assert(atomic_load(&start_waiting));
     return &thread;
 }
 unsigned ulTaskNotifyTake(int clear, unsigned wait_ms)
 {
     (void)clear; (void)wait_ms;
+    if (wait_ms == portMAX_DELAY) {
+        atomic_store(&start_waiting, true);
+        while (!atomic_load(&owner_announced)) vTaskDelay(1);
+        return 1;
+    }
     if (atomic_load(&stop)) pthread_exit(NULL);
     vTaskDelay(1);
     return 1;
 }
-void xTaskNotifyGive(TaskHandle_t handle) { (void)handle; }
+void xTaskNotifyGive(TaskHandle_t handle) { assert(handle == &thread); atomic_store(&owner_announced, true); }
 TaskHandle_t xTaskGetCurrentTaskHandle(void)
 { return pthread_equal(pthread_self(), thread) ? &thread : NULL; }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 {
+    assert(atomic_load(&owner_announced) && zj_owner_is_current_task());
     (void)mode;
     assert(!strcmp(name, "zkt_journal") || !strcmp(name, "zone_lite") || !strcmp(name, "file_tx") || !strcmp(name, "zone_ota"));
     if (!strcmp(name, "zone_ota")) {

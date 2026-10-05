@@ -458,6 +458,9 @@ static void task(void *context)
     owner_t *o = context;
     zj_request_t request;
     zj_reply_t reply;
+    /* Static creation can schedule this higher-priority task before returning
+     * its handle. Routing must recognize the owner before it touches storage. */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     for (;;) {
         uint64_t ticket = 0;
         while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
@@ -628,6 +631,7 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
         mailbox_lock = NULL;
         return false;
     }
+    xTaskNotifyGive(owner_task);
     return true;
 }
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)

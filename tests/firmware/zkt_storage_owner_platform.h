@@ -22,6 +22,7 @@ typedef struct { unsigned used; } StaticTask_t;
 #define MALLOC_CAP_8BIT 2
 #define pdTRUE 1
 #define pdPASS 1
+#define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) (ms)
 int64_t esp_timer_get_time(void);
 void esp_fill_random(void *, size_t);
