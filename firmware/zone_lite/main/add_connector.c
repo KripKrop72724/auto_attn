@@ -2327,7 +2327,11 @@ static void restore_command_inbox(void)
         if (!length || line[length - 1] != '\n') { complete = false; break; }
         char *plain = decrypt_storage_line(line);
         cJSON *root = plain ? cJSON_Parse(plain) : NULL;
-        add_command_t command = {0};
+        /* The command mutex covers this complete restore operation. One
+         * bounded scratch record avoids stacking a full command on top of
+         * the owner reader/recovery frames in the startup supervisor. */
+        static add_command_t command;
+        memset(&command, 0, sizeof(command));
         bool parsed = root && parse_command_object(root, &command);
         QueueHandle_t target = parsed && strcmp(command.command_type, "APPLY_CONFIG") == 0
             ? s_config_commands

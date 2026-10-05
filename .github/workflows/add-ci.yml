@@ -341,6 +341,13 @@ jobs:
           bash -lc 'idf.py -B build-ci-bridge -D SDKCONFIG=/tmp/zone-lite-ci-bridge-sdkconfig -D PROJECT_VER=2.6.16 -D ZONE_LITE_JOURNAL_WRITES=ON build'
       - name: Check bridge application identity
         run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-bridge/zone_lite.bin --family zkt --version 2.6.16
+      - name: Check actual Xtensa startup stack budgets
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project
+          espressif/idf:v5.5.3
+          python3 scripts/check_zkt_startup_stack.py firmware/zone_lite/build-ci-bridge
       - name: Rebuild the writer and bridge at different paths and compare unsigned artifacts
         run: |
           set -euo pipefail

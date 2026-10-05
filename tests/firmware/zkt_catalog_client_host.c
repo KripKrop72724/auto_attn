@@ -8,6 +8,7 @@ static zj_mailbox_t mailbox;
 static uint64_t now = 1;
 static bool stalled, poll_failed;
 static unsigned submissions;
+static uint64_t completed_id;
 static zj_operation_t expected_operation = ZJ_CATALOG;
 static uint64_t clock_us(void *context) { (void)context; return now; }
 static void wait_step(void *context) { (void)context; now += 10; }
@@ -24,7 +25,8 @@ static bool poll(void *context, uint64_t ticket, zj_reply_t *reply, bool *comple
         zj_request_t request; uint64_t running;
         if (zj_mailbox_begin(&mailbox, &request, &running)) {
             assert(request.operation == expected_operation);
-            zj_reply_t result = {.result = ZJ_OK, .catalog = {.id = 77}};
+            completed_id = request.input.catalog.id ? request.input.catalog.id : 77;
+            zj_reply_t result = {.result = ZJ_OK, .catalog = {.id = completed_id}};
             assert(zj_mailbox_finish(&mailbox, running, &result));
         }
     }
@@ -70,5 +72,23 @@ int main(void)
     assert(zc_client_call(&client, port, &request, &reply) == ZJ_UNCERTAIN && client.pending_ticket);
     stalled = false;
     assert(zc_client_drain(&client, port) && client.active_may_have_changed && !mailbox.occupied);
+    /* Each caller retains its own scratch. Submission copies the request:
+     * polling/reusing scratch while another client waits cannot change it. */
+    zj_mailbox_init(&mailbox);
+    zc_client_t first = {0}, second = {0};
+    expected_operation = ZJ_CATALOG; stalled = true;
+    request = (zc_request_t){.operation = ZC_ACTIVATE, .id = 81, .deadline_us = now + 100};
+    assert(zc_client_call(&first, port, &request, &reply) == ZJ_UNCERTAIN);
+    request.id = 82; request.deadline_us = now + 100;
+    assert(zc_client_call(&second, port, &request, &reply) == ZJ_UNCERTAIN);
+    assert(first.pending_ticket != second.pending_ticket && mailbox.occupied == 2);
+    memset(&first.scratch, 0xcc, sizeof(first.scratch));
+    memset(&second.scratch, 0xdd, sizeof(second.scratch));
+    stalled = false;
+    assert(zc_client_drain(&first, port) && completed_id == 81);
+    assert(second.pending_ticket && zc_client_drain(&second, port) && completed_id == 82);
+    const unsigned char *scratch = (const unsigned char *)&first.scratch;
+    for (size_t i = 0; i < sizeof(first.scratch); ++i) assert(!scratch[i]);
+    assert(!mailbox.occupied);
     puts("retained catalog timeout and admission checks passed");
 }

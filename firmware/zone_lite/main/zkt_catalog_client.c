@@ -7,14 +7,14 @@ static void collected(zc_client_t *client)
     if (client->pending_operation == ZC_ACTIVATE || client->pending_operation == ZC_RECOVER)
         client->active_may_have_changed = true;
     client->pending_ticket = 0;
+    memset(&client->scratch, 0, sizeof(client->scratch));
 }
 bool zc_client_drain(zc_client_t *client, zc_client_port_t port)
 {
     if (!client || !port.poll) return false;
     if (!client->pending_ticket) return true;
-    zj_reply_t reply;
     bool complete = false;
-    if (!port.poll(port.context, client->pending_ticket, &reply, &complete) || !complete) return false;
+    if (!port.poll(port.context, client->pending_ticket, &client->scratch.reply, &complete) || !complete) return false;
     collected(client);
     return true;
 }
@@ -35,20 +35,23 @@ zj_result_t zc_client_call(zc_client_t *client, zc_client_port_t port,
         reply->operation = client->commands ? "commands_deadline" : "catalog_deadline";
         return ZJ_STALE;
     }
-    zj_request_t message = {.operation = client->commands ? ZJ_COMMANDS : ZJ_CATALOG, .input.catalog = *request};
-    if (!port.submit(port.context, &message, &client->pending_ticket)) {
+    memset(&client->scratch, 0, sizeof(client->scratch));
+    client->scratch.request.operation = client->commands ? ZJ_COMMANDS : ZJ_CATALOG;
+    client->scratch.request.input.catalog = *request;
+    if (!port.submit(port.context, &client->scratch.request, &client->pending_ticket)) {
+        memset(&client->scratch, 0, sizeof(client->scratch));
         reply->error = EBUSY;
         reply->operation = client->commands ? "commands_owner_admission" : "catalog_owner_admission";
         return ZJ_IO;
     }
     client->pending_operation = request->operation;
     for (;;) {
-        zj_reply_t response;
         bool complete = false;
-        if (port.poll(port.context, client->pending_ticket, &response, &complete) && complete) {
-            *reply = response.catalog;
+        if (port.poll(port.context, client->pending_ticket, &client->scratch.reply, &complete) && complete) {
+            *reply = client->scratch.reply.catalog;
+            zj_result_t result = client->scratch.reply.result;
             collected(client);
-            return response.result;
+            return result;
         }
         if (port.now_us(port.context) >= request->deadline_us) {
             reply->error = ETIMEDOUT;
