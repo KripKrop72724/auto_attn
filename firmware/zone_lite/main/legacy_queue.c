@@ -35,7 +35,9 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
         lq_checkpoint_t *cp=&q->checkpoint;
         if (loaded<0) { if(!errno)errno=EIO; return DQ_IO; }
         if (loaded && ((cp->version!=1 && cp->version!=2) || !cp->generation ||
-            cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc)))) return DQ_CORRUPT;
+            cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc)))) {
+            q->checkpoint_corrupt=true; return DQ_CORRUPT;
+        }
         q->recovering=true;
     }
     lq_checkpoint_t *cp=&q->checkpoint;
@@ -59,10 +61,10 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
         if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
         // Failed I/O retries exactly this slice, including a failed close.
         if (!ok) { errno=error; return DQ_IO; }
-        if (!boundary) { q->recovering=false; return DQ_CORRUPT; }
+        if (!boundary) { q->recovering=false; q->checkpoint_corrupt=true; return DQ_CORRUPT; }
         q->recovery_offset=position; q->recovery_crc=crc;
         if (position<cp->offset) return DQ_PENDING;
-        if (crc!=cp->prefix_crc) { q->recovering=false; return DQ_CORRUPT; }
+        if (crc!=cp->prefix_crc) { q->recovering=false; q->checkpoint_corrupt=true; return DQ_CORRUPT; }
     }
     q->recovering=false; q->ready=true;
     return DQ_OK;
@@ -97,14 +99,46 @@ dq_result_t lq_peek(legacy_queue_t *q, char *data, size_t capacity, lq_token_t *
     if (!n && ch==EOF) return DQ_EMPTY;
     if (n>UINT32_MAX-q->checkpoint.offset) return DQ_CORRUPT;
     data[n]=0;
-    *token=(lq_token_t){q->checkpoint.generation,q->checkpoint.offset,
-        q->checkpoint.offset+(uint32_t)n,dq_crc32(data,n),
-        q->checkpoint.version==2 || data[n-1]!='\n'};
+    *token=(lq_token_t){.generation=q->checkpoint.generation,.offset=q->checkpoint.offset,
+        .end=q->checkpoint.offset+(uint32_t)n,.crc=dq_crc32(data,n),
+        .evidence_required=q->checkpoint.version==2 || data[n-1]!='\n'};
+    return DQ_OK;
+}
+dq_result_t lq_checkpoint_evidence(legacy_queue_t *q, void *data, size_t capacity, lq_token_t *token)
+{
+    if (!q || !data || !token || capacity<sizeof(q->checkpoint) ||
+        q->ready || !q->checkpoint_corrupt) return DQ_IO;
+    memcpy(data,&q->checkpoint,sizeof(q->checkpoint));
+    *token=(lq_token_t){.generation=q->checkpoint.generation,.end=sizeof(q->checkpoint),
+        .crc=dq_crc32(data,sizeof(q->checkpoint)),.evidence_required=true,.checkpoint_evidence=true};
+    return DQ_OK;
+}
+static dq_result_t settle_checkpoint(legacy_queue_t *q, const lq_token_t *token)
+{
+    if (!q->checkpoint_corrupt || q->ready || !q->port.load || !q->port.commit ||
+        !token->evidence_required || token->generation!=q->checkpoint.generation ||
+        token->offset || token->end!=sizeof(q->checkpoint) ||
+        token->crc!=dq_crc32(&q->checkpoint,sizeof(q->checkpoint))) return DQ_STALE;
+    lq_checkpoint_t actual;
+    errno=0;
+    int loaded=q->port.load(q->port.context,&actual);
+    if (loaded<0) { if(!errno)errno=EIO; return DQ_IO; }
+    if (loaded!=1 || memcmp(&actual,&q->checkpoint,sizeof(actual))) return DQ_STALE;
+    /* Never wrap a generation or pretend this proves removed bytes existed.
+     * The original cursor is already in ADD custody; retained files stay
+     * untouched and are read again from the beginning after this commit. */
+    if (actual.generation==UINT32_MAX) return DQ_CORRUPT;
+    lq_checkpoint_t next={.version=1,.generation=actual.generation};
+    if (!persist(q,next)) return DQ_IO;
+    q->ready=q->recovering=q->empty_cached=q->checkpoint_corrupt=false;
+    q->recovery_offset=q->recovery_crc=0;
     return DQ_OK;
 }
 static dq_result_t settle(legacy_queue_t *q, const lq_token_t *token, bool custody)
 {
-    if (!q || !q->ready || !token) return DQ_IO;
+    if (!q || !token) return DQ_IO;
+    if (token->checkpoint_evidence) return custody ? settle_checkpoint(q,token) : DQ_STALE;
+    if (!q->ready) return DQ_IO;
     if (!custody && (token->evidence_required || q->checkpoint.version==2)) return DQ_STALE;
     if (token->generation!=q->checkpoint.generation || token->offset!=q->checkpoint.offset ||
         token->end<=token->offset || token->end-token->offset>DQ_MAX_RECORD_BYTES) return DQ_STALE;

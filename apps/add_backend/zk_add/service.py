@@ -182,6 +182,44 @@ OTA_FAILURE_MESSAGES = {
     "PARTITION_HASH_FAILED": "The ESP could not read back the written OTA partition digest.",
     "IMAGE_HASH_MISMATCH": "The written OTA partition digest does not match the signed release.",
 }
+LOCAL_BOOT_WAIT_REASONS = frozenset({
+    "BOOT_LOCAL_STORAGE_UPGRADE", "BOOT_LOCAL_JOURNAL_RECOVERY",
+    "BOOT_LOCAL_STORAGE_UNVERIFIED", "BOOT_LOCAL_TELEMETRY_LOCK",
+    "BOOT_LOCAL_TERMINAL_SESSION", "BOOT_LOCAL_TERMINAL_COUNTS",
+    "BOOT_LOCAL_LEGACY_WORKERS",
+})
+
+
+def _local_boot_is_waiting(payload: HeartbeatPayload, release) -> bool:
+    """Recognize bounded local validation, without granting any boot verdict.
+
+    Journal-capable firmware exposes its current local wait reason in
+    last_error while READY_TO_BOOT. The task gets 900 seconds to recover;
+    allow one minute for startup/scheduling, but never suppress a terminal
+    error, an expired wait, or evidence for a different running image.
+    """
+    from zk_add.ota import _application_sha256, _versions_match
+    from zk_add.zkt_bridge_contract import BRIDGE_VERSIONS
+
+    ota = payload.ota
+    digest = _application_sha256(release)
+    return (
+        release.version in {*BRIDGE_VERSIONS, "2.7.0"}
+        and (release.manifest or {}).get("firmware_family", "zkt") == "zkt"
+        and ota.state == "READY_TO_BOOT"
+        and ota.last_error in LOCAL_BOOT_WAIT_REASONS
+        and _versions_match(payload.firmware_version, release.version)
+        and _versions_match(ota.running_version, release.version)
+        and ota.running_partition in {"ota_0", "ota_1"}
+        and bool(digest) and ota.image_sha256 == digest
+        and ota.secure_boot and ota.rollback_enabled
+        and ota.partition_layout == release.partition_layout
+        and ota.bytes_written == release.image_size == ota.image_size
+        and 0 < ota.boot_health_checks < 900
+        and not ota.boot_health_last_ready
+        and payload.uptime_seconds is not None
+        and 0 <= payload.uptime_seconds <= 960
+    )
 
 
 def attendance_device_time_is_plausible(
@@ -302,6 +340,11 @@ def apply_ota_heartbeat_diagnostics(
     )
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None:
+        return
+    if (connector.firmware_family == "zkt"
+            and deployment.status == "READY_TO_BOOT"
+            and _local_boot_is_waiting(payload, release)):
+        connector.ota_state = "UPDATING"
         return
     bounded_bytes = min(
         release.image_size,

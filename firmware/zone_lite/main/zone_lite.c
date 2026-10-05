@@ -7463,7 +7463,8 @@ static void oracle_drain_owned_pending(void)
         bool identity = qs_generation(instance);
         snprintf(generation, sizeof(generation), "%s-legacy-%lu", identity ? instance : "", (unsigned long)token.generation);
         snprintf(record_id, sizeof(record_id), "%lu:%lu", (unsigned long)token.offset, (unsigned long)token.crc);
-        settled = identity && add_connector_transfer_queue_evidence("ords_legacy", generation, record_id,
+        settled = identity && add_connector_transfer_queue_evidence(
+            token.checkpoint_evidence ? "ords_legacy_checkpoint" : "ords_legacy", generation, record_id,
             event, length, NULL, delivery == ORACLE_DELIVERY_IDENTITY_UNRESOLVED ? "IDENTITY_UNRESOLVED" : "MALFORMED");
     }
     char *quarantine = delivery == ORACLE_DELIVERY_PERMANENT_REJECTION ? oracle_mark_permanent_rejection(event) : NULL;
@@ -7691,7 +7692,8 @@ static void blocked_evidence_slice(void)
         segmented ? (unsigned long)segmented_token.sequence : (unsigned long)legacy_token.crc);
     add_connector_report_ords_worker(ADD_WORKER_NETWORK);
     bool preserved = identity && add_connector_transfer_queue_evidence(
-        segmented ? "blocked" : "blocked_legacy", generation, record_id, line, length,
+        segmented ? "blocked" : legacy_token.checkpoint_evidence ? "blocked_legacy_checkpoint" : "blocked_legacy",
+        generation, record_id, line, length,
         cJSON_IsString(serial) ? serial->valuestring : NULL, syntax ? "LEGACY_RECOVERY" : "MALFORMED");
     cJSON_Delete(root);
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);

@@ -104,6 +104,31 @@ tests also cover 2.6.17. A replacement reader may renew a valid older proof
 only for the same terminal, capture epoch and layout. The old proof alone
 cannot authorize a writer or OTA transition.
 
+The signed 2.6.17 canary reached its first boot on 5 October. Its legacy ORDS
+reader then reported an integrity failure (`legacy_read`, error 77) while the
+new journal owner remained healthy. This is not a passed bridge qualification.
+The installed image exhausted its local boot checks and reported
+`BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED`; its failed campaign remains paused and
+the immutable 2.6.17 release is revoked from further HIL offers. The writer's
+pin to that failed bridge is not publication-ready.
+ADD has no connector-reboot command in that image, and the failed-boot loop
+does not poll another OTA assignment. A backend status edit cannot repair or
+replace those installed bytes. Preserve this device's failed history and all
+17 devices in the nationwide denominator.
+
+Development recovery now lets the storage owner transfer a rejected legacy
+checkpoint's exact bytes to ADD as a separately named opaque evidence item.
+Only its matching durable receipt permits resetting that same checkpoint to
+offset zero. All retained file bytes replay through the existing identity and
+custody checks; the reset never deletes a file or establishes source/Oracle
+completion. Changed checkpoint evidence, failed I/O and generation exhaustion
+remain held. A successful subsequent read is required to clear its read
+incident; unrelated persistence faults remain independent. Sanitizer tests
+exercise corrupt headers/prefixes, reboot and lost acknowledgement, changed
+evidence, uncertain NVS commit, and the actual ADD/Oracle owner adapters.
+These changes require a new signed bridge identity and renewed writer pins;
+do not replace or republish the immutable 2.6.17 artifact.
+
 The replacement was built and signed from the seven-job CI-passing source
 `42de8ac5b38c9229203e0c779d151af834b28123` in
 [HIL candidate run 37284425786](https://github.com/KripKrop72724/auto_attn/actions/runs/37284425786).
@@ -293,3 +318,25 @@ the matching ADD-authority runtime and the existing cursor, chain, completed
 reconciliation and preservation checks. The observation stores custody and
 Oracle states independently; it does not turn raw custody into valid attendance
 or an Oracle delivery pass. Legacy releases cannot claim this exception.
+
+## Retrying publication without replacing signed bytes
+
+Production ADD uses a read-only root filesystem and a tmpfs `/tmp` mount.
+Admission metadata is transferred through `docker exec` in bounded base64
+arguments, with contiguous offsets and each original SHA-256 checked before the
+saved inspector runs. This avoids Windows stdin transformations and keeps every
+argument below the native command-line limit. Only public metadata and the
+inspector use this path; firmware bytes and secrets are excluded. This avoids
+[Docker's documented tmpfs copy restriction](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases).
+An isolated container with the production mount configuration reproduced the
+original copy failure and accepted the same signed package after this repair;
+both paths removed their temporary files.
+
+The candidate workflow's optional `signed_candidate_run_id` reuses an existing
+artifact from its original completed provenance, build and signing jobs. The
+original workflow and repository, available bounded artifact, main ancestry,
+seven successful firmware-source checks, requested manifest identity, deployed
+signature/contract admission and exact HIL quarantine are still checked. Build
+and sign jobs are skipped in this mode. Rebuilding or resigning a published
+version is not a recovery mechanism. A publication retry is not a firmware or
+field qualification result.

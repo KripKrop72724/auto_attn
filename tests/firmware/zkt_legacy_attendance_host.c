@@ -148,7 +148,7 @@ static bool add_enqueue_json_receipts(char **events,size_t count,const char *pat
 static bool add_connector_transfer_queue_evidence(const char *queue,const char *generation,const char *id,
     const void *bytes,size_t length,const char *serial,const char *reason)
 {
-    assert(!budget && !owner_task && !strcmp(queue,"ords_legacy") && strstr(generation,"-legacy-") &&
+    assert(!budget && !owner_task && (!strcmp(queue,"ords_legacy") || !strcmp(queue,"ords_legacy_checkpoint")) && strstr(generation,"-legacy-") &&
         strchr(id,':') && !serial && (!strcmp(reason,"MALFORMED") || !strcmp(reason,"IDENTITY_UNRESOLVED") || !strcmp(reason,"LEGACY_RECOVERY")));
     snprintf(evidence_identity,sizeof(evidence_identity),"%s/%s/%s",queue,generation,id);
     ++evidence_sends;evidence_length=length;memcpy(delivered,bytes,length);return evidence;
@@ -283,6 +283,24 @@ int main(void)
     oracle_drain_owned_pending();assert(exists(ZOL_PENDING_PATH) && !saved[0].offset);
     evidence=true;oracle_drain_owned_pending();assert(!exists(ZOL_PENDING_PATH));
     assert(!delivery_faults); /* Refusals and unresolved identity are not failed persistence. */
+    /* A damaged legacy cursor is transferred through ADD custody before it
+     * can reset. It is never sent to Oracle or confused with attendance. */
+    reset_lane(0);seed(ZOL_PENDING_PATH,"retained\n",9);
+    saved[0]=(lq_checkpoint_t){.version=1,.generation=9,.offset=4,.crc=1};
+    lq_checkpoint_t damaged=saved[0]; before=sends;evidence=false;
+    oracle_drain_owned_pending();
+    assert(sends==before && evidence_length==sizeof(damaged) && !memcmp(delivered,&damaged,sizeof(damaged)));
+    assert(strstr(evidence_identity,"ords_legacy_checkpoint/") && !memcmp(&saved[0],&damaged,sizeof(damaged)));
+    assert(!zol_pending_verified_empty() && health.legacy.read_faults && exists(ZOL_PENDING_PATH));
+    memcpy(first_identity,evidence_identity,sizeof(first_identity));
+    memset(&lanes[0].queue,0,sizeof(lanes[0].queue));lanes[0].initialized=false;
+    oracle_drain_owned_pending();assert(!strcmp(first_identity,evidence_identity));
+    evidence=true;oracle_drain_owned_pending();
+    assert(sends==before && !saved[0].offset && saved[0].generation==10 && exists(ZOL_PENDING_PATH));
+    assert(health.legacy.read_faults); /* Reset alone cannot clear the read incident. */
+    assert(peek_lane(0,bytes,&length,&token)==DQ_OK && length==9 && !memcmp(bytes,"retained\n",9));
+    assert(!health.legacy.read_faults && !token.checkpoint_evidence);
+    reset_lane(0);
     required=false;assert(zol_append(0,"wrong-image",11,QS_ADMIT_LIVE)==DQ_PENDING && !exists(ZOL_PENDING_PATH));
     assert(!budget && !ticket && failed_writes);
     puts("legacy attendance owner: generations, actual I/O faults, retained replies, ABI and bounded recovery passed");

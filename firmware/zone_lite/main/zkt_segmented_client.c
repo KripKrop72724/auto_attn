@@ -74,7 +74,8 @@ done:
 static bool same_legacy_token(const lq_token_t *a, const lq_token_t *b)
 {
     return a->generation == b->generation && a->offset == b->offset &&
-        a->end == b->end && a->crc == b->crc && a->evidence_required == b->evidence_required;
+        a->end == b->end && a->crc == b->crc && a->evidence_required == b->evidence_required &&
+        a->checkpoint_evidence == b->checkpoint_evidence;
 }
 static dq_result_t peek(zq_domain_t domain, unsigned lane, void *data, size_t capacity,
                        size_t *length, dq_token_t *token, lq_token_t *legacy_token)
