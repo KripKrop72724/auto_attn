@@ -233,5 +233,18 @@ int main(void)
     assert(health.legacy.read_faults==1 && legacy_health.errors[LF_ADD_BULK][LF_READ]==EIO);
     nvs_fault=0;assert(peek(1)==DQ_EMPTY);
     assert(!health.legacy.read_faults && health.legacy.read_recoveries==2 && health.legacy.retire_faults==1);
+    /* A corrupt cursor is returned as opaque evidence, never as a row. A
+     * receipt resets only that cursor; the first original row remains. */
+    write_bytes("bulk.jsonl","kept\n",5);
+    committed[1]=(lq_checkpoint_t){.version=1,.generation=19,.offset=2,.crc=1};
+    lq_checkpoint_t original_checkpoint=committed[1];
+    s_bulk_outbox.owner_initialized=false;memset(&s_bulk_outbox.legacy,0,sizeof(s_bulk_outbox.legacy));
+    assert(peek(1)==DQ_OK && token.checkpoint_evidence && token.evidence_required);
+    assert(copied_length==sizeof(original_checkpoint) && !memcmp(copied,&original_checkpoint,copied_length));
+    assert(health.legacy.read_faults && !s_bulk_outbox.depth_known);
+    assert(zq_legacy_settle(1,&token,false)==DQ_STALE && !memcmp(&committed[1],&original_checkpoint,sizeof(original_checkpoint)));
+    settle(1,true);
+    assert(!committed[1].offset && committed[1].generation==20 && health.legacy.read_faults);
+    expect(1,"kept\n");assert(!token.checkpoint_evidence && !health.legacy.read_faults);settle(1,false);
     puts("actual ADD legacy owner: generations, faults, copied replies, prefix recovery and custody passed");
 }

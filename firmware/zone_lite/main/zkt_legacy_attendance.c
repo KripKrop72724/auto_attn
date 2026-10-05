@@ -84,7 +84,7 @@ static dq_result_t finish(lane_t *lane, dq_result_t result, lf_operation_t opera
     if (lane == &lanes[ZOL_PENDING]) atomic_store_explicit(&pending_empty,
         result == DQ_EMPTY && lane->queue.ready && lane->queue.empty_cached, memory_order_release);
     qs_local_end_legacy(lane == &lanes[ZOL_PENDING] ? LF_ORDS_PENDING : LF_IDENTITY_BLOCKED,
-        operation, result, error);
+        operation, lane->queue.checkpoint_corrupt && result == DQ_OK ? DQ_CORRUPT : result, error);
     return result;
 }
 static dq_result_t retire(lane_t *lane)
@@ -135,6 +135,11 @@ dq_result_t zol_owner_peek(unsigned index, void *bytes, size_t capacity, size_t 
     errno = 0;
     lf_operation_t operation = LF_READ;
     dq_result_t result = prepare(lane);
+    if (result == DQ_CORRUPT && lane->queue.checkpoint_corrupt) {
+        result = lq_checkpoint_evidence(&lane->queue, bytes, capacity, token);
+        if (result == DQ_OK) *length = token->end;
+        goto done;
+    }
     if (result != DQ_OK) goto done;
     if (lane->queue.empty_cached) { result = DQ_EMPTY; goto done; }
     result = lq_peek(&lane->queue, bytes, capacity, token);
@@ -157,7 +162,7 @@ dq_result_t zol_owner_settle(unsigned index, const lq_token_t *token, bool custo
     if (!lane) return DQ_PENDING;
     errno = 0;
     dq_result_t result = custody ? lq_settle_evidence(&lane->queue, token) : lq_settle(&lane->queue, token);
-    if (result == DQ_OK) {
+    if (result == DQ_OK && !token->checkpoint_evidence) {
         result = retire(lane);
         if (result == DQ_STALE) result = DQ_OK; /* Another retained row remains. */
     }
