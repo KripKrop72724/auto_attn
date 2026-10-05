@@ -153,10 +153,10 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     # The complete suite includes 100,000/200,000-record PostgreSQL qualifications
-    # and took 19m35s on a hosted runner before migration/build checks. Reserve
-    # time for those checks and setup; individual responsiveness/progress
-    # deadlines remain enforced by the tests.
-    timeout-minutes: 30
+    # and took 28m57s in run 37274975076, leaving too little time for
+    # migration/build checks and runner cleanup under the old 30-minute cap.
+    # Individual responsiveness/progress deadlines remain enforced by tests.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
