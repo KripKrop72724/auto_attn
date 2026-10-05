@@ -367,4 +367,6 @@ def test_report_sync_failure_is_reported_as_an_error(tmp_path, fast_compile, mon
         raise OSError("synthetic-fsync-failure")
     monkeypatch.setattr(bench.os, "fsync", fail)
     assert bench.main([str(path), "--output", str(tmp_path / "result.json")]) == 2
-    assert "BUNDLE_REPORT_WRITE_FAILED" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "BUNDLE_REPORT_WRITE_FAILED" in captured.err
+    assert "comparison=ERROR" in captured.out and "comparison=PASSED" not in captured.out

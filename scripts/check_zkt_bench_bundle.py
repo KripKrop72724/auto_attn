@@ -373,7 +373,8 @@ def main(argv=None) -> int:
         except OSError:
             print("BUNDLE_REPORT_WRITE_FAILED", file=sys.stderr)
             status = 2
-    print(f"comparison={report['comparison']} profile_qualification=NOT_ASSERTED activation_authority=NONE")
+    result = "ERROR" if status == 2 else report["comparison"]
+    print(f"comparison={result} profile_qualification=NOT_ASSERTED activation_authority=NONE")
     return status
 
 
