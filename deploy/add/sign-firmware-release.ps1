@@ -95,6 +95,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release me
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
+$journalHilTargets = $null
+if ($Version -eq '2.6.16') {
+    if ($FirmwareFamily -ne 'zkt') { throw 'The journal bridge is ZKT-only' }
+    . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
+    Assert-JournalHilScope -TargetsJson $HilTargetsJson
+    $journalHilTargets = Get-JournalHilScope
+}
 if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
     # A signed candidate is necessary to exercise the five physical terminals.
     # Production publication still requires promotion of these exact HIL bytes
@@ -206,7 +213,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
@@ -218,8 +225,10 @@ try {
     if ($null -ne $storageContract) {
         # Keep canonical lexical key order used by ADD signature verification.
         $sortedManifest = [ordered]@{}
-        foreach ($key in @($manifest.Keys + @('queue_storage') | Sort-Object)) {
-            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } else { $manifest[$key] })
+        $additionalKeys = @('queue_storage')
+        if ($Version -eq '2.6.16') { $additionalKeys += @('hil_targets', 'release_channel') }
+        foreach ($key in @($manifest.Keys + $additionalKeys | Sort-Object)) {
+            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'hil_targets') { $journalHilTargets } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })
         }
         $manifest = $sortedManifest
     }

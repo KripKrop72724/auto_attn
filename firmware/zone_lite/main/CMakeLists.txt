@@ -31,13 +31,19 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
         "zkt_journal_diagnostics.c")
 endif()
 
-# This is an integration-test switch, not release authorization. Signed bridge
-# and candidate registration remain blocked until reader compatibility exists.
+# This compiles the journal runtime. Only the exact bridge role is admitted to
+# experimental HIL; the candidate still requires separate cutover qualification.
 if(ZONE_LITE_JOURNAL_WRITES)
     if(ZONE_LITE_FAMILY STREQUAL "hikvision")
         message(FATAL_ERROR "The attendance journal writer is ZKT-only")
     endif()
+    if(ZONE_LITE_SEGMENTED_WRITES OR ZONE_LITE_DIRECT_LEGACY_UPGRADE)
+        message(FATAL_ERROR "Journal images cannot mix legacy storage upgrade modes")
+    endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITES=1)
+    if(PROJECT_VER STREQUAL "2.6.16")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_BRIDGE_IMAGE=1)
+    endif()
 endif()
 if(ZONE_LITE_FAMILY STREQUAL "hikvision")
     if(NOT CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH OR NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC)

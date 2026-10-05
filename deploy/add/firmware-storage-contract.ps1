@@ -4,6 +4,33 @@ function Get-FirmwareStorageContract {
     # with the wrong writer mode before opening the protected signing key.
     $bytes = [IO.File]::ReadAllBytes($ImagePath)
     $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+    $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V3:[A-Z0-9:=_.,]+')
+    if ($Version -eq '2.6.16') {
+        $expectedBridge = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
+        $legacyMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:')
+        if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedBridge -or $legacyMarkers.Count -ne 0) {
+            throw 'Missing, ambiguous, or incorrect journal bridge reader/capture contract'
+        }
+        return [ordered]@{
+            allowed_bootstrap_images = [ordered]@{
+                '2.4.12' = 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589'
+                '2.5.2' = '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b'
+                '2.6.15' = '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6'
+            }
+            allowed_bootstrap_versions = @('2.4.12', '2.5.2', '2.6.15')
+            compatibility_version = '2.6.16'
+            delivery_authority = 'LEGACY_UNTIL_PERSISTED_ADD_CUTOVER'
+            journal_capture = $true
+            journal_read_format = 1
+            journal_reader_mask = 63
+            journal_write_format = 1
+            read_format = 2
+            reader_mask = 63
+            schema_version = 3
+            write_format = 1
+        }
+    }
+    if ($journalMarkers.Count -gt 0) { throw 'Journal bridge marker cannot sign another firmware version' }
     $markers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:[A-Z]+:READ=[0-9]+:LANES=[0-9A-F]+:(?:COMPAT=[0-9.]+|BASE=[0-9.,]+)')
     if ($Version -notin @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) {
         if ($markers.Count -gt 0) { throw 'Storage-contract version is not qualified for signing' }

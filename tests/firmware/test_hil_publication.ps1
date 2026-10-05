@@ -15,6 +15,30 @@ try {
 New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
+$bridgeMarker = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
+[IO.File]::WriteAllText($contractImage, $bridgeMarker + [char]0)
+$bridgeContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.16'
+if ($bridgeContract.schema_version -ne 3 -or $bridgeContract.journal_capture -ne $true -or
+    $bridgeContract.journal_read_format -ne 1 -or $bridgeContract.journal_reader_mask -ne 63 -or
+    $bridgeContract.journal_write_format -ne 1 -or $bridgeContract.write_format -ne 1 -or
+    $bridgeContract.delivery_authority -ne 'LEGACY_UNTIL_PERSISTED_ADD_CUTOVER' -or
+    $bridgeContract.allowed_bootstrap_versions.Count -ne 3 -or
+    $bridgeContract.allowed_bootstrap_images['2.6.15'] -ne '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6') {
+    throw 'Bridge reader or predecessor contract changed'
+}
+foreach ($other in @('2.6.15', '2.7.0', '9.9.9')) {
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $other | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Bridge marker signed as another version' }
+}
+foreach ($bad in @('', $bridgeMarker.Replace('CAPTURE=1', 'CAPTURE=0'),
+    ($bridgeMarker + [char]0 + $bridgeMarker),
+    ($bridgeMarker + [char]0 + 'ZONE_STORAGE_CONTRACT_V2:LEGACY'))) {
+    [IO.File]::WriteAllText($contractImage, $bad + [char]0)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.16' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Unqualified bridge storage marker accepted' }
+}
 foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) {
     $mode = if ($version -eq '2.6.0') { 'SEGMENTED' } else { 'LEGACY' }
     $marker = if ($version -eq '2.6.15') {
@@ -601,6 +625,62 @@ Write-TestManifest
 $rejected=$false
 try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 3.1.0 -PublicationMode HIL_ONLY -HilTargetMac 'ac:27:6e:a4:e9:74' } catch { $rejected=$true }
 if (-not $rejected) { throw 'Mislabelled Hikvision image accepted' }
+# Experimental bridge publication requires connector, ESP and terminal identity;
+# neither publication nor promotion may remove quarantine from these bytes.
+$bridgeImage = Join-Path $source 'zone-lite-2.6.16.bin'
+[IO.File]::WriteAllText($bridgeImage, 'Bridge fixture, not deployable firmware')
+$manifest = @{version='2.6.16';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.6.16';image_name='zone-lite-2.6.16.bin';image_sha256=(Get-FileHash $bridgeImage).Hash.ToLowerInvariant();image_size=(Get-Item $bridgeImage).Length;git_sha=('a'*40);application_sha256=('d'*64);release_channel='EXPERIMENTAL_HIL_ONLY';queue_storage=$bridgeContract}
+. (Join-Path $repo 'deploy/add/journal-hil-scope.ps1')
+$journalTargets = Get-JournalHilScope
+$manifest.hil_targets = $journalTargets
+$journalScope = ConvertTo-Json -InputObject @($journalTargets[0]) -Depth 5 -Compress
+foreach ($count in 1..17) {
+    Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject @($journalTargets[0..($count-1)]) -Depth 5 -Compress)
+}
+foreach ($bad in @('[]', $targets, (ConvertTo-Json -InputObject @($journalTargets[1], $journalTargets[0]) -Depth 5 -Compress))) {
+    $rejected = $false
+    try { Assert-JournalHilScope -TargetsJson $bad } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Journal scope accepted unreviewed target identities or order' }
+}
+Write-TestManifest
+foreach ($mode in @('AVAILABLE', 'HIL_ONLY')) {
+    $rejected = $false
+    try {
+        if ($mode -eq 'AVAILABLE') {
+            & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode $mode
+        } else {
+            & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode $mode -HilTargetMac '00:11:22:33:44:55'
+        }
+    } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Experimental publication bypassed ordered HIL quarantine' }
+}
+if (Test-Path (Join-Path $store '2.6.16')) { throw 'Rejected bridge publication left a release' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode HIL_ONLY -HilTargetsJson $journalScope
+$bridgeScopePath = Join-Path $store '2.6.16/.hil-only.json'
+$bridgeScopeBefore = [IO.File]::ReadAllText($bridgeScopePath)
+$bridgeOutput = Join-Path $root 'bridge-promotion-output'
+$rejected = $false
+try {
+    & (Join-Path $repo 'deploy/add/promote-firmware.ps1') -StoreDirectory $store -Version 2.6.16 -GitSha ('a'*40) -OutputDirectory $bridgeOutput
+} catch { $rejected = $true }
+if (-not $rejected -or (Test-Path $bridgeOutput) -or
+    [IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) {
+    throw 'Experimental promotion changed the quarantine or produced output'
+}
+$fullJournalScope = ConvertTo-Json -InputObject $journalTargets -Depth 5 -Compress
+$bridgeArguments = @{
+    StoreDirectory=$store; Version='2.6.16'; ExpectedGitSha=('a'*40)
+    ExpectedImageSha256=[string]$manifest.image_sha256; ExpectedApplicationSha256=('d'*64)
+    ExistingTargetsJson=$journalScope; ExtendedTargetsJson=$fullJournalScope
+}
+& $extend @bridgeArguments -PreviewOnly
+if ([IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) { throw 'Journal preview changed quarantine' }
+& $extend @bridgeArguments
+$expandedBridge = Get-Content $bridgeScopePath -Raw | ConvertFrom-Json
+if ($expandedBridge.targets.Count -ne 17) { throw 'Journal scope expansion lost a nationwide target' }
+if ((Get-FileHash (Join-Path $store '2.6.16/zone-lite-2.6.16.bin')).Hash.ToLowerInvariant() -cne $manifest.image_sha256) {
+    throw 'Journal expansion changed signed image bytes'
+}
 Write-Host 'Publication regression tests passed'
 
 } finally {

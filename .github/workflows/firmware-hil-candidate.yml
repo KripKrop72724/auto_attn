@@ -77,8 +77,14 @@ jobs:
           if mac and not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
               raise SystemExit('Invalid HIL MAC')
           targets = json.loads(raw) if raw else None
+          journal_bridge = os.environ['INPUT_VERSION'] == '2.6.16'
+          target_limit = 17 if journal_bridge else 8
+          if journal_bridge:
+              expected = json.load(open('deploy/add/hil-targets-zkt-270.json'))
+              if not isinstance(targets, list) or not targets or targets != expected[:len(targets)]:
+                  raise SystemExit('Journal bridge requires its exact ordered nationwide prefix')
           if targets is not None:
-              if not isinstance(targets, list) or not 1 <= len(targets) <= 8:
+              if not isinstance(targets, list) or not 1 <= len(targets) <= target_limit:
                   raise SystemExit('Invalid ordered target list')
               for row in targets:
                   if not isinstance(row, dict) or set(row) != {'connector_id', 'mac', 'terminal_serial'}:
@@ -126,7 +132,12 @@ jobs:
           project=zone_lite
           if [[ "$FIRMWARE_FAMILY" == "hikvision" ]]; then project=zone_lite_hikvision; fi
           actual="$(sed -n "s/^project($project VERSION \([^ )]*\).*/\1/p" CMakeLists.txt)"
-          test "$actual" = "$EXPECTED_VERSION"
+          journal_mode=OFF
+          if [[ "$FIRMWARE_FAMILY" == "zkt" && "$EXPECTED_VERSION" == "2.6.16" ]]; then
+            journal_mode=ON
+          else
+            test "$actual" = "$EXPECTED_VERSION"
+          fi
           storage_mode=OFF
           if [[ "$EXPECTED_VERSION" == "2.6.0" ]]; then storage_mode=ON; fi
           direct_mode=OFF
@@ -134,12 +145,23 @@ jobs:
           docker run --rm \
             -e ZONE_LITE_SEGMENTED_WRITES="$storage_mode" \
             -e ZONE_LITE_DIRECT_LEGACY_UPGRADE="$direct_mode" \
+            -e ZONE_LITE_JOURNAL_WRITES="$journal_mode" \
+            -e EXPECTED_VERSION \
             -e FIRMWARE_FAMILY \
             -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_DIRECT_LEGACY_UPGRADE="$ZONE_LITE_DIRECT_LEGACY_UPGRADE" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
+            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D PROJECT_VER="$EXPECTED_VERSION" -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_DIRECT_LEGACY_UPGRADE="$ZONE_LITE_DIRECT_LEGACY_UPGRADE" -D ZONE_LITE_JOURNAL_WRITES="$ZONE_LITE_JOURNAL_WRITES" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
+      - name: Verify built family and requested application version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=zone_lite
+          if [[ "$FIRMWARE_FAMILY" == "hikvision" ]]; then project=zone_lite_hikvision; fi
+          python3 scripts/check_firmware_identity.py "firmware/zone_lite/build-hil-release/$project.bin" --family "$FIRMWARE_FAMILY" --version "$EXPECTED_VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-hil-unsigned-${{ needs.provenance.outputs.sha }}
