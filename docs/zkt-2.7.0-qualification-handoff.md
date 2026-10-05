@@ -86,6 +86,12 @@ current enrollment identity by assumption. Decoder changes add derived
 correction evidence and retain original bytes and classifications. Employee
 attribution still needs its own historical identity evidence.
 
+The [protected bench bundle checker](zkt-bench-bundle.md) supplies the repeatable
+record-layout/clock comparison and evidence format. It runs both production
+decoders against independently supplied expectations, preserves hashes and
+reports failures without printing punch facts. Its passing comparison does not
+authenticate provenance, qualify transport/framing or activate a profile.
+
 ## Capacity, migration and elapsed observation
 
 Measure the approved 30-day per-zone source-occurrence baseline, including
