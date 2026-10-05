@@ -64,6 +64,31 @@ int main(void)
     /* An already verified empty read uses the existing absence proof. */
     observe(&s,request(ZQ_ADD_LEGACY,0,ZQ_PEEK_BEGIN),(zq_reply_t){.result=DQ_EMPTY});
     assert(zq_inventory_empty(&s));
+    /* The app runs both checks every second. Successful verification neither
+     * creates attendance nor changes an already complete absence proof. Two
+     * telemetry samples must therefore retain the same inventory generation. */
+    uint64_t stable_generation=s.generation;
+    for(unsigned second=0;second<90;second++) {
+        observe(&s,request(ZQ_SEGMENTED,0,ZQ_RECOVER),(zq_reply_t){.result=DQ_OK,.verified=true});
+        observe(&s,request(ZQ_SEGMENTED,0,ZQ_PROBE),(zq_reply_t){.result=DQ_OK,.verified=true});
+        empty_domains(&s,-1);
+        assert(zq_inventory_empty(&s) && s.generation==stable_generation);
+    }
+    /* Successful maintenance cannot establish queue absence on its own. */
+    zq_inventory_invalidate(&s);
+    observe(&s,request(ZQ_SEGMENTED,0,ZQ_RECOVER),(zq_reply_t){.result=DQ_OK,.verified=true});
+    observe(&s,request(ZQ_SEGMENTED,0,ZQ_PROBE),(zq_reply_t){.result=DQ_OK,.verified=true});
+    assert(!zq_inventory_empty(&s) && s.empty_mask==0);
+    /* Retry, corruption, and an unverified result revoke the complete proof. */
+    for(unsigned operation=ZQ_RECOVER;operation<=ZQ_PROBE;operation++) {
+        for(unsigned fault=DQ_OK;fault<=DQ_PENDING;fault++) {
+            zq_inventory_invalidate(&s);empty_domains(&s,-1);
+            stable_generation=s.generation;
+            observe(&s,request(ZQ_SEGMENTED,0,operation),(zq_reply_t){.result=(dq_result_t)fault});
+            assert(!zq_inventory_empty(&s) && s.generation>stable_generation);
+        }
+    }
+    zq_inventory_invalidate(&s);empty_domains(&s,-1);
     observe(&s,request(ZQ_SEGMENTED,QS_HIK_SOURCE,ZQ_PEEK_BEGIN),(zq_reply_t){.result=DQ_EMPTY});
     assert(!zq_inventory_empty(&s));
     s.generation=UINT64_MAX;zq_inventory_invalidate(&s);empty_domains(&s,-1);
