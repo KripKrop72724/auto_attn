@@ -149,9 +149,10 @@ def start_run(
     if (
         len({row.get("name") for row in queues}) != len(queues)
         or not required <= {row.get("name") for row in queues}
-        or any(row.get("count_known") is not True or row.get("records") is None for row in queues)
+        or any(row.get("count_known") is not True or type(row.get("records")) is not int or row["records"] < 0
+               for row in queues if row.get("name") in required)
     ):
-        raise ValueError("Every queue must have verified recovery and known depth")
+        raise ValueError("Every required runtime queue must have verified recovery and known depth")
     terminal = payload.get("zkt") or {}
     if terminal.get("serial") != target.terminal_serial:
         raise ValueError("Telemetry belongs to a different terminal")
