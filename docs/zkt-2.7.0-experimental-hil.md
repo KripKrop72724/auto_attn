@@ -147,3 +147,14 @@ scope; attendance creation alone never becomes Oracle completion.
 The tests exercise the real raw-custody ingress, source worker, identity gates,
 delivery claim and membership adapter with synthetic data. They do not issue a
 field cutover, qualify a terminal model, or complete live/source matching.
+
+Once a journal runtime is ready and has committed source coverage, its source
+tail scheduler attempts at most one existing bounded range per gateway turn,
+then waits two seconds plus up to 250 ms jitter. Live packet preservation,
+lease expiry and commands retain their earlier positions in that turn. An ADD
+outage suppresses these scans while local raw capture continues. Failures back
+off with jitter to at most 60 seconds, with deadlines retained across terminal
+session reconnects. A failed count read retains the previous observed count;
+it cannot publish a fabricated zero and trigger source regression handling.
+Legacy delivery keeps its existing audit interval. This scheduling change does
+not establish measured end-to-end latency or change an already signed image.
