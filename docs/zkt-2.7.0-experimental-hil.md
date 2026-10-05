@@ -108,7 +108,9 @@ The signed 2.6.17 canary reached its first boot on 5 October. Its legacy ORDS
 reader then reported an integrity failure (`legacy_read`, error 77) while the
 new journal owner remained healthy. This is not a passed bridge qualification.
 The installed image exhausted its local boot checks and reported
-`BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED`; its failed campaign remains paused.
+`BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED`; its failed campaign remains paused and
+the immutable 2.6.17 release is revoked from further HIL offers. The writer's
+pin to that failed bridge is not publication-ready.
 ADD has no connector-reboot command in that image, and the failed-boot loop
 does not poll another OTA assignment. A backend status edit cannot repair or
 replace those installed bytes. Preserve this device's failed history and all
