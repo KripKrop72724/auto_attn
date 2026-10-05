@@ -306,6 +306,28 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
         return;
     }
     switch (request->operation) {
+        case ZJ_SOURCE_BOUNDARY: {
+            uint64_t now = (uint64_t)esp_timer_get_time();
+            uint64_t deadline = request->input.source_boundary.deadline_us;
+            o->store.last_operation = "source_boundary";
+            if (deadline <= now || deadline - now > 5000000ULL) { reply->result = ZJ_STALE; break; }
+            if (!o->writer_allowed || zj_state_authority(&o->state) != ZJ_AUTHORITY_ADD ||
+                o->store.checkpoint_recovery_pending) { reply->result = ZJ_INVALID; break; }
+            qs_health_t health = qs_local_health_locked();
+            if (!health.observed || !health.available || !health.recovery_complete ||
+                !health.persistence_verified || health.last_error || health.persistence_probe_error) {
+                reply->result = ZJ_IO; break;
+            }
+            zj_reader_identity_t identity;
+            reply->compatibility = zj_reader_platform_writer_identity(o->metadata.terminal_serial,
+                o->metadata.capture_epoch, &identity);
+            if (reply->compatibility != ZJ_COMPAT_OK) { reply->result = ZJ_INVALID; break; }
+            if ((uint64_t)esp_timer_get_time() >= deadline) { reply->result = ZJ_STALE; break; }
+            reply->result = zsb_open(o->state.port, &identity,
+                request->input.source_boundary.create ? &request->input.source_boundary.facts : NULL,
+                &reply->source_boundary);
+            break;
+        }
         case ZJ_APPEND:
             reply->result = zj_store_append(&o->store, &request->input.observation, &reply->capture_sequence);
             break;
@@ -527,6 +549,11 @@ static void task(void *context)
             o->health.append_observed = true;
             o->health.last_append_result = reply.result;
             o->health.last_append_uptime_us = finished;
+        }
+        if (work && request.operation == ZJ_SOURCE_BOUNDARY) {
+            o->health.source_boundary_observed = true;
+            o->health.source_boundary_result = reply.result;
+            o->health.source_boundary = reply.source_boundary;
         }
         if (!pending && reply.result != ZJ_OK && reply.result != ZJ_EMPTY && reply.result != ZJ_STALE) {
             ++o->health.failures;

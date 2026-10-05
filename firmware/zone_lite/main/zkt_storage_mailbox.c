@@ -32,7 +32,10 @@ void zj_mailbox_init(zj_mailbox_t *mailbox)
 bool zj_mailbox_submit(zj_mailbox_t *mailbox, const zj_request_t *request, uint64_t *ticket)
 {
     if (ticket) *ticket = 0;
-    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_SEGMENTED_QUEUE) return false;
+    if (!mailbox || !request || !ticket || (unsigned)request->operation > ZJ_SOURCE_BOUNDARY) return false;
+    if (request->operation == ZJ_SOURCE_BOUNDARY &&
+        (!request->input.source_boundary.deadline_us ||
+         (request->input.source_boundary.create && !zsb_facts_valid(&request->input.source_boundary.facts)))) return false;
     if ((request->operation == ZJ_CATALOG || request->operation == ZJ_COMMANDS) &&
         !zc_request_valid(&request->input.catalog)) return false;
     if (request->operation == ZJ_COMMAND_IDS && !zi_request_valid(&request->input.command_ids)) return false;

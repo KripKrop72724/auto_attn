@@ -186,7 +186,9 @@ int main(void){
  for(unsigned scenario=0;scenario<14;scenario++){
   sample_clock=5000;
   owner=(zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=4000000,
-   .inventory_known=true,.verified_empty=true};
+   .inventory_known=true,.verified_empty=true,.source_boundary_observed=true,
+   .source_boundary_result=ZJ_OK,.source_boundary={.facts={.next_ordinal=200000,.record_size=40,.anchor_digest={9}},
+    .capture_epoch={1},.writer_digest={2},.terminal_digest={3}}};
   capture=(zj_capture_health_t){.sampled_ms=1}; /* Quiet site is not a stalled capture task. */
   for(unsigned i=0;i<100;i++){
    zj_capture_latency_record(&capture.packet_commit_latency,i<99?251:900);
@@ -211,6 +213,14 @@ int main(void){
   payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
   diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
   storage=cJSON_GetObjectItemCaseSensitive(diagnostics,"storage");
+  cJSON *boundary=cJSON_GetObjectItemCaseSensitive(diagnostics,"source_boundary");assert(boundary);
+  assert(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(boundary,"migration_certified")));
+  bool boundary_ready=scenario!=2 && scenario!=3 && scenario!=10;
+  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(boundary,"verified"))==boundary_ready);
+  if(boundary_ready){
+   assert(cJSON_GetObjectItemCaseSensitive(boundary,"next_ordinal")->valueint==200000);
+   assert(strlen(string(boundary,"capture_epoch"))==32 && strlen(string(boundary,"writer_digest"))==64);
+  }else assert(!cJSON_HasObjectItem(boundary,"anchor_digest"));
   cJSON *workers=cJSON_GetObjectItemCaseSensitive(diagnostics,"workers");
   cJSON *timing=cJSON_GetObjectItemCaseSensitive(named(workers,"capture"),"packet_commit_latency_ms");
   if(scenario==13)assert(!timing);

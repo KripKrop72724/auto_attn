@@ -20,12 +20,16 @@ static atomic_bool stop, pause_write, write_waiting, full;
 static atomic_bool refuse_compatibility, stale_transport;
 static atomic_bool bridge_image, cutover_readback_failure;
 static atomic_int cutover_failure;
+static atomic_int persistence_failure;
 static pthread_t thread;
 static pthread_mutex_t budget = PTHREAD_MUTEX_INITIALIZER;
 static void (*task_function)(void *);
 static void *task_argument;
 static uint8_t root[ZJ_ROOT_BYTES], checkpoint[ZJ_CHECKPOINT_BYTES];
 static size_t root_length, checkpoint_length;
+static uint8_t source_boundary[ZSB_BYTES];
+static bool source_boundary_present;
+static unsigned source_boundary_writes;
 static runtime_checkpoint_t runtime_blob;
 static bool runtime_present;
 static unsigned runtime_writes;
@@ -153,6 +157,11 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *name, void *out, size_t 
         return ESP_OK;
     }
     assert(handle == 1);
+    if (!strcmp(name, "source_v1")) {
+        assert(*length == ZSB_BYTES && pthread_equal(pthread_self(), thread));
+        if (!source_boundary_present) return ESP_ERR_NVS_NOT_FOUND;
+        memcpy(out, source_boundary, ZSB_BYTES); return ESP_OK;
+    }
     if (!strcmp(name, "reader_v1")) return ESP_ERR_NVS_NOT_FOUND;
     bool is_root = !strcmp(name, "root");
     if (is_root && atomic_exchange(&cutover_readback_failure, false)) return -7;
@@ -193,6 +202,12 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *name, const void *bytes,
         return ESP_OK;
     }
     assert(handle == 1);
+    if (!strcmp(name, "source_v1")) {
+        assert(length == ZSB_BYTES && pthread_equal(pthread_self(), thread));
+        assert(pthread_mutex_trylock(&budget) == EBUSY);
+        memcpy(source_boundary, bytes, length); source_boundary_present=true;
+        ++source_boundary_writes; return ESP_OK;
+    }
     if (!strcmp(name, "root")) {
         assert(length == sizeof(root));
         int failure = ((const uint8_t *)bytes)[145] == 1 && root[145] == 0
@@ -244,8 +259,10 @@ void qs_local_end(bool persisted, int error) { (void)persisted; (void)error; ass
 qs_health_t qs_local_health_locked(void)
 {
     assert(pthread_mutex_trylock(&budget) == EBUSY);
-    return (qs_health_t){.observed = true, .available = true,
-        .recovery_complete = true, .persistence_verified = true};
+    int failure = atomic_load(&persistence_failure);
+    return (qs_health_t){.observed = failure != 1, .available = failure != 2,
+        .recovery_complete = failure != 3, .persistence_verified = failure != 4,
+        .last_error = failure == 5 ? EIO : 0, .persistence_probe_error = failure == 6 ? EIO : 0};
 }
 /* Existing queue format with real files/checkpoints. Every operation invoked
  * by the copied client must execute on the storage thread. */
@@ -335,6 +352,15 @@ bool zj_transport_health(zj_transport_health_t *health)
     *health = (zj_transport_health_t){.started = true,
         .sampled_ms = (uint32_t)(esp_timer_get_time() / 1000) - (atomic_load(&stale_transport) ? 50000U : 0)};
     return true;
+}
+zj_compat_result_t zj_reader_platform_writer_identity(const char *serial, const uint8_t epoch[16],
+    zj_reader_identity_t *out)
+{
+    assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0]);
+    assert(pthread_equal(pthread_self(), thread) && pthread_mutex_trylock(&budget) == EBUSY);
+    if (atomic_load(&bridge_image)) return ZJ_COMPAT_VERSION;
+    *out=(zj_reader_identity_t){.terminal_digest={2}, .image_digest={3}};
+    memcpy(out->capture_epoch, epoch, 16); return ZJ_COMPAT_OK;
 }
 zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t epoch[16],
     bool ready, bool delivery, bool persistence, bool recovering, bool *writer_allowed)
@@ -515,7 +541,8 @@ int main(int argc, char **argv)
     bool authority_test = argc == 2 && !strncmp(argv[1], "--authority-", 12);
     failed_rollback_test = argc == 2 && !strcmp(argv[1], "--failed-boot-full");
     bool rollback_test = failed_rollback_test || (argc == 2 && !strcmp(argv[1], "--rollback-full"));
-    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test;
+    bool boundary_test = argc == 2 && !strcmp(argv[1], "--source-boundary");
+    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test && !boundary_test;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {
         /* A retained encrypted-NVS root is intact; only its retirement blob
@@ -572,6 +599,37 @@ int main(int argc, char **argv)
         vTaskDelay(1);
     }
     assert(health.ready && root_length && !health.operation_running);
+    if (boundary_test) {
+        uint64_t ticket;
+        zj_request_t request = {.operation=ZJ_SOURCE_BOUNDARY, .input.source_boundary={
+            .create=true, .deadline_us=(uint64_t)esp_timer_get_time()+5000000,
+            .facts={.next_ordinal=200000, .record_size=40, .anchor_digest={9}}}};
+        assert(zj_owner_submit(&request, &ticket));
+        assert(wait_reply(ticket).result==ZJ_INVALID && !source_boundary_writes);
+        zj_request_t proof={.operation=ZJ_READER_CHECK};
+        assert(zj_owner_submit(&proof, &ticket)); assert(wait_reply(ticket).result==ZJ_OK);
+        for (int failure = 1; failure <= 6; ++failure) {
+            atomic_store(&persistence_failure, failure);
+            assert(zj_owner_submit(&request, &ticket));
+            assert(wait_reply(ticket).result==ZJ_IO && !source_boundary_writes);
+        }
+        atomic_store(&persistence_failure, 0);
+        atomic_store(&full, true); /* NVS boundary does not consume live SPIFFS reserve. */
+        assert(zj_owner_submit(&request, &ticket));
+        zj_reply_t reply=wait_reply(ticket);
+        assert(reply.result==ZJ_OK && reply.source_boundary.facts.next_ordinal==200000 && source_boundary_writes==1);
+        request.input.source_boundary.facts.next_ordinal=210000;
+        assert(zj_owner_submit(&request, &ticket));
+        reply=wait_reply(ticket);
+        assert(reply.result==ZJ_OK && reply.source_boundary.facts.next_ordinal==200000 && source_boundary_writes==1);
+        request.input.source_boundary.deadline_us=1;
+        assert(zj_owner_submit(&request, &ticket)); assert(wait_reply(ticket).result==ZJ_STALE);
+        request.input.source_boundary.deadline_us=(uint64_t)esp_timer_get_time()+5000000;
+        atomic_store(&bridge_image, true);
+        assert(zj_owner_submit(&request, &ticket)); assert(wait_reply(ticket).result==ZJ_INVALID);
+        assert(source_boundary_writes==1);
+        atomic_store(&stop, true); assert(!pthread_join(thread, NULL)); return 0;
+    }
     if (rollback_test) { rollback_with_full_mailbox(); return 0; }
     if (authority_test) {
         assert(health.delivery_authority == ZJ_AUTHORITY_LEGACY && root[145] == 0);

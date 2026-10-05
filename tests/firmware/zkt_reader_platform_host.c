@@ -146,19 +146,24 @@ static zj_compat_result_t failed_boot(void)
 }
 int main(void)
 {
+    zj_reader_identity_t source_identity;
+    assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, NULL) == ZJ_COMPAT_INVALID);
 #if !CONFIG_NVS_ENCRYPTION
+    assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, &source_identity) == ZJ_COMPAT_SECURITY);
     assert(check() == ZJ_COMPAT_SECURITY && !writes);
     assert(update() == ZJ_COMPAT_SECURITY && !writes);
     assert(select_reader() == ZJ_COMPAT_SECURITY && !selections);
     assert(failed_boot() == ZJ_COMPAT_SECURITY && !invalidations);
     return 0;
 #elif !ZONE_LITE_JOURNAL_WRITES
+    assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, &source_identity) == ZJ_COMPAT_CAPTURE_DISABLED);
     assert(check() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
     assert(update() == ZJ_COMPAT_CAPTURE_DISABLED && !writes);
     assert(select_reader() == ZJ_COMPAT_CAPTURE_DISABLED && !selections);
     assert(failed_boot() == ZJ_COMPAT_CAPTURE_DISABLED && !invalidations);
     return 0;
 #else
+    assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, &source_identity) == ZJ_COMPAT_VERSION);
     current_valid = false;
     assert(check() == ZJ_COMPAT_SECURITY && !writes); /* Unconfirmed bridge. */
     assert(update() == ZJ_COMPAT_SECURITY && !writes);
@@ -182,6 +187,15 @@ int main(void)
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
     reverse = false;
     strcpy(app.version, ZJ_WRITER_VERSION); running = 2; other = 3; current_valid = false;
+    assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, &source_identity) == ZJ_COMPAT_OK);
+    assert(source_identity.image_digest[0] == 16 && !memcmp(source_identity.capture_epoch, epoch, 16));
+    for (unsigned f=1; f<=10; ++f) {
+        if (f==3 || f==4 || f==5 || f==7) continue; /* Other slot, a different valid digest, or boot VALID is not identity. */
+        fault=f;
+        assert(zj_reader_platform_writer_identity("TEST-TERMINAL", epoch, &source_identity) != ZJ_COMPAT_OK);
+        for (unsigned i=0; i<sizeof(source_identity); ++i) assert(!((uint8_t *)&source_identity)[i]);
+    }
+    fault=0;
     assert(update() == ZJ_COMPAT_PROTECTED_SLOT);
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
 #if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK

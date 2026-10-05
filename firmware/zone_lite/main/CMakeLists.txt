@@ -28,7 +28,7 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
         "zkt_segmented_store.c" "zkt_segmented_client.c" "zkt_legacy_attendance.c"
         "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
         "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c"
-        "zkt_journal_diagnostics.c")
+        "zkt_journal_diagnostics.c" "zkt_source_boundary_client.c")
 endif()
 
 # This compiles the journal runtime. Only the exact bridge role is admitted to

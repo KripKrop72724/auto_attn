@@ -32,6 +32,7 @@ static const char *owner_operation(zj_operation_t operation)
         case ZJ_COMMANDS: return "updating durable command inbox";
         case ZJ_COMMAND_IDS: return "checking durable command receipts";
         case ZJ_SEGMENTED_QUEUE: return "servicing retained attendance queues";
+        case ZJ_SOURCE_BOUNDARY: return "preserving first source boundary";
         default: return "unknown operation";
     }
 }
@@ -107,6 +108,18 @@ static bool latency(cJSON *entry, const char *name, const zj_capture_latency_t *
     }
     return true;
 }
+static bool add_hex(cJSON *object, const char *name, const uint8_t *bytes, size_t length)
+{
+    static const char digits[] = "0123456789abcdef";
+    char value[65];
+    if (length > 32) return false;
+    for (size_t i = 0; i < length; ++i) {
+        value[i * 2] = digits[bytes[i] >> 4];
+        value[i * 2 + 1] = digits[bytes[i] & 15];
+    }
+    value[length * 2] = 0;
+    return cJSON_AddStringToObject(object, name, value) != NULL;
+}
 bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
                            bool recent, bool legacy, const zj_diagnostics_snapshot_t *sample,
                            uint64_t now)
@@ -135,6 +148,20 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
     bool owner_ready = owner_fresh && owner->started && owner->ready && !owner_stalled &&
         !owner->recovering && !owner->quiescing && !owner->checkpoint_recovery_pending;
     bool append_failed = owner->append_observed && owner->last_append_result != ZJ_OK;
+    cJSON *boundary = cJSON_AddObjectToObject(diagnostics, "source_boundary");
+    bool boundary_ready = owner_ready && owner->source_boundary_observed && owner->source_boundary_result == ZJ_OK;
+    if (!boundary || !cJSON_AddNumberToObject(boundary, "schema_version", 1) ||
+        !cJSON_AddBoolToObject(boundary, "observed", owner->source_boundary_observed) ||
+        !cJSON_AddBoolToObject(boundary, "verified", boundary_ready) ||
+        !cJSON_AddBoolToObject(boundary, "migration_certified", false) ||
+        !cJSON_AddStringToObject(boundary, "result", owner->source_boundary_observed ?
+            result_name(owner->source_boundary_result) : "NOT_OBSERVED")) return false;
+    if (boundary_ready && (!cJSON_AddNumberToObject(boundary, "next_ordinal", owner->source_boundary.facts.next_ordinal) ||
+        !cJSON_AddNumberToObject(boundary, "record_size", owner->source_boundary.facts.record_size) ||
+        !add_hex(boundary, "capture_epoch", owner->source_boundary.capture_epoch, 16) ||
+        !add_hex(boundary, "writer_digest", owner->source_boundary.writer_digest, 32) ||
+        !add_hex(boundary, "terminal_digest", owner->source_boundary.terminal_digest, 32) ||
+        !add_hex(boundary, "anchor_digest", owner->source_boundary.facts.anchor_digest, 32))) return false;
     const char *owner_state = !recent || !sample->owner_observed ? "UNKNOWN" : !owner->started ? "STOPPED" :
         !owner_fresh || owner_stalled ? "FAULT" : owner->quiesced ? "STOPPED" :
         !owner_ready || append_failed ? "WAITING_RESOURCE" : "RUNNING";

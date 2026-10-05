@@ -131,6 +131,20 @@ static zj_compat_result_t current_reader(const char *terminal_serial,
         !layout_digest(binding.layout_digest) || !identity(current, &binding, current_id)) return ZJ_COMPAT_IO;
     return ZJ_COMPAT_OK;
 }
+zj_compat_result_t zj_reader_platform_writer_identity(const char *terminal_serial,
+    const uint8_t capture_epoch[16], zj_reader_identity_t *out)
+{
+    if (!out) return ZJ_COMPAT_INVALID;
+    memset(out, 0, sizeof(*out));
+    zj_reader_environment_t environment;
+    zj_reader_identity_t identity;
+    zj_compat_result_t result = current_reader(terminal_serial, capture_epoch, true, true, true, false,
+        &environment, &identity);
+    if (result != ZJ_COMPAT_OK) return result;
+    if (strcmp(environment.version, ZJ_WRITER_VERSION)) return ZJ_COMPAT_VERSION;
+    *out = identity;
+    return ZJ_COMPAT_OK;
+}
 zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, bool *writer_allowed)

@@ -34,6 +34,9 @@ typedef struct {
     bool legacy_verified_empty, legacy_append_pending;
     uint32_t legacy_empty_mask, legacy_required_mask;
     uint64_t legacy_inventory_generation;
+    bool source_boundary_observed;
+    zj_result_t source_boundary_result;
+    zsb_record_t source_boundary;
     zj_result_t last_append_result;
     uint64_t last_append_uptime_us;
     int filesystem_error, nvs_error;
