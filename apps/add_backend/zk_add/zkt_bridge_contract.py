@@ -3,7 +3,11 @@ import struct
 
 from zk_add.zkt270_scope import TARGETS
 
+# Preserve the already signed 2.6.16 package for audit/recovery. New field
+# attempts use a distinct 2.6.17 image; neither version implies boot success.
 BRIDGE_VERSION = "2.6.16"
+REPLACEMENT_BRIDGE_VERSION = "2.6.17"
+BRIDGE_VERSIONS = (BRIDGE_VERSION, REPLACEMENT_BRIDGE_VERSION)
 BRIDGE_MARKER = "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
 PREDECESSOR_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -24,11 +28,19 @@ def bridge_hil_targets(raw: object) -> list:
     return [target.identity for target in TARGETS[:len(raw)]]
 
 
-def bridge_contract() -> dict:
+def bridge_marker(version: str) -> str:
+    if version not in BRIDGE_VERSIONS:
+        raise ValueError("Journal bridge version is unqualified.")
+    return BRIDGE_MARKER + (":VERSION=2.6.17" if version == REPLACEMENT_BRIDGE_VERSION else "")
+
+
+def bridge_contract(version: str = BRIDGE_VERSION) -> dict:
+    if not isinstance(version, str) or version not in BRIDGE_VERSIONS:
+        raise ValueError("Journal bridge version is unqualified.")
     return {
         "allowed_bootstrap_images": dict(PREDECESSOR_IMAGES),
         "allowed_bootstrap_versions": list(PREDECESSOR_IMAGES),
-        "compatibility_version": BRIDGE_VERSION,
+        "compatibility_version": version,
         "delivery_authority": "LEGACY_UNTIL_PERSISTED_ADD_CUTOVER",
         "journal_capture": True,
         "journal_read_format": 1,
@@ -43,9 +55,8 @@ def bridge_contract() -> dict:
 
 def validate_bridge_manifest(manifest: dict) -> dict:
     contract = manifest.get("queue_storage")
-    expected = bridge_contract()
-    if (manifest.get("version") != BRIDGE_VERSION
-            or manifest.get("release_id") != "zone-lite-2.6.16"
+    expected = bridge_contract(manifest.get("version"))
+    if (manifest.get("release_id") != f"zone-lite-{manifest['version']}"
             or manifest.get("firmware_family") != "zkt"
             or manifest.get("project_name") != "zone_lite"
             or manifest.get("release_channel") != "EXPERIMENTAL_HIL_ONLY"
@@ -57,17 +68,18 @@ def validate_bridge_manifest(manifest: dict) -> dict:
     return contract
 
 
-def validate_bridge_image(image: bytes) -> None:
+def validate_bridge_image(image: bytes, version: str = BRIDGE_VERSION) -> None:
     """Bind manifest capabilities to the compiled role and ESP descriptor.
 
     The normal release loader independently verifies the signed manifest and
     entire image digest. A marker is packaging evidence, never runtime proof.
     """
+    marker = bridge_marker(version)
     if (len(image) < 112 or image[0] != 0xE9
             or struct.unpack_from("<I", image, 32)[0] != 0xABCD5432
-            or image[48:80].split(b"\0", 1)[0] != BRIDGE_VERSION.encode()
+            or image[48:80].split(b"\0", 1)[0] != version.encode()
             or image[80:112].split(b"\0", 1)[0] != b"zone_lite"
-            or image.count(BRIDGE_MARKER.encode() + b"\0") != 1
+            or image.count(marker.encode() + b"\0") != 1
             or image.count(b"ZONE_STORAGE_CONTRACT_V3:") != 1
             or b"ZONE_STORAGE_CONTRACT_V1:" in image or b"ZONE_STORAGE_CONTRACT_V2:" in image):
         raise ValueError("Journal bridge image lacks its exact descriptor or compiled reader/capture marker.")

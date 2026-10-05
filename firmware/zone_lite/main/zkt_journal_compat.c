@@ -51,7 +51,7 @@ static bool separate_slots(const zj_reader_identity_t *a, const zj_reader_identi
     return a->slot_address + a->slot_size <= b->slot_address ||
         b->slot_address + b->slot_size <= a->slot_address;
 }
-static void encode(const zj_reader_identity_t *id, uint64_t generation,
+static void encode(const zj_reader_identity_t *id, uint64_t generation, const char *version,
                    uint8_t bytes[ZJ_READER_PROOF_BYTES])
 {
     memset(bytes, 0, ZJ_READER_PROOF_BYTES);
@@ -71,7 +71,7 @@ static void encode(const zj_reader_identity_t *id, uint64_t generation,
     memcpy(bytes + 112, id->capture_epoch, 16);
     memcpy(bytes + 128, id->layout_digest, 32);
     put64(bytes + 160, generation);
-    memcpy(bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION));
+    memcpy(bytes + 168, version, strlen(version) + 1);
     put32(bytes + 188, dq_crc32(bytes, 188));
 }
 bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
@@ -87,7 +87,15 @@ bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
     memcpy(decoded.layout_digest, bytes + 128, 32);
     uint64_t revision = get64(bytes + 160);
     uint8_t canonical[ZJ_READER_PROOF_BYTES];
-    encode(&decoded, revision, canonical);
+    /* A replacement reader may inspect the old proof only to renew it after
+     * checking the unchanged terminal/epoch/layout. Writer/update admission
+     * below still requires the exact current reader version and image. */
+    const char *version = !memcmp(bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))
+        ? ZJ_BRIDGE_VERSION
+        : !strcmp(ZJ_BRIDGE_VERSION, "2.6.17") && !memcmp(bytes + 168, "2.6.16", sizeof("2.6.16"))
+            ? "2.6.16" : NULL;
+    if (!version) return false;
+    encode(&decoded, revision, version, canonical);
     if (!revision || !identity_valid(&decoded) || memcmp(bytes, canonical, sizeof(canonical))) return false;
     *id = decoded;
     *generation = revision;
@@ -125,10 +133,11 @@ zj_compat_result_t zj_reader_attest(zj_reader_proof_port_t port,
     result = load(port, proof, &previous, &generation);
     if (result == ZJ_COMPAT_OK) {
         if (!binding_equal(identity, &previous)) return ZJ_COMPAT_BINDING;
-        if (image_equal(identity, &previous)) return ZJ_COMPAT_OK;
+        if (image_equal(identity, &previous) &&
+            !memcmp(proof + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))) return ZJ_COMPAT_OK;
     } else if (result != ZJ_COMPAT_MISSING) return result;
     if (generation == UINT64_MAX) return ZJ_COMPAT_EXHAUSTED;
-    encode(identity, generation + 1, proof);
+    encode(identity, generation + 1, ZJ_BRIDGE_VERSION, proof);
     if (!port.write(port.context, proof) || port.read(port.context, verify) != 1 ||
         memcmp(proof, verify, sizeof(proof))) return ZJ_COMPAT_UNCERTAIN;
     return ZJ_COMPAT_OK;
@@ -149,6 +158,7 @@ static zj_compat_result_t check_retained_bridge(zj_reader_proof_port_t port,
     uint64_t generation;
     result = load(port, proof, &attested, &generation);
     if (result != ZJ_COMPAT_OK) return result;
+    if (memcmp(proof + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))) return ZJ_COMPAT_VERSION;
     if (!binding_equal(current, previous) || !binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
     return image_equal(previous, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
 }
@@ -184,6 +194,7 @@ zj_compat_result_t zj_reader_check_update(zj_reader_proof_port_t port,
     uint64_t generation;
     result = load(port, proof, &attested, &generation);
     if (result != ZJ_COMPAT_OK) return result;
+    if (memcmp(proof + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))) return ZJ_COMPAT_VERSION;
     if (!binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
     return image_equal(current, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
 }

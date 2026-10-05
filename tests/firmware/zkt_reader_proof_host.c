@@ -86,6 +86,21 @@ int main(void)
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && !storage.writes);
 
+    if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.17")) {
+        memcpy(storage.bytes + 168, "2.6.16", sizeof("2.6.16"));
+        crc();
+        assert(zj_reader_proof_decode(storage.bytes, &decoded, &generation) && generation == 1);
+        assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_VERSION);
+        assert(zj_reader_check_update(port(), &b, &previous, current.slot_address, current.slot_size,
+            ZJ_WRITER_VERSION) == ZJ_COMPAT_VERSION);
+        zj_reader_identity_t rebound = previous; rebound.terminal_digest[0] ^= 1;
+        assert(zj_reader_attest(port(), &b, &rebound) == ZJ_COMPAT_BINDING && !storage.writes);
+        assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && storage.writes == 1);
+        assert(zj_reader_proof_decode(storage.bytes, &decoded, &generation) && generation == 2);
+        assert(!memcmp(storage.bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION)));
+        assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
+        memcpy(storage.bytes, original, sizeof(original)); storage.writes = 0;
+    }
     for (unsigned byte = 0; byte < ZJ_READER_PROOF_BYTES; ++byte) {
         storage.bytes[byte] ^= 1;
         assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_CORRUPT);

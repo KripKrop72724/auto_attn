@@ -77,6 +77,30 @@ endurance qualification remain `NOT_PERFORMED`.
 
 ## Compatibility bridge package
 
+Two controlled 2.6.16 canary attempts on 5 October rolled back before ADD
+received a bridge heartbeat. Compiling the released startup adapters with
+Xtensa stack-usage output found a 7,936-byte nested command-recovery path in a
+4,096-byte supervisor. The repaired bounded client scratch and mutex-protected
+command scratch reduce that path to 1,984 bytes; catalog recovery measures
+2,240 bytes. CI requires the measured paths plus a 1,024-byte callee reserve
+to fit. This is compiler evidence, not a field crash diagnosis or measured
+stack high-watermark.
+
+The replacement is a separately versioned **2.6.17** bridge with its own
+application descriptor and versioned V3 marker. Preserve the signed 2.6.16
+package and failed deployment history; never republish repaired bytes under
+that identity. The release scanner continues to validate the old signed
+package while publication, exact-target scope, predecessor checks and recovery
+tests also cover 2.6.17. A replacement reader may renew a valid older proof
+only for the same terminal, capture epoch and layout. The old proof alone
+cannot authorize a writer or OTA transition.
+
+The writer's current 2.6.16 package pin is **not ready for publication**.
+After producing the replacement's actual signed artifact, update the writer's
+compiled reader version and exact application/artifact pins together, rerun
+their tests, and verify the replacement's successful field boot. Neither a
+locally compiled unsigned digest nor an expected future digest is a substitute.
+
 HIL publication first verifies the exact signed manifest using the running ADD
 container's installed family and storage-contract validators and configured
 public key. This preflight uses bounded temporary metadata files, executes no
