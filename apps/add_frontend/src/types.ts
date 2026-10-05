@@ -132,6 +132,15 @@ export interface FirmwareDiagnostics {
   sample_sequence?: number | null
   sampled_at?: string | null
   sampled_uptime_ms?: number | null
+  ota_runtime?: {
+    running_version?: string | null
+    running_partition?: 'factory' | 'ota_0' | 'ota_1' | null
+    image_sha256?: string | null
+    state?: string
+    last_error?: string
+    boot_health_checks?: number
+    boot_health_last_ready?: boolean
+  } | null
   delivery_authority?: 'LEGACY_DUAL' | 'ADD' | 'UNKNOWN' | null
   journal_runtime?: {
     observed: boolean

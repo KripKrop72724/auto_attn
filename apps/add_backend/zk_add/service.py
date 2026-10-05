@@ -656,9 +656,12 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
     diagnostics = payload.diagnostics
     evidence = diagnostics.model_dump(mode="json") if diagnostics else None
     if evidence is not None:
-        # Identity comes from the authenticated envelope, never a nested claim.
+        # Bind runtime image/boot evidence to this authenticated sample. The
+        # separately registered OTA capability can still belong to an older
+        # image while a new boot is waiting or has failed local validation.
         evidence.update(boot_id=connector.boot_id, sample_sequence=connector.last_sequence,
-                        sampled_at=ensure_utc(sampled_at).isoformat() if sampled_at else None)
+                        sampled_at=ensure_utc(sampled_at).isoformat() if sampled_at else None,
+                        ota_runtime=payload.ota.model_dump(mode="json"))
     connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = utc_now() if diagnostics else None
     storage = diagnostics.storage if diagnostics else None

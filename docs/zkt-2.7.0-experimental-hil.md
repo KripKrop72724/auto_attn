@@ -116,6 +116,18 @@ does not poll another OTA assignment. A backend status edit cannot repair or
 replace those installed bytes. Preserve this device's failed history and all
 17 devices in the nationwide denominator.
 
+The original 2.6.16 release is also revoked; both of its cancelled canary
+campaigns retain their `ROLLED_BACK` outcomes. Neither failed image may be
+offered again as a recovery shortcut.
+
+ADD stores each heartbeat's running version, partition, application digest,
+OTA state, local boot check count and error with that diagnostic sample's
+authenticated boot ID and sequence. The preservation panel distinguishes this
+report from the separately registered OTA capability, which can still describe
+the previous image when local boot validation fails. Missing, stale or
+different-boot reports remain unverified. These display fields do not confer
+OTA eligibility, boot success or HIL acceptance.
+
 Development recovery now lets the storage owner transfer a rejected legacy
 checkpoint's exact bytes to ADD as a separately named opaque evidence item.
 Only its matching durable receipt permits resetting that same checkpoint to
