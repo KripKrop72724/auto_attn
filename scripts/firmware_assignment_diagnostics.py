@@ -153,6 +153,13 @@ def diagnose(campaign_id: str) -> dict:
                 "release_state": release.state if release else None,
                 "hil_enabled": settings.firmware_hil_enabled,
             }
+            # The workflow can run before this backend revision is deployed.
+            # Missing support is explicit, never an empty/resolved reservation.
+            from zk_add import zkt_ota_admission
+            inspect_reservations = getattr(zkt_ota_admission, "reservation_snapshot", None)
+            result["nationwide_reservations"] = (
+                inspect_reservations(session) if inspect_reservations else {"supported": False}
+            )
             if not release:
                 return result
             try:
