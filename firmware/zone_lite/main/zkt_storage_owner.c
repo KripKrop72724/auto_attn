@@ -9,6 +9,7 @@
 #include "zkt_add_legacy_owner.h"
 #include "zkt_quarantine_owner.h"
 #include "zkt_legacy_attendance.h"
+#include "zkt_legacy_inventory.h"
 #include "queue_store.h"
 #include <dirent.h>
 #include <errno.h>
@@ -33,6 +34,7 @@ typedef struct {
     zc_store_t commands;
     zi_store_t command_ids;
     zq_store_t segmented;
+    zq_inventory_t legacy_inventory;
     zj_owner_health_t health;
     char prefix[112];
     int nvs_error;
@@ -454,6 +456,10 @@ static void task(void *context)
             o->health.operation_started_us = o->health.sampled_uptime_us;
             o->health.inventory_known = false;
             if (repair || (work && request.operation == ZJ_APPEND)) o->health.verified_empty = false;
+            o->health.legacy_verified_empty = false;
+            if (o->health.recovering) zq_inventory_invalidate(&o->legacy_inventory);
+            else if (request.operation == ZJ_SEGMENTED_QUEUE)
+                zq_inventory_begin(&o->legacy_inventory, &request.input.segmented);
         }
         xSemaphoreGive(mailbox_lock);
         if (!work && !repair) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)); continue; }
@@ -501,6 +507,16 @@ static void task(void *context)
         o->health.delivery_authority = zj_state_authority(&o->state);
         o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;
+        if (work && request.operation == ZJ_SEGMENTED_QUEUE)
+            zq_inventory_complete(&o->legacy_inventory, &request.input.segmented, &reply.segmented);
+        if (!o->health.ready || o->health.checkpoint_recovery_pending)
+            zq_inventory_invalidate(&o->legacy_inventory);
+        o->health.legacy_append_pending = o->segmented.append_transfer != 0;
+        o->health.legacy_empty_mask = o->legacy_inventory.empty_mask;
+        o->health.legacy_required_mask = ZQ_INVENTORY_REQUIRED;
+        o->health.legacy_inventory_generation = o->legacy_inventory.generation;
+        o->health.legacy_verified_empty = o->health.ready && !o->health.checkpoint_recovery_pending &&
+            !o->health.legacy_append_pending && zq_inventory_empty(&o->legacy_inventory);
         o->health.inventory_known = o->health.ready;
         o->health.journal_segments = o->store.count;
         o->health.journal_bytes = 0;
@@ -583,6 +599,10 @@ bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
     if (!owner || !enter()) return false;
     bool ok = !owner->health.quiescing && zj_mailbox_submit(&owner->mailbox, request, ticket);
     if (ok && request->operation == ZJ_APPEND) owner->health.verified_empty = false;
+    if (ok && request->operation == ZJ_SEGMENTED_QUEUE) {
+        zq_inventory_admitted(&owner->legacy_inventory, &request->input.segmented);
+        owner->health.legacy_verified_empty = false;
+    }
     if (owner->health.quiescing) ++owner->mailbox.refused;
     xSemaphoreGive(mailbox_lock);
     if (ok) xTaskNotifyGive(owner_task);
@@ -653,14 +673,23 @@ bool zj_owner_health(zj_owner_health_t *health)
     health->occupied = owner->mailbox.occupied;
     health->high_watermark = owner->mailbox.high_watermark;
     health->pending_appends = 0;
+    health->legacy_empty_mask = owner->legacy_inventory.empty_mask;
+    health->legacy_required_mask = ZQ_INVENTORY_REQUIRED;
+    health->legacy_inventory_generation = owner->legacy_inventory.generation;
     for (unsigned i = 0; i < ZJ_REQUEST_SLOTS; ++i) {
         const zj_request_slot_t *slot = &owner->mailbox.slots[i];
         if ((slot->state == ZJ_SLOT_QUEUED || slot->state == ZJ_SLOT_RUNNING) &&
             slot->request.operation == ZJ_APPEND) ++health->pending_appends;
+        if ((slot->state == ZJ_SLOT_QUEUED || slot->state == ZJ_SLOT_RUNNING) &&
+            slot->request.operation == ZJ_SEGMENTED_QUEUE &&
+            slot->request.input.segmented.operation <= ZQ_APPEND_COMMIT)
+            health->legacy_append_pending = true;
     }
     /* A PEEK can finish after another producer admits an append. Check the
      * mailbox under the same lock; that snapshot must never advertise zero. */
     if (health->pending_appends) health->verified_empty = false;
+    if (health->legacy_append_pending || health->operation_running || health->recovering ||
+        !zq_inventory_empty(&owner->legacy_inventory)) health->legacy_verified_empty = false;
     xSemaphoreGive(mailbox_lock);
     return true;
 }

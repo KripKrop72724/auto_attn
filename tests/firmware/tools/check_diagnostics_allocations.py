@@ -26,6 +26,7 @@ program = r'''
 #include "queue_store.h"
 #include "zkt_journal_boot.h"
 #include "zkt_journal_diagnostics.h"
+#include "zkt_legacy_inventory.h"
 #define ESP_OK 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
@@ -243,6 +244,31 @@ int main(void){
   }
   cJSON_Delete(payload);
   check_ownership("ZKT_JOURNAL_V1","ADD",true);
+ }
+ /* A local legacy absence proof needs every domain, a fresh idle owner and
+  * recovered storage. It does not assert downstream delivery. */
+ for(unsigned fault=0;fault<9;fault++){
+  sample_clock=5000;owner_observed=true;legacy_healthy=true;health.sampled_ms=4000;
+  owner=(zj_owner_health_t){.started=true,.ready=true,.sampled_uptime_us=4000000,
+   .inventory_known=true,.verified_empty=true,.legacy_verified_empty=true,
+   .legacy_inventory_generation=1,.legacy_empty_mask=ZQ_INVENTORY_REQUIRED,
+   .legacy_required_mask=ZQ_INVENTORY_REQUIRED};
+  if(fault==1)owner.legacy_append_pending=true;
+  if(fault==2)owner.legacy_empty_mask&=~1U;
+  if(fault==3)owner.legacy_required_mask--;
+  if(fault==4)owner.sampled_uptime_us=6000000;
+  if(fault==5)legacy_healthy=false;
+  if(fault==6){owner.operation_running=true;owner.operation_started_us=4000000;}
+  if(fault==7)owner.legacy_verified_empty=false;
+  if(fault==8)owner.legacy_inventory_generation=0;
+  payload=cJSON_CreateObject();append_firmware_diagnostics(payload,&zkt,"LIVE_CAPTURE");
+  diagnostics=cJSON_GetObjectItemCaseSensitive(payload,"diagnostics");assert(diagnostics);
+  cJSON *migration=named(cJSON_GetObjectItemCaseSensitive(diagnostics,"queues"),"legacy_migration");
+  assert(migration && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(migration,"count_known"))==(fault==0));
+  if(!fault){assert(cJSON_GetObjectItemCaseSensitive(migration,"records")->valueint==0);
+   assert(!strcmp(string(migration,"count_reason"),"VERIFIED_EMPTY"));}
+  else assert(!cJSON_HasObjectItem(migration,"records") && !cJSON_HasObjectItem(migration,"bytes"));
+  cJSON_Delete(payload);check_ownership("ZKT_JOURNAL_V1","ADD",true);
  }
  puts("diagnostics allocation regressions passed");
 }
