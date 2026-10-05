@@ -34,8 +34,13 @@ def _release_identity(release: FirmwareRelease) -> ReleaseIdentity:
 
 
 def start_run(
-    session: Session, *, deployment_id: str, target: HilTarget, actor: str, idempotency_key: str
+    session: Session, *, deployment_id: str, target: HilTarget, actor: str, idempotency_key: str,
+    profile: str = "FULL_REMOTE_HIL_V1",
 ) -> FirmwareHilRun:
+    from zk_add.bridge_observation import FULL_PROFILE, PROFILE, require_bridge_baseline
+
+    if profile not in {FULL_PROFILE, PROFILE}:
+        raise ValueError("Unknown observation profile")
     if not actor or len(actor) > 120 or not idempotency_key or len(idempotency_key) > 120:
         raise ValueError("HIL actor and idempotency key are required and bounded")
     deployment = session.scalar(
@@ -64,6 +69,7 @@ def start_run(
             prior.deployment_id != deployment.id
             or prior.target != target.model_dump()
             or prior.release_identity != identity
+            or prior.baseline.get("profile", FULL_PROFILE) != profile
         ):
             raise ValueError("HIL idempotency key belongs to a different scope")
         return prior
@@ -184,6 +190,8 @@ def start_run(
     job = session.get(ReconciliationJob, coverage.job_id)
     if job is None or job.status != "COMPLETED" or not job.capture_certificate:
         raise ValueError("Completed initial reconciliation evidence is required")
+    if profile == PROFILE:
+        require_bridge_baseline(release, telemetry, target, identity)
     run = FirmwareHilRun(
         run_id=str(uuid4()),
         deployment_id=deployment.id,
@@ -197,6 +205,7 @@ def start_run(
         started_at=now,
         ends_at=now + timedelta(minutes=15),
         baseline={
+            "profile": profile,
             "telemetry_id": telemetry.id,
             "boot_id": telemetry.boot_id,
             "coverage_id": coverage.coverage_id,
@@ -227,7 +236,7 @@ def cancel_run(session: Session, run_id: str, *, actor: str) -> FirmwareHilRun:
     session.add(
         FirmwareEvent(
             deployment_id=run.deployment_id,
-            state="HIL_INCOMPLETE",
+            state="BRIDGE_INCOMPLETE" if run.baseline.get("profile") == "BRIDGE_READINESS_V1" else "HIL_INCOMPLETE",
             details={
                 **run.release_identity,
                 "target": run.target,
@@ -235,6 +244,7 @@ def cancel_run(session: Session, run_id: str, *, actor: str) -> FirmwareHilRun:
                 "run_id": run.run_id,
                 "reason": "CANCELLED",
                 "actor": actor,
+                "profile": run.baseline.get("profile", "FULL_REMOTE_HIL_V1"),
             },
         )
     )
