@@ -23,6 +23,9 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
     throw "Firmware $Version is missing its signed manifest"
 }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+if ($manifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY') {
+    throw 'Experimental firmware cannot be promoted to AVAILABLE'
+}
 $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
 if ([string]$manifest.version -ne $Version -or [string]$manifest.git_sha -ne $GitSha) {
     throw 'Promotion SHA or version does not match the signed release'

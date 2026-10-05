@@ -525,6 +525,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
         contract = validate_storage_contract(release.manifest or {}, release.version)
     except ValueError:
         return "STORAGE_CONTRACT_INVALID"
+    if release.version == "2.6.16" and release.state != "HIL_ONLY":
+        return "JOURNAL_BRIDGE_HIL_ONLY"
     if contract and contract.get("allowed_bootstrap_versions") is not None:
         qualified_version = next(
             (
@@ -543,7 +545,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version in {"2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15"} and qualified_version in {"2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10"}) or (
             release.version in {"2.6.13", "2.6.14", "2.6.15"} and qualified_version == "2.6.12") or (
             release.version in {"2.6.14", "2.6.15"} and qualified_version == "2.6.13") or (
-            release.version == "2.6.15" and qualified_version == "2.6.14")
+            release.version == "2.6.15" and qualified_version == "2.6.14") or (
+            release.version == "2.6.16" and qualified_version == "2.6.15")
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
@@ -820,9 +823,13 @@ def sync_release_store(session: Session) -> None:
         validate_storage_contract(manifest, str(manifest.get("version", "")))
         image_name = os.path.basename(str(manifest["image_name"]))
         image = manifest_path.parent / image_name
-        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        image_bytes = image.read_bytes()
+        digest = hashlib.sha256(image_bytes).hexdigest()
         if not hmac.compare_digest(digest, str(manifest["image_sha256"])) or image.stat().st_size != int(manifest["image_size"]):
             raise RuntimeError(f"Firmware release {release_id} failed immutable artifact verification.")
+        if manifest.get("version") == "2.6.16":
+            from zk_add.zkt_bridge_contract import validate_bridge_image
+            validate_bridge_image(image_bytes)
         application_digest = str(manifest.get("application_sha256") or "")
         if application_digest and (
             len(application_digest) != 64 or application_digest != application_digest.lower() or
@@ -839,6 +846,11 @@ def sync_release_store(session: Session) -> None:
         desired_state = "AVAILABLE"
         if marker_path.is_file():
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if manifest.get("release_channel") == "EXPERIMENTAL_HIL_ONLY" and (
+                type(marker.get("schema_version")) is not int or marker["schema_version"] != 2
+                or "targets" not in marker
+            ):
+                raise ValueError("Experimental journal bridge requires ordered exact HIL identities.")
             if "targets" in marker:
                 identity = (release_id, str(manifest.get("version", "")),
                             str(manifest["git_sha"]), digest, application_digest)
@@ -857,6 +869,8 @@ def sync_release_store(session: Session) -> None:
                 raise RuntimeError(f"Firmware release {release_id} HIL marker has a different image hash.")
             desired_state = "HIL_ONLY"
         if desired_state == "AVAILABLE":
+            if manifest.get("release_channel") == "EXPERIMENTAL_HIL_ONLY":
+                raise ValueError("Experimental journal bridge requires an exact HIL quarantine marker.")
             require_production_qualification(manifest)
         stored_manifest = {
             **manifest,

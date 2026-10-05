@@ -19,6 +19,8 @@ const char *storage_upgrade_contract(void)
 {
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     return "ZONE_HIKVISION_STORAGE_CONTRACT_V1:SOURCE:READ=2:LANES=7F";
+#elif defined(ZONE_LITE_JOURNAL_BRIDGE_IMAGE) && ZONE_LITE_JOURNAL_BRIDGE_IMAGE
+    return "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1";
 #elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
     return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14";
 #elif ZONE_LITE_SEGMENTED_WRITES
@@ -45,6 +47,14 @@ bool storage_upgrade_init(void)
     error_code = ""; ready = true; return true;
 #endif
     if (!running || strcmp(running->project_name, "zone_lite")) return failed("STORAGE_APPLICATION_UNKNOWN");
+#if defined(ZONE_LITE_JOURNAL_BRIDGE_IMAGE) && ZONE_LITE_JOURNAL_BRIDGE_IMAGE
+    /* The bridge initially preserves the legacy writer. Its separate journal
+     * runtime requires secure boot, encrypted NVS and its actual reader proof;
+     * no new authority is granted by this packaging marker. */
+    if (strcmp(running->version, "2.6.16") || ZONE_LITE_SEGMENTED_WRITES || ZONE_LITE_DIRECT_LEGACY_UPGRADE)
+        return failed("STORAGE_BRIDGE_BUILD_MISMATCH");
+    if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
+#endif
 #if ZONE_LITE_DIRECT_LEGACY_UPGRADE
     {
         if (strcmp(running->version, UG_DIRECT_VERSION)) return failed("STORAGE_DIRECT_VERSION_MISMATCH");

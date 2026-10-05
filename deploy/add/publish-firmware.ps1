@@ -61,6 +61,10 @@ if ($PublicationMode -eq 'HIL_ONLY' -and [string]::IsNullOrWhiteSpace($HilTarget
 if ($PublicationMode -eq 'AVAILABLE' -and (-not [string]::IsNullOrWhiteSpace($HilTargetMac) -or $targets.Count)) {
     throw 'A production publication cannot carry HIL targets'
 }
+if ($manifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY' -and
+    ($PublicationMode -ne 'HIL_ONLY' -or $targets.Count -eq 0)) {
+    throw 'Experimental firmware requires ordered exact HIL identities and cannot be published as AVAILABLE'
+}
 if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.1') {
     if ($PublicationMode -ne 'HIL_ONLY' -or -not [string]::IsNullOrWhiteSpace($HilTargetMac)) {
         throw 'ZKT 2.6.1 must first be published only to its exact ordered HIL scope'

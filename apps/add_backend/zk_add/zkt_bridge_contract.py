@@ -1,0 +1,57 @@
+"""Exact bridge packaging for experimental HIL; no writer or production grant."""
+import struct
+
+BRIDGE_VERSION = "2.6.16"
+BRIDGE_MARKER = "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
+PREDECESSOR_IMAGES = {
+    "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
+    "2.5.2": "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b",
+    "2.6.15": "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6",
+}
+
+
+def bridge_contract() -> dict:
+    return {
+        "allowed_bootstrap_images": dict(PREDECESSOR_IMAGES),
+        "allowed_bootstrap_versions": list(PREDECESSOR_IMAGES),
+        "compatibility_version": BRIDGE_VERSION,
+        "delivery_authority": "LEGACY_UNTIL_PERSISTED_ADD_CUTOVER",
+        "journal_capture": True,
+        "journal_read_format": 1,
+        "journal_reader_mask": 63,
+        "journal_write_format": 1,
+        "read_format": 2,
+        "reader_mask": 63,
+        "schema_version": 3,
+        "write_format": 1,
+    }
+
+
+def validate_bridge_manifest(manifest: dict) -> dict:
+    contract = manifest.get("queue_storage")
+    expected = bridge_contract()
+    if (manifest.get("version") != BRIDGE_VERSION
+            or manifest.get("firmware_family") != "zkt"
+            or manifest.get("project_name") != "zone_lite"
+            or manifest.get("release_channel") != "EXPERIMENTAL_HIL_ONLY"
+            or manifest.get("minimum_bootstrap_version") != "2.4.12"
+            or not isinstance(contract, dict) or contract != expected
+            or any(type(contract[key]) is not type(value) for key, value in expected.items())):
+        raise ValueError("Journal bridge requires its exact experimental HIL storage contract.")
+    return contract
+
+
+def validate_bridge_image(image: bytes) -> None:
+    """Bind manifest capabilities to the compiled role and ESP descriptor.
+
+    The normal release loader independently verifies the signed manifest and
+    entire image digest. A marker is packaging evidence, never runtime proof.
+    """
+    if (len(image) < 112 or image[0] != 0xE9
+            or struct.unpack_from("<I", image, 32)[0] != 0xABCD5432
+            or image[48:80].split(b"\0", 1)[0] != BRIDGE_VERSION.encode()
+            or image[80:112].split(b"\0", 1)[0] != b"zone_lite"
+            or image.count(BRIDGE_MARKER.encode() + b"\0") != 1
+            or image.count(b"ZONE_STORAGE_CONTRACT_V3:") != 1
+            or b"ZONE_STORAGE_CONTRACT_V1:" in image or b"ZONE_STORAGE_CONTRACT_V2:" in image):
+        raise ValueError("Journal bridge image lacks its exact descriptor or compiled reader/capture marker.")

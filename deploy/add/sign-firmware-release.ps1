@@ -206,7 +206,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
@@ -218,8 +218,10 @@ try {
     if ($null -ne $storageContract) {
         # Keep canonical lexical key order used by ADD signature verification.
         $sortedManifest = [ordered]@{}
-        foreach ($key in @($manifest.Keys + @('queue_storage') | Sort-Object)) {
-            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } else { $manifest[$key] })
+        $additionalKeys = @('queue_storage')
+        if ($Version -eq '2.6.16') { $additionalKeys += 'release_channel' }
+        foreach ($key in @($manifest.Keys + $additionalKeys | Sort-Object)) {
+            $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })
         }
         $manifest = $sortedManifest
     }
