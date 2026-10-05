@@ -77,6 +77,16 @@ endurance qualification remain `NOT_PERFORMED`.
 
 ## Compatibility bridge package
 
+HIL publication first verifies the exact signed manifest using the running ADD
+container's installed family and storage-contract validators and configured
+public key. This preflight uses bounded temporary metadata files, executes no
+database operation and never copies firmware credentials into the container.
+A backend without the required contract must be deployed before publication;
+otherwise the package remains outside the live store. Publication shares the
+ADD deployment lock, so backend replacement cannot race this check. Signature,
+image and quarantine verification still apply independently. This ordering
+prevents a valid new package from breaking an older backend's release scanner.
+
 The 2.6.16 HIL build includes journal readers and capture support, with legacy
 delivery authority on first installation. It carries one compiled V3 bridge
 marker and an exact signed storage contract. ADD verifies the ESP application

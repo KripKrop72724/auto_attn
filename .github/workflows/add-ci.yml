@@ -27,6 +27,7 @@ jobs:
           if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
           ./tests/firmware/test_hil_publication.ps1
           ./tests/firmware/test_backup_restore.ps1
+          ./tests/firmware/test_deployed_firmware_contract.ps1
 
   repository-contract:
     runs-on: ubuntu-latest
@@ -43,6 +44,9 @@ jobs:
       - name: Exercise pre-migration backup restore gate
         shell: pwsh
         run: ./tests/firmware/test_backup_restore.ps1
+      - name: Exercise deployed backend firmware admission
+        shell: pwsh
+        run: ./tests/firmware/test_deployed_firmware_contract.ps1
       - name: Parse production PowerShell scripts
         shell: pwsh
         run: |
