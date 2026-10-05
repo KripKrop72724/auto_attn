@@ -16,7 +16,8 @@ from zk_add import zkt_oracle_delivery as delivery, worker
 from zk_add.crypto import cnic_lookup, decrypt_json, encrypt_cnic
 from zk_add.db import Base
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, TerminalRecordManifest,
-    TerminalSourceEpoch, ZKTDevice, ZktOccurrenceAlias, ZktOracleIntent, ZktOracleContentReceipt)
+    TerminalSourceEpoch, ZKTDevice, ZktOccurrenceAlias, ZktOracleIntent, ZktOracleContentReceipt,
+    ZktOracleMembershipReceipt)
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 from zk_add.zkt_custody import occurrence_id
@@ -406,6 +407,7 @@ def test_additive_migration_and_rollback_retain_payloads_and_receipts(store, mon
     spec.loader.exec_module(migration)
     engine = store.kw["bind"]
     with engine.begin() as connection:
+        ZktOracleMembershipReceipt.__table__.drop(connection)
         ZktOracleContentReceipt.__table__.drop(connection)
         ZktOracleIntent.__table__.drop(connection)
         monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))

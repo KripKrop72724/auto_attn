@@ -15,10 +15,10 @@ creation remain the future caller's responsibility.
 
 Migration `20261004_0046` adds delivery intents and content receipts. Existing
 attendance rows, Oracle keys and delivery paths retain their prior behavior.
-An intent permanently selects the ADD-owned content-verification path, including
-after its connector's custody feature is disabled. It is selected before both
-ordinary and manually overridden delivery. Generic HTTP success, UID membership
-checks and firmware receipts cannot complete it.
+An intent permanently selects its ADD-owned verification path, including after
+its connector's custody feature is disabled. It is selected before both ordinary
+and manually overridden delivery. Generic HTTP success and firmware receipts
+cannot complete it. UID membership cannot complete a content-verification intent.
 
 At claim time ADD revalidates terminal/source ownership, source occurrence
 identity, current identity authorization and clock plausibility. It freezes the
@@ -38,7 +38,7 @@ share the existing worker concurrency budget.
 
 ## Versioned Oracle projection
 
-New intents require `raw-captures/delivery-v2/check`, contract `2`, scope
+Default intents require `raw-captures/delivery-v2/check`, contract `2`, scope
 `ORACLE_RAW_DAY_TIMES_V2` and confirmation path `ADD_ZKT_PROJECTION_V2`. The
 response must bind the exact keyed request digest and event UID, contain a
 SHA-256 content token, and independently confirm raw projection and downstream
@@ -66,6 +66,24 @@ Raw-only observations require false check-in/out flags and the separate
 `RAW_ONLY` disposition. This proves raw preservation and daily punch times,
 not leave, roster, holiday, payroll or effective-status policy correctness.
 Those business-policy and production qualification gates remain separate.
+
+## Experimental installed-interface contract
+
+An internal caller may explicitly register a new experimental HIL intent with
+`ORACLE_UID_MEMBERSHIP_V1`. Migration `20261005_0050` preserves all existing
+intents as `ORACLE_RAW_DAY_TIMES_V2`; their frozen scope cannot change through
+replay. The experimental adapter uses ordinary ADD attendance credentials and
+the installed `raw-captures/check` route. It requires HTTP 200, strict response
+counts and an exact requested-UID disposition before recording presence.
+
+The same check-before-post, committed attempt reservation, post-response check,
+payload freeze and stale-worker fencing apply. UID presence commits a separate
+`add_zkt_oracle_membership_receipts` row and the `ADD_ZKT_UID_ONLY_V1` confirmation
+path atomically with acknowledgement. It does not populate a content receipt,
+identity-content verification or downstream daily verification. A missing or
+failed v2 endpoint never selects this path. No Oracle object or data repair is
+installed, and this component creates no field intent until canonical occurrence
+creation is integrated and explicitly activated.
 
 The content token binds the observed raw fields, receipt time, derived flags,
 identity multiplicity, affected-day boundaries, actual daily times and explicit
@@ -123,7 +141,10 @@ local evidence. This is anonymous compilation evidence only.
 Production's inspected Oracle engine is 19c. The newer local engine does **not**
 qualify stored-package installation/execution on 19c, the production schema's business rules, ORDS
 authentication, downstream writer behavior or concurrent real delivery. Those
-checks need an isolated matching Oracle environment before field activation.
+checks remain necessary for full content/production qualification. The user's
+experimental HIL direction permits the explicit installed-interface membership
+contract above without waiting for that environment; unperformed checks retain
+their unperformed status.
 No production Oracle data or schema was changed during this work.
 
 ## Recovery and verification
