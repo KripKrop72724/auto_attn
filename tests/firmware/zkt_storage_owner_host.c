@@ -6,6 +6,7 @@
 #include "zkt_journal_transport.h"
 #include "zkt_reader_platform.h"
 #include "zkt_runtime_checkpoint.h"
+#include "zkt_legacy_inventory.h"
 #include "queue_store.h"
 #include "durable_queue.h"
 #include <assert.h>
@@ -305,6 +306,7 @@ dq_result_t add_legacy_owner_append(unsigned lane,const void *bytes,size_t lengt
 {
     assert((unsigned)policy<=QS_ADMIT_RECOVERY);
     legacy_queue_t *q=flat_queue(lane);
+    lq_invalidate_empty(q); /* Match the actual producer adapter's invalidation. */
     if(atomic_load(&full))return DQ_FULL;
     FILE *f=fopen(q->path,"ab");
     assert(f && fwrite(bytes,1,length,f)==length && fputc('\n',f)!=EOF && fclose(f)==0);
@@ -486,6 +488,19 @@ static void rollback_with_full_mailbox(void)
     assert(zj_owner_health(&health) && health.quiesced && !health.occupied && !health.writer_allowed);
     atomic_store(&stop, true);
     assert(!pthread_join(thread, NULL));
+}
+
+static void prove_legacy_empty(void)
+{
+    uint8_t bytes[DQ_MAX_RECORD_BYTES]; size_t length;
+    lq_token_t token; uint32_t depth;
+    for(unsigned lane=0;lane<QS_HIK_SOURCE;lane++)assert(zq_snapshot((qs_lane_t)lane,&depth)&&!depth);
+    for(unsigned lane=0;lane<2;lane++)assert(zq_legacy_peek(lane,bytes,sizeof(bytes),&length,&token)==DQ_EMPTY);
+    for(unsigned lane=0;lane<2;lane++)assert(zq_attendance_legacy_peek(lane,bytes,sizeof(bytes),&length,&token)==DQ_EMPTY);
+    for(unsigned lane=0;lane<3;lane++)assert(zq_evidence_peek(lane,bytes,sizeof(bytes),&length,&token)==DQ_EMPTY);
+    zj_owner_health_t health;
+    assert(zj_owner_health(&health) && health.legacy_verified_empty && !health.legacy_append_pending);
+    assert(health.legacy_empty_mask==ZQ_INVENTORY_REQUIRED && health.legacy_required_mask==ZQ_INVENTORY_REQUIRED);
 }
 
 int main(int argc, char **argv)
@@ -874,6 +889,47 @@ int main(int argc, char **argv)
     assert(zq_attendance_legacy_settle(0,&flat_token,false)==DQ_OK);
     assert(zq_attendance_legacy_peek(0,retained_output,sizeof(retained_output),&retained_length,&flat_token)==DQ_EMPTY);
     assert(zj_owner_health(&health) && !health.occupied);
+    assert(zq_probe()); /* Starts a new absence proof across all thirteen domains. */
+    assert(zj_owner_health(&health) && !health.legacy_verified_empty);
+    prove_legacy_empty();
+    assert(zj_owner_health(&health));
+    uint64_t inventory_generation=health.legacy_inventory_generation;
+    prove_legacy_empty();
+    assert(zj_owner_health(&health) && health.legacy_inventory_generation==inventory_generation);
+    /* A queued legacy append invalidates absence before it executes. Keep the
+     * real owner blocked in another write while admitting the copied request. */
+    zj_request_t pause_capture={.operation=ZJ_APPEND,.input.observation={
+        .raw_format=ZJ_LIVE_FRAME,.time_quality=ZJ_TIME_UNKNOWN,.source_ordinal=UINT32_MAX,
+        .raw_length=40,.raw={'I'}}};
+    atomic_store(&pause_write,true);atomic_store(&write_waiting,false);
+    assert(zj_owner_submit(&pause_capture,&ticket));
+    for(unsigned i=0;i<2000&&!atomic_load(&write_waiting);i++)vTaskDelay(1);
+    assert(atomic_load(&write_waiting));
+    zj_request_t pending_legacy={.operation=ZJ_SEGMENTED_QUEUE,.input.segmented={
+        .domain=ZQ_ADD_LEGACY,.lane=0,.operation=ZQ_APPEND_BEGIN,.policy=QS_ADMIT_LIVE,
+        .total=1,.deadline_us=(uint64_t)esp_timer_get_time()+5000000U}};
+    uint64_t legacy_ticket;
+    assert(zj_owner_submit(&pending_legacy,&legacy_ticket));
+    assert(zj_owner_health(&health) && !health.legacy_verified_empty && health.legacy_append_pending);
+    atomic_store(&pause_write,false);assert(wait_reply(ticket).result==ZJ_OK);
+    zj_reply_t legacy_reply=wait_reply(legacy_ticket);assert(legacy_reply.segmented.result==DQ_OK);
+    assert(zj_owner_health(&health) && health.legacy_append_pending && !health.legacy_verified_empty);
+    pending_legacy.input.segmented.transfer=legacy_reply.segmented.transfer;
+    pending_legacy.input.segmented.operation=ZQ_APPEND_CHUNK;
+    pending_legacy.input.segmented.length=1;pending_legacy.input.segmented.bytes[0]='Z';
+    assert(zj_owner_submit(&pending_legacy,&legacy_ticket));assert(wait_reply(legacy_ticket).segmented.result==DQ_OK);
+    pending_legacy.input.segmented.operation=ZQ_APPEND_COMMIT;pending_legacy.input.segmented.length=0;
+    assert(zj_owner_submit(&pending_legacy,&legacy_ticket));assert(wait_reply(legacy_ticket).segmented.result==DQ_OK);
+    assert(zj_owner_health(&health) && !health.legacy_verified_empty && !health.legacy_append_pending);
+    assert(zq_legacy_peek(0,retained_output,sizeof(retained_output),&retained_length,&flat_token)==DQ_OK);
+    assert(retained_length==2 && !memcmp(retained_output,"Z\n",2));
+    assert(zq_legacy_settle(0,&flat_token,false)==DQ_OK);
+    prove_legacy_empty();
+    atomic_store(&full,true);
+    assert(zq_legacy_append(1,"refused",7,QS_ADMIT_LIVE)==DQ_FULL);
+    assert(zj_owner_health(&health) && !health.legacy_verified_empty);
+    atomic_store(&full,false);prove_legacy_empty();
+    assert(zj_owner_health(&health) && health.legacy_inventory_generation>inventory_generation);
     /* A capture caller can time out while its accepted append is still inside
      * storage. Quiescence must finish that write and all queued work before
      * acknowledging; a new producer cannot race the completed barrier. */

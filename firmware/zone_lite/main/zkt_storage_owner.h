@@ -29,6 +29,11 @@ typedef struct {
     unsigned pending_appends, journal_segments;
     uint64_t journal_bytes;
     bool inventory_known, verified_empty, append_observed;
+    /* Verified absence across all retained ZKT queue domains. This is local
+     * custody-transfer evidence, never source/identity/Oracle completion. */
+    bool legacy_verified_empty, legacy_append_pending;
+    uint32_t legacy_empty_mask, legacy_required_mask;
+    uint64_t legacy_inventory_generation;
     zj_result_t last_append_result;
     uint64_t last_append_uptime_us;
     int filesystem_error, nvs_error;

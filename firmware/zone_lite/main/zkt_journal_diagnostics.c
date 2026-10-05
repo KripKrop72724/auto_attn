@@ -1,4 +1,5 @@
 #include "zkt_journal_diagnostics.h"
+#include "zkt_legacy_inventory.h"
 #include <string.h>
 
 static const char *result_name(zj_result_t result)
@@ -222,7 +223,14 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
             !replace(storage, "recovery_complete", cJSON_CreateBool(false))) return false;
     }
     bool empty = owner_ready && owner->inventory_known && owner->verified_empty && !owner->operation_running && !owner->pending_appends;
+    bool legacy_empty = owner_ready && owner->legacy_verified_empty && !owner->legacy_append_pending &&
+        !owner->operation_running && owner->legacy_inventory_generation && owner->legacy_required_mask == ZQ_INVENTORY_REQUIRED &&
+        owner->legacy_empty_mask == ZQ_INVENTORY_REQUIRED &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(storage, "recovery_complete")) &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(storage, "persistence_verified"));
     return queue(queues, "journal", empty, !owner_fresh ? "STALE_OWNER" : owner->pending_appends ? "PENDING_APPEND" :
             empty ? "VERIFIED_EMPTY" : "NONEMPTY_OR_UNVERIFIED", owner_fresh && owner->inventory_known, owner->journal_bytes) &&
-        queue(queues, "legacy_migration", false, "UNVERIFIED_MIGRATION", false, 0);
+        queue(queues, "legacy_migration", legacy_empty, !owner_fresh ? "STALE_OWNER" :
+            owner->legacy_append_pending ? "PENDING_APPEND" : legacy_empty ? "VERIFIED_EMPTY" : "UNVERIFIED_MIGRATION",
+            legacy_empty, 0);
 }
