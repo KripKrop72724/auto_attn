@@ -86,7 +86,7 @@ int main(int argc,char **argv){
     unit = tmp_path / "boundary-gateway.c"
     unit.write_text(program)
     binary = tmp_path / "boundary-gateway"
-    subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+    subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(main),
                     str(unit), str(main / "durable_queue.c"), "-o", str(binary)], check=True)
     for scenario in range(13):
