@@ -26,8 +26,9 @@ function Get-FirmwareStorageContract {
             write_format = 1
         }
     }
-    if ($Version -eq '2.6.16') {
+    if ($Version -in @('2.6.16', '2.6.17')) {
         $expectedBridge = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
+        if ($Version -eq '2.6.17') { $expectedBridge += ':VERSION=2.6.17' }
         $legacyMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:')
         if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedBridge -or $legacyMarkers.Count -ne 0) {
             throw 'Missing, ambiguous, or incorrect journal bridge reader/capture contract'
@@ -39,7 +40,7 @@ function Get-FirmwareStorageContract {
                 '2.6.15' = '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6'
             }
             allowed_bootstrap_versions = @('2.4.12', '2.5.2', '2.6.15')
-            compatibility_version = '2.6.16'
+            compatibility_version = $Version
             delivery_authority = 'LEGACY_UNTIL_PERSISTED_ADD_CUTOVER'
             journal_capture = $true
             journal_read_format = 1

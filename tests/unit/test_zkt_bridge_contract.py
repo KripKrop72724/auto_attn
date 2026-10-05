@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import secrets
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,28 +22,34 @@ from zk_add.settings import settings
 from zk_add.storage_contract import validate_storage_contract
 from zk_add.zkt_bridge_contract import (
     BRIDGE_MARKER, BRIDGE_VERSION, PREDECESSOR_IMAGES, bridge_contract,
-    validate_bridge_image, signed_hil_targets, bridge_hil_targets,
+    validate_bridge_image, signed_hil_targets, bridge_hil_targets, bridge_marker,
 )
+
+
+@pytest.fixture(params=["2.6.16", "2.6.17"], autouse=True)
+def bridge_version(request, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "BRIDGE_VERSION", request.param)
+    monkeypatch.setattr(sys.modules[__name__], "BRIDGE_MARKER", bridge_marker(request.param))
 
 
 def bridge_image():
     image = bytearray(112)
     image[0] = 0xE9
     struct.pack_into("<I", image, 32, 0xABCD5432)
-    image[48:54] = b"2.6.16"
+    image[48:54] = BRIDGE_VERSION.encode()
     image[80:89] = b"zone_lite"
     return bytes(image) + BRIDGE_MARKER.encode() + b"\0"
 
 
 def bridge_manifest():
     return {
-        "release_id": "zone-lite-2.6.16", "version": BRIDGE_VERSION,
+        "release_id": f"zone-lite-{BRIDGE_VERSION}", "version": BRIDGE_VERSION,
         "git_sha": "a" * 40, "application_sha256": "c" * 64,
         "firmware_family": "zkt", "project_name": "zone_lite",
         "minimum_bootstrap_version": "2.4.12",
         "release_channel": "EXPERIMENTAL_HIL_ONLY",
         "hil_targets": signed_hil_targets(),
-        "queue_storage": bridge_contract(),
+        "queue_storage": bridge_contract(BRIDGE_VERSION),
     }
 
 
@@ -57,9 +64,9 @@ def session():
 
 def test_bridge_has_no_implicit_writer_authority():
     manifest = bridge_manifest()
-    assert validate_storage_contract(manifest, BRIDGE_VERSION) == bridge_contract()
+    assert validate_storage_contract(manifest, BRIDGE_VERSION) == bridge_contract(BRIDGE_VERSION)
     assert manifest["queue_storage"]["delivery_authority"] == "LEGACY_UNTIL_PERSISTED_ADD_CUTOVER"
-    validate_bridge_image(bridge_image())
+    validate_bridge_image(bridge_image(), BRIDGE_VERSION)
     with pytest.raises(ValueError, match="Journal writer"):
         validate_storage_contract(manifest, "2.7.0")
 
@@ -77,7 +84,7 @@ def test_bridge_rejects_wrong_role_or_missing_contract(field, value):
         validate_storage_contract(manifest, BRIDGE_VERSION)
 
 
-@pytest.mark.parametrize("field", list(bridge_contract()))
+@pytest.mark.parametrize("field", list(bridge_contract(BRIDGE_VERSION)))
 def test_every_bridge_capability_is_required(field):
     manifest = bridge_manifest()
     del manifest["queue_storage"][field]
@@ -102,7 +109,7 @@ def test_bridge_rejects_changed_or_coerced_capabilities(field, value):
 @pytest.mark.parametrize("mutation", [
     lambda image: image[:50], lambda image: b"X" + image[1:],
     lambda image: image[:32] + b"XXXX" + image[36:],
-    lambda image: image.replace(b"2.6.16", b"2.6.15"),
+    lambda image: image.replace(BRIDGE_VERSION.encode(), b"2.6.15"),
     lambda image: image.replace(b"zone_lite", b"wrong_app"),
     lambda image: image[:112], lambda image: image.replace(b"CAPTURE=1", b"CAPTURE=0"),
     lambda image: image + BRIDGE_MARKER.encode() + b"\0",
@@ -112,7 +119,7 @@ def test_bridge_rejects_changed_or_coerced_capabilities(field, value):
 ])
 def test_bridge_binary_must_match_signed_capability(mutation):
     with pytest.raises(ValueError, match="compiled reader/capture marker"):
-        validate_bridge_image(mutation(bridge_image()))
+        validate_bridge_image(mutation(bridge_image()), BRIDGE_VERSION)
 
 
 @pytest.mark.parametrize("version", list(PREDECESSOR_IMAGES))
@@ -241,7 +248,7 @@ def test_bridge_scope_can_expand_without_changing_older_campaigns(session, monke
     legacy = json.dumps([{"connector_id": "old", "mac": "00:11:22:33:44:55", "terminal_serial": "OLD"}])
     monkeypatch.setattr(settings, "firmware_hil_targets_json", legacy)
     targets = signed_hil_targets()[:count]
-    release = FirmwareRelease(id=123, release_id="zone-lite-2.6.16", version=BRIDGE_VERSION,
+    release = FirmwareRelease(id=123, release_id=f"zone-lite-{BRIDGE_VERSION}", version=BRIDGE_VERSION,
         git_sha="a" * 40, image_sha256="b" * 64, state="HIL_ONLY",
         manifest={**bridge_manifest(), "_hil_targets": targets})
     assert [row.model_dump() for row in bridge_hil_targets(targets)] == targets
@@ -300,13 +307,13 @@ def test_real_bridge_campaign_and_scope_expansion_require_exact_previous_accepta
         session.add(connector)
         connectors.append(connector)
     session.flush()
-    preview = preview_campaign_scope(session, release_public_id="zone-lite-2.6.16", zone_id="ZONE-0")
+    preview = preview_campaign_scope(session, release_public_id=f"zone-lite-{BRIDGE_VERSION}", zone_id="ZONE-0")
     assert [row["connector_id"] for row in preview["eligible"]] == [connectors[0].connector_id]
-    campaign = create_campaign(session, release_public_id="zone-lite-2.6.16", zone_id="ZONE-0",
-        reason="Test bridge", typed_confirmation="2.6.16", actor="test", scope_token=preview["scope_token"],
+    campaign = create_campaign(session, release_public_id=f"zone-lite-{BRIDGE_VERSION}", zone_id="ZONE-0",
+        reason="Test bridge", typed_confirmation=BRIDGE_VERSION, actor="test", scope_token=preview["scope_token"],
         idempotency_key="test-bridge-campaign")
     offer = assignment_for_connector(session, connector=connectors[0], public_base="https://test.invalid")
-    assert offer and offer["version"] == "2.6.16"
+    assert offer and offer["version"] == BRIDGE_VERSION
     assert assignment_for_connector(session, connector=connectors[1], public_base="https://test.invalid") is None
     deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id == campaign.id))
     release = session.get(FirmwareRelease, campaign.release_id)
@@ -327,3 +334,14 @@ def test_real_bridge_campaign_and_scope_expansion_require_exact_previous_accepta
     session.flush()
     assert _permitted_hil_targets(session, release)[0].connector_id == connectors[0].connector_id
     assert release.state == "HIL_ONLY"
+
+
+def test_package_version_cannot_be_relabelled():
+    other = "2.6.17" if BRIDGE_VERSION == "2.6.16" else "2.6.16"
+    with pytest.raises(ValueError, match="Journal bridge"):
+        validate_storage_contract(bridge_manifest(), other)
+    with pytest.raises(ValueError, match="compiled reader/capture marker"):
+        validate_bridge_image(bridge_image(), other)
+    renamed = bridge_image().replace(BRIDGE_VERSION.encode(), other.encode(), 1)
+    with pytest.raises(ValueError, match="compiled reader/capture marker"):
+        validate_bridge_image(renamed, other)

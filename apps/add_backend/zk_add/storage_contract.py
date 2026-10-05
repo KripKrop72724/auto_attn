@@ -69,8 +69,10 @@ LOCK_MARKER = DELIVERY_MARKER + ",2.6.14"
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     # Both roles require exact experimental contracts; neither may fall
     # through the pre-contract legacy path or grant runtime authority here.
-    if version == "2.6.16":
+    if version in {"2.6.16", "2.6.17"}:
         from zk_add.zkt_bridge_contract import validate_bridge_manifest
+        if manifest.get("version") != version:
+            raise ValueError("Journal bridge version disagrees with its manifest.")
         return validate_bridge_manifest(manifest)
     if version == "2.7.0":
         from zk_add.zkt_writer_contract import validate_writer_manifest

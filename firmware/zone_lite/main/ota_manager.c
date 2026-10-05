@@ -736,7 +736,7 @@ static bool uses_local_boot_confirmation(void)
 #else
     const esp_app_desc_t *app = esp_app_get_description();
     return app && !strcmp(app->project_name, "zone_lite") &&
-        (!strcmp(app->version, "2.6.16") || !strcmp(app->version, "2.7.0"));
+        (!strcmp(app->version, ZJ_BRIDGE_VERSION) || !strcmp(app->version, ZJ_WRITER_VERSION));
 #endif
 }
 

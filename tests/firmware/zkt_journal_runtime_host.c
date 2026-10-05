@@ -72,7 +72,7 @@ int main(void){
  assert(!zj_runtime_writer_ready() && !zj_runtime_raw_source_required());
  tick();assert(zj_runtime_health(&health)&&health.phase==ZJ_BOOT_OFF&&!owner_starts);
  strcpy(app.version,"2.7.1");tick();assert(!owner_starts&&zj_runtime_legacy_capture_allowed());
- strcpy(app.version,"2.6.16");reset();
+ strcpy(app.version,ZJ_BRIDGE_VERSION);reset();
  assert(!zj_runtime_boot_ready() && zj_runtime_raw_source_required() && !zj_runtime_legacy_capture_allowed());
  mutex_fail=true;tick();assert(!zj_runtime_health(&health)&&!owner_starts);mutex_fail=false;
  secure=false;tick();assert(zj_runtime_health(&health)&&health.phase==ZJ_BOOT_SECURITY_HOLD);
@@ -100,7 +100,7 @@ int main(void){
  strcpy(config.zkt_expected_serial,"REBOUND");tick();assert(!zj_runtime_writer_ready()&&!zj_runtime_boot_ready());
  strcpy(config.zkt_expected_serial,"TEST-SERIAL");
  /* Roll back and reboot. The persisted ADD authority starts bridge capture. */
- strcpy(app.version,"2.6.16");reset();pending_bridge=true;
+ strcpy(app.version,ZJ_BRIDGE_VERSION);reset();pending_bridge=true;
  for(unsigned i=0;i<5;i++)tick();
  assert(zj_runtime_boot_ready()&&!zj_runtime_writer_ready()&&!zj_runtime_legacy_capture_allowed());
  assert(zj_runtime_raw_source_required()&&!proofs&&!capture_starts);

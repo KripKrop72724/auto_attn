@@ -1,5 +1,6 @@
 #include "storage_upgrade.h"
 #include "upgrade_guard.h"
+#include "zkt_journal_compat.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -19,6 +20,8 @@ const char *storage_upgrade_contract(void)
 {
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     return "ZONE_HIKVISION_STORAGE_CONTRACT_V1:SOURCE:READ=2:LANES=7F";
+#elif defined(ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE) && ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE
+    return "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1:VERSION=2.6.17";
 #elif defined(ZONE_LITE_JOURNAL_BRIDGE_IMAGE) && ZONE_LITE_JOURNAL_BRIDGE_IMAGE
     return "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1";
 #elif defined(ZONE_LITE_JOURNAL_WRITER_IMAGE) && ZONE_LITE_JOURNAL_WRITER_IMAGE
@@ -53,7 +56,7 @@ bool storage_upgrade_init(void)
     /* The bridge initially preserves the legacy writer. Its separate journal
      * runtime requires secure boot, encrypted NVS and its actual reader proof;
      * no new authority is granted by this packaging marker. */
-    if (strcmp(running->version, "2.6.16") || ZONE_LITE_SEGMENTED_WRITES || ZONE_LITE_DIRECT_LEGACY_UPGRADE)
+    if (strcmp(running->version, ZJ_BRIDGE_VERSION) || ZONE_LITE_SEGMENTED_WRITES || ZONE_LITE_DIRECT_LEGACY_UPGRADE)
         return failed("STORAGE_BRIDGE_BUILD_MISMATCH");
     if (!esp_secure_boot_enabled()) return failed("STORAGE_SECURE_BOOT_REQUIRED");
 #endif

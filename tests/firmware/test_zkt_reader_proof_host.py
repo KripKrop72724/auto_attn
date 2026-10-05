@@ -5,13 +5,16 @@ import struct
 import subprocess
 import zlib
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_reader_proof_persistence_and_exact_rollback(tmp_path):
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17"])
+def test_reader_proof_persistence_and_exact_rollback(tmp_path, bridge_version):
     main = ROOT / "firmware/zone_lite/main"
     executable = tmp_path / "reader-proof"
-    subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
+    subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", f'-DZJ_BRIDGE_VERSION="{bridge_version}"',
                     "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(main),
                     str(ROOT / "tests/firmware/zkt_reader_proof_host.c"),
@@ -28,12 +31,13 @@ def test_reader_proof_persistence_and_exact_rollback(tmp_path):
     expected[112] = 33
     expected[128] = 44
     struct.pack_into("<Q", expected, 160, 1)
-    expected[168:174] = b"2.6.16"
+    expected[168:174] = bridge_version.encode()
     struct.pack_into("<I", expected, 188, zlib.crc32(expected[:188]))
     assert (tmp_path / "reader-proof.bin").read_bytes() == bytes(expected)
 
 
-def test_platform_facts_and_nvs_failures(tmp_path):
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17"])
+def test_platform_facts_and_nvs_failures(tmp_path, bridge_version):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"
     for header in ["esp_app_desc.h", "esp_ota_ops.h", "esp_partition.h",
@@ -43,7 +47,7 @@ def test_platform_facts_and_nvs_failures(tmp_path):
         path.write_text('#include "zkt_reader_platform_host.h"\n')
     for encrypted, anti_rollback, capture in ((1, 0, 1), (0, 0, 1), (1, 1, 1), (1, 0, 0)):
         executable = tmp_path / f"reader-platform-{encrypted}-{anti_rollback}-{capture}"
-        subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
+        subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", f'-DZJ_BRIDGE_VERSION="{bridge_version}"',
                         f"-DCONFIG_NVS_ENCRYPTION={encrypted}",
                         f"-DCONFIG_BOOTLOADER_APP_ANTI_ROLLBACK={anti_rollback}",
                         f"-DZONE_LITE_JOURNAL_WRITES={capture}",

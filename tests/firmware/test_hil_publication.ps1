@@ -1,3 +1,4 @@
+param([ValidateSet("2.6.16", "2.6.17")][string]$BridgeVersion = "2.6.16")
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('hil-publication-' + [guid]::NewGuid().ToString('N'))
 $source = Join-Path $root 'package'
@@ -16,9 +17,10 @@ New-Item -ItemType Directory -Path $source -Force | Out-Null
 . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
 $contractImage = Join-Path $root 'contract.bin'
 $bridgeMarker = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
+if ($BridgeVersion -eq '2.6.17') { $bridgeMarker += ':VERSION=2.6.17' }
 [IO.File]::WriteAllText($contractImage, $bridgeMarker + [char]0)
-$bridgeContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.16'
-if ($bridgeContract.schema_version -ne 3 -or $bridgeContract.journal_capture -ne $true -or
+$bridgeContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version $BridgeVersion
+if ($bridgeContract.compatibility_version -cne $BridgeVersion -or $bridgeContract.schema_version -ne 3 -or $bridgeContract.journal_capture -ne $true -or
     $bridgeContract.journal_read_format -ne 1 -or $bridgeContract.journal_reader_mask -ne 63 -or
     $bridgeContract.journal_write_format -ne 1 -or $bridgeContract.write_format -ne 1 -or
     $bridgeContract.delivery_authority -ne 'LEGACY_UNTIL_PERSISTED_ADD_CUTOVER' -or
@@ -36,7 +38,7 @@ foreach ($bad in @('', $bridgeMarker.Replace('CAPTURE=1', 'CAPTURE=0'),
     ($bridgeMarker + [char]0 + 'ZONE_STORAGE_CONTRACT_V2:LEGACY'))) {
     [IO.File]::WriteAllText($contractImage, $bad + [char]0)
     $rejected = $false
-    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.16' | Out-Null } catch { $rejected = $true }
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $BridgeVersion | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw 'Unqualified bridge storage marker accepted' }
 }
 $writerMarker = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.16'
@@ -644,9 +646,9 @@ try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 3.1.0 
 if (-not $rejected) { throw 'Mislabelled Hikvision image accepted' }
 # Experimental bridge publication requires connector, ESP and terminal identity;
 # neither publication nor promotion may remove quarantine from these bytes.
-$bridgeImage = Join-Path $source 'zone-lite-2.6.16.bin'
+$bridgeImage = Join-Path $source "zone-lite-$BridgeVersion.bin"
 [IO.File]::WriteAllText($bridgeImage, 'Bridge fixture, not deployable firmware')
-$manifest = @{version='2.6.16';firmware_family='zkt';project_name='zone_lite';release_id='zone-lite-2.6.16';image_name='zone-lite-2.6.16.bin';image_sha256=(Get-FileHash $bridgeImage).Hash.ToLowerInvariant();image_size=(Get-Item $bridgeImage).Length;git_sha=('a'*40);application_sha256=('d'*64);release_channel='EXPERIMENTAL_HIL_ONLY';queue_storage=$bridgeContract}
+$manifest = @{version=$BridgeVersion;firmware_family='zkt';project_name='zone_lite';release_id="zone-lite-$BridgeVersion";image_name="zone-lite-$BridgeVersion.bin";image_sha256=(Get-FileHash $bridgeImage).Hash.ToLowerInvariant();image_size=(Get-Item $bridgeImage).Length;git_sha=('a'*40);application_sha256=('d'*64);release_channel='EXPERIMENTAL_HIL_ONLY';queue_storage=$bridgeContract}
 . (Join-Path $repo 'deploy/add/journal-hil-scope.ps1')
 $journalTargets = Get-JournalHilScope
 $manifest.hil_targets = $journalTargets
@@ -664,21 +666,21 @@ foreach ($mode in @('AVAILABLE', 'HIL_ONLY')) {
     $rejected = $false
     try {
         if ($mode -eq 'AVAILABLE') {
-            & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode $mode
+            & $publish -SourceDirectory $source -StoreDirectory $store -Version $BridgeVersion -PublicationMode $mode
         } else {
-            & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode $mode -HilTargetMac '00:11:22:33:44:55'
+            & $publish -SourceDirectory $source -StoreDirectory $store -Version $BridgeVersion -PublicationMode $mode -HilTargetMac '00:11:22:33:44:55'
         }
     } catch { $rejected = $true }
     if (-not $rejected) { throw 'Experimental publication bypassed ordered HIL quarantine' }
 }
-if (Test-Path (Join-Path $store '2.6.16')) { throw 'Rejected bridge publication left a release' }
-& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.16 -PublicationMode HIL_ONLY -HilTargetsJson $journalScope
-$bridgeScopePath = Join-Path $store '2.6.16/.hil-only.json'
+if (Test-Path (Join-Path $store $BridgeVersion)) { throw 'Rejected bridge publication left a release' }
+& $publish -SourceDirectory $source -StoreDirectory $store -Version $BridgeVersion -PublicationMode HIL_ONLY -HilTargetsJson $journalScope
+$bridgeScopePath = Join-Path $store "$BridgeVersion/.hil-only.json"
 $bridgeScopeBefore = [IO.File]::ReadAllText($bridgeScopePath)
 $bridgeOutput = Join-Path $root 'bridge-promotion-output'
 $rejected = $false
 try {
-    & (Join-Path $repo 'deploy/add/promote-firmware.ps1') -StoreDirectory $store -Version 2.6.16 -GitSha ('a'*40) -OutputDirectory $bridgeOutput
+    & (Join-Path $repo 'deploy/add/promote-firmware.ps1') -StoreDirectory $store -Version $BridgeVersion -GitSha ('a'*40) -OutputDirectory $bridgeOutput
 } catch { $rejected = $true }
 if (-not $rejected -or (Test-Path $bridgeOutput) -or
     [IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) {
@@ -686,7 +688,7 @@ if (-not $rejected -or (Test-Path $bridgeOutput) -or
 }
 $fullJournalScope = ConvertTo-Json -InputObject $journalTargets -Depth 5 -Compress
 $bridgeArguments = @{
-    StoreDirectory=$store; Version='2.6.16'; ExpectedGitSha=('a'*40)
+    StoreDirectory=$store; Version=$BridgeVersion; ExpectedGitSha=('a'*40)
     ExpectedImageSha256=[string]$manifest.image_sha256; ExpectedApplicationSha256=('d'*64)
     ExistingTargetsJson=$journalScope; ExtendedTargetsJson=$fullJournalScope
 }
@@ -695,7 +697,7 @@ if ([IO.File]::ReadAllText($bridgeScopePath) -cne $bridgeScopeBefore) { throw 'J
 & $extend @bridgeArguments
 $expandedBridge = Get-Content $bridgeScopePath -Raw | ConvertFrom-Json
 if ($expandedBridge.targets.Count -ne 17) { throw 'Journal scope expansion lost a nationwide target' }
-if ((Get-FileHash (Join-Path $store '2.6.16/zone-lite-2.6.16.bin')).Hash.ToLowerInvariant() -cne $manifest.image_sha256) {
+if ((Get-FileHash (Join-Path $store "$BridgeVersion/zone-lite-$BridgeVersion.bin")).Hash.ToLowerInvariant() -cne $manifest.image_sha256) {
     throw 'Journal expansion changed signed image bytes'
 }
 # The writer remains quarantined even if its experimental tag is removed.

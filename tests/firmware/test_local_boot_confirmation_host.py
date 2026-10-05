@@ -9,18 +9,19 @@ ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / "firmware/zone_lite/main"
 
 
-def compile_and_run(tmp_path, program, *, family=0):
+def compile_and_run(tmp_path, program, *, family=0, bridge_version="2.6.16"):
     unit = tmp_path / "boot.c"
     unit.write_text(program)
     binary = tmp_path / "boot"
     subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-        "-fsanitize=address,undefined", "-fno-omit-frame-pointer", f"-DZONE_LITE_HIKVISION={family}",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer", f"-DZONE_LITE_HIKVISION={family}", f'-DZJ_BRIDGE_VERSION="{bridge_version}"',
         "-I", str(MAIN), str(unit), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
 @pytest.mark.parametrize("family", [0, 1])
-def test_boot_confirmation_network_loss_and_checkpoint_boundaries(tmp_path, family):
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17"])
+def test_boot_confirmation_network_loss_and_checkpoint_boundaries(tmp_path, family, bridge_version):
     source = (MAIN / "ota_manager.c").read_text()
     start = source.index("static bool uses_local_boot_confirmation(void)\n{")
     production = source[start:source.index("static bool acknowledge_pending_success(void)\n{", start)]
@@ -100,7 +101,7 @@ int main(void)
     reset();local_ready=false;legacy_ready=false;
     assert(!confirm_or_report_rollback() && !marked && !rollbacks && s_failed_boot_pending);
     assert(now_us>=OTA_BOOT_CONFIRM_SECONDS*1000000ULL);
-    reset();strcpy(app.version,"2.6.16");strcpy(s_journal.target_version,"2.6.16");durable=s_journal;
+    reset();strcpy(app.version,ZJ_BRIDGE_VERSION);strcpy(s_journal.target_version,ZJ_BRIDGE_VERSION);durable=s_journal;
     assert(uses_local_boot_confirmation() && !confirm_or_report_rollback());
     assert(marked==1 && !strcmp(durable.state,"LOCAL_VALIDATED"));
 #else
@@ -113,7 +114,7 @@ int main(void)
     puts("Local boot proof, legacy behavior, lost replies and checkpoint boundaries passed");
 }
 '''
-    compile_and_run(tmp_path, harness.replace("/* PRODUCTION */", production), family=family)
+    compile_and_run(tmp_path, harness.replace("/* PRODUCTION */", production), family=family, bridge_version=bridge_version)
 
 
 def test_local_boot_uses_current_storage_and_required_workers(tmp_path):

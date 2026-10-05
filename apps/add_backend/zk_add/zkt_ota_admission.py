@@ -11,7 +11,7 @@ from zk_add.models import Connector
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.zkt270_scope import BY_ID
 
-JOURNAL_VERSIONS = ("2.6.16", "2.7.0")
+JOURNAL_VERSIONS = ("2.6.16", "2.6.17", "2.7.0")
 # Fixed two-key namespace; independent of Python's randomized hash function.
 LOCK_NAMESPACE, LOCK_KEY = 0x5A4B54, 270
 RESERVATION_SCAN_LIMIT = 128
