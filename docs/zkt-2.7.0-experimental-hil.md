@@ -293,3 +293,25 @@ the matching ADD-authority runtime and the existing cursor, chain, completed
 reconciliation and preservation checks. The observation stores custody and
 Oracle states independently; it does not turn raw custody into valid attendance
 or an Oracle delivery pass. Legacy releases cannot claim this exception.
+
+## Retrying publication without replacing signed bytes
+
+Production ADD uses a read-only root filesystem and a tmpfs `/tmp` mount.
+Admission metadata is transferred through `docker exec` in bounded base64
+arguments, with contiguous offsets and each original SHA-256 checked before the
+saved inspector runs. This avoids Windows stdin transformations and keeps every
+argument below the native command-line limit. Only public metadata and the
+inspector use this path; firmware bytes and secrets are excluded. This avoids
+[Docker's documented tmpfs copy restriction](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases).
+An isolated container with the production mount configuration reproduced the
+original copy failure and accepted the same signed package after this repair;
+both paths removed their temporary files.
+
+The candidate workflow's optional `signed_candidate_run_id` reuses an existing
+artifact from its original completed provenance, build and signing jobs. The
+original workflow and repository, available bounded artifact, main ancestry,
+seven successful firmware-source checks, requested manifest identity, deployed
+signature/contract admission and exact HIL quarantine are still checked. Build
+and sign jobs are skipped in this mode. Rebuilding or resigning a published
+version is not a recovery mechanism. A publication retry is not a firmware or
+field qualification result.

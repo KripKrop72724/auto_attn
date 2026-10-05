@@ -25,8 +25,13 @@ on:
         description: Ordered exact targets as JSON (connector_id, mac, terminal_serial); mutually exclusive with device_mac
         required: false
         type: string
+      signed_candidate_run_id:
+        description: Optional completed candidate run whose existing signed bytes should be published without rebuilding
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
   checks: read
 
@@ -41,6 +46,7 @@ jobs:
       sha: ${{ steps.provenance.outputs.sha }}
       mac: ${{ steps.provenance.outputs.mac }}
       targets: ${{ steps.provenance.outputs.targets }}
+      reuse_run: ${{ steps.reuse.outputs.reuse_run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,9 +109,27 @@ jobs:
               output.write('targets=' + (json.dumps(targets, separators=(',', ':')) if targets else '') + '\n')
           PYCODE
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        if: inputs.signed_candidate_run_id != ''
+        name: Require the original completed build and signature artifact
+        shell: bash
+        env:
+          REUSE_RUN_ID: ${{ inputs.signed_candidate_run_id }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID" > /tmp/hil-reuse-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID/jobs?filter=latest&per_page=100" > /tmp/hil-reuse-jobs.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID/artifacts?per_page=100" > /tmp/hil-reuse-artifacts.json
+          python3 scripts/check_hil_signed_reuse.py "$REUSE_RUN_ID" "$RELEASE_VERSION" "$GITHUB_REPOSITORY" \
+            /tmp/hil-reuse-run.json /tmp/hil-reuse-jobs.json /tmp/hil-reuse-artifacts.json >> "$GITHUB_OUTPUT"
+          git merge-base --is-ancestor "$(jq -r .head_sha /tmp/hil-reuse-run.json)" origin/main
 
   build:
     needs: provenance
+    if: needs.provenance.outputs.reuse_run == ''
     runs-on: ubuntu-latest
     environment: firmware-signing
     env:
@@ -171,6 +195,7 @@ jobs:
 
   sign:
     needs: [provenance, build]
+    if: needs.provenance.outputs.reuse_run == ''
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-signing
     timeout-minutes: 20
@@ -217,6 +242,7 @@ jobs:
 
   publish-hil:
     needs: [provenance, sign]
+    if: always() && needs.provenance.result == 'success' && (needs.sign.result == 'success' || needs.provenance.outputs.reuse_run != '')
     # Admission and publication must observe one deployed backend. Share the
     # production deployment lock so a backend replacement cannot race them.
     concurrency:
@@ -227,13 +253,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.provenance.outputs.sha }}
+          # Publication tooling can be repaired without changing signed bytes.
+          # The manifest below must still match the exact green firmware SHA.
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+      - name: Verify publication transfer failure handling
+        shell: powershell
+        run: ./tests/firmware/test_deployed_firmware_contract.ps1
       - uses: actions/download-artifact@v4
+        if: needs.provenance.outputs.reuse_run == ''
         with:
           name: zone-lite-${{ inputs.version }}-hil-only
           path: firmware-release
+      - uses: actions/download-artifact@v4
+        if: needs.provenance.outputs.reuse_run != ''
+        with:
+          name: zone-lite-${{ inputs.version }}-hil-only
+          path: firmware-release
+          run-id: ${{ needs.provenance.outputs.reuse_run }}
+          github-token: ${{ github.token }}
+      - name: Match preserved signed metadata to the requested release
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ needs.provenance.outputs.sha }}
+          FIRMWARE_FAMILY: ${{ inputs.firmware_family }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -LiteralPath 'firmware-release/manifest.json' -Raw | ConvertFrom-Json
+          if ($manifest.version -cne $env:RELEASE_VERSION -or $manifest.git_sha -cne $env:RELEASE_SHA -or
+              $manifest.firmware_family -cne $env:FIRMWARE_FAMILY) {
+            throw 'Signed candidate does not match the requested firmware identity.'
+          }
       - name: Verify the deployed ADD admits this signed contract
         shell: powershell
         run: ./deploy/add/check-deployed-firmware-contract.ps1 -SourceDirectory firmware-release
