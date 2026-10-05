@@ -5293,7 +5293,9 @@ async def revoke_firmware_release(
         _FirmwareCampaign.release_id == release.id,
         _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         campaign.status = "PAUSED"
-        campaign.pause_reason = f"Release revoked: {body.reason}"
+        # The complete operator reason remains in the audit event below.
+        # Reserve the prefix within the column's 200-character bound too.
+        campaign.pause_reason = f"Release revoked: {body.reason}"[:200]
     _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
                   target_type="firmware_release", target_id=release_id,
                   outcome="REVOKED", after={"reason": body.reason})
