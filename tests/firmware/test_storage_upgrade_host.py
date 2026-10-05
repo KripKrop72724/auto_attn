@@ -47,6 +47,7 @@ void nvs_close(int);
     harness = r"""
 #include "ports.h"
 #include "storage_upgrade.h"
+#include "zkt_journal_compat.h"
 #include "upgrade_guard.h"
 #include <assert.h>
 #include <stdio.h>
@@ -98,15 +99,19 @@ int main(void)
     assert(storage_upgrade_init());
     strcpy(app.project_name,"unknown");assert(!storage_upgrade_init());
 #elif ZONE_LITE_JOURNAL_BRIDGE_IMAGE
-    strcpy(app.version,"2.6.16");
+    strcpy(app.version,ZJ_BRIDGE_VERSION);
     assert(storage_upgrade_init() && storage_upgrade_ready());
     assert(!storage_upgrade_segmented_writes() && !writes && !commits);
     assert(!strcmp(storage_upgrade_contract(),
-        "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"));
+        "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
+#if ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE
+        ":VERSION=" ZJ_BRIDGE_VERSION
+#endif
+        ));
     secure=false;assert(!storage_upgrade_init() && !storage_upgrade_ready());secure=true;
     strcpy(app.version,"2.7.0");assert(!storage_upgrade_init());
     strcpy(app.version,"2.6.15");assert(!storage_upgrade_init());
-    strcpy(app.version,"2.6.16");assert(storage_upgrade_init());
+    strcpy(app.version,ZJ_BRIDGE_VERSION);assert(storage_upgrade_init());
     strcpy(app.project_name,"unknown");assert(!storage_upgrade_init());
 #elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
     strcpy(app.version,UG_DIRECT_VERSION);
@@ -167,8 +172,11 @@ int main(void)
 """
     unit = tmp_path / "upgrade.c"
     unit.write_text(harness)
-    for mode, hikvision, direct, bridge in ((0, 0, 0, 0), (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)):
-        executable = tmp_path / f"upgrade-{mode}-{hikvision}-{direct}-{bridge}"
+    cases = [(mode, hikvision, direct, 0, "2.6.16") for mode, hikvision, direct in
+             ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))]
+    cases.extend((0, 0, 0, 1, version) for version in ("2.6.16", "2.6.17", "2.6.18"))
+    for mode, hikvision, direct, bridge, version in cases:
+        executable = tmp_path / f"upgrade-{mode}-{hikvision}-{direct}-{bridge}-{version}"
         subprocess.run(
             [
                 shutil.which("cc"),
@@ -185,7 +193,8 @@ int main(void)
                 f"-DZONE_LITE_HIKVISION={hikvision}",
                 f"-DZONE_LITE_DIRECT_LEGACY_UPGRADE={direct}",
                 f"-DZONE_LITE_JOURNAL_BRIDGE_IMAGE={bridge}",
-                '-DZJ_BRIDGE_VERSION="2.6.16"',
+                f'-DZJ_BRIDGE_VERSION="{version}"',
+                f"-DZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE={int(bridge and version != '2.6.16')}",
                 "-I",
                 str(tmp_path),
                 "-I",

@@ -15,8 +15,8 @@ from zk_add.time_utils import ensure_utc
 from zk_add.zkt_bridge_contract import bridge_contract, signed_hil_targets
 
 
-@pytest.fixture
-def bridge(ready, monkeypatch):  # noqa: F811
+@pytest.fixture(params=["2.6.17", "2.6.18"])
+def bridge(ready, monkeypatch, request):  # noqa: F811
     session, release, device, deployment, job, coverage, telemetry = ready
     target = signed_hil_targets()[0]
     device.connector_id = target["connector_id"]
@@ -24,11 +24,11 @@ def bridge(ready, monkeypatch):  # noqa: F811
     device.zkt_device.serial = device.zkt_device.expected_serial = device.zkt_device.confirmed_serial = target["terminal_serial"]
     device.zkt_device.online = True
     job.terminal_serial = coverage.terminal_serial = target["terminal_serial"]
-    release.release_id, release.version = "zone-lite-2.6.17", "2.6.17"
+    release.release_id, release.version = f"zone-lite-{request.param}", request.param
     release.manifest = {"release_id": release.release_id, "version": release.version,
         "firmware_family": "zkt", "project_name": "zone_lite", "release_channel": "EXPERIMENTAL_HIL_ONLY",
         "minimum_bootstrap_version": "2.4.12", "hil_targets": signed_hil_targets(),
-        "queue_storage": bridge_contract("2.6.17"), "runtime_profile": "ZKT_LEGACY",
+        "queue_storage": bridge_contract(release.version), "runtime_profile": "ZKT_LEGACY",
         "application_sha256": "c" * 64, "_hil_targets": signed_hil_targets()[:2]}
     deployment.target_version = release.version
     payload = deepcopy(telemetry.payload)

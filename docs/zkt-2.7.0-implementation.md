@@ -535,7 +535,7 @@ Physical power-loss qualification remains a separate release requirement.
 3. ADD-owned delivery for new records, preserved legacy migration checkpoints,
    one-to-one live/history matching, decoder correction provenance and automatic
    recovery of parser-affected history. No force-send or invented identity is allowed.
-4. Build and qualify a new immutable reader replacing the failed 2.6.17 bridge,
+4. Build and qualify the new immutable 2.6.18 reader replacing the failed 2.6.17 bridge,
    then sign the 2.7.0 candidate with exact predecessors,
    factory paths, compatible rollback slot and reproducible build records.
 5. Trusted qualification collector and enforcement in OTA assignment. The scope
@@ -550,8 +550,15 @@ Physical power-loss qualification remains a separate release requirement.
 Two 2.6.16 canary installation attempts rolled back; their original evidence
 remains retained. The separately signed 2.6.17 replacement failed local storage
 recovery; it and the original 2.6.16 bridge are revoked from further offers. Its
-failed-boot loop does not accept another ADD assignment. No 2.7.0 connector is
-accepted by these implementation results.
+failed-boot loop does not accept another ADD assignment. After the user attached
+the exact 3FL ESP by USB, ADD observed a new 2.6.15 boot with its terminal online
+at 10:23 UTC on 5 October. The old image still reports unqualified rollback
+storage health. Passive console access is available for diagnosing the next
+2.6.18 attempt; no local erase or provisioning reset was performed. The new
+bridge role includes receipt-bound checkpoint recovery, preserves old package
+validation, and requires a new signed artifact and actual readiness evidence.
+Writer pins remain held until that artifact exists and is qualified. No 2.7.0
+connector is accepted by these implementation results.
 
 ## Journal component implementation
 
