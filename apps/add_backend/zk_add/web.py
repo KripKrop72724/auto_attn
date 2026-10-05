@@ -4867,6 +4867,7 @@ class _HilRunIn(_BaseModel):
     deployment_id: str = _Field(min_length=1, max_length=100)
     target: _HilTarget
     idempotency_key: str = _Field(min_length=8, max_length=120)
+    profile: _Literal["FULL_REMOTE_HIL_V1", "BRIDGE_READINESS_V1"] = "FULL_REMOTE_HIL_V1"
 
 
 @app.post("/api/v1/firmware/hil-runs", status_code=201)
@@ -4876,11 +4877,29 @@ def start_firmware_hil_run(
     db, context = auth
     try:
         run = _start_hil_run(db, deployment_id=body.deployment_id, target=body.target,
-                             actor=context.username, idempotency_key=body.idempotency_key)
+                             actor=context.username, idempotency_key=body.idempotency_key, profile=body.profile)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     _append_audit(db, actor=context.username, action="FIRMWARE_HIL_STARTED", target_type="connector",
                   target_id=body.target.connector_id, outcome=run.status, after={"run_id": run.run_id})
+    db.commit()
+    return _serialize_hil_run(run)
+
+
+@app.post("/api/v1/firmware/hil-runs/{run_id}/complete-bridge")
+def complete_firmware_bridge_observation(
+    run_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.bridge_observation import complete_bridge_run
+
+    db, context = auth
+    try:
+        run = complete_bridge_run(db, run_id, actor=context.username)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_BRIDGE_OBSERVATION_COMPLETED",
+                  target_type="connector", target_id=run.target["connector_id"],
+                  outcome=run.status, after={"run_id": run.run_id, "profile": run.baseline["profile"]})
     db.commit()
     return _serialize_hil_run(run)
 

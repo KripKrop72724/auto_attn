@@ -68,6 +68,11 @@ def worker_snapshot_fresh(worker: dict, uptime_seconds: int | None, runtime: Run
 def journal_storage_status(diagnostics: dict, uptime_seconds: int | None) -> str | None:
     if diagnostics.get("runtime_profile") != "ZKT_JOURNAL_V1":
         return None
+    return journal_owner_status(diagnostics, uptime_seconds)
+
+
+def journal_owner_status(diagnostics: dict, uptime_seconds: int | None) -> str:
+    """The compatibility reader owns a journal even before ADD cutover."""
     storage = diagnostics.get("journal_storage") or {}
     sampled = storage.get("sampled_uptime_ms")
     if (uptime_seconds is None or not isinstance(sampled, int) or isinstance(sampled, bool)

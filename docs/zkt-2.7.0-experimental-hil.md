@@ -136,6 +136,20 @@ manifest. ADD advances to the next exposed target only after the preceding
 target's successful deployment and matching artifact HIL acceptance. This
 release-specific scope leaves legacy campaigns' shared configuration intact.
 An unavailable target stays pending; no acceptance is inferred from absence.
+For the replacement 2.6.17 reader, bridge preparation advances only after a
+separate `BRIDGE_READINESS_V1` observation. Start it through the HIL-run API
+with that profile, then invoke `complete-bridge` after its 15-minute interval.
+The server reads its own authenticated telemetry, checks the exact signed
+image and current boot, sample continuity, reader and storage health, workers,
+legacy queue recovery, unchanged failure counters and completed source tail.
+An incomplete interval, reset, stale current state or missing evidence cannot
+produce `BRIDGE_READY`. The stored observation and exact release identity must
+back the event before the next bridge target becomes eligible.
+
+`BRIDGE_READY` is preparation evidence, not `HIL_ACCEPTED`. Oracle delivery,
+writer HIL, recovery fault injection and physical qualification remain explicitly
+unasserted or unperformed in that result. The 2.7.0 writer still requires its
+own custody handoff and HIL acceptance; a bridge result cannot satisfy them.
 Both publisher
 and promoter reject general production availability for this experimental
 package, and ADD rejects missing quarantine. Runtime reader attestation, storage
