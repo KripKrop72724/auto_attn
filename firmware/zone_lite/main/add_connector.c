@@ -286,6 +286,7 @@ static volatile bool s_outbox_buffer_ready;
 static volatile bool s_worker_start_failed;
 static worker_retry_t s_outbox_retry, s_heartbeat_retry;
 static volatile uint32_t s_ords_start_attempts;
+static atomic_uint_least32_t s_outbox_successful_starts, s_ords_successful_starts;
 static volatile bool s_outboxes_initialized;
 static volatile uint32_t s_ords_worker_tick_ms;
 static volatile bool s_ords_worker_started;
@@ -2834,9 +2835,17 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     }
 }
 
+static void worker_start_succeeded(atomic_uint_least32_t *counter)
+{
+    uint_least32_t previous = atomic_load(counter);
+    while (previous < UINT32_MAX &&
+        !atomic_compare_exchange_weak(counter, &previous, previous + 1U)) {}
+}
+
 void add_connector_report_ords_start(bool started, uint32_t attempts)
 {
     s_ords_start_attempts = attempts;
+    if (started) worker_start_succeeded(&s_ords_successful_starts);
     if (!started) s_ords_worker_started = false;
 }
 
@@ -2860,12 +2869,15 @@ static bool append_worker_diagnostic(cJSON *workers, const char *name,
         operation == ADD_WORKER_NETWORK ? "waiting for acknowledgement" :
         operation == ADD_WORKER_COMMITTING ? "committing receipt" :
         operation == ADD_WORKER_RESOURCE ? "allocating delivery buffer" : "idle";
+    uint_least32_t successful_starts = !strcmp(name, "add_delivery")
+        ? atomic_load(&s_outbox_successful_starts) : atomic_load(&s_ords_successful_starts);
     cJSON *worker = cJSON_CreateObject();
     if (!worker) return false;
     if (!cJSON_AddItemToArray(workers, worker)) { cJSON_Delete(worker); return false; }
     return cJSON_AddStringToObject(worker, "name", name) &&
         cJSON_AddStringToObject(worker, "state", state) &&
         cJSON_AddStringToObject(worker, "operation", operation_name) &&
+        cJSON_AddNumberToObject(worker, "restart_count", successful_starts ? successful_starts - 1U : 0U) &&
         cJSON_AddNumberToObject(worker, "restart_attempts", !strcmp(name, "add_delivery")
             ? (s_outbox_retry.total ? s_outbox_retry.total - 1U : 0U)
             : (s_ords_start_attempts ? s_ords_start_attempts - 1U : 0U)) &&
@@ -4447,9 +4459,11 @@ static void delivery_supervisor_task(void *arg)
             if (!s_heartbeat_task_handle && worker_retry_allow(&s_heartbeat_retry, now) &&
                 xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, &s_heartbeat_task_handle) != pdPASS)
                 s_heartbeat_task_handle = NULL;
-            if (!s_outbox_task_handle && worker_retry_allow(&s_outbox_retry, now) &&
-                xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, &s_outbox_task_handle) != pdPASS)
-                s_outbox_task_handle = NULL;
+            if (!s_outbox_task_handle && worker_retry_allow(&s_outbox_retry, now)) {
+                if (xTaskCreate(outbox_task, "add_outbox", 8192, NULL, 4, &s_outbox_task_handle) == pdPASS)
+                    worker_start_succeeded(&s_outbox_successful_starts);
+                else s_outbox_task_handle = NULL;
+            }
             s_worker_start_failed = !s_outbox_task_handle || !s_heartbeat_task_handle;
         }
         if (s_worker_start_failed || (s_outbox_tick_ms &&

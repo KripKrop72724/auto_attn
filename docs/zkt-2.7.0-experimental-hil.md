@@ -17,6 +17,25 @@ whether a campaign succeeds.
 
 ## Implementation and release sequence
 
+The 3FL USB canary rejected bridge 2.6.18. It reported 35,479 free internal
+bytes but a largest block of 11,776 bytes, so its 12,288-byte journal transport
+stack could not be allocated. A subsequent retained-queue integrity incident
+also blocked the recovery worker behind the health condition it had to repair.
+The controlled USB reset returned the connector to its existing 2.6.15 slot;
+ADD recorded `ROLLED_BACK` and the 2.6.18 release was revoked. No storage was
+erased and no second target received that bridge.
+
+The replacement is a separate 2.6.19 role. It reserves the full transport stack
+and control structures in internal memory before heap fragmentation, permits
+the storage owner and transport to recover an available but unhealthy store,
+and still requires verified health before attestation, capture or boot success.
+Legacy delivery workers publish successful restart counts separately from
+attempts. Host regressions reproduce the allocation and recovery-order defects;
+field readiness must still be established on the exact signed replacement.
+HIL builds retain their matching ELF and map files so USB backtraces can be
+decoded only after the application's ELF digest is checked. A symbol file from
+a different build is not evidence for an installed image.
+
 1. Finish and test the code needed for preservation, delivery, migration and
    rollback. Passing compilation alone does not finish an unimplemented path.
 2. Build and sign the compatibility bridge from a green exact main commit.

@@ -20,7 +20,7 @@ def compile_and_run(tmp_path, program, *, family=0, bridge_version="2.6.16"):
 
 
 @pytest.mark.parametrize("family", [0, 1])
-@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18"])
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19"])
 def test_boot_confirmation_network_loss_and_checkpoint_boundaries(tmp_path, family, bridge_version):
     source = (MAIN / "ota_manager.c").read_text()
     start = source.index("static bool uses_local_boot_confirmation(void)\n{")

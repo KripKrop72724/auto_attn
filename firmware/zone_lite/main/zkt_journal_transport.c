@@ -1,6 +1,7 @@
 #include "zkt_journal_transport.h"
 #include "zkt_storage_owner.h"
 #include "add_connector.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -13,6 +14,15 @@ static zj_delivery_t *delivery;
 static zj_transport_health_t snapshot;
 static SemaphoreHandle_t health_lock;
 static TaskHandle_t transport_task;
+/* Reserve the complete internal stack before Wi-Fi/TLS fragments the heap.
+ * The 3FL canary had 35 KiB free but no 12 KiB contiguous internal block.
+ * Keep the measured stack size; PSRAM is only for the bounded delivery state. */
+#define ZJ_TRANSPORT_STACK_BYTES 12288U
+static DRAM_ATTR StackType_t transport_stack[ZJ_TRANSPORT_STACK_BYTES / sizeof(StackType_t)]
+    __attribute__((aligned(16)));
+static DRAM_ATTR StaticTask_t transport_control;
+static DRAM_ATTR StaticSemaphore_t health_mutex;
+_Static_assert(sizeof(transport_stack) == ZJ_TRANSPORT_STACK_BYTES, "journal transport stack size");
 static uint32_t now_ms(void *context) { (void)context; return (uint32_t)(esp_timer_get_time() / 1000); }
 static uint32_t random_value(void *context) { (void)context; return esp_random(); }
 static bool connected(void *context) { (void)context; return add_connector_is_connected(); }
@@ -51,17 +61,21 @@ bool zj_transport_start(void)
 {
     zj_owner_health_t owner;
     if (delivery || !zj_owner_health(&owner) || !owner.started) return false;
-    health_lock = xSemaphoreCreateMutex();
+    if (!health_lock) health_lock = xSemaphoreCreateMutexStatic(&health_mutex);
     if (!health_lock) return false;
     delivery = heap_caps_calloc(1, sizeof(*delivery), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     zj_delivery_port_t port = {now_ms, random_value, connected, submit, poll, abandon, send_custody,
         NULL, {.digest = digest}};
-    if (!delivery || !zj_delivery_init(delivery, port) ||
-        xTaskCreate(task, "zkt_journal_tx", 12288, delivery, 3, &transport_task) != pdPASS) {
+    if (!delivery || !zj_delivery_init(delivery, port)) {
         heap_caps_free(delivery);
         delivery = NULL;
-        vSemaphoreDelete(health_lock);
-        health_lock = NULL;
+        return false;
+    }
+    transport_task = xTaskCreateStatic(task, "zkt_journal_tx", ZJ_TRANSPORT_STACK_BYTES,
+        delivery, 3, transport_stack, &transport_control);
+    if (!transport_task) {
+        heap_caps_free(delivery);
+        delivery = NULL;
         return false;
     }
     return true;

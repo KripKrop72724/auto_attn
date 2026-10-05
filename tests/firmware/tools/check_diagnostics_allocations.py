@@ -17,6 +17,7 @@ program = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,7 @@ static const char *storage_upgrade_contract(void){return "contract";}
 static int esp_spiffs_info(const void *label,size_t *total,size_t *used){(void)label;*total=8000000;*used=2000000;return 0;}
 static struct {unsigned total;} s_outbox_retry={2};
 static unsigned s_ords_start_attempts=2;
+static atomic_uint_least32_t s_outbox_successful_starts=1,s_ords_successful_starts=2;
 static int *s_outbox_task_handle=&held;
 static uint32_t s_outbox_tick_ms=4000,s_ords_worker_tick_ms=4000;
 static bool s_outbox_buffer_ready=true,s_ords_worker_started=true;
@@ -106,6 +108,11 @@ static void check_ownership(const char *profile,const char *authority,bool write
  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(runtime,"writer_ready"))==writer);
  cJSON *workers=cJSON_GetObjectItemCaseSensitive(diagnostics,"workers");
  assert(named(workers,"add_delivery"));
+ const char *legacy_add=!strcmp(profile,"ZKT_JOURNAL_V1")?"legacy_add_delivery":"add_delivery";
+ const char *legacy_ords=!strcmp(profile,"ZKT_JOURNAL_V1")?"legacy_ords_delivery":"ords_delivery";
+ assert(cJSON_GetObjectItemCaseSensitive(named(workers,legacy_add),"restart_count")->valueint==0);
+ assert(cJSON_GetObjectItemCaseSensitive(named(workers,legacy_ords),"restart_count")->valueint==1);
+ assert(cJSON_GetObjectItemCaseSensitive(named(workers,legacy_add),"restart_attempts")->valueint==1);
  if(!strcmp(profile,"ZKT_JOURNAL_V1")){
   assert(cJSON_GetArraySize(workers)==5 && named(workers,"capture") && named(workers,"storage_owner"));
   assert(named(workers,"legacy_add_delivery") && named(workers,"legacy_ords_delivery") && !named(workers,"ords_delivery"));

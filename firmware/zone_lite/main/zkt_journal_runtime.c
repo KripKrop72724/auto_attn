@@ -66,6 +66,7 @@ void zj_runtime_step(void)
             (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
 #endif
         qs_health_t storage = qs_health();
+        input.storage_available = storage.observed && storage.available;
         input.storage_ready = storage.observed && storage.available && storage.recovery_complete &&
             storage.persistence_verified && !storage.last_error && !storage.persistence_probe_error;
 #if defined(ZONE_LITE_JOURNAL_WRITES) && ZONE_LITE_JOURNAL_WRITES
