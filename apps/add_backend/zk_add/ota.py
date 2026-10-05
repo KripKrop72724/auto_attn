@@ -313,6 +313,7 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
 
 
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
+    from zk_add.bridge_observation import EVENTS as BRIDGE_EVENTS, ready_event_matches
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
@@ -340,7 +341,7 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         .join(Connector, FirmwareDeployment.connector_id == Connector.id)
         .where(
             FirmwareDeployment.release_id == release.id,
-            FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE"]),
+            FirmwareEvent.state.in_(["HIL_ACCEPTED", "HIL_FAILED", "HIL_INCOMPLETE", *BRIDGE_EVENTS]),
         ).order_by(FirmwareEvent.id)
     ))
     def accepted(target: HilTarget) -> bool:
@@ -356,6 +357,8 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         if not evidence:
             return False
         latest, deployment = evidence[-1]
+        if release.version == "2.6.17":
+            return deployment.status == "SUCCEEDED" and ready_event_matches(session, latest, deployment, release)
         return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
                 and deployment.status == "SUCCEEDED")
 

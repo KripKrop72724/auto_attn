@@ -104,11 +104,15 @@ tests also cover 2.6.17. A replacement reader may renew a valid older proof
 only for the same terminal, capture epoch and layout. The old proof alone
 cannot authorize a writer or OTA transition.
 
-The writer's current 2.6.16 package pin is **not ready for publication**.
-After producing the replacement's actual signed artifact, update the writer's
-compiled reader version and exact application/artifact pins together, rerun
-their tests, and verify the replacement's successful field boot. Neither a
-locally compiled unsigned digest nor an expected future digest is a substitute.
+The replacement was built and signed from the seven-job CI-passing source
+`42de8ac5b38c9229203e0c779d151af834b28123` in
+[HIL candidate run 37284425786](https://github.com/KripKrop72724/auto_attn/actions/runs/37284425786).
+The downloaded package's RSA-PSS manifest signature, field signing key, compiled
+contract, binary digest and actual ESP application-validation hash were checked.
+The writer's compiled reader version and packaging pins now use these exact
+2.6.17 bytes. Publication does not prove a successful field boot; ADD still
+requires the installed compatible reader and fresh healthy evidence before
+assigning the writer.
 
 HIL publication first verifies the exact signed manifest using the running ADD
 container's installed family and storage-contract validators and configured
@@ -136,6 +140,20 @@ manifest. ADD advances to the next exposed target only after the preceding
 target's successful deployment and matching artifact HIL acceptance. This
 release-specific scope leaves legacy campaigns' shared configuration intact.
 An unavailable target stays pending; no acceptance is inferred from absence.
+For the replacement 2.6.17 reader, bridge preparation advances only after a
+separate `BRIDGE_READINESS_V1` observation. Start it through the HIL-run API
+with that profile, then invoke `complete-bridge` after its 15-minute interval.
+The server reads its own authenticated telemetry, checks the exact signed
+image and current boot, sample continuity, reader and storage health, workers,
+legacy queue recovery, unchanged failure counters and completed source tail.
+An incomplete interval, reset, stale current state or missing evidence cannot
+produce `BRIDGE_READY`. The stored observation and exact release identity must
+back the event before the next bridge target becomes eligible.
+
+`BRIDGE_READY` is preparation evidence, not `HIL_ACCEPTED`. Oracle delivery,
+writer HIL, recovery fault injection and physical qualification remain explicitly
+unasserted or unperformed in that result. The 2.7.0 writer still requires its
+own custody handoff and HIL acceptance; a bridge result cannot satisfy them.
 Both publisher
 and promoter reject general production availability for this experimental
 package, and ADD rejects missing quarantine. Runtime reader attestation, storage
@@ -227,8 +245,9 @@ custody, resolve identity, or assert migration or Oracle completion.
 ## Experimental writer handoff
 
 The 2.7.0 package carries one compiled V4 writer marker and an exact signed
-journal contract. Its only packaged predecessor is the immutable 2.6.16 bridge
-application `7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599`.
+journal contract. Its only packaged predecessor is the immutable 2.6.17 bridge
+application `f803361f8c3e1ed03f57814793942ebda45bbbd10cd0c1e77239602f5e6e32a1`
+and signed artifact `be23f88bfc8e2a6f7233ab2f8903c53ac9deaf1433ad39608e7f00f7e4f2bc71`.
 ADD requires that connector's successful bridge installation, current secure
 OTA-slot identity, recovered storage and live compatible-reader telemetry.
 A failed or rolled-back bridge cannot authorize the writer. The actual runtime
@@ -267,6 +286,13 @@ layouts without supported textual user identity remain held for this path.
 
 These interfaces do not automatically grant a field handoff, report HIL success,
 or replace actual post-installation source/identity/delivery evidence.
+
+A signed writer with complete ordinal custody may enter observation while its
+source interpretation is `SOURCE_CAPTURE_CERTIFIED_RAW_PENDING`. This requires
+the matching ADD-authority runtime and the existing cursor, chain, completed
+reconciliation and preservation checks. The observation stores custody and
+Oracle states independently; it does not turn raw custody into valid attendance
+or an Oracle delivery pass. Legacy releases cannot claim this exception.
 
 ## Retrying publication without replacing signed bytes
 

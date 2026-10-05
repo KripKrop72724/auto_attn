@@ -185,6 +185,7 @@ int main(void)
                 f"-DZONE_LITE_HIKVISION={hikvision}",
                 f"-DZONE_LITE_DIRECT_LEGACY_UPGRADE={direct}",
                 f"-DZONE_LITE_JOURNAL_BRIDGE_IMAGE={bridge}",
+                '-DZJ_BRIDGE_VERSION="2.6.16"',
                 "-I",
                 str(tmp_path),
                 "-I",

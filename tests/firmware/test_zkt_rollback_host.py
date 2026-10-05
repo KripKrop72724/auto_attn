@@ -68,7 +68,7 @@ static ota_checkpoint_t request(void)
 {
     ota_checkpoint_t c={.version=1,.generation=7};
     strcpy(c.journal.deployment_id,"synthetic-operation");strcpy(c.journal.release_id,"synthetic-reader");
-    strcpy(c.journal.target_version,"2.6.16");memset(c.journal.image_sha256,'1',64);
+    strcpy(c.journal.target_version,"2.6.17");memset(c.journal.image_sha256,'1',64);
     strcpy(c.journal.download_url,"https://example.invalid/unused");strcpy(c.journal.state,"DOWNLOADING");
     c.journal.image_size=131072;c.crc=dq_crc32(&c,offsetof(ota_checkpoint_t,crc));return c;
 }
@@ -116,7 +116,7 @@ int main(void)
 }
 '''
     if failed_boot:
-        program = program.replace('strcpy(c.journal.target_version,"2.6.16")',
+        program = program.replace('strcpy(c.journal.target_version,"2.6.17")',
                                   'strcpy(c.journal.target_version,"2.7.0")')
         program = program.replace('strcpy(c.journal.state,"DOWNLOADING")',
                                   'strcpy(c.journal.state,"READY_TO_BOOT")')
@@ -126,7 +126,7 @@ int main(void)
         program = program.replace('!out.journal.bytes_written',
                                   'out.journal.bytes_written==out.journal.image_size')
         program = program.replace('assert(zj_rollback_request_valid(&expected));strcpy(expected.journal.target_version,"2.7.0");',
-                                  'assert(zj_rollback_request_valid(&expected));strcpy(expected.journal.target_version,"2.6.16");')
+                                  'assert(zj_rollback_request_valid(&expected));strcpy(expected.journal.target_version,"2.6.17");')
     run(tmp_path, program, ["zkt_rollback.c"])
 
 
@@ -173,7 +173,7 @@ bool zj_owner_poll(uint64_t ticket,zj_reply_t *reply,bool *done)
 }
 const char *zj_compat_error(zj_compat_result_t code){assert(code!=ZJ_COMPAT_OK);return "selection-error";}
 bool zj_rollback_request_valid(const ota_checkpoint_t *c)
-{return ota_checkpoint_valid(c) && !strcmp(c->journal.target_version,"2.6.16") && !c->journal.bytes_written;}
+{return ota_checkpoint_valid(c) && !strcmp(c->journal.target_version,"2.6.17") && !c->journal.bytes_written;}
 bool zj_rollback_same_target(const ota_checkpoint_t *a,const ota_checkpoint_t *b)
 {return zj_rollback_request_valid(a)&&zj_rollback_request_valid(b)&&!strcmp(a->journal.deployment_id,b->journal.deployment_id)&&!strcmp(a->journal.image_sha256,b->journal.image_sha256);}
 static void esp_restart(void){assert(claimed&&drained&&complete&&s_busy);++restarts;}
@@ -182,7 +182,7 @@ static void esp_restart(void){assert(claimed&&drained&&complete&&s_busy);++resta
 static void reset(void)
 {
     memset(&s_journal,0,sizeof(s_journal));strcpy(s_journal.deployment_id,"synthetic-operation");
-    strcpy(s_journal.release_id,"synthetic-reader");strcpy(s_journal.target_version,"2.6.16");
+    strcpy(s_journal.release_id,"synthetic-reader");strcpy(s_journal.target_version,"2.6.17");
     strcpy(s_journal.download_url,"https://example.invalid/unused");memset(s_journal.image_sha256,'1',64);
     strcpy(s_journal.state,"DOWNLOADING");s_journal.image_size=131072;s_committed_journal=s_journal;
     s_journal_generation=7;s_busy=false;
@@ -206,7 +206,7 @@ int main(void)
     polled=true;assert(!advance_reader_rollback() && submits==1 && !restarts);
     complete=true;assert(!advance_reader_rollback() && restarts==1 && !s_reader_ticket && !saves);
     assert(!strcmp(s_committed_journal.state,"READER_INTENT"));
-    strcpy(app.version,"2.6.16");assert(advance_reader_rollback() && !s_busy && saves==1);
+    strcpy(app.version,"2.6.17");assert(advance_reader_rollback() && !s_busy && saves==1);
     assert(!strcmp(s_committed_journal.state,"READY_TO_BOOT") && s_journal.bytes_written==s_journal.image_size);
     reset();claimed=drained=true;assert(!advance_reader_rollback());complete=true;reply_valid=false;
     assert(!advance_reader_rollback() && !restarts && !strcmp(s_last_error,"JOURNAL_READER_INTENT_REPLY_INVALID"));
@@ -216,7 +216,7 @@ int main(void)
     complete=true;compatibility=ZJ_COMPAT_SELECTION_UNCERTAIN;result=ZJ_INVALID;
     assert(!advance_reader_rollback() && !restarts && !strcmp(s_last_error,"selection-error"));
     reset();strcpy(s_journal.state,"READER_INTENT");s_committed_journal=s_journal;
-    strcpy(app.version,"2.6.16");s_running_image_digest[0]='2';
+    strcpy(app.version,"2.6.17");s_running_image_digest[0]='2';
     assert(!advance_reader_rollback() && !saves && !claims && s_busy);
     s_running_image_digest[0]='1';cache_ok=false;assert(!advance_reader_rollback()&&!saves);
     cache_ok=true;save_ok=false;assert(!advance_reader_rollback() && !strcmp(s_journal.state,"READER_INTENT"));

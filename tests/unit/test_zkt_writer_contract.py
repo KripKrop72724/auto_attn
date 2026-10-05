@@ -42,7 +42,7 @@ def manifest():
         firmware_family="zkt",
         project_name="zone_lite",
         release_channel="EXPERIMENTAL_HIL_ONLY",
-        minimum_bootstrap_version="2.6.16",
+        minimum_bootstrap_version="2.6.17",
         runtime_profile="ZKT_JOURNAL_V1",
         hil_targets=signed_hil_targets(),
         queue_storage=writer_contract(),
@@ -83,9 +83,10 @@ def test_no_missing_writer_capability(field):
         {"runtime_profile": "ZKT_LEGACY"},
         {"firmware_family": "hikvision"},
         {"minimum_bootstrap_version": "2.6.15"},
+        {"minimum_bootstrap_version": "2.6.16"},
         {"hil_targets": signed_hil_targets()[:-1]},
         {"queue_storage": {**writer_contract(), "journal_capture": 1}},
-        {"queue_storage": {**writer_contract(), "allowed_bootstrap_images": {"2.6.16": "c" * 64}}},
+        {"queue_storage": {**writer_contract(), "allowed_bootstrap_images": {"2.6.17": "c" * 64}}},
     ],
 )
 def test_no_implicit_authority_through_modified_manifest(change):
@@ -103,6 +104,7 @@ def test_no_implicit_authority_through_modified_manifest(change):
         image().replace(b"zone_lite", b"wrong_app"),
         image() + b"ZONE_STORAGE_CONTRACT_V3:BRIDGE\0",
         image().replace(b"AUTHORITY=ADD", b"AUTHORITY=ESP"),
+        image().replace(b"BRIDGE=2.6.17", b"BRIDGE=2.6.16"),
     ],
 )
 def test_mislabeled_binary_rejected(bad):
@@ -157,8 +159,8 @@ def test_real_signed_store_requires_quarantine_and_exact_writer_marker(
 def installed(session):
     now = utc_now()
     bridge = FirmwareRelease(
-        release_id="zone-lite-2.6.16",
-        version="2.6.16",
+        release_id="zone-lite-2.6.17",
+        version="2.6.17",
         git_sha="b" * 40,
         image_sha256=BRIDGE_ARTIFACT,
         image_size=1380352,
@@ -176,7 +178,7 @@ def installed(session):
         zone_name="test",
         device_id="test",
         display_name="test",
-        firmware_version="zone-lite-2.6.16",
+        firmware_version="zone-lite-2.6.17",
         zkt_custody_enabled=True,
         ota_image_sha256=BRIDGE_APPLICATION,
         ota_running_partition="ota_1",
@@ -209,7 +211,7 @@ def installed(session):
         zone_id="test",
         actor="test",
         idempotency_key="test",
-        typed_confirmation="2.6.16",
+        typed_confirmation="2.6.17",
         reason="test",
     )
     session.add(campaign)
@@ -220,7 +222,7 @@ def installed(session):
         release_id=bridge.id,
         connector_id=connector.id,
         status="SUCCEEDED",
-        target_version="2.6.16",
+        target_version="2.6.17",
     )
     session.add(deployment)
     session.flush()
@@ -246,6 +248,7 @@ def test_real_assignment_gate_requires_reader_and_add_custody(installed):
         "wrong-image",
         "factory",
         "old-version",
+        "failed-original-bridge",
         "revoked",
         "unknown-reader",
         "wrong-boot",
@@ -267,6 +270,9 @@ def test_failed_bridge_never_authorizes_writer(installed, fault):
         connector.ota_running_partition = "factory"
     elif fault == "old-version":
         connector.firmware_version = "2.6.15"
+    elif fault == "failed-original-bridge":
+        connector.firmware_version = "2.6.16"
+        connector.ota_image_sha256 = "7a6d7d69e8c033723d9075edd87b96747920260114576da5c1f6359872737599"
     elif fault == "revoked":
         bridge.state = "REVOKED"
     elif fault == "unknown-reader":
