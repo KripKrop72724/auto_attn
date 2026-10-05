@@ -9,6 +9,11 @@ zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, bool *writer_allowed);
 
+/* Identity only; the storage owner must separately require its current
+ * writer/ADD-authority gate. A bridge cannot create a new source boundary. */
+zj_compat_result_t zj_reader_platform_writer_identity(const char *terminal_serial,
+    const uint8_t capture_epoch[16], zj_reader_identity_t *out);
+
 zj_compat_result_t zj_reader_platform_update(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, uint32_t target_address,

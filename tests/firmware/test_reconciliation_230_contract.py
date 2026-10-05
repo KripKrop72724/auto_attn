@@ -89,10 +89,14 @@ def test_243_tail_uses_one_signed_source_protocol_and_advances_past_poison_rows(
 
 
 def test_final_manifest_does_not_reopen_the_prepared_terminal_buffer():
-    manifest_gate = ZONE.index(
+    # Check the reconciliation operation, not another independent bounded
+    # source reader earlier in this translation unit.
+    start = ZONE.index("static bool process_add_reconciliation_assignment(")
+    operation = ZONE[start:ZONE.index("static bool process_add_incremental_tail(", start)]
+    manifest_gate = operation.index(
         "assignment->committed_next_ordinal == cutoff"
     )
-    buffer_prepare = ZONE.index(
+    buffer_prepare = operation.index(
         "zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source)"
     )
     assert manifest_gate < buffer_prepare

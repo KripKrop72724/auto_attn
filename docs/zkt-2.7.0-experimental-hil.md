@@ -158,3 +158,26 @@ session reconnects. A failed count read retains the previous observed count;
 it cannot publish a fabricated zero and trigger source regression handling.
 Legacy delivery keeps its existing audit interval. This scheduling change does
 not establish measured end-to-end latency or change an already signed image.
+
+The 2.7.0 gateway now preserves its first consistent terminal count and the raw
+digest of the preceding ordinal in encrypted NVS, through the storage owner.
+The owner binds this immutable boundary to the capture epoch, terminal digest
+and actual writer image. It verifies the commit by reading it back; a lost reply
+or a later, larger terminal count returns the original boundary. Invalid,
+corrupted or differently bound state stays held and is never recreated.
+
+The gateway reads only the four-byte prepared-buffer header and one final
+record, accepts an exact count/length agreement, and releases the prepared
+buffer before waiting for persistence. A failed release cannot authorize a
+boundary. Empty terminals have an explicit zero boundary and no inferred
+layout. This capture works without ADD connectivity and retries with bounded
+backoff while live preservation remains active. Its caller retains one pending
+owner request after a timeout instead of discarding uncertain work.
+
+Diagnostics report the persisted boundary separately from migration, with
+`migration_certified: false`. This is source evidence, not a completed legacy
+handoff or permission to deliver attendance. The backend still needs to verify
+the matching source anchor and legacy custody before issuing a cutover permit.
+The already signed 2.6.16 artifact is unchanged. Host sanitizers cover uncertain
+commits, all stored-byte corruptions, binding changes, saturated storage,
+concurrent callers, changed snapshot sizes and terminal-release failures.

@@ -11,6 +11,7 @@
 #endif
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
+#include "zkt_source_boundary_client.h"
 #endif
 #include "zkt_credential_record.h"
 #include "worker_retry.h"
@@ -1768,16 +1769,17 @@ static bool zk_read_bounded_range(
     return ok;
 }
 
-static void zk_close_bounded_buffer(
+static bool zk_close_bounded_buffer(
     int sock,
     zk_context_t *ctx,
     zk_bounded_buffer_t *buffer)
 {
-    if (!buffer) return;
+    if (!buffer) return false;
+    bool released = true;
     if (buffer->prepared) {
         uint8_t rx[128];
         zk_response_t response = {0};
-        (void)zk_send_command(
+        released = zk_send_command(
             sock,
             ctx,
             CMD_FREE_DATA,
@@ -1785,11 +1787,52 @@ static void zk_close_bounded_buffer(
             0,
             rx,
             sizeof(rx),
-            &response);
+            &response) && zk_status_ok(response.code);
     }
     free(buffer->direct_data);
     memset(buffer, 0, sizeof(*buffer));
+    return released;
 }
+
+#if defined(ZONE_LITE_JOURNAL_WRITES) && ZONE_LITE_JOURNAL_WRITES && !defined(ZONE_LITE_HIKVISION)
+static void zkt_preserve_first_source_boundary(int sock, zk_context_t *ctx)
+{
+    static bool preserved;
+    static zts_schedule_t retry;
+    if (preserved || !zsb_runtime_required() ||
+        !zts_due(&retry, (uint64_t)uptime_ms(), zj_runtime_writer_ready(), true)) return;
+    if (!add_connector_begin_exclusive_activity("PRESERVING_SOURCE_BOUNDARY")) return;
+    zsb_record_t saved;
+    zj_result_t result = zsb_runtime_read(&saved);
+    if (result == ZJ_EMPTY) {
+        int32_t users = 0, records = 0;
+        zk_bounded_buffer_t source = {0};
+        uint8_t header[4], raw[40];
+        zsb_facts_t facts = {0};
+        bool ok = zk_get_counts(sock, ctx, &users, &records) && records >= 0 &&
+            zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source);
+        ok = ok && zk_read_bounded_range(sock, ctx, &source, 0, header, sizeof(header)) &&
+            zsb_source_size(records, source.size, read_le32(header), &facts.record_size);
+        if (ok) {
+            facts.next_ordinal = (uint32_t)records;
+            facts.sampled_uptime_ms = (uint64_t)uptime_ms();
+            if (records) ok = zk_read_bounded_range(sock, ctx, &source,
+                4 + ((uint32_t)records - 1) * facts.record_size, raw, facts.record_size) &&
+                mbedtls_sha256(raw, facts.record_size, facts.anchor_digest, 0) == 0;
+        }
+        /* Never wait on storage with a prepared terminal buffer retained.
+         * A failed release leaves this attempt unconfirmed and retryable. */
+        bool released = zk_close_bounded_buffer(sock, ctx, &source);
+        result = ok && released ? zsb_runtime_create(&facts, &saved) : ZJ_IO;
+    }
+    preserved = result == ZJ_OK;
+    zts_completed(&retry, (uint64_t)uptime_ms(), preserved, esp_random());
+    add_connector_set_activity("LIVE_CAPTURE");
+}
+#else
+static void zkt_preserve_first_source_boundary(int sock, zk_context_t *ctx)
+{ (void)sock; (void)ctx; }
+#endif
 
 static void zk_disconnect(int sock, zk_context_t *ctx)
 {
@@ -8841,6 +8884,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     zkt_mark_authenticated(host_order_ip, "live session authenticated and identified", true);
     led_status_set(LED_STATUS_ZKT_AUTHENTICATED);
+    zkt_preserve_first_source_boundary(sock, &ctx);
     (void)zk_sync_terminal_time(sock, &ctx);
     if (!add_connector_begin_exclusive_activity("VERIFYING_IDENTITY")) {
         zk_disconnect(sock, &ctx);
@@ -9005,6 +9049,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
             add_connector_set_activity("LIVE_CAPTURE");
         }
         add_source_coverage_t authoritative_coverage;
+        if (!g_temp_admin_active) zkt_preserve_first_source_boundary(sock, &ctx);
         if (add_connector_take_source_coverage(&authoritative_coverage) &&
             !apply_add_source_coverage(&authoritative_coverage)) {
             add_connector_log("ERROR", "storage", "ADD_SOURCE_COVERAGE_DEFERRED",
