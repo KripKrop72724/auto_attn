@@ -271,8 +271,11 @@ or replace actual post-installation source/identity/delivery evidence.
 ## Retrying publication without replacing signed bytes
 
 Production ADD uses a read-only root filesystem and a tmpfs `/tmp` mount.
-Admission metadata is transferred through `docker exec -i` as bounded base64,
-with each original SHA-256 checked before the saved inspector runs. This avoids
+Admission metadata is transferred through `docker exec` in bounded base64
+arguments, with contiguous offsets and each original SHA-256 checked before the
+saved inspector runs. This avoids Windows stdin transformations and keeps every
+argument below the native command-line limit. Only public metadata and the
+inspector use this path; firmware bytes and secrets are excluded. This avoids
 [Docker's documented tmpfs copy restriction](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases).
 An isolated container with the production mount configuration reproduced the
 original copy failure and accepted the same signed package after this repair;
