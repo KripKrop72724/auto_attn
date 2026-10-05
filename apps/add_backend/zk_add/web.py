@@ -2051,6 +2051,8 @@ def zkt_custody_status(
     response.headers["Cache-Control"] = "no-store, max-age=0"
     result = work_status(db, connector, before=before, limit=limit)
     result["processor"] = custody_processor.snapshot()
+    from zk_add.zkt_handoff import boundary_status
+    result["source_boundary"] = boundary_status(db, connector)
     return result
 
 

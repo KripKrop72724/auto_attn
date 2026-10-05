@@ -17,12 +17,19 @@ type Processor = {
   inspected_groups_total: number; successful_ticks: number; failed_ticks: number;
   last_tick_ms: number | null;
 }
+type SourceBoundary = {
+  state: 'HELD' | 'VERIFIED_SOURCE_ANCHOR'; reason: string;
+  migration_certified: false; delivery_permission: 'NOT_EVALUATED';
+  source_epoch?: string; next_ordinal?: number; record_size?: number;
+  writer_digest?: string; capture_epoch?: string; sampled_at?: string;
+}
 export type CustodySnapshot = {
   connector_id: string; enabled: boolean; sampled_at: string;
   oracle_completion: 'NOT_ASSERTED'; missing_processing_obligation: boolean;
   counts: { state: string; owner: string; count: number }[];
   rows: Work[]; next_cursor: number | null;
   processor?: Processor;
+  source_boundary?: SourceBoundary;
 }
 const states: Record<string, string> = {
   PENDING: 'Awaiting inspection', INTERPRETING: 'Interpretation in progress', WAIT_FRAGMENTS: 'Waiting for packet fragments',
@@ -41,6 +48,20 @@ const owner = (value: string) => owners[value] || humanizeStatus(value)
 const date = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Asia/Karachi' })
 const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
 const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+function boundaryLabel(value: SourceBoundary | undefined, fresh: boolean, now: number) {
+  if (!value || value.migration_certified !== false || value.delivery_permission !== 'NOT_EVALUATED'
+    || typeof value.reason !== 'string' || !/^SOURCE_BOUNDARY_[A-Z_]{1,70}$/.test(value.reason)) return 'Source boundary evidence unavailable'
+  if (value.state === 'HELD') return `${fresh ? '' : 'Previous report: '}${humanizeStatus(value.reason)}`
+  if (value.state !== 'VERIFIED_SOURCE_ANCHOR' || value.reason !== 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY'
+    || !counter(value.next_ordinal) || value.next_ordinal > 0x7fffffff
+    || !(value.next_ordinal === 0 ? value.record_size === 0 : [8, 16, 40].includes(value.record_size || 0))
+    || !timestamp(value.sampled_at) || Date.parse(value.sampled_at) > now + 1000
+    || typeof value.writer_digest !== 'string' || typeof value.capture_epoch !== 'string' || typeof value.source_epoch !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.writer_digest || '') || !/^[a-f0-9]{32}$/.test(value.capture_epoch || '')
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.source_epoch || '')) return 'Source boundary evidence unavailable'
+  return fresh && now - Date.parse(value.sampled_at) <= 45_000
+    ? 'Boundary matches preserved source bytes in ADD' : 'Previous report: boundary matched preserved source bytes in ADD'
+}
 const interpretations: Record<string, string> = {
   PENDING: 'Interpretation in progress', UNQUALIFIED_FACTS: 'Proposed facts · qualification required',
   AMBIGUOUS_LAYOUT: 'Ambiguous record layout', DECODE_REJECTED: 'No valid interpretation',
@@ -121,6 +142,8 @@ export function ZktCustodyStatus({ connectorId, revision }: { connectorId: strin
         <div><dt>Journal receipt path</dt><dd>{data.enabled ? 'Enabled' : 'Not enabled'}</dd></div>
         <div><dt>Missing processing obligations</dt><dd>{data.missing_processing_obligation ? 'Detected — needs ADD operations review' : 'None detected in this snapshot'}</dd></div>
         <div><dt>Oracle completion</dt><dd>Not established by custody</dd></div>
+        <div><dt>Source handoff boundary</dt><dd>{boundaryLabel(data.source_boundary, fresh, now)}</dd></div>
+        <div><dt>Migration certification</dt><dd>Requires its own committed proof</dd></div>
       </dl>
       <h4>ADD worker · all ZKT connectors</h4>
       {!processor ? <p>Worker progress evidence is unavailable.</p> : <dl>

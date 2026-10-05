@@ -181,3 +181,12 @@ the matching source anchor and legacy custody before issuing a cutover permit.
 The already signed 2.6.16 artifact is unchanged. Host sanitizers cover uncertain
 commits, all stored-byte corruptions, binding changes, saturated storage,
 concurrent callers, changed snapshot sizes and terminal-release failures.
+
+ADD retains this boundary in the typed heartbeat contract and binds its sample
+to the authenticated envelope's boot and sequence. The custody status API
+independently checks the current writer image, terminal binding, fresh sample,
+active source coverage and the encrypted original anchor bytes. A matching
+metadata digest with changed or unavailable raw bytes remains held. The device
+detail panel ages the boundary's own heartbeat separately from the API query.
+This check is read-only and cannot create a source cutover, enable journal
+custody, resolve identity, or assert migration or Oracle completion.

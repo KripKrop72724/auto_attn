@@ -104,6 +104,41 @@ describe('ZKT custody evidence', () => {
     expect(await screen.findByText('Worker progress evidence is unavailable.')).toBeTruthy()
     expect(screen.getByText('12')).toBeTruthy()
   })
+  it('shows the independently verified source boundary without granting migration or Oracle completion', async () => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ source_boundary: {
+      state: 'VERIFIED_SOURCE_ANCHOR', reason: 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY',
+      migration_certified: false, delivery_permission: 'NOT_EVALUATED',
+      source_epoch: '12345678-1234-1234-1234-123456789012', next_ordinal: 200000, record_size: 40,
+      writer_digest: 'a'.repeat(64), capture_epoch: 'b'.repeat(32),
+      sampled_at: new Date().toISOString(),
+    } })))
+    mount()
+    expect(await screen.findByText('Boundary matches preserved source bytes in ADD')).toBeTruthy()
+    expect(screen.getByText('Requires its own committed proof')).toBeTruthy()
+    expect(screen.getByText('Not established by custody')).toBeTruthy()
+  })
+  it('ages the boundary heartbeat independently of a fresh custody query', async () => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ source_boundary: {
+      state: 'VERIFIED_SOURCE_ANCHOR', reason: 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY',
+      migration_certified: false, delivery_permission: 'NOT_EVALUATED',
+      source_epoch: '12345678-1234-1234-1234-123456789012', next_ordinal: 1, record_size: 40,
+      writer_digest: 'a'.repeat(64), capture_epoch: 'b'.repeat(32),
+      sampled_at: new Date(Date.now() - 60_000).toISOString(),
+    } })))
+    mount()
+    expect(await screen.findByText('Previous report: boundary matched preserved source bytes in ADD')).toBeTruthy()
+    expect(screen.queryByText('Boundary matches preserved source bytes in ADD')).toBeNull()
+  })
+  it.each(['missing-binding', 'forged-certificate', 'unknown-state'])('rejects invalid boundary evidence: %s', async kind => {
+    const boundary = { state: 'VERIFIED_SOURCE_ANCHOR', reason: 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY',
+      migration_certified: false, delivery_permission: 'NOT_EVALUATED' }
+    const change = kind === 'forged-certificate' ? { migration_certified: true }
+      : kind === 'unknown-state' ? { state: 'SUCCEEDED' } : {}
+    vi.mocked(fetch).mockResolvedValue(response({ ...fixture(), source_boundary: { ...boundary, ...change } }))
+    mount()
+    expect(await screen.findByText('Source boundary evidence unavailable')).toBeTruthy()
+    expect(screen.queryByText('Boundary matches preserved source bytes in ADD')).toBeNull()
+  })
   it('shows preserved holds, responsibility and independent Oracle status', async () => {
     mount()
     expect(await screen.findByRole('heading', { name: 'ADD custody processing' })).toBeTruthy()
