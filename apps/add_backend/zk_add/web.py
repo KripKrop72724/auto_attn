@@ -2257,6 +2257,7 @@ async def control_reconciliation(
             actor=context.username,
             reason=body.reason,
             idempotency_key=body.idempotency_key,
+            expected_state=body.expected_state,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

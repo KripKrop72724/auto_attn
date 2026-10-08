@@ -42,6 +42,7 @@ from zk_add.schemas import (
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationManifestRequest,
+    ReconciliationRetryExpectedState,
     SourceProbeResultRequest,
     SourceTailChunkRequest,
 )
@@ -433,17 +434,24 @@ def control_reconciliation_job(
     actor: str,
     reason: str,
     idempotency_key: str,
+    expected_state: ReconciliationRetryExpectedState | None = None,
 ) -> ReconciliationJob:
+    if expected_state is not None and action != "retry":
+        raise ValueError("Expected state is supported only for a guarded retry.")
+    connector = session.scalar(select(Connector).where(Connector.id == job.connector_id)
+        .with_for_update().execution_options(populate_existing=True))
     locked = session.scalar(
         select(ReconciliationJob)
         .where(ReconciliationJob.id == job.id)
-        .with_for_update()
+        .with_for_update().execution_options(populate_existing=True)
     )
     if locked is None:
         raise ValueError("Reconciliation job no longer exists.")
     job = locked
     if action not in {"pause", "resume", "cancel", "retry"}:
         raise ValueError("Unknown reconciliation control action.")
+    expected_digest = hashlib.sha256(json.dumps(expected_state.model_dump(mode="json"),
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest() if expected_state is not None else None
     replay = session.scalar(
         select(ReconciliationEvent).where(
             ReconciliationEvent.job_id == job.id,
@@ -451,7 +459,25 @@ def control_reconciliation_job(
         )
     )
     if replay:
+        if expected_state is not None and (replay.details or {}).get("expected_state_sha256") != expected_digest:
+            raise ValueError("Retry idempotency key has different expected state.")
         return job
+    if expected_state is not None:
+        actual = {"status": job.status, "phase": job.phase, "error_code": job.error_code,
+            "wait_reason": job.wait_reason, "source_epoch": source_epoch_uuid(session, job),
+            "terminal_serial": job.terminal_serial, "terminal_generation": job.terminal_generation,
+            "committed_next_ordinal": job.committed_next_ordinal, "cutoff_count": job.cutoff_count,
+            "chain_digest": job.last_chain_digest, "retry_count": job.retry_count,
+            "updated_at": ensure_utc(job.updated_at) if job.updated_at else None,
+            "connector_boot_id": connector.boot_id if connector else None,
+            "firmware_version": connector.firmware_version if connector else None,
+            "application_sha256": connector.ota_image_sha256 if connector else None,
+            "diagnostics_sample_sequence": (connector.firmware_diagnostics or {}).get("sample_sequence") if connector else None,
+            "diagnostics_at": ensure_utc(connector.firmware_diagnostics_at) if connector and connector.firmware_diagnostics_at else None}
+        if (actual != expected_state.model_dump() or connector is None or connector.zkt_device is None
+                or connector.zkt_device.serial != expected_state.terminal_serial
+                or connector.onboarding_generation != expected_state.terminal_generation):
+            raise ValueError("Reconciliation retry evidence changed; refresh and review before retrying.")
     if job.status in TERMINAL_JOB_STATES:
         if action == "retry" and job.status == "FAILED":
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
@@ -507,7 +533,8 @@ def control_reconciliation_job(
         session,
         job,
         job.status,
-        {"action": action, "reason": reason.strip()},
+        {"action": action, "reason": reason.strip(),
+         **({"expected_state_sha256": expected_digest} if expected_digest else {})},
         idempotency_key=idempotency_key,
     )
     append_audit(

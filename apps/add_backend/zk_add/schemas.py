@@ -508,10 +508,39 @@ class ReconciliationCreateRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class ReconciliationRetryExpectedState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["NEEDS_ATTENTION"]
+    phase: str = Field(max_length=80)
+    error_code: str | None = Field(max_length=120)
+    wait_reason: str | None = Field(max_length=255)
+    source_epoch: str = Field(min_length=36, max_length=36)
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    terminal_generation: int = Field(ge=1)
+    committed_next_ordinal: int = Field(ge=0)
+    cutoff_count: int = Field(ge=0)
+    chain_digest: str | None = Field(min_length=64, max_length=64)
+    retry_count: int = Field(ge=0)
+    updated_at: datetime
+    connector_boot_id: str = Field(min_length=1, max_length=100)
+    firmware_version: str = Field(min_length=1, max_length=80)
+    application_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    diagnostics_sample_sequence: int = Field(ge=0)
+    diagnostics_at: datetime
+
+    @field_validator("updated_at", "diagnostics_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("Retry evidence timestamps require a timezone")
+        return value
+
+
 class ReconciliationControlRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
     password: str = Field(min_length=1, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
+    expected_state: ReconciliationRetryExpectedState | None = None
 
 
 class SourceEpochRequest(BaseModel):

@@ -466,3 +466,126 @@ def test_manifest_matching_current_authority_keeps_ordinary_positive_ack(reconci
     first = web.persist_envelope(connector.id, envelope)
     assert first.ack["type"] == "reconcile_manifest_ack" and first.coverage is None
     assert web.persist_envelope(connector.id, envelope).ack == first.ack
+
+
+def retry_expectation(session, connector, job):
+    from zk_add.schemas import ReconciliationRetryExpectedState
+    from zk_add.time_utils import ensure_utc, utc_now
+    job.status, job.phase = "NEEDS_ATTENTION", "FINAL_ASSURANCE"
+    job.wait_reason = job.error_code = "SOURCE_EPOCH_RECOVERY_LIMIT"
+    job.updated_at = utc_now()
+    connector.boot_id, connector.ota_image_sha256 = "guarded-retry-boot", "a" * 64
+    connector.firmware_diagnostics = {"sample_sequence": 7}
+    connector.firmware_diagnostics_at = utc_now()
+    session.commit()
+    return ReconciliationRetryExpectedState(status=job.status, phase=job.phase,
+        error_code=job.error_code, wait_reason=job.wait_reason,
+        source_epoch=service.source_epoch_uuid(session, job), terminal_serial=job.terminal_serial,
+        terminal_generation=job.terminal_generation, committed_next_ordinal=job.committed_next_ordinal,
+        cutoff_count=job.cutoff_count, chain_digest=job.last_chain_digest, retry_count=job.retry_count,
+        updated_at=ensure_utc(job.updated_at), connector_boot_id=connector.boot_id,
+        firmware_version=connector.firmware_version, application_sha256=connector.ota_image_sha256,
+        diagnostics_sample_sequence=7, diagnostics_at=ensure_utc(connector.firmware_diagnostics_at))
+
+
+def guarded_retry(session, job, expected, *, action="retry"):
+    return service.control_reconciliation_job(session, job=job, action=action, actor="test",
+        reason="One reviewed retry from the exact held checkpoint.", idempotency_key="guarded-retry-once",
+        expected_state=expected)
+
+
+def test_guarded_retry_and_lost_response_replay_commit_one_audited_action(reconciliation_db):  # noqa: F811
+    session, connector, job, coverage, _ = scenario(reconciliation_db)
+    expected = retry_expectation(session, connector, job)
+    before = job.retry_count
+    guarded_retry(session, job, expected)
+    session.commit()
+    assert job.status == "QUEUED" and job.retry_count == before + 1
+    guarded_retry(session, job, expected)
+    session.commit()
+    assert job.status == "QUEUED" and job.retry_count == before + 1
+    events = list(session.scalars(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.idempotency_key == "guarded-retry-once")))
+    assert len(events) == 1 and len(events[0].details["expected_state_sha256"]) == 64
+    with pytest.raises(ValueError, match="idempotency"):
+        guarded_retry(session, job, expected.model_copy(update={"phase": "DIFFERENT_PHASE"}))
+    assert coverage.source_committed_cursor == 11
+
+
+@pytest.mark.parametrize("field", ["status", "phase", "error_code", "wait_reason", "source_epoch", "terminal_serial",
+    "terminal_generation", "committed_next_ordinal", "cutoff_count", "chain_digest", "retry_count", "updated_at",
+    "connector_boot_id", "firmware_version", "application_sha256", "diagnostics_sample_sequence", "diagnostics_at"])
+def test_guarded_retry_refuses_any_expected_state_drift_before_mutation(reconciliation_db, field):  # noqa: F811
+    from datetime import timedelta
+    session, connector, job, coverage, _ = scenario(reconciliation_db)
+    expected = retry_expectation(session, connector, job)
+    value = getattr(expected, field)
+    if isinstance(value, int):
+        value += 1
+    elif field in {"updated_at", "diagnostics_at"}:
+        value += timedelta(microseconds=1)
+    elif field in {"application_sha256", "chain_digest"}:
+        value = "b" * 64
+    else:
+        value = "changed"
+    before = (job.status, job.phase, job.error_code, job.retry_count, job.active_assignment_id, job.updated_at)
+    with pytest.raises(ValueError, match="evidence changed"):
+        guarded_retry(session, job, expected.model_copy(update={field: value}))
+    assert (job.status, job.phase, job.error_code, job.retry_count, job.active_assignment_id, job.updated_at) == before
+    assert session.scalar(select(func.count(ReconciliationEvent.id)).where(
+        ReconciliationEvent.idempotency_key == "guarded-retry-once")) == 0
+
+
+def test_retry_precondition_is_optional_but_cannot_authorize_other_control_actions(reconciliation_db):  # noqa: F811
+    from zk_add.schemas import ReconciliationControlRequest
+    session, connector, job, _, _ = scenario(reconciliation_db)
+    expected = retry_expectation(session, connector, job)
+    for action in ("resume", "pause", "cancel"):
+        with pytest.raises(ValueError, match="only"):
+            guarded_retry(session, job, expected, action=action)
+    legacy = ReconciliationControlRequest(reason="Legacy manual retry remains compatible.", password="synthetic",
+        idempotency_key="legacy-control-key")
+    assert legacy.expected_state is None
+    for field in ("updated_at", "diagnostics_at"):
+        payload = expected.model_dump(mode="json")
+        payload[field] = "2026-01-01T00:00:00"
+        with pytest.raises(ValueError, match="timezone"):
+            type(expected).model_validate(payload)
+
+
+@pytest.mark.parametrize("change", ["new_hold", "diagnostic_revision"])
+def test_postgres_guarded_retry_rechecks_stale_session_after_locked_state_change(pg_scenario, change):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from zk_add.models import Connector
+    factory, (connector_id, job_id, _), _ = pg_scenario
+    with factory() as db:
+        expected = retry_expectation(db, db.get(Connector, connector_id), db.get(ReconciliationJob, job_id))
+    loaded, changed = Event(), Event()
+    def retry_with_stale_rows():
+        with factory() as db:
+            db.get(Connector, connector_id)
+            stale_job = db.get(ReconciliationJob, job_id)
+            loaded.set()
+            assert changed.wait(3)
+            with pytest.raises(ValueError, match="evidence changed"):
+                guarded_retry(db, stale_job, expected)
+            db.rollback()
+    with factory() as first, ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(retry_with_stale_rows)
+        assert loaded.wait(3)
+        connector = first.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+        job = first.scalar(select(ReconciliationJob).where(ReconciliationJob.id == job_id).with_for_update())
+        if change == "new_hold":
+            job.error_code = job.wait_reason = "SOURCE_MANIFEST_GAP"
+        else:
+            connector.firmware_diagnostics = {"sample_sequence": 8}
+        first.flush()
+        changed.set()
+        first.commit()
+        pending.result(timeout=10)
+    with factory() as db:
+        job = db.get(ReconciliationJob, job_id)
+        assert job.status == "NEEDS_ATTENTION" and job.retry_count == expected.retry_count
+        assert db.scalar(select(func.count(ReconciliationEvent.id)).where(
+            ReconciliationEvent.idempotency_key == "guarded-retry-once")) == 0
