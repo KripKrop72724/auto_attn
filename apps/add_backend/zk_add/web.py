@@ -211,6 +211,7 @@ from zk_add.reconciliation import (
     control_reconciliation_job,
     create_reconciliation_job,
     preflight_reconciliation,
+    reconciliation_manifest_authority,
     reconciliation_scheduler_state,
     refresh_reconciliations_for_source_exception,
     serialize_job,
@@ -2256,6 +2257,7 @@ async def control_reconciliation(
             actor=context.username,
             reason=body.reason,
             idempotency_key=body.idempotency_key,
+            expected_state=body.expected_state,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -3847,17 +3849,20 @@ def persist_device_reconciliation_manifest(
     db, connector = auth
     try:
         job = apply_reconciliation_manifest(db, connector=connector, payload=body)
+        authority = reconciliation_manifest_authority(db, connector, job)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
     events.append(("reconciliation", {"job_id": job.job_id, "status": job.status, "phase": job.phase}))
     response = {
-        "ok": job.capture_certified_at is not None,
+        "ok": job.capture_certified_at is not None and authority is None,
+        "code": "SOURCE_COVERAGE_RETAINED" if authority is not None else job.error_code,
         "job_id": job.job_id,
         "status": job.status,
         "phase": job.phase,
         "capture_certificate": job.capture_certificate or None,
         "oracle_certificate": job.oracle_certificate or None,
+        "source_coverage": authority,
     }
 
     return response, events
@@ -4213,7 +4218,8 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         sequence_replay = connector.boot_id == envelope.boot_id and envelope.seq <= connector.last_sequence
         # Custody ACKs must carry the original durable receipt on replay. A
         # generic transport ACK cannot authorize retiring preserved bytes.
-        receipt_message = envelope.type in {"attendance_batch", "queue_evidence", "zkt_observation_batch"}
+        receipt_message = envelope.type in {"attendance_batch", "queue_evidence", "zkt_observation_batch",
+                                           "reconcile_source_manifest"}
         if envelope.type == "command_update":
             update = CommandUpdate.model_validate(envelope.payload)
             # A preboot intent ACK is an action authorization. Even a repeated
@@ -4449,6 +4455,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         elif envelope.type == "reconcile_source_manifest":
             manifest = ReconciliationManifestRequest.model_validate(envelope.payload)
             job = apply_reconciliation_manifest(db, connector=connector, payload=manifest)
+            authoritative_coverage_payload = reconciliation_manifest_authority(db, connector, job)
             event_payload = {
                 "connector_id": connector.connector_id,
                 "job_id": job.job_id,
@@ -4459,11 +4466,11 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             ack_payload = {
                 "type": (
                     "error"
-                    if job.capture_certified_at is None
+                    if job.capture_certified_at is None or authoritative_coverage_payload is not None
                     else "reconcile_manifest_ack"
                 ),
                 "message_id": envelope.message_id,
-                "code": job.error_code,
+                "code": "SOURCE_COVERAGE_RETAINED" if authoritative_coverage_payload is not None else job.error_code,
                 "message_type": envelope.type,
                 "job_id": job.job_id,
                 "source_epoch": source_epoch_uuid(db, job),
