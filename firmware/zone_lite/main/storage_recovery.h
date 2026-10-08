@@ -1,5 +1,6 @@
 #pragma once
-/* Dedicated one-shot ZKT storage recovery image (2.6.24).
+/* Dedicated one-shot ZKT storage recovery image (2.6.25; 2.6.24 is the
+ * published predecessor that stopped at the first unreadable region).
  *
  * The image never confirms itself. After the exact Peshawar target transfers
  * its retained blocked-identity queue into ADD custody, the OTA manager reports
@@ -7,7 +8,7 @@
  * Every refusal or interruption leaves the legacy files unchanged. */
 #include <stdbool.h>
 
-#define STORAGE_RECOVERY_VERSION "2.6.24"
+#define STORAGE_RECOVERY_VERSION "2.6.25"
 
 /* Compile-time role as a constant expression, so shared code keeps every
  * ordinary path referenced while the recovery build skips it. */

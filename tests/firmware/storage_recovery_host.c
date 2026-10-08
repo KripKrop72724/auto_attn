@@ -1,8 +1,15 @@
 /* Host regression for the one-shot blocked-queue custody transfer. Executes
- * storage_recovery_core.c against real files with fault-injecting ports. */
+ * storage_recovery_core.c against real files with fault-injecting ports and
+ * injected unreadable byte ranges (fread/ferror/fclose are redirected for the
+ * production unit by the test command line). */
+#undef fread
+#undef ferror
+#undef fclose
+#undef fseek
 #include "storage_recovery_core.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +19,7 @@
 #define BACKUP "blocked_recovery.bak"
 #define TMP "blocked_recovery.tmp"
 #define ACKED "acked_uids.txt"
-#define MAX_SENT 64
+#define MAX_SENT 256
 
 typedef struct {
     char generation[80], record_id[80], serial[128], reason[32];
@@ -28,9 +35,59 @@ typedef struct {
     int append_at;            /* Append to BLOCKED after this many rows */
     bool refuse_retire, retired_called;
     unsigned logs;
+    long arm_bad_start, arm_bad_end; /* Fault armed at the first send */
 } fake_t;
 
 static const char *const k_sources[] = {BLOCKED, BACKUP, TMP};
+
+/* Unreadable byte range of the injected fault, armed per test. With
+ * g_bad_seek the range also cannot be reached by a seek, like a SPIFFS span
+ * whose object index page is unreadable. */
+static long g_bad_start = -1, g_bad_end = -1;
+static bool g_bad_seek;
+static FILE *g_faulted[8];
+
+static void mark_faulted(FILE *file, bool faulted)
+{
+    for (unsigned i = 0; i < 8; ++i) {
+        if (faulted && !g_faulted[i]) { g_faulted[i] = file; return; }
+        if (!faulted && g_faulted[i] == file) g_faulted[i] = NULL;
+    }
+}
+
+size_t sr_test_fread(void *buffer, size_t size, size_t count, FILE *file)
+{
+    long position = ftell(file);
+    long end = position + (long)(size * count);
+    if (g_bad_start >= 0 && position < g_bad_end && end > g_bad_start) {
+        mark_faulted(file, true);
+        return 0;
+    }
+    mark_faulted(file, false);
+    return fread(buffer, size, count, file);
+}
+
+int sr_test_ferror(FILE *file)
+{
+    for (unsigned i = 0; i < 8; ++i)
+        if (g_faulted[i] == file) return 1;
+    return ferror(file);
+}
+
+int sr_test_fclose(FILE *file)
+{
+    mark_faulted(file, false);
+    return fclose(file);
+}
+
+int sr_test_fseek(FILE *file, long offset, int whence)
+{
+    if (g_bad_seek && whence == SEEK_SET && offset >= g_bad_start && offset < g_bad_end) {
+        errno = ENOENT;
+        return -1;
+    }
+    return fseek(file, offset, whence);
+}
 
 static char *read_all(const char *path, size_t *length)
 {
@@ -64,6 +121,11 @@ static sr_send_t fake_send(void *context, const char *generation, const char *re
 {
     fake_t *fake = context;
     fake->attempts++;
+    if (fake->arm_bad_start >= 0) {
+        g_bad_start = fake->arm_bad_start;
+        g_bad_end = fake->arm_bad_end;
+        fake->arm_bad_start = -1;
+    }
     if (fake->stop_at >= 0 && (int)fake->count == fake->stop_at) return SR_SEND_STOP;
     if (fake->retry_first) { fake->retry_first--; return SR_SEND_RETRY; }
     if (fake->append_at >= 0 && (int)fake->count == fake->append_at) {
@@ -110,6 +172,9 @@ static fake_t *new_fake(void)
     assert(fake);
     fake->stop_at = -1;
     fake->append_at = -1;
+    fake->arm_bad_start = -1;
+    g_bad_start = g_bad_end = -1;
+    g_bad_seek = false;
     return fake;
 }
 
@@ -293,6 +358,140 @@ static void test_repeated_runs_reuse_identical_custody_identities(void)
     free(first); free(second);
 }
 
+/* Rows of 100 bytes: {"device_serial":"CJH9211060009","event_uid":"<64 hex>","n":"NN"} padded. */
+static char *write_rows(unsigned rows)
+{
+    size_t capacity = (size_t)rows * 128 + 1;
+    char *data = calloc(1, capacity);
+    assert(data);
+    size_t used = 0;
+    for (unsigned i = 0; i < rows; ++i) {
+        char uid[65];
+        for (unsigned b = 0; b < 64; ++b) uid[b] = "0123456789abcdef"[(i * 7 + b) % 16];
+        uid[64] = 0;
+        used += (size_t)snprintf(data + used, capacity - used,
+                                 "{\"device_serial\":\"CJH9211060009\",\"event_uid\":\"%s\",\"n\":\"%05u\"}\n", uid, i);
+    }
+    remove(BLOCKED); remove(BACKUP); remove(TMP); remove(ACKED);
+    write_all(BLOCKED, data);
+    return data;
+}
+
+static unsigned count_with_prefix(const fake_t *fake, const char *prefix)
+{
+    unsigned count = 0;
+    for (unsigned i = 0; i < fake->count; ++i)
+        if (!strncmp(fake->sent[i].record_id, prefix, strlen(prefix))) count++;
+    return count;
+}
+
+static void test_unreadable_region_is_skipped_reported_and_bounded(void)
+{
+    char *data = write_rows(60);
+    size_t total = strlen(data);
+    fake_t *clean = new_fake();
+    clean->refuse_retire = true;
+    sr_ports_t ports = ports_for(clean);
+    sr_outcome_t outcome;
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(clean->count == 60 && outcome.unreadable_bytes == 0);
+    fake_t *fake = new_fake();
+    g_bad_start = 2500;
+    g_bad_end = 2700;
+    ports = ports_for(fake);
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(outcome.result == SR_COMPLETE && outcome.gaps == 1);
+    /* Probes resolve the region to 32-byte pieces around the bad bytes. */
+    assert(outcome.unreadable_bytes >= 200 && outcome.unreadable_bytes <= 264);
+    assert(count_with_prefix(fake, "gap:") == 1);
+    const sent_t *gap = NULL;
+    for (unsigned i = 0; i < fake->count; ++i)
+        if (!strncmp(fake->sent[i].record_id, "gap:", 4)) gap = &fake->sent[i];
+    assert(gap && strstr(gap->bytes, "\"type\":\"storage_recovery_unreadable\"") && !strcmp(gap->reason, "MALFORMED"));
+    /* Every intact row keeps the exact identity of the clean run. */
+    unsigned intact = 0;
+    for (unsigned i = 0; i < clean->count; ++i) {
+        long offset = atol(clean->sent[i].record_id);
+        bool damaged = offset < 2720 && offset + (long)clean->sent[i].length > 2496;
+        if (damaged) continue;
+        bool found = false;
+        for (unsigned j = 0; j < fake->count && !found; ++j)
+            found = !strcmp(fake->sent[j].record_id, clean->sent[i].record_id);
+        assert(found);
+        intact++;
+    }
+    assert(intact >= 57);
+    assert(outcome.malformed >= 1 && outcome.uids == intact);
+    assert(!exists(BLOCKED));
+    size_t length = 0;
+    char *acked = read_all(ACKED, &length);
+    assert(acked && length == (size_t)intact * 65);
+    (void)total;
+    free(acked); free(data); free(clean); free(fake);
+}
+
+static void test_unreadable_over_limit_refuses_before_sending(void)
+{
+    char *data = write_rows(400);
+    fake_t *fake = new_fake();
+    g_bad_start = 4000;
+    g_bad_end = 4000 + (long)SR_UNREADABLE_LIMIT + 1024;
+    sr_ports_t ports = ports_for(fake);
+    sr_outcome_t outcome;
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(outcome.result == SR_REFUSED && !strcmp(outcome.code, "STORAGE_RECOVERY_UNREADABLE_LIMIT"));
+    assert(fake->count == 0 && !fake->retired_called && !exists(ACKED));
+    size_t length = 0;
+    char *after = read_all(BLOCKED, &length);
+    assert(after && !strcmp(after, data));
+    free(after); free(data); free(fake);
+}
+
+static void test_region_seen_only_by_transfer_pass_is_not_retired(void)
+{
+    char *data = write_rows(60);
+    fake_t *fake = new_fake();
+    fake->arm_bad_start = 6000; /* Past the first 4096-byte read */
+    fake->arm_bad_end = 6100;
+    sr_ports_t ports = ports_for(fake);
+    sr_outcome_t outcome;
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(outcome.result == SR_INCOMPLETE && !strcmp(outcome.code, "STORAGE_RECOVERY_SOURCE_CHANGED"));
+    assert(!fake->retired_called && exists(BLOCKED) && !exists(ACKED));
+    free(data); free(fake);
+}
+
+static void test_unreachable_offsets_are_skipped_like_unreadable_bytes(void)
+{
+    char *data = write_rows(80);
+    fake_t *fake = new_fake();
+    g_bad_start = 4200;
+    g_bad_end = 4500;
+    g_bad_seek = true;
+    sr_ports_t ports = ports_for(fake);
+    sr_outcome_t outcome;
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(outcome.result == SR_COMPLETE && outcome.gaps == 1);
+    assert(outcome.unreadable_bytes >= 300 && outcome.unreadable_bytes <= 364);
+    assert(count_with_prefix(fake, "gap:") == 1 && !exists(BLOCKED));
+    free(data); free(fake);
+}
+
+static void test_unreadable_tail_reaches_eof(void)
+{
+    char *data = write_rows(30);
+    long total = (long)strlen(data);
+    fake_t *fake = new_fake();
+    g_bad_start = total - 90;
+    g_bad_end = total;
+    sr_ports_t ports = ports_for(fake);
+    sr_outcome_t outcome;
+    sr_transfer_and_retire(k_sources, 3, ACKED, &ports, &outcome);
+    assert(outcome.result == SR_COMPLETE && outcome.gaps == 1 && outcome.unreadable_bytes <= 128);
+    assert(outcome.uids == 29 && !exists(BLOCKED));
+    free(data); free(fake);
+}
+
 int main(void)
 {
     test_complete_transfer_retires_after_every_receipt();
@@ -302,6 +501,11 @@ int main(void)
     test_oversized_row_is_refused_without_change();
     test_exact_limit_row_and_absent_files();
     test_repeated_runs_reuse_identical_custody_identities();
+    test_unreadable_region_is_skipped_reported_and_bounded();
+    test_unreadable_over_limit_refuses_before_sending();
+    test_region_seen_only_by_transfer_pass_is_not_retired();
+    test_unreachable_offsets_are_skipped_like_unreadable_bytes();
+    test_unreadable_tail_reaches_eof();
     puts("storage recovery custody tests passed");
     return 0;
 }

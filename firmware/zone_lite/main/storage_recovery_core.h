@@ -1,17 +1,26 @@
 #pragma once
 /* One-shot custody transfer of retained legacy blocked-identity rows to ADD.
  *
- * Every row of every source generation must receive a matching durable ADD
- * receipt before anything is removed. Removal only happens after that, and the
- * retired event UIDs are then appended in the legacy acked-UID format so the
- * 2.5.2 rollback image does not queue the same punches again. The engine has no
- * ESP-IDF dependency so the host tests execute the production code. */
+ * Every readable row of every source generation must receive a matching
+ * durable ADD receipt before anything is removed. Removal only happens after
+ * that, and the retired event UIDs are then appended in the legacy acked-UID
+ * format so the 2.5.2 rollback image does not queue the same punches again.
+ *
+ * A source region the filesystem cannot read is located with unbuffered
+ * probes, reported to ADD with its exact offset and length, and skipped. A
+ * scan pass measures every such region before anything is sent; more than
+ * SR_UNREADABLE_LIMIT unreadable bytes refuses the run with nothing changed.
+ * The engine has no ESP-IDF dependency so the host tests execute it. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define SR_RECORD_MAX_BYTES 8192U /* ADD queue_evidence raw-byte limit */
 #define SR_PROGRESS_INTERVAL 500U
+#define SR_PROBE_BYTES 32U /* Resolution of an unreadable region */
+/* Owner-approved (9 October 2026) maximum of unreadable bytes discarded by
+ * one run; such bytes are unreadable by every image, including 2.5.2. */
+#define SR_UNREADABLE_LIMIT (16U * 1024U)
 
 typedef enum { SR_SEND_ACKED = 0, SR_SEND_RETRY, SR_SEND_STOP } sr_send_t;
 
@@ -42,7 +51,8 @@ typedef struct {
     sr_result_t result;
     char code[48];
     uint32_t files, records, malformed, uids, uids_appended, sends, retries;
-    uint64_t bytes;
+    uint32_t gaps;            /* Unreadable regions skipped by the transfer */
+    uint64_t bytes, unreadable_bytes;
 } sr_outcome_t;
 
 /* Sources are retired in the given order after all of them are receipted.

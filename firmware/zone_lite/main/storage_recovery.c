@@ -243,12 +243,14 @@ void storage_recovery_run(void)
     const char *sources[] = {SR_BLOCKED_PATH, SR_BLOCKED_BACKUP_PATH, SR_BLOCKED_TMP_PATH};
     sr_outcome_t outcome;
     sr_transfer_and_retire(sources, sizeof(sources) / sizeof(sources[0]), SR_ACKED_PATH, &ports, &outcome);
-    char message[220];
+    char message[240];
     snprintf(message, sizeof(message),
-             "Recovery %s: files %lu rows %lu malformed %lu bytes %llu uids %lu recorded %lu retries %lu",
+             "Recovery %s: files %lu rows %lu malformed %lu bytes %llu uids %lu recorded %lu retries %lu "
+             "unreadable regions %lu bytes %llu",
              sr_result_name(outcome.result), (unsigned long)outcome.files, (unsigned long)outcome.records,
              (unsigned long)outcome.malformed, (unsigned long long)outcome.bytes, (unsigned long)outcome.uids,
-             (unsigned long)outcome.uids_appended, (unsigned long)outcome.retries);
+             (unsigned long)outcome.uids_appended, (unsigned long)outcome.retries, (unsigned long)outcome.gaps,
+             (unsigned long long)outcome.unreadable_bytes);
     bool clean = outcome.result == SR_COMPLETE || outcome.result == SR_NOTHING_TO_DO;
     log_line(NULL, clean ? "INFO" : "WARN", outcome.code, message);
     log_inventory("STORAGE_RECOVERY_INVENTORY_AFTER");

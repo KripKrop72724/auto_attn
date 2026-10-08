@@ -17,6 +17,9 @@ typedef struct {
     sr_outcome_t *outcome;
     uint8_t *uids;
     size_t uid_capacity;
+    bool scan;                 /* Measuring pass: nothing is sent or recorded */
+    uint32_t scan_rows, pass_gaps;
+    uint64_t pass_unreadable;
 } sr_run_t;
 
 const char *sr_result_name(sr_result_t result)
@@ -108,12 +111,17 @@ static bool remember_uid(sr_run_t *run, const char *row, size_t length)
     return true;
 }
 
-/* Returns 1 when acknowledged, 0 when the caller must stop. */
+/* Returns 1 when acknowledged (or counted by a scan), 0 when the caller must
+ * stop, and -1 when the UID set cannot grow. */
 static int transfer_row(sr_run_t *run, const char *generation, uint64_t offset, const char *row, size_t length)
 {
     size_t json_length = length;
     if (json_length && row[json_length - 1] == '\r') json_length--;
     bool valid = json_length > 0 && !memchr(row, 0, json_length) && rel_json_syntax_valid(row, json_length);
+    if (run->scan) {
+        run->scan_rows++;
+        return 1;
+    }
     char serial[SR_SERIAL_MAX + 1] = {0};
     if (valid) {
         size_t serial_length = 0;
@@ -148,27 +156,218 @@ static int transfer_row(sr_run_t *run, const char *generation, uint64_t offset, 
     return 1;
 }
 
+/* Every unreadable region is counted against the approved limit. A scan logs
+ * it; the transfer pass hands ADD a durable record of its exact location.
+ * Returns 1 to continue, 0 to stop (send refused), -2 over the limit. */
+static int report_gap(sr_run_t *run, const char *generation, uint64_t offset, uint64_t length, int error)
+{
+    run->pass_gaps++;
+    run->pass_unreadable += length;
+    char message[200];
+    if (run->pass_unreadable > SR_UNREADABLE_LIMIT) {
+        snprintf(message, sizeof(message), "More than %u unreadable bytes (region at offset %llu); nothing will be removed",
+                 (unsigned)SR_UNREADABLE_LIMIT, (unsigned long long)offset);
+        logf_line(run, "ERROR", "STORAGE_RECOVERY_UNREADABLE_LIMIT", message);
+        return -2;
+    }
+    if (run->scan) {
+        if (run->pass_gaps <= 20) {
+            snprintf(message, sizeof(message), "Unreadable region in %s at offset %llu length %llu errno %d",
+                     generation, (unsigned long long)offset, (unsigned long long)length, error);
+            logf_line(run, "WARN", "STORAGE_RECOVERY_UNREADABLE_REGION", message);
+        }
+        return 1;
+    }
+    char record_id[80], raw[240];
+    snprintf(record_id, sizeof(record_id), "gap:%llu:%llu", (unsigned long long)offset, (unsigned long long)length);
+    int written = snprintf(raw, sizeof(raw),
+        "{\"errno\":%d,\"generation\":\"%s\",\"length\":%llu,\"offset\":%llu,\"type\":\"storage_recovery_unreadable\"}",
+        error, generation, (unsigned long long)length, (unsigned long long)offset);
+    if (written <= 0 || (size_t)written >= sizeof(raw)) return 0;
+    for (;;) {
+        run->outcome->sends++;
+        sr_send_t sent = run->ports->send(run->ports->context, generation, record_id, raw, (size_t)written,
+                                          NULL, "MALFORMED");
+        if (sent == SR_SEND_ACKED) break;
+        if (sent == SR_SEND_STOP) return 0;
+        run->outcome->retries++;
+    }
+    run->outcome->gaps++;
+    run->outcome->unreadable_bytes += length;
+    return 1;
+}
+
+typedef enum { SR_READ_OK, SR_READ_GAP, SR_READ_EOF, SR_READ_FAIL } sr_read_t;
+
+typedef struct {
+    const char *path;
+    FILE *file;
+    uint64_t position, size, clean;
+    bool probing;
+    int error;
+} sr_reader_t;
+
+/* Unbuffered, so one fread is one filesystem read of exactly these bytes.
+ * Returns 1 when open at the offset, 0 when the offset cannot be reached (a
+ * SPIFFS seek resolves the index page of that span, which may be unreadable)
+ * and -1 when the source cannot be opened at all. */
+static int open_at(sr_reader_t *reader, uint64_t offset, FILE **out)
+{
+    *out = NULL;
+    errno = 0;
+    FILE *file = fopen(reader->path, "rb");
+    if (!file) {
+        reader->error = errno ? errno : EIO;
+        return -1;
+    }
+    if (setvbuf(file, NULL, _IONBF, 0) != 0) {
+        reader->error = errno ? errno : EIO;
+        fclose(file);
+        return -1;
+    }
+    errno = 0;
+    if (fseek(file, (long)offset, SEEK_SET) != 0) {
+        reader->error = errno ? errno : EIO;
+        fclose(file);
+        return 0;
+    }
+    *out = file;
+    return 1;
+}
+
+/* Returns 1 when the piece read (got 0 is EOF), 0 when it is unreadable and
+ * -1 when the source cannot be opened at all. */
+static int read_piece(sr_reader_t *reader, uint64_t offset, char *buffer, size_t length, size_t *got)
+{
+    *got = 0;
+    FILE *file = NULL;
+    int opened = open_at(reader, offset, &file);
+    if (opened <= 0) return opened;
+    errno = 0;
+    *got = fread(buffer, 1, length, file);
+    int readable = !ferror(file);
+    if (!readable) reader->error = errno ? errno : EIO;
+    fclose(file);
+    return readable;
+}
+
+/* Sequential reads until a read fails. The bytes of a failed read are then
+ * read in SR_PROBE_BYTES pieces; an unreadable piece starts a region that is
+ * extended until a probe reads again, EOF, or the limit. */
+static sr_read_t reader_next(sr_reader_t *reader, char *buffer, size_t capacity, size_t *got,
+                             uint64_t *gap_offset, uint64_t *gap_length)
+{
+    *got = 0;
+    if (reader->position >= reader->size) return SR_READ_EOF;
+    size_t want = capacity;
+    if ((uint64_t)want > reader->size - reader->position) want = (size_t)(reader->size - reader->position);
+    if (!reader->probing && !reader->file) {
+        int opened = open_at(reader, reader->position, &reader->file);
+        if (opened < 0) return SR_READ_FAIL;
+        if (!opened) {
+            reader->probing = true;
+            reader->clean = 0;
+        }
+    }
+    if (!reader->probing) {
+        errno = 0;
+        size_t n = fread(buffer, 1, want, reader->file);
+        if (!ferror(reader->file)) {
+            if (n == 0) return SR_READ_EOF;
+            reader->position += n;
+            *got = n;
+            return SR_READ_OK;
+        }
+        reader->error = errno ? errno : EIO;
+        fclose(reader->file);
+        reader->file = NULL;
+        reader->probing = true;
+        reader->clean = 0;
+    }
+    size_t length = want < SR_PROBE_BYTES ? want : SR_PROBE_BYTES;
+    size_t n = 0;
+    int readable = read_piece(reader, reader->position, buffer, length, &n);
+    if (readable < 0) return SR_READ_FAIL;
+    if (readable) {
+        if (n == 0) return SR_READ_EOF;
+        reader->position += n;
+        reader->clean += n;
+        if (reader->clean >= SR_READ_CHUNK) reader->probing = false;
+        *got = n;
+        return SR_READ_OK;
+    }
+    uint64_t start = reader->position;
+    int error = reader->error;
+    for (;;) {
+        uint64_t next = reader->position + SR_PROBE_BYTES;
+        reader->position = next < reader->size ? next : reader->size;
+        if (reader->position >= reader->size || reader->position - start > SR_UNREADABLE_LIMIT) break;
+        char byte;
+        size_t one = 0;
+        readable = read_piece(reader, reader->position, &byte, 1, &one);
+        if (readable < 0) return SR_READ_FAIL;
+        if (readable) break;
+    }
+    reader->clean = 0;
+    reader->error = error;
+    *gap_offset = start;
+    *gap_length = reader->position - start;
+    return SR_READ_GAP;
+}
+
+static bool row_sent(sr_run_t *run, int sent)
+{
+    if (sent > 0) return true;
+    if (sent < 0) finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_UID_MEMORY");
+    else finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_STOPPED");
+    return false;
+}
+
 /* Stream one source. Each newline-terminated row (and a final unterminated
- * tail) is sent as exact bytes. Empty rows carry no data and are skipped. */
+ * tail) is sent as exact bytes. Empty rows carry no data and are skipped. A
+ * row cut by an unreadable region is sent as its exact readable fragments. */
 static bool transfer_source(sr_run_t *run, const char *path, unsigned index, off_t expected_size)
 {
     char generation[80];
     snprintf(generation, sizeof(generation), "storage-recovery-v1-%u-%lld", index, (long long)expected_size);
-    FILE *file = fopen(path, "rb");
-    if (!file) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_OPEN"); return false; }
     char *chunk = malloc(SR_READ_CHUNK);
     char *row = malloc(SR_RECORD_MAX_BYTES + 1);
     if (!chunk || !row) {
-        free(chunk); free(row); fclose(file);
+        free(chunk); free(row);
         finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_MEMORY");
         return false;
     }
+    sr_reader_t reader = {.path = path, .size = (uint64_t)expected_size};
     bool ok = true;
     size_t row_length = 0;
-    uint64_t position = 0, row_start = 0;
-    for (;;) {
-        size_t got = fread(chunk, 1, SR_READ_CHUNK, file);
-        for (size_t i = 0; ok && i < got; ++i, ++position) {
+    uint64_t row_start = 0;
+    while (ok) {
+        size_t got = 0;
+        uint64_t gap_offset = 0, gap_length = 0, chunk_start = reader.position;
+        sr_read_t read = reader_next(&reader, chunk, SR_READ_CHUNK, &got, &gap_offset, &gap_length);
+        if (read == SR_READ_EOF) break;
+        if (read == SR_READ_FAIL) {
+            finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_READ");
+            ok = false;
+            break;
+        }
+        if (read == SR_READ_GAP) {
+            if (row_length && !row_sent(run, transfer_row(run, generation, row_start, row, row_length))) {
+                ok = false;
+                break;
+            }
+            int reported = report_gap(run, generation, gap_offset, gap_length, reader.error);
+            if (reported == -2) finish(run, SR_REFUSED, "STORAGE_RECOVERY_UNREADABLE_LIMIT");
+            else if (reported == 0) finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_STOPPED");
+            if (reported <= 0) {
+                ok = false;
+                break;
+            }
+            row_length = 0;
+            row_start = reader.position;
+            continue;
+        }
+        for (size_t i = 0; ok && i < got; ++i) {
             if (chunk[i] != '\n') {
                 if (row_length == SR_RECORD_MAX_BYTES) {
                     finish(run, SR_REFUSED, "STORAGE_RECOVERY_ROW_TOO_LARGE");
@@ -179,29 +378,20 @@ static bool transfer_source(sr_run_t *run, const char *path, unsigned index, off
                 continue;
             }
             bool empty = row_length == 0 || (row_length == 1 && row[0] == '\r');
-            if (!empty) {
-                int sent = transfer_row(run, generation, row_start, row, row_length);
-                if (sent < 0) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_UID_MEMORY"); ok = false; }
-                else if (sent == 0) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_STOPPED"); ok = false; }
-            }
+            if (!empty && !row_sent(run, transfer_row(run, generation, row_start, row, row_length))) ok = false;
             row_length = 0;
-            row_start = position + 1;
+            row_start = chunk_start + i + 1;
         }
-        if (!ok || got < SR_READ_CHUNK) break;
     }
-    if (ok && ferror(file)) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_READ"); ok = false; }
-    if (ok && row_length && !(row_length == 1 && row[0] == '\r')) {
-        int sent = transfer_row(run, generation, row_start, row, row_length);
-        if (sent < 0) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_UID_MEMORY"); ok = false; }
-        else if (sent == 0) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_STOPPED"); ok = false; }
-    }
-    if (ok && position != (uint64_t)expected_size) {
+    if (reader.file) fclose(reader.file);
+    if (ok && row_length && !(row_length == 1 && row[0] == '\r'))
+        ok = row_sent(run, transfer_row(run, generation, row_start, row, row_length));
+    if (ok && reader.position != (uint64_t)expected_size) {
         finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_CHANGED");
         ok = false;
     }
     free(chunk);
     free(row);
-    if (fclose(file) != 0 && ok) { finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_READ"); ok = false; }
     struct stat after;
     if (ok && (stat(path, &after) != 0 || after.st_size != expected_size)) {
         finish(run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_CHANGED");
@@ -274,16 +464,37 @@ void sr_transfer_and_retire(const char *const *sources, size_t source_count,
     bool any = false;
     for (size_t i = 0; i < source_count; ++i) any = any || present[i];
     if (!any) { finish(&run, SR_NOTHING_TO_DO, "STORAGE_RECOVERY_NOTHING_TO_DO"); return; }
+    /* Measure every unreadable region before sending anything. */
+    run.scan = true;
+    for (size_t i = 0; i < source_count; ++i) {
+        if (present[i] && !transfer_source(&run, sources[i], (unsigned)i, sizes[i])) return;
+    }
+    char message[220];
+    uint32_t scan_gaps = run.pass_gaps;
+    uint64_t scan_unreadable = run.pass_unreadable;
+    snprintf(message, sizeof(message), "Scan found %lu rows and %lu unreadable regions (%llu bytes, limit %u); transfer starts",
+             (unsigned long)run.scan_rows, (unsigned long)scan_gaps, (unsigned long long)scan_unreadable,
+             (unsigned)SR_UNREADABLE_LIMIT);
+    logf_line(&run, scan_gaps ? "WARN" : "INFO", "STORAGE_RECOVERY_SCAN", message);
+    run.scan = false;
+    run.pass_gaps = 0;
+    run.pass_unreadable = 0;
     for (size_t i = 0; i < source_count; ++i) {
         if (!present[i]) continue;
         outcome->files++;
         if (!transfer_source(&run, sources[i], (unsigned)i, sizes[i])) { free(run.uids); return; }
     }
-    char message[200];
+    if (run.pass_gaps != scan_gaps || run.pass_unreadable != scan_unreadable) {
+        /* The same bytes must be unreadable in both passes. */
+        free(run.uids);
+        finish(&run, SR_INCOMPLETE, "STORAGE_RECOVERY_SOURCE_CHANGED");
+        return;
+    }
     snprintf(message, sizeof(message),
-             "ADD acknowledged every retained blocked row: files=%lu rows=%lu malformed=%lu bytes=%llu uids=%lu",
+             "ADD acknowledged every readable blocked row: files=%lu rows=%lu malformed=%lu bytes=%llu uids=%lu unreadable=%llu",
              (unsigned long)outcome->files, (unsigned long)outcome->records, (unsigned long)outcome->malformed,
-             (unsigned long long)outcome->bytes, (unsigned long)outcome->uids);
+             (unsigned long long)outcome->bytes, (unsigned long)outcome->uids,
+             (unsigned long long)outcome->unreadable_bytes);
     logf_line(&run, "INFO", "STORAGE_RECOVERY_CUSTODY_COMPLETE", message);
     if (ports->before_retire && !ports->before_retire(ports->context)) {
         free(run.uids);
