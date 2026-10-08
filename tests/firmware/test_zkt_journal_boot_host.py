@@ -18,7 +18,7 @@ def test_journal_startup_and_recovery_state_machine(tmp_path):
     subprocess.run([str(executable)], check=True, timeout=30)
 
 
-@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19"])
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20"])
 def test_actual_runtime_security_version_and_writer_build_gates(tmp_path, bridge_version):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"

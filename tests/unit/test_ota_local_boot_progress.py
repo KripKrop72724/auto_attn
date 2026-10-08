@@ -47,7 +47,7 @@ def attempt():
     engine.dispose()
 
 
-@pytest.mark.parametrize("version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.7.0"])
+@pytest.mark.parametrize("version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.7.0"])
 @pytest.mark.parametrize("reason", sorted(LOCAL_BOOT_WAIT_REASONS))
 def test_current_signed_image_may_continue_its_local_boot_wait(attempt, version, reason):
     session, connector, release, campaign, deployment, payload = attempt

@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19"])
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20"])
 def test_reader_proof_persistence_and_exact_rollback(tmp_path, bridge_version):
     main = ROOT / "firmware/zone_lite/main"
     executable = tmp_path / "reader-proof"
@@ -36,7 +36,7 @@ def test_reader_proof_persistence_and_exact_rollback(tmp_path, bridge_version):
     assert (tmp_path / "reader-proof.bin").read_bytes() == bytes(expected)
 
 
-@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19"])
+@pytest.mark.parametrize("bridge_version", ["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20"])
 def test_platform_facts_and_nvs_failures(tmp_path, bridge_version):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"

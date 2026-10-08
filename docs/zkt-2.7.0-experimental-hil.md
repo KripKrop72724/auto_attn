@@ -36,6 +36,23 @@ HIL builds retain their matching ELF and map files so USB backtraces can be
 decoded only after the application's ELF digest is checked. A symbol file from
 a different build is not evidence for an installed image.
 
+The 2.6.19 attempt later returned to 2.6.15 before any 2.6.19 heartbeat reached
+ADD. ADD recorded `BOOTLOADER_ROLLBACK`; the candidate is revoked and its
+campaign is paused. The reset cause remains unknown because that attempt has
+no matching console capture. The 2.6.18 diagnosis cannot establish the cause
+of this later rollback.
+
+**2.6.20** is a new diagnostic bridge role for a bounded 3FL canary with USB
+console capture prepared. Its publication remains experimental and restricted
+to the first exact ordered target until stored bridge-readiness evidence permits
+expansion. It must pass the same predecessor, image, persistence, reader and
+source gates; adding the role is neither a field pass nor a diagnosis. Preserve
+the immutable 2.6.17/18/19 packages and their revocation evidence. Keep the
+writer's 2.6.17 version and digest pins unchanged until a replacement reader
+has actually qualified. Record the new build's ELF/map, internal memory and
+startup-stack evidence before signing; bridge-disabled reboot code still has
+static/RTC storage costs and is not evidence for the previous reset cause.
+
 1. Finish and test the code needed for preservation, delivery, migration and
    rollback. Passing compilation alone does not finish an unimplemented path.
 2. Build and sign the compatibility bridge from a green exact main commit.

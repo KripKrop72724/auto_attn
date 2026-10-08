@@ -29,6 +29,7 @@ jobs:
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.17
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.18
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.19
+          ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.20
           ./tests/firmware/test_backup_restore.ps1
           ./tests/firmware/test_deployed_firmware_contract.ps1
 
@@ -48,6 +49,7 @@ jobs:
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.17
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.18
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.19
+          ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.20
       - name: Exercise pre-migration backup restore gate
         shell: pwsh
         run: ./tests/firmware/test_backup_restore.ps1
@@ -345,9 +347,9 @@ jobs:
           -v "$GITHUB_WORKSPACE:/project"
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
-          bash -lc 'idf.py -B build-ci-bridge -D SDKCONFIG=/tmp/zone-lite-ci-bridge-sdkconfig -D PROJECT_VER=2.6.19 -D ZONE_LITE_JOURNAL_WRITES=ON build'
+          bash -lc 'idf.py -B build-ci-bridge -D SDKCONFIG=/tmp/zone-lite-ci-bridge-sdkconfig -D PROJECT_VER=2.6.20 -D ZONE_LITE_JOURNAL_WRITES=ON build'
       - name: Check bridge application identity
-        run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-bridge/zone_lite.bin --family zkt --version 2.6.19
+        run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-bridge/zone_lite.bin --family zkt --version 2.6.20
       - name: Check actual Xtensa startup stack budgets
         run: >-
           docker run --rm
@@ -361,7 +363,7 @@ jobs:
           docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
           for variant in journal bridge; do
             version=2.7.0
-            if [ "$variant" = bridge ]; then version=2.6.19; fi
+            if [ "$variant" = bridge ]; then version=2.6.20; fi
             docker run --rm -e REPRO_VARIANT="$variant" -e REPRO_VERSION="$version" \
               -v "$GITHUB_WORKSPACE:/rebuild" -w /rebuild/firmware/zone_lite \
               espressif/idf:v5.5.3 bash -lc \

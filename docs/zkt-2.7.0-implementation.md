@@ -24,6 +24,22 @@ interruption is established as the reset cause. The earlier 2.6.18 memory
 finding cannot be assigned to this attempt without evidence. Reader
 qualification and the writer's artifact pins remain unresolved.
 
+The next diagnostic bridge has the separate immutable version **2.6.20**.
+USB console capture is prepared for a bounded 3FL canary, but no 2.6.20 boot,
+reset cause, field readiness or recovery result is claimed by this role addition.
+It retains the same exact predecessor images, signed nationwide scope, HIL-only
+publication and stored bridge-readiness requirements. The revoked 2.6.17,
+2.6.18 and 2.6.19 artifacts remain historical evidence. The 2.7.0 writer still
+requires its pinned 2.6.17 image; replacing that pin requires actual qualified
+reader evidence and a separately reviewed contract update.
+
+The 2.6.20 build must include a fresh internal-memory and startup-stack review.
+Controlled ESP reboot is unsupported on a bridge, but shared ZKT code retains
+its RTC witness and pending-action storage. These costs must be measured in the
+exact ELF/map along with the reserved journal worker stacks. They do not identify
+the cause of the previous 2.6.19 rollback. This candidate must not be described as
+fixing that cause without reproduction and evidence.
+
 The [5 October experimental HIL direction](zkt-2.7.0-experimental-hil.md)
 permits remote HIL using ADD and automated evidence without waiting for external
 Oracle/bench resources. Those tests remain unperformed; unfinished software,
