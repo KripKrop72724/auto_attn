@@ -25,6 +25,18 @@ jobs:
         timeout-minutes: 3
         shell: powershell
         run: |
+          # A reused Windows checkout can keep clean CRLF bytes when only
+          # .gitattributes changed. Recreate this one trusted tracked file;
+          # checkout-index --force alone may retain its cached working bytes.
+          $head = git rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'AUDIT_CHECKOUT_IDENTITY_CHANGED' }
+          git diff --cached --quiet -- scripts/audit_factory_bundle.py
+          if ($LASTEXITCODE -ne 0) { throw 'AUDIT_CHECKOUT_INDEX_CHANGED' }
+          git diff --quiet -- scripts/audit_factory_bundle.py
+          if ($LASTEXITCODE -ne 0) { throw 'AUDIT_CHECKOUT_WORKTREE_CHANGED' }
+          Remove-Item -LiteralPath scripts/audit_factory_bundle.py -Force
+          git checkout-index --force -- scripts/audit_factory_bundle.py
+          if ($LASTEXITCODE -ne 0) { throw 'AUDIT_CHECKOUT_REFRESH_FAILED' }
           # Docker uses a bounded shell=False launcher; native stderr is never
           # emitted or redirected through Windows PowerShell 5.1.
           python scripts/invoke_factory_audit.py
