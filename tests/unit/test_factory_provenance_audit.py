@@ -8,8 +8,10 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import struct
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -651,3 +653,24 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("deploy.ps1", workflow)
         self.assertNotIn("publish-factory-firmware", workflow)
         self.assertIn("if-no-files-found: error", workflow)
+
+    @unittest.skipUnless(shutil.which("git"), "Git checkout is required")
+    def test_windows_style_checkout_preserves_pinned_verifier_bytes(self):
+        source_root = self.script.parent.parent
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "scripts").mkdir()
+            (root / "empty-hooks").mkdir()
+            (root / ".gitattributes").write_bytes((source_root / ".gitattributes").read_bytes())
+            target = root / "scripts/audit_factory_bundle.py"
+            target.write_bytes(self.script.read_bytes())
+            command = ["git", "-c", "core.autocrlf=true", "-c", "core.eol=crlf",
+                       "-c", "core.hooksPath=" + str(root / "empty-hooks")]
+            for arguments in (["init", "-q"], ["add", ".gitattributes", "scripts/audit_factory_bundle.py"]):
+                subprocess.run(command + arguments, cwd=root, check=True,
+                               capture_output=True, timeout=15)
+            target.unlink()
+            subprocess.run(command + ["checkout", "--", "scripts/audit_factory_bundle.py"],
+                           cwd=root, check=True, capture_output=True, timeout=15)
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), launch.AUDITOR_SHA256)
+            self.assertNotIn(b"\r\n", target.read_bytes())

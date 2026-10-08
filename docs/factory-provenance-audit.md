@@ -18,6 +18,10 @@ mounts, no network, no added capabilities, a non-root user, bounded memory,
 CPU and process counts, and a 60-second verifier deadline. Host subprocess
 output and execution time are also bounded; raw stderr is never exported.
 
+The verifier has a targeted Git attribute that preserves LF bytes on Windows,
+and Windows CI checks those actual checkout bytes against the same pinned hash.
+The launcher does not normalize or accept modified bytes before verification.
+
 Verification covers the signed manifest and its exact source identity, all
 image hashes, complete padded application and bootloader secure-boot
 signatures, the ESP32-S3 application descriptor and validation digest, the

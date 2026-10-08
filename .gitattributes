@@ -1,1 +1,3 @@
 *.sh text eol=lf
+# This verifier's exact checkout bytes are pinned by the read-only launcher.
+scripts/audit_factory_bundle.py text eol=lf
