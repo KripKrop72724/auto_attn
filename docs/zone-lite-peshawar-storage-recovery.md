@@ -55,6 +55,25 @@ read is measured, reported to ADD, and skipped:
 The generation and record identities are unchanged from 2.6.24. Rows that 2.6.24
 already moved into ADD custody replay the same receipts.
 
+ZONE-PESHAWAR-06 completed 2.6.24 on 8 October 2026. All 11,959 rows reached ADD
+custody. Storage use fell from 5,192,688 to 1,659,361 bytes, and the device
+returned to 2.5.2. The removal and UID recording took about 13 minutes of SPIFFS
+garbage collection; the image logs nothing during that step.
+
+### Removing a file with an unreadable data page
+
+ESP-IDF 5.5.3 SPIFFS removes a file from its last page backwards. It first marks
+the index header deleted, so the name disappears at once. If a data page fails
+its header check, the removal stops there but still returns success. Pages after
+the bad page are freed. Pages before it stay allocated until a SPIFFS filesystem
+check reclaims them, and Zone Lite never runs that check.
+
+After a 2.6.25 run that skipped a region, compare `STORAGE_RECOVERY_INVENTORY_AFTER`
+with the use before the run. Expect a drop of roughly the retired file size less
+the recorded UIDs (65 bytes each). A much smaller drop means the start of the file
+is still allocated. Reclaiming it needs a separately approved filesystem check,
+because that check also repairs or drops pages of any other damaged file.
+
 ## What the image does
 
 2.6.25 is a separately built ZKT role
