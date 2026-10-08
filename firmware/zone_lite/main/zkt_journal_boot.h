@@ -26,6 +26,8 @@ typedef struct {
     zj_boot_mode_t mode;
     const char *terminal_serial;
     bool secure, storage_ready, writer_build, bridge_validation_pending;
+    /* Availability permits recovery work; it never grants capture/boot proof. */
+    bool storage_available;
 } zj_boot_input_t;
 typedef struct {
     zj_boot_mode_t mode;

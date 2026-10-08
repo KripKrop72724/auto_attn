@@ -43,8 +43,8 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
     if (!serial_valid(in->terminal_serial)) { s->phase = ZJ_BOOT_BINDING_HOLD; return; }
     if (s->terminal_serial[0] && strcmp(s->terminal_serial, in->terminal_serial)) s->binding_changed = true;
     if (s->binding_changed) { s->phase = ZJ_BOOT_BINDING_HOLD; return; }
-    if (!in->storage_ready) { s->phase = ZJ_BOOT_STORAGE_WAIT; return; }
     if (!s->owner_started) {
+        if (!in->storage_ready && !in->storage_available) { s->phase = ZJ_BOOT_STORAGE_WAIT; return; }
         s->phase = ZJ_BOOT_OWNER_START;
         if (!due(s, now)) return;
         increment(&s->start_attempts);
@@ -105,6 +105,10 @@ void zj_boot_step(zj_boot_t *s, zj_boot_port_t p, const zj_boot_input_t *in)
          * grant capture. An accepted proof operation can finish after timeout. */
         return;
     }
+    /* The owner/transport must be able to transfer the evidence needed to
+     * repair a legacy persistence incident. Health remains mandatory for
+     * reader attestation, capture admission and local boot acceptance. */
+    if (!in->storage_ready) { s->phase = ZJ_BOOT_STORAGE_WAIT; return; }
     if (!owner.ready || owner.checkpoint_recovery_pending) { s->phase = ZJ_BOOT_RECOVERING; return; }
     if (owner.delivery_authority == ZJ_AUTHORITY_UNKNOWN) { s->phase = ZJ_BOOT_AUTHORITY_HOLD; return; }
     if (!in->writer_build) { s->phase = ZJ_BOOT_WRITER_DISABLED; return; }

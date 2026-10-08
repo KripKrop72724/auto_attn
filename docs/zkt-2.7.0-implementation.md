@@ -8,6 +8,14 @@ This register records implementation evidence. It is not a release certificate.
 No signed bridge or 2.7.0 candidate is qualified by the existence of code.
 Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 
+The 3FL 2.6.18 canary failed journal transport startup on a fragmented internal
+heap and returned to 2.6.15 through its existing rollback slot. The immutable
+2.6.19 replacement reserves both full journal worker stacks, permits receipt-bound
+recovery before the healthy-storage gate, and distinguishes successful worker
+restarts from failed attempts. This source repair does not certify a signed
+bridge or enable the 2.7.0 writer; installed-image and recovery evidence remain
+required.
+
 The [5 October experimental HIL direction](zkt-2.7.0-experimental-hil.md)
 permits remote HIL using ADD and automated evidence without waiting for external
 Oracle/bench resources. Those tests remain unperformed; unfinished software,

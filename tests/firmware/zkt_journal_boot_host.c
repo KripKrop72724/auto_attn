@@ -70,6 +70,29 @@ static void ready(zj_boot_t *s, fixture_t *f, zj_boot_input_t *in)
 }
 int main(void)
 {
+    /* A legacy read incident may itself require a receipt from this transport.
+     * It must not prevent the already-running owner from starting recovery
+     * delivery. Reader attestation and capture remain held. */
+    {
+        fixture_t blocked = {0}; zj_boot_t recovery = {0};
+        zj_boot_input_t recovering = input(100); healthy(&blocked,100);
+        recovering.storage_ready = false;
+        recovery.owner_started = true;
+        strcpy(recovery.terminal_serial,"TEST-SERIAL");
+        step(&recovery,&blocked,&recovering,100);
+        assert(blocked.transports == 1 && recovery.transport_started);
+        step(&recovery,&blocked,&recovering,101);
+        assert(!blocked.submissions && !blocked.captures && !recovery.reader_ready &&
+            !recovery.writer_ready && !zj_boot_local_ready(&recovery,101));
+        memset(&blocked,0,sizeof(blocked)); memset(&recovery,0,sizeof(recovery));
+        recovering.storage_available=true; healthy(&blocked,100);
+        step(&recovery,&blocked,&recovering,100);
+        assert(blocked.owners==1 && recovery.owner_started);
+        step(&recovery,&blocked,&recovering,101);
+        assert(blocked.transports==1 && !blocked.captures && !recovery.reader_ready);
+        step(&recovery,&blocked,&recovering,102);
+        assert(recovery.phase==ZJ_BOOT_STORAGE_WAIT && !recovery.writer_ready && !blocked.submissions);
+    }
     zj_boot_t s={0}; fixture_t f={0}; zj_boot_input_t in=input(1);
     in.mode=ZJ_BOOT_DISABLED; step(&s,&f,&in,1); assert(s.phase==ZJ_BOOT_OFF && !f.owners && zj_boot_local_ready(&s,1));
     in.mode=ZJ_BOOT_WRITER; in.secure=false; step(&s,&f,&in,2); assert(s.phase==ZJ_BOOT_SECURITY_HOLD && !f.owners);

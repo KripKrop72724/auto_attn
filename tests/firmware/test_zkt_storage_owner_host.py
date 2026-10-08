@@ -51,7 +51,7 @@ def test_storage_mailbox_saturation_timeout_and_fairness(tmp_path):
 def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path):
     main = ROOT / "firmware/zone_lite/main"
     fixture = ROOT / "tests/firmware"
-    for header in ["esp_heap_caps.h", "esp_random.h", "esp_timer.h", "esp_app_desc.h", "nvs.h",
+    for header in ["esp_attr.h", "esp_heap_caps.h", "esp_random.h", "esp_timer.h", "esp_app_desc.h", "nvs.h",
                    "freertos/FreeRTOS.h", "freertos/semphr.h", "freertos/task.h",
                    "mbedtls/platform_util.h"]:
         path = tmp_path / header

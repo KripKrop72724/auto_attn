@@ -86,7 +86,7 @@ int main(void)
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && !storage.writes);
 
-    const char *historical[] = {"2.6.16", "2.6.17", "2.6.18"};
+    const char *historical[] = {"2.6.16", "2.6.17", "2.6.18", "2.6.19"};
     for (size_t i = 0; i < sizeof(historical) / sizeof(*historical); ++i) {
         if (!strcmp(historical[i], ZJ_BRIDGE_VERSION)) continue;
         memcpy(storage.bytes + 168, historical[i], strlen(historical[i]) + 1);

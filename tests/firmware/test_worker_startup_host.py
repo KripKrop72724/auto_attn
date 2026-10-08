@@ -10,6 +10,92 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("hikvision", [0, 1])
+def test_delivery_success_counters_exclude_failed_creation(tmp_path, hikvision):
+    firmware = ROOT / "firmware/zone_lite/main"
+    source = (firmware / "add_connector.c").read_text()
+    report = source[source.index("static void worker_start_succeeded("):
+                    source.index("void add_connector_report_ords_worker(")]
+    supervisor = source[source.index("static void delivery_supervisor_task("):
+                        source.index("void add_connector_init(")]
+    harness = r'''
+#include "worker_retry.h"
+#include <assert.h>
+#include <setjmp.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <string.h>
+#define pdPASS 1
+#define pdMS_TO_TICKS(x) (x)
+#define LED_STATUS_LOCAL_FAILURE 1
+typedef void *TaskHandle_t;
+static atomic_uint_least32_t s_outbox_successful_starts,s_ords_successful_starts;
+static uint32_t s_ords_start_attempts,s_outbox_tick_ms;
+static bool s_ords_worker_started,s_worker_start_failed;
+static bool s_client=true,s_outboxes_initialized=true;
+static TaskHandle_t s_outbox_task_handle,s_heartbeat_task_handle;
+static worker_retry_t s_outbox_retry,s_heartbeat_retry;
+static jmp_buf done;
+static uint32_t now,stop_at;
+static unsigned failures,creates,heartbeat_creates;
+static int64_t monotonic_ms(void){return now;}
+static void heartbeat_task(void *arg){(void)arg;}
+static void outbox_task(void *arg){(void)arg;}
+static int xTaskCreate(void (*task)(void *),const char *name,unsigned stack,
+                       void *arg,unsigned priority,TaskHandle_t *handle){
+ (void)name;assert(!arg && stack==8192 && priority==4);
+ if(task==outbox_task){++creates;if(failures){--failures;return 0;}}
+ else {assert(task==heartbeat_task);++heartbeat_creates;}
+ *handle=(void *)1;return pdPASS;
+}
+static void led_status_fault(int fault){assert(fault==LED_STATUS_LOCAL_FAILURE);}
+static void restore_command_inbox(void){}
+#if !ZONE_LITE_HIKVISION
+static void catalog_owner_maintenance(void){}
+#endif
+static void vTaskDelay(unsigned ms){now+=ms;if(now>=stop_at)longjmp(done,1);}
+/* PRODUCTION */
+int main(void){
+ failures=3;stop_at=600000;
+ if(!setjmp(done))delivery_supervisor_task(NULL);
+ assert(creates==3 && heartbeat_creates==1 && s_outbox_retry.total==3);
+ assert(!atomic_load(&s_outbox_successful_starts));
+ stop_at=601000;
+ if(!setjmp(done))delivery_supervisor_task(NULL);
+ assert(creates==4 && s_outbox_retry.total==4 && atomic_load(&s_outbox_successful_starts)==1);
+ /* A healthy task is never recreated by repeated supervisor iterations. */
+ stop_at=610000;
+ if(!setjmp(done))delivery_supervisor_task(NULL);
+ assert(creates==4 && atomic_load(&s_outbox_successful_starts)==1);
+ /* Model a worker that completed its own shutdown, not an asynchronous kill. */
+ s_outbox_task_handle=NULL;stop_at=611000;
+ if(!setjmp(done))delivery_supervisor_task(NULL);
+ assert(creates==5 && atomic_load(&s_outbox_successful_starts)==2);
+ add_connector_report_ords_start(false,1);
+ add_connector_report_ords_start(false,2);
+ assert(s_ords_start_attempts==2 && !atomic_load(&s_ords_successful_starts));
+ add_connector_report_ords_start(true,3);
+ assert(atomic_load(&s_ords_successful_starts)==1);
+ add_connector_report_ords_start(false,4);
+ assert(atomic_load(&s_ords_successful_starts)==1);
+ add_connector_report_ords_start(true,5);
+ assert(atomic_load(&s_ords_successful_starts)==2);
+ atomic_store(&s_ords_successful_starts,UINT32_MAX);
+ add_connector_report_ords_start(true,UINT32_MAX);
+ assert(atomic_load(&s_ords_successful_starts)==UINT32_MAX);
+ return 0;
+}
+'''
+    unit = tmp_path / "delivery-start.c"
+    unit.write_text(harness.replace("/* PRODUCTION */", report + supervisor))
+    executable = tmp_path / "delivery-start"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+                    f"-DZONE_LITE_HIKVISION={hikvision}", "-fsanitize=address,undefined",
+                    "-fno-omit-frame-pointer", "-I", str(firmware), str(unit),
+                    str(firmware / "worker_retry.c"), "-o", str(executable)], check=True)
+    subprocess.run([str(executable)], cwd=tmp_path, check=True, timeout=30)
+
+
+@pytest.mark.parametrize("hikvision", [0, 1])
 def test_startup_retries_do_not_reboot_or_recreate_healthy_capture(tmp_path, hikvision):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "zone_lite.c").read_text()
