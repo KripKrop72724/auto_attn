@@ -77,6 +77,10 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     if version == "2.7.0":
         from zk_add.zkt_writer_contract import validate_writer_manifest
         return validate_writer_manifest(manifest)
+    if version == "2.6.24":
+        # The one-shot recovery role never falls through to the legacy path.
+        from zk_add.storage_recovery import validate_recovery_manifest
+        return validate_recovery_manifest(manifest)
     contract = manifest.get("queue_storage")
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:

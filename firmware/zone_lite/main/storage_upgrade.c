@@ -32,6 +32,9 @@ const char *storage_upgrade_contract(void)
 #else
     return "ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17";
 #endif
+#elif defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    /* One-shot custody transfer that always returns to the exact signed 2.5.2. */
+    return "ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2";
 #elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
     return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14";
 #elif ZONE_LITE_SEGMENTED_WRITES

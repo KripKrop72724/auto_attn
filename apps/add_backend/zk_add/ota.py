@@ -35,6 +35,13 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from zk_add.db import Base
 from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
+from zk_add.storage_recovery import (
+    OFFERABLE_STATES as RECOVERY_OFFERABLE_STATES,
+    RELEASE_ID as RECOVERY_RELEASE_ID,
+    VERSION as RECOVERY_VERSION,
+    recovery_hil_targets,
+    validate_recovery_image,
+)
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
@@ -308,6 +315,8 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
     if identity[:2] in {("zone-lite-2.6.16", "2.6.16"), ("zone-lite-2.6.17", "2.6.17"), ("zone-lite-2.6.18", "2.6.18"), ("zone-lite-2.6.19", "2.6.19"), ("zone-lite-2.6.20", "2.6.20"), ("zone-lite-2.6.21", "2.6.21"), ("zone-lite-2.6.23", "2.6.23"), ("zone-lite-2.7.0", "2.7.0")}:
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
+    if identity[:2] == (RECOVERY_RELEASE_ID, RECOVERY_VERSION):
+        return recovery_hil_targets(raw)
     # The general parser retains its eight-device limit. Only the exact
     # already signed image and reviewed fourteen-device scope can exceed it.
     if identity == HIL_2615_BLD5_IDENTITY and raw == [target.model_dump() for target in HIL_2615_CITY_TARGETS]:
@@ -320,6 +329,16 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
+    if release.version == RECOVERY_VERSION:
+        # Exact signed one-shot scope. Each target starts independently and is
+        # never ordered behind another target's acceptance: the image always
+        # returns to 2.5.2. The shared ordered HIL configuration is untouched.
+        if not settings.firmware_hil_enabled:
+            raise ValueError("Ordered firmware HIL quarantine is disabled.")
+        validate_storage_contract(release.manifest or {}, release.version)
+        if release.state != "HIL_ONLY" or release.release_id != RECOVERY_RELEASE_ID:
+            raise ValueError("Storage recovery is restricted to its exact HIL-only release.")
+        return recovery_hil_targets(raw)
     bridge = release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
     if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
@@ -565,6 +584,8 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             None if connector.zkt_custody_enabled else "JOURNAL_ADD_CUSTODY_DISABLED")
     if release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"} and release.state != "HIL_ONLY":
         return "JOURNAL_BRIDGE_HIL_ONLY"
+    if release.version == RECOVERY_VERSION and release.state != "HIL_ONLY":
+        return "STORAGE_RECOVERY_HIL_ONLY"
     if contract and contract.get("allowed_bootstrap_versions") is not None:
         qualified_version = next(
             (
@@ -875,6 +896,8 @@ def sync_release_store(session: Session) -> None:
         if manifest.get("version") == "2.7.0":
             from zk_add.zkt_writer_contract import validate_writer_image
             validate_writer_image(image_bytes, manifest)
+        if manifest.get("version") == RECOVERY_VERSION:
+            validate_recovery_image(image_bytes)
         application_digest = str(manifest.get("application_sha256") or "")
         if application_digest and (
             len(application_digest) != 64 or application_digest != application_digest.lower() or
@@ -1060,6 +1083,9 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         pending_offer = True
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
+        return None
+    if release.version == RECOVERY_VERSION and deployment.status not in RECOVERY_OFFERABLE_STATES:
+        # A selected one-shot image is never re-offered after the device returns.
         return None
     try:
         require_family_match(connector.firmware_family, release.manifest or {})
@@ -1722,6 +1748,8 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     release = session.get(FirmwareRelease, deployment.release_id) if deployment else None
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         raise ValueError("Firmware release is unavailable.")
+    if release.version == RECOVERY_VERSION and deployment.status not in RECOVERY_OFFERABLE_STATES:
+        raise ValueError("A selected one-shot storage recovery image is never downloaded again.")
     if release.state == "HIL_ONLY":
         campaign = session.get(FirmwareCampaign, deployment.campaign_id)
         if campaign is None or campaign.status != "ACTIVE" or deployment.status not in ACTIVE_DEPLOYMENT_STATES:

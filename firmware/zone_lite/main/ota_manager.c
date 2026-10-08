@@ -27,6 +27,7 @@
 #include "nvs.h"
 
 #include "add_connector.h"
+#include "storage_recovery.h"
 #include "zone_config.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_ota_guard.h"
@@ -940,6 +941,76 @@ static bool confirm_or_report_rollback(void)
     return false;
 }
 
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+#define OTA_RECOVERY_START_SECONDS (30 * 60)
+#define OTA_RECOVERY_MAX_SECONDS (9 * 60 * 60)
+#define OTA_RECOVERY_STOP_WAIT_SECONDS (30 * 60)
+#define OTA_RECOVERY_REPORT_SECONDS 60
+/* The returning 2.5.2 cannot be relied on to settle the deployment, so the
+ * terminal outcome is retried for about two minutes before the rollback. */
+#define OTA_RECOVERY_FINAL_REPORT_ATTEMPTS 12
+static bool s_recovery_authorized;
+
+bool ota_manager_storage_recovery_authorized(void) { return s_recovery_authorized; }
+
+static bool recovery_journal_matches(const ota_journal_t *journal)
+{
+    const esp_app_desc_t *running = esp_app_get_description();
+    return journal && running && journal->deployment_id[0] &&
+        !strcmp(journal->state, "READY_TO_BOOT") &&
+        !strcmp(running->version, journal->target_version) &&
+        !strcmp(running->version, STORAGE_RECOVERY_VERSION);
+}
+
+/* The recovery image never calls esp_ota_mark_app_valid_cancel_rollback().
+ * It leaves either through the bootloader rollback below or through any reset,
+ * which IDF also turns into a rollback because the image remains pending. No
+ * OTA journal is written: 2.5.2 reads its own legacy journal after returning,
+ * and a stale journal_v1 must never be left for a later 2.6.x image. */
+static bool storage_recovery_boot(void)
+{
+    (void)confirm_or_report_rollback; /* Ordinary boot proof is never used here. */
+    int64_t started = esp_timer_get_time() / 1000000;
+    int64_t last_report = started;
+    int64_t stop_at = 0;
+    /* Exact running-image evidence first, even if the run ends immediately. */
+    if (s_recovery_authorized) (void)report_state("BOOTED_PENDING", "STORAGE_RECOVERY_RUNNING");
+    while (s_recovery_authorized && storage_recovery_state() != STORAGE_RECOVERY_DONE) {
+        int64_t now = esp_timer_get_time() / 1000000;
+        bool never_started = storage_recovery_state() == STORAGE_RECOVERY_IDLE &&
+            now - started >= OTA_RECOVERY_START_SECONDS;
+        if (!stop_at && (never_started || now - started >= OTA_RECOVERY_MAX_SECONDS)) {
+            storage_recovery_request_stop();
+            stop_at = now;
+        }
+        // Transfers stop between rows; retirement finishes. Both are bounded.
+        if (stop_at && (never_started || now - stop_at >= OTA_RECOVERY_STOP_WAIT_SECONDS)) break;
+        if (now - last_report >= OTA_RECOVERY_REPORT_SECONDS) {
+            (void)report_state("BOOTED_PENDING", "STORAGE_RECOVERY_RUNNING");
+            last_report = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    const char *code = !s_recovery_authorized ? "STORAGE_RECOVERY_NOT_AUTHORIZED" :
+        storage_recovery_state() == STORAGE_RECOVERY_DONE ? storage_recovery_code() : "STORAGE_RECOVERY_TIMEOUT";
+    // FAILED is the transition that already returned these targets to 2.5.2.
+    // Only an authorized deployment is reported; s_last_error stays empty until
+    // then so a heartbeat cannot turn the outcome into a separate OTA alert.
+    for (int attempt = 0; attempt < OTA_RECOVERY_FINAL_REPORT_ATTEMPTS && s_recovery_authorized; ++attempt) {
+        if (report_state("FAILED", code)) break;
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+    strlcpy(s_last_error, code, sizeof(s_last_error));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    // Only reached when IDF has no bootable predecessor. Stay reachable so ADD
+    // can reinstall the signed 2.5.2 release through the ordinary OTA path.
+    ESP_LOGE(TAG, "Storage recovery rollback failed: %s", esp_err_to_name(err));
+    strlcpy(s_last_error, "STORAGE_RECOVERY_ROLLBACK_FAILED", sizeof(s_last_error));
+    return true;
+}
+#endif
+
 static bool acknowledge_pending_success(void)
 {
     if (!s_journal.deployment_id[0] || strcmp(s_journal.state, "RECONCILING") != 0) {
@@ -983,7 +1054,11 @@ static void ota_task(void *argument)
             continue;
         }
         if (!boot_checked) {
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+            boot_checked = storage_recovery_boot();
+#else
             boot_checked = confirm_or_report_rollback();
+#endif
             if (!boot_checked) {
                 atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
                 vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS)); continue;
@@ -1024,6 +1099,29 @@ void ota_manager_init(void)
     if (!cache_running_image_digest())
         ESP_LOGW(TAG, "Running image digest unavailable at boot; OTA evidence will retry");
     load_journal();
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    {
+        /* Authorize storage changes only for the exact deployment that just
+         * selected this image. Decided once, before any concurrent reader. */
+        s_recovery_authorized = s_journal_ready && recovery_journal_matches(&s_journal);
+        if (!s_recovery_authorized) {
+            /* A stale journal_v1 from an older 2.6.x attempt must not hide the
+             * legacy journal 2.5.2 wrote for this deployment. It is used in
+             * memory only; this image never writes either journal. */
+            ota_journal_t legacy = {0};
+            size_t size = sizeof(legacy);
+            nvs_handle_t handle;
+            if (nvs_open(OTA_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+                if (nvs_get_blob(handle, "journal", &legacy, &size) == ESP_OK && size == sizeof(legacy) &&
+                    ota_journal_valid(&legacy) && recovery_journal_matches(&legacy)) {
+                    s_journal = s_committed_journal = legacy;
+                    s_journal_ready = s_recovery_authorized = true;
+                }
+                nvs_close(handle);
+            }
+        }
+    }
+#endif
 #if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
     zf_platform_prepare(s_journal_ready ? s_journal.deployment_id : "",s_running_image_digest);
 #endif

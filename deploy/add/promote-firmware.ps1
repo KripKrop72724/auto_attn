@@ -6,6 +6,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Version -eq '2.6.24') {
+    throw 'The one-shot storage recovery image always returns to 2.5.2 and can never be promoted'
+}
 $store = (Resolve-Path $StoreDirectory).Path
 $release = Join-Path $store $Version
 $markerPath = Join-Path $release '.hil-only.json'

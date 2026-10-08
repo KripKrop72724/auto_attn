@@ -1,0 +1,12 @@
+[
+  {
+    "connector_id": "bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e",
+    "mac": "e0:72:a1:d7:05:c4",
+    "terminal_serial": "CJH9211060009"
+  },
+  {
+    "connector_id": "233dac02-eb1b-4598-a876-e3a7b1ecfd54",
+    "mac": "e0:72:a1:d5:08:a0",
+    "terminal_serial": "CJH9211060002"
+  }
+]

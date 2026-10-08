@@ -189,6 +189,20 @@ if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.15') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-15-hil-scope.ps1')
     Assert-Zkt2615HilScope -HilTargetsJson $HilTargetsJson
 }
+if ($Version -eq '2.6.24') {
+    # One-shot storage recovery: exact signed Peshawar scope, never AVAILABLE.
+    if ($manifest.firmware_family -cne 'zkt' -or $PublicationMode -ne 'HIL_ONLY' -or
+        -not [string]::IsNullOrWhiteSpace($HilTargetMac) -or
+        $manifest.release_channel -cne 'EXPERIMENTAL_HIL_ONLY' -or
+        $manifest.minimum_bootstrap_version -cne '2.5.2') {
+        throw 'ZKT 2.6.24 storage recovery must be published only to its exact experimental HIL scope'
+    }
+    . (Join-Path $PSScriptRoot 'firmware-2-6-24-hil-scope.ps1')
+    Assert-Zkt2624HilScope -HilTargetsJson $HilTargetsJson
+    Assert-Zkt2624HilScope -HilTargetsJson (ConvertTo-Json -InputObject @($manifest.hil_targets) -Depth 5 -Compress)
+    . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
+    Get-FirmwareStorageContract -ImagePath $image -Version $Version -ForSigning | Out-Null
+}
 $scopeJson = ConvertTo-Json -InputObject @($targets) -Depth 5 -Compress
 
 $final = Join-Path $store $Version

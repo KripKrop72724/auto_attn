@@ -18,7 +18,22 @@ idf_component_register(
     INCLUDE_DIRS "." "${ZONE_LITE_GENERATED_DIR}"
     REQUIRES esp_wifi esp_netif esp_http_server esp_driver_gpio nvs_flash lwip esp_http_client esp_https_ota app_update esp_partition esp-tls esp_app_format json spiffs mbedtls esp_timer led_strip esp_websocket_client
 )
-target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c" "zkt_socket_io.c" "add_source_wire.c" "ota_progress_receipt.c" "legacy_storage_health.c")
+target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c" "zkt_socket_io.c" "add_source_wire.c" "ota_progress_receipt.c" "legacy_storage_health.c"
+    "storage_recovery_core.c" "storage_recovery.c")
+# The one-shot recovery image is its own exact role. It never confirms itself
+# and always returns to the signed 2.5.2 predecessor; no other version may
+# claim it and it cannot be combined with another storage mode.
+if(ZONE_LITE_STORAGE_RECOVERY)
+    if(NOT ZONE_LITE_FAMILY STREQUAL "zkt" OR ZONE_LITE_SEGMENTED_WRITES OR ZONE_LITE_DIRECT_LEGACY_UPGRADE OR ZONE_LITE_JOURNAL_WRITES)
+        message(FATAL_ERROR "The storage recovery image is a separate ZKT legacy-mode role")
+    endif()
+    if(NOT PROJECT_VER STREQUAL "2.6.24")
+        message(FATAL_ERROR "The storage recovery image requires its exact 2.6.24 version")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_STORAGE_RECOVERY_IMAGE=1)
+elseif(PROJECT_VER STREQUAL "2.6.24")
+    message(FATAL_ERROR "Version 2.6.24 is reserved for the storage recovery image")
+endif()
 if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_QUEUE_OWNER=1)
     target_sources(${COMPONENT_LIB} PRIVATE "zkt_journal_codec.c" "zkt_journal_crypto.c" "zkt_journal_store.c"

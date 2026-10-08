@@ -74,6 +74,25 @@ function Get-FirmwareStorageContract {
     }
     if ($journalMarkers.Count -gt 0) { throw 'Journal bridge marker cannot sign another firmware version' }
     $markers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:[A-Z]+:READ=[0-9]+:LANES=[0-9A-F]+:(?:COMPAT=[0-9.]+|BASE=[0-9.,]+)')
+    $recoveryMarker = 'ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2'
+    if ($Version -eq '2.6.24') {
+        # The one-shot recovery role carries only its own compiled contract and
+        # may return only to the exact signed 2.5.2 application.
+        if ($markers.Count -ne 1 -or $markers[0].Value -cne $recoveryMarker -or
+            -not $ascii.Contains($recoveryMarker + [char]0) -or
+            [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V').Count -ne 1) {
+            throw 'Missing, ambiguous, or incorrect storage recovery contract'
+        }
+        return [ordered]@{
+            allowed_bootstrap_images = [ordered]@{ '2.5.2' = '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b' }
+            allowed_bootstrap_versions = @('2.5.2')
+            read_format = 2
+            reader_mask = 63
+            schema_version = 2
+            write_format = 1
+        }
+    }
+    if ($ascii.Contains($recoveryMarker)) { throw 'The storage recovery contract cannot sign another firmware version' }
     if ($Version -notin @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15')) {
         if ($markers.Count -gt 0) { throw 'Storage-contract version is not qualified for signing' }
         return $null

@@ -16,3 +16,7 @@ bool ota_manager_hil_reboot_capable(void);
 bool ota_manager_hil_reboot_reserve(void);
 void ota_manager_hil_reboot_release(void);
 bool ota_manager_running_image(char output[65]);
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+/* True only when this boot was selected by its own pending deployment. */
+bool ota_manager_storage_recovery_authorized(void);
+#endif
