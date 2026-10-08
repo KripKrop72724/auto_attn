@@ -5402,8 +5402,10 @@ async def start_firmware_campaign(
         )
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    from zk_add.zkt_hil_schedule import campaign_audit_scope
     _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
-                  target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id, "release_id": body.release_id})
+                  target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id,
+                      "release_id": body.release_id, **campaign_audit_scope(db, campaign)})
     db.commit()
     await browser_events.publish(
         "firmware",

@@ -53,6 +53,15 @@ has actually qualified. Record the new build's ELF/map, internal memory and
 startup-stack evidence before signing; bridge-disabled reboot code still has
 static/RTC storage costs and is not evidence for the previous reset cause.
 
+Explicit writer rollback must retain the proved bridge's `VALID` state. Making
+that image `NEW` creates a pending bridge with retained ADD authority: capture
+cannot start until validation, and repeated live punches can prevent the
+terminal-stability window from completing. After durable reader intent and
+quiescence, invalidate the departed writer using IDF's rollback path, verify the
+exact selected reader and its unchanged `VALID` state, and retain uncertainty
+if selection or readback fails. This recovery defect does not explain the
+2.6.15-to-2.6.19 installation rollback.
+
 1. Finish and test the code needed for preservation, delivery, migration and
    rollback. Passing compilation alone does not finish an unimplemented path.
 2. Build and sign the compatibility bridge from a green exact main commit.

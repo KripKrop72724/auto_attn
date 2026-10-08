@@ -837,6 +837,22 @@ export interface FirmwareRelease {
   hil_next_target?: HilTarget | null
   hil_allowed_targets?: HilTarget[] | null
   hil_scope_message?: string | null
+  hil_schedule?: {
+    policy: string
+    denominator: number
+    counts: Record<'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED', number>
+    hold: string | null
+    rows: {
+      target: HilTarget
+      name: string
+      wave: string
+      exposed: boolean
+      status: 'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED'
+      reason: string
+      prerequisites: string[]
+      current_hold: string | null
+    }[]
+  } | null
 }
 
 export interface FirmwareCampaign {

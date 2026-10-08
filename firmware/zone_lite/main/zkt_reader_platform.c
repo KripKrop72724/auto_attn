@@ -204,11 +204,11 @@ zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
     if (!expected_digest) return ZJ_COMPAT_INVALID;
     if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
 #if defined(CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK) && CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
-    /* IDF 5.5.3's setter can erase an image rejected by anti-rollback. This
-     * release uses secure boot with anti-rollback disabled; do not enter the
-     * destructive code path in an unqualified build configuration. */
+    /* This release qualifies secure boot with anti-rollback disabled.
+     * Selecting a retained reader under another policy requires new proof. */
     return ZJ_COMPAT_ANTI_ROLLBACK;
 #endif
+    if (esp_ota_get_app_partition_count() != 2) return ZJ_COMPAT_SECURITY;
     zj_reader_environment_t env;
     zj_reader_identity_t current_id, previous_id;
     zj_compat_result_t result = current_reader(terminal_serial, capture_epoch, reader_ready,
@@ -228,15 +228,12 @@ zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
     bool already_selected = boot->address == previous->address && boot->size == previous->size;
     esp_ota_img_states_t previous_state;
     if (esp_ota_get_state_partition(previous, &previous_state) != ESP_OK) return ZJ_COMPAT_IO;
-    if (previous_state != ESP_OTA_IMG_VALID && !(already_selected && previous_state == ESP_OTA_IMG_NEW))
-        return ZJ_COMPAT_SECURITY;
+    if (previous_state != ESP_OTA_IMG_VALID) return ZJ_COMPAT_SECURITY;
     zj_reader_environment_t rollback = {.application = previous_app.project_name, .version = previous_app.version,
         .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
-        .ota_slot = true, .image_validated = previous_state == ESP_OTA_IMG_VALID};
+        .ota_slot = true, .image_validated = true};
     zj_reader_proof_port_t port = {read_proof, NULL, NULL};
-    result = already_selected && previous_state == ESP_OTA_IMG_NEW
-        ? zj_reader_check_selected(port, &env, &current_id, &rollback, &previous_id)
-        : zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
+    result = zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
     if (result != ZJ_COMPAT_OK) return result;
     if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
     /* Retry after lost success must still verify all proof above, but need
@@ -244,12 +241,20 @@ zj_compat_result_t zj_reader_platform_select(const char *terminal_serial,
     if (already_selected) return ZJ_COMPAT_OK;
     if (boot->address != current_id.slot_address || boot->size != current_id.slot_size)
         return ZJ_COMPAT_ROLLBACK;
+    if (!esp_ota_check_rollback_is_possible()) return ZJ_COMPAT_ROLLBACK;
     if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
-    /* IDF validates the signed image before selecting it. An error or failed
-     * readback may follow a partial otadata write: preserve the uncertainty. */
-    if (esp_ota_set_boot_partition(previous) != ESP_OK) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    /* The caller has durably committed READER_INTENT and drained accepted
+     * writes. Invalidate this departed writer rather than making its proved
+     * reader NEW: a pending bridge with retained ADD authority cannot capture
+     * until validation, so live punches would prevent terminal stability.
+     * IDF 5.5.3 permits invalidating a VALID writer and retains the other
+     * entry's VALID state. A failed write/readback remains uncertain. */
+    if (esp_ota_mark_app_invalid_rollback() != ESP_OK) return ZJ_COMPAT_SELECTION_UNCERTAIN;
     boot = esp_ota_get_boot_partition();
-    return boot && boot->address == previous->address && boot->size == previous->size
+    /* The otadata write may already have committed. Expiry now must revoke
+     * cached writer permission just like failed mutation readback. */
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_UNCERTAIN;
+    return boot && boot->address == previous->address && boot->size == previous->size && validated(previous)
         ? ZJ_COMPAT_OK : ZJ_COMPAT_SELECTION_UNCERTAIN;
 }
 
@@ -296,7 +301,7 @@ zj_compat_result_t zj_reader_platform_failed_boot(const char *terminal_serial,
      * terminal outage does not turn the recovery image into another trial. */
     if (esp_ota_mark_app_invalid_rollback() != ESP_OK) return ZJ_COMPAT_SELECTION_UNCERTAIN;
     boot = esp_ota_get_boot_partition();
-    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_EXPIRED;
+    if (!selection_deadline(deadline_us)) return ZJ_COMPAT_SELECTION_UNCERTAIN;
     return boot && boot->address == previous_id.slot_address && boot->size == previous_id.slot_size && validated(previous)
         ? ZJ_COMPAT_OK : ZJ_COMPAT_SELECTION_UNCERTAIN;
 }

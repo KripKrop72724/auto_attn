@@ -249,7 +249,7 @@ def test_bridge_scope_can_expand_without_changing_older_campaigns(session, monke
     monkeypatch.setattr(settings, "firmware_hil_targets_json", legacy)
     targets = signed_hil_targets()[:count]
     release = FirmwareRelease(id=123, release_id=f"zone-lite-{BRIDGE_VERSION}", version=BRIDGE_VERSION,
-        git_sha="a" * 40, image_sha256="b" * 64, state="HIL_ONLY",
+        git_sha="a" * 40, image_sha256="b" * 64, signing_key_id="test", state="HIL_ONLY",
         manifest={**bridge_manifest(), "_hil_targets": targets})
     assert [row.model_dump() for row in bridge_hil_targets(targets)] == targets
     assert [row.model_dump() for row in _permitted_hil_targets(session, release)] == targets[:1]
@@ -301,7 +301,9 @@ def test_real_bridge_campaign_and_scope_expansion_require_exact_previous_accepta
             firmware_family="zkt", firmware_version="2.6.15", connected=True,
             ota_capable=True, ota_secure_boot=True, ota_rollback_enabled=True,
             ota_partition_layout="zone-lite-ota-v1", ota_running_partition="ota_0",
-            ota_image_sha256=PREDECESSOR_IMAGES["2.6.15"])
+            ota_image_sha256=PREDECESSOR_IMAGES["2.6.15"], firmware_diagnostics={"storage": {
+                "durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True,
+                "upgrade_ready": True}})
         connector.zkt_device = ZKTDevice(serial=target["terminal_serial"], expected_serial=target["terminal_serial"],
             confirmed_serial=target["terminal_serial"], terminal_binding_state="CONFIRMED")
         session.add(connector)

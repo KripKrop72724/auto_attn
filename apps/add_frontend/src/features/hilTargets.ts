@@ -52,6 +52,10 @@ export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, d
 }
 
 export function hilScopeLabel(release: FirmwareRelease): string {
+  if (release.hil_schedule) {
+    const { counts, denominator, hold } = release.hil_schedule
+    return `${counts.PASSED}/${denominator} passed · ${counts.PENDING} pending · ${counts.DEFERRED_OFFLINE} deferred offline · ${counts.BLOCKED} blocked${hold ? ' · progression held' : ''}`
+  }
   if (release.hil_targets) {
     const allowed = hilAllowedTargets(release)
     if (allowed.length > 1) return `${allowed.length} exact HIL targets open for independent trials`

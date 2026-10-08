@@ -538,6 +538,12 @@ static void rollback_with_full_mailbox(void)
     reply = wait_reply(ticket);
     assert(reply.compatibility == ZJ_COMPAT_SELECTION_UNCERTAIN && selection_calls == 1 && ota_writes == 2);
     assert(ota_checkpoint_valid(&reply.rollback_intent) && reply.rollback_intent.generation == 8);
+    /* Includes expiry after the platform's otadata mutation: it is uncertain,
+     * never a retry-safe pre-action expiry or permission to resume capture. */
+    assert(zj_owner_health(&health) && health.quiescing && health.quiesced &&
+        !health.writer_allowed && !health.compatibility_checked);
+    assert(!zj_owner_submit(&capture, &refused));
+    assert(!strcmp(ota_blob.journal.state, failed_rollback_test ? "FAILED_BOOT_INTENT" : "READER_INTENT"));
     uncertain_selection = false;
     assert(zj_owner_select_quiesced_reader(&expected, &ticket));
     reply = wait_reply(ticket);
