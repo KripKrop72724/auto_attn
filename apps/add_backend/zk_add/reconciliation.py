@@ -1022,8 +1022,23 @@ def apply_reconciliation_assignment_release(
     """Release only transport credit; the committed source checkpoint is immutable."""
 
     job = _device_job(session, connector, payload.job_id)
-    _require_runnable(job, payload.generation)
     _require_source_epoch(session, connector, job, payload.source_epoch)
+    if job.capture_certified_at is not None:
+        certificate = job.capture_certificate or {}
+        if (payload.generation != job.terminal_generation
+                or payload.source_epoch != source_epoch_uuid(session, job)
+                or payload.committed_next_ordinal != job.cutoff_count
+                or job.committed_next_ordinal != job.cutoff_count
+                or job.active_assignment_id is not None
+                or not _valid_sealed_evidence(certificate)
+                or certificate.get("certified_source_cursor") != job.cutoff_count
+                or certificate.get("source_chain_digest") != (job.last_chain_digest or "0" * 64)
+                or _assurance_coverage(session, job) is None):
+            raise ValueError("Released certified reconciliation credit does not match its committed receipt.")
+        # A legacy reader reports a failed transport step after the deliberate
+        # negative manifest handoff. Its committed job has no credit to release.
+        return job
+    _require_runnable(job, payload.generation)
     # A chunk can commit in ADD before the connector receives its ACK.  The
     # connector may then release its credit with the last cursor it knows.
     # ADD's committed cursor remains authoritative; reject only a claimed
@@ -1057,15 +1072,250 @@ def apply_reconciliation_assignment_release(
     return job
 
 
+# Receipt proofs are bounded independently of the terminal's reported size.
+# A larger history stays on hold until a separately bounded verifier exists.
+COVERAGE_PROOF_MAX_RECORDS = 200_000
+COVERAGE_PROOF_PAGE = 256
+RETAINED_COVERAGE_POLICY = "PRESERVE_LONGER_SAME_EPOCH_V1"
+
+
+def _valid_sealed_evidence(evidence: object) -> bool:
+    if not isinstance(evidence, dict) or evidence.get("evidence_algorithm") != "HMAC-SHA256":
+        return False
+    signature = evidence.get("evidence_signature")
+    if not isinstance(signature, str):
+        return False
+    body = {key: value for key, value in evidence.items()
+            if key not in {"evidence_algorithm", "evidence_signature"}}
+    return hmac.compare_digest(signature, _sealed_evidence(body)["evidence_signature"])
+
+
+def _committed_chain_proof(session, statement, *, start, end, previous, final):
+    """Check server-committed receipts, not reconstructed mutable attendance.
+
+    Chunk acceptance validates raw bytes and digest, source keys and occurrence
+    identity against the canonical epoch before committing this receipt. A
+    different chunk layout legitimately has a different resulting chain.
+    """
+    if not 0 <= start <= end <= COVERAGE_PROOF_MAX_RECORDS:
+        raise ValueError("SOURCE_COVERAGE_PROOF_LIMIT")
+    cursor, chain, count = start, previous, 0
+    proof = hashlib.sha256()
+    model = statement.column_descriptions[0]["entity"]
+    while cursor < end:
+        rows = session.scalars(statement.where(model.start_ordinal >= cursor,
+            model.start_ordinal < end).order_by(model.start_ordinal)
+            .limit(COVERAGE_PROOF_PAGE)).all()
+        if not rows:
+            raise ValueError("SOURCE_COVERAGE_CHAIN_GAP")
+        for row in rows:
+            if (row.start_ordinal != cursor or not cursor < row.end_ordinal <= end
+                    or row.record_count != row.end_ordinal - cursor
+                    or not 1 <= row.record_count <= 100
+                    or row.previous_chain_digest != chain
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.chunk_digest or "")
+                    or row.committed_at is None
+                    or row.resulting_chain_digest != reconciliation_chain_digest(chain,
+                        start_ordinal=cursor, end_ordinal=row.end_ordinal,
+                        chunk_digest=row.chunk_digest)):
+                raise ValueError("SOURCE_COVERAGE_CHAIN_DIVERGED")
+            proof.update(json.dumps([row.id, cursor, row.end_ordinal, row.chunk_digest,
+                row.previous_chain_digest, row.resulting_chain_digest],
+                separators=(",", ":")).encode() + b"\n")
+            cursor, chain, count = row.end_ordinal, row.resulting_chain_digest, count + 1
+    if (chain or "0" * 64) != final:
+        raise ValueError("SOURCE_COVERAGE_CHAIN_ENDPOINT_DIVERGED")
+    return {"receipt_count": count, "receipts_sha256": proof.hexdigest()}
+
+
+def _canonical_inventory_proof(session, job, *, cursor):
+    if not 0 <= cursor <= COVERAGE_PROOF_MAX_RECORDS:
+        raise ValueError("SOURCE_COVERAGE_PROOF_LIMIT")
+    scope = (TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+        TerminalRecordManifest.generation == job.terminal_generation,
+        TerminalRecordManifest.source_epoch_id == job.source_epoch_id,
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal < cursor)
+    count, first, last = session.execute(select(func.count(TerminalRecordManifest.id),
+        func.min(TerminalRecordManifest.ordinal), func.max(TerminalRecordManifest.ordinal))
+        .where(*scope)).one()
+    # The unique canonical source-ordinal constraint plus these bounds proves
+    # contiguity. Negative ordinals cannot replace an otherwise missing record.
+    if count != cursor or (cursor and (first != 0 or last != cursor - 1)):
+        raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
+    after = -1
+    proof = hashlib.sha256()
+    while after + 1 < cursor:
+        rows = session.execute(select(TerminalRecordManifest.ordinal,
+            TerminalRecordManifest.connector_id, TerminalRecordManifest.terminal_serial,
+            TerminalRecordManifest.record_size, TerminalRecordManifest.raw_record_digest,
+            TerminalRecordManifest.terminal_record_key, TerminalRecordManifest.occurrence_index,
+            (TerminalRecordManifest.protected_raw_record.is_not(None)
+             & (func.length(TerminalRecordManifest.protected_raw_record) > 0)).label("raw_present"))
+            .where(*scope, TerminalRecordManifest.ordinal > after)
+            .order_by(TerminalRecordManifest.ordinal).limit(COVERAGE_PROOF_PAGE)).all()
+        if not rows:
+            raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
+        for row in rows:
+            if (row.ordinal != after + 1 or row.connector_id != job.connector_id
+                    or row.terminal_serial != job.terminal_serial or row.record_size != job.record_size
+                    or not row.raw_present or row.occurrence_index < 1
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.raw_record_digest or "")
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.terminal_record_key or "")):
+                raise ValueError("SOURCE_COVERAGE_CANONICAL_EVIDENCE_MISSING")
+            proof.update(json.dumps([row.ordinal, row.raw_record_digest, row.terminal_record_key,
+                row.occurrence_index, row.record_size], separators=(",", ":")).encode() + b"\n")
+            after = row.ordinal
+    return {"record_count": count, "canonical_inventory_sha256": proof.hexdigest()}
+
+
+def _retained_coverage_proof(session, job, coverage):
+    epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
+    prior_job = session.get(ReconciliationJob, coverage.job_id)
+    if (epoch is None or epoch.state != "ACTIVE" or epoch.zkt_device_id != job.zkt_device_id
+            or epoch.terminal_generation != job.terminal_generation
+            or not coverage.active or coverage.source_epoch_id != job.source_epoch_id
+            or coverage.terminal_serial != job.terminal_serial
+            or coverage.terminal_generation != job.terminal_generation
+            or prior_job is None or prior_job.source_epoch_id != job.source_epoch_id
+            or prior_job.zkt_device_id != job.zkt_device_id or prior_job.connector_id != job.connector_id
+            or prior_job.terminal_serial != job.terminal_serial
+            or prior_job.terminal_generation != job.terminal_generation
+            or job.record_size not in {8, 16, 40} or prior_job.record_size != job.record_size):
+        raise ValueError("SOURCE_COVERAGE_RETENTION_BINDING_MISMATCH")
+    if coverage.source_committed_cursor < job.cutoff_count:
+        raise ValueError("SOURCE_COVERAGE_RETENTION_COUNT_REGRESSION")
+    evidence = coverage.capture_evidence or {}
+    if (not _valid_sealed_evidence(evidence) or evidence != prior_job.capture_certificate
+            or evidence.get("job_id") != prior_job.job_id
+            or evidence.get("terminal_serial") != job.terminal_serial
+            or evidence.get("terminal_generation") != job.terminal_generation
+            or evidence.get("certified_source_cursor") != coverage.certified_source_cursor
+            or evidence.get("source_chain_digest") != coverage.source_chain_digest
+            or prior_job.cutoff_count != coverage.certified_source_cursor):
+        raise ValueError("SOURCE_COVERAGE_RETAINED_CERTIFICATE_INVALID")
+    short_chain = _committed_chain_proof(session, select(ReconciliationChunk).where(
+        ReconciliationChunk.job_id == job.id, ReconciliationChunk.generation == job.terminal_generation),
+        start=0, end=job.cutoff_count, previous=None, final=job.last_chain_digest or "0" * 64)
+    baseline_chain = _committed_chain_proof(session, select(ReconciliationChunk).where(
+        ReconciliationChunk.job_id == prior_job.id, ReconciliationChunk.generation == job.terminal_generation),
+        start=0, end=coverage.certified_source_cursor, previous=None, final=coverage.source_chain_digest)
+    tail_chain = _committed_chain_proof(session, select(SourceTailChunk).where(
+        SourceTailChunk.coverage_id == coverage.id, SourceTailChunk.connector_id == job.connector_id,
+        SourceTailChunk.zkt_device_id == job.zkt_device_id, SourceTailChunk.generation == job.terminal_generation),
+        start=coverage.certified_source_cursor, end=coverage.source_committed_cursor,
+        previous=coverage.source_chain_digest, final=coverage.source_committed_chain_digest)
+    inventory = _canonical_inventory_proof(session, job, cursor=coverage.source_committed_cursor)
+    return {"policy": RETAINED_COVERAGE_POLICY, "coverage_id": coverage.coverage_id,
+        "source_epoch": epoch.epoch_id, "terminal_serial": job.terminal_serial,
+        "terminal_generation": job.terminal_generation, "record_size": job.record_size,
+        "source_committed_cursor": coverage.source_committed_cursor,
+        "source_committed_chain_digest": coverage.source_committed_chain_digest,
+        "job_chain": short_chain, "retained_baseline_chain": baseline_chain,
+        "retained_tail_chain": tail_chain, "canonical_inventory": inventory}
+
+
+def _assurance_coverage(session, job):
+    """Resolve a job's own certificate without lending it another job's tail."""
+    certificate = job.capture_certificate or {}
+    active = session.scalar(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.job_id == job.id, ReconciliationCoverage.active == True))  # noqa: E712
+    if active is not None:
+        return None if "retained_coverage" in certificate else active
+    binding = certificate.get("retained_coverage")
+    if not isinstance(binding, dict) or not _valid_sealed_evidence(certificate):
+        return None
+    if binding.get("policy") != RETAINED_COVERAGE_POLICY:
+        return None
+    own = session.scalar(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.job_id == job.id, ReconciliationCoverage.active == False,  # noqa: E712
+        ReconciliationCoverage.invalidated_reason == RETAINED_COVERAGE_POLICY))
+    retained = session.scalar(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.coverage_id == binding.get("coverage_id"),
+        ReconciliationCoverage.active == True))  # noqa: E712
+    epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
+    cursor = binding.get("source_committed_cursor")
+    if (own is None or own.capture_evidence != certificate or retained is None or epoch is None
+            or epoch.state != "ACTIVE" or binding.get("source_epoch") != epoch.epoch_id
+            or epoch.zkt_device_id != job.zkt_device_id or epoch.terminal_generation != job.terminal_generation
+            or retained.source_epoch_id != job.source_epoch_id or own.source_epoch_id != job.source_epoch_id
+            or own.certified_source_cursor != job.cutoff_count or own.source_committed_cursor != job.cutoff_count
+            or own.source_chain_digest != (job.last_chain_digest or "0" * 64)
+            or own.source_committed_chain_digest != (job.last_chain_digest or "0" * 64)
+            or any(row.zkt_device_id != job.zkt_device_id or row.terminal_serial != job.terminal_serial
+                   or row.terminal_generation != job.terminal_generation for row in (own, retained))
+            or binding.get("terminal_serial") != job.terminal_serial
+            or binding.get("terminal_generation") != job.terminal_generation
+            or binding.get("record_size") != job.record_size
+            or type(cursor) is not int or not job.cutoff_count <= cursor <= retained.source_committed_cursor):
+        return None
+    try:
+        _committed_chain_proof(session, select(SourceTailChunk).where(
+            SourceTailChunk.coverage_id == retained.id, SourceTailChunk.connector_id == job.connector_id,
+            SourceTailChunk.zkt_device_id == job.zkt_device_id,
+            SourceTailChunk.generation == job.terminal_generation),
+            start=cursor, end=retained.source_committed_cursor,
+            previous=binding.get("source_committed_chain_digest"), final=retained.source_committed_chain_digest)
+    except ValueError:
+        return None
+    return own
+
+
+def reconciliation_manifest_authority(session, connector, job):
+    """Return current source authority when the manifest ACK must not install its cutoff.
+
+    Existing readers install their assignment cutoff on a positive manifest
+    ACK. An older certificate is durable, but it does not authorize replacing a
+    longer live cursor. The transport sends a matched negative handoff followed
+    by this existing authority, never a fabricated successful protocol ACK.
+    """
+    if job.capture_certified_at is None:
+        return None
+    coverage = active_coverage(session, connector.zkt_device)
+    if (coverage is None or coverage.source_epoch_id != job.source_epoch_id
+            or coverage.terminal_serial != job.terminal_serial
+            or coverage.terminal_generation != job.terminal_generation):
+        raise ValueError("Committed source manifest has no matching current source authority.")
+    if (coverage.source_committed_cursor == job.cutoff_count
+            and coverage.source_committed_chain_digest == (job.last_chain_digest or "0" * 64)):
+        return None
+    if coverage.source_committed_cursor < job.cutoff_count:
+        raise ValueError("Committed source authority regressed below the manifest cutoff.")
+    return {"type": "source_coverage", "coverage_id": coverage.coverage_id,
+        "source_epoch_id": coverage.source_epoch_id, "source_epoch": source_epoch_uuid(session, coverage),
+        "terminal_serial": coverage.terminal_serial, "terminal_generation": coverage.terminal_generation,
+        "certified_source_cursor": coverage.certified_source_cursor,
+        "source_chain_digest": coverage.source_chain_digest,
+        "source_committed_cursor": coverage.source_committed_cursor,
+        "source_committed_chain_digest": coverage.source_committed_chain_digest, "active": True}
+
+
 def apply_reconciliation_manifest(
     session: Session,
     *,
     connector: Connector,
     payload: ReconciliationManifestRequest,
 ) -> ReconciliationJob:
+    # Match WebSocket ingestion's connector-first ordering for HTTP callers as
+    # well. Tail extension and final certification must see one serialized cut.
+    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
     job = _device_job(session, connector, payload.job_id)
-    _require_runnable(job, payload.generation)
     _require_source_epoch(session, connector, job, payload.source_epoch)
+    if job.capture_certified_at is not None:
+        if (payload.generation != job.terminal_generation
+                or payload.terminal_generation != job.terminal_generation
+                or payload.terminal_serial != job.terminal_serial
+                or payload.cutoff_count != job.cutoff_count
+                or payload.final_chain_digest != (job.last_chain_digest or "0" * 64)
+                or payload.latest_terminal_count < payload.cutoff_count
+                or not _valid_sealed_evidence(job.capture_certificate)
+                or job.capture_certificate.get("certified_source_cursor") != job.cutoff_count
+                or job.capture_certificate.get("source_chain_digest") != (job.last_chain_digest or "0" * 64)):
+            raise ValueError("Replayed source manifest differs from its committed certificate.")
+        # The original response may have been lost, including after Oracle
+        # completion or a later tail commit. Return its immutable receipt.
+        return job
+    _require_runnable(job, payload.generation)
     if (
         job.terminal_serial != payload.terminal_serial
         or job.terminal_generation != payload.terminal_generation
@@ -1104,6 +1354,19 @@ def apply_reconciliation_manifest(
             "SOURCE_MANIFEST_GAP",
             "ADD does not hold one source-manifest row for every terminal ordinal.",
         )
+    prior_coverages = session.scalars(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
+        ReconciliationCoverage.active == True).with_for_update()  # noqa: E712
+        .execution_options(populate_existing=True)).all()
+    retained = next((row for row in prior_coverages
+                     if row.source_committed_cursor >= payload.cutoff_count), None)
+    retention = None
+    if retained is not None:
+        try:
+            retention = _retained_coverage_proof(session, job, retained)
+        except ValueError as exc:
+            return _safety_hold(session, job, str(exc),
+                "The longer committed source coverage could not be safely retained; its cursor and evidence remain unchanged.")
     now = utc_now()
     evidence = _sealed_evidence({
         "job_id": job.job_id,
@@ -1117,6 +1380,7 @@ def apply_reconciliation_manifest(
         "terminal_duplicates": job.terminal_duplicate_count,
         "firmware_version": job.firmware_version,
         "certified_at": now.isoformat(),
+        **({"retained_coverage": retention} if retention is not None else {}),
     })
     capture_state = (
         "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
@@ -1125,16 +1389,12 @@ def apply_reconciliation_manifest(
         if job.blocked_identity_count or job.quarantined_count
         else "SOURCE_CAPTURE_CERTIFIED"
     )
-    for prior in session.scalars(
-        select(ReconciliationCoverage).where(
-            ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
-            ReconciliationCoverage.active == True,  # noqa: E712
-        )
-    ).all():
-        prior.active = False
-        prior.invalidated_reason = "SUPERSEDED_BY_NEW_SOURCE_CERTIFICATE"
-        prior.invalidated_at = now
-        prior.updated_at = now
+    if retained is None:
+        for prior in prior_coverages:
+            prior.active = False
+            prior.invalidated_reason = "SUPERSEDED_BY_NEW_SOURCE_CERTIFICATE"
+            prior.invalidated_at = now
+            prior.updated_at = now
     coverage = ReconciliationCoverage(
         zkt_device_id=job.zkt_device_id,
         job_id=job.id,
@@ -1150,6 +1410,8 @@ def apply_reconciliation_manifest(
         capture_state=capture_state,
         oracle_state="ORACLE_MEMBERSHIP_PENDING",
         capture_evidence=evidence,
+        active=retained is None,
+        invalidated_reason=RETAINED_COVERAGE_POLICY if retained is not None else None,
     )
     session.add(coverage)
     job.latest_terminal_count = payload.latest_terminal_count
@@ -1171,6 +1433,9 @@ def apply_reconciliation_manifest(
     job.next_retry_at = None
     _release_assignment(job)
     _event(session, job, capture_state, evidence)
+    # Production sessions disable autoflush. The assurance lookup and transport
+    # handoff must see the certificate created in this same transaction.
+    session.flush()
     return refresh_reconciliation_assurance(session, job)
 
 
@@ -1224,6 +1489,7 @@ def apply_source_tail_chunk(
     invalidates source coverage.
     """
 
+    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT terminal.")
@@ -1233,7 +1499,7 @@ def apply_source_tail_chunk(
             ReconciliationCoverage.zkt_device_id == zkt.id,
             ReconciliationCoverage.active == True,  # noqa: E712
         )
-        .with_for_update()
+        .with_for_update().execution_options(populate_existing=True)
     )
     if coverage is None:
         raise ValueError("Terminal has no active certified source coverage.")
@@ -1497,6 +1763,11 @@ def source_exception_assurance(
         "correction_ids": [],
     }
     if not (job.quarantined_count or job.raw_preserved_count):
+        if (job.capture_certified_at is not None
+                and "retained_coverage" in (job.capture_certificate or {})
+                and _assurance_coverage(session, job) is None):
+            return {**empty, "state": "SCOPE_MISMATCH",
+                    "mismatch_reasons": ["RETAINED_COVERAGE_BINDING_INVALID"]}
         return empty
 
     cutoff = job.cutoff_count or 0
@@ -1643,12 +1914,7 @@ def source_exception_assurance(
     if any(row.attendance_event_id is not None for row in manifests):
         mismatches.append("EXCEPTION_HAS_ATTENDANCE_EVENT")
 
-    coverage = session.scalar(
-        select(ReconciliationCoverage).where(
-            ReconciliationCoverage.job_id == job.id,
-            ReconciliationCoverage.active == True,  # noqa: E712
-        )
-    )
+    coverage = _assurance_coverage(session, job)
     if coverage is None:
         mismatches.append("ACTIVE_COVERAGE_MISSING")
     else:
@@ -1850,12 +2116,7 @@ def refresh_reconciliation_assurance(
     if counts_changed:
         job.last_progress_at = now
         job.updated_at = now
-    coverage = session.scalar(
-        select(ReconciliationCoverage).where(
-            ReconciliationCoverage.job_id == job.id,
-            ReconciliationCoverage.active == True,  # noqa: E712
-        )
-    )
+    coverage = _assurance_coverage(session, job)
     if job.capture_certified_at is None:
         return job
     if job.status in PAUSED_JOB_STATES:
