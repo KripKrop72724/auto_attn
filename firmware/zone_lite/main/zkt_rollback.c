@@ -17,7 +17,7 @@ bool zj_rollback_failed_boot(const ota_checkpoint_t *request)
 bool zj_rollback_request_valid(const ota_checkpoint_t *request)
 {
     return zj_rollback_failed_boot(request) || (ota_checkpoint_valid(request) &&
-        !strcmp(request->journal.target_version, ZJ_BRIDGE_VERSION) &&
+        zj_reader_policy_target(request->journal.target_version, request->journal.image_sha256) &&
         (!strcmp(request->journal.state, "DOWNLOADING") ||
          !strcmp(request->journal.state, "READER_INTENT")) &&
         !request->journal.bytes_written &&

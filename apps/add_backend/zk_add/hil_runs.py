@@ -208,6 +208,9 @@ def start_run(
         raise ValueError("Completed initial reconciliation evidence is required")
     epoch_pin = {}
     if writer and profile == FULL_PROFILE:
+        from zk_add.zkt_reader_evidence import admitted_reader, qualified_reader_proof
+        selection = admitted_reader(session, deployment, release)
+        reader_proof = qualified_reader_proof(diagnostics, selection, telemetry.uptime_seconds)
         epoch = session.get(TerminalSourceEpoch, coverage.source_epoch_id) if coverage.source_epoch_id else None
         if (epoch is None or not epoch.epoch_id or epoch.state != "ACTIVE" or epoch.superseded_at is not None
                 or epoch.zkt_device_id != connector.zkt_device.id
@@ -219,7 +222,8 @@ def start_run(
             raise ValueError("The writer source epoch must match its completed reconciliation")
         # Coverage can later advance or be replaced. Preserve both immutable
         # identities now so a collector never infers the old epoch from it.
-        epoch_pin = {"source_epoch_id": epoch.id, "source_epoch": epoch.epoch_id}
+        epoch_pin = {"source_epoch_id": epoch.id, "source_epoch": epoch.epoch_id,
+                     "reader_admission": selection, "qualified_reader": reader_proof}
         depths = {row["name"]: row["records"] for row in queues if row.get("name") in required}
         if any(depths[name] != 0 for name in required):
             raise ValueError("Full writer observation requires a verified empty queue baseline")
@@ -342,6 +346,14 @@ def accepted_full_record_matches(session: Session, event, deployment, release) -
 def accepted_full_event_matches(session: Session, event, deployment, release) -> bool:
     """Rollout additionally requires the current deployment and active authority."""
     if not accepted_full_record_matches(session, event, deployment, release):
+        return False
+    from zk_add.zkt_reader_evidence import admitted_reader, stored_reader_evidence_matches
+    try:
+        selection = admitted_reader(session, deployment, release)
+        run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == event.details["run_id"]))
+        if not stored_reader_evidence_matches(run, release, selection["reader"]["version"]):
+            return False
+    except (ValueError, KeyError, TypeError):
         return False
     latest = session.scalar(select(FirmwareDeployment.id).where(
         FirmwareDeployment.connector_id == deployment.connector_id)

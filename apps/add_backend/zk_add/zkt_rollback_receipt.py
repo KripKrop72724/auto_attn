@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from zk_add.terminal_families import require_family_match
 from zk_add.time_utils import ensure_utc
-from zk_add.zkt_writer_contract import REQUIRED_BRIDGE_VERSION
+from zk_add.zkt_writer_contract import REQUIRED_BRIDGE_VERSION, reader_release_matches
 
 
 def verify_failed_boot_return(
@@ -25,12 +25,18 @@ def verify_failed_boot_return(
     from zk_add.ota import FirmwareDeployment, FirmwareEvent, FirmwareRelease, _application_sha256
 
     message = "Failed-boot recovery requires the exact previously accepted bridge."
+    selection = None
+    version = REQUIRED_BRIDGE_VERSION  # Historical V4 recovery evidence only.
+    if (release.manifest.get("queue_storage") or {}).get("schema_version") == 5:
+        from zk_add.zkt_reader_evidence import admitted_reader
+        selection = admitted_reader(session, deployment, release)
+        version = selection["reader"]["version"]
     if (
         connector.firmware_family != "zkt"
         or release.version != "2.7.0"
         or deployment.target_version != "2.7.0"
-        or deployment.previous_version != REQUIRED_BRIDGE_VERSION
-        or running_version != REQUIRED_BRIDGE_VERSION
+        or (deployment.previous_version or "").removeprefix("zone-lite-") != version
+        or running_version != version
         or running_partition not in {"ota_0", "ota_1"}
         or bytes_written != release.image_size
         or deployment.bytes_written != release.image_size
@@ -58,18 +64,20 @@ def verify_failed_boot_return(
     if (
         bridge is None
         or bridge.status != "SUCCEEDED"
-        or bridge.target_version != REQUIRED_BRIDGE_VERSION
+        or bridge.target_version != version
         or ensure_utc(bridge.created_at) >= ensure_utc(deployment.created_at)
     ):
         raise ValueError(message)
     reader = session.get(FirmwareRelease, bridge.release_id)
     if (
         reader is None
-        or reader.version != REQUIRED_BRIDGE_VERSION
+        or reader.version != version
         or reader.state not in {"HIL_ONLY", "AVAILABLE"}
         or not _application_sha256(reader)
         or image_sha256 != _application_sha256(reader)
     ):
+        raise ValueError(message)
+    if selection and not reader_release_matches(reader, selection["reader"]):
         raise ValueError(message)
     require_family_match("zkt", reader.manifest or {})
     event = session.scalar(
@@ -83,7 +91,7 @@ def verify_failed_boot_return(
         event is None
         or ensure_utc(event.created_at) >= ensure_utc(deployment.created_at)
         or details.get("image_sha256") != image_sha256
-        or details.get("running_version") != REQUIRED_BRIDGE_VERSION
+        or details.get("running_version") != version
         or details.get("running_partition") != running_partition
         or details.get("bytes_written") != reader.image_size
         or bridge.bytes_written != reader.image_size
@@ -114,4 +122,5 @@ def verify_failed_boot_return(
         "bridge_boot_event_id": event.id,
         "failure_event_id": failure.id if failure else None,
         "failure_report_received": failure is not None,
+        **({"reader_admission": selection} if selection else {}),
     }

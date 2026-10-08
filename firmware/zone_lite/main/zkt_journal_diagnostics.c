@@ -149,6 +149,25 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
     bool owner_ready = owner_fresh && owner->started && owner->ready && !owner_stalled &&
         !owner->recovering && !owner->quiescing && !owner->checkpoint_recovery_pending;
     bool append_failed = owner->append_observed && owner->last_append_result != ZJ_OK;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+    cJSON *reader = cJSON_AddObjectToObject(diagnostics, "qualified_reader");
+    bool reader_verified = owner_ready && owner->compatibility_checked && owner->writer_allowed &&
+        owner->compatibility == ZJ_COMPAT_OK && owner->selected_reader.verified;
+    if (!reader || !cJSON_AddNumberToObject(reader, "schema_version", 1) ||
+        !cJSON_AddBoolToObject(reader, "verified", reader_verified) ||
+        !cJSON_AddStringToObject(reader, "matrix_sha256", ZJ_READER_MATRIX_SHA256)) return false;
+    if (reader_verified) {
+        char generation[24];
+        snprintf(generation, sizeof(generation), "%llu",
+            (unsigned long long)owner->selected_reader.proof_generation);
+        if (!cJSON_AddStringToObject(reader, "version", owner->selected_reader.version) ||
+            !add_hex(reader, "application_sha256", owner->selected_reader.image_digest, 32) ||
+            !cJSON_AddNumberToObject(reader, "slot_address", owner->selected_reader.slot_address) ||
+            !cJSON_AddNumberToObject(reader, "slot_size", owner->selected_reader.slot_size) ||
+            !cJSON_AddStringToObject(reader, "proof_generation", generation) ||
+            !cJSON_AddNumberToObject(reader, "sampled_uptime_ms", (double)(owner->sampled_uptime_us / 1000))) return false;
+    }
+#endif
     cJSON *boundary = cJSON_AddObjectToObject(diagnostics, "source_boundary");
     bool boundary_ready = owner_ready && owner->source_boundary_observed && owner->source_boundary_result == ZJ_OK;
     if (!boundary || !cJSON_AddNumberToObject(boundary, "schema_version", 1) ||

@@ -17,6 +17,9 @@ typedef struct {
     bool quiescing, quiesced;
     bool hil_reboot_persistence_incident; /* Boot-sticky experimental-test veto. */
     bool compatibility_checked, writer_allowed;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+    zj_reader_selection_t selected_reader;
+#endif
     zj_delivery_authority_t delivery_authority;
     zj_compat_result_t compatibility;
     zj_operation_t operation;

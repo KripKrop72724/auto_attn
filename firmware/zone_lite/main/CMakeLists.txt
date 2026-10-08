@@ -55,7 +55,18 @@ if(ZONE_LITE_JOURNAL_WRITES)
             target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE=1)
         endif()
     elseif(PROJECT_VER STREQUAL "2.7.0")
-        target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITER_IMAGE=1)
+        execute_process(COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/build_zkt_reader_matrix.py"
+            --header "${ZONE_LITE_GENERATED_DIR}/zkt_qualified_reader_matrix.h"
+            RESULT_VARIABLE ZONE_LITE_MATRIX_RESULT)
+        if(NOT ZONE_LITE_MATRIX_RESULT EQUAL 0)
+            message(FATAL_ERROR "The reviewed writer reader matrix is invalid")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_LIST_DIR}/../../../apps/add_backend/zk_add/zkt_reader_matrix.json"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../apps/add_backend/zk_add/zkt_reader_matrix.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/build_zkt_reader_matrix.py")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITER_IMAGE=1
+            ZONE_LITE_QUALIFIED_READER_MATRIX=1)
     else()
         message(FATAL_ERROR "Journal storage requires an explicitly versioned reader/writer role")
     endif()

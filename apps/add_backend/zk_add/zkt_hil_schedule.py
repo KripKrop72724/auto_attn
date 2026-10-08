@@ -153,7 +153,7 @@ def _row(session, release, item, connector, exposed):
         from zk_add.zkt_writer_contract import qualified_bridge_hold
         qualification = qualified_bridge_hold(session, connector)
         if qualification in {"JOURNAL_BRIDGE_INSTALL_NOT_VERIFIED", "JOURNAL_BRIDGE_READY_MISSING",
-                              "JOURNAL_BRIDGE_ARTIFACT_MISSING"}:
+                              "JOURNAL_BRIDGE_ARTIFACT_MISSING", "JOURNAL_EXACT_BRIDGE_REQUIRED"}:
             row["prerequisites"].append(qualification)
         elif qualification:
             hold = qualification

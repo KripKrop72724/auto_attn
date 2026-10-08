@@ -258,6 +258,19 @@ class LegacyInventoryDiagnostics(BaseModel):
         return self
 
 
+class QualifiedReaderDiagnostics(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal[1]
+    verified: bool
+    matrix_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    version: str | None = Field(default=None, max_length=19, pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")
+    application_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    slot_address: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    slot_size: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    proof_generation: str | None = Field(default=None, pattern=r"^[1-9][0-9]{0,19}$")
+    sampled_uptime_ms: int | None = Field(default=None, ge=0)
+
+
 class FirmwareDiagnostics(BaseModel):
     schema_version: Literal[1, 2] = 1
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
@@ -271,6 +284,7 @@ class FirmwareDiagnostics(BaseModel):
     storage: StorageDiagnostics | None = None
     memory: MemoryDiagnostics | None = None
     journal_runtime: JournalRuntimeDiagnostics | None = None
+    qualified_reader: QualifiedReaderDiagnostics | None = None
     journal_storage: JournalStorageDiagnostics | None = None
     source_boundary: SourceBoundaryDiagnostics | None = None
     legacy_inventory: LegacyInventoryDiagnostics | None = None

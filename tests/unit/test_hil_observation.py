@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import event as sa_event, select
 
+from reader_matrix_fixtures import admit, pinned, proof as reader_proof  # noqa: F401
 from test_hil_writer_evidence import observed, prepared, seal_oracle, source_store, store  # noqa: F401
 from zk_add import hil_observation as observation
 from zk_add.attendance_repair import _protected_digest
@@ -53,6 +54,8 @@ def telemetry_payload(run, *, boot, tick, cursor, stamp):
                     "legacy_add_delivery", "legacy_ords_delivery")],
             "queues": [{"name": name, "count_known": True, "records": 0}
                 for name in ("journal", "legacy_migration")]}}
+    if "reader_admission" in run.baseline:
+        value["diagnostics"]["qualified_reader"] = reader_proof(run.baseline["reader_admission"], tick)
     value["diagnostics"]["workers"][0].update(execution_model="ON_DEMAND",
         sampled_uptime_ms=tick, pending_requests=0)
     return value
@@ -67,6 +70,9 @@ def startup_payload(payload, *, owner_observed):
     """
     payload = deepcopy(payload)
     diag = payload["diagnostics"]
+    if "qualified_reader" in diag:
+        diag["qualified_reader"] = {key: diag["qualified_reader"][key] for key in ("schema_version", "matrix_sha256")}
+        diag["qualified_reader"]["verified"] = False
     diag.pop("source_generation")
     diag.pop("committed_source_cursor")
     authority = "ADD" if owner_observed else "UNKNOWN"
@@ -115,12 +121,18 @@ def interruption_control(run, start, telemetry_id):
 
 
 @pytest.fixture
-def full_rows(observed, monkeypatch, request):  # noqa: F811
+def full_rows(observed, monkeypatch, request, pinned):  # noqa: F811
     now = utc_now().replace(microsecond=0)
     start = now - timedelta(minutes=15)
     with observed() as db:
         seal_oracle(db)
         run = db.scalar(select(FirmwareHilRun))
+        release = db.get(FirmwareRelease, run.release_id)
+        deployment = db.get(FirmwareDeployment, run.deployment_id)
+        selection = admit(db, release, deployment, pinned)
+        baseline_proof = reader_proof(selection)
+        baseline_proof.pop("sampled_uptime_ms")
+        run.baseline = {**run.baseline, "reader_admission": selection, "qualified_reader": baseline_proof}
         run.run_id = str(uuid4())
         run.started_at, run.ends_at = start, now
         connector = db.scalar(select(Connector))
@@ -371,7 +383,7 @@ def test_real_boot_prefix_retains_unknown_and_recovering_snapshots(full_rows):
     assert transitions[1]["storage_healthy"] is False
     assert all(row["persistence_verified"] is False and row["recovery_complete"] is False for row in transitions)
     assert transitions[0]["startup_diagnostics"]["delivery_authority"] == "UNKNOWN"
-    assert transitions[0]["errors"] == ["DELIVERY_AUTHORITY_UNVERIFIED"]
+    assert transitions[0]["errors"] == ["DELIVERY_AUTHORITY_UNVERIFIED", "QUALIFIED_READER_PROOF_PENDING"]
     assert transitions[1]["startup_diagnostics"]["journal_storage"]["durability"] == "DEGRADED"
     assert all(row["reboot_startup"]["recovery_telemetry_id"] == run.result["esp_reboot"]["recovery_telemetry_id"]
                for row in transitions)
@@ -589,7 +601,7 @@ def test_completion_is_immutable_and_has_one_hash_bound_event(full_rows):
     assert first.result == again.result and first.completed_at == again.completed_at
     assert first.result["evidence_sha256"] == observation.evidence_digest(first.result["evidence"])
     with sessions() as db:
-        events = list(db.scalars(select(FirmwareEvent)))
+        events = list(db.scalars(select(FirmwareEvent).where(FirmwareEvent.state != "OFFERED")))
         assert len(events) == 1
         assert events[0].details["evidence_sha256"] == first.result["evidence_sha256"]
         assert not observation.accepted_full_evidence_valid(first, events[0].details)

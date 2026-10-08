@@ -55,7 +55,8 @@ def _classify_startup(row, sample, details, control, test, recovered):
             or any(getattr(recovered, name) is not True for name in HEALTH_FIELDS)
             or not integer(row.uptime_seconds)
             or row.uptime_seconds > (sample.diagnostics_at - test.started_at).total_seconds() + 5
-            or any(error != "DELIVERY_AUTHORITY_UNVERIFIED" for error in details["errors"])):
+            or any(error not in {"DELIVERY_AUTHORITY_UNVERIFIED", "QUALIFIED_READER_PROOF_PENDING"}
+                   for error in details["errors"])):
         return None
     payload = row.payload
     diag = payload.get("diagnostics")
@@ -66,6 +67,10 @@ def _classify_startup(row, sample, details, control, test, recovered):
     if not all(isinstance(value, dict) for value in (storage, journal, runtime, terminal)):
         return None
     tick, phase = diag.get("sampled_uptime_ms"), runtime.get("phase")
+    if "QUALIFIED_READER_PROOF_PENDING" in details["errors"] and (
+            details.get("qualified_reader_pending") is not True
+            or runtime.get("writer_ready") is not False or phase == "READY"):
+        return None
     if (not integer(tick) or phase not in PHASES
             or diag.get("delivery_authority") not in {"ADD", "UNKNOWN"}
             or runtime.get("delivery_authority") != diag.get("delivery_authority")

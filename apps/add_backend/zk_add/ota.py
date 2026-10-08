@@ -863,7 +863,7 @@ def sync_release_store(session: Session) -> None:
             validate_bridge_image(image_bytes, manifest["version"])
         if manifest.get("version") == "2.7.0":
             from zk_add.zkt_writer_contract import validate_writer_image
-            validate_writer_image(image_bytes)
+            validate_writer_image(image_bytes, manifest)
         application_digest = str(manifest.get("application_sha256") or "")
         if application_digest and (
             len(application_digest) != 64 or application_digest != application_digest.lower() or
@@ -1091,11 +1091,25 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
             deployment.error_code = hold
             deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
             return None
+        details = {}
+        if release.version == "2.7.0":
+            from zk_add.zkt_reader_evidence import current_reader_admission
+            try:
+                details["reader_admission"] = current_reader_admission(release, connector)
+            except ValueError:
+                return None
         deployment.status = "OFFERED"
         deployment.error_code = deployment.error_message = None
         deployment.offered_at = utc_now()
         deployment.attempt_count += 1
-        session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details={}))
+        session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details=details))
+    elif release.version == "2.7.0":
+        from zk_add.zkt_reader_evidence import admitted_reader, current_reader_admission
+        try:
+            if admitted_reader(session, deployment, release) != current_reader_admission(release, connector):
+                return None
+        except ValueError:
+            return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
         deployment_id=deployment.id, connector_id=connector.id,
@@ -1212,6 +1226,8 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         details = (event.details or {}) if event else {}
         if (details.get("recovery") or {}).get("schema_version") == 1:
             receipt["rollback_application_sha256"] = details.get("image_sha256")
+            if (details["recovery"].get("reader_admission") or {}).get("schema_version") == 1:
+                receipt["reader_admission"] = details["recovery"]["reader_admission"]
     return receipt
 
 
@@ -1702,6 +1718,10 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     connector = session.get(Connector, grant.connector_id)
     if connector is None or _storage_predecessor_exclusion(session, release, connector):
         raise ValueError("Firmware storage predecessor is no longer eligible.")
+    if release.version == "2.7.0":
+        from zk_add.zkt_reader_evidence import admitted_reader, current_reader_admission
+        if admitted_reader(session, deployment, release) != current_reader_admission(release, connector):
+            raise ValueError("Firmware grant retained-reader identity changed.")
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)
     bridge_target = _factory_3fl_bridge_target(release, campaign.zone_id if campaign else connector.zone_id)
     if bridge_target and (campaign is None or campaign.status != "ACTIVE"
