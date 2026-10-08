@@ -17,6 +17,14 @@ whether a campaign succeeds.
 
 ## Implementation and release sequence
 
+The current [V5 reader policy](zkt-qualified-reader-matrix.md) pins the verified
+signed 2.6.23 ordinary and 2.6.22 factory packages. Signing can proceed with
+those packages after the exact source and deployed-policy checks pass. Installing
+the writer still requires each target's stored reader readiness and fresh health;
+factory trials additionally require the first 3FL writer's accepted HIL evidence.
+The earlier reader-pin directions in the trial history below describe those
+historical stages.
+
 The 3FL USB canary rejected bridge 2.6.18. It reported 35,479 free internal
 bytes but a largest block of 11,776 bytes, so its 12,288-byte journal transport
 stack could not be allocated. A subsequent retained-queue integrity incident
@@ -59,9 +67,9 @@ reboot code still has static/RTC costs.
 
 Publication remains experimental and restricted to the first exact ordered
 target until stored bridge-readiness evidence permits expansion. Preserve all
-immutable 2.6.17/18/19/20 packages and their failure/revocation evidence. Keep the
-writer's 2.6.17 version and digest pins unchanged until a replacement reader
-actually qualifies. No 2.6.21 field pass, recovered health or physical stack
+immutable 2.6.17/18/19/20 packages and their failure/revocation evidence. The
+writer's then-current 2.6.17 version and digest pins were retained during that
+trial stage. No 2.6.21 field pass, recovered health or physical stack
 watermark is implied by the new role or successful automated tests.
 
 The exact signed 2.6.21 field trial then reported a failed 1,024-byte DMA
@@ -86,9 +94,10 @@ correction, but recovered field headroom remains untested until the new trial.
 
 CI builds and checks the exact 23 descriptor and reader marker, while retaining
 publication and reader-proof regressions for earlier bridge versions. The
-writer's active artifact pins remain unchanged and the proposed final reader
-matrix remains blocked until actual signed artifacts and per-target evidence
-exist. Any allocation repair still requires an exact ESP-IDF build, actual ELF
+final V5 reader matrix remains BLOCKED until both actual signed reader packages
+are independently verified and their exact identities enter a reviewed source
+change. PINNED permits package checks; each device still needs its own stored
+reader qualification and fresh runtime evidence before writer admission. Any allocation repair still requires an exact ESP-IDF build, actual ELF
 memory/stack inspection, and field observation before the next promotion.
 
 Explicit writer rollback must retain the proved bridge's `VALID` state. Making
@@ -106,12 +115,14 @@ if selection or readback fails. This recovery defect does not explain the
    Restrict its package to exact HIL targets and supported predecessor images.
    Its initial authority remains the legacy delivery path. Including journal
    capture support does not itself switch delivery authority.
-3. Verify bridge boot and local storage through ADD. Retain the exact image as
+3. Before writer installation, verify bridge boot and local storage through ADD. Retain the exact image as
    the writer's compatible rollback image. Complete retained-queue custody and
    the ADD integration before enabling the writer.
-4. Build the final 2.7.0 candidate reproducibly, sign it using the existing ADD
+4. Once both signed reader packages are verified and pinned, build the final 2.7.0 candidate reproducibly, sign it using the existing ADD
    host vault, and publish it as an immutable HIL-only artifact. Preserve all
-   test results and stated limitations with that exact artifact identity.
+   test results and stated limitations with that exact artifact identity. This
+   artifact preparation may precede the field observation in step 3; installation
+   remains subject to that step's stored readiness and current-health gates.
 5. Start eligible online targets through the controlled waves. Keep at most
    two simultaneous upgrades and one per physical location. An online connector
    whose terminal is unavailable still needs capture readiness. All 17 active

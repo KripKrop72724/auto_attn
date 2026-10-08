@@ -24,6 +24,8 @@ try {
         'apps/add_backend/zk_add/zkt_factory_contract.py')) {
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination (Join-Path $root $file)
     }
+    # Keep the blocked-policy refusal independent of the checked-in release state.
+    [IO.File]::WriteAllText((Join-Path $root 'apps/add_backend/zk_add/zkt_reader_matrix.json'), '{"schema_version":1,"matrix_id":"zkt-2.7.0-readers-v1","state":"BLOCKED","readers":[]}')
     . (Join-Path $root 'deploy/add/firmware-storage-contract.ps1')
     $image = Join-Path $root 'contract.bin'
     [IO.File]::WriteAllText($image, 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17' + [char]0)
@@ -31,7 +33,7 @@ try {
     Assert-Refused { Get-FirmwareStorageContract -ImagePath $image -Version 2.7.0 -ForSigning }
     [IO.File]::WriteAllText($image, 'ZONE_STORAGE_CONTRACT_V5:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:MATRIX=' + ('a' * 64) + [char]0)
     Assert-Refused { Get-FirmwareStorageContract -ImagePath $image -Version 2.7.0 -ForSigning }
-    # Pins exist only in this disposable test copy. No release policy is changed.
+    # Synthetic pins exist only in this disposable test copy. No release policy is changed.
     $entries = @()
     foreach ($item in @(@('2.6.23', '1'), @('2.6.22', '2'))) {
         $entries += @{version=$item[0];release_id=('zone-lite-' + $item[0]);application_sha256=($item[1] + ('a'*63));

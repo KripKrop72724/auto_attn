@@ -1,7 +1,7 @@
 """Combined factory/matrix gates use actual stored rows and seals.
 
 Synthetic23/22 identities are isolated to this fixture; the deployment
-policy remains empty and BLOCKED. Stored-verdict linkage is tested here; the
+policy is not modified. Stored-verdict linkage is tested here; the
 collector tests separately establish how observation evidence earns a verdict.
 """
 from copy import deepcopy

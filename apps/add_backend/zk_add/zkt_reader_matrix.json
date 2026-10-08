@@ -1,6 +1,23 @@
 {
-  "schema_version": 1,
   "matrix_id": "zkt-2.7.0-readers-v1",
-  "state": "BLOCKED",
-  "readers": []
+  "readers": [
+    {
+      "application_sha256": "2ee98dfd2b944761c23913958b5b5bee7f570ab9c016373ff38e4b62c2f57248",
+      "artifact_sha256": "e2c29dc7b48078db93c0cea369a9bc6764e2658196fedcd271290df645258b10",
+      "release_id": "zone-lite-2.6.23",
+      "signing_key_id": "9fc614e085ba24f260ad92be0812103beef0b43c74881d72e800caf68c602a55",
+      "source_sha": "92b8701be486c4d534f244df3196f7d0cbc640f8",
+      "version": "2.6.23"
+    },
+    {
+      "application_sha256": "bc20d5f47b9330f8c7c65d84e5d5bc3d10cd3530c62e5c137616c7bf55e0500b",
+      "artifact_sha256": "401ab992d1aafc4dba139165e1782f66577d9d6661f69d281b51ee42df64c270",
+      "release_id": "zone-lite-2.6.22",
+      "signing_key_id": "9fc614e085ba24f260ad92be0812103beef0b43c74881d72e800caf68c602a55",
+      "source_sha": "774f9e37517b4c3b91db655848306d8821d604d7",
+      "version": "2.6.22"
+    }
+  ],
+  "schema_version": 1,
+  "state": "PINNED"
 }
