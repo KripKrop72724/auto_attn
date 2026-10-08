@@ -17,6 +17,11 @@ def test_storage_recovery_transfers_every_row_before_retirement(tmp_path: Path) 
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-omit-frame-pointer", "-I", str(firmware),
+        # Inject unreadable byte ranges into the engine's own reads. glibc's
+        # fortified fread is an inline wrapper that would bypass the rename.
+        "-U_FORTIFY_SOURCE",
+        "-Dfread=sr_test_fread", "-Dferror=sr_test_ferror", "-Dfclose=sr_test_fclose",
+        "-Dfseek=sr_test_fseek",
         str(firmware / "storage_recovery_core.c"), str(firmware / "reliability.c"),
         str(ROOT / "tests/firmware/storage_recovery_host.c"), "-o", str(executable),
     ], check=True)

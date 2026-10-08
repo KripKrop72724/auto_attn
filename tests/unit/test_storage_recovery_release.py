@@ -1,4 +1,4 @@
-"""One-shot 2.6.24 storage recovery: exact Peshawar scope, never re-offered or promoted."""
+"""One-shot storage recovery (2.6.24, 2.6.25): exact Peshawar scope, never re-offered or promoted."""
 import json
 import re
 import secrets
@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from zk_add.storage_contract import validate_storage_contract
 from zk_add.storage_recovery import (
-    BASELINE_IMAGE, CONTRACT, MARKER, TARGETS, validate_recovery_image, validate_recovery_manifest,
+    BASELINE_IMAGE, CONTRACT, MARKER, RELEASE_IDS, TARGETS, VERSIONS, validate_recovery_image,
+    validate_recovery_manifest,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,14 +20,14 @@ APPLICATION = "f" * 64
 ZONES = ("ZONE-PESHAWAR-02", "ZONE-PESHAWAR-06")
 
 
-def signed_manifest(**changes):
+def signed_manifest(version=VERSIONS[-1], **changes):
     manifest = {
         "application_sha256": APPLICATION, "firmware_family": "zkt", "git_sha": "a" * 40,
-        "hil_targets": [target.model_dump() for target in TARGETS], "image_name": "zone-lite-2.6.24.bin",
+        "hil_targets": [target.model_dump() for target in TARGETS], "image_name": f"zone-lite-{version}.bin",
         "minimum_bootstrap_version": "2.5.2", "partition_layout": "zone-lite-ota-v1",
         "project_name": "zone_lite", "queue_storage": json.loads(json.dumps(CONTRACT)),
-        "release_channel": "EXPERIMENTAL_HIL_ONLY", "release_id": "zone-lite-2.6.24",
-        "version": "2.6.24",
+        "release_channel": "EXPERIMENTAL_HIL_ONLY", "release_id": f"zone-lite-{version}",
+        "version": version,
     }
     for key, value in changes.items():
         if value is None:
@@ -36,7 +37,7 @@ def signed_manifest(**changes):
     return manifest
 
 
-def image(version=b"2.6.24", marker=MARKER.encode() + b"\0", project=b"zone_lite"):
+def image(version=VERSIONS[-1].encode(), marker=MARKER.encode() + b"\0", project=b"zone_lite"):
     header = bytearray(112)
     header[0] = 0xE9
     struct.pack_into("<I", header, 32, 0xABCD5432)
@@ -45,38 +46,63 @@ def image(version=b"2.6.24", marker=MARKER.encode() + b"\0", project=b"zone_lite
     return bytes(header) + b"code" + marker + b"tail"
 
 
-def test_exact_recovery_contract_and_manifest():
-    assert validate_recovery_manifest(signed_manifest()) == CONTRACT
-    assert validate_storage_contract(signed_manifest(), "2.6.24") == CONTRACT
+def test_published_and_current_recovery_roles():
+    # 2.6.24 is already published and must stay valid in the release store.
+    assert VERSIONS == ("2.6.24", "2.6.25")
+    assert RELEASE_IDS == {"2.6.24": "zone-lite-2.6.24", "2.6.25": "zone-lite-2.6.25"}
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+def test_exact_recovery_contract_and_manifest(version):
+    other = next(candidate for candidate in VERSIONS if candidate != version)
+    assert validate_recovery_manifest(signed_manifest(version), version) == CONTRACT
+    assert validate_storage_contract(signed_manifest(version), version) == CONTRACT
     assert validate_storage_contract({}, "2.5.3") is None
+    for bad_version in (other, "2.6.26"):
+        with pytest.raises(ValueError):
+            validate_recovery_manifest(signed_manifest(version), bad_version)
     reordered = [TARGETS[1].model_dump(), TARGETS[0].model_dump()]
     extra_baseline = {**CONTRACT, "allowed_bootstrap_versions": ["2.4.12", "2.5.2"]}
     boolean_format = {**CONTRACT, "write_format": True}
     for bad in (
-        signed_manifest(queue_storage=None), signed_manifest(queue_storage=extra_baseline),
-        signed_manifest(queue_storage=boolean_format), signed_manifest(minimum_bootstrap_version="2.4.12"),
-        signed_manifest(minimum_bootstrap_version=None), signed_manifest(release_channel=None),
-        signed_manifest(hil_targets=reordered), signed_manifest(hil_targets=reordered[:1]),
-        signed_manifest(release_id="zone-lite-2.6.25"), signed_manifest(firmware_family="hikvision"),
-        signed_manifest(factory_trial={}), signed_manifest(runtime_profile="ZKT_JOURNAL_V1"),
+        signed_manifest(version, queue_storage=None), signed_manifest(version, queue_storage=extra_baseline),
+        signed_manifest(version, queue_storage=boolean_format),
+        signed_manifest(version, minimum_bootstrap_version="2.4.12"),
+        signed_manifest(version, minimum_bootstrap_version=None), signed_manifest(version, release_channel=None),
+        signed_manifest(version, hil_targets=reordered), signed_manifest(version, hil_targets=reordered[:1]),
+        signed_manifest(version, release_id=f"zone-lite-{other}"), signed_manifest(other),
+        signed_manifest(version, release_id="zone-lite-2.6.26"), signed_manifest(version, firmware_family="hikvision"),
+        signed_manifest(version, factory_trial={}), signed_manifest(version, runtime_profile="ZKT_JOURNAL_V1"),
     ):
         with pytest.raises(ValueError):
-            validate_storage_contract(bad, "2.6.24")
+            validate_storage_contract(bad, version)
 
 
-def test_compiled_role_and_descriptor_bind_the_image():
-    validate_recovery_image(image())
+@pytest.mark.parametrize("version", VERSIONS)
+def test_compiled_role_and_descriptor_bind_the_image(version):
+    other = next(candidate for candidate in VERSIONS if candidate != version)
+    validate_recovery_image(image(version=version.encode()), version)
+    with pytest.raises(ValueError):
+        validate_recovery_image(image(version=b"2.6.26"), "2.6.26")
     legacy = b"ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2\0"
-    for bad in (image(version=b"2.6.15"), image(project=b"zone_lite_hikvision"), image(marker=b""),
-                image(marker=MARKER.encode() + b"\0" + MARKER.encode() + b"\0"),
-                image(marker=MARKER.encode() + b"\0" + legacy), image(marker=legacy), b"\xe9" * 64):
+    for bad in (image(version=b"2.6.15"), image(version=other.encode()), image(project=b"zone_lite_hikvision"),
+                image(version=version.encode(), marker=b""),
+                image(version=version.encode(), marker=MARKER.encode() + b"\0" + MARKER.encode() + b"\0"),
+                image(version=version.encode(), marker=MARKER.encode() + b"\0" + legacy),
+                image(version=version.encode(), marker=legacy), b"\xe9" * 64):
         with pytest.raises(ValueError):
-            validate_recovery_image(bad)
+            validate_recovery_image(bad, version)
 
 
 def test_reviewed_scope_matches_release_tooling_and_firmware():
-    tooling = json.loads((ROOT / "deploy/add/hil-targets-2.6.24.json").read_text())
+    tooling = json.loads((ROOT / "deploy/add/hil-targets-storage-recovery.json").read_text())
     assert tooling == [target.model_dump() for target in TARGETS]
+    # Only the newest role is buildable; every recovery version stays reserved.
+    header = (ROOT / "firmware/zone_lite/main/storage_recovery.h").read_text()
+    assert f'#define STORAGE_RECOVERY_VERSION "{VERSIONS[-1]}"' in header
+    cmake = (ROOT / "firmware/zone_lite/main/CMakeLists.txt").read_text()
+    assert f'if(NOT PROJECT_VER STREQUAL "{VERSIONS[-1]}")' in cmake
+    assert 'elseif(PROJECT_VER STREQUAL "2.6.24" OR PROJECT_VER STREQUAL "2.6.25")' in cmake
     firmware = (ROOT / "firmware/zone_lite/main/storage_recovery.c").read_text()
     pairs = re.findall(r'\{"([0-9a-f-]{36})", \{((?:0x[0-9a-f]{2}, ){5}0x[0-9a-f]{2})\}\}', firmware)
     assert [(connector, ":".join(byte[2:] for byte in mac.split(", "))) for connector, mac in pairs] == [
@@ -86,8 +112,8 @@ def test_reviewed_scope_matches_release_tooling_and_firmware():
     assert BASELINE_IMAGE in (ROOT / "firmware/zone_lite/main/upgrade_guard.c").read_text()
 
 
-@pytest.fixture
-def recovery_session(monkeypatch, tmp_path):
+@pytest.fixture(params=VERSIONS)
+def recovery_session(request, monkeypatch, tmp_path):
     from zk_add import ota
     from zk_add.hil_2615_cities import CITY_TARGETS
     from zk_add.models import Base, Connector, ZKTDevice
@@ -112,9 +138,9 @@ def recovery_session(monkeypatch, tmp_path):
             minimum_bootstrap_version="2.2.0", storage_name="hil/baseline.bin",
             manifest_signature="test-signature", state="AVAILABLE",
             manifest={"application_sha256": BASELINE_IMAGE}))
-        manifest = signed_manifest()
+        manifest = signed_manifest(request.param)
         release = ota.FirmwareRelease(
-            release_id="zone-lite-2.6.24", version="2.6.24", git_sha="a" * 40, image_sha256="b" * 64,
+            release_id=RELEASE_IDS[request.param], version=request.param, git_sha="a" * 40, image_sha256="b" * 64,
             image_size=1024, signing_key_id="production-key", partition_layout=ota.OTA_LAYOUT,
             minimum_bootstrap_version="2.5.2", storage_name="hil/recovery.bin",
             manifest_signature="test-signature", state="HIL_ONLY",
@@ -156,11 +182,12 @@ def offer(session, device):
 
 
 def report(session, device, state, error_code=None, release_digest=APPLICATION):
-    from zk_add.ota import FirmwareDeployment, record_progress
+    from zk_add.ota import FirmwareDeployment, FirmwareRelease, record_progress
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.connector_id == device.id).order_by(FirmwareDeployment.id.desc()))
+    version = session.get(FirmwareRelease, deployment.release_id).version
     return record_progress(session, connector=device, deployment_public_id=deployment.deployment_id,
-                           state=state, bytes_written=1024, running_version="2.6.24",
+                           state=state, bytes_written=1024, running_version=version,
                            running_partition="ota_0", image_sha256=release_digest, error_code=error_code)
 
 
@@ -170,7 +197,7 @@ def test_each_peshawar_target_starts_independently_in_either_order(recovery_sess
         scope, run = start(session, release, ZONES[index])
         assert [row["connector_id"] for row in scope["eligible"]] == [devices[index].connector_id]
         assert run.eligible_count == 1
-        assert offer(session, devices[index])["version"] == "2.6.24"
+        assert offer(session, devices[index])["version"] == release.version
 
 
 @pytest.mark.parametrize("change", ["factory", "digest", "version", "spare", "serial", "release"])
@@ -247,3 +274,40 @@ def test_recovery_progress_requires_exact_running_image(recovery_session):
     session.flush()
     with pytest.raises(ValueError, match="digest"):
         report(session, devices[0], "BOOTED_PENDING", "STORAGE_RECOVERY_RUNNING", release_digest="0" * 64)
+
+
+def test_failed_published_run_is_cancelled_before_the_next_recovery_starts(recovery_session):
+    """Peshawar-02: the stopped 2.6.24 run is cancelled, then 2.6.25 starts."""
+    from zk_add import ota
+    session, release, devices = recovery_session
+    if release.version != "2.6.24":
+        pytest.skip("The published 2.6.24 run precedes the current role")
+    manifest = signed_manifest("2.6.25")
+    current = ota.FirmwareRelease(
+        release_id="zone-lite-2.6.25", version="2.6.25", git_sha="a" * 40, image_sha256="c" * 64,
+        image_size=1024, signing_key_id="production-key", partition_layout=ota.OTA_LAYOUT,
+        minimum_bootstrap_version="2.5.2", storage_name="hil/recovery-2625.bin",
+        manifest_signature="test-signature", state="HIL_ONLY",
+        manifest={**manifest, "_publication_mode": "HIL_ONLY", "_hil_target_mac": None,
+                  "_hil_targets": manifest["hil_targets"]})
+    session.add(current)
+    session.flush()
+    _scope, stopped = start(session, release, ZONES[0])
+    assert offer(session, devices[0])["version"] == "2.6.24"
+    session.flush()
+    report(session, devices[0], "FAILED", "STORAGE_RECOVERY_SOURCE_READ")
+    session.flush()
+    session.refresh(stopped)
+    assert stopped.status == "PAUSED"
+    with pytest.raises(ValueError):
+        start(session, current, ZONES[0])  # A paused campaign still owns the zone.
+    stopped.status = "CANCELLED"  # The administrator's step-up cancel.
+    session.flush()
+    from zk_add.ota import create_campaign, preview_campaign_scope
+    scope = preview_campaign_scope(session, release_public_id=current.release_id, zone_id=ZONES[0])
+    run = create_campaign(session, release_public_id=current.release_id, zone_id=ZONES[0],
+                          reason="Peshawar storage recovery", typed_confirmation=current.version,
+                          actor="test-admin", scope_token=scope["scope_token"],
+                          idempotency_key="recovery-2625-ZONE-PESHAWAR-02")
+    assert run.eligible_count == 1
+    assert offer(session, devices[0])["version"] == "2.6.25"

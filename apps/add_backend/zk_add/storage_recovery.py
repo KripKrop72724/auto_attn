@@ -1,11 +1,13 @@
-"""One-shot ZKT storage recovery release (2.6.24) for the two Peshawar ESPs.
+"""One-shot ZKT storage recovery releases (2.6.24, 2.6.25) for the two Peshawar ESPs.
 
 The image hands every retained blocked-identity row to ADD queue-evidence
 custody, retires the local copies only after every exact receipt, records the
 retired event UIDs for the rollback image, and always returns to the exact
-signed 2.5.2 application. It is HIL_ONLY and never promotable. Each exact
-target may start independently: no run is ever accepted as an upgrade, so the
-ordinary ordered-acceptance gate cannot apply.
+signed 2.5.2 application. 2.6.25 also skips flash regions SPIFFS cannot read,
+reporting each one to ADD, within an owner-approved 16 KiB bound. Both are
+HIL_ONLY and never promotable. Each exact target may start independently: no
+run is ever accepted as an upgrade, so the ordinary ordered-acceptance gate
+cannot apply.
 """
 from __future__ import annotations
 
@@ -14,8 +16,8 @@ from typing import Any
 
 from zk_add.hil_scope import HilTarget, parse_hil_targets
 
-VERSION = "2.6.24"
-RELEASE_ID = "zone-lite-2.6.24"
+VERSIONS = ("2.6.24", "2.6.25")
+RELEASE_IDS = {version: f"zone-lite-{version}" for version in VERSIONS}
 BASELINE_VERSION = "2.5.2"
 BASELINE_IMAGE = "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b"
 MARKER = "ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2"
@@ -45,11 +47,12 @@ def recovery_hil_targets(raw: Any) -> list[HilTarget]:
     return targets
 
 
-def validate_recovery_manifest(manifest: dict) -> dict:
+def validate_recovery_manifest(manifest: dict, version: str) -> dict:
     contract = manifest.get("queue_storage")
     qualified = (
-        manifest.get("version") == VERSION
-        and manifest.get("release_id") == RELEASE_ID
+        version in RELEASE_IDS
+        and manifest.get("version") == version
+        and manifest.get("release_id") == RELEASE_IDS[version]
         and manifest.get("firmware_family") == "zkt"
         and manifest.get("project_name") == "zone_lite"
         and manifest.get("minimum_bootstrap_version") == BASELINE_VERSION
@@ -64,11 +67,11 @@ def validate_recovery_manifest(manifest: dict) -> dict:
     return contract
 
 
-def validate_recovery_image(image: bytes) -> None:
+def validate_recovery_image(image: bytes, version: str) -> None:
     """Bind the signed manifest to the compiled recovery role and descriptor."""
-    if (len(image) < 112 or image[0] != 0xE9
+    if (version not in RELEASE_IDS or len(image) < 112 or image[0] != 0xE9
             or struct.unpack_from("<I", image, 32)[0] != 0xABCD5432
-            or image[48:80].split(b"\0", 1)[0] != VERSION.encode()
+            or image[48:80].split(b"\0", 1)[0] != version.encode()
             or image[80:112].split(b"\0", 1)[0] != b"zone_lite"
             or image.count(MARKER.encode() + b"\0") != 1
             or image.count(b"ZONE_STORAGE_CONTRACT_V") != 1):

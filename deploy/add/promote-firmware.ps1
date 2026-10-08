@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if ($Version -eq '2.6.24') {
+if ($Version -in @('2.6.24', '2.6.25')) {
     throw 'The one-shot storage recovery image always returns to 2.5.2 and can never be promoted'
 }
 $store = (Resolve-Path $StoreDirectory).Path
