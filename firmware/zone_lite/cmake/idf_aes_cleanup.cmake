@@ -24,5 +24,11 @@ endif()
 list(REMOVE_ITEM _aes_sources "${_aes_original}")
 list(APPEND _aes_sources "${_aes_generated}")
 set_property(TARGET mbedcrypto PROPERTY SOURCES "${_aes_sources}")
+# IDF normalizes build-directory debug paths, but its macro maps cover only the
+# project and SDK roots. This generated source also uses __FILE__ in assertions.
+# Apply the build map last, in the crypto target's directory scope, so repeated
+# builds retain the same diagnostic filename without embedding their output path.
+set_property(SOURCE "${_aes_generated}" TARGET_DIRECTORY mbedcrypto APPEND PROPERTY
+    COMPILE_OPTIONS "-fmacro-prefix-map=${CMAKE_BINARY_DIR}=/IDF_BUILD")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_aes_original}" "${_aes_patch}")
 message(STATUS "Applied reviewed ESP-IDF 5.5.3 AES output-allocation cleanup")
