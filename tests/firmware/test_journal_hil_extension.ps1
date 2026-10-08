@@ -3,7 +3,8 @@ $ErrorActionPreference = 'Stop'
 if (Test-Path variable:PSNativeCommandArgumentPassing) { $PSNativeCommandArgumentPassing = $NativeArgumentMode }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $root = Join-Path ([IO.Path]::GetTempPath()) ('scope-extension-' + [guid]::NewGuid().ToString('N'))
-$global:scopePython = (Get-Command python -CommandType Application).Source
+$pythonBootstrap = @(Get-Command python -CommandType Application)[0].Source
+$originalPath = $env:PATH
 $previous = @{}
 foreach ($name in @('GITHUB_REF','GITHUB_SHA','GITHUB_REPOSITORY')) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
 $encoding = $OutputEncoding
@@ -35,6 +36,16 @@ function global:docker {
     return ($id + '|sha256:' + ('f'*64) + '|2026-01-01T00:00:00Z|true|0')
 }
 try {
+    # Hosted Linux can discover /usr/bin/python and /bin/python together. Keep
+    # two actual Application results in every platform's fixture so a bare
+    # `.Source` array cannot silently become one invalid multiline executable.
+    $pythonProbe = Join-Path $root 'python-path-probe'
+    New-Item -ItemType Directory -Path $pythonProbe -Force | Out-Null
+    Copy-Item -LiteralPath $pythonBootstrap -Destination (Join-Path $pythonProbe ([IO.Path]::GetFileName($pythonBootstrap)))
+    $env:PATH = (Split-Path -Parent $pythonBootstrap) + [IO.Path]::PathSeparator + $originalPath + [IO.Path]::PathSeparator + $pythonProbe
+    if (@(Get-Command python -CommandType Application).Count -lt 2) { throw 'Duplicate Python application fixture was not established' }
+    $global:scopePython = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+    if ($global:scopePython -isnot [string] -or $global:scopePython -cne $pythonBootstrap) { throw 'One exact Python executable was not selected' }
     foreach ($folder in @('deploy/add','scripts','apps/add_backend/zk_add')) {
         New-Item -ItemType Directory -Path (Join-Path $root $folder) -Force | Out-Null
     }
@@ -125,6 +136,7 @@ if ($AllowPreviousPrefixCount) { Write-Output 'CATALOG_REFRESH_PENDING' } else {
 } finally {
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name]) }
     $OutputEncoding=$encoding
+    $env:PATH=$originalPath
     Remove-Item Function:git,Function:python,Function:docker
     Remove-Variable -Scope Global -Name scopePython,scopeMainChecks,scopeInspectCalls,scopeContractChecks,scopeCase,scopeManifest,scopeMarker -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $root -Recurse -Force
