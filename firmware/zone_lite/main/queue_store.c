@@ -519,6 +519,21 @@ dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token)
     xSemaphoreGive(lanes[lane].mutex);
     return result;
 }
+bool qs_snapshot_ram(qs_lane_t lane, uint32_t *depth)
+{
+    if (!depth || (unsigned)lane >= QS_COUNT || !lanes[lane].mutex ||
+        xSemaphoreTake(lanes[lane].mutex, 0) != pdTRUE) return false;
+    bool ready = lanes[lane].queue.ready;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    /* Opening an NVS checkpoint alone is not verified recovery. A stale
+     * generation after append/settlement remains unknown until re-audited. */
+    ready = ready && recovery_audits[lane].complete &&
+        recovery_audits[lane].generation == lanes[lane].queue.checkpoint.generation;
+#endif
+    if (ready) *depth = lanes[lane].queue.checkpoint.depth;
+    xSemaphoreGive(lanes[lane].mutex);
+    return ready;
+}
 bool qs_snapshot(qs_lane_t lane, uint32_t *depth)
 {
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER

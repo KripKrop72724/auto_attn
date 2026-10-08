@@ -455,6 +455,19 @@ static void execute_reader_shutdown(owner_t *o, zj_request_t *request, zj_reply_
     o->store.last_operation = "rollback_selection";
 }
 
+static void pause_after_work(bool pending, uint64_t *last_pause_us)
+{
+    /* Finishing a request does not imply a scheduling block: a saturated
+     * mailbox can otherwise keep this priority-5 task READY indefinitely.
+     * Pause only after all local locks are released, with a positive tick at
+     * both 100 Hz and 1000 Hz; never reset or weaken the idle watchdog. */
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    if (pending || now - *last_pause_us >= 2000U) {
+        vTaskDelay(1);
+        *last_pause_us = (uint64_t)esp_timer_get_time();
+    }
+}
+
 static void task(void *context)
 {
     owner_t *o = context;
@@ -463,9 +476,10 @@ static void task(void *context)
     /* Static creation can schedule this higher-priority task before returning
      * its handle. Routing must recognize the owner before it touches storage. */
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    uint64_t last_pause_us = (uint64_t)esp_timer_get_time();
     for (;;) {
         uint64_t ticket = 0;
-        while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
+        while (!enter()) vTaskDelay(1);
         o->health.sampled_uptime_us = (uint64_t)esp_timer_get_time();
         bool work = zj_mailbox_begin(&o->mailbox, &request, &ticket);
         bool reader_control = !work && o->reader_ticket && !o->reader_completed;
@@ -519,7 +533,7 @@ static void task(void *context)
             reply.result = recover(o);
         }
         uint64_t finished = (uint64_t)esp_timer_get_time();
-        while (!enter()) vTaskDelay(pdMS_TO_TICKS(1));
+        while (!enter()) vTaskDelay(1);
         if (work) {
             if (reader_control) {
                 o->reader_result = reply.result;
@@ -595,7 +609,7 @@ static void task(void *context)
         xSemaphoreGive(mailbox_lock);
         mbedtls_platform_zeroize(&request, sizeof(request));
         mbedtls_platform_zeroize(&reply, sizeof(reply));
-        if (pending) vTaskDelay(pdMS_TO_TICKS(1));
+        pause_after_work(pending, &last_pause_us);
     }
 }
 

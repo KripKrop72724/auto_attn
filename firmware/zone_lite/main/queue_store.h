@@ -30,6 +30,11 @@ dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t lengt
 dq_result_t qs_peek(qs_lane_t lane, void *data, size_t capacity, size_t *length, dq_token_t *token);
 dq_result_t qs_settle(qs_lane_t lane, const dq_token_t *token);
 bool qs_snapshot(qs_lane_t lane, uint32_t *depth);
+/* Telemetry only: copy the verified in-RAM durable checkpoint without owner
+ * work, filesystem access or waiting. Busy/unrecovered lanes are unknown.
+ * This does not prove absence of admitted-but-uncommitted records and must
+ * not replace custody, boot-health or queue-retirement checks. */
+bool qs_snapshot_ram(qs_lane_t lane, uint32_t *depth);
 qs_health_t qs_health(void);
 
 /* Holds the shared filesystem admission lock across bounded local writes only.

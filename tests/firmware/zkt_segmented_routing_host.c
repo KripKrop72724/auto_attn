@@ -9,6 +9,7 @@ typedef struct { durable_queue_t queue; int *mutex; qs_admission_t admission; } 
 static int lane_lock, budget_mutex;
 static int *budget_lock = &budget_mutex;
 static lane_t lanes[QS_COUNT];
+static dq_audit_t recovery_audits[QS_COUNT];
 static qs_health_t health;
 static char storage_generation[33] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static bool required, owner_context;

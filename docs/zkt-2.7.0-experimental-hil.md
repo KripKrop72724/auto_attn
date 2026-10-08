@@ -42,16 +42,27 @@ campaign is paused. The reset cause remains unknown because that attempt has
 no matching console capture. The 2.6.18 diagnosis cannot establish the cause
 of this later rollback.
 
-**2.6.20** is a new diagnostic bridge role for a bounded 3FL canary with USB
-console capture prepared. Its publication remains experimental and restricted
-to the first exact ordered target until stored bridge-readiness evidence permits
-expansion. It must pass the same predecessor, image, persistence, reader and
-source gates; adding the role is neither a field pass nor a diagnosis. Preserve
-the immutable 2.6.17/18/19 packages and their revocation evidence. Keep the
+The separate **2.6.20** diagnostic canary booted its exact signed image, but
+failed `BOOT_HEALTH_TIMEOUT` and remains revoked. Matching USB and ELF evidence
+showed idle-task watchdog reports in queued heartbeat/storage paths and AES DMA
+allocation failures followed by TLS write errors. At 100 Hz, the 2 ms client and
+1 ms owner delays rounded to zero. The scheduling defect is reproduced; the
+specific failed DMA allocation and the earlier 2.6.19 reset cause remain unknown.
+
+**2.6.21** is a new, unqualified diagnostic bridge. It adds positive-tick waits,
+bounded owner scheduling pauses after lock release, verified RAM-only queue
+telemetry, and bounded numeric memory diagnostics. It retains the existing
+watchdog, allocation, persistence and reader gates. The added diagnostics do
+not claim to fix DMA pressure. Capture the exact signed ELF/map and measure
+internal memory and startup-stack paths before signing; shared bridge-disabled
+reboot code still has static/RTC costs.
+
+Publication remains experimental and restricted to the first exact ordered
+target until stored bridge-readiness evidence permits expansion. Preserve all
+immutable 2.6.17/18/19/20 packages and their failure/revocation evidence. Keep the
 writer's 2.6.17 version and digest pins unchanged until a replacement reader
-has actually qualified. Record the new build's ELF/map, internal memory and
-startup-stack evidence before signing; bridge-disabled reboot code still has
-static/RTC storage costs and is not evidence for the previous reset cause.
+actually qualifies. No 2.6.21 field pass, recovered health or physical stack
+watermark is implied by the new role or successful automated tests.
 
 Explicit writer rollback must retain the proved bridge's `VALID` state. Making
 that image `NEW` creates a pending bridge with retained ADD authority: capture

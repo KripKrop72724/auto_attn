@@ -24,21 +24,37 @@ interruption is established as the reset cause. The earlier 2.6.18 memory
 finding cannot be assigned to this attempt without evidence. Reader
 qualification and the writer's artifact pins remain unresolved.
 
-The next diagnostic bridge has the separate immutable version **2.6.20**.
-USB console capture is prepared for a bounded 3FL canary, but no 2.6.20 boot,
-reset cause, field readiness or recovery result is claimed by this role addition.
-It retains the same exact predecessor images, signed nationwide scope, HIL-only
-publication and stored bridge-readiness requirements. The revoked 2.6.17,
-2.6.18 and 2.6.19 artifacts remain historical evidence. The 2.7.0 writer still
+The signed **2.6.20** canary reached its matching application image on 8 October,
+but ADD recorded `BOOT_HEALTH_TIMEOUT` and the candidate remains revoked. Its
+matching USB capture showed idle-task watchdog reports and failed AES DMA
+allocations followed by TLS write failures. Verified backtraces reached the
+heartbeat's queued storage snapshot and storage-owner legacy reads. At the
+release's 100 Hz tick rate, the client 2 ms and owner 1 ms waits rounded down to
+zero ticks. This establishes a scheduling defect; it does not establish which
+AES allocation failed or the cause of the earlier 2.6.19 rollback.
+
+The next diagnostic bridge has the separate immutable version **2.6.21**. It
+uses positive scheduling waits, pauses a continuously busy storage owner after
+releasing its locks, and obtains heartbeat queue counts from verified RAM
+checkpoints without scheduling storage work. Busy or unaudited counts remain
+unknown. Bounded numeric UART diagnostics report capability-specific free and
+largest heap blocks and allocation-failure samples; they do not change the
+allocation policy or claim that the AES failure is resolved. The failed 2.6.20
+artifact is not replaced or relabelled, and every older package remains auditable.
+
+2.6.21 retains the same exact predecessor images, signed nationwide scope,
+HIL-only publication and stored bridge-readiness requirements. It is unqualified
+until its exact signed image supplies field evidence. The 2.7.0 writer still
 requires its pinned 2.6.17 image; replacing that pin requires actual qualified
 reader evidence and a separately reviewed contract update.
 
-The 2.6.20 build must include a fresh internal-memory and startup-stack review.
-Controlled ESP reboot is unsupported on a bridge, but shared ZKT code retains
-its RTC witness and pending-action storage. These costs must be measured in the
-exact ELF/map along with the reserved journal worker stacks. They do not identify
-the cause of the previous 2.6.19 rollback. This candidate must not be described as
-fixing that cause without reproduction and evidence.
+The new build requires an exact-ELF internal-memory and startup-stack review.
+Controlled ESP reboot is unsupported on bridges, but shared ZKT code retains
+its RTC witness and pending-action storage. The allocation-failure callback
+uses bounded native CAS only on internal DRAM; target flags, generated calls and
+IRAM/DRAM placement must be verified. Host tests alone cannot establish the
+ESP32-S3 memory or timing behavior. Physical stack watermarks and recovered field
+health remain unperformed until measured.
 
 The [5 October experimental HIL direction](zkt-2.7.0-experimental-hil.md)
 permits remote HIL using ADD and automated evidence without waiting for external

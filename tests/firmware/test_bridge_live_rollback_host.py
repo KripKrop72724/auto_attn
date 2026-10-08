@@ -3,12 +3,15 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / "firmware/zone_lite/main"
 FIXTURES = ROOT / "tests/firmware"
 
 
-def test_valid_reader_captures_during_terminal_stability_window(tmp_path):
+@pytest.mark.parametrize("bridge_version", ["2.6.20", "2.6.21"])
+def test_valid_reader_captures_during_terminal_stability_window(tmp_path, bridge_version):
     for header in ("esp_app_desc.h", "esp_ota_ops.h", "esp_secure_boot.h", "esp_err.h", "sdkconfig.h"):
         (tmp_path / header).write_text('#include "zkt_reader_platform_host.h"\n')
     (tmp_path / "esp_timer.h").write_text('#include <stdint.h>\nint64_t esp_timer_get_time(void);\n')
@@ -140,7 +143,7 @@ int main(void)
                     simulate.replace("/* ACTUAL_LIVE_ACCEPTANCE */", live_acceptance))
     binary = tmp_path / "rollback-live"
     subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
-                    '-DZJ_BRIDGE_VERSION="2.6.20"', "-DCONFIG_NVS_ENCRYPTION=1", "-DZONE_LITE_JOURNAL_WRITES=1",
+                    f'-DZJ_BRIDGE_VERSION="{bridge_version}"', "-DCONFIG_NVS_ENCRYPTION=1", "-DZONE_LITE_JOURNAL_WRITES=1",
                     "-g", "-O1", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
                     "-fno-omit-frame-pointer", "-I", str(tmp_path), "-I", str(FIXTURES), "-I", str(MAIN),
                     str(unit), str(MAIN / "zkt_journal_boot.c"), "-o", str(binary)], check=True)

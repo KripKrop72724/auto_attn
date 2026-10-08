@@ -10,6 +10,7 @@
 #include "zkt_command_ids.h"
 #include "zkt_add_legacy_owner.h"
 #include "zkt_runtime_checkpoint.h"
+#include "zkt_memory_diagnostics.h"
 #endif
 #include "evidence_receipt.h"
 #include "file_transaction.h"
@@ -2861,6 +2862,10 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        zkt_memory_diag_report(ZMD_ADD_TRANSPORT_FAILURE,
+            event ? event->error_handle.esp_tls_last_esp_err : ESP_FAIL);
+#endif
         reset_inbound_payload();
         mark_transport_disconnected();
         ESP_LOGW(TAG, "ADD WebSocket transport error");
@@ -3019,7 +3024,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         if (!queue) goto failed;
         if (!cJSON_AddItemToArray(queues, queue)) { cJSON_Delete(queue); goto failed; }
         uint32_t depth = 0;
-        bool known = qs_snapshot((qs_lane_t)i, &depth);
+        bool known = qs_snapshot_ram((qs_lane_t)i, &depth);
         if (!cJSON_AddStringToObject(queue, "name", segmented_names[i]) ||
             !cJSON_AddBoolToObject(queue, "count_known", known) ||
             (known && !cJSON_AddNumberToObject(queue, "records", depth))) goto failed;
@@ -4693,6 +4698,9 @@ static bool perform_onboarding(void)
     esp_http_client_set_header(client, "X-ADD-Signature", signature);
     esp_http_client_set_post_field(client, body, (int)strlen(body));
     esp_err_t err = esp_http_client_perform(client);
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (err != ESP_OK) zkt_memory_diag_report(ZMD_ADD_TRANSPORT_FAILURE, err);
+#endif
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     free(body);

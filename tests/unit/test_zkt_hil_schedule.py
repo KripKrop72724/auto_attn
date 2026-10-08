@@ -66,10 +66,10 @@ def ready_event(session, release, device, deployment):
     return run, event
 
 
-@pytest.fixture
-def fleet(hil_session):  # noqa: F811
+@pytest.fixture(params=["2.6.20", "2.6.21"])
+def fleet(hil_session, request):  # noqa: F811
     session, release, devices = hil_session
-    release.release_id, release.version = "zone-lite-2.6.20", "2.6.20"
+    release.release_id, release.version = f"zone-lite-{request.param}", request.param
     release.minimum_bootstrap_version = "2.4.12"
     release.manifest = {
         **release.manifest,
@@ -80,7 +80,7 @@ def fleet(hil_session):  # noqa: F811
         "release_channel": "EXPERIMENTAL_HIL_ONLY",
         "minimum_bootstrap_version": "2.4.12",
         "runtime_profile": "ZKT_LEGACY",
-        "queue_storage": bridge_contract("2.6.20"),
+        "queue_storage": bridge_contract(release.version),
         "hil_targets": signed_hil_targets(),
         "_hil_targets": signed_hil_targets()[:3],
     }
@@ -690,7 +690,7 @@ def test_postgres_concurrent_creates_cannot_reserve_two_targets(pg_fleet):
                     release_public_id=release_id,
                     zone_id=zone_id,
                     reason="race",
-                    typed_confirmation="2.6.20",
+                    typed_confirmation=release_id.removeprefix("zone-lite-"),
                     actor="second",
                     scope_token=preview["scope_token"],
                     idempotency_key="second",
@@ -703,7 +703,7 @@ def test_postgres_concurrent_creates_cannot_reserve_two_targets(pg_fleet):
             release_public_id=release_id,
             zone_id=zone_id,
             reason="race",
-            typed_confirmation="2.6.20",
+            typed_confirmation=release_id.removeprefix("zone-lite-"),
             actor="first",
             scope_token=preview["scope_token"],
             idempotency_key="first",
@@ -736,7 +736,7 @@ def test_postgres_reconnect_committed_before_create_invalidates_preview(pg_fleet
                 release_public_id=release_id,
                 zone_id=zone_id,
                 reason="stale",
-                typed_confirmation="2.6.20",
+                typed_confirmation=release_id.removeprefix("zone-lite-"),
                 actor="first",
                 scope_token=preview["scope_token"],
                 idempotency_key="stale",

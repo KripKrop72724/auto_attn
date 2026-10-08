@@ -19,7 +19,10 @@ static bool collect(client_t *client, uint64_t deadline, zj_reply_t *reply)
             client->ticket = 0; return true;
         }
         if ((uint64_t)esp_timer_get_time() >= deadline) return false;
-        vTaskDelay(pdMS_TO_TICKS(2));
+        /* IDF's conversion floors: 2 ms is zero ticks at the release's
+         * 100 Hz. A zero delay keeps this priority task READY, starving the
+         * idle watchdog while the owner is inside flash I/O. */
+        vTaskDelay(pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1);
     } while (true);
 }
 static bool begin(client_t *client, uint64_t *deadline)
