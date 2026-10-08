@@ -1,0 +1,100 @@
+name: Extend exact ZKT journal HIL exposure
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing signed experimental release
+        required: true
+        type: choice
+        options: ['2.6.23', '2.6.22', '2.7.0']
+      source_sha:
+        description: Exact signed firmware source SHA (40 lowercase hex)
+        required: true
+        type: string
+      application_sha256:
+        description: Exact published application digest
+        required: true
+        type: string
+      artifact_sha256:
+        description: Exact full signed binary digest
+        required: true
+        type: string
+      old_prefix_count:
+        description: Expected currently exposed prefix count
+        required: true
+        type: string
+      new_prefix_count:
+        description: Larger prefix count (maximum17; factory22 maximum3)
+        required: true
+        type: string
+      mode:
+        description: Preview verifies without replacing the exposure marker
+        required: true
+        default: preview
+        type: choice
+        options: [preview, apply]
+      confirmation:
+        description: Type PREVIEW-version-HIL-old-TO-new or APPLY-version-HIL-old-TO-new
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+# Same group as ADD deploy. This coordinates repository workflows, not arbitrary
+# Docker or database operations; runtime identity/revocation checks still apply.
+concurrency:
+  group: add-production
+  cancel-in-progress: false
+
+jobs:
+  extend:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact current main, deployed trust, release and ordered scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORE_DIRECTORY: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          APPLICATION_SHA256: ${{ inputs.application_sha256 }}
+          ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+          OLD_PREFIX_COUNT: ${{ inputs.old_prefix_count }}
+          NEW_PREFIX_COUNT: ${{ inputs.new_prefix_count }}
+          EXTENSION_MODE: ${{ inputs.mode }}
+          TYPED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:STORE_DIRECTORY) { throw 'Production firmware store is not configured.' }
+          ./deploy/add/extend-journal-hil-scope.ps1 `
+            -StoreDirectory $env:STORE_DIRECTORY `
+            -Version $env:RELEASE_VERSION `
+            -ExpectedGitSha $env:SOURCE_SHA `
+            -ExpectedImageSha256 $env:ARTIFACT_SHA256 `
+            -ExpectedApplicationSha256 $env:APPLICATION_SHA256 `
+            -ExistingPrefixCount $env:OLD_PREFIX_COUNT `
+            -ExtendedPrefixCount $env:NEW_PREFIX_COUNT `
+            -Mode $env:EXTENSION_MODE `
+            -Confirmation $env:TYPED_CONFIRMATION `
+            -ExpectedMainSha $env:GITHUB_SHA `
+            -EvidencePath (Join-Path $PWD 'hil-scope-evidence.json')
+      - name: Retain exposure decision and partial-outcome evidence
+        if: always() && hashFiles('hil-scope-evidence.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-scope-extension-${{ github.run_id }}-${{ github.run_attempt }}
+          path: hil-scope-evidence.json
+          if-no-files-found: error
+          retention-days: 30

@@ -17,7 +17,7 @@ function docker {
         $path = $arguments[-3]
         $chunk = $arguments[-2]
         $offset = [int]$arguments[-1]
-        if ($path -notmatch '^/tmp/add-firmware-admission-[a-f0-9]{32}/(manifest.json|manifest.sig|check.py)$' -or
+        if ($path -notmatch '^/tmp/add-firmware-admission-[a-f0-9]{32}/(manifest.json|manifest.sig|check.py|hil-marker.json)$' -or
             $chunk.Length -gt 3072) { throw 'Unsafe admission chunk identity or size' }
         $decoded = [Convert]::FromBase64String($chunk)
         $stored = $global:admissionTestBytes[$path]
@@ -44,7 +44,20 @@ function docker {
         if ($arguments[4] -match 'rmtree' -and $global:admissionTestScenario -eq 'cleanup-failure') { $global:LASTEXITCODE = 1 }
         return
     }
-    if ($arguments[3] -notmatch '/check.py$' -or $global:admissionTestBytes.Count -ne 3) { throw 'Checker must execute three fully transferred public files' }
+    $published = $global:admissionTestScenario -like 'published-*'
+    $expectedFiles = if ($published) { 4 } else { 3 }
+    if ($arguments[3] -notmatch '/check.py$' -or $global:admissionTestBytes.Count -ne $expectedFiles) { throw 'Checker must execute the exact fully transferred public files' }
+    if ($published) {
+        if ($arguments[4] -cne '--require-published-hil' -or $arguments[5] -cne '--publication-marker' -or
+            $arguments[6] -cnotmatch '/hil-marker.json$' -or $arguments[7] -cne '--previous-prefix-count') {
+            throw 'Published checker mode or marker was not passed exactly'
+        }
+        $expectedPrevious = if ($global:admissionTestScenario -eq 'published-pending') { '1' } else { '0' }
+        if ($arguments[8] -cne $expectedPrevious) { throw 'Previous prefix permission changed' }
+        if ($global:admissionTestScenario -eq 'published-reject') { $global:LASTEXITCODE = 1; return 'ADD_FIRMWARE_CONTRACT_REJECTED' }
+        $state = if ($global:admissionTestScenario -in @('published-pending', 'published-unallowed-pending')) { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
+        return ('ADD_FIRMWARE_CONTRACT_ACCEPTED:' + $arguments[-1] + ':' + $state)
+    }
     if ($global:admissionTestScenario -eq 'reject') { $global:LASTEXITCODE = 1; return 'ADD_FIRMWARE_CONTRACT_REJECTED' }
     if ($global:admissionTestScenario -eq 'empty') { return }
     if ($global:admissionTestScenario -eq 'wrong-artifact') { return ('ADD_FIRMWARE_CONTRACT_ACCEPTED:' + ('a'*64)) }
@@ -57,13 +70,17 @@ try {
     # contain only base64 and must reconstruct the original bytes exactly.
     [IO.File]::WriteAllBytes((Join-Path $root 'manifest.json'), [Text.Encoding]::UTF8.GetBytes(('x' * 12000) + [char]0x0627))
     [IO.File]::WriteAllText((Join-Path $root 'manifest.sig'), 'public-test-signature')
+    [IO.File]::WriteAllText((Join-Path $root '.hil-only.json'), '{"schema_version":2}')
     foreach ($case in @('pass', 'reject', 'empty', 'wrong-artifact', 'extra-output', 'copy-failure', 'hash-failure', 'prepare-failure', 'cleanup-failure')) {
         $global:admissionTestScenario = $case
         $global:admissionTestCalls.Clear()
         $global:admissionTestBytes.Clear()
         $caught = $false
         $failure = ''
-        try { & $check -SourceDirectory $root } catch { $caught = $true; $failure = $_.Exception.Message }
+        try {
+            $successStream = @(& $check -SourceDirectory $root)
+            if ($successStream.Count -ne 0) { throw 'Default admission checker changed its success-stream contract' }
+        } catch { $caught = $true; $failure = $_.Exception.Message }
         if ($OutputEncoding.GetPreamble().Length -eq 0) { throw 'Transfer unexpectedly changed caller encoding' }
         if ($caught -ne ($case -ne 'pass')) { throw "Incorrect deployed admission result: $case ($failure)" }
         if ($case -eq 'prepare-failure') {
@@ -73,6 +90,20 @@ try {
             if ($global:admissionTestCalls[-1][-1] -cne $global:admissionTestCalls[0][-1]) { throw 'Cleanup scope mismatch' }
             if ($case -eq 'pass' -and $global:admissionTestCalls.Count -lt 12) { throw 'Multi-chunk transfer was not exercised' }
         }
+    }
+    foreach ($case in @('published-current', 'published-pending', 'published-unallowed-pending', 'published-reject')) {
+        $global:admissionTestScenario = $case
+        $global:admissionTestCalls.Clear()
+        $global:admissionTestBytes.Clear()
+        $caught = $false
+        try {
+            $previousCount = if ($case -eq 'published-pending') { 1 } else { 0 }
+            $successStream = @(& $check -SourceDirectory $root -RequirePublishedHilRelease -AllowPreviousPrefixCount $previousCount)
+            $expectedState = if ($case -eq 'published-pending') { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
+            if ($successStream.Count -ne 1 -or $successStream[0] -cne $expectedState) { throw 'Published checker success-stream state changed' }
+        } catch { $caught = $true }
+        if ($caught -ne ($case -in @('published-unallowed-pending', 'published-reject'))) { throw "Incorrect published admission result: $case" }
+        if ($global:admissionTestCalls[-1][4] -notmatch 'rmtree') { throw 'Published check temporary-file cleanup missing' }
     }
     Write-Host 'Deployed firmware admission regressions passed.'
 } finally {
