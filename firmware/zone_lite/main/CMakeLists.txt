@@ -28,7 +28,8 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
         "zkt_segmented_store.c" "zkt_segmented_client.c" "zkt_legacy_attendance.c"
         "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
         "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c"
-        "zkt_journal_diagnostics.c" "zkt_source_boundary_client.c" "zkt_memory_diagnostics.c")
+        "zkt_journal_diagnostics.c" "zkt_source_boundary_client.c" "zkt_memory_diagnostics.c"
+        "zkt_factory_trial.c" "zkt_factory_platform.c")
     # IDF disables native atomics globally to protect PSRAM operands. The small
     # diagnostic callback uses only explicit DRAM words and must not call the
     # locking PSRAM fallback. Keep this exception scoped to this source; its
@@ -49,13 +50,27 @@ if(ZONE_LITE_JOURNAL_WRITES)
         message(FATAL_ERROR "Journal images cannot mix legacy storage upgrade modes")
     endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITES=1)
-    if(PROJECT_VER STREQUAL "2.6.16" OR PROJECT_VER STREQUAL "2.6.17" OR PROJECT_VER STREQUAL "2.6.18" OR PROJECT_VER STREQUAL "2.6.19" OR PROJECT_VER STREQUAL "2.6.20" OR PROJECT_VER STREQUAL "2.6.21" OR PROJECT_VER STREQUAL "2.6.23")
+    if(PROJECT_VER STREQUAL "2.6.16" OR PROJECT_VER STREQUAL "2.6.17" OR PROJECT_VER STREQUAL "2.6.18" OR PROJECT_VER STREQUAL "2.6.19" OR PROJECT_VER STREQUAL "2.6.20" OR PROJECT_VER STREQUAL "2.6.21" OR PROJECT_VER STREQUAL "2.6.22" OR PROJECT_VER STREQUAL "2.6.23")
         target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_BRIDGE_IMAGE=1 ZJ_BRIDGE_VERSION="${PROJECT_VER}")
+        if(PROJECT_VER STREQUAL "2.6.22")
+            target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_FACTORY_TRIAL_IMAGE=1)
+        endif()
         if(NOT PROJECT_VER STREQUAL "2.6.16")
             target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE=1)
         endif()
     elseif(PROJECT_VER STREQUAL "2.7.0")
-        target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITER_IMAGE=1)
+        execute_process(COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/build_zkt_reader_matrix.py"
+            --header "${ZONE_LITE_GENERATED_DIR}/zkt_qualified_reader_matrix.h"
+            RESULT_VARIABLE ZONE_LITE_MATRIX_RESULT)
+        if(NOT ZONE_LITE_MATRIX_RESULT EQUAL 0)
+            message(FATAL_ERROR "The reviewed writer reader matrix is invalid")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_LIST_DIR}/../../../apps/add_backend/zk_add/zkt_reader_matrix.json"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../apps/add_backend/zk_add/zkt_reader_matrix.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/build_zkt_reader_matrix.py")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITER_IMAGE=1
+            ZONE_LITE_QUALIFIED_READER_MATRIX=1)
     else()
         message(FATAL_ERROR "Journal storage requires an explicitly versioned reader/writer role")
     endif()

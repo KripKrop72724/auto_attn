@@ -4,6 +4,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
+from reader_matrix_fixtures import admit, pinned, proof  # noqa: F401
 from test_hil_scope import hil_session  # noqa: F401
 from test_hil_runs import ready  # noqa: F401
 from zk_add.hil_runs import _release_identity
@@ -12,11 +13,11 @@ from zk_add.models import Connector
 from zk_add.ota import FirmwareDeployment, FirmwareEvent, FirmwareHilRun, _permitted_hil_targets
 from zk_add.time_utils import utc_now
 from zk_add.zkt_bridge_contract import signed_hil_targets
-from zk_add.zkt_writer_contract import writer_contract
+from zk_add.zkt_reader_matrix import writer_matrix_contract
 
 
 @pytest.fixture
-def writer(ready):  # noqa: F811
+def writer(ready, pinned):  # noqa: F811
     session, release, device, deployment, *_ = ready
     targets = signed_hil_targets()[:2]
     devices = list(session.scalars(select(Connector).order_by(Connector.id).limit(2)))
@@ -24,23 +25,28 @@ def writer(ready):  # noqa: F811
         connector.connector_id, connector.hardware_id = target["connector_id"], target["mac"]
         for field in ("serial", "expected_serial", "confirmed_serial"):
             setattr(connector.zkt_device, field, target["terminal_serial"])
-    contract = writer_contract()
+    contract = writer_matrix_contract()
     release.release_id, release.version = "zone-lite-2.7.0", "2.7.0"
     release.manifest = {**release.manifest, "release_id": release.release_id, "version": release.version,
         "firmware_family": "zkt", "project_name": "zone_lite", "release_channel": "EXPERIMENTAL_HIL_ONLY",
-        "minimum_bootstrap_version": contract["compatibility_version"], "runtime_profile": "ZKT_JOURNAL_V1",
+        "minimum_bootstrap_version": contract["allowed_bootstrap_versions"][0], "runtime_profile": "ZKT_JOURNAL_V1",
         "queue_storage": contract, "hil_targets": signed_hil_targets(), "_hil_targets": targets}
     deployment.target_version = release.version
+    selection = admit(session, release, deployment, pinned)
+    reader_proof = proof(selection)
+    reader_proof.pop("sampled_uptime_ms")
     now = utc_now()
     identity = _release_identity(release).model_dump(mode="json")
     run = FirmwareHilRun(run_id="full-run", deployment_id=deployment.id, connector_id=device.id,
         release_id=release.id, actor="test", idempotency_key="full-run", status="HIL_ACCEPTED",
-        target=targets[0], release_identity=identity, baseline={"profile": "FULL_REMOTE_HIL_V1"},
+        target=targets[0], release_identity=identity, baseline={"profile": "FULL_REMOTE_HIL_V1", "reader_admission": selection, "qualified_reader": reader_proof},
         started_at=now - timedelta(minutes=16), ends_at=now - timedelta(minutes=1), completed_at=now,
         result={"profile": "FULL_REMOTE_HIL_V1", "outcome": "PASS", "reasons": []})
     # This fixture tests stored-seal linkage only. The collector's independent
     # tests establish whether real stored observations may produce this result.
-    sealed = {"collector_version": COLLECTOR_VERSION, "outcome": "PASS", "reasons": [],
+    sealed = {"reader_admission": selection, "qualified_reader": reader_proof,
+        "samples": [{"qualified_reader": reader_proof}], "current_sample": {"qualified_reader": reader_proof},
+        "collector_version": COLLECTOR_VERSION, "outcome": "PASS", "reasons": [],
         "baseline_sha256": evidence_digest(run.baseline),
         "scope": {"run_id": run.run_id, "deployment_id": run.deployment_id,
                   "target": run.target, "release_identity": run.release_identity},
@@ -86,7 +92,7 @@ def test_offline_unqualified_writer_target_can_defer_without_admitting_next_unqu
     decision = schedule(session, release)
     assert decision["selected"] == targets[2]
     assert decision["rows"][1]["status"] == "DEFERRED_OFFLINE"
-    assert "JOURNAL_BRIDGE_ARTIFACT_MISSING" in decision["rows"][1]["prerequisites"]
+    assert "JOURNAL_EXACT_BRIDGE_REQUIRED" in decision["rows"][1]["prerequisites"]
     assert decision["denominator"] == 17 and decision["counts"]["PASSED"] == 1
     with pytest.raises(ValueError, match="JOURNAL_EXACT_BRIDGE_REQUIRED"):
         preview_campaign_scope(session, release_public_id=release.release_id, zone_id=third.zone_id)

@@ -133,6 +133,13 @@ def complete_bridge_run(session, run_id, *, actor):
     if (connector is None or not target_matches(target, connector) or not connector.connected
             or not connector.zkt_device.online or connector.boot_id != run.baseline["boot_id"]):
         errors.append("CURRENT_TARGET_NOT_READY")
+    if release is not None and release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import revoked_evidence
+        try:
+            if revoked_evidence(session, connector, deployment, release, current_boot=True) != run.baseline.get("factory_fallback_revocation"):
+                errors.append("FACTORY_REVOCATION_CHANGED")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            errors.append("FACTORY_REVOCATION_UNVERIFIED")
     rows = list(session.scalars(select(DeviceTelemetry).where(
         DeviceTelemetry.connector_id == run.connector_id,
         DeviceTelemetry.created_at >= start, DeviceTelemetry.created_at <= end,
@@ -208,6 +215,14 @@ def ready_event_matches(session, event, deployment, release):
     """Scope progression needs the stored server verdict, not an event label."""
     details = event.details or {}
     run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == details.get("run_id")))
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import revoked_evidence
+        try:
+            connector = session.get(Connector, deployment.connector_id)
+            if run is None or revoked_evidence(session, connector, deployment, release) != run.baseline.get("factory_fallback_revocation"):
+                return False
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return False
     return bool(event.state == "BRIDGE_READY" and details.get("profile") == PROFILE
         and details.get("outcome") == "READY" and run is not None and run.status == "BRIDGE_READY"
         and run.deployment_id == deployment.id and run.connector_id == deployment.connector_id

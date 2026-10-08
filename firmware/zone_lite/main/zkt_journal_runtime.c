@@ -1,6 +1,7 @@
 #include "zkt_journal_runtime.h"
 #include "zkt_capture_runtime.h"
 #include "zkt_journal_diagnostics.h"
+#include "zkt_factory_platform.h"
 #include "queue_store.h"
 #include "zone_config.h"
 #include "esp_app_desc.h"
@@ -64,6 +65,9 @@ void zj_runtime_step(void)
         input.secure = config->provisioned && !strcmp(config->firmware_family, "zkt") &&
             esp_secure_boot_enabled() && running && running->type == ESP_PARTITION_TYPE_APP &&
             (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+        input.secure = input.secure && zf_platform_startup_allowed();
+#endif
 #endif
         qs_health_t storage = qs_health();
         input.storage_available = storage.observed && storage.available;

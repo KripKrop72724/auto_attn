@@ -20,6 +20,7 @@ from zk_add.crypto import decrypt_json, encrypt_json
 from zk_add.hil_scope import target_matches
 from zk_add.models import (
     Connector,
+    ZKTDevice,
     DeviceTelemetry,
     ReconciliationCoverage,
     TerminalSourceEpoch,
@@ -27,7 +28,7 @@ from zk_add.models import (
     ZktLegacyHandoff,
     ZktSourceCutover,
 )
-from zk_add.ota import FirmwareDeployment, FirmwareRelease, _application_sha256, _verify_manifest
+from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareRelease, _application_sha256, _verify_manifest
 from zk_add.runtime_contract import journal_storage_status, runtime_contract, worker_snapshot_fresh
 from zk_add.schemas import LegacyInventoryDiagnostics
 from zk_add.time_utils import ensure_utc, utc_now
@@ -40,7 +41,7 @@ SCOPE = "LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1"
 
 def _release(session, connector, release_id):
     release = session.scalar(
-        select(FirmwareRelease).where(FirmwareRelease.release_id == release_id)
+        select(FirmwareRelease).where(FirmwareRelease.release_id == release_id).execution_options(populate_existing=True)
     )
     target = BY_ID.get(connector.connector_id)
     if (
@@ -60,7 +61,8 @@ def _release(session, connector, release_id):
     try:
         from zk_add.storage_contract import validate_storage_contract
 
-        validate_storage_contract(manifest, release.version)
+        if validate_storage_contract(manifest, release.version)["schema_version"] != 5:
+            raise ValueError("Historical writer contract is audit-only")
         _verify_manifest(manifest, release.manifest_signature)
     except (ValueError, RuntimeError, InvalidSignature, TypeError) as exc:
         raise ValueError("HANDOFF_RELEASE_SIGNATURE_OR_CONTRACT") from exc
@@ -112,10 +114,14 @@ def _lock(session, connector_id, actor, idempotency_key):
     if not actor or len(actor) > 120 or not idempotency_key or len(idempotency_key) > 120:
         raise ValueError("HANDOFF_ACTOR_AND_KEY_REQUIRED")
     connector = session.scalar(
-        select(Connector).where(Connector.connector_id == connector_id).with_for_update()
+        select(Connector).where(Connector.connector_id == connector_id).with_for_update().execution_options(populate_existing=True)
     )
     if connector is None:
         raise ValueError("HANDOFF_CONNECTOR_NOT_FOUND")
+    terminal = session.scalar(select(ZKTDevice).where(ZKTDevice.connector_id == connector.id)
+        .execution_options(populate_existing=True))
+    if terminal is None or connector.zkt_device is not terminal:
+        raise ValueError("HANDOFF_EXACT_TERMINAL_REQUIRED")
     return connector
 
 
@@ -234,6 +240,7 @@ def commit_handoff(session, connector_id, *, release_id, actor, idempotency_key,
         .where(FirmwareDeployment.connector_id == connector.id)
         .order_by(FirmwareDeployment.id.desc())
         .limit(1)
+        .execution_options(populate_existing=True)
     )
     if (
         deployment is None
@@ -241,11 +248,19 @@ def commit_handoff(session, connector_id, *, release_id, actor, idempotency_key,
         or deployment.status not in {"RECONCILING", "SUCCEEDED"}
     ):
         raise ValueError("HANDOFF_VERIFIED_INSTALL_REQUIRED")
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id, populate_existing=True)
+    if (campaign is None or campaign.release_id != release.id or campaign.zone_id != connector.zone_id
+            or campaign.status not in {"ACTIVE", "COMPLETED"}):
+        raise ValueError("HANDOFF_VERIFIED_INSTALL_REQUIRED")
+    from zk_add.zkt_reader_evidence import admitted_reader, qualified_reader_proof
+    selection = admitted_reader(session, deployment, release)
+    reader_proofs = []
     samples = session.scalars(
         select(DeviceTelemetry)
         .where(DeviceTelemetry.connector_id == connector.id)
         .order_by(DeviceTelemetry.id.desc())
         .limit(2)
+        .execution_options(populate_existing=True)
     ).all()
     if len(samples) != 2:
         raise ValueError("HANDOFF_STABLE_SAMPLES_REQUIRED")
@@ -286,9 +301,12 @@ def commit_handoff(session, connector_id, *, release_id, actor, idempotency_key,
             != connector.firmware_diagnostics.get("source_boundary")
         ):
             raise ValueError("HANDOFF_SAMPLE_BINDING_CHANGED")
+        reader_proofs.append(qualified_reader_proof(diagnostics, selection, row.uptime_seconds))
         proofs.append(_local_proof(diagnostics, row.uptime_seconds))
     if not 10 <= (sampled_times[0] - sampled_times[1]).total_seconds() <= 90:
         raise ValueError("HANDOFF_STABLE_SAMPLES_REQUIRED")
+    if reader_proofs[0] != reader_proofs[1]:
+        raise ValueError("HANDOFF_RETAINED_READER_CHANGED")
     if proofs[0] != proofs[1]:
         raise ValueError("HANDOFF_LEGACY_GENERATION_CHANGED")
     epoch = session.scalar(
@@ -310,6 +328,8 @@ def commit_handoff(session, connector_id, *, release_id, actor, idempotency_key,
     evidence = {
         "schema_version": 1,
         "scope": SCOPE,
+        "reader_admission": selection,
+        "qualified_reader": reader_proofs[0],
         "connector_id": connector.connector_id,
         "release_id": release.release_id,
         "artifact_sha256": release.image_sha256,

@@ -19,7 +19,7 @@ RESERVATION_LIMIT = 128
 
 
 def applies(release):
-    return release.state == "HIL_ONLY" and release.version in {"2.6.20", "2.6.21", "2.6.23", "2.7.0"}
+    return release.state == "HIL_ONLY" and release.version in {"2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
 
 
 def digest(value):
@@ -153,7 +153,7 @@ def _row(session, release, item, connector, exposed):
         from zk_add.zkt_writer_contract import qualified_bridge_hold
         qualification = qualified_bridge_hold(session, connector)
         if qualification in {"JOURNAL_BRIDGE_INSTALL_NOT_VERIFIED", "JOURNAL_BRIDGE_READY_MISSING",
-                              "JOURNAL_BRIDGE_ARTIFACT_MISSING"}:
+                              "JOURNAL_BRIDGE_ARTIFACT_MISSING", "JOURNAL_EXACT_BRIDGE_REQUIRED"}:
             row["prerequisites"].append(qualification)
         elif qualification:
             hold = qualification
@@ -307,6 +307,8 @@ def schedule(session, release):
     validate_storage_contract(release.manifest or {}, release.version)
     if (release.manifest or {}).get("hil_targets") != signed_hil_targets():
         raise ValueError("Signed nationwide HIL scope is incomplete.")
+    if release.version == "2.6.22":
+        return _factory_schedule(session, release)
     exposed = bridge_hil_targets((release.manifest or {}).get("_hil_targets"))
     connectors = {row.connector_id: row for row in session.scalars(select(Connector)
         .where(Connector.connector_id.in_([item.identity.connector_id for item in TARGETS])))}
@@ -346,6 +348,62 @@ def schedule(session, release):
     return {"policy": POLICY, "denominator": len(TARGETS), "rows": rows, "counts": counts,
             "selected": selected, "reservation": reservation, "hold": hold,
             "decision_sha256": digest(normalized)}
+
+
+
+def _factory_schedule(session, release):
+    """Three trials share the17-device denominator, with an external3FL gate."""
+    from zk_add.zkt_factory_contract import FACTORY_TARGETS, factory_trial_exposure
+    from zk_add.zkt_factory_trial import dependencies
+    exposed = factory_trial_exposure((release.manifest or {}).get("_hil_targets"))
+    pins = {pin["connector_id"]: pin for pin in FACTORY_TARGETS}
+    exposed_ids = {pin["connector_id"] for pin in exposed}
+    connectors = {row.connector_id: row for row in session.scalars(select(Connector).where(
+        Connector.connector_id.in_([item.identity.connector_id for item in TARGETS])))}
+    rows = []
+    for item in TARGETS:
+        row = _row(session, release, item, connectors.get(item.identity.connector_id),
+                   item.identity.connector_id in exposed_ids) if item.identity.connector_id in pins else {
+            "target": item.identity.model_dump(), "name": item.name, "wave": item.wave,
+            "exposed": False, "status": "NOT_APPLICABLE_TO_THIS_BRIDGE", "reason": "USES_OTHER_QUALIFIED_READER",
+            "accepted": None, "prerequisites": [], "current_hold": None, "connected": None, "last_seen_at": None}
+        if row["status"] == "DEFERRED_OFFLINE":
+            connector = connectors[item.identity.connector_id]
+            pin = pins[item.identity.connector_id]
+            from zk_add.ota import _versions_match
+            if (connector.onboarding_generation != pin["onboarding_generation"]
+                    or not _versions_match(connector.firmware_version, pin["factory_version"])
+                    or connector.ota_running_partition != "factory"
+                    or connector.ota_image_sha256 != pin["factory_application_sha256"]):
+                row.update(status="BLOCKED", reason="FACTORY_PREDECESSOR_BINDING_CHANGED")
+        rows.append(row)
+    dependency, hold = None, None
+    try:
+        dependency = dependencies(session, release)
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        hold = str(exc) if isinstance(exc, ValueError) else "FACTORY_DEPENDENCY_INVALID"
+    reservation, reservation_hold = _reservation(session, release, rows)
+    hold = hold or reservation_hold
+    expansion = next((row["current_hold"] for row in rows if row["current_hold"]), None)
+    if not reservation:
+        hold = hold or expansion
+    selected = None
+    if not hold and reservation:
+        selected = reservation["target"]
+    elif not hold:
+        for row in rows:
+            if row["exposed"] and row["status"] not in {"PASSED", "DEFERRED_OFFLINE"}:
+                selected = row["target"]
+                break
+    states = ("PASSED", "PENDING", "DEFERRED_OFFLINE", "BLOCKED", "NOT_APPLICABLE_TO_THIS_BRIDGE")
+    normalized = {"policy": POLICY, "release": _identity(release), "exposed": exposed, "dependency": dependency,
+                  "selected": selected, "reservation": reservation, "hold": hold,
+                  "rows": [{key: row[key] for key in ("target", "exposed", "status", "reason", "prerequisites",
+                                                       "current_hold", "accepted", "connected")} for row in rows]}
+    return {"policy": POLICY, "denominator": len(TARGETS), "trial_target_count": len(pins), "rows": rows,
+            "counts": {state: sum(row["status"] == state for row in rows) for state in states},
+            "selected": selected, "reservation": reservation, "hold": hold,
+            "factory_dependency": dependency, "decision_sha256": digest(normalized)}
 
 
 def lock_campaign_scope(session, release_public_id):

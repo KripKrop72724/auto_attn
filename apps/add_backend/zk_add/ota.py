@@ -302,6 +302,9 @@ def _is_2615_bld5_extension(release: FirmwareRelease, targets: list[HilTarget]) 
 
 
 def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
+    if identity[:2] == ("zone-lite-2.6.22", "2.6.22"):
+        from zk_add.zkt_factory_contract import factory_trial_exposure
+        return [HilTarget.model_validate(item) for item in factory_trial_exposure(raw)]
     if identity[:2] in {("zone-lite-2.6.16", "2.6.16"), ("zone-lite-2.6.17", "2.6.17"), ("zone-lite-2.6.18", "2.6.18"), ("zone-lite-2.6.19", "2.6.19"), ("zone-lite-2.6.20", "2.6.20"), ("zone-lite-2.6.21", "2.6.21"), ("zone-lite-2.6.23", "2.6.23"), ("zone-lite-2.7.0", "2.7.0")}:
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
@@ -317,7 +320,7 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     raw = (release.manifest or {}).get("_hil_targets")
     if raw is None:
         return None
-    bridge = release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23", "2.7.0"}
+    bridge = release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
     if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
     if bridge:
@@ -365,7 +368,7 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         if not evidence:
             return False
         latest, deployment = evidence[-1]
-        if release.version in {"2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"}:
+        if release.version in {"2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23"}:
             return deployment.status == "SUCCEEDED" and ready_event_matches(session, latest, deployment, release)
         if release.version == "2.7.0":
             from zk_add.hil_runs import accepted_full_event_matches
@@ -480,7 +483,7 @@ def _scope_exclusion_reason(
 
 def _scope_digest(
     release: FirmwareRelease, zone_id: str, connectors: list[Connector],
-    eligible: list[Connector], schedule_state: dict | None = None,
+    eligible: list[Connector], schedule_state: dict | None = None, *, session: Session | None = None,
 ) -> str:
     payload = {
         "release_id": release.release_id,
@@ -511,6 +514,10 @@ def _scope_digest(
             for row in sorted(connectors, key=lambda item: item.connector_id)
         ],
     }
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import predecessor_snapshot
+        payload["factory_trial_baselines"] = {row.connector_id: predecessor_snapshot(session, release, row)
+            for row in eligible}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -543,11 +550,15 @@ def _decode_scope_token(token: str) -> dict[str, Any]:
     return payload
 
 
-def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, connector: Connector) -> str | None:
+def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, connector: Connector,
+                                   *, deployment_id: int | None = None) -> str | None:
     try:
         contract = validate_storage_contract(release.manifest or {}, release.version)
     except ValueError:
         return "STORAGE_CONTRACT_INVALID"
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import admission_hold
+        return admission_hold(session, release, connector, own_deployment_id=deployment_id)
     if release.version == "2.7.0":
         from zk_add.zkt_writer_contract import writer_predecessor_hold
         return writer_predecessor_hold(session, connector, release) or (
@@ -731,7 +742,7 @@ def preview_campaign_scope(
     expires_at = utc_now() + timedelta(seconds=ttl_seconds)
     from zk_add.zkt_hil_schedule import schedule
     nationwide = schedule(session, release)
-    digest = _scope_digest(release, zone_id, connectors, eligible, nationwide)
+    digest = _scope_digest(release, zone_id, connectors, eligible, nationwide, session=session)
     token = _encode_scope_token(
         {
             "release_id": release.release_id,
@@ -795,7 +806,7 @@ def verify_campaign_scope_token(
         zone_id=zone_id,
     )
     from zk_add.zkt_hil_schedule import schedule
-    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors, eligible, schedule(session, release)):
+    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors, eligible, schedule(session, release), session=session):
         raise ValueError("Firmware scope changed. Refresh the preview before starting the campaign.")
     return release, connectors, eligible
 
@@ -858,12 +869,12 @@ def sync_release_store(session: Session) -> None:
         digest = hashlib.sha256(image_bytes).hexdigest()
         if not hmac.compare_digest(digest, str(manifest["image_sha256"])) or image.stat().st_size != int(manifest["image_size"]):
             raise RuntimeError(f"Firmware release {release_id} failed immutable artifact verification.")
-        if manifest.get("version") in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"}:
+        if manifest.get("version") in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23"}:
             from zk_add.zkt_bridge_contract import validate_bridge_image
             validate_bridge_image(image_bytes, manifest["version"])
         if manifest.get("version") == "2.7.0":
             from zk_add.zkt_writer_contract import validate_writer_image
-            validate_writer_image(image_bytes)
+            validate_writer_image(image_bytes, manifest)
         application_digest = str(manifest.get("application_sha256") or "")
         if application_digest and (
             len(application_digest) != 64 or application_digest != application_digest.lower() or
@@ -997,6 +1008,9 @@ def create_campaign(
         session.add(deployment)
         session.flush()
         reserve(session, release, campaign, deployment, nationwide)
+        if release.version == "2.6.22":
+            from zk_add.zkt_factory_trial import reserve_trial
+            reserve_trial(session, release, campaign, deployment, connector)
     return campaign
 
 
@@ -1055,7 +1069,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         return None
     if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
         return None
-    if _storage_predecessor_exclusion(session, release, connector):
+    if _storage_predecessor_exclusion(session, release, connector, deployment_id=deployment.id):
         return None
     try:
         bridge_target = _factory_3fl_bridge_target(release, connector.zone_id)
@@ -1085,17 +1099,37 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         return None
     # A heartbeat version string is not boot, digest, or reconciliation evidence.
     # Only the checked progress transitions may complete this deployment.
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import _trial
+        try:
+            _trial(session, connector, deployment.deployment_id, require_new_boot=False)
+        except ValueError:
+            return None
     if pending_offer:
         hold = pending_offer_hold(session, connector)
         if hold:
             deployment.error_code = hold
             deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
             return None
+        details = {}
+        if release.version == "2.7.0":
+            from zk_add.zkt_reader_evidence import current_reader_admission
+            try:
+                details["reader_admission"] = current_reader_admission(release, connector)
+            except ValueError:
+                return None
         deployment.status = "OFFERED"
         deployment.error_code = deployment.error_message = None
         deployment.offered_at = utc_now()
         deployment.attempt_count += 1
-        session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details={}))
+        session.add(FirmwareEvent(deployment_id=deployment.id, state="OFFERED", details=details))
+    elif release.version == "2.7.0":
+        from zk_add.zkt_reader_evidence import admitted_reader, current_reader_admission
+        try:
+            if admitted_reader(session, deployment, release) != current_reader_admission(release, connector):
+                return None
+        except ValueError:
+            return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
         deployment_id=deployment.id, connector_id=connector.id,
@@ -1141,6 +1175,9 @@ def record_progress(
     if release is None:
         raise ValueError("Firmware release is unavailable.")
     recovery = None
+    if release.version == "2.6.22" and state in {"BOOTED_PENDING", "RECONCILING", "SUCCEEDED"}:
+        from zk_add.zkt_factory_trial import revoked_evidence
+        revoked_evidence(session, connector, deployment, release, current_boot=True)
     if failed_boot_return:
         from zk_add.zkt_rollback_receipt import verify_failed_boot_return
 
@@ -1212,6 +1249,8 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         details = (event.details or {}) if event else {}
         if (details.get("recovery") or {}).get("schema_version") == 1:
             receipt["rollback_application_sha256"] = details.get("image_sha256")
+            if (details["recovery"].get("reader_admission") or {}).get("schema_version") == 1:
+                receipt["reader_admission"] = details["recovery"]["reader_admission"]
     return receipt
 
 
@@ -1700,14 +1739,21 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
             if connector is None or connector.hardware_id.lower() != target:
                 raise ValueError("HIL firmware grant target mismatch.")
     connector = session.get(Connector, grant.connector_id)
-    if connector is None or _storage_predecessor_exclusion(session, release, connector):
+    if connector is None or _storage_predecessor_exclusion(session, release, connector, deployment_id=deployment.id):
         raise ValueError("Firmware storage predecessor is no longer eligible.")
+    if release.version == "2.7.0":
+        from zk_add.zkt_reader_evidence import admitted_reader, current_reader_admission
+        if admitted_reader(session, deployment, release) != current_reader_admission(release, connector):
+            raise ValueError("Firmware grant retained-reader identity changed.")
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)
     bridge_target = _factory_3fl_bridge_target(release, campaign.zone_id if campaign else connector.zone_id)
     if bridge_target and (campaign is None or campaign.status != "ACTIVE"
                           or connector.zone_id != campaign.zone_id
                           or _factory_3fl_bridge_exclusion(connector, bridge_target)):
         raise ValueError("Factory-to-OTA bridge exact target or predecessor changed.")
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import _trial
+        _trial(session, connector, deployment.deployment_id, require_new_boot=False)
     root = Path(settings.firmware_store_path).resolve()
     image = (root / release.storage_name).resolve()
     if root not in image.parents or not image.is_file():

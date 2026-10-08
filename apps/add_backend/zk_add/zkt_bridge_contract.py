@@ -2,6 +2,8 @@
 import struct
 
 from zk_add.zkt270_scope import TARGETS
+from zk_add.zkt_factory_contract import (FACTORY_BRIDGE_VERSION, FACTORY_TRIAL_MARKER,
+    validate_factory_trial_contract)
 
 # Preserve revoked bridge package validation for audit and recovery.
 # Each field repair has a new immutable identity, with no implied boot success.
@@ -14,10 +16,10 @@ PROGRESS_BRIDGE_VERSION = "2.6.21"
 DMA_BRIDGE_VERSION = "2.6.23"
 BRIDGE_VERSIONS = (BRIDGE_VERSION, REPLACEMENT_BRIDGE_VERSION, RECOVERY_BRIDGE_VERSION,
                    STARTUP_BRIDGE_VERSION, DIAGNOSTIC_BRIDGE_VERSION, PROGRESS_BRIDGE_VERSION,
-                   DMA_BRIDGE_VERSION)
+                   FACTORY_BRIDGE_VERSION, DMA_BRIDGE_VERSION)
 READINESS_BRIDGE_VERSIONS = (REPLACEMENT_BRIDGE_VERSION, RECOVERY_BRIDGE_VERSION,
                              STARTUP_BRIDGE_VERSION, DIAGNOSTIC_BRIDGE_VERSION, PROGRESS_BRIDGE_VERSION,
-                             DMA_BRIDGE_VERSION)
+                             FACTORY_BRIDGE_VERSION, DMA_BRIDGE_VERSION)
 BRIDGE_MARKER = "ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1"
 PREDECESSOR_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -41,15 +43,16 @@ def bridge_hil_targets(raw: object) -> list:
 def bridge_marker(version: str) -> str:
     if version not in BRIDGE_VERSIONS:
         raise ValueError("Journal bridge version is unqualified.")
-    return BRIDGE_MARKER + (f":VERSION={version}" if version != BRIDGE_VERSION else "")
+    return (BRIDGE_MARKER + (f":VERSION={version}" if version != BRIDGE_VERSION else "")
+            + (FACTORY_TRIAL_MARKER if version == FACTORY_BRIDGE_VERSION else ""))
 
 
 def bridge_contract(version: str = BRIDGE_VERSION) -> dict:
     if not isinstance(version, str) or version not in BRIDGE_VERSIONS:
         raise ValueError("Journal bridge version is unqualified.")
     return {
-        "allowed_bootstrap_images": dict(PREDECESSOR_IMAGES),
-        "allowed_bootstrap_versions": list(PREDECESSOR_IMAGES),
+        "allowed_bootstrap_images": {} if version == FACTORY_BRIDGE_VERSION else dict(PREDECESSOR_IMAGES),
+        "allowed_bootstrap_versions": [] if version == FACTORY_BRIDGE_VERSION else list(PREDECESSOR_IMAGES),
         "compatibility_version": version,
         "delivery_authority": "LEGACY_UNTIL_PERSISTED_ADD_CUTOVER",
         "journal_capture": True,
@@ -70,11 +73,15 @@ def validate_bridge_manifest(manifest: dict) -> dict:
             or manifest.get("firmware_family") != "zkt"
             or manifest.get("project_name") != "zone_lite"
             or manifest.get("release_channel") != "EXPERIMENTAL_HIL_ONLY"
-            or manifest.get("minimum_bootstrap_version") != "2.4.12"
+            or manifest.get("minimum_bootstrap_version") != ("2.5.2" if manifest["version"] == FACTORY_BRIDGE_VERSION else "2.4.12")
             or manifest.get("hil_targets") != signed_hil_targets()
             or not isinstance(contract, dict) or contract != expected
             or any(type(contract[key]) is not type(value) for key, value in expected.items())):
         raise ValueError("Journal bridge requires its exact experimental HIL storage contract.")
+    if manifest["version"] == FACTORY_BRIDGE_VERSION:
+        validate_factory_trial_contract(manifest.get("factory_trial"))
+    elif "factory_trial" in manifest:
+        raise ValueError("Factory trial policy is exclusive to its exact bridge.")
     return contract
 
 

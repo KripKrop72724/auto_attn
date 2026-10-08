@@ -713,21 +713,10 @@ foreach ($channel in @('', 'AVAILABLE', 'EXPERIMENTAL_HIL_ONLY')) {
 }
 if (Test-Path (Join-Path $store '2.7.0')) { throw 'Rejected writer publication left release files' }
 Write-TestManifest
-& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.7.0 -PublicationMode HIL_ONLY -HilTargetsJson $journalScope
-$writerScopePath = Join-Path $store '2.7.0/.hil-only.json'
-$writerScopeBefore = [IO.File]::ReadAllText($writerScopePath)
-$writerArguments = @{
-    StoreDirectory=$store; Version='2.7.0'; ExpectedGitSha=('a'*40)
-    ExpectedImageSha256=[string]$manifest.image_sha256; ExpectedApplicationSha256=('d'*64)
-    ExistingTargetsJson=$journalScope; ExtendedTargetsJson=$fullJournalScope
-}
-& $extend @writerArguments -PreviewOnly
-if ([IO.File]::ReadAllText($writerScopePath) -cne $writerScopeBefore) { throw 'Writer preview changed quarantine' }
-& $extend @writerArguments
-if ((Get-Content $writerScopePath -Raw | ConvertFrom-Json).targets.Count -ne 17) { throw 'Writer scope lost nationwide targets' }
-if ((Get-FileHash (Join-Path $store '2.7.0/zone-lite-2.7.0.bin')).Hash.ToLowerInvariant() -cne $manifest.image_sha256) {
-    throw 'Writer scope expansion changed immutable firmware'
-}
+$rejected = $false
+try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.7.0 -PublicationMode HIL_ONLY -HilTargetsJson $journalScope } catch { $rejected = $true }
+if (-not $rejected) { throw 'Historical V4 writer was admitted for new publication' }
+if (Test-Path (Join-Path $store '2.7.0')) { throw 'Rejected historical writer left release files' }
 Write-Host 'Publication regression tests passed'
 
 } finally {

@@ -47,7 +47,7 @@ void vTaskDelay(TickType_t ticks);
         path.write_text(header)
     source = (MAIN / "zkt_storage_owner.c").read_text()
     pause = _function(source, "static void pause_after_work(")
-    task = source[source.index("static void task(void *context)"):source.index("bool zj_owner_start(")]
+    task = source[source.index("static void task(void *context)"):source.index("static bool owner_start_impl(")]
     # A yield must follow release of ownership locks and copied secret buffers.
     assert task.rindex("xSemaphoreGive(mailbox_lock)") < task.index("pause_after_work(pending,")
     assert task.rindex("mbedtls_platform_zeroize(&reply") < task.index("pause_after_work(pending,")

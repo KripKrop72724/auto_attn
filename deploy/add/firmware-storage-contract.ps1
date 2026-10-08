@@ -1,11 +1,25 @@
 function Get-FirmwareStorageContract {
-    param([Parameter(Mandatory)][string]$ImagePath, [Parameter(Mandatory)][string]$Version)
+    param([Parameter(Mandatory)][string]$ImagePath, [Parameter(Mandatory)][string]$Version, [switch]$ForSigning)
     # The referenced marker is compiled into the application. Reject a build made
     # with the wrong writer mode before opening the protected signing key.
     $bytes = [IO.File]::ReadAllBytes($ImagePath)
     $ascii = [Text.Encoding]::ASCII.GetString($bytes)
-    $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[34]:[A-Z0-9:=_.,]+')
+    $journalMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[345]:[A-Za-z0-9:=_.,]+')
     if ($Version -eq '2.7.0') {
+        if ($ascii.Contains('ZONE_STORAGE_CONTRACT_V5:')) {
+            $helper = Join-Path $PSScriptRoot '../../scripts/build_zkt_reader_matrix.py'
+            $json = & python $helper --signing-contract
+            if ($LASTEXITCODE -ne 0) { throw 'The writer reader matrix is blocked or invalid' }
+            $contract = ($json -join [Environment]::NewLine) | ConvertFrom-Json
+            $expected = 'ZONE_STORAGE_CONTRACT_V5:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:MATRIX=' + [string]$contract.reader_matrix_sha256
+            if ($contract.schema_version -ne 5 -or $journalMarkers.Count -ne 1 -or
+                $journalMarkers[0].Value -cne $expected -or -not $ascii.Contains($expected + [char]0) -or
+                [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:').Count -ne 0) {
+                throw 'Missing, ambiguous, or mismatched compiled reader matrix'
+            }
+            return $contract
+        }
+        if ($ForSigning) { throw 'Historical V4 writer contracts are audit-only' }
         $expectedWriter = 'ZONE_STORAGE_CONTRACT_V4:WRITER:LEGACY=2:JOURNAL=1:READERS=3F:AUTHORITY=ADD:BRIDGE=2.6.17'
         if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedWriter -or
             [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:').Count -ne 0) {
@@ -26,14 +40,15 @@ function Get-FirmwareStorageContract {
             write_format = 1
         }
     }
-    if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23')) {
+    if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23')) {
         $expectedBridge = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
         if ($Version -ne '2.6.16') { $expectedBridge += ':VERSION=' + $Version }
+        if ($Version -eq '2.6.22') { $expectedBridge += ':FACTORY_TRIAL=1' }
         $legacyMarkers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:')
         if ($journalMarkers.Count -ne 1 -or $journalMarkers[0].Value -cne $expectedBridge -or $legacyMarkers.Count -ne 0) {
             throw 'Missing, ambiguous, or incorrect journal bridge reader/capture contract'
         }
-        return [ordered]@{
+        $bridgeContract = [ordered]@{
             allowed_bootstrap_images = [ordered]@{
                 '2.4.12' = 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589'
                 '2.5.2' = '4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b'
@@ -51,6 +66,11 @@ function Get-FirmwareStorageContract {
             schema_version = 3
             write_format = 1
         }
+        if ($Version -eq '2.6.22') {
+            $bridgeContract.allowed_bootstrap_images = [ordered]@{}
+            $bridgeContract.allowed_bootstrap_versions = @()
+        }
+        return $bridgeContract
     }
     if ($journalMarkers.Count -gt 0) { throw 'Journal bridge marker cannot sign another firmware version' }
     $markers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:[A-Z]+:READ=[0-9]+:LANES=[0-9A-F]+:(?:COMPAT=[0-9.]+|BASE=[0-9.,]+)')
@@ -128,4 +148,13 @@ function Get-FirmwareStorageContract {
         schema_version = 1
         write_format = $(if ($mode -eq 'SEGMENTED') { 2 } else { 1 })
     }
+}
+function Get-WriterBootstrapMinimum {
+    param([Parameter(Mandatory = $true)]$StorageContract)
+    # Called only after the exact compiled policy has been validated. This is
+    # a coarse semantic floor, not a substitute for either exact reader pin.
+    if ($StorageContract.schema_version -ne 5 -or $StorageContract.allowed_bootstrap_versions.Count -ne 2) {
+        throw 'A populated writer matrix is required for the bootstrap minimum.'
+    }
+    return [string]($StorageContract.allowed_bootstrap_versions | Sort-Object { [version]$_ } | Select-Object -First 1)
 }
