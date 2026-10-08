@@ -15,7 +15,7 @@ def diagnose(raw):
         if raw.startswith(prefix):
             result["bom"] = name
     try:
-        text = raw.decode("utf-8")
+        text = raw.decode("utf-8-sig")
         result["utf8"] = True
         value = json.loads(text)
     except (ValueError, UnicodeError):

@@ -74,11 +74,12 @@ def test_returned_signing_policy_does_not_mutate_canonical_pins():
 
 
 @pytest.mark.parametrize("count", [1, 2, 3])
-def test_factory_signing_helper_accepts_bounded_stdin_prefix(count, tmp_path):
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+def test_factory_signing_helper_accepts_bounded_stdin_prefix(count, bom, tmp_path):
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest()))
     program = str(Path(__file__).resolve().parents[2] / "scripts/build_zkt_factory_contract.py")
-    payload = json.dumps(factory_trial_targets()[:count]).encode() + b"\r\n"
+    payload = bom + json.dumps(factory_trial_targets()[:count]).encode() + b"\r\n"
     for extra in ([], ["--manifest", str(path)]):
         result = subprocess.run([sys.executable, program, "--exposure-stdin", *extra],
                                 input=payload, capture_output=True, timeout=15)
@@ -90,6 +91,7 @@ def test_factory_signing_helper_accepts_bounded_stdin_prefix(count, tmp_path):
 
 
 @pytest.mark.parametrize("payload", [b"", b"[]", b"{}", b"\xff", b" " * 4097,
+    b"\xff\xfe[\x00]\x00", b"\xef\xbb\xbf\xef\xbb\xbf[]",
     json.dumps(factory_trial_targets()[0]).encode(),
     json.dumps(factory_trial_targets()).replace('"', '').encode(),
     json.dumps(list(reversed(factory_trial_targets()))).encode(),
@@ -104,6 +106,8 @@ def test_factory_signing_helper_rejects_invalid_stdin_without_policy_output(payl
 
 @pytest.mark.parametrize("payload, checks", [
     (json.dumps(factory_trial_targets()).encode() + b"\r\n", {"rows": 3, "exact_prefix": True, "utf8": True}),
+    (b"\xef\xbb\xbf" + json.dumps(factory_trial_targets()).encode() + b"\r\n",
+     {"bom": "UTF8", "rows": 3, "exact_prefix": True, "utf8": True}),
     (b'[{"do-not-log-secret-key":"do-not-log-secret-value"}]', {"rows": 1, "keys_exact": [False], "exact_prefix": False}),
     (b'\xff\xfe[\x00]\x00', {"bom": "UTF16LE", "utf8": False, "json": False}),
 ])

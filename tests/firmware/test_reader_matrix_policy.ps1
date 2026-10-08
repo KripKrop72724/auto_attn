@@ -97,8 +97,14 @@ try {
     # Diagnose the native byte/JSON boundary without logging any input identity.
     $factoryScope | & python (Join-Path $repo 'tests/firmware/tools/check_factory_scope_input.py')
     if ($LASTEXITCODE -ne 0) { throw 'Factory input diagnostic failed' }
-    $factoryScope | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Exact factory targets refused' }
+    $previousEncoding = $OutputEncoding
+    try {
+        foreach ($encoding in @([Text.Encoding]::ASCII, (New-Object Text.UTF8Encoding($false)), (New-Object Text.UTF8Encoding($true)))) {
+            $OutputEncoding = $encoding
+            $factoryScope | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Exact factory targets refused' }
+        }
+    } finally { $OutputEncoding = $previousEncoding }
     Assert-Refused {
         $targets | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Factory trial refused the unrelated 3FL target' }

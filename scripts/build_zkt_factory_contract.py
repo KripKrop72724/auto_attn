@@ -27,7 +27,9 @@ def main():
             if len(raw_exposure) > 4096:
                 raise ValueError()
             if isinstance(raw_exposure, bytes):
-                raw_exposure = raw_exposure.decode("utf-8")
+                # Native Windows PowerShell may prefix its UTF-8 pipeline with
+                # one BOM. Other encodings and embedded/repeated BOMs still fail.
+                raw_exposure = raw_exposure.decode("utf-8-sig")
             factory_trial_exposure(json.loads(raw_exposure))
         if args.manifest:
             if args.manifest.stat().st_size > 65536:
