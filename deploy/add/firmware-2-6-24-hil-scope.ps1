@@ -14,7 +14,10 @@ function Assert-Zkt2624HilScope {
     }
     $expected = Get-Zkt2624HilScope
     try {
-        $actual = @(ConvertFrom-Json -InputObject $HilTargetsJson)
+        # Windows PowerShell 5.1 emits a JSON array as one pipeline object;
+        # assign before normalizing so @() does not nest it.
+        $parsed = ConvertFrom-Json -InputObject $HilTargetsJson
+        $actual = @($parsed)
     } catch {
         throw 'ZKT 2.6.24 HIL scope is not valid JSON'
     }

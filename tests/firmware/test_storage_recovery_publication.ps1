@@ -36,7 +36,9 @@ try {
 
     # Exact reviewed scope only.
     $scope = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.6.24.json') -Raw
-    $targets = @(ConvertFrom-Json -InputObject $scope)
+    $parsedScope = ConvertFrom-Json -InputObject $scope
+    $targets = @($parsedScope)
+    if ($targets.Count -ne 2) { throw 'Recovery scope file must hold two targets' }
     $exact = ConvertTo-Json -InputObject $targets -Depth 5 -Compress
     Assert-Zkt2624HilScope -HilTargetsJson $exact
     $reordered = ConvertTo-Json -InputObject @($targets[1], $targets[0]) -Depth 5 -Compress
