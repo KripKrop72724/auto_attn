@@ -46,8 +46,51 @@ def validate_writer_image(image):
         raise ValueError("Journal writer image lacks its exact descriptor or compiled writer marker.")
 
 
+def qualified_bridge_hold(session, connector):
+    """An installed version claim cannot substitute for this target's stored verdict."""
+    from zk_add.bridge_observation import EVENTS, ready_event_matches
+    from zk_add.hil_runs import _release_identity
+    from zk_add.hil_scope import target_matches
+    from zk_add.ota import FirmwareCampaign, FirmwareRelease, FirmwareDeployment, FirmwareEvent, FirmwareHilRun, _application_sha256
+    from zk_add.time_utils import ensure_utc, utc_now
+    from zk_add.zkt270_scope import BY_ID
+    target = BY_ID.get(connector.connector_id)
+    if target is None or not target_matches(target.identity, connector):
+        return "JOURNAL_BRIDGE_EXACT_TARGET_REQUIRED"
+    bridge = session.scalar(select(FirmwareRelease).where(FirmwareRelease.version == REQUIRED_BRIDGE_VERSION))
+    if bridge is None:
+        return "JOURNAL_BRIDGE_ARTIFACT_MISSING"
+    if (bridge.release_id != "zone-lite-" + REQUIRED_BRIDGE_VERSION
+            or bridge.state != "HIL_ONLY" or bridge.revoked_at is not None
+            or _application_sha256(bridge) != BRIDGE_APPLICATION or bridge.image_sha256 != BRIDGE_ARTIFACT):
+        return "JOURNAL_BRIDGE_ARTIFACT_UNAVAILABLE"
+    installed = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == connector.id,
+        FirmwareDeployment.release_id == bridge.id).order_by(FirmwareDeployment.id.desc()).limit(1))
+    if installed is None or installed.status != "SUCCEEDED":
+        return "JOURNAL_BRIDGE_INSTALL_NOT_VERIFIED"
+    campaign = session.get(FirmwareCampaign, installed.campaign_id)
+    event = session.scalar(select(FirmwareEvent).where(FirmwareEvent.deployment_id == installed.id,
+        FirmwareEvent.state.in_(EVENTS)).order_by(FirmwareEvent.id.desc()).limit(1))
+    if campaign is None or campaign.status not in {"ACTIVE", "COMPLETED"}:
+        return "JOURNAL_BRIDGE_READY_NOT_VERIFIED"
+    if event is None:
+        return "JOURNAL_BRIDGE_READY_MISSING"
+    identity = _release_identity(bridge).model_dump(mode="json")
+    if ((event.details or {}).get("target") != target.identity.model_dump()
+            or any((event.details or {}).get(key) != value for key, value in identity.items())
+            or not ready_event_matches(session, event, installed, bridge)):
+        return "JOURNAL_BRIDGE_READY_NOT_VERIFIED"
+    run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == event.details["run_id"]))
+    # The signed reader's historical qualification survives a verified return
+    # to that image. Current boot identity and recovery must independently pass
+    # writer_predecessor_hold below; an old healthy runtime sample cannot do so.
+    if ensure_utc(run.completed_at) > utc_now():
+        return "JOURNAL_BRIDGE_READY_STALE"
+    return None
+
+
 def writer_predecessor_hold(session, connector, release):
-    from zk_add.ota import FirmwareRelease, FirmwareDeployment, _application_sha256, _versions_match
+    from zk_add.ota import _versions_match
     from zk_add.time_utils import ensure_utc, utc_now
     if release.state != "HIL_ONLY":
         return "JOURNAL_WRITER_HIL_ONLY"
@@ -56,14 +99,9 @@ def writer_predecessor_hold(session, connector, release):
             or connector.ota_running_partition not in {"ota_0", "ota_1"}
             or not connector.ota_secure_boot or not connector.ota_rollback_enabled):
         return "JOURNAL_EXACT_BRIDGE_REQUIRED"
-    bridge = session.scalar(select(FirmwareRelease).where(FirmwareRelease.version == REQUIRED_BRIDGE_VERSION))
-    if (bridge is None or bridge.state != "HIL_ONLY" or bridge.revoked_at is not None
-            or _application_sha256(bridge) != BRIDGE_APPLICATION or bridge.image_sha256 != BRIDGE_ARTIFACT):
-        return "JOURNAL_BRIDGE_ARTIFACT_UNAVAILABLE"
-    installed = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == connector.id,
-        FirmwareDeployment.release_id == bridge.id).order_by(FirmwareDeployment.id.desc()).limit(1))
-    if installed is None or installed.status != "SUCCEEDED":
-        return "JOURNAL_BRIDGE_INSTALL_NOT_VERIFIED"
+    qualification = qualified_bridge_hold(session, connector)
+    if qualification:
+        return qualification
     diagnostics = connector.firmware_diagnostics or {}
     runtime = diagnostics.get("journal_runtime") or {}
     storage = diagnostics.get("storage") or {}

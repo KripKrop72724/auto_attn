@@ -66,6 +66,32 @@ def test_writer_progresses_only_after_matching_completed_full_run(writer):
     assert next_target(writer) == writer[-1][1]
 
 
+def test_offline_unqualified_writer_target_can_defer_without_admitting_next_unqualified_target(writer):
+    from zk_add.zkt_hil_schedule import schedule
+    from zk_add.ota import preview_campaign_scope
+    session, release, *_ = writer
+    targets = signed_hil_targets()[:3]
+    release.manifest = {**release.manifest, "_hil_targets": targets}
+    devices = list(session.scalars(select(Connector).order_by(Connector.id)))
+    devices[1].connected = False
+    devices[1].last_seen_at = utc_now() - timedelta(minutes=5)
+    devices[1].firmware_diagnostics = None
+    devices[1].firmware_diagnostics_at = None
+    devices[1].boot_id = None
+    third = devices[2]
+    third.connector_id, third.hardware_id, third.is_spare = targets[2]["connector_id"], targets[2]["mac"], False
+    for field in ("serial", "expected_serial", "confirmed_serial"):
+        setattr(third.zkt_device, field, targets[2]["terminal_serial"])
+    session.flush()
+    decision = schedule(session, release)
+    assert decision["selected"] == targets[2]
+    assert decision["rows"][1]["status"] == "DEFERRED_OFFLINE"
+    assert "JOURNAL_BRIDGE_ARTIFACT_MISSING" in decision["rows"][1]["prerequisites"]
+    assert decision["denominator"] == 17 and decision["counts"]["PASSED"] == 1
+    with pytest.raises(ValueError, match="JOURNAL_EXACT_BRIDGE_REQUIRED"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=third.zone_id)
+
+
 def test_orphan_acceptance_label_cannot_advance_writer(writer):
     writer[0].delete(writer[3])
     writer[0].flush()

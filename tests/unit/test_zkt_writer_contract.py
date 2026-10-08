@@ -13,11 +13,12 @@ import pytest
 from sqlalchemy import select
 
 from test_zkt_bridge_contract import session as session
-from zk_add.models import Connector
+from zk_add.models import Connector, ZKTDevice
 from zk_add.ota import (
     FirmwareCampaign,
     FirmwareDeployment,
     FirmwareRelease,
+    FirmwareEvent, FirmwareHilRun,
     _storage_predecessor_exclusion,
     sync_release_store,
 )
@@ -171,9 +172,10 @@ def installed(session):
         manifest_signature="test",
         state="HIL_ONLY",
     )
+    target = signed_hil_targets()[0]
     connector = Connector(
-        connector_id="synthetic",
-        hardware_id="aa:bb:cc:dd:ee:01",
+        connector_id=target["connector_id"],
+        hardware_id=target["mac"],
         zone_id="test",
         zone_name="test",
         device_id="test",
@@ -203,6 +205,8 @@ def installed(session):
             },
         },
     )
+    connector.zkt_device = ZKTDevice(serial=target["terminal_serial"], expected_serial=target["terminal_serial"],
+        confirmed_serial=target["terminal_serial"], terminal_binding_state="CONFIRMED")
     session.add_all([bridge, connector])
     session.flush()
     campaign = FirmwareCampaign(
@@ -225,6 +229,16 @@ def installed(session):
         target_version="2.6.17",
     )
     session.add(deployment)
+    session.flush()
+    from zk_add.hil_runs import _release_identity
+    identity = _release_identity(bridge).model_dump(mode="json")
+    run = FirmwareHilRun(run_id="ready", deployment_id=deployment.id, connector_id=connector.id,
+        release_id=bridge.id, actor="test", idempotency_key="ready", status="BRIDGE_READY",
+        target=target, release_identity=identity, baseline={"profile": "BRIDGE_READINESS_V1", "boot_id": "test"},
+        started_at=now - timedelta(minutes=16), ends_at=now - timedelta(minutes=1), completed_at=now,
+        result={"outcome": "READY", "reasons": []})
+    session.add_all([run, FirmwareEvent(deployment_id=deployment.id, state="BRIDGE_READY", details={
+        **identity, "target": target, "run_id": run.run_id, "profile": "BRIDGE_READINESS_V1", "outcome": "READY"})])
     session.flush()
     release = FirmwareRelease(version="2.7.0", state="HIL_ONLY", manifest=manifest())
     return session, connector, bridge, deployment, release
@@ -288,3 +302,85 @@ def test_failed_bridge_never_authorizes_writer(installed, fault):
     connector.firmware_diagnostics = diagnostics
     session.flush()
     assert _storage_predecessor_exclusion(session, release, connector)
+
+
+@pytest.mark.parametrize("fault", ["missing", "forged", "target", "image", "key", "git", "stale", "future", "cancelled", "later-incomplete"])
+def test_writer_requires_its_exact_stored_bridge_ready(installed, fault):
+    session, connector, bridge, deployment, release = installed
+    run = session.scalar(select(FirmwareHilRun))
+    event = session.scalar(select(FirmwareEvent))
+    if fault == "missing":
+        session.delete(event)
+    elif fault == "forged":
+        session.delete(run)
+    elif fault in {"target", "image", "key", "git"}:
+        key = {"target": "target", "image": "application_sha256", "key": "signing_key_id", "git": "git_sha"}[fault]
+        value = signed_hil_targets()[1] if fault == "target" else "wrong"
+        event.details = {**event.details, key: value}
+        if fault == "target":
+            run.target = value
+        else:
+            run.release_identity = {**run.release_identity, key: value}
+    elif fault == "stale":
+        session.add(FirmwareDeployment(deployment_id="newer-bridge", campaign_id=deployment.campaign_id,
+            release_id=bridge.id, connector_id=connector.id, status="SUCCEEDED", target_version=bridge.version))
+    elif fault == "future":
+        run.completed_at = utc_now() + timedelta(minutes=1)
+    elif fault == "cancelled":
+        session.get(FirmwareCampaign, deployment.campaign_id).status = "CANCELLED"
+    else:
+        session.add(FirmwareEvent(deployment_id=deployment.id, state="BRIDGE_INCOMPLETE", details=event.details))
+    session.flush()
+    assert _storage_predecessor_exclusion(session, release, connector)
+
+
+def test_actual_writer_campaign_assignment_and_download_require_stored_bridge_ready(installed, monkeypatch, tmp_path):
+    from zk_add import ota
+    session, connector, bridge, deployment, release = installed
+    monkeypatch.setattr(ota, "sync_release_store", lambda _session: None)
+    monkeypatch.setattr(settings, "firmware_hil_enabled", True)
+    monkeypatch.setattr(settings, "fleet_root_secret", "isolated-test-secret")
+    monkeypatch.setattr(settings, "firmware_store_path", str(tmp_path))
+    connector.connected = connector.ota_capable = True
+    connector.ota_partition_layout = "zone-lite-ota-v1"
+    bridge_campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    bridge_campaign.status = "COMPLETED"
+    release.release_id, release.git_sha, release.image_sha256 = "zone-lite-2.7.0", "b" * 40, "f" * 64
+    release.image_size, release.signing_key_id, release.partition_layout = 4, "test", "zone-lite-ota-v1"
+    release.storage_name, release.manifest_signature = "test.bin", "test"
+    release.minimum_bootstrap_version = "2.6.17"
+    release.manifest = {**release.manifest, "_hil_targets": signed_hil_targets()[:1]}
+    (tmp_path / release.storage_name).write_bytes(b"test")
+    session.add(release)
+    session.flush()
+    event = session.scalar(select(FirmwareEvent).where(FirmwareEvent.state == "BRIDGE_READY"))
+    correct = event.details
+    event.details = {**correct, "run_id": "forged"}
+    with pytest.raises(ValueError, match="READY_NOT_VERIFIED"):
+        ota.preview_campaign_scope(session, release_public_id=release.release_id, zone_id=connector.zone_id)
+    event.details = correct
+    preview = ota.preview_campaign_scope(session, release_public_id=release.release_id, zone_id=connector.zone_id)
+    ota.create_campaign(session, release_public_id=release.release_id, zone_id=connector.zone_id,
+        reason="test", typed_confirmation=release.version, actor="test", scope_token=preview["scope_token"], idempotency_key="writer")
+    assigned = ota.assignment_for_connector(session, connector=connector, public_base="https://add.test")
+    assert assigned is not None
+    token = assigned["download_url"].rsplit("/", 1)[1]
+    assert ota.resolve_download(session, token)[0].id == release.id
+    bridge_campaign.status = "CANCELLED"
+    session.flush()
+    assert ota.assignment_for_connector(session, connector=connector, public_base="https://add.test") is None
+    with pytest.raises(ValueError, match="storage predecessor"):
+        ota.resolve_download(session, token)
+
+
+def test_qualified_bridge_new_boot_requires_fresh_current_reader_evidence(installed):
+    session, connector, bridge, deployment, release = installed
+    connector.boot_id = "verified-return-boot"
+    diagnostics = deepcopy(connector.firmware_diagnostics)
+    diagnostics.update(boot_id=connector.boot_id, sampled_at=utc_now().isoformat())
+    connector.firmware_diagnostics, connector.firmware_diagnostics_at = diagnostics, utc_now()
+    assert _storage_predecessor_exclusion(session, release, connector) is None
+    diagnostics = deepcopy(diagnostics)
+    diagnostics["journal_runtime"]["reader_ready"] = False
+    connector.firmware_diagnostics = diagnostics
+    assert _storage_predecessor_exclusion(session, release, connector) == "JOURNAL_BRIDGE_READER_NOT_VERIFIED"

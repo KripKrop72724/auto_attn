@@ -308,12 +308,8 @@ def serialize_run(run: FirmwareHilRun) -> dict:
     }
 
 
-def accepted_full_event_matches(session: Session, event, deployment, release) -> bool:
-    """A writer's rollout gate consumes its completed server-owned full run.
-
-    This cannot create acceptance or replace the evidence collector. A copied
-    event, bridge observation or superseded deployment never advances scope.
-    """
+def accepted_full_record_matches(session: Session, event, deployment, release) -> bool:
+    """Validate a historical full verdict; this alone never authorizes rollout."""
     from zk_add.bridge_observation import FULL_PROFILE
 
     details = event.details or {}
@@ -339,6 +335,13 @@ def accepted_full_event_matches(session: Session, event, deployment, release) ->
         return False
     from zk_add.hil_observation import accepted_full_evidence_valid
     if not accepted_full_evidence_valid(run, details):
+        return False
+    return True
+
+
+def accepted_full_event_matches(session: Session, event, deployment, release) -> bool:
+    """Rollout additionally requires the current deployment and active authority."""
+    if not accepted_full_record_matches(session, event, deployment, release):
         return False
     latest = session.scalar(select(FirmwareDeployment.id).where(
         FirmwareDeployment.connector_id == deployment.connector_id)

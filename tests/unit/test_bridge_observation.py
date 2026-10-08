@@ -68,6 +68,8 @@ def bridge(ready, monkeypatch, request):  # noqa: F811
         rows.append(row)
     session.flush()
     monkeypatch.setattr(bridge_observation, "utc_now", lambda: start + timedelta(seconds=901))
+    from zk_add import zkt_hil_schedule
+    monkeypatch.setattr(zkt_hil_schedule, "utc_now", lambda: start + timedelta(seconds=901))
     return session, release, device, deployment, run, rows
 
 

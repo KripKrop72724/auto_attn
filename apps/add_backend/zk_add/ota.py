@@ -335,6 +335,14 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         (bld5_extension or city_extension) and tuple(configured) == HIL_269_EXACT_TARGETS
     ):
         raise ValueError("Ordered HIL targets do not match the configured exact scope.")
+    from zk_add.zkt_hil_schedule import schedule
+    nationwide = schedule(session, release)
+    if nationwide is not None:
+        if nationwide["hold"]:
+            raise ValueError("Nationwide HIL scope held: " + nationwide["hold"])
+        if nationwide["selected"] is None:
+            raise ValueError("No online pending target is available in the exposed HIL scope; deferred targets remain incomplete.")
+        return [HilTarget.model_validate(nationwide["selected"])]
     events = list(session.execute(
         select(FirmwareEvent, Connector, FirmwareDeployment)
         .join(FirmwareDeployment, FirmwareEvent.deployment_id == FirmwareDeployment.id)
@@ -472,7 +480,7 @@ def _scope_exclusion_reason(
 
 def _scope_digest(
     release: FirmwareRelease, zone_id: str, connectors: list[Connector],
-    eligible: list[Connector],
+    eligible: list[Connector], schedule_state: dict | None = None,
 ) -> str:
     payload = {
         "release_id": release.release_id,
@@ -481,6 +489,7 @@ def _scope_digest(
         "application_sha256": _application_sha256(release),
         "hil_targets": (release.manifest or {}).get("_hil_targets"),
         "hil_target_mac": (release.manifest or {}).get("_hil_target_mac"),
+        "nationwide_schedule": schedule_state["decision_sha256"] if schedule_state else None,
         "eligible": sorted(row.connector_id for row in eligible),
         "version": release.version,
         "zone_id": zone_id,
@@ -720,7 +729,9 @@ def preview_campaign_scope(
         zone_id=zone_id,
     )
     expires_at = utc_now() + timedelta(seconds=ttl_seconds)
-    digest = _scope_digest(release, zone_id, connectors, eligible)
+    from zk_add.zkt_hil_schedule import schedule
+    nationwide = schedule(session, release)
+    digest = _scope_digest(release, zone_id, connectors, eligible, nationwide)
     token = _encode_scope_token(
         {
             "release_id": release.release_id,
@@ -751,6 +762,7 @@ def preview_campaign_scope(
             "state": release.state,
         },
         "zone_id": zone_id,
+        "hil_schedule": nationwide,
         "counts": {
             "candidates": len(connectors),
             "eligible": len(eligible),
@@ -782,7 +794,8 @@ def verify_campaign_scope_token(
         release_public_id=release_public_id,
         zone_id=zone_id,
     )
-    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors, eligible):
+    from zk_add.zkt_hil_schedule import schedule
+    if payload.get("scope_digest") != _scope_digest(release, zone_id, connectors, eligible, schedule(session, release)):
         raise ValueError("Firmware scope changed. Refresh the preview before starting the campaign.")
     return release, connectors, eligible
 
@@ -955,6 +968,8 @@ def create_campaign(
         ):
             raise ValueError("That idempotency key belongs to another firmware campaign.")
         return replay
+    from zk_add.zkt_hil_schedule import lock_campaign_scope, schedule, reserve
+    lock_campaign_scope(session, release_public_id)
     release, connectors, eligible = verify_campaign_scope_token(
         session,
         token=scope_token,
@@ -963,6 +978,9 @@ def create_campaign(
     )
     if typed_confirmation != release.version:
         raise ValueError("Typed firmware version does not match the release.")
+    nationwide = schedule(session, release)
+    if nationwide and nationwide["reservation"]:
+        raise ValueError("Nationwide HIL scope already has an unsettled reservation.")
     if session.scalar(select(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == zone_id, FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         raise ValueError("This zone already has an active or paused firmware campaign.")
@@ -973,9 +991,12 @@ def create_campaign(
     session.add(campaign)
     session.flush()
     for connector in eligible:
-        session.add(FirmwareDeployment(deployment_id=secrets.token_hex(16), campaign_id=campaign.id,
+        deployment = FirmwareDeployment(deployment_id=secrets.token_hex(16), campaign_id=campaign.id,
             release_id=release.id, connector_id=connector.id, previous_version=connector.firmware_version,
-            target_version=release.version))
+            target_version=release.version)
+        session.add(deployment)
+        session.flush()
+        reserve(session, release, campaign, deployment, nationwide)
     return campaign
 
 
@@ -1267,11 +1288,14 @@ def previous_firmware_return_evidence(
 
 
 def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]:
+    from zk_add.zkt_hil_schedule import schedule
+    nationwide = None
     next_target = None
     allowed_targets = None
     scope_message = None
     if row.state == "HIL_ONLY" and (row.manifest or {}).get("_hil_targets") is not None:
         try:
+            nationwide = schedule(session, row)
             permitted = _permitted_hil_targets(session, row)
             allowed_targets = [target.model_dump() for target in permitted or []]
             next_target = allowed_targets[0] if allowed_targets else None
@@ -1297,6 +1321,7 @@ def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]
         "hil_next_target": next_target,
         "hil_allowed_targets": allowed_targets,
         "hil_scope_message": scope_message,
+        "hil_schedule": nationwide,
     }
 
 

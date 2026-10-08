@@ -10,6 +10,13 @@ const device = { connector_id: target.connector_id, hardware_id: target.mac,
     expected_serial: target.terminal_serial, terminal_binding_state: 'CONFIRMED' } } as Device
 
 describe('ordered HIL destination', () => {
+  it('keeps deferred zones in the denominator without counting them as passed', () => {
+    const scheduled = { ...release, hil_schedule: { policy: 'ZKT_CONNECTIVITY_DEFERRAL_V1', denominator: 17,
+      counts: { PASSED: 1, PENDING: 12, DEFERRED_OFFLINE: 2, BLOCKED: 2 }, hold: null, rows: [] } }
+    expect(hilScopeLabel(scheduled)).toBe('1/17 passed · 12 pending · 2 deferred offline · 2 blocked')
+    expect(hilAllowedTargets(scheduled)).toEqual([target])
+    expect(hilAllowedTargets({ ...scheduled, hil_next_target: null, hil_allowed_targets: [] })).toEqual([])
+  })
   it('uses the server-selected exact target, excluding the same-name spare', () => {
     const spare = { ...device, connector_id: 'spare', is_spare: true }
     expect(hilDevice(release, [spare, device])).toBe(device)

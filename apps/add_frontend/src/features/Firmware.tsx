@@ -885,6 +885,22 @@ function CampaignCreator({
                 </span>
               </div>
             )}
+            {selectedRelease?.hil_schedule && (
+              <details>
+                <summary>Nationwide qualification status ({selectedRelease.hil_schedule.denominator} connectors)</summary>
+                <p>Deferred offline connectors remain incomplete. A bridge readiness verdict covers the bridge observation only.</p>
+                <table>
+                  <thead><tr><th>Connector</th><th>Status</th><th>Reason and prerequisites</th></tr></thead>
+                  <tbody>{selectedRelease.hil_schedule.rows.map(row => (
+                    <tr key={row.target.connector_id}>
+                      <td>{row.name}{row.exposed ? '' : ' · awaiting exposure'}</td>
+                      <td>{row.status.replaceAll('_', ' ')}</td>
+                      <td>{[row.reason, ...row.prerequisites, ...(row.current_hold ? [row.current_hold] : [])].map(value => value.replaceAll('_', ' ').toLowerCase()).join('; ')}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </details>
+            )}
           </section>
           <section>
             <h3 className="firmware-wizard-heading"><span aria-hidden="true">3</span>Device scope</h3>
