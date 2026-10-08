@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$SourceDirectory,
-    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]+$')][string]$AddContainer = 'attendance-device-dashboard-add-api-1'
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]+$')][string]$AddContainer = 'attendance-device-dashboard-add-api-1',
+    [switch]$RequirePublishedHilRelease,
+    [ValidateRange(0,16)][int]$AllowPreviousPrefixCount = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +30,10 @@ try {
     # Transfer public metadata through bounded ASCII arguments. Windows runner
     # stdin transformations cannot affect these bytes; each argument stays well
     # below its native command-line limit. Never use this for firmware or secrets.
-    foreach ($item in @(@($manifest, 'manifest.json'), @($signature, 'manifest.sig'), @($script, 'check.py'))) {
+    $items = @(@($manifest, 'manifest.json'), @($signature, 'manifest.sig'), @($script, 'check.py'))
+    if ($RequirePublishedHilRelease) { $items += ,@((Join-Path $source '.hil-only.json'), 'hil-marker.json') }
+    elseif ($AllowPreviousPrefixCount) { throw 'Previous prefix requires published HIL mode.' }
+    foreach ($item in $items) {
         $bytes = [IO.File]::ReadAllBytes($item[0])
         if ($bytes.Length -eq 0 -or $bytes.Length -gt 65536) { throw 'Firmware admission file exceeds its bounded format.' }
         $fileDigest = (Get-FileHash -LiteralPath $item[0] -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -42,12 +47,22 @@ try {
         & docker exec $AddContainer python -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); assert 0<len(data)<=65536 and hashlib.sha256(data).hexdigest()==sys.argv[2]' "$temporary/$($item[1])" $fileDigest
         if ($LASTEXITCODE -ne 0) { throw 'Deployed admission file identity did not verify.' }
     }
-    $report = @(& docker exec $AddContainer python "$temporary/check.py" "$temporary/manifest.json" "$temporary/manifest.sig" $digest 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $report.Count -ne 1 -or
-        $report[0] -cne "ADD_FIRMWARE_CONTRACT_ACCEPTED:$digest") {
+    $checkArguments = @("$temporary/check.py")
+    if ($RequirePublishedHilRelease) {
+        $checkArguments += @('--require-published-hil', '--publication-marker', "$temporary/hil-marker.json", '--previous-prefix-count', [string]$AllowPreviousPrefixCount)
+    }
+    $checkArguments += @("$temporary/manifest.json", "$temporary/manifest.sig", $digest)
+    $report = @(& docker exec $AddContainer python @checkArguments 2>$null)
+    $allowed = @("ADD_FIRMWARE_CONTRACT_ACCEPTED:$digest")
+    if ($RequirePublishedHilRelease) {
+        $allowed = @("ADD_FIRMWARE_CONTRACT_ACCEPTED:${digest}:CATALOG_CURRENT")
+        if ($AllowPreviousPrefixCount) { $allowed += "ADD_FIRMWARE_CONTRACT_ACCEPTED:${digest}:CATALOG_REFRESH_PENDING" }
+    }
+    if ($LASTEXITCODE -ne 0 -or $report.Count -ne 1 -or $allowed -cnotcontains $report[0]) {
         throw 'Deployed ADD rejects this signed firmware contract. Deploy its tested backend support before publication.'
     }
     Write-Host "Deployed ADD accepts signed manifest SHA256 $digest"
+    if ($RequirePublishedHilRelease) { Write-Output ($report[0].Split(':')[-1]) }
 } catch {
     $failed = $true
     throw

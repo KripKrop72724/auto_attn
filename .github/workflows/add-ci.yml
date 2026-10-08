@@ -33,6 +33,7 @@ jobs:
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.21
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.23
           ./tests/firmware/test_reader_matrix_policy.ps1
+          ./tests/firmware/test_journal_hil_extension.ps1
           ./tests/firmware/test_backup_restore.ps1
           ./tests/firmware/test_deployed_firmware_contract.ps1
 
@@ -56,6 +57,7 @@ jobs:
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.21
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.23
           ./tests/firmware/test_reader_matrix_policy.ps1
+          ./tests/firmware/test_journal_hil_extension.ps1
       - name: Exercise pre-migration backup restore gate
         shell: pwsh
         run: ./tests/firmware/test_backup_restore.ps1
