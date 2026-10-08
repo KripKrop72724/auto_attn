@@ -401,9 +401,21 @@ class LauncherTests(unittest.TestCase):
             self.calls.append(args)
             return 1, b"", b"PRIVATE_NATIVE_ERROR"
 
-        with self.assertRaises(launch.Refused):
+        with self.assertRaises(launch.Refused) as refused:
             launch.perform_audit(self.bundle, self.script, native_call=missing)
+        self.assertEqual(refused.exception.code, "PINNED_RUNTIME_NOT_CACHED")
+        self.assertEqual(refused.exception.stage, "RUNTIME_INSPECT")
         self.assertEqual(len(self.calls), 1)
+
+    def test_missing_fixed_file_is_named_by_safe_stage_without_path_or_native_call(self):
+        (self.bundle / "manifest.sig").unlink()
+        with self.assertRaises(launch.Refused) as refused:
+            launch.perform_audit(self.bundle, self.script, native_call=self.fake)
+        result = launch.refusal_report(refused.exception, "UNCLASSIFIED")
+        self.assertEqual(result["error_code"], "INPUT_MISSING")
+        self.assertEqual(result["failure_stage"], "BUNDLE_MANIFEST_SIG")
+        self.assertNotIn(str(self.bundle), json.dumps(result))
+        self.assertEqual(self.calls, [])
 
     def test_run_failure_cleanup_absent_does_not_mask_primary_error(self):
         def fail(args, timeout):
@@ -486,9 +498,105 @@ class LauncherTests(unittest.TestCase):
         }
         result = launch.validate_report(1, json.dumps(bad).encode())
         self.assertNotIn("SECRET_DATA", json.dumps(result))
+        self.assertEqual(result["error_code"], "ARCHIVE_VERIFIER_REFUSED")
+        self.assertEqual(result["failure_stage"], "ARCHIVE_VERIFICATION")
+        bad["error_code"] = "IMAGE_FILE_HASH"
+        self.assertEqual(launch.validate_report(1, json.dumps(bad).encode())["error_code"], "IMAGE_FILE_HASH")
         self.report["private_bytes"] = "SECRET_DATA"
         with self.assertRaises(launch.Refused):
             launch.validate_report(0, json.dumps(self.report).encode())
+
+    def test_exception_and_stage_enums_redact_arbitrary_text(self):
+        private = SECRET.decode() + r" C:\private\firmware.bin https://private.invalid/token"
+        cases = [
+            (launch.Refused(private, private), "HOST_FAILURE_UNCLASSIFIED"),
+            (RuntimeError(private), "HOST_FAILURE_UNCLASSIFIED"),
+            (FileNotFoundError(private), "INPUT_MISSING"),
+            (PermissionError(private), "INPUT_ACCESS_DENIED"),
+            (OSError(private), "INPUT_IO_FAILURE"),
+            (json.JSONDecodeError(private, private, 0), "AUDIT_OUTPUT_INVALID"),
+        ]
+        for error, code in cases:
+            with self.subTest(code=code):
+                result = launch.refusal_report(error, "OUTPUT_VALIDATION")
+                self.assertEqual(result["error_code"], code)
+                self.assertEqual(result["failure_stage"], "OUTPUT_VALIDATION")
+                self.assertFalse(result["raw_firmware_exported"])
+                self.assertEqual(result["hil_qualification"], "NOT_ASSERTED")
+                self.assertNotIn(private, json.dumps(result))
+        self.assertEqual(launch.refusal_report(RuntimeError(private), private)["failure_stage"], "UNCLASSIFIED")
+        self.assertEqual(launch.refusal_report(FileNotFoundError(private), "RUNTIME_INSPECT")["error_code"], "NATIVE_EXECUTABLE_MISSING")
+
+    def test_malformed_verifier_stdout_is_redacted_and_cleanup_still_runs(self):
+        def malformed(args, timeout):
+            if args[1] == "run":
+                self.calls.append((args, timeout))
+                return 1, SECRET, SECRET
+            return self.fake(args, timeout)
+
+        with self.assertRaises(launch.Refused) as refused:
+            launch.perform_audit(self.bundle, self.script, native_call=malformed)
+        self.assertEqual(refused.exception.code, "AUDIT_OUTPUT_INVALID")
+        self.assertEqual(refused.exception.stage, "OUTPUT_VALIDATION")
+        self.assertNotIn(SECRET.decode(), str(refused.exception))
+        self.assertEqual(self.calls[-1][0][1:3], ["rm", "-f"])
+
+    def test_valid_github_identity_persists_metadata_only_failure(self):
+        identity = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1"}
+        output = io.StringIO()
+        failure = launch.Refused("PINNED_RUNTIME_NOT_CACHED", "RUNTIME_INSPECT")
+        with (
+            patch.dict(os.environ, identity, clear=True),
+            patch.object(launch, "__file__", str(self.bundle / "scripts/invoke_factory_audit.py")),
+            patch.object(launch, "validate_host"),
+            patch.object(launch, "perform_audit", side_effect=failure),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(launch.main(), 1)
+        saved = self.bundle / "factory-provenance-report-12345-1.json"
+        result = json.loads(saved.read_text())
+        self.assertEqual(result["github_source_sha"], identity["GITHUB_SHA"])
+        self.assertEqual(result["github_run_id"], "12345")
+        self.assertEqual(result["qualification"], "NOT_ASSERTED")
+        self.assertEqual(result["archive_report"]["error_code"], "PINNED_RUNTIME_NOT_CACHED")
+        self.assertEqual(result["archive_report"]["failure_stage"], "RUNTIME_INSPECT")
+        self.assertEqual(json.loads(output.getvalue())["failure_stage"], "RUNTIME_INSPECT")
+        self.assertNotIn(str(self.bundle), saved.read_text())
+        self.assertNotIn(SECRET.decode(), saved.read_text())
+        self.assertEqual(result["auditor_sha256"], launch.AUDITOR_SHA256)
+        self.assertEqual(result["runtime"], launch.RUNTIME)
+
+    def test_unknown_host_failure_persists_redacted_envelope_and_never_overwrites(self):
+        identity = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "12346", "GITHUB_RUN_ATTEMPT": "1"}
+        with (
+            patch.dict(os.environ, identity, clear=True),
+            patch.object(launch, "__file__", str(self.bundle / "scripts/invoke_factory_audit.py")),
+            patch.object(launch, "validate_host", side_effect=RuntimeError(SECRET.decode())),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(launch.main(), 1)
+            saved = self.bundle / "factory-provenance-report-12346-1.json"
+            before = saved.read_bytes()
+            self.assertNotIn(SECRET, before)
+            self.assertEqual(json.loads(before)["archive_report"]["error_code"], "HOST_FAILURE_UNCLASSIFIED")
+            self.assertEqual(launch.main(), 1)
+            self.assertEqual(saved.read_bytes(), before)
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1])["failure_stage"], "REPORT_PERSIST")
+        self.assertNotIn(SECRET.decode(), output.getvalue())
+
+    def test_invalid_identity_cannot_choose_artifact_path_or_start_audit(self):
+        identity = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "../" + SECRET.decode(), "GITHUB_RUN_ATTEMPT": "1"}
+        with (
+            patch.dict(os.environ, identity, clear=True),
+            patch.object(launch, "__file__", str(self.bundle / "scripts/invoke_factory_audit.py")),
+            patch.object(launch, "perform_audit") as perform,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(launch.main(), 1)
+        self.assertEqual(json.loads(output.getvalue())["error_code"], "GITHUB_IDENTITY_REQUIRED")
+        self.assertEqual(list(self.bundle.glob("factory-provenance-report-*.json")), [])
+        self.assertNotIn(SECRET.decode(), output.getvalue())
+        perform.assert_not_called()
 
     def test_native_stderr_never_emitted_and_exit_code_preserved(self):
         stdout = io.StringIO()
@@ -542,3 +650,4 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertNotIn("deploy.ps1", workflow)
         self.assertNotIn("publish-factory-firmware", workflow)
+        self.assertIn("if-no-files-found: error", workflow)

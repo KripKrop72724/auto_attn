@@ -1,8 +1,9 @@
 # Retained factory bundle provenance audit
 
-Production execution status: **NOT_PERFORMED**. Synthetic tests validate the
-audit procedure; they do not establish that the archive exists or that any
-installed device matches it.
+Archive verification status comes from a saved run artifact. Synthetic tests
+validate the audit procedure; they do not establish that the archive exists
+or that any installed device matches it. A host refusal does not examine or
+qualify the archive.
 
 The manually dispatched `factory-provenance-audit.yml` workflow reads only the
 retained `zone-lite-2.5.2-27c3bb80eb20` bundle from the fixed Windows factory
@@ -33,6 +34,17 @@ Only metadata is uploaded as `exact-factory-provenance-metadata`, retained
 for seven days. It includes the GitHub source/run identity, verifier and
 runtime identity, cryptographic results, fixed layout and device comparisons.
 It excludes firmware bytes, provisioning data, employee data and credentials.
+
+Once the GitHub source/run/attempt identity is validated, host failures also
+produce this metadata artifact. Its `failure_stage` identifies the fixed
+preflight, runtime, verification or output step; its `error_code` comes from
+a closed allowlist. Missing files, denied access, unavailable pinned runtime,
+timeouts, output bounds and invalid verifier output stay distinguishable.
+Unknown exception text and all native stderr are discarded. A failed runtime
+inspection does not distinguish an absent cached image from an unavailable
+Docker engine; it never triggers a pull. Invalid GitHub identity cannot create
+a report, and an existing report is never overwritten. Missing artifacts are
+reported as a workflow error instead of being silently ignored.
 
 `ARCHIVE_VERIFIED` describes the archive alone. Installed security, partition
 state, rollback feasibility, attendance preservation and HIL acceptance need
