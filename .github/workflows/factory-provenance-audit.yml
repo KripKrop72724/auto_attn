@@ -1,0 +1,38 @@
+name: Read-only exact factory bundle provenance
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        type: choice
+        options: [AUDIT EXACT PUBLISHED 2.5.2 BUNDLE]
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: exact-factory-provenance-audit
+  cancel-in-progress: false
+jobs:
+  audit:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'AUDIT EXACT PUBLISHED 2.5.2 BUNDLE'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify exact retained bundle without firmware export
+        timeout-minutes: 3
+        shell: powershell
+        run: |
+          # Docker uses a bounded shell=False launcher; native stderr is never
+          # emitted or redirected through Windows PowerShell 5.1.
+          python scripts/invoke_factory_audit.py
+          if ($LASTEXITCODE -ne 0) { throw 'EXACT_FACTORY_ARCHIVE_AUDIT_REFUSED' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exact-factory-provenance-metadata
+          path: factory-provenance-report-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: ignore
+          retention-days: 7

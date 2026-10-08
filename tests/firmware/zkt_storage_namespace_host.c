@@ -20,7 +20,6 @@ typedef struct {
     bool format_if_mount_failed;
 } esp_vfs_spiffs_conf_t;
 static int g_seen_lock;
-static uint8_t g_seen_occupied[SEEN_UID_CAPACITY];
 static uid_cache_t g_seen_cache;
 static char mounted[64], journal_prefix[128];
 static unsigned legacy_reads;
@@ -30,6 +29,7 @@ static unsigned storage_faults;
 static int xSemaphoreCreateMutex(void) { return 1; }
 static void *heap_caps_calloc(size_t count, size_t bytes, unsigned flags)
 { assert(flags == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)); return calloc(count, bytes); }
+static void heap_caps_free(void *pointer) { free(pointer); }
 static esp_err_t esp_vfs_spiffs_register(const esp_vfs_spiffs_conf_t *config)
 {
     assert(config && !config->partition_label && !config->format_if_mount_failed && config->max_files == 16);
@@ -65,18 +65,16 @@ int main(void)
     assert(!strcmp(PENDING_PATH,ZOL_PENDING_PATH) && !strcmp(BLOCKED_PATH,ZOL_BLOCKED_PATH));
     assert(!strcmp(PENDING_BACKUP_PATH,ZOL_PENDING_BACKUP_PATH) && !strcmp(PENDING_TMP_PATH,ZOL_PENDING_TEMP_PATH));
     assert(!strcmp(BLOCKED_RECOVERY_BACKUP_PATH,ZOL_BLOCKED_BACKUP_PATH) && !strcmp(BLOCKED_RECOVERY_TMP_PATH,ZOL_BLOCKED_TEMP_PATH));
-    free(g_seen_cache.keys);
     pending_restored = false;
     storage_init();
     assert(backlog && storage_faults == 1); /* Later file probing cannot erase the failed restore. */
-    free(g_seen_cache.keys);
     pending_restored = true; blocked_restored = false;
     storage_init();
     assert(backlog && storage_faults == 2);
-    free(g_seen_cache.keys);
     owner_required=true;
     unsigned before=legacy_reads;
     storage_init();
     assert(backlog && storage_faults==2 && legacy_reads==before);
     free(g_seen_cache.keys);
+    free(g_seen_cache.occupied);
 }

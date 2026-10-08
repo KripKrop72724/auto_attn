@@ -40,7 +40,7 @@ function Get-FirmwareStorageContract {
             write_format = 1
         }
     }
-    if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22')) {
+    if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23')) {
         $expectedBridge = 'ZONE_STORAGE_CONTRACT_V3:BRIDGE:LEGACY=2:JOURNAL=1:READERS=3F:CAPTURE=1:AUTHORITY=1'
         if ($Version -ne '2.6.16') { $expectedBridge += ':VERSION=' + $Version }
         if ($Version -eq '2.6.22') { $expectedBridge += ':FACTORY_TRIAL=1' }

@@ -66,7 +66,7 @@ def ready_event(session, release, device, deployment):
     return run, event
 
 
-@pytest.fixture(params=["2.6.20", "2.6.21"])
+@pytest.fixture(params=["2.6.20", "2.6.21", "2.6.23"])
 def fleet(hil_session, request):  # noqa: F811
     session, release, devices = hil_session
     release.release_id, release.version = f"zone-lite-{request.param}", request.param

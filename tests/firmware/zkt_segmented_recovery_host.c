@@ -5,15 +5,18 @@
 #define ZONE_LITE_QUEUE_OWNER 1
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
+#define MALLOC_CAP_SPIRAM 1024U
+#define MALLOC_CAP_8BIT 4U
 typedef struct { durable_queue_t queue; int *mutex; } lane_t;
 static int lane_lock, budget_mutex;
 static int *budget_lock = &budget_mutex;
 static lane_t lanes[QS_COUNT];
 static qs_health_t health;
 static dq_audit_t recovery_audits[QS_COUNT];
-static uint8_t recovery_buffer[DQ_MAX_RECORD_BYTES];
+static uint8_t scratch[DQ_MAX_RECORD_BYTES];
+static uint8_t *recovery_buffer;
 static bool required, started, owner_context;
-static unsigned routed, accesses;
+static unsigned routed, accesses, allocations;
 static int failed_lane = -1;
 bool zj_runtime_checkpoint_required(void) { return required; }
 bool zj_owner_started(void) { return started; }
@@ -24,6 +27,12 @@ static bool lock(qs_lane_t lane)
 static int xSemaphoreTake(int *mutex, unsigned wait)
 { (void)wait; assert(!*mutex); *mutex = 1; return pdTRUE; }
 static void xSemaphoreGive(int *mutex) { assert(*mutex); *mutex = 0; }
+static void *heap_caps_malloc(size_t bytes, unsigned caps)
+{
+    assert(lane_lock && budget_mutex && bytes == sizeof(scratch));
+    assert(caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) && !allocations);
+    ++allocations; return scratch;
+}
 static dq_result_t reopen(lane_t *lane) { assert(lane->queue.ready); return DQ_OK; }
 static void record_queue_result(dq_result_t result, const char *operation, bool write)
 { (void)operation; assert(!write); if (result != DQ_OK) health.last_error = EIO; }
@@ -76,4 +85,5 @@ int main(void)
     failed_lane = -1;
     for (unsigned pass = 0; pass < 2 * QS_COUNT; ++pass) assert(!qs_recover_step());
     assert(health.last_error == EIO); /* This component cannot clear an unrelated incident. */
+    assert(allocations == 1); /* Owner/bootstrap handoff shares the bounded scratch. */
 }

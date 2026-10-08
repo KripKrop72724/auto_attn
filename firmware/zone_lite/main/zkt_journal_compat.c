@@ -91,7 +91,7 @@ bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
      * checking the unchanged terminal/epoch/layout. Writer/update admission
      * below still requires the exact current reader version and image. */
     static const char *const history[] = {
-        "2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22"
+        "2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23"
     };
     const char *version = NULL;
     unsigned limit = 0;
