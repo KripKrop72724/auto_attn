@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
+from reader_matrix_fixtures import pinned  # noqa: F401
 from test_add_backend import db  # noqa: F401
 from test_hil_observation import full_rows, observed, prepared, source_store, store  # noqa: F401
 from zk_add.models import AuditEvent

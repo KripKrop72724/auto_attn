@@ -83,9 +83,16 @@ static void reset(void){
 }
 int main(void){
     for(unsigned fault=0;fault<10;++fault){reset();
-        if(fault==0)secure_boot=false;if(fault==1)debug=true;if(fault==2)signature_ok=false;if(fault==3)hash_ok=false;
-        if(fault==4)read_ok=false;if(fault==5)other_ota=true;if(fault==6)rollback_ok=false;
-        if(fault==7)namespace_present=true;if(fault==8)parts[6].size-=4096;if(fault==9)config.connector_id[0]='b';
+        if (fault == 0) { secure_boot = false; }
+        if (fault == 1) { debug = true; }
+        if (fault == 2) { signature_ok = false; }
+        if (fault == 3) { hash_ok = false; }
+        if (fault == 4) { read_ok = false; }
+        if (fault == 5) { other_ota = true; }
+        if (fault == 6) { rollback_ok = false; }
+        if (fault == 7) { namespace_present = true; }
+        if (fault == 8) { parts[6].size -= 4096; }
+        if (fault == 9) { config.connector_id[0] = 'b'; }
         zf_platform_prepare(deployment,image);assert(!zf_platform_startup_allowed());assert(!zf_platform_pending_fallback());assert(writes==0 && select_calls==0);
     }
     reset();zf_platform_prepare(deployment,image);assert(writes==1 && verify_calls==1 && delays>0);assert(!zf_platform_startup_allowed());
@@ -99,7 +106,10 @@ int main(void){
     reset();readback_ok=false;zf_platform_prepare(deployment,image);assert(!zf_platform_startup_allowed());assert(!select_calls);
     reset();zf_platform_prepare(deployment,image);assert(zf_platform_storage_check());assert(zf_platform_select_factory());assert(select_calls==1);assert(!zf_platform_startup_allowed());assert(!zf_platform_select_factory());assert(select_calls==1);
     for(unsigned fault=0;fault<4;++fault){reset();zf_platform_prepare(deployment,image);assert(zf_platform_storage_check());
-        if(fault==0)signature_ok=false;if(fault==1)commit_ok=false;if(fault==2)select_ok=false;if(fault==3)selected_factory=false;
+        if (fault == 0) { signature_ok = false; }
+        if (fault == 1) { commit_ok = false; }
+        if (fault == 2) { select_ok = false; }
+        if (fault == 3) { selected_factory = false; }
         assert(!zf_platform_select_factory());assert(select_calls==(fault>=2?1:0));
         if(fault>=2){assert(!zf_platform_startup_allowed());assert(!zf_platform_select_factory());assert(select_calls==1);}
     }
