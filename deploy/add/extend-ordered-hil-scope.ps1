@@ -67,7 +67,7 @@ if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     if ($Version -eq '2.6.22') {
         foreach ($scope in @($ExistingTargetsJson, $ExtendedTargetsJson)) {
-            & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure $scope | Out-Null
+            $scope | & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure-stdin | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Factory trial expansion requires an exact three-target prefix' }
         }
     } else {
@@ -120,7 +120,7 @@ if ($Version -eq '2.7.0') {
     if ($LASTEXITCODE -ne 0) { throw 'Writer expansion requires the exact populated reader matrix' }
 }
 if ($Version -eq '2.6.22') {
-    & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest $manifestPath --exposure $ExtendedTargetsJson
+    $ExtendedTargetsJson | & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest $manifestPath --exposure-stdin
     if ($LASTEXITCODE -ne 0) { throw 'Factory trial manifest or expansion is invalid' }
 }
 $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json

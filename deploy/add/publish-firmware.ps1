@@ -30,7 +30,7 @@ if ($journalBridge) {
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete
     if ($Version -eq '2.6.22') {
-        & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest (Join-Path $source 'manifest.json') --exposure $HilTargetsJson
+        $HilTargetsJson | & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest (Join-Path $source 'manifest.json') --exposure-stdin
         if ($LASTEXITCODE -ne 0) { throw 'Factory trial contract or exposure is invalid' }
     } else { Assert-JournalHilScope -TargetsJson $HilTargetsJson }
 }

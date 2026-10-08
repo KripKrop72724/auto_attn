@@ -1,4 +1,8 @@
+param([ValidateSet('Legacy', 'Standard')][string]$NativeArgumentMode = 'Legacy')
 $ErrorActionPreference = 'Stop'
+# Exercise the production Windows 5.1 native argument boundary on PowerShell 7
+# too. Native Windows already uses these semantics and has no such preference.
+if (Test-Path variable:PSNativeCommandArgumentPassing) { $PSNativeCommandArgumentPassing = $NativeArgumentMode }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $root = Join-Path ([IO.Path]::GetTempPath()) ('reader-matrix-' + [guid]::NewGuid().ToString('N'))
 function Assert-Refused([scriptblock]$Action) {
@@ -89,10 +93,27 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Factory contract unavailable' }
     $trial = ($trialJson -join [Environment]::NewLine) | ConvertFrom-Json
     $factoryTargets = @($trial.targets | ForEach-Object { @{connector_id=$_.connector_id;mac=$_.mac;terminal_serial=$_.terminal_serial} })
-    & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure (ConvertTo-Json -InputObject $factoryTargets -Depth 5 -Compress) | Out-Null
+    $factoryScope = ConvertTo-Json -InputObject $factoryTargets -Depth 5 -Compress
+    $factoryScope | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Exact factory targets refused' }
-    & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure $targets 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { throw 'Factory trial admitted 3FL' }
+    Assert-Refused {
+        $targets | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Factory trial refused the unrelated 3FL target' }
+    }
+    # Exercise real factory publication/extension, including native JSON input.
+    $factoryImage = Join-Path $source 'zone-lite-2.6.22.bin'
+    Copy-Item -LiteralPath $image -Destination $factoryImage
+    $factoryManifest = @{version='2.6.22';release_id='zone-lite-2.6.22';firmware_family='zkt';project_name='zone_lite';
+        release_channel='EXPERIMENTAL_HIL_ONLY';image_name='zone-lite-2.6.22.bin';image_size=(Get-Item $factoryImage).Length;
+        image_sha256=(Get-FileHash $factoryImage).Hash.ToLowerInvariant();application_sha256=('f'*64);git_sha=('a'*40);
+        minimum_bootstrap_version='2.5.2';queue_storage=$factory;factory_trial=$trial;hil_targets=$all}
+    [IO.File]::WriteAllText($manifestPath, ($factoryManifest | ConvertTo-Json -Depth 12 -Compress))
+    & python (Join-Path $root 'scripts/canonicalize_firmware_manifest.py') $manifestPath
+    if ($LASTEXITCODE -ne 0) { throw 'Synthetic factory manifest canonicalization failed' }
+    $firstFactory = ConvertTo-Json -InputObject @($factoryTargets[0]) -Depth 5 -Compress
+    & (Join-Path $root 'deploy/add/publish-firmware.ps1') -SourceDirectory $source -StoreDirectory $store -Version 2.6.22 -PublicationMode HIL_ONLY -HilTargetsJson $firstFactory
+    & (Join-Path $root 'deploy/add/extend-ordered-hil-scope.ps1') -StoreDirectory $store -Version 2.6.22 -ExpectedGitSha $factoryManifest.git_sha -ExpectedImageSha256 $factoryManifest.image_sha256 -ExpectedApplicationSha256 $factoryManifest.application_sha256 -ExistingTargetsJson $firstFactory -ExtendedTargetsJson $factoryScope
+    if ((Get-Content (Join-Path $store '2.6.22/.hil-only.json') -Raw | ConvertFrom-Json).targets.Count -ne 3) { throw 'Factory exposure changed' }
     # Execute the actual pre-decryption signer branch with an isolated vault.
     # A rejected deployed proof must stop before output or key work is created.
     $vault = Join-Path $root 'vault'

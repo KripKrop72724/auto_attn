@@ -1,6 +1,10 @@
 """The factory bridge cannot fall through ordinary same-version OTA admission."""
 from copy import deepcopy
+import json
+from pathlib import Path
 import struct
+import subprocess
+import sys
 
 import pytest
 
@@ -67,6 +71,35 @@ def test_returned_signing_policy_does_not_mutate_canonical_pins():
     first = factory_trial_signing_contract()
     first["targets"][0]["mac"] = "changed"
     assert validate_factory_trial_contract(factory_trial_signing_contract())
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_factory_signing_helper_accepts_bounded_stdin_prefix(count, tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest()))
+    program = str(Path(__file__).resolve().parents[2] / "scripts/build_zkt_factory_contract.py")
+    payload = json.dumps(factory_trial_targets()[:count]).encode() + b"\r\n"
+    for extra in ([], ["--manifest", str(path)]):
+        result = subprocess.run([sys.executable, program, "--exposure-stdin", *extra],
+                                input=payload, capture_output=True, timeout=15)
+        assert result.returncode == 0 and not result.stderr
+        if not extra:
+            assert json.loads(result.stdout) == factory_trial_signing_contract()
+        else:
+            assert not result.stdout
+
+
+@pytest.mark.parametrize("payload", [b"", b"[]", b"{}", b"\xff", b" " * 4097,
+    json.dumps(factory_trial_targets()[0]).encode(),
+    json.dumps(factory_trial_targets()).replace('"', '').encode(),
+    json.dumps(list(reversed(factory_trial_targets()))).encode(),
+    json.dumps(signed_hil_targets()[:1]).encode()])
+def test_factory_signing_helper_rejects_invalid_stdin_without_policy_output(payload):
+    program = str(Path(__file__).resolve().parents[2] / "scripts/build_zkt_factory_contract.py")
+    result = subprocess.run([sys.executable, program, "--exposure-stdin"], input=payload,
+                            capture_output=True, timeout=15)
+    assert result.returncode == 1 and not result.stdout
+    assert result.stderr == b"Factory trial policy or exact exposure is invalid.\n"
 
 
 @pytest.mark.parametrize("targets", [[], signed_hil_targets()[:1], signed_hil_targets(),

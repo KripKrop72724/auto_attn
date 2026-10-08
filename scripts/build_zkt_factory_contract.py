@@ -12,14 +12,23 @@ from zk_add.zkt_factory_contract import (  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exposure")
+    exposure = parser.add_mutually_exclusive_group()
+    exposure.add_argument("--exposure")
+    exposure.add_argument("--exposure-stdin", action="store_true")
     parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
     try:
-        if args.exposure is not None:
-            if len(args.exposure) > 4096:
+        raw_exposure = args.exposure
+        if args.exposure_stdin:
+            # Windows PowerShell 5.1 removes native argument quotes. Keep the
+            # JSON document off that boundary, with a bounded UTF-8 stdin read.
+            raw_exposure = sys.stdin.buffer.read(4097)
+        if raw_exposure is not None:
+            if len(raw_exposure) > 4096:
                 raise ValueError()
-            factory_trial_exposure(json.loads(args.exposure))
+            if isinstance(raw_exposure, bytes):
+                raw_exposure = raw_exposure.decode("utf-8")
+            factory_trial_exposure(json.loads(raw_exposure))
         if args.manifest:
             if args.manifest.stat().st_size > 65536:
                 raise ValueError()

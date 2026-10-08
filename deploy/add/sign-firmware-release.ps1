@@ -108,7 +108,7 @@ if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '
     if ($FirmwareFamily -ne 'zkt') { throw 'The journal bridge is ZKT-only' }
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     if ($Version -eq '2.6.22') {
-        $factoryJson = & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure $HilTargetsJson
+        $factoryJson = $HilTargetsJson | & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure-stdin
         if ($LASTEXITCODE -ne 0) { throw 'Factory trial contract or exposure is invalid' }
         $factoryTrial = ($factoryJson -join [Environment]::NewLine) | ConvertFrom-Json
     } else { Assert-JournalHilScope -TargetsJson $HilTargetsJson }
