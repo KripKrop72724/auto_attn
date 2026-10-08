@@ -1657,7 +1657,8 @@ def test_six_parallel_scan_slots_are_bounded_and_device_isolated(
 
 @pytest.mark.parametrize(
     "fault_code",
-    ["SOURCE_COMMITTED_BOUNDARY_DIVERGED", "SOURCE_RANGE_COUNT_REGRESSION"],
+    ["SOURCE_COMMITTED_BOUNDARY_DIVERGED", "SOURCE_RANGE_COUNT_REGRESSION",
+     "SOURCE_RANGE_LAYOUT_INVALID", "SOURCE_FIRST_ANCHOR_DIVERGED"],
 )
 def test_unconfirmed_firmware_source_divergence_holds_add_job(
     reconciliation_db, fault_code
@@ -2163,3 +2164,58 @@ def test_bound_anchor_cannot_change_epoch_generation(reconciliation_db):
     with pytest.raises(ValueError, match="Source epoch cannot change terminal generation"):
         apply_reconciliation_anchor(session, connector=connector, payload=request)
     assert job.terminal_generation == generation and job.cutoff_count is None
+
+
+@pytest.mark.parametrize("retry_code", [
+    "SOURCE_RANGE_READ_RETRY", "SOURCE_RANGE_SNAPSHOT_RETRY", "SOURCE_RANGE_RELEASE_RETRY",
+])
+def test_source_snapshot_retry_keeps_checkpoint_backoff_and_existing_hold(
+    reconciliation_db, monkeypatch, retry_code,
+):
+    from datetime import timedelta
+    import zk_add.reconciliation as reconciliation
+
+    session, connector = reconciliation_db
+    zkt = connector.zkt_device
+    zkt.capability_profile = {**zkt.capability_profile, "history_stream_v2": True,
+        "history_chunk_max_records": 100, "history_credit_max_records": 400}
+    zkt.attendance_count = 68_788
+    now = [utc_now()]
+    monkeypatch.setattr(reconciliation, "utc_now", lambda: now[0])
+    job = create_reconciliation_job(session, connector=connector, actor="operator",
+        reason="Verify source transport retries do not rewrite durable source facts.",
+        confirmation="RECONCILE 1 FROM START", idempotency_key="source-snapshot-retry-0001")
+    job.status = "RUNNING"
+    job.cutoff_count = 68_788
+    job.record_size = 40
+    job.first_anchor_digest = "a" * 64
+    job.committed_next_ordinal = job.scanned_count = 57_300
+    job.last_chain_digest = "b" * 64
+    original = (job.cutoff_count, job.record_size, job.first_anchor_digest,
+                job.committed_next_ordinal, job.last_chain_digest)
+    for retry, delay in enumerate((5, 15, 30, 60, 60)):
+        assignment = assignment_rows(session)[0][1]
+        assert not apply_reconciliation_device_fault(session, connector=connector, code=retry_code)
+        payload = ReconciliationAssignmentReleaseRequest(
+            assignment_id=assignment["assignment_id"], job_id=job.job_id,
+            generation=job.terminal_generation, committed_next_ordinal=57_300,
+            reason="TRANSIENT_STEP_FAILED")
+        apply_reconciliation_assignment_release(session, connector=connector, payload=payload)
+        assert job.status == "RUNNING" and job.wait_reason == "TRANSIENT_STEP_RETRY"
+        assert job.next_retry_at == now[0] + timedelta(seconds=delay)
+        assert job.auto_retry_count == retry + 1
+        assert assignment_rows(session) == []
+        # Lost release acknowledgement is a replay, not another retry debit.
+        apply_reconciliation_assignment_release(session, connector=connector, payload=payload)
+        assert job.auto_retry_count == retry + 1
+        assert (job.cutoff_count, job.record_size, job.first_anchor_digest,
+                job.committed_next_ordinal, job.last_chain_digest) == original
+        assert job.capture_certified_at is None
+        now[0] += timedelta(seconds=delay + 1)
+    assert apply_reconciliation_device_fault(
+        session, connector=connector, code="SOURCE_RANGE_LAYOUT_INVALID")
+    assert not apply_reconciliation_device_fault(session, connector=connector, code=retry_code)
+    assert job.status == "NEEDS_ATTENTION" and job.error_code == "SOURCE_RANGE_LAYOUT_INVALID"
+    assert assignment_rows(session) == []
+    assert (job.cutoff_count, job.record_size, job.first_anchor_digest,
+            job.committed_next_ordinal, job.last_chain_digest) == original
