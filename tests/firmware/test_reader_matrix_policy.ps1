@@ -94,6 +94,9 @@ try {
     $trial = ($trialJson -join [Environment]::NewLine) | ConvertFrom-Json
     $factoryTargets = @($trial.targets | ForEach-Object { @{connector_id=$_.connector_id;mac=$_.mac;terminal_serial=$_.terminal_serial} })
     $factoryScope = ConvertTo-Json -InputObject $factoryTargets -Depth 5 -Compress
+    # Diagnose the native byte/JSON boundary without logging any input identity.
+    $factoryScope | & python (Join-Path $repo 'tests/firmware/tools/check_factory_scope_input.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Factory input diagnostic failed' }
     $factoryScope | & python (Join-Path $root 'scripts/build_zkt_factory_contract.py') --exposure-stdin | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Exact factory targets refused' }
     Assert-Refused {

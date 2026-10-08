@@ -102,6 +102,22 @@ def test_factory_signing_helper_rejects_invalid_stdin_without_policy_output(payl
     assert result.stderr == b"Factory trial policy or exact exposure is invalid.\n"
 
 
+@pytest.mark.parametrize("payload, checks", [
+    (json.dumps(factory_trial_targets()).encode() + b"\r\n", {"rows": 3, "exact_prefix": True, "utf8": True}),
+    (b'[{"do-not-log-secret-key":"do-not-log-secret-value"}]', {"rows": 1, "keys_exact": [False], "exact_prefix": False}),
+    (b'\xff\xfe[\x00]\x00', {"bom": "UTF16LE", "utf8": False, "json": False}),
+])
+def test_native_scope_diagnostic_reports_only_shape(payload, checks):
+    program = str(Path(__file__).resolve().parents[2] / "tests/firmware/tools/check_factory_scope_input.py")
+    result = subprocess.run([sys.executable, program], input=payload, capture_output=True, timeout=15)
+    assert result.returncode == 0 and not result.stderr
+    assert result.stdout.startswith(b"FACTORY_SCOPE_INPUT ") and len(result.stdout) < 1024
+    value = json.loads(result.stdout.removeprefix(b"FACTORY_SCOPE_INPUT "))
+    assert all(value[key] == expected for key, expected in checks.items())
+    assert b"do-not-log-secret" not in result.stdout
+    assert FACTORY_TARGETS[0]["terminal_serial"].encode() not in result.stdout
+
+
 @pytest.mark.parametrize("targets", [[], signed_hil_targets()[:1], signed_hil_targets(),
     factory_trial_targets()[1:], list(reversed(factory_trial_targets())), factory_trial_targets() * 2])
 def test_exposure_is_only_exact_factory_prefix(targets):
