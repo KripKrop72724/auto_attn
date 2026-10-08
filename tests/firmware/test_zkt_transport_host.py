@@ -172,6 +172,19 @@ int main(void){
  now=0;total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
  assert(captures==6 && acknowledgements==3); /* Second frame preserved, not falsely ACKed. */
+ /* A header-read retry must retain the same live-event preservation obligation.
+  * The actual prepared-range command cannot ACK an unpreserved interleaved punch. */
+ now=0;preservation_delay=0;fragment_delay=0;fragment=1024;
+ zk_bounded_buffer_t header_source={.prepared=true,.size=44};uint8_t header_bytes[4];
+ unsigned prior_captures=captures,prior_acks=acknowledgements;
+ preserve_ok=false;total=position=0;
+ frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"\x28\0\0\0",4);
+ assert(!zk_read_bounded_range(1,&ctx,&header_source,0,header_bytes,4));
+ assert(captures==prior_captures+1 && acknowledgements==prior_acks);
+ preserve_ok=true;total=position=0;
+ frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"\x28\0\0\0",4);
+ assert(zk_read_bounded_range(1,&ctx,&header_source,0,header_bytes,4));
+ assert(header_bytes[0]==40 && captures==prior_captures+2 && acknowledgements==prior_acks+1);
  return 0;
 }
 '''
