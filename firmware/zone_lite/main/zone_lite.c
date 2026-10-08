@@ -491,7 +491,9 @@ typedef struct {
 
 static char g_device_serial[80] = "";
 static uid_cache_t g_seen_cache;
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
 static uint8_t g_seen_occupied[SEEN_UID_CAPACITY / 8];
+#endif
 static SemaphoreHandle_t g_seen_lock;
 static uint32_t g_last_authenticated_zkt_ip;
 static int32_t g_last_synced_attendance_count = -1;
@@ -3310,18 +3312,41 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
 
 static bool g_queue_store_ready;
 
-static void storage_init(void)
+/* Boot's single caller initializes this optional, CPU-only cache before any
+ * worker starts. Later contains/add calls own g_seen_lock. Missing cache is
+ * safe replay through immutable event IDs, never custody or queue retirement. */
+static void seen_cache_init(void)
 {
+    static bool initialized;
+    if (initialized) return;
+    initialized = true;
     g_seen_lock = xSemaphoreCreateMutex();
     g_seen_cache.capacity = SEEN_UID_CAPACITY;
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     g_seen_cache.occupied = g_seen_occupied;
     g_seen_cache.keys = heap_caps_calloc(SEEN_UID_CAPACITY, 32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (g_seen_cache.keys == NULL) {
         g_seen_cache.keys = calloc(SEEN_UID_CAPACITY, 32);
     }
-    if (!g_seen_cache.keys || !g_seen_lock) {
+#else
+    if (g_seen_lock) {
+        g_seen_cache.occupied = heap_caps_calloc(SEEN_UID_CAPACITY / 8, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (g_seen_cache.occupied)
+            g_seen_cache.keys = heap_caps_calloc(SEEN_UID_CAPACITY, 32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_seen_cache.keys) {
+            heap_caps_free(g_seen_cache.occupied);
+            g_seen_cache.occupied = NULL;
+        }
+    }
+#endif
+    if (!g_seen_cache.keys || !g_seen_cache.occupied || !g_seen_lock) {
         ESP_LOGW(TAG, "Volatile UID cache unavailable; durable deliveries may replay");
     }
+}
+
+static void storage_init(void)
+{
+    seen_cache_init();
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
         .partition_label = NULL,

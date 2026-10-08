@@ -95,23 +95,28 @@ bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
         version = ZJ_BRIDGE_VERSION;
     else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.17") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.18") ||
               !strcmp(ZJ_BRIDGE_VERSION, "2.6.19") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
+              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.23")) &&
              !memcmp(bytes + 168, "2.6.16", sizeof("2.6.16")))
         version = "2.6.16";
     else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.18") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.19") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
+              !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21") ||
+              !strcmp(ZJ_BRIDGE_VERSION, "2.6.23")) &&
              !memcmp(bytes + 168, "2.6.17", sizeof("2.6.17")))
         version = "2.6.17";
     else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.19") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
+              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.23")) &&
              !memcmp(bytes + 168, "2.6.18", sizeof("2.6.18")))
         version = "2.6.18";
-    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
+    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21") ||
+              !strcmp(ZJ_BRIDGE_VERSION, "2.6.23")) &&
              !memcmp(bytes + 168, "2.6.19", sizeof("2.6.19")))
         version = "2.6.19";
-    else if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.21") &&
+    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.21") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.23")) &&
              !memcmp(bytes + 168, "2.6.20", sizeof("2.6.20")))
         version = "2.6.20";
+    else if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.23") &&
+             !memcmp(bytes + 168, "2.6.21", sizeof("2.6.21")))
+        version = "2.6.21";
     if (!version) return false;
     encode(&decoded, revision, version, canonical);
     if (!revision || !identity_valid(&decoded) || memcmp(bytes, canonical, sizeof(canonical))) return false;
